@@ -112,7 +112,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     ("WriteFileJob", "batched write job; writes go through write/writev until batching is measured as needed"),
     ("bigintStatFsValues", "bigint view of statfs fields, follows the BigInt stat surface"),
     ("bigintStatValues", "bigint view of stat fields, follows the BigInt stat surface"),
-    ("cpSyncCheckPaths", "cp -r path validation, lands with cp -r"),
     ("cpSyncCopyDir", "cp -r directory recursion, lands with cp -r"),
     ("cpSyncOverrideFile", "cp -r overwrite rule, lands with cp -r"),
     ("getFormatOfExtensionlessFile", "ESM format sniffing for extensionless files, owned by the ESM loader"),
@@ -155,6 +154,7 @@ pub const MEMBERS: &[&str] = &[
     "realpath",
     "access",
     "copyFile",
+    "cpSyncCheckPaths",
     "chmod",
     "fchmod",
     "chown",
@@ -185,6 +185,7 @@ struct Installer<'a, 's, 'i> {
 
 impl<'a, 's, 'i> Installer<'a, 's, 'i> {
     fn install_all(&mut self) -> Result<(), String> {
+        mkfn!(self, "cpSyncCheckPaths", cp_sync_check_paths_binding);
         mkfn!(self, "open", open_binding);
         mkfn!(self, "close", close_binding);
         mkfn!(self, "read", read_binding);
@@ -1037,6 +1038,56 @@ fn readlink_binding<'a, 's, 'i>(
         Err(error) => Completion::failed(error),
     };
     conclude!(scope, args, rv, completion);
+}
+
+/// `cpSyncCheckPaths(src, dest, dereference, recursive)`.
+///
+/// `lib/internal/fs/cp/cp-sync.js` calls this once before it walks anything;
+/// everything else about `cpSync` is JavaScript over the other `fs` members.
+/// Without it every `fs.cpSync` call threw
+/// `fsBinding.cpSyncCheckPaths is not a function`.
+fn cp_sync_check_paths_binding<'a, 's, 'i>(
+    scope: &'a mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let Some(src) = crate::args::path_bytes(scope, args.get(0)) else {
+        throw_error(scope, &FsError::from_errno("cp", libc::EINVAL));
+        return;
+    };
+    let Some(dest) = crate::args::path_bytes(scope, args.get(1)) else {
+        throw_error(scope, &FsError::from_errno("cp", libc::EINVAL));
+        return;
+    };
+    let dereference = args.get(2).is_true();
+    let recursive = args.get(3).is_true();
+
+    let src_path = path_from_bytes(&src);
+    let dest_path = path_from_bytes(&dest);
+    // The C++ stats `src` first and throws on failure, so a missing source is
+    // reported before anything is compared.
+    if std::fs::symlink_metadata(&src_path).is_err() {
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::ENOENT);
+        throw_error(scope, &FsError::from_errno("stat", errno));
+        return;
+    }
+
+    if let Some(error) = crate::cp::check_paths(&src_path, &dest_path, dereference, recursive) {
+        crate::cp::throw_cp_error(
+            scope,
+            &error,
+            &src_path.to_string_lossy(),
+            &dest_path.to_string_lossy(),
+        );
+    }
+}
+
+/// A byte path as a `Path`, matching how the rest of this crate handles paths.
+fn path_from_bytes(bytes: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
 }
 
 /// `realpath(path, encoding, [req])`.
