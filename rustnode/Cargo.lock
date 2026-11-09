@@ -1329,6 +1329,7 @@ dependencies = [
  "rn-bind-crypto",
  "rn-bind-heap-utils",
  "rn-bind-messaging",
+ "rn-bind-options",
  "rn-bind-task-queue",
  "rn-bind-timers",
  "rn-bindings",

@@ -14,8 +14,6 @@
 
 use rn_v8_sys::v8;
 
-use crate::option::DefaultValue;
-
 /// Creates a JavaScript string, mapping a failed allocation to a plain error.
 pub(crate) fn string<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -98,30 +96,19 @@ pub(crate) fn define_method(
     Ok(())
 }
 
-/// Converts a tabled default value into the JavaScript value Node reports.
-pub(crate) fn default_to_v8<'s>(
+/// `{ host, port }`, the object a `kHostPort` option reports.
+///
+/// The host is borrowed rather than taken as a `&'static str` because a parsed
+/// host name is owned by the store, while a table default is static; one
+/// signature serves both without forcing the parser to leak its strings.
+pub(crate) fn host_port_to_v8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    value: DefaultValue,
+    host: &str,
+    port: u16,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    Ok(match value {
-        DefaultValue::Undefined => v8::undefined(scope).into(),
-        DefaultValue::Bool(flag) => v8::Boolean::new(scope, flag).into(),
-        DefaultValue::Int(number) => v8::Number::new(scope, number as f64).into(),
-        DefaultValue::Uint(number) => v8::Number::new(scope, number as f64).into(),
-        DefaultValue::Str(text) => string(scope, text)?.into(),
-        DefaultValue::List(items) => {
-            let mut values = Vec::with_capacity(items.len());
-            for item in items {
-                values.push(string(scope, item)?.into());
-            }
-            v8::Array::new_with_elements(scope, &values).into()
-        }
-        DefaultValue::HostPort(host, port) => {
-            let host = string(scope, host)?;
-            let port = v8::Integer::new(scope, i32::from(port));
-            object_with(scope, &[("host", host.into()), ("port", port.into())])?.into()
-        }
-    })
+    let host = string(scope, host)?;
+    let port = v8::Integer::new(scope, i32::from(port));
+    Ok(object_with(scope, &[("host", host.into()), ("port", port.into())])?.into())
 }
 
 /// Throws a JavaScript `Error` and leaves the return value unset.

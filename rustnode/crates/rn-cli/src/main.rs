@@ -85,6 +85,13 @@ fn main() {
         eprintln!("rustnode: warning: {flag} is accepted but not implemented");
     }
 
+    // `lib/**` reads option values through `internalBinding('options')`, and
+    // that binding can only report them if it is told what the command line
+    // said. Installing before the realm bootstrap matters: `realm.js` builds
+    // the builtin allow-list from `--experimental-bench` during its own load,
+    // so a value installed later would arrive after the decision was made.
+    rn_bind_options::parsed::install(options.parsed.clone());
+
     if let Err(message) = install_globals(scope, &args) {
         eprintln!("rustnode: {message}");
         std::process::exit(1);

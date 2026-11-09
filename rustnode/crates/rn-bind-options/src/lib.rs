@@ -26,6 +26,7 @@
 
 pub mod install;
 pub mod option;
+pub mod parsed;
 pub mod table;
 pub mod values;
 
@@ -33,6 +34,7 @@ use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
 pub use option::{DefaultValue, OptionInfo, OptionNamespace};
+pub use parsed::{ParsedValue, Store};
 pub use values::{
     cli_info, cli_values, env_options_input_types, namespace_options_input_types, options_as_flags,
     parse_node_options, CliValue, EmbedderOptions, InputType, NodeOptionsError, OptionMetadata,
@@ -155,7 +157,7 @@ fn build_cli_options_values<'s>(
     let mut converted = Vec::with_capacity(entries.len());
     for (name, value) in &entries {
         names.push(install::string(scope, name)?.into());
-        converted.push(cli_value_to_v8(scope, *value)?);
+        converted.push(cli_value_to_v8(scope, value.clone())?);
     }
     let null = v8::null(scope);
     Ok(v8::Object::with_prototype_and_properties(
@@ -174,17 +176,15 @@ fn cli_value_to_v8<'s>(
         CliValue::Undefined => v8::undefined(scope).into(),
         CliValue::Bool(flag) => v8::Boolean::new(scope, flag).into(),
         CliValue::Number(number) => v8::Number::new(scope, number).into(),
-        CliValue::Text(text) => install::string(scope, text)?.into(),
+        CliValue::Text(text) => install::string(scope, &text)?.into(),
         CliValue::TextList(items) => {
             let mut elements = Vec::with_capacity(items.len());
             for item in items {
-                elements.push(install::string(scope, item)?.into());
+                elements.push(install::string(scope, &item)?.into());
             }
             v8::Array::new_with_elements(scope, &elements).into()
         }
-        CliValue::HostPort(host, port) => {
-            install::default_to_v8(scope, DefaultValue::HostPort(host, port))?
-        }
+        CliValue::HostPort(host, port) => install::host_port_to_v8(scope, &host, port)?,
     })
 }
 

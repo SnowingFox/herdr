@@ -19,6 +19,10 @@ rn-errors = { path = "../rn-errors" }
 rn-builtins = { path = "../rn-builtins" }
 rn-js2c = { path = "../rn-js2c" }
 rn-core = { path = "../rn-core" }
+# The CLI owns what the command line means, and `lib/**` reads it back through
+# `internalBinding('options')`. Parsing happens here so there is one authority
+# for the argv rather than two that can disagree.
+rn-bind-options = { path = "../rn-bind-options" }
 rn-bindings = { path = "../rn-bindings" }
 # `process.versions.openssl` has to report the version this binary actually
 # linked, so the CLI reads it from the crypto binding rather than hardcoding.
