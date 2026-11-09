@@ -1,3 +1,4 @@
+mod args;
 mod bootstrap;
 
 use rn_bindings::install_all;
@@ -40,6 +41,18 @@ fn main() {
     let scope = &mut v8::ContextScope::new(scope, context);
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let options = match args::parse(&args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("rustnode: {message}");
+            std::process::exit(9);
+        }
+    };
+    // A flag whose feature has not landed must not pass silently, or a test
+    // that needed it looks like it exercised something it did not.
+    for flag in &options.unimplemented {
+        eprintln!("rustnode: warning: {flag} is accepted but not implemented");
+    }
 
     if let Err(message) = install_globals(scope, &args) {
         eprintln!("rustnode: {message}");
@@ -51,24 +64,22 @@ fn main() {
     // the bootstrap itself; the reason is printed so a failure is never silent.
     match bootstrap::bootstrap_realm(scope, registry) {
         Ok(loaders) => {
+            if options.expose_internals() {
+                bootstrap::expose_internals(scope, &loaders);
+            }
             let _ = (loaders.internal_binding, loaders.require);
         }
         Err(message) => eprintln!("rustnode: realm bootstrap failed: {message}"),
     }
 
     let mut print_result = false;
-    let source = match args.as_slice() {
-        [flag, code] if flag == "-e" || flag == "--eval" => code.clone(),
-        [flag, code] if flag == "-p" || flag == "--print" => {
-            print_result = true;
-            code.clone()
+    let source = match options.source {
+        args::Source::Eval { code, print } => {
+            print_result = print;
+            code
         }
-        [] => "0".to_string(),
-        [flag, ..] if flag.starts_with('-') => {
-            eprintln!("rustnode: unsupported option '{flag}'");
-            std::process::exit(9);
-        }
-        [path, ..] => match std::fs::read_to_string(path) {
+        args::Source::Empty => "0".to_string(),
+        args::Source::File(path) => match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
                 eprintln!("rustnode: cannot open {path}: {error}");
