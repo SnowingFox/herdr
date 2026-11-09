@@ -237,13 +237,26 @@ fn cache_usage(
     rv.set(v8::Number::new(scope, 0.0).into());
 }
 
-/// Node stores the loaders `realm.js` hands over; rustnode keeps its own loader
-/// state, so the call is accepted and ignored rather than failing startup.
+/// Stores the loaders `realm.js` hands over.
+///
+/// Everything the bootstrap runs afterwards closes over these, and the CLI needs
+/// `require` to run a user script, so a silent no-op here leaves the whole
+/// runtime without a module loader.
 fn set_internal_loaders(
-    _scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
+    let internal_binding = v8::Local::<v8::Function>::try_from(args.get(0));
+    let require = v8::Local::<v8::Function>::try_from(args.get(1));
+    let (Ok(internal_binding), Ok(require)) = (internal_binding, require) else {
+        throw(scope, "setInternalLoaders expects two functions");
+        return;
+    };
+    rn_core::hook_slot::set_internal_loaders(
+        v8::Global::new(scope, internal_binding),
+        v8::Global::new(scope, require),
+    );
 }
 
 fn import_source_text_module(
@@ -279,7 +292,7 @@ fn throw(scope: &mut v8::PinScope, message: &str) {
 
 /// Registers the `builtins` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(rn_core::Namespace::from_module(&Builtins));
+    registry.register_module(Builtins);
 }
 
 #[cfg(test)]

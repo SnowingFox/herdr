@@ -789,7 +789,7 @@ fn throw_type_error(scope: &mut v8::PinScope, message: &str) {
 
 /// Registers the `module_wrap` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(rn_core::Namespace::from_module(&ModuleWrapBinding));
+    registry.register_module(ModuleWrapBinding);
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ pub mod value;
 
 pub use config::Config;
 pub use constants::Constants;
-use rn_core::{BindingRegistry, Namespace};
+use rn_core::BindingRegistry;
 pub use value::Value;
 
 pub(crate) use install::{
@@ -30,6 +30,6 @@ pub(crate) use install::{
 /// checks against `contracts/<namespace>.json`; a name listed here but never
 /// installed would let the contract pass while `lib/**` reads `undefined`.
 pub fn register(registry: &mut BindingRegistry) {
-    registry.register(Namespace::from_module(&Config));
-    registry.register(Namespace::from_module(&Constants));
+    registry.register_module(Config);
+    registry.register_module(Constants);
 }

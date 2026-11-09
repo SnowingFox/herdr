@@ -41,6 +41,9 @@ pub const IMPORT_META: Hook = Hook::ImportMeta;
 /// Callback behind `import.meta.resolve`.
 pub const IMPORT_META_RESOLVE: Hook = Hook::ImportMetaResolve;
 
+/// The loaders `realm.js` installs, once it has.
+type Loaders = (Option<v8::Global<v8::Function>>, Option<v8::Global<v8::Function>>);
+
 thread_local! {
     /// The `internalBinding` and `require` functions Node's `realm.js` installs
     /// through `setInternalLoaders`.
@@ -48,8 +51,7 @@ thread_local! {
     /// Every builtin compiled after the bootstrap closes over these, and the CLI
     /// needs `require` to run a user script, so they have to outlive the call
     /// that stored them.
-    static LOADERS: RefCell<(Option<v8::Global<v8::Function>>, Option<v8::Global<v8::Function>>)> =
-        const { RefCell::new((None, None)) };
+    static LOADERS: RefCell<Loaders> = const { RefCell::new((None, None)) };
 }
 
 /// Records the loaders `realm.js` installed.

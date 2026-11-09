@@ -25,6 +25,9 @@ fn main() {
     for namespace in registry.namespaces() {
         env.insert(namespace.clone());
     }
+    // `internalBinding` reaches the registry from a V8 callback, which cannot
+    // borrow, so the registry lives for the whole process.
+    let registry: &'static rn_core::BindingRegistry = Box::leak(Box::new(registry));
 
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
@@ -46,7 +49,7 @@ fn main() {
     // Node's own bootstrap defines `internalBinding` and `require`. When it fails
     // the CLI still runs, because `-e` on a bare global is useful for debugging
     // the bootstrap itself; the reason is printed so a failure is never silent.
-    match bootstrap::bootstrap_realm(scope, &registry) {
+    match bootstrap::bootstrap_realm(scope, registry) {
         Ok(loaders) => {
             let _ = (loaders.internal_binding, loaders.require);
         }
