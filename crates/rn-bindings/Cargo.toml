@@ -23,6 +23,7 @@ rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-os = { path = "../rn-bind-os" }
 rn-bind-process-methods = { path = "../rn-bind-process-methods" }
 rn-bind-report = { path = "../rn-bind-report" }
+rn-bind-string-decoder = { path = "../rn-bind-string-decoder" }
 rn-bind-symbols = { path = "../rn-bind-symbols" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 rn-bind-timers = { path = "../rn-bind-timers" }
