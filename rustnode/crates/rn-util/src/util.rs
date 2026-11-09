@@ -56,10 +56,6 @@ pub const MEMBERS: &[&str] = &[
 /// Members the namespace needs but this crate does not install yet.
 pub const DEFERRED: &[(&str, &str)] = &[
     (
-        "getCallSites",
-        "structured CallSite records; needs the stack formatting work",
-    ),
-    (
         "getCallerLocation",
         "positional caller lookup, lands with structured stacks",
     ),
@@ -141,6 +137,7 @@ impl BindingModule for Util {
             "constructSharedArrayBuffer" => construct_shared_array_buffer,
             "defineLazyProperties" => define_lazy_properties,
             "getConstructorName" => get_constructor_name,
+            "getCallSites" => get_call_sites,
             "getExternalValue" => get_external_value,
             "getOwnNonIndexProperties" => get_own_non_index_properties,
             "getPromiseDetails" => get_promise_details,
@@ -471,6 +468,98 @@ fn get_constructor_name(
         return;
     };
     rv.set(object.get_constructor_name().into());
+}
+
+/// `GetCallSites`: the `CallSite` records `lib/util.js`'s `getCallSites` returns.
+///
+/// Each record is a **null-prototype** object with six properties, and both facts
+/// are load-bearing:
+///
+/// * `lib/util.js`'s `mapCallSite` feeds these straight to `reconstructCallSite`,
+///   and `test/common`'s `mustNotCall` reads `scriptName` and `lineNumber` off
+///   one. A record with an `Object.prototype` would pick up inherited names the
+///   consumer does not expect.
+/// * The keys are `functionName`, `scriptId`, `scriptName`, `lineNumber`,
+///   `columnNumber` and `column` — the last duplicating `columnNumber` because
+///   Node's C++ builds them from one `DictionaryTemplate` with both slots.
+///   `scriptId` is a *string*, which is what `reconstructCallSite` compares.
+///
+/// # Why frame 0 is skipped
+///
+/// V8's stack starts at this native function, which Node's C++ also discards
+/// (`// Frame 0 is node:util. It should be skipped.`). The frame above it is
+/// `lib/util.js`'s `getCallSites`, and that one *is* reported — callers index
+/// into the result expecting their own frame at `[1]`, not `[0]`.
+fn get_call_sites(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    // `CHECK(args[0]->IsUint32())` and `CHECK(frames >= 1 && frames <= 200)`:
+    // `lib/util.js` validates first, so a bad value here is a caller bug rather
+    // than a script error, and clamping keeps it from asking V8 for a huge stack.
+    let frames = args.get(0).uint32_value(scope).unwrap_or(10).clamp(1, 200);
+    // `+1` for the frame this call itself occupies, exactly as Node does.
+    let Some(stack) = v8::StackTrace::current_stack_trace(scope, frames as usize + 1) else {
+        let empty = v8::Array::new(scope, 0);
+        rv.set(empty.into());
+        return;
+    };
+
+    let count = stack.get_frame_count();
+    let result = v8::Array::new(scope, count.saturating_sub(1) as i32);
+    let mut written = 0u32;
+    for index in 1..count {
+        let Some(frame) = stack.get_frame(scope, index) else {
+            continue;
+        };
+        let Some(record) = call_site_record(scope, &frame) else {
+            continue;
+        };
+        result.set_index(scope, written, record.into());
+        written += 1;
+    }
+    rv.set(result.into());
+}
+
+/// Builds one null-prototype `CallSite` record from a stack frame.
+fn call_site_record<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    frame: &v8::StackFrame,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let object = v8::Object::new(scope);
+    // `NewDictionaryInstanceNullProto`. A dictionary-mode object rather than a
+    // literal is what Node builds, and it is what keeps `__proto__` from being a
+    // meaningful key on a frame whose function is named that.
+    object.set_prototype(scope, v8::null(scope).into());
+
+    let function_name = match frame.get_function_name(scope) {
+        Some(name) => name.into(),
+        None => v8::String::empty(scope).into(),
+    };
+    let script_name = match frame.get_script_name(scope) {
+        Some(name) => name.into(),
+        None => v8::String::empty(scope).into(),
+    };
+    let script_id = v8::String::new(scope, &frame.get_script_id().to_string())?;
+    let line = v8::Integer::new_from_unsigned(scope, frame.get_line_number() as u32);
+    let column = v8::Integer::new_from_unsigned(scope, frame.get_column() as u32);
+
+    let values: [(&str, v8::Local<'s, v8::Value>); 6] = [
+        ("functionName", function_name),
+        ("scriptId", script_id.into()),
+        ("scriptName", script_name),
+        ("lineNumber", line.into()),
+        ("columnNumber", column.into()),
+        // `CallSite.column` is deprecated but still present, and duplicates
+        // `columnNumber`; `lib/util.js` only reads `columnNumber`.
+        ("column", column.into()),
+    ];
+    for (name, value) in values {
+        let key = v8::String::new(scope, name)?;
+        object.set(scope, key.into(), value);
+    }
+    Some(object)
 }
 
 fn get_external_value(

@@ -26,9 +26,12 @@ rn-bind-crypto = { path = "../rn-bind-crypto" }
 rn-bind-diagnostics-channel = { path = "../rn-bind-diagnostics-channel" }
 rn-bind-encoding = { path = "../rn-bind-encoding" }
 rn-bind-fs = { path = "../rn-bind-fs" }
+rn-bind-fs-dir = { path = "../rn-bind-fs-dir" }
+rn-bind-fs-event-wrap = { path = "../rn-bind-fs-event-wrap" }
 rn-bind-glob = { path = "../rn-bind-glob" }
 rn-bind-http-parser = { path = "../rn-bind-http-parser" }
 rn-bind-icu = { path = "../rn-bind-icu" }
+rn-bind-js-stream = { path = "../rn-bind-js-stream" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-bind-mksnapshot = { path = "../rn-bind-mksnapshot" }
 rn-bind-modules = { path = "../rn-bind-modules" }
@@ -39,6 +42,7 @@ rn-bind-pipe-wrap = { path = "../rn-bind-pipe-wrap" }
 rn-bind-process-methods = { path = "../rn-bind-process-methods" }
 rn-bind-process-wrap = { path = "../rn-bind-process-wrap" }
 rn-bind-report = { path = "../rn-bind-report" }
+rn-bind-serdes = { path = "../rn-bind-serdes" }
 rn-bind-spawn-sync = { path = "../rn-bind-spawn-sync" }
 rn-bind-stream-wrap = { path = "../rn-bind-stream-wrap" }
 rn-bind-string-decoder = { path = "../rn-bind-string-decoder" }
