@@ -10,6 +10,7 @@ pub mod binding;
 pub mod env;
 pub mod error;
 pub mod handle;
+pub mod hook_slot;
 pub mod queue;
 
 pub use abi::{BindingModule, InstallCtx};

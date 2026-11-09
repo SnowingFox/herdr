@@ -623,6 +623,7 @@ dependencies = [
  "rn-bind-zlib",
  "rn-builtins",
  "rn-core",
+ "rn-errors",
  "rn-io",
  "rn-permission",
  "rn-v8-sys",
@@ -674,6 +675,14 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
+]
+
+[[package]]
+name = "rn-errors"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
 ]
 
 [[package]]
