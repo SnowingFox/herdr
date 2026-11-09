@@ -78,6 +78,19 @@ pub fn require<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8:
     })
 }
 
+/// Swaps the installed `require` for a wrapper around it.
+///
+/// Builtins compiled later close over whatever reference they were given at
+/// compile time, so replacing the slot only affects code that reads it from
+/// here on. The CLI installs the wrapper before running user code, which is the
+/// window that matters: a `node:` specifier is only ever typed by user code.
+pub fn replace_require(scope: &mut v8::PinScope, require: v8::Local<v8::Function>) {
+    let global = v8::Global::new(scope, require);
+    LOADERS.with(|loaders| {
+        loaders.borrow_mut().1 = Some(global);
+    });
+}
+
 /// Returns a local handle to the installed `internalBinding`, if it ran.
 pub fn internal_binding<'s>(
     scope: &mut v8::PinScope<'s, '_>,

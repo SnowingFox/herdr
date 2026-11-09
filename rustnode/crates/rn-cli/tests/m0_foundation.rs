@@ -121,3 +121,39 @@ fn exec_argv_reproduces_the_entry_point() {
         "the executable must not be in execArgv, got {printed}"
     );
 }
+
+#[test]
+fn a_builtin_can_be_required_with_its_scheme() {
+    // `node:path` and `path` name the same module, and user code writes both.
+    // The internal loader matches ids verbatim, so the scheme has to be
+    // normalized away before the lookup.
+    let out = rustnode(&["-e", "console.log(typeof require('node:path').join)"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "function");
+
+    let out = rustnode(&[
+        "-e",
+        "console.log(require('node:path') === require('path'))",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true");
+}
+
+#[test]
+fn an_unknown_specifier_still_fails_with_the_scheme_stripped() {
+    // The wrapper must not turn a typo into a silent success.
+    let out = rustnode(&["-e", "require('node:not-a-real-builtin')"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not-a-real-builtin"),
+        "the error must name the specifier"
+    );
+}
+
+#[test]
+fn a_relative_specifier_is_not_treated_as_a_builtin() {
+    let out = rustnode(&["-e", "require('./does-not-exist.js')"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("./does-not-exist.js"),
+        "the specifier must survive untouched so the loader can report it"
+    );
+}

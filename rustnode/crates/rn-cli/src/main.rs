@@ -83,6 +83,10 @@ fn main() {
             if options.expose_internals() {
                 bootstrap::expose_internals(scope, &loaders);
             }
+            // The internal loader needs the `node:` scheme stripped before it
+            // can resolve a specifier; Node's user-land loader does that, and
+            // this stands in for it until `contextify` unblocks the real one.
+            bootstrap::wrap_require_with_scheme_support(scope, &loaders);
             let _ = (loaders.internal_binding, loaders.require);
         }
         Err(message) => eprintln!("rustnode: realm bootstrap failed: {message}"),
