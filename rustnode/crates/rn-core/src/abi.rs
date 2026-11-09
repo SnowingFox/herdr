@@ -27,6 +27,12 @@ pub trait BindingModule {
     /// Members this crate exposes.
     fn members(&self) -> &'static [&'static str];
 
+    /// Members the namespace needs but this crate does not install yet, each
+    /// with the reason. Defaults to none.
+    fn deferred(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
+    }
+
     /// Builds the object `internalBinding(namespace)` returns.
     ///
     /// Must not throw a JavaScript exception; return `Err` instead and let the

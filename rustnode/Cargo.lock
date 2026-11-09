@@ -540,9 +540,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-fs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bindings"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-fs",
  "rn-core",
  "rn-io",
  "rn-v8-sys",
