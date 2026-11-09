@@ -1,0 +1,155 @@
+{
+ "canonicalize": {
+  "": "__undefined__",
+  " 1.2.3.4": "__undefined__",
+  "0.0.0.0": "0.0.0.0",
+  "01.2.3.4": "__undefined__",
+  "0:0:0:0:0:0:0:0": "::",
+  "0x7f.0.0.1": "__undefined__",
+  "1.2.3": "__undefined__",
+  "1.2.3.04": "__undefined__",
+  "1.2.3.4 ": "__undefined__",
+  "1.2.3.4.5": "__undefined__",
+  "12345::": "__undefined__",
+  "127.0.0.1": "127.0.0.1",
+  "192.168.000.001": "__undefined__",
+  "1:2:3:4:5:6:1.2.3.4": "1:2:3:4:5:6:102:304",
+  "1:2:3:4:5:6:7:8": "1:2:3:4:5:6:7:8",
+  "1:2:3:4:5:6:7:8:9": "__undefined__",
+  "1::2": "1::2",
+  "1::2::3": "__undefined__",
+  "2001:0DB8:0000:0000:0000:0000:0000:0001": "2001:db8::1",
+  "2001:DB8::0:1:0:0:1": "2001:db8::1:0:0:1",
+  "2001:db8:0:0:1:0:0:1": "2001:db8::1:0:0:1",
+  "2001:db8::1": "2001:db8::1",
+  "255.255.255.255": "255.255.255.255",
+  "::": "::",
+  "::0.0.0.0": "::",
+  "::1": "::1",
+  "::1.2.3.4": "::1.2.3.4",
+  ":::1": "__undefined__",
+  "::ffff:1.2.3.4": "::ffff:1.2.3.4",
+  "::ffff:127.0.0.1": "::ffff:127.0.0.1",
+  "FE80::1": "fe80::1",
+  "fe80::1%eth0": "fe80::1",
+  "not-an-ip": "__undefined__"
+ },
+ "channel": {
+  "own": [],
+  "prototype": [
+   "cancel",
+   "constructor",
+   "getHostByAddr",
+   "getServers",
+   "queryA",
+   "queryAaaa",
+   "queryAny",
+   "queryCaa",
+   "queryCname",
+   "queryMx",
+   "queryNaptr",
+   "queryNs",
+   "queryPtr",
+   "querySoa",
+   "querySrv",
+   "queryTlsa",
+   "queryTxt",
+   "setLocalAddress",
+   "setServers"
+  ],
+  "set_bad": 17
+ },
+ "constants": {
+  "AF_INET": 2,
+  "AF_INET6": 10,
+  "AF_UNSPEC": 0,
+  "AI_ADDRCONFIG": 32,
+  "AI_ALL": 16,
+  "AI_V4MAPPED": 8,
+  "DNS_ORDER_IPV4_FIRST": 1,
+  "DNS_ORDER_IPV6_FIRST": 2,
+  "DNS_ORDER_VERBATIM": 0
+ },
+ "convert_ipv6": {
+  "": "THREW:Error:Invalid IPv6 address",
+  "1.2.3.4": "THREW:Error:Invalid IPv6 address",
+  "2001:db8::1": {
+   "hex": "20010db8000000000000000000000001",
+   "length": 16
+  },
+  "::": {
+   "hex": "00000000000000000000000000000000",
+   "length": 16
+  },
+  "::1": {
+   "hex": "00000000000000000000000000000001",
+   "length": 16
+  },
+  "::ffff:127.0.0.1": {
+   "hex": "00000000000000000000ffff7f000001",
+   "length": 16
+  },
+  "fe80::1%eth0": {
+   "hex": "fe800000000000000000000000000001",
+   "length": 16
+  },
+  "not-an-ip": "THREW:Error:Invalid IPv6 address"
+ },
+ "request_wraps": {
+  "ChannelWrap": {
+   "kind": "function",
+   "length": 0,
+   "name": "ChannelWrap"
+  },
+  "GetAddrInfoReqWrap": {
+   "kind": "function",
+   "length": 0,
+   "name": "GetAddrInfoReqWrap"
+  },
+  "GetNameInfoReqWrap": {
+   "kind": "function",
+   "length": 0,
+   "name": "GetNameInfoReqWrap"
+  },
+  "QueryReqWrap": {
+   "kind": "function",
+   "length": 0,
+   "name": "QueryReqWrap"
+  }
+ },
+ "strerror": {
+  "-1": "unknown",
+  "-1000": "There are pending queries.",
+  "-2": "unknown",
+  "0": "Successful completion",
+  "1": "DNS server returned answer with no data",
+  "10": "Misformatted DNS reply",
+  "11": "Could not contact DNS servers",
+  "12": "Timeout while contacting DNS servers",
+  "12345": "unknown",
+  "13": "End of file",
+  "14": "Error reading file",
+  "15": "Out of memory",
+  "16": "Channel is being destroyed",
+  "17": "Misformatted string",
+  "18": "Illegal flags specified",
+  "19": "Given hostname is not numeric",
+  "2": "DNS server claims query was misformatted",
+  "20": "Illegal hints flags specified",
+  "21": "c-ares library initialization not yet performed",
+  "22": "Error loading iphlpapi.dll",
+  "23": "Could not find GetNetworkParams function",
+  "24": "DNS query cancelled",
+  "25": "Invalid service name or number",
+  "26": "No DNS servers were configured",
+  "27": "unknown",
+  "28": "unknown",
+  "3": "DNS server returned general failure",
+  "4": "Domain name not found",
+  "5": "DNS server does not implement requested operation",
+  "6": "DNS server refused query",
+  "7": "Misformatted DNS query",
+  "8": "Misformatted domain name",
+  "9": "Unsupported address family"
+ }
+}

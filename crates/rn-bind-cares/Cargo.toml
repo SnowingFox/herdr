@@ -1,0 +1,19 @@
+[package]
+name = "rn-bind-cares"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('cares_wrap') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+# Cross-checks the `UV_EAI_*` codes in `sys.rs` against libuv's own table, so a
+# transcription error fails a test instead of changing an error's `code`.
+rn-bind-uv = { path = "../rn-bind-uv" }
+serde_json.workspace = true
