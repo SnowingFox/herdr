@@ -4,7 +4,8 @@ Two trees are copied byte-identical from the Node revision pinned in
 `tools/node-pin.toml` (`f344e7f552e`, which reports itself as 28.0.0):
 
     lib/**                    435 .js files, Node's own builtin layer
-    deps/undici/undici.js     1 .js file, the `deps_files` entry lib/** requires
+    deps/**                   3 .js files, the `deps_files` entries `lib/**`
+                              requires as `internal/deps/...`
 
 `LIBJS.sha256` records the SHA-256 of every file in both trees, keyed by the
 path Node's js2c sees (`lib/fs.js`, `deps/undici/undici.js`). That is what
@@ -37,20 +38,27 @@ instead of undici's source tree because that is exactly what Node's build
 produces and embeds — the source tree's thousands of modules are not builtins
 and shipping them would reproduce a different artifact than Node runs.
 
-`deps/v8/tools/**` and `deps/acorn/**` are also in Node's `deps_files`, and
-`lib/internal/repl/*` requires `internal/deps/acorn/acorn/dist/acorn`. They are
-**not** vendored yet, so `internal/repl` remains unreachable from rustnode. That
-is a separate gap from the one this tree closes, and it is visible rather than
-silent: the id has no entry in the table, so `require` throws `Missing internal
-module` naming it.
+`deps/acorn/acorn/dist/acorn.js` and `deps/acorn/acorn-walk/dist/walk.js` are
+the other two `deps_files` entries `lib/**` reaches. `internal/repl/*`,
+`internal/errors/error_source.js`, `internal/modules/esm/module_job.js` — which
+is what finds top-level `await` while loading an ES module — and
+`internal/modules/esm/get_format.js` all parse with them. Leaving them out made
+126 files in `test/parallel` fail with `Missing internal module
+'internal/deps/acorn/acorn/dist/acorn'` the first time the parser was needed.
+
+`deps/v8/tools/**.mjs` (eleven files) are also in Node's `deps_files` and are
+**not** vendored: only `--prof-process` imports them, through
+`importBuiltinSourceTextModule`, and that entry point is not built yet. The gap
+stays visible rather than silent, because the id has no entry in the table and
+`require` throws `Missing internal module` naming it.
 
 ## Why the counts are separate
 
 `[counts]` in `tools/node-pin.toml` records `builtin_files = 435` and
-`deps_files = 1`, and `rn-js2c` enforces each against its own tree.
+`deps_files = 3`, and `rn-js2c` enforces each against its own tree.
 
 A single total over both trees would be weaker than it looks: if `lib/` lost a
-file and `deps/` gained one, the sum would still be 436 and every check would
+file and `deps/` gained one, the sum would still balance and every check would
 pass while the embedded table had drifted from what Node's js2c would produce.
 The two trees are separate inputs to js2c, so they stay separate counts.
 
@@ -60,7 +68,6 @@ Re-copy both trees from the newer Node checkout, regenerate `LIBJS.sha256` over
 `lib/**` and `deps/**`, and update `commit` and both counts in
 `tools/node-pin.toml` — all in one commit. `TABLE_DIGEST` in
 `crates/rn-js2c/tests/builtins.rs` fails with the new value to paste.
-
 Regenerate the manifest in a way that keeps the existing `lib/` lines
 byte-identical where they have not changed, so a re-pin's diff shows only the
 files that actually moved:

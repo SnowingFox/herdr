@@ -42,12 +42,19 @@ pub const BUILTIN_FILE_COUNT: usize = 435;
 ///
 /// Node's `node.gyp` lists `deps_files` explicitly instead of globbing that
 /// tree, because undici's own source tree is thousands of files and only the
-/// esbuild output is a builtin. rustnode vendors the same single file for the
-/// same reason, so this count is 1 rather than "however many files are there":
-/// it is a check, and a second `deps/` file appearing must be a deliberate
+/// esbuild output is a builtin. rustnode vendors the same files for the same
+/// reason, so this count is pinned rather than "however many files are there":
+/// it is a check, and another `deps/` file appearing must be a deliberate
 /// change to this constant, `tools/node-pin.toml`, `LIBJS.sha256`, and the
 /// build error that names it.
-pub const DEPS_FILE_COUNT: usize = 1;
+///
+/// The three are the undici bundle and the acorn parser plus its walker.
+/// `internal/repl/*`, `internal/errors/error_source.js` and
+/// `internal/modules/esm/module_job.js` parse with acorn, so a build without it
+/// made 126 files in `test/parallel` throw `Missing internal module` the first
+/// time a parser was needed. The eleven `deps/v8/tools/**.mjs` entries stay out
+/// because only `--prof-process` imports them.
+pub const DEPS_FILE_COUNT: usize = 3;
 
 /// Node's js2c root-relative location of the builtin tree.
 pub const VENDOR_LIB_RELATIVE: &str = "../../vendor/libnode-js/lib";

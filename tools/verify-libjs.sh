@@ -4,9 +4,9 @@
 # Two trees are vendored, from the same Node revision:
 #
 #   lib/**   Node's own builtin layer, 435 files
-#   deps/**  the `deps_files` entries Node's js2c also embeds, 1 file
-#            (`deps/undici/undici.js`, the esbuild bundle `lib/**` requires as
-#            `internal/deps/undici/undici`)
+#   deps/**  the `deps_files` entries Node's js2c also embeds, 3 files: the
+#            undici esbuild bundle and the two acorn files `internal/repl/*` and
+#            the ESM module job parse with
 #
 # One `LIBJS.sha256` covers both because `sha256sum -c` is keyed by path: a
 # `lib/...` entry and a `deps/...` entry are verified by the same pass and the
@@ -30,9 +30,9 @@ if [ "$lib_count" -ne 435 ]; then
 fi
 
 deps_count="$(find deps -name '*.js' | wc -l)"
-if [ "$deps_count" -ne 1 ]; then
-  echo "expected 1 builtin file under deps/, found $deps_count" >&2
+if [ "$deps_count" -ne 3 ]; then
+  echo "expected 3 builtin files under deps/, found $deps_count" >&2
   exit 1
 fi
 
-echo "vendor/libnode-js matches the pinned Node revision ($lib_count lib files, $deps_count deps file)"
+echo "vendor/libnode-js matches the pinned Node revision ($lib_count lib files, $deps_count deps files)"

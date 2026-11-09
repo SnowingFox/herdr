@@ -23,11 +23,23 @@ v8_crate = "152.2.0"
 # explicit list in `node.gyp`. One combined total would let either tree gain a
 # file while the other lost one and still balance, so both counts are exact.
 builtin_files = 435
-# Node's js2c embeds `deps/undici/undici.js`, the self-contained esbuild bundle
-# `lib/**` requires as `internal/deps/undici/undici`. It is the only
-# `deps_files` entry rustnode vendors, so this is 1 rather than a glob over
-# undici's own source tree, which is thousands of files and none of them
-# builtins.
-deps_files = 1
+# Node's `deps_files` is the list of non-`lib/**` JavaScript that js2c embeds,
+# and `lib/**` requires each by its `internal/deps/...` id. rustnode vendors the
+# entries that are reachable from `lib/**`:
+#
+#   deps/undici/undici.js            internal/deps/undici/undici
+#   deps/acorn/acorn/dist/acorn.js   internal/deps/acorn/acorn/dist/acorn
+#   deps/acorn/acorn-walk/dist/walk.js
+#                                    internal/deps/acorn/acorn-walk/dist/walk
+#
+# acorn is what `internal/repl/*`, `lib/internal/errors/error_source.js` and
+# `lib/internal/modules/esm/module_job.js` parse with; without it those modules
+# throw `Missing internal module` the first time they are reached, which put
+# 126 files in `test/parallel` out of reach.
+#
+# The eleven `deps/v8/tools/**.mjs` entries stay out: only `--prof-process`
+# imports them, through `importBuiltinSourceTextModule`, and that path is not
+# built yet. They are a separate gap, deliberately visible rather than counted.
+deps_files = 3
 internal_binding_namespaces = 73
 test_files_parallel = 5161
