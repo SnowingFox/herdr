@@ -15,6 +15,7 @@ rn-v8-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+rn-bind-config = { path = "../rn-bind-config" }
 rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-zlib = { path = "../rn-bind-zlib" }
 rn-permission = { path = "../rn-permission" }
