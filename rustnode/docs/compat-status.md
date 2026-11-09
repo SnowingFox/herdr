@@ -222,3 +222,35 @@ which is usually enough to name the missing member.
   is wrong.
 - **Timeouts are failures, not skips.** A file killed at 30 seconds counts
   against the pass rate. Raise `--timeout` before concluding a test is broken.
+
+## Known divergences
+
+Recorded differences from Node that are real, measured, and not yet fixed.
+Each names why it exists, so it is not mistaken for a bug report or a to-do
+without context.
+
+### `zlib` level 4-6 compress less than Node
+
+`libz-rs-sys` and the zlib Node vendors (zlib-ng) map compression levels
+differently above level 3. Measured with `deflateSync` on a 4000-byte
+alphabet-cycle payload:
+
+| level | node | rustnode |
+| --- | --- | --- |
+| 1-3 | 79 | 78-79 |
+| 4-6 | **60** | **79** |
+| 7-9 | 60 | 60 |
+| -1 (default) | 60 | 79 |
+
+Decompression is byte-identical either way — a payload compressed by rustnode
+round-trips through node and vice versa — so this affects compression ratio,
+not correctness. Closing it means linking the same zlib Node vendors, which is
+a build change of its own.
+
+### Web Streams globals are not installed
+
+`ReadableStream`, `WritableStream`, `TransformStream` and their friends are
+not on the global object. `internal/webstreams/**` loads correctly; the
+globals are simply not wired, because `internal/bootstrap/node.js` never runs
+in this build. `util.inspect`'s own test needs `ReadableStream`, and is the one
+remaining failure in the Node test smoke set.
