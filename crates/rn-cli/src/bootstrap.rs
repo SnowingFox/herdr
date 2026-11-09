@@ -71,6 +71,80 @@ pub fn expose_internals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
     let _ = expose.call(scope, function.into(), &[]);
 }
 
+/// Normalizes the `node:` prefix the way Node's user-land loader does.
+///
+/// The loader `realm.js` hands out is the *internal* one: it looks ids up in
+/// `BuiltinModule.map` verbatim, so `require('node:path')` misses `path` and
+/// throws `Missing internal module`. Node's real user-land `require` is the
+/// CommonJS loader, which calls `BuiltinModule.normalizeRequirableId` first.
+/// That loader needs `contextify` and cannot run yet, so this installs the same
+/// normalization over the internal loader. Every specifier that is not a
+/// `node:` builtin reaches the internal loader unchanged.
+pub fn wrap_require_with_scheme_support(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
+    let Some(require) = loaders.require.as_ref() else {
+        return;
+    };
+    let require = v8::Local::new(scope, require);
+    let Some(normalize) = normalize_requirable_id(scope, require) else {
+        return;
+    };
+
+    // The wrapper is written in JavaScript because it has to close over the
+    // normalize function and the inner loader. A V8 callback cannot capture
+    // values: its data slot is statically sized and a closure does not fit.
+    let source = "(function (normalize, inner) {\n\
+                  \x20 return function require(id) {\n\
+                  \x20   if (typeof id === 'string' && id.startsWith('node:')) {\n\
+                  \x20     const normalized = normalize(id);\n\
+                  \x20     if (normalized !== undefined) return inner(normalized);\n\
+                  \x20   }\n\
+                  \x20   return inner(id);\n\
+                  \x20 };\n\
+                  })";
+    let Some(source) = v8::String::new(scope, source) else {
+        return;
+    };
+    let Some(factory) = v8::Script::compile(scope, source, None) else {
+        return;
+    };
+    let Some(factory) = factory.run(scope) else {
+        return;
+    };
+    let Ok(factory) = v8::Local::<v8::Function>::try_from(factory) else {
+        return;
+    };
+    let Some(wrapped) = factory.call(
+        scope,
+        v8::undefined(scope).into(),
+        &[normalize.into(), require.into()],
+    ) else {
+        return;
+    };
+    let Ok(wrapped) = v8::Local::<v8::Function>::try_from(wrapped) else {
+        return;
+    };
+
+    let global = scope.get_current_context().global(scope);
+    let _ = set(scope, global, "require", wrapped.into());
+    rn_core::hook_slot::replace_require(scope, wrapped);
+}
+
+/// `BuiltinModule.normalizeRequirableId`, reached through the realm exports.
+fn normalize_requirable_id<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let id = v8::String::new(scope, "internal/bootstrap/realm")?;
+    let exports = require.call(scope, v8::undefined(scope).into(), &[id.into()])?;
+    let exports = v8::Local::<v8::Object>::try_from(exports).ok()?;
+    let key = v8::String::new(scope, "BuiltinModule")?;
+    let builtin_module = exports.get(scope, key.into())?;
+    let builtin_module = v8::Local::<v8::Function>::try_from(builtin_module).ok()?;
+    let key = v8::String::new(scope, "normalizeRequirableId")?;
+    let normalize = builtin_module.get(scope, key.into())?;
+    v8::Local::<v8::Function>::try_from(normalize).ok()
+}
+
 /// Runs the bootstrap and returns the loaders it created.
 pub fn bootstrap_realm(
     scope: &mut v8::PinScope,
