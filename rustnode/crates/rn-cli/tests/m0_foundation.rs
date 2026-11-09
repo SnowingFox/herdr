@@ -186,3 +186,22 @@ fn text_encoder_and_decoder_are_the_node_implementations() {
         "utf-8 [104,195,169,108,108,111]\nutf-8 héllo"
     );
 }
+
+#[test]
+fn the_buffer_global_is_the_module_itself() {
+    // The global must be the same function `require('buffer')` hands out, not a
+    // second copy: `instanceof` across the two has to hold.
+    let out = rustnode(&[
+        "-e",
+        "console.log(Buffer === require('buffer').Buffer,\n\
+         Buffer.from('hi').toString('base64'),\n\
+         Buffer.byteLength('héllo'));",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true aGk= 6");
+}
+
+#[test]
+fn btoa_and_atob_round_trip() {
+    let out = rustnode(&["-e", "console.log(btoa('hi'), atob('aGk='))"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "aGk= hi");
+}

@@ -167,6 +167,19 @@ pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
             }
         }
     }
+
+    // `Buffer` is the `buffer` module's own constructor, and the module is
+    // requireable, so the global is a reference to the same function a script
+    // gets from `require('buffer')`. `btoa` and `atob` come from the same
+    // module and are installed alongside it because they share its base64
+    // implementation.
+    if let Some(buffer) = call_require(scope, require, "buffer") {
+        for name in ["Buffer", "btoa", "atob"] {
+            if let Some(value) = get_property(scope, buffer, name) {
+                let _ = set(scope, global, name, value);
+            }
+        }
+    }
 }
 
 fn call_require<'s>(
