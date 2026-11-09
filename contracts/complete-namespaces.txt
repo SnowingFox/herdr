@@ -22,11 +22,14 @@ options
 os
 performance
 permission
+pipe_wrap
 process_methods
 report
+stream_wrap
 string_decoder
 symbols
 task_queue
+tcp_wrap
 timers
 trace_events
 types
