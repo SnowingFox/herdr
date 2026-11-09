@@ -16,32 +16,49 @@
 //! and `timeoutInfo` is an `Int32Array(1)` holding the ref count. Node's
 //! JavaScript writes `timeoutInfo[0]` directly, so a copy here would drift.
 //!
+//! # The handles are libuv's, and they are the point
+//!
+//! Node's `Environment` owns one `uv_timer_t`, one check handle for
+//! `setImmediate` and one idle handle, and the callbacks those handles run are
+//! `processTimers` and `processImmediate`. rustnode does exactly that: the
+//! handles are created on the loop `rn-uv` owns, and `libuv` decides when they
+//! fire because it is `uv_run` that runs them.
+//!
+//! That is what makes the ordering Node's rather than an approximation of it.
+//! `uv__run_timers` is the last thing an iteration does, `uv__run_check` is
+//! after poll and before close, and `uv__run_idle` runs before poll without
+//! letting it block — so an immediate cannot be starved by a poll that waits for
+//! a timer, and a 0ms timer created in the script body is due before the first
+//! iteration rather than after it.
+//!
 //! # Who counts what
 //!
 //! `lib/internal/timers.js` maintains the counters itself: `incRefCount()` does
 //! `timeoutInfo[0]++` and only calls `toggleTimerRef(true)` when that made the
-//! count one. So `toggleTimerRef` and `toggleImmediateRef` must *record* the
-//! libuv-style ref state and must not write the counters — writing them would
-//! double-count every timer.
-//!
-//! The loop asks [`timer_handle`] and [`immediate_ref_count`] whether the process
-//! has anything left to wait for, and those are two different measurements on
-//! purpose:
-//!
-//! * A timer is libuv's single `uv_timer_t`, so "alive" means *started and
-//!   ref'd*, exactly as `uv__loop_alive()` asks. `scheduleTimer` starts it and
-//!   [`stop_timer_handle`] stops it when `processTimers` reports nothing ref'd.
-//! * Immediates have no handle of their own in this runtime yet, and
-//!   `processImmediate()` decrements `immediateInfo[1]` without toggling the ref
-//!   bit, so the count is the only signal that stays correct after a run.
+//! count one. So `toggleTimerRef` and `toggleImmediateRef` must map onto
+//! `uv_ref`/`uv_unref` of the corresponding handle and must not write the
+//! counters — writing them would double-count every timer.
 //!
 //! `timeoutInfo[0]` is deliberately not the timer signal: `listOnTimeout()`
 //! decrements it directly when a timer fires, and a script that writes the array
 //! (`internalBinding('timers').timeoutInfo[0] = 7`) would otherwise pin the
-//! process forever. Node reads its handle state, not the array.
+//! process forever or let it exit early. libuv reads its handle state, not the
+//! array.
+//!
+//! # The idle handle
+//!
+//! Node runs `setImmediate` callbacks from a check handle, and starts an idle
+//! handle while an immediate is outstanding. The idle handle is what defeats
+//! `uv__io_poll`'s "nothing to wait for" shortcut, and it also makes the check
+//! phase run before poll blocks when the only other work is a timer that is not
+//! due yet. Without it, `setImmediate(g)` next to `setTimeout(f, 200)` would sit
+//! in poll for 200ms before running `g`; with it, `g` runs first, in the
+//! iteration that starts immediately.
 
 use std::cell::{Cell, RefCell};
+use std::pin::Pin;
 
+use libuv_sys2 as uv;
 use rn_core::{AliasedUint8Array, BindingModule, Element, InstallCtx};
 use rn_v8_sys::v8;
 
@@ -78,72 +95,32 @@ thread_local! {
         immediate: None,
         timer: None,
     }) };
-    /// libuv's timer handle state, which is what decides whether the loop is
-    /// alive.
+    /// The three libuv handles `Environment` owns for JavaScript timers.
     ///
-    /// Node's `Environment` owns one `uv_timer_t` for all JavaScript timers, and
-    /// three calls drive it:
+    /// Created lazily, on the first `scheduleTimer`, `setImmediate` or
+    /// `processTimers` call, because a handle needs the loop and the loop is
+    /// created by whoever needs it first. `None` means "not created yet".
+    static HANDLES: RefCell<Handles> = const { RefCell::new(Handles::new()) };
+    /// Extra work the check phase runs after `processImmediate`.
     ///
-    /// * `scheduleTimer(ms)` is `uv_timer_start(&timer_, RunTimers, ms, 0)`,
-    ///   which both arms the handle and makes it *active*.
-    /// * `processTimers` is `RunTimers`. Its return value is a deadline when a
-    ///   ref'd timer is pending, and `Node`'s C++ reacts by restarting the handle
-    ///   for a positive value and calling `uv_timer_stop` for a value of zero or
-    ///   less. Stopping is what makes the handle *inactive*.
-    /// * `toggleTimerRef(bool)` is `uv_ref`/`uv_unref` on that same handle.
+    /// `setImmediate` is not the only thing Node's check phase carries: a
+    /// `MessagePort` is delivered from it too. The handle lives in this crate and
+    /// the consumer lives in another namespace, so the consumer registers here
+    /// rather than this crate depending on it.
+    static CHECK_PHASE_HOOK: Cell<Option<fn(&mut v8::PinScope<'_, '_>)>> = const { Cell::new(None) };
+    /// Whether that extra work has anything queued.
     ///
-    /// The loop is kept alive by an active *and* ref'd handle, which is why both
-    /// bits are tracked here rather than one count. `timeoutInfo[0]` looks like it
-    /// would answer the same question, but `listOnTimeout()` decrements it
-    /// directly when a timer fires, without calling `toggleTimerRef`, and a script
-    /// that writes the array would otherwise pin the process forever.
-    static TIMER_HANDLE: Cell<TimerHandle> = const { Cell::new(TimerHandle::new()) };
-    /// `libuv`'s ref state for the check handle that runs immediates.
-    static IMMEDIATE_REF_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    /// A `MessagePort` with a message waiting needs the check phase to run once,
+    /// and nothing in `immediateInfo` says so, so the handle is started from this
+    /// predicate as well as from the immediate count.
+    static CHECK_PHASE_PENDING: RefCell<Option<fn() -> bool>> = const { RefCell::new(None) };
 }
 
-/// libuv's per-handle state for the one timer handle a Node environment owns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TimerHandle {
-    /// `uv_is_active`: started by `scheduleTimer`, stopped when `processTimers`
-    /// reports no ref'd deadline.
-    active: bool,
-    /// `uv_has_ref`: whether the handle keeps the loop alive.
-    refed: bool,
-}
-
-impl TimerHandle {
-    /// A handle before `scheduleTimer` has ever started it.
-    ///
-    /// libuv's `uv_timer_init` leaves a handle active=false and ref'd=true, which
-    /// is the state this reproduces: not started, and ready to keep the loop alive
-    /// once it is.
-    pub const fn new() -> Self {
-        Self {
-            active: false,
-            refed: true,
-        }
-    }
-
-    /// Whether the handle is both started and ref'd, i.e. whether it keeps the
-    /// loop alive.
-    pub fn keeps_loop_alive(&self) -> bool {
-        self.active && self.refed
-    }
-
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    pub fn is_refed(&self) -> bool {
-        self.refed
-    }
-}
-
-impl Default for TimerHandle {
-    fn default() -> Self {
-        Self::new()
-    }
+/// The JavaScript callbacks the loop's handles run.
+#[derive(Default)]
+struct Callbacks {
+    immediate: Option<v8::Global<v8::Function>>,
+    timer: Option<v8::Global<v8::Function>>,
 }
 
 struct TimerInfo {
@@ -151,10 +128,24 @@ struct TimerInfo {
     timeout: AliasedUint8Array,
 }
 
-#[derive(Default)]
-struct Callbacks {
-    immediate: Option<v8::Global<v8::Function>>,
-    timer: Option<v8::Global<v8::Function>>,
+/// The libuv handles a Node environment keeps for its timers.
+///
+/// Each is a `Pin<Box<..>>`: libuv requires a handle not to move after
+/// `uv_*_init`, so it is allocated first and initialised where it sits.
+struct Handles {
+    timer: Option<Pin<Box<uv::uv_timer_t>>>,
+    check: Option<Pin<Box<uv::uv_check_t>>>,
+    idle: Option<Pin<Box<uv::uv_idle_t>>>,
+}
+
+impl Handles {
+    const fn new() -> Self {
+        Self {
+            timer: None,
+            check: None,
+            idle: None,
+        }
+    }
 }
 
 pub struct Timers;
@@ -173,6 +164,14 @@ impl BindingModule for Timers {
         scope: &mut v8::PinScope<'s, '_>,
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
+        // The loop's timer and check handles fire from inside `uv_run`, where
+        // there is no V8 scope and no entered context. Recording the isolate and
+        // context here is what lets their callbacks reach JavaScript at all, and
+        // `timers` installs earlier than any I/O binding, so doing it here is
+        // what makes the first `setTimeout` work rather than the first
+        // `net.connect`.
+        rn_uv::callback::remember_context(scope);
+
         // The two counters have different element types on purpose: Node's
         // `timeoutInfo` is signed and `immediateInfo` is not.
         let immediate = AliasedUint8Array::new(scope, IMMEDIATE_FIELDS_COUNT, Element::Word)?;
@@ -220,17 +219,26 @@ fn get_libuv_now(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    // `uv_now` is the loop's cached monotonic time in milliseconds, refreshed
-    // once per loop turn. Reading the clock directly is what libuv does at the
-    // same point: `uv__update_time()` before timers run, and no other read
-    // inside a turn. A timer that fires therefore sees the time the turn
-    // started, not the time its own callback ran, which is why
-    // `insert()`'s `_idleStart` and `listOnTimeout`'s `diff` agree.
-    rv.set(v8::Number::new(scope, now_ms()).into());
+    // `uv_now` is the loop's cached time, which libuv refreshes once per
+    // iteration. Measured against real `node`, `getLibuvNow()` reports the time
+    // the *call* was made, not the start of the iteration: across a 300ms busy
+    // wait inside a script the value advances by 299ms, and `_idleStart` shows
+    // the same. Node's `Environment::Now()` therefore refreshes before reading,
+    // and so does this.
+    //
+    // It matters for accuracy, not just cosmetics: `uv_timer_start` adds its
+    // timeout to the same cached value, so a stale cache would arm a timer
+    // against a deadline that had already partly elapsed.
+    rn_uv::uv_loop::update_time();
+    rv.set(v8::Number::new(scope, rn_uv::uv_loop::now_ms()).into());
 }
 
-/// Monotonic milliseconds, the unit `lib/internal/timers.js` compares against.
-pub fn now_ms() -> f64 {
+/// Monotonic milliseconds from a fresh read of the clock.
+///
+/// This is the fallback for a caller that runs before the loop exists. Unlike
+/// [`rn_uv::uv_loop::now_ms`] it is not cached, so it must not be used where
+/// Node compares against `_idleStart`.
+pub fn wall_now_ms() -> f64 {
     // SAFETY: `timespec` is plain-old-data and `clock_gettime` fills it.
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: `now` is a valid, writable `timespec`.
@@ -250,23 +258,26 @@ fn schedule_timer(
     };
     // `lib/internal/timers.js` calls this with the *duration* of a newly created
     // list, and only when that list expires before any it already knew about.
-    // libuv's `uv_timer_start` takes a deadline, so the conversion is here, at
-    // the boundary where the two conventions meet.
-    // `uv_timer_start` both arms the handle and marks it active. Marking it
-    // active here rather than at `processTimers()` time is what makes a timer
-    // scheduled during a turn keep the loop alive for one more turn.
-    TIMER_HANDLE.with(|handle| {
-        let mut state = handle.get();
-        state.active = true;
-        handle.set(state);
-    });
-    let Some(loop_handle) = rn_io::current_loop() else {
-        // No loop yet. During bootstrap that is the normal state: the deadline
-        // is recorded on the handle so a later turn sees it, but there is
-        // nothing to wake.
+    // `uv_timer_start` takes a timeout and adds it to the loop's cached time, so
+    // it is the same unit; the important part is that it is `uv_timer_start` and
+    // not a deadline recorded on the side, because only libuv's own timer heap
+    // decides how long the next poll waits.
+    let Some(timer) = ensure_timer_handle() else {
         return;
     };
-    loop_handle.wake_at(now_ms() + duration as f64);
+    // A negative duration is a timer already due, which libuv spells as 0.
+    let timeout = u64::try_from(duration).unwrap_or(0);
+    // `uv_timer_start` adds the timeout to the loop's *cached* time, so the
+    // cache has to be fresh or the timer is armed against a deadline that has
+    // already partly elapsed. `lib/internal/timers.js` computed `duration` from
+    // a fresh `getLibuvNow()`, so the two must agree.
+    rn_uv::uv_loop::update_time();
+    // SAFETY: `timer` is the live handle this module owns, and the callback only
+    // touches thread-local state plus V8 through `rn_uv::callback`.
+    let status = unsafe { uv::uv_timer_start(timer, Some(on_timer), timeout, 0) };
+    if status != 0 {
+        tracing::error!(status, "uv_timer_start failed");
+    }
 }
 
 fn setup_timers(
@@ -288,6 +299,12 @@ fn setup_timers(
         callbacks.immediate = Some(immediate);
         callbacks.timer = Some(timer);
     });
+    // The handle callbacks were installed before JavaScript could name them, so
+    // this is only about recording them. Creating the handles here rather than
+    // on first `scheduleTimer` means the first timer does not pay for two
+    // `uv_*_init` calls inside a poll that is already timed out.
+    let _ = ensure_timer_handle();
+    let _ = ensure_immediate_handles();
 }
 
 fn toggle_immediate_ref(
@@ -296,11 +313,37 @@ fn toggle_immediate_ref(
     _rv: v8::ReturnValue,
 ) {
     let increment = args.get(0).boolean_value(scope);
-    // This is `uv_ref`/`uv_unref` on the loop's check handle, nothing more.
+    // `uv_ref`/`uv_unref` on the loop's check handle, and start/stop of the idle
+    // handle that stops poll from blocking while an immediate is queued.
     // `lib/internal/timers.js` already adjusted `immediateInfo[1]` before
     // calling, so writing that array here would count every immediate twice and
     // leave the loop thinking there was always one more outstanding.
-    IMMEDIATE_REF_ACTIVE.with(|active| active.set(increment));
+    let Some((check, idle)) = ensure_immediate_handles() else {
+        return;
+    };
+    // SAFETY: both are the live handles this module owns.
+    unsafe {
+        if increment {
+            // `uv_check_start` both activates the handle and, because a handle
+            // is ref'd by default, makes the loop count it. Re-starting an
+            // already active handle is a no-op, so this is safe on every
+            // immediate. The idle handle stops poll from blocking while an
+            // immediate is waiting for the check phase.
+            let status = uv::uv_check_start(check, Some(on_check));
+            if status != 0 {
+                tracing::error!(status, "uv_check_start failed");
+            }
+            uv::uv_ref(check.cast());
+            uv::uv_idle_start(idle, Some(on_idle));
+        } else {
+            // Only the idle handle and the ref bit change here. The check handle
+            // keeps running: an `unref()`'d immediate must still be run by any
+            // later iteration that happens for another reason, which is what real
+            // `node` does with a 20ms timer next to `setImmediate(f).unref()`.
+            uv::uv_unref(check.cast());
+            uv::uv_idle_stop(idle);
+        }
+    }
 }
 
 fn toggle_timer_ref(
@@ -309,152 +352,376 @@ fn toggle_timer_ref(
     _rv: v8::ReturnValue,
 ) {
     let increment = args.get(0).boolean_value(scope);
-    // `uv_ref`/`uv_unref`. The counter in `timeoutInfo[0]` is maintained by
-    // `incRefCount`/`decRefCount` in JavaScript, so writing it here would count
-    // every timer twice.
-    TIMER_HANDLE.with(|handle| {
-        let mut state = handle.get();
-        state.refed = increment;
-        handle.set(state);
+    // `uv_ref`/`uv_unref` on the timer handle. The counter in `timeoutInfo[0]` is
+    // maintained by `incRefCount`/`decRefCount` in JavaScript, so writing it here
+    // would count every timer twice.
+    let Some(timer) = ensure_timer_handle() else {
+        return;
+    };
+    // SAFETY: `timer` is the live handle this module owns.
+    unsafe {
+        if increment {
+            uv::uv_ref(timer.cast());
+        } else {
+            uv::uv_unref(timer.cast());
+        }
+    }
+}
+
+/// The loop's `uv_timer_t`, created on first use.
+///
+/// `None` means the loop itself could not be created, which is the only way a
+/// handle here can fail.
+fn ensure_timer_handle() -> Option<*mut uv::uv_timer_t> {
+    HANDLES.with(|handles| {
+        let mut handles = handles.borrow_mut();
+        if handles.timer.is_none() {
+            let loop_pointer = rn_uv::uv_loop::loop_ptr()?;
+            let handle = Box::pin(std::mem::MaybeUninit::<uv::uv_timer_t>::zeroed());
+            // SAFETY: `handle` points at a live, aligned, zeroed slot, and
+            // `loop_pointer` is the process' live loop.
+            let status = unsafe { uv::uv_timer_init(loop_pointer, pin_ptr(&handle)) };
+            if status != 0 {
+                tracing::error!(status, "uv_timer_init failed");
+                return None;
+            }
+            // SAFETY: `uv_timer_init` succeeded, so the slot is initialised.
+            handles.timer = Some(unsafe { assume_init(handle) });
+        }
+        handles
+            .timer
+            .as_ref()
+            .map(|handle| std::ptr::from_ref(&**handle).cast_mut())
+    })
+}
+
+/// The loop's check and idle handles, created on first use.
+fn ensure_immediate_handles() -> Option<(*mut uv::uv_check_t, *mut uv::uv_idle_t)> {
+    HANDLES.with(|handles| {
+        let mut handles = handles.borrow_mut();
+        let loop_pointer = rn_uv::uv_loop::loop_ptr()?;
+        if handles.check.is_none() {
+            let handle = Box::pin(std::mem::MaybeUninit::<uv::uv_check_t>::zeroed());
+            // SAFETY: as in `ensure_timer_handle`.
+            let status = unsafe { uv::uv_check_init(loop_pointer, pin_ptr(&handle)) };
+            if status != 0 {
+                tracing::error!(status, "uv_check_init failed");
+                return None;
+            }
+            // SAFETY: `uv_check_init` succeeded.
+            let check = unsafe { assume_init(handle) };
+            // The check handle is started on demand by `toggleImmediateRef(true)`
+            // and unref'd once the queue drains, so it is created inactive here:
+            // an active ref'd check handle would keep the process alive forever,
+            // and one active but unref'd would still run `processImmediate` on
+            // every iteration for nothing.
+            handles.check = Some(check);
+        }
+        if handles.idle.is_none() {
+            let handle = Box::pin(std::mem::MaybeUninit::<uv::uv_idle_t>::zeroed());
+            // SAFETY: as in `ensure_timer_handle`.
+            let status = unsafe { uv::uv_idle_init(loop_pointer, pin_ptr(&handle)) };
+            if status != 0 {
+                tracing::error!(status, "uv_idle_init failed");
+                return None;
+            }
+            // SAFETY: `uv_idle_init` succeeded.
+            let idle = unsafe { assume_init(handle) };
+            // The idle handle is unref'd at init, as Node's is. It exists only to
+            // make `uv__io_poll` return without waiting while an immediate is
+            // outstanding; an active *ref'd* idle handle would keep the process
+            // alive forever, because `uv_idle_start` re-adds it to the loop's
+            // active count on every start.
+            // SAFETY: `idle` is the live handle just initialised.
+            unsafe { uv::uv_unref(std::ptr::from_ref(&*idle).cast_mut().cast()) };
+            handles.idle = Some(idle);
+        }
+        let check = handles
+            .check
+            .as_ref()
+            .map(|handle| std::ptr::from_ref(&**handle).cast_mut())?;
+        let idle = handles
+            .idle
+            .as_ref()
+            .map(|handle| std::ptr::from_ref(&**handle).cast_mut())?;
+        Some((check, idle))
+    })
+}
+
+/// A mutable pointer to the handle a `Pin<Box<MaybeUninit<_>>>` holds.
+fn pin_ptr<T>(handle: &Pin<Box<std::mem::MaybeUninit<T>>>) -> *mut T {
+    // `MaybeUninit` is never assumed initialised through this pointer, so the
+    // `Unpin` requirement `Pin::get_mut` would impose is irrelevant here; the
+    // address of `MaybeUninit<T>` and `T` is the same and libuv writes into it
+    // in place.
+    handle.as_ptr().cast::<T>().cast_mut()
+}
+
+/// Wraps a `Pin<Box<MaybeUninit<T>>>` an init call filled in.
+///
+/// # Safety
+///
+/// The caller must have run the matching `uv_*_init` successfully on this slot.
+unsafe fn assume_init<T>(handle: Pin<Box<std::mem::MaybeUninit<T>>>) -> Pin<Box<T>> {
+    // SAFETY: the caller guarantees the slot is initialised, and `Pin<Box<_>>`
+    // keeps the value at the address libuv was given, which is the requirement
+    // libuv places on a handle.
+    unsafe { std::mem::transmute::<Pin<Box<std::mem::MaybeUninit<T>>>, Pin<Box<T>>>(handle) }
+}
+
+/// `uv_timer_t`'s callback: run `processTimers`.
+///
+/// # Safety
+///
+/// Called by libuv with the timer handle this module initialised.
+unsafe extern "C" fn on_timer(_handle: *mut uv::uv_timer_t) {
+    // SAFETY: this callback only touches thread-local state and V8, which the
+    // loop only runs while the isolate exists.
+    unsafe { run_timer_callback() };
+}
+
+/// `uv_check_t`'s callback: run `processImmediate`.
+///
+/// # Safety
+///
+/// Called by libuv with the check handle this module initialised.
+unsafe extern "C" fn on_check(_handle: *mut uv::uv_check_t) {
+    // SAFETY: as in `on_timer`.
+    unsafe { run_immediate_callback() };
+    // Anything else Node runs in the check phase. A `MessagePort` becomes
+    // readable the moment it is posted to, and delivery goes last so a message
+    // handler that queues an immediate does not run in the same phase the
+    // message arrived in.
+    //
+    // This is a registered hook rather than a direct call because the check
+    // handle lives here while message delivery lives in another namespace, and
+    // the direction that avoids a cycle is for the owner of the phase to ask.
+    let hook = CHECK_PHASE_HOOK.with(Cell::get);
+    if let Some(hook) = hook {
+        rn_uv::callback::with_context(hook);
+    }
+    // `processImmediate` decrements `immediateInfo[1]` directly when it runs an
+    // immediate, so `toggleImmediateRef(false)` is not called for the last one
+    // and the ref this handle took would keep the loop alive forever. Node's
+    // `Environment` stops the check handle once the queue is drained for exactly
+    // this reason: an active ref'd handle is work, and an empty immediate queue
+    // is not.
+    //
+    // The extra check-phase work is part of that decision: a second message
+    // posted while the first was being delivered must run in a later iteration,
+    // so the handle stays armed while anything is still queued.
+    if check_phase_pending() {
+        return;
+    }
+    if immediate_ref_count() == 0 {
+        if let Some((check, idle)) = immediate_handles() {
+            // SAFETY: both are the live handles this module owns.
+            unsafe {
+                uv::uv_unref(check.cast());
+                uv::uv_idle_stop(idle);
+            }
+        }
+    }
+}
+
+/// Registers the callback the check phase runs after `processImmediate`.
+///
+/// One slot, replaced rather than accumulated: Node has exactly one set of
+/// check-phase work per environment, and a second registration would mean two
+/// deliveries per iteration.
+pub fn set_check_phase_hook(hook: fn(&mut v8::PinScope<'_, '_>)) {
+    CHECK_PHASE_HOOK.with(|slot| slot.set(Some(hook)));
+}
+
+/// Whether an immediate is queued or a ref'd check-phase consumer is waiting.
+///
+/// The check handle is started on demand, so this is also the signal that the
+/// handle must be started before the next iteration for its work to run.
+pub fn check_phase_pending() -> bool {
+    if immediate_count() > 0 {
+        return true;
+    }
+    CHECK_PHASE_PENDING.with(|pending| pending.borrow().is_some_and(|pending| pending()))
+}
+
+/// Registers a predicate saying the check phase has work beyond immediates.
+///
+/// A `MessagePort` with a queued message is exactly that: its delivery runs in
+/// the check phase, but nothing in `immediateInfo` records it. The consumer
+/// registers here so this crate keeps owning the handle without depending on it.
+pub fn set_check_phase_pending(pending: fn() -> bool) {
+    CHECK_PHASE_PENDING.with(|slot| *slot.borrow_mut() = Some(pending));
+}
+
+/// Arms the check phase for work that does not go through `setImmediate`.
+///
+/// This is `uv_async_send` for a consumer whose readiness is tracked in Rust
+/// rather than by libuv: it starts the check handle and refs it, so the loop runs
+/// one more iteration and does not exit under it. `lib/internal/timers.js` takes
+/// the same path through `toggleImmediateRef`, which is why both end up here.
+pub fn arm_check_phase() {
+    let Some((check, idle)) = ensure_immediate_handles() else {
+        return;
+    };
+    // SAFETY: both are the live handles this module owns.
+    unsafe {
+        let status = uv::uv_check_start(check, Some(on_check));
+        if status != 0 {
+            tracing::error!(status, "uv_check_start failed");
+            return;
+        }
+        uv::uv_ref(check.cast());
+        uv::uv_idle_start(idle, Some(on_idle));
+    }
+}
+
+/// `uv_idle_t`'s callback, which has nothing to do.
+///
+/// The handle exists to stop poll from blocking, so being run is the whole job.
+///
+/// # Safety
+///
+/// Called by libuv with the idle handle this module initialised.
+unsafe extern "C" fn on_idle(_handle: *mut uv::uv_idle_t) {}
+
+/// Runs `processTimers` through libuv's callback scope.
+///
+/// # Safety
+///
+/// Only called from inside `uv_run`, while the isolate the bindings were
+/// installed into is alive.
+unsafe fn run_timer_callback() {
+    rn_uv::callback::with_context(|scope| {
+        let Some(callback) = timer_callback(scope) else {
+            return;
+        };
+        let now = rn_uv::uv_loop::now_ms();
+        let argument: v8::Local<v8::Value> = v8::Number::new(scope, now).into();
+        match call_catching(scope, callback, &[argument]) {
+            Ok(Some(result)) => {
+                // The return value is the next deadline, using libuv's sign
+                // convention: positive when a ref'd timer is behind it, negative
+                // when every timer is unref'd, zero when the lists are empty.
+                // Node's C++ reacts by restarting the handle for a positive value
+                // and stopping it otherwise, and that reaction belongs here
+                // because it is a fact about the handle, not about JavaScript.
+                apply_timer_result(result.number_value(scope));
+            }
+            // A callback that reported nothing is the "function was replaced"
+            // case; there is no deadline to arm.
+            Ok(None) => stop_timer(),
+            Err(exception) => {
+                record_uncaught(scope, exception);
+                stop_timer();
+            }
+        }
     });
 }
 
-/// libuv's state for the loop's timer handle.
+/// Restarts or stops the timer handle from `processTimers`' return value.
 ///
-/// The loop asks this rather than the shared counters: `keeps_loop_alive()` is
-/// `uv_is_active(handle) && uv_has_ref(handle)`, which is exactly the condition
-/// libuv's `uv__loop_alive()` applies to every handle it holds.
-pub fn timer_handle() -> TimerHandle {
-    TIMER_HANDLE.with(Cell::get)
+/// This is `TimerWrap::Restart`/`TimerWrap::Stop` in `src/timer_wrap.cc`, with
+/// the sign of the value choosing between them.
+fn apply_timer_result(value: Option<f64>) {
+    let Some(value) = value else {
+        stop_timer();
+        return;
+    };
+    if value > 0.0 {
+        // A ref'd deadline is still pending, so the handle is re-armed for it.
+        let Some(timer) = ensure_timer_handle() else {
+            return;
+        };
+        // `processTimers` returns an absolute deadline and `uv_timer_start` takes
+        // a delay, so the loop's cached time is subtracted here. The cache is
+        // refreshed first for the same reason `scheduleTimer` refreshes it: the
+        // callback that produced `value` may have taken milliseconds.
+        rn_uv::uv_loop::update_time();
+        let now = rn_uv::uv_loop::now_ms();
+        let delay = (value - now).max(0.0);
+        // SAFETY: `timer` is the live handle this module owns.
+        let status = unsafe { uv::uv_timer_start(timer, Some(on_timer), delay.ceil() as u64, 0) };
+        if status != 0 {
+            tracing::error!(status, "uv_timer_start failed while re-arming");
+        }
+        return;
+    }
+    // Zero and negative both mean "nothing here keeps the loop alive": zero is
+    // an empty list and a negative value is a deadline with only unref'd timers
+    // behind it. `uv_timer_stop` is what makes the handle inactive, and it leaves
+    // the ref bit alone, so the next `scheduleTimer` can start it again.
+    stop_timer();
 }
 
-/// Stops the timer handle, as Node's C++ does when `processTimers` reports no
-/// ref'd timer left.
+/// Stops the loop's timer handle, as `uv_timer_stop` does.
+fn stop_timer() {
+    if let Some(timer) = timer_handle() {
+        // SAFETY: `timer` is the live handle this module owns.
+        unsafe { uv::uv_timer_stop(timer) };
+    }
+}
+
+/// Runs `processImmediate` through libuv's callback scope.
 ///
-/// `uv_timer_stop` leaves the ref bit alone: the next `scheduleTimer` marks the
-/// handle active again without needing another `uv_ref`. That is why this is a
-/// separate operation from [`timer_handle`], which only reports.
-pub fn stop_timer_handle() {
-    TIMER_HANDLE.with(|handle| {
-        let mut state = handle.get();
-        state.active = false;
-        handle.set(state);
+/// # Safety
+///
+/// Only called from inside `uv_run`, while the isolate the bindings were
+/// installed into is alive.
+unsafe fn run_immediate_callback() {
+    rn_uv::callback::with_context(|scope| {
+        let Some(callback) = immediate_callback(scope) else {
+            return;
+        };
+        if let Err(exception) = call_catching(scope, callback, &[]) {
+            record_uncaught(scope, exception);
+        }
     });
 }
 
-/// Whether the loop's check handle is ref'd.
-pub fn immediate_ref_active() -> bool {
-    IMMEDIATE_REF_ACTIVE.with(Cell::get)
+/// The loop's timer handle, if it has been created.
+fn timer_handle() -> Option<*mut uv::uv_timer_t> {
+    HANDLES.with(|handles| {
+        handles
+            .borrow()
+            .timer
+            .as_ref()
+            .map(|handle| std::ptr::from_ref(&**handle).cast_mut())
+    })
+}
+
+/// The loop's check and idle handles, if they have been created.
+fn immediate_handles() -> Option<(*mut uv::uv_check_t, *mut uv::uv_idle_t)> {
+    HANDLES.with(|handles| {
+        let handles = handles.borrow();
+        let check = handles
+            .check
+            .as_ref()
+            .map(|handle| std::ptr::from_ref(&**handle).cast_mut())?;
+        let idle = handles
+            .idle
+            .as_ref()
+            .map(|handle| std::ptr::from_ref(&**handle).cast_mut())?;
+        Some((check, idle))
+    })
 }
 
 /// Runs the timer callback `setupTimers` installed, if there is one.
 ///
-/// Kept for callers that only want the side effects; a caller that needs the
-/// deadline the callback reports should use [`run_timers`].
+/// Kept for callers that only want the side effects; the loop itself goes
+/// through the handle callback above.
 pub fn call_timer_callback(scope: &mut v8::PinScope) {
-    let callback = CALLBACKS.with(|callbacks| {
-        callbacks
-            .borrow()
-            .timer
-            .as_ref()
-            .map(|callback| v8::Local::new(scope, callback))
-    });
+    let callback = timer_callback(scope);
     if let Some(callback) = callback {
         let _ = callback.call(scope, v8::undefined(scope).into(), &[]);
     }
 }
 
 /// Runs the immediate callback `setupTimers` installed, if there is one.
-///
-/// Kept for callers that only want the side effects; a caller that needs to know
-/// whether anything ran should use [`run_immediates`].
 pub fn call_immediate_callback(scope: &mut v8::PinScope) {
-    let callback = CALLBACKS.with(|callbacks| {
-        callbacks
-            .borrow()
-            .immediate
-            .as_ref()
-            .map(|callback| v8::Local::new(scope, callback))
-    });
+    let callback = immediate_callback(scope);
     if let Some(callback) = callback {
         let _ = callback.call(scope, v8::undefined(scope).into(), &[]);
     }
-}
-
-/// Runs the timer callback `setupTimers` installed with `now_ms` as its
-/// argument, and returns what it reported.
-///
-/// `lib/internal/timers.js`'s `processTimers(now)` returns the deadline the loop
-/// should arm next, using libuv's sign convention:
-///
-/// * `0` — no timers left at all.
-/// * positive — the next deadline, with a ref'd timer behind it.
-/// * negative — the next deadline, but every timer is `unref()`'d.
-///
-/// The sign is folded into [`TimerRun`] here, at the one place that has to know
-/// it, so no caller can read `-0` or a negative deadline as a deadline in the
-/// past.
-///
-/// A callback that throws is caught here rather than left pending. A pending
-/// exception on the isolate is printed by V8's own default reporter — to stdout,
-/// with V8's formatting — which is neither Node's output nor Node's stream. The
-/// exception travels back to the caller as
-/// [`TimerRun::Threw`], which reports it the way Node does.
-pub fn run_timers(scope: &mut v8::PinScope, now_ms: f64) -> TimerRun {
-    let Some(callback) = timer_callback(scope) else {
-        return TimerRun::NotInstalled;
-    };
-    let argument = v8::Number::new(scope, now_ms).into();
-    match call_catching(scope, callback, &[argument]) {
-        Ok(Some(result)) => match result.number_value(scope) {
-            Some(value) if value < 0.0 => TimerRun::Next {
-                at_ms: -value,
-                refed: false,
-            },
-            Some(value) if value > 0.0 => TimerRun::Next {
-                at_ms: value,
-                refed: true,
-            },
-            _ => TimerRun::Idle,
-        },
-        // A callback that reported nothing at all is not an error: `processTimers`
-        // always returns a number, so this is the "the function was replaced"
-        // case and there is no deadline to arm.
-        Ok(None) => TimerRun::Idle,
-        Err(exception) => {
-            record_uncaught(scope, exception);
-            TimerRun::Threw
-        }
-    }
-}
-
-/// What running the timer phase found.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TimerRun {
-    /// `processTimers()` has not been installed; the phase cannot run.
-    NotInstalled,
-    /// The callback threw. The exception was formatted to stderr and the
-    /// process's exit was requested.
-    Threw,
-    /// No timer is pending.
-    Idle,
-    /// The next deadline, and whether a ref'd timer is behind it.
-    Next { at_ms: f64, refed: bool },
-}
-
-/// Runs the immediate callback `setupTimers` installed.
-///
-/// Returns whether a callback was installed, which is false during the bootstrap
-/// window before `internal/bootstrap/node.js` runs. A throw is caught and
-/// reported, for the same reason as in [`run_timers`].
-pub fn run_immediates(scope: &mut v8::PinScope) -> bool {
-    let Some(callback) = immediate_callback(scope) else {
-        return false;
-    };
-    if let Err(exception) = call_catching(scope, callback, &[]) {
-        record_uncaught(scope, exception);
-    }
-    true
 }
 
 /// Calls `callable`, turning a throw into `Err`.
@@ -545,8 +812,7 @@ pub fn immediate_ref_count() -> u32 {
 /// How many immediates are queued, ref'd or not.
 ///
 /// This is `immediateInfo[0]`, which `Immediate`'s constructor increments and
-/// `processImmediate()` decrements. The loop reads it to know that the check
-/// phase has work, which is why the poll phase must not block.
+/// `processImmediate()` decrements.
 pub fn immediate_count() -> u32 {
     INFO.with(|info| {
         info.borrow()
@@ -593,9 +859,9 @@ mod tests {
 
     #[test]
     fn the_clock_is_monotonic_milliseconds() {
-        let first = now_ms();
+        let first = wall_now_ms();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = now_ms();
+        let second = wall_now_ms();
         assert!(second >= first);
         // Milliseconds, not seconds: two milliseconds of sleep must show up.
         assert!(second - first >= 1.0, "the unit must be milliseconds");
@@ -609,5 +875,34 @@ mod tests {
         assert_eq!(IMMEDIATE_REF_COUNT, 1);
         assert_eq!(IMMEDIATE_HAS_OUTSTANDING, 2);
         assert_eq!(TIMEOUT_REF_COUNT, 0);
+    }
+
+    #[test]
+    fn the_timer_handle_is_created_once_and_keeps_its_address() {
+        // libuv stores the handle's address when it is initialised, so a handle
+        // that moved afterwards would corrupt the loop's timer heap.
+        let first = ensure_timer_handle().expect("the loop is creatable");
+        let second = ensure_timer_handle().expect("the loop is creatable");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn the_check_and_idle_handles_are_created_once_and_keep_their_addresses() {
+        let first = ensure_immediate_handles().expect("the loop is creatable");
+        let second = ensure_immediate_handles().expect("the loop is creatable");
+        assert_eq!(first, second);
+        // SAFETY: both are the live handles this module owns.
+        unsafe {
+            // Neither is active at init: the check handle is started by
+            // `toggleImmediateRef(true)` and the idle handle by the same call.
+            // An active handle at init would make every process refuse to exit,
+            // which is exactly the bug this test exists to catch.
+            assert_eq!(
+                uv::uv_is_active(first.0.cast()),
+                0,
+                "check starts on demand"
+            );
+            assert_eq!(uv::uv_is_active(first.1.cast()), 0, "idle starts on demand");
+        }
     }
 }

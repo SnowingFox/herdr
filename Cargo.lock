@@ -1069,10 +1069,12 @@ name = "rn-bind-timers"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "libuv-sys2",
  "rn-core",
  "rn-errors",
- "rn-io",
+ "rn-uv",
  "rn-v8-sys",
+ "tracing",
 ]
 
 [[package]]
@@ -1300,9 +1302,9 @@ dependencies = [
 name = "rn-io"
 version = "0.1.0"
 dependencies = [
- "libc",
- "thiserror",
- "tracing",
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
 ]
 
 [[package]]

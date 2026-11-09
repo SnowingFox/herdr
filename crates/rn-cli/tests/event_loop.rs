@@ -391,3 +391,43 @@ fn all_five_queues_drain_in_node_order_from_one_script() {
     );
     assert_eq!(printed, "a\nb\ntick\nthen\nmicro\nimm\ntimer\n");
 }
+
+#[test]
+fn a_tcp_echo_round_trip_completes() {
+    // The regression the libuv loop exists for. A `TCP` handle lives on libuv's
+    // loop, so nothing about it works unless that loop is the one being pumped:
+    // `listen()` reported a port because it is synchronous enough, but no accept
+    // and no connect ever happened. Measured against real `node`, which prints
+    // `got hi`.
+    let printed = same_as_node(
+        "const s=require('net').createServer(c=>{c.end('hi'); s.close()});\n\
+         s.listen(0,()=>{const p=s.address().port;\n\
+           const c=net.connect(p,()=>{});\n\
+           c.on('data',d=>{console.log('got',d.toString()); c.end()})});",
+    );
+    assert_eq!(printed, "got hi\n");
+}
+
+#[test]
+fn a_udp_datagram_reaches_its_own_socket() {
+    // `dgram` is the second handle family: `send()` called back because the send
+    // completion was already runnable, while `on('message')` never fired because
+    // the receive side needed the loop pumped.
+    let printed = same_as_node(
+        "const d=require('dgram'); const s=d.createSocket('udp4');\n\
+         s.on('message',m=>{console.log('RECV',m.toString()); s.close()});\n\
+         s.bind(0,'127.0.0.1',()=>s.send('ping',s.address().port,'127.0.0.1'))",
+    );
+    assert_eq!(printed, "RECV ping\n");
+}
+
+#[test]
+fn a_spawned_child_reports_its_exit_event() {
+    // `process_wrap`'s exit callback is a libuv one, so the `exit` event is the
+    // third handle family that only fires on the pumped loop. A pid came back
+    // from `spawn()` before, which made the missing event easy to miss.
+    let printed = same_as_node(
+        "require('child_process').spawn('sh',['-c','exit 7']).on('exit',c=>console.log('exit',c))",
+    );
+    assert_eq!(printed, "exit 7\n");
+}

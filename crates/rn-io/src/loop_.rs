@@ -1,287 +1,178 @@
-//! The event loop: phases, the poller under them, and when the loop stops.
+//! The event loop: libuv's loop, driven one iteration at a time.
 //!
-//! Node's order is libuv's `uv_run` order, with a microtask drain after each
-//! phase because V8's microtask queue is drained by the embedder:
+//! Node's event loop *is* libuv's. `uv_run` runs pending, idle, prepare, poll,
+//! check, close and timers in that order, and Node adds a microtask checkpoint
+//! after every JavaScript callback. rustnode therefore does not reimplement the
+//! phase order: [`Loop::run`] calls `uv_run(UV_RUN_ONCE)` in a loop and drains
+//! ticks between the iterations.
 //!
-//! 1. **timers** — every timer whose deadline has passed.
-//! 2. **pending callbacks** — deferred I/O callbacks from the previous turn.
-//! 3. **poll** — wait for readiness, up to the next timer deadline.
-//! 4. **check** — `setImmediate` callbacks.
-//! 5. **close callbacks** — handles being torn down.
+//! # Why `UV_RUN_ONCE` and not `UV_RUN_DEFAULT`
 //!
-//! `lib/internal/process/task_queues.js` documents the drain points: ticks and
-//! microtasks run between every pair of those, which is why `setTimeout(f, 0)`
-//! reports after a `queueMicrotask()` scheduled in the script body and before
-//! the process exits.
+//! `UV_RUN_DEFAULT` runs the whole loop inside one C call, so nothing in Rust
+//! regains control between two iterations and a `process.nextTick` queued by one
+//! phase could only run once the process had done everything else. `UV_RUN_ONCE`
+//! runs exactly one iteration — blocking in poll until a descriptor is ready or
+//! the earliest libuv timer is due — and returns, which is where the drain goes.
 //!
-//! # When the loop stops
+//! How long that wait is, is libuv's decision: `uv__backend_timeout` is zero
+//! whenever a pending callback, an idle handle, a closing handle or a child
+//! process needs attention, and the next timer deadline otherwise, ignoring
+//! unref'd timers. A scheduler that computed its own timeout would have to
+//! reproduce that rule, and the case it got wrong is exactly the bug this
+//! replaces: the old loop slept in its own `poll(2)` for a deadline no handle
+//! owned.
 //!
-//! libuv's rule is `uv__loop_alive()`: a turn runs while a *ref'd* handle is
-//! active, and only ref'd work lets the poll phase block. An `unref()`'d handle
-//! is therefore work the loop will run if it is already due, but never work it
-//! waits for. Measured against a real `node`, `setTimeout(f, 1).unref()` on its
-//! own exits in 0.1ms without calling `f`.
+//! # Who owns what
 //!
-//! The one allowance is a final turn for a deadline that has already passed by
-//! the end of a turn: libuv runs due timers before deciding the loop is dead, so
-//! an unref'd timer that became due during a turn kept alive by something else
-//! still fires.
-//!
-//! # Why this is not libuv FFI
-//!
-//! `Backend::Libuv` names the ordering contract, not a link against libuv. Two
-//! facts decided it:
-//!
-//! * The workspace links no C library: `rn-bind-uv` reproduces libuv's error
-//!   strings from a table for the same reason, and libuv would have to be built
-//!   and shipped per platform alongside the binary.
-//! * The phases are not libuv's hard part. What Node's tests assert is that a
-//!   timer due at 41 ms runs after one due at 40 ms, that an immediate runs
-//!   before a timer created in the same turn, and that `unref()` decides exit.
-//!   Those are the ordering rules below, and they are testable without a
-//!   syscall.
-//!
-//! The poller under them is `poll(2)`, the same readiness primitive `epoll`
-//! wraps for the handle counts a single-threaded runtime has, reached through
-//! `libc` so no new dependency appears. `Backend::IoUring` stays unimplemented
-//! and [`Loop::new`] rejects it instead of pretending.
+//! * `rn-uv` owns the `uv_loop_t` and every handle on it.
+//! * `rn-bind-timers` owns the loop's timer, check and idle handles, because
+//!   their callbacks run `internal/timers.js`'s `processTimers` and
+//!   `processImmediate` and so need a V8 scope. That is the same split Node has
+//!   between `TimerWrap`/`Environment` and `lib/internal/timers.js`.
+//! * This crate owns *when* the loop runs and the drain between iterations.
+//! * `rn-cli` implements [`Scheduler`] over V8.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::time::Duration;
-
-use crate::backend::{Backend, LoopHandle, WakeupState};
-use crate::poll::Poller;
-
-/// One of the loop's phases, in the order they run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Phase {
-    Timers,
-    Pending,
-    Poll,
-    Check,
-    Close,
-}
-
-impl Phase {
-    /// The phases in the order one loop turn runs them.
-    pub const ORDER: [Phase; 5] = [
-        Phase::Timers,
-        Phase::Pending,
-        Phase::Poll,
-        Phase::Check,
-        Phase::Close,
-    ];
-}
+pub use crate::backend::Backend;
 
 /// What the loop needs from the runtime it is driving.
 ///
-/// The loop knows nothing about V8 or timers; it asks these questions and runs
-/// them. That keeps the ordering testable without an isolate, which is what lets
-/// a unit test pin the phase order while the behaviour those phases exist for is
-/// checked against a real `node` binary by the CLI's integration tests.
+/// The phases themselves belong to libuv; the two things it cannot answer are
+/// "drain the JavaScript queues" and "did the script ask to exit", which is what
+/// this trait is for. Keeping it this narrow is deliberate: a scheduler that also
+/// reported deadlines and ref counts would be a second loop again, and the two
+/// would disagree about which deadline is real.
 pub trait Scheduler {
-    /// Runs every timer whose deadline has passed at `now_ms`, and records what
-    /// is pending for [`next_deadline`](Self::next_deadline).
-    fn run_timers(&mut self, now_ms: f64);
-
-    /// Runs the deferred I/O callbacks queued for the previous turn.
-    fn run_pending(&mut self);
-
-    /// Waits for readiness on `poller`, at most `timeout`.
+    /// Drains `process.nextTick` and V8's microtask queue.
     ///
-    /// `Some(Duration::ZERO)` means "check and return", which the loop asks for
-    /// whenever a callback is already runnable or nothing is ref'd: blocking
-    /// there would delay work that does not depend on I/O, or wait for a timer
-    /// the process is not being kept alive for.
-    fn poll(&mut self, poller: &mut Poller, timeout: Option<Duration>);
-
-    /// Runs every queued `setImmediate` callback.
-    fn run_immediates(&mut self);
-
-    /// Runs close callbacks, the last JavaScript in a turn.
-    fn run_close(&mut self);
-
-    /// Drains ticks and V8 microtasks.
-    ///
-    /// Called between phases, never inside one, matching
-    /// `lib/internal/process/task_queues.js`'s `runNextTicks()`.
+    /// Called between loop iterations, never inside one, so a callback that
+    /// queues a microtask cannot have it run before the libuv callback that
+    /// queued it returns. `lib/internal/process/task_queues.js` is what actually
+    /// drains; this only gives it the chance.
     fn drain(&mut self);
 
-    /// The next timer deadline, as the last timer phase reported it.
-    fn next_deadline(&self) -> Option<f64>;
-
-    /// Whether a ref'd timer, ref'd immediate or pending tick is outstanding.
+    /// Whether the process has asked to exit, e.g. through `process.exit()`.
     ///
-    /// This decides whether the loop runs another turn: only ref'd work keeps
-    /// the process alive.
-    fn has_refed_work(&self) -> bool;
-
-    /// Whether a callback is queued for the check phase.
-    ///
-    /// The poll phase must not block while one is: the check phase runs the
-    /// moment poll returns, and the immediate is already runnable.
-    fn has_pending_immediates(&self) -> bool;
-
-    /// Whether a timer deadline that keeps the process alive is armed.
-    ///
-    /// Distinct from [`has_refed_work`](Self::has_refed_work) because a ref'd
-    /// immediate keeps the loop turning but must not make poll wait: an
-    /// `unref()`'d timer next to a ref'd `setImmediate` exits without firing in
-    /// Node, so a pending immediate must not lend its ref to the deadline.
-    fn has_refed_deadline(&self) -> bool;
-
-    /// Whether the process has asked to exit, e.g. an uncaught exception or
-    /// `process.exit()`.
+    /// An uncaught exception is not reported here: it sets the shared
+    /// [`rn_core::hook_slot::EXIT_REQUESTED`] flag from inside the callback that
+    /// threw, where no scheduler is borrowed, and [`Loop::run`] reads that flag
+    /// itself.
     fn exit_requested(&self) -> bool;
 
-    /// The loop's monotonic millisecond clock.
-    fn now_ms(&self) -> f64;
+    /// Whether work outside libuv still keeps the process alive.
+    ///
+    /// libuv only knows about handles. A `MessagePort` keeps itself alive in
+    /// Rust (`rn_bind_messaging::has_work`), so without this the loop would exit
+    /// with a port still listening, which Node does not do. The default is
+    /// "nothing", so a scheduler that owns no such work says nothing.
+    fn has_external_work(&self) -> bool {
+        false
+    }
 }
 
-/// A loop over a [`Scheduler`].
+/// A loop over libuv.
 #[derive(Debug)]
 pub struct Loop {
     backend: Backend,
-    handle: LoopHandle,
-    poller: Poller,
 }
 
 impl Loop {
     /// Builds a loop for `backend`, or explains why that backend cannot run.
     pub fn new(backend: Backend) -> Result<Self, String> {
         match backend {
-            Backend::Libuv => {}
+            Backend::Libuv => {
+                // Creating the loop here rather than lazily on first use means a
+                // failure to create it reaches the caller that asked for a loop,
+                // instead of surfacing later as an I/O binding that silently
+                // does nothing.
+                if rn_uv::uv_loop::loop_ptr().is_none() {
+                    return Err("the libuv loop could not be created".to_string());
+                }
+            }
             Backend::IoUring => {
                 return Err(
-                    "the io_uring backend is not implemented; use the default libuv ordering"
+                    "the io_uring backend is not implemented; use the default libuv loop"
                         .to_string(),
                 )
             }
         }
-        let poller = Poller::new()?;
-        let wakeups = Rc::new(RefCell::new(WakeupState::default()));
-        let handle = LoopHandle::new(backend, wakeups);
-        Ok(Self {
-            backend,
-            handle,
-            poller,
-        })
+        Ok(Self { backend })
     }
 
     pub fn backend(&self) -> Backend {
         self.backend
     }
 
-    /// A handle other code can use to arm this loop.
-    pub fn handle(&self) -> LoopHandle {
-        self.handle.clone()
-    }
-
-    /// Runs one turn of the loop.
+    /// Runs one iteration of the libuv loop, then drains ticks.
     ///
-    /// Returns whether another turn is warranted. `false` means nothing is left
-    /// to run, so the caller may exit.
+    /// Returns whether libuv still has referenced work. `false` means nothing is
+    /// left that could keep the process alive, so the caller may exit.
+    ///
+    /// The iteration blocks in poll until a descriptor is ready or the earliest
+    /// libuv timer is due, which is what makes `setTimeout(f, 20)` cost 20ms of
+    /// sleep rather than 20ms of spinning. It does not block at all when libuv
+    /// has a callback that is already runnable, because `uv__backend_timeout`
+    /// reports zero then.
     pub fn tick<S: Scheduler>(&mut self, scheduler: &mut S) -> bool {
-        for phase in Phase::ORDER {
-            if scheduler.exit_requested() {
+        // Nothing is alive, so libuv would return without running an iteration.
+        // Taking that answer from libuv rather than deciding it here is what
+        // makes `unref()` mean what it means: one iteration is long enough for a
+        // 1ms deadline to become due, so an unref'd timer that the loop never
+        // enters for is a timer Node never calls.
+        //
+        // Work that keeps itself alive outside libuv still needs the iteration,
+        // so it counts here too. The check phase is what drains it, and that
+        // phase runs whether or not libuv has a ref'd handle of its own.
+        if !rn_uv::uv_loop::is_active() {
+            if !scheduler.has_external_work() {
                 return false;
             }
-            match phase {
-                Phase::Timers => {
-                    let now = scheduler.now_ms();
-                    // Drop the arm this turn is about to honour before running
-                    // timers, so the deadline the phase reports is the only one
-                    // left and a superseded arm cannot resurface.
-                    let _ = self.handle.clear_due(now);
-                    scheduler.run_timers(now);
-                    // The timer phase is the only thing that knows what to wait
-                    // for, so the deadline is re-armed from what it reported
-                    // rather than from whatever was armed before it ran.
-                    match scheduler.next_deadline() {
-                        Some(at) => self.handle.wake_at(at),
-                        None => self.handle.cancel_wakeup(),
-                    }
-                }
-                Phase::Pending => scheduler.run_pending(),
-                Phase::Poll => {
-                    let timeout = self.poll_timeout(scheduler);
-                    scheduler.poll(&mut self.poller, timeout);
-                }
-                Phase::Check => scheduler.run_immediates(),
-                Phase::Close => scheduler.run_close(),
-            }
+            // A loop libuv calls dead never blocks in poll, so this iteration
+            // runs the check phase and returns rather than waiting.
+            let _ = rn_uv::uv_loop::run_once();
             scheduler.drain();
+            return rn_uv::uv_loop::is_active() || scheduler.has_external_work();
         }
-
-        if scheduler.exit_requested() {
-            return false;
-        }
-        if scheduler.has_refed_work() {
-            return true;
-        }
-        // Nothing ref'd is left, but a deadline that has already arrived gets a
-        // final turn: `setTimeout(f, 4).unref()` next to a `setImmediate(g)`
-        // fires `f` in Node, because the deadline passed while `g` kept the loop
-        // turning, and libuv runs due timers before deciding the loop is dead.
-        // A deadline still in the future gets nothing, which is what makes the
-        // same test with a 5ms timer print only `g`.
-        scheduler
-            .next_deadline()
-            .is_some_and(|deadline| deadline <= scheduler.now_ms())
+        let _ = rn_uv::uv_loop::run_once_blocking();
+        scheduler.drain();
+        rn_uv::uv_loop::is_active() || scheduler.has_external_work()
     }
 
-    /// Runs turns until nothing is left, up to `turn_limit`.
+    /// Runs iterations until nothing is left, up to `turn_limit`.
     ///
-    /// The limit guards against a scheduler that never settles. The runtime
+    /// The limit guards against a program that keeps libuv alive forever without
+    /// ever exiting, which only a test should have to care about. The runtime
     /// passes [`u32::MAX`] because a real program is allowed to run forever;
     /// tests use a small number so a bug fails instead of hanging.
     pub fn run<S: Scheduler>(&mut self, scheduler: &mut S, turn_limit: u32) -> StopReason {
-        // libuv checks `uv__loop_alive()` before the first iteration and does
-        // not run a turn at all when nothing is ref'd. That first check is
-        // load-bearing: without it the loop would run one turn for an
-        // `unref()`'d timer, and a turn is long enough for a 1ms deadline to
-        // arrive, so the timer would fire when Node never calls it.
         if scheduler.exit_requested() {
             return StopReason::ExitRequested;
         }
-        if !scheduler.has_refed_work() {
-            return StopReason::Idle;
-        }
         for _ in 0..turn_limit {
             if !self.tick(scheduler) {
-                return if scheduler.exit_requested() {
+                return if scheduler.exit_requested() || rn_core_exit_requested() {
                     StopReason::ExitRequested
                 } else {
                     StopReason::Idle
                 };
             }
+            // An uncaught exception aborts the process the way Node does: the
+            // error is already printed by the callback that threw, so the loop
+            // stops here rather than running the rest of the program.
+            if scheduler.exit_requested() || rn_core_exit_requested() {
+                return StopReason::ExitRequested;
+            }
         }
         StopReason::TurnLimit
     }
+}
 
-    /// How long the poll phase may block.
-    fn poll_timeout<S: Scheduler>(&self, scheduler: &S) -> Option<Duration> {
-        // Nothing to wait for when a callback is already runnable. The check
-        // phase runs straight after poll, so blocking here would delay an
-        // immediate that does not depend on I/O at all.
-        if scheduler.has_pending_immediates() {
-            return Some(Duration::ZERO);
-        }
-        // `None` is "wait until a descriptor is ready". With no deadline armed
-        // and no descriptor registered, that wait could only end at process
-        // death, so every path that cannot name a duration returns zero.
-        if !scheduler.has_refed_deadline() {
-            return Some(Duration::ZERO);
-        }
-        let Some(deadline) = scheduler.next_deadline() else {
-            return Some(Duration::ZERO);
-        };
-        let delay = (deadline - scheduler.now_ms()).max(0.0);
-        // libuv rounds the timeout up so a 1ms timer cannot return early and
-        // then have to spin for the fractional remainder.
-        Some(Duration::from_millis(delay.ceil() as u64))
-    }
+/// Whether an uncaught exception already asked the process to exit.
+///
+/// `rn-errors` raises this from inside the `TryCatch` that caught the throw,
+/// where no scheduler is in scope, so it has to be read separately from
+/// [`Scheduler::exit_requested`].
+fn rn_core_exit_requested() -> bool {
+    rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED)
 }
 
 /// Why [`Loop::run`] returned.
@@ -298,74 +189,101 @@ pub enum StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use std::cell::Cell;
+    use std::pin::Pin;
+    use std::rc::Rc;
 
-    /// A scheduler that records the order its phases ran in.
+    /// A scheduler that counts drains and can ask to exit.
     #[derive(Default)]
-    struct Recorder {
-        log: Vec<&'static str>,
-        /// What each `run_timers` call reports as the next deadline.
-        deadlines: VecDeque<Option<f64>>,
-        next: Option<f64>,
-        now: f64,
-        refed: bool,
-        immediates: bool,
+    struct Counter {
+        drains: Cell<u32>,
         exit: bool,
     }
 
-    impl Scheduler for Recorder {
-        fn run_timers(&mut self, _now_ms: f64) {
-            self.log.push("timers");
-            self.next = self.deadlines.pop_front().flatten();
-        }
-        fn run_pending(&mut self) {
-            self.log.push("pending");
-        }
-        fn poll(&mut self, _poller: &mut Poller, timeout: Option<Duration>) {
-            self.log.push("poll");
-            let _ = timeout;
-        }
-        fn run_immediates(&mut self) {
-            self.log.push("check");
-        }
-        fn run_close(&mut self) {
-            self.log.push("close");
-        }
+    impl Scheduler for Counter {
         fn drain(&mut self) {
-            self.log.push("drain");
+            self.drains.set(self.drains.get() + 1);
         }
-        fn next_deadline(&self) -> Option<f64> {
-            self.next
-        }
-        fn has_refed_work(&self) -> bool {
-            self.refed
-        }
-        fn has_pending_immediates(&self) -> bool {
-            self.immediates
-        }
-        fn has_refed_deadline(&self) -> bool {
-            self.refed
-        }
+
         fn exit_requested(&self) -> bool {
             self.exit
         }
-        fn now_ms(&self) -> f64 {
-            self.now
+    }
+
+    /// A timer handle that outlives the test body but can be closed on demand.
+    ///
+    /// libuv requires a handle not to move once `uv_timer_init` has run, so it is
+    /// allocated first and initialised where it sits.
+    struct TestTimer {
+        handle: Pin<Box<libuv_sys2::uv_timer_t>>,
+        fired: Rc<Cell<u32>>,
+        rearm: bool,
+    }
+
+    impl TestTimer {
+        fn new(rearm: bool) -> Box<Self> {
+            let pointer = rn_uv::uv_loop::loop_ptr().expect("the loop exists");
+            let mut handle = Box::pin(std::mem::MaybeUninit::<libuv_sys2::uv_timer_t>::zeroed());
+            // SAFETY: `handle` points at a live, aligned, zeroed slot and
+            // `pointer` is the process' live loop.
+            let status = unsafe { libuv_sys2::uv_timer_init(pointer, handle.as_mut_ptr()) };
+            assert_eq!(status, 0, "uv_timer_init must succeed");
+            // SAFETY: `uv_timer_init` succeeded, so the handle is initialised.
+            let handle: Pin<Box<libuv_sys2::uv_timer_t>> =
+                Box::pin(unsafe { handle.assume_init() });
+            let test = Box::new(Self {
+                handle,
+                fired: Rc::new(Cell::new(0)),
+                rearm,
+            });
+            // SAFETY: the handle is live and outlives the loop run, and `data`
+            // holds a pointer to the test box, which the caller keeps alive.
+            unsafe {
+                (*std::ptr::from_ref(&*test.handle).cast_mut()).data =
+                    std::ptr::from_ref(&*test).cast_mut().cast();
+            }
+            test
+        }
+
+        fn start(&mut self, delay: u64) {
+            // SAFETY: the handle is live.
+            let status = unsafe {
+                libuv_sys2::uv_timer_start(
+                    std::ptr::from_ref(&*self.handle).cast_mut(),
+                    Some(on_timer),
+                    delay,
+                    0,
+                )
+            };
+            assert_eq!(status, 0, "uv_timer_start must succeed");
+        }
+
+        fn close(&mut self) {
+            // SAFETY: the handle is live and no run is in progress.
+            unsafe {
+                libuv_sys2::uv_timer_stop(std::ptr::from_ref(&*self.handle).cast_mut());
+                libuv_sys2::uv_close(std::ptr::from_ref(&*self.handle).cast_mut().cast(), None);
+            }
         }
     }
 
-    #[test]
-    fn one_turn_runs_the_phases_in_node_order_with_a_drain_between_each() {
-        let mut scheduler = Recorder::default();
-        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        let _ = event_loop.tick(&mut scheduler);
-        assert_eq!(
-            scheduler.log,
-            [
-                "timers", "drain", "pending", "drain", "poll", "drain", "check", "drain", "close",
-                "drain"
-            ]
-        );
+    /// # Safety
+    ///
+    /// Called by libuv with a handle whose `data` is a `*mut TestTimer`.
+    unsafe extern "C" fn on_timer(handle: *mut libuv_sys2::uv_timer_t) {
+        // SAFETY: the handle's `data` is the test that initialised it, which is
+        // alive for the whole run.
+        let Some(test) = (unsafe { rn_uv::uv_loop::handle_data::<TestTimer>(handle.cast()) })
+        else {
+            return;
+        };
+        // SAFETY: `test` came from the live box that owns the handle.
+        let test = unsafe { &mut *test };
+        test.fired.set(test.fired.get() + 1);
+        if test.rearm {
+            // SAFETY: the handle is live.
+            unsafe { libuv_sys2::uv_timer_start(handle, Some(on_timer), 0, 0) };
+        }
     }
 
     #[test]
@@ -377,203 +295,88 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_with_nothing_refed_stops_the_loop() {
-        let mut scheduler = Recorder::default();
-        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        assert_eq!(
-            event_loop.run(&mut scheduler, 10),
-            StopReason::Idle,
-            "a scheduler with nothing outstanding must not spin"
-        );
-        assert!(
-            scheduler.log.is_empty(),
-            "libuv runs no turn at all when nothing is ref'd"
-        );
+    fn the_libuv_backend_creates_the_process_loop() {
+        let event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
+        assert_eq!(event_loop.backend(), Backend::Libuv);
+        assert!(rn_uv::uv_loop::is_initialised());
+        assert!(!rn_uv::uv_loop::is_active(), "an idle loop is not alive");
     }
 
     #[test]
-    fn refed_work_keeps_the_loop_running_until_it_is_gone() {
-        let mut scheduler = Recorder {
-            refed: true,
-            ..Recorder::default()
-        };
+    fn a_run_with_nothing_refed_runs_no_turn() {
+        // `setTimeout(f, 1).unref()` on its own exits in 0.1ms under real `node`
+        // without calling `f`, even though a millisecond may already have passed
+        // by the time the loop starts. The entry check is what guarantees that.
+        let mut scheduler = Counter::default();
         let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        assert!(event_loop.tick(&mut scheduler));
-        scheduler.refed = false;
         assert_eq!(event_loop.run(&mut scheduler, 10), StopReason::Idle);
+        assert_eq!(scheduler.drains.get(), 0, "no turn ran for unref'd work");
     }
 
     #[test]
-    fn an_exit_request_stops_before_the_next_phase() {
-        let mut scheduler = Recorder {
+    fn an_exit_request_stops_before_any_turn() {
+        let mut scheduler = Counter {
             exit: true,
-            ..Recorder::default()
+            ..Counter::default()
         };
         let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        assert!(!event_loop.tick(&mut scheduler));
         assert_eq!(
             event_loop.run(&mut scheduler, 10),
             StopReason::ExitRequested,
             "`run` reports the exit request even when it stops before a turn"
         );
-        assert!(
-            scheduler.log.is_empty(),
-            "no phase runs after an exit request"
-        );
+        assert_eq!(scheduler.drains.get(), 0);
     }
 
     #[test]
-    fn the_turn_limit_bounds_a_scheduler_that_never_settles() {
-        let mut scheduler = Recorder {
-            refed: true,
-            ..Recorder::default()
-        };
+    fn a_timer_is_a_libuv_timer_and_its_callback_runs_inside_the_loop() {
+        // The whole point of the move: a deadline armed on libuv's own handle is
+        // honoured by `uv_run`, with no scheduler-side deadline bookkeeping.
+        let mut timer = TestTimer::new(false);
+        timer.start(1);
+        let fired = Rc::clone(&timer.fired);
+        let mut scheduler = Counter::default();
+        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
+        assert_eq!(event_loop.run(&mut scheduler, 100), StopReason::Idle);
+        assert_eq!(fired.get(), 1, "the libuv timer fired exactly once");
+        timer.close();
+        let _ = rn_uv::uv_loop::run_once();
+    }
+
+    #[test]
+    fn the_turn_limit_bounds_a_loop_that_never_settles() {
+        // A timer re-armed from its own callback is work that never ends, which
+        // is the case the turn limit exists for.
+        let mut timer = TestTimer::new(true);
+        timer.start(0);
+        let fired = Rc::clone(&timer.fired);
+        let mut scheduler = Counter::default();
         let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
         assert_eq!(event_loop.run(&mut scheduler, 3), StopReason::TurnLimit);
+        assert!(scheduler.drains.get() >= 3, "each turn drains once");
+        assert!(fired.get() >= 3, "the timer fired each turn");
+        timer.close();
+        let _ = rn_uv::uv_loop::run_once();
     }
 
     #[test]
-    fn a_timer_deadline_becomes_the_poll_timeout() {
-        let mut scheduler = Recorder {
-            now: 1000.0,
-            refed: true,
-            ..Recorder::default()
-        };
-        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        scheduler.deadlines.push_back(Some(1042.0));
-        let _ = event_loop.tick(&mut scheduler);
-        assert_eq!(
-            event_loop.poll_timeout(&scheduler),
-            Some(Duration::from_millis(42)),
-            "the poll must wait until the next deadline, not longer"
-        );
-    }
+    fn an_unrefed_timer_does_not_start_a_run_but_fires_once_refed_work_arrives() {
+        // The measured `node` behaviour: an unref'd 1ms timer alone exits in
+        // 0.1ms without firing, and the same timer next to a ref'd immediate
+        // fires, because the deadline passed while the immediate kept the loop
+        // turning.
+        let mut timer = TestTimer::new(false);
+        timer.start(1);
+        // SAFETY: the handle is live.
+        unsafe { libuv_sys2::uv_unref(std::ptr::from_ref(&*timer.handle).cast_mut().cast()) };
+        assert!(!rn_uv::uv_loop::is_active(), "an unref'd timer is not work");
 
-    #[test]
-    fn a_fractional_deadline_rounds_up_so_polling_cannot_spin() {
-        let mut scheduler = Recorder {
-            now: 10.25,
-            refed: true,
-            ..Recorder::default()
-        };
-        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        scheduler.deadlines.push_back(Some(10.5));
-        let _ = event_loop.tick(&mut scheduler);
-        assert_eq!(
-            event_loop.poll_timeout(&scheduler),
-            Some(Duration::from_millis(1))
-        );
-    }
-
-    #[test]
-    fn a_turn_without_a_deadline_does_not_block() {
-        let scheduler = Recorder {
-            now: 5.0,
-            refed: true,
-            ..Recorder::default()
-        };
-        let event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        assert_eq!(event_loop.poll_timeout(&scheduler), Some(Duration::ZERO));
-    }
-
-    #[test]
-    fn an_unrefed_timer_never_lets_the_poll_block() {
-        // `setTimeout(f, 1).unref()` makes the loop run one more turn but must
-        // not make it sit waiting for the deadline.
-        let mut scheduler = Recorder {
-            refed: false,
-            ..Recorder::default()
-        };
-        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        scheduler.deadlines.push_back(Some(5.0));
-        let _ = event_loop.tick(&mut scheduler);
-        assert_eq!(event_loop.poll_timeout(&scheduler), Some(Duration::ZERO));
-    }
-
-    #[test]
-    fn an_unrefed_timer_that_is_not_due_stops_the_loop() {
-        // Measured from `node`: `setTimeout(f, 1).unref()` on its own exits in
-        // 0.1ms without calling `f`, so a deadline in the future is not work.
-        let mut scheduler = Recorder {
-            now: 0.0,
-            ..Recorder::default()
-        };
-        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        scheduler.deadlines.push_back(Some(50.0));
-        assert!(!event_loop.tick(&mut scheduler));
-        assert_eq!(
-            scheduler
-                .log
-                .iter()
-                .filter(|line| **line == "timers")
-                .count(),
-            1,
-            "the turn ran, and then the loop stopped rather than waiting"
-        );
-    }
-
-    #[test]
-    fn an_unrefed_timer_never_starts_a_run_even_when_it_is_due() {
-        // Measured from `node`: `setTimeout(f, 1).unref()` on its own exits in
-        // 0.1ms without calling `f`, even though a millisecond may already have
-        // passed by the time the loop starts. The entry check is what guarantees
-        // that, because a turn is long enough for a short deadline to arrive.
-        let mut scheduler = Recorder {
-            now: 10.0,
-            ..Recorder::default()
-        };
-        scheduler.deadlines.push_back(Some(10.0));
+        let mut scheduler = Counter::default();
         let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
         assert_eq!(event_loop.run(&mut scheduler, 10), StopReason::Idle);
-        assert!(scheduler.log.is_empty(), "no turn ran for unref'd work");
-    }
+        assert_eq!(timer.fired.get(), 0, "the unref'd timer never ran");
 
-    #[test]
-    fn a_deadline_that_arrived_during_a_live_turn_gets_a_final_one() {
-        // Measured from `node`: `setTimeout(f, 4).unref()` next to a
-        // `setImmediate(g)` fires `f`, because the deadline passed while `g`
-        // kept the loop turning. The reverse — a 5ms deadline — does not fire,
-        // and that is the `is_some_and` comparison below.
-        let mut scheduler = Recorder {
-            now: 10.0,
-            ..Recorder::default()
-        };
-        scheduler.deadlines.push_back(Some(10.0));
-        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        assert!(event_loop.tick(&mut scheduler), "a due deadline runs again");
-        scheduler.deadlines.push_back(None);
-        assert!(!event_loop.tick(&mut scheduler), "and then the loop stops");
-    }
-
-    #[test]
-    fn a_deadline_still_in_the_future_gets_no_final_turn() {
-        // The 5ms case: an active deadline that is not due and not ref'd is
-        // where the loop stops, which is what keeps an `unref()`'d interval from
-        // pinning the process.
-        let mut scheduler = Recorder {
-            now: 0.0,
-            refed: true,
-            ..Recorder::default()
-        };
-        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        scheduler.deadlines.push_back(Some(50.0));
-        assert!(event_loop.tick(&mut scheduler), "refed work keeps turning");
-        // The work went away and left only a deadline half a turn in the future.
-        scheduler.refed = false;
-        assert!(!event_loop.tick(&mut scheduler));
-    }
-
-    #[test]
-    fn a_pending_tick_keeps_the_loop_alive_without_a_timer() {
-        // `process.nextTick` on its own is ref'd work: Node runs the tick and
-        // then exits, and the loop must not stop before the tick runs.
-        let mut scheduler = Recorder {
-            refed: true,
-            ..Recorder::default()
-        };
-        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
-        assert!(event_loop.tick(&mut scheduler));
-        scheduler.refed = false;
-        assert_eq!(event_loop.run(&mut scheduler, 10), StopReason::Idle);
+        timer.close();
+        let _ = rn_uv::uv_loop::run_once();
     }
 }

@@ -215,6 +215,16 @@ impl Drop for Allocation {
 /// any other negative value for an error. The two values JS reads are published
 /// to the shared `streamBaseState` first, because `onStreamRead` reads them
 /// before it looks at its argument.
+///
+/// # Why `onread` is read from the object, not stored on the state
+///
+/// `Node`'s `StreamResource::EmitRead` does `owner_object()->Get(onread)`, and
+/// that matters: `lib/net.js` assigns `handle.onread` after the handle exists
+/// (`Socket.prototype._handle.onread = onStreamRead`) and replaces it with
+/// `noop` when the socket is paused, so the property is the only authoritative
+/// value. A copy taken at construction time would go stale the first time a
+/// socket was paused, and a copy taken at `readStart` would miss a later
+/// assignment.
 pub fn deliver_read(
     state: &mut StreamState,
     stream_base_state: &rn_core::AliasedUint8Array,
@@ -226,7 +236,7 @@ pub fn deliver_read(
         // `handle.bytesRead` is already up to date inside `onread`.
         state.bytes_read += status as u64;
     }
-    let Some(on_read) = state.on_read.clone() else {
+    let Some(owner) = state.owner_object.clone() else {
         return;
     };
 
@@ -238,10 +248,13 @@ pub fn deliver_read(
         stream_base_state.set(K_ARRAY_BUFFER_OFFSET, 0);
 
         callback::with_context(|scope| {
+            let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
+            let Some(handler) = onread_of(scope, object) else {
+                return;
+            };
             let buffer = allocation.into_array_buffer(scope);
             let argument: v8::Local<v8::Value> = buffer.into();
-            let handler: v8::Local<v8::Function> = v8::Local::new(scope, &on_read);
-            let receiver: v8::Local<v8::Value> = v8::undefined(&**scope).into();
+            let receiver: v8::Local<v8::Value> = object.into();
             let _ = handler.call(&*scope, receiver, &[argument]);
         });
         return;
@@ -255,7 +268,27 @@ pub fn deliver_read(
 
     stream_base_state.set(K_READ_BYTES_OR_ERROR, status as u32);
     stream_base_state.set(K_ARRAY_BUFFER_OFFSET, 0);
-    callback::call(&on_read, None, &[]);
+    callback::with_context(|scope| {
+        let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
+        let Some(handler) = onread_of(scope, object) else {
+            return;
+        };
+        let receiver: v8::Local<v8::Value> = object.into();
+        let _ = handler.call(&*scope, receiver, &[]);
+    });
+}
+
+/// Reads the `onread` function off a stream handle object.
+///
+/// Returns `None` when the property is missing or not callable, which is the
+/// state a handle is in before JavaScript attaches its listener.
+fn onread_of<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let key = v8::String::new(scope, "onread")?;
+    let value = object.get(scope, key.into())?;
+    v8::Local::<v8::Function>::try_from(value).ok()
 }
 
 /// Casts a typed handle pointer to the `uv_handle_t` libuv's generic calls want.

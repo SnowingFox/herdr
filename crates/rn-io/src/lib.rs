@@ -1,60 +1,33 @@
-//! Event loop. The first backend keeps libuv semantics so Node's timer and
-//! handle ordering tests pass; io_uring replaces the poller later without
-//! changing this interface.
+//! The event loop rustnode runs on, and when to run it.
 //!
-//! The loop is deliberately split in two:
+//! There is one loop in this runtime and it is libuv's, owned by `crates/rn-uv`.
+//! This crate is the part that decides when it runs: one `uv_run(UV_RUN_ONCE)`
+//! iteration at a time, with a `process.nextTick` and microtask drain between
+//! iterations.
 //!
-//! * [`Loop`] owns the phase order and the poller. It is pure bookkeeping and
-//!   testable without a JavaScript engine.
-//! * [`Scheduler`] is what the loop asks to run each phase. `rn-cli` implements
-//!   it over V8 and the `timers` binding.
+//! # Why this is not a second loop
 //!
-//! That split is what lets a unit test pin "timers, pending, poll, check, close,
-//! with a drain between each" while the behaviour those phases exist for is
-//! checked against a real `node` binary by the CLI's integration tests.
+//! An earlier version of this crate owned a `poll(2)` poller, its own timer heap,
+//! and a phase order that reproduced libuv's in Rust. It was the loop the CLI
+//! drove, and the real libuv loop that every I/O handle lives on was never
+//! pumped, so `net`, `dgram` and `child_process` scheduled work that no one ran.
+//! Two loops cannot both be the loop: whichever one a handle is registered on is
+//! the only one that can report it, and the timer deadlines in one are invisible
+//! to the other.
+//!
+//! What is left here is the seam that has to exist: [`Scheduler`], which lets the
+//! runtime drain JavaScript queues at the one point libuv cannot know about.
+//!
+//! # Ordering
+//!
+//! Node's guarantees — `process.nextTick` before a microtask, a 0ms timer after
+//! both, `setImmediate` in the check phase that follows poll, `unref()` deciding
+//! whether the process waits — are statements about `uv_run` plus a checkpoint
+//! after every JavaScript callback. Running the same loop is what makes them
+//! true; see `crates/rn-uv/src/uv_loop.rs`.
 
 pub mod backend;
 pub mod loop_;
-pub mod poll;
-pub mod timer;
 
-pub use backend::{Backend, LoopHandle, Wakeup};
-pub use loop_::{Loop, Phase, Scheduler, StopReason};
-pub use poll::{Descriptor, Poller, Ready};
-pub use timer::TimerHeap;
-
-use std::cell::RefCell;
-
-thread_local! {
-    /// The loop this thread's isolate runs on.
-    ///
-    /// Bindings that must re-arm the loop (`scheduleTimer` in the `timers`
-    /// namespace, and every asynchronous I/O binding that follows it) run inside
-    /// a V8 callback, which receives no context and cannot be handed a
-    /// `LoopHandle`. Node solves this by reaching the loop through the
-    /// `Environment` its callbacks capture; rustnode has no per-isolate object
-    /// yet, so the loop installs itself here and a binding asks for it.
-    ///
-    /// `None` before the CLI builds a loop, which is the whole bootstrap window.
-    /// A binding that finds nothing reports honestly instead of pretending it
-    /// armed a loop that does not exist.
-    static CURRENT: RefCell<Option<LoopHandle>> = const { RefCell::new(None) };
-}
-
-/// Records `handle` as the loop on this thread.
-pub fn install_loop(handle: LoopHandle) {
-    CURRENT.with(|current| *current.borrow_mut() = Some(handle));
-}
-
-/// The loop installed on this thread, if the runtime has created one.
-pub fn current_loop() -> Option<LoopHandle> {
-    CURRENT.with(|current| current.borrow().clone())
-}
-
-/// Forgets the installed loop.
-///
-/// The CLI calls this when its isolate is done so a later isolate on the same
-/// thread cannot arm a loop that no longer runs.
-pub fn uninstall_loop() {
-    CURRENT.with(|current| *current.borrow_mut() = None);
-}
+pub use backend::Backend;
+pub use loop_::{Loop, Scheduler, StopReason};
