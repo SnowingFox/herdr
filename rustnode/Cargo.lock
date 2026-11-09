@@ -718,6 +718,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-uv"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bind-zlib"
 version = "0.1.0"
 dependencies = [
@@ -748,6 +758,7 @@ dependencies = [
  "rn-bind-symbols",
  "rn-bind-task-queue",
  "rn-bind-timers",
+ "rn-bind-uv",
  "rn-bind-zlib",
  "rn-builtins",
  "rn-core",
