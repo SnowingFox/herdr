@@ -386,22 +386,88 @@ fn init_groups(
 
 fn get_hostname(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
     match hostname() {
         Ok(name) => set_string(scope, &mut rv, &name),
-        Err(message) => throw(scope, &message),
+        // Node reports failure by filling the context object and returning
+        // `undefined`; `lib/os.js` turns that into `ERR_SYSTEM_ERROR`. Throwing
+        // here instead would bypass that and lose the errno.
+        Err(error) => report_system_error(scope, &args, "uv_os_gethostname", &error),
     }
 }
 
-fn hostname() -> Result<String, String> {
+/// Fills the error context object the way `CollectUVExceptionInfo` does.
+///
+/// `lib/os.js` wraps these calls in `getCheckedFunction`, which passes a fresh
+/// object and throws `ERR_SYSTEM_ERROR` when the call returns `undefined`. The
+/// object therefore has to carry `errno`, `code`, `message` and `syscall`.
+fn report_system_error(
+    scope: &mut v8::PinScope,
+    args: &v8::FunctionCallbackArguments<'_>,
+    syscall: &str,
+    error: &SystemError,
+) {
+    let context = args.get(args.length() - 1);
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(context) {
+        let fields: [(&str, v8::Local<v8::Value>); 4] = [
+            ("errno", v8::Integer::new(scope, error.errno).into()),
+            (
+                "code",
+                v8::String::new(scope, &error.code)
+                    .map(|text| text.into())
+                    .unwrap_or_else(|| v8::undefined(scope).into()),
+            ),
+            (
+                "message",
+                v8::String::new(scope, &error.message)
+                    .map(|text| text.into())
+                    .unwrap_or_else(|| v8::undefined(scope).into()),
+            ),
+            (
+                "syscall",
+                v8::String::new(scope, syscall)
+                    .map(|text| text.into())
+                    .unwrap_or_else(|| v8::undefined(scope).into()),
+            ),
+        ];
+        for (name, value) in fields {
+            if let Some(key) = v8::String::new(scope, name) {
+                object.set(scope, key.into(), value);
+            }
+        }
+    }
+}
+
+/// The `errno`, `code` and `message` Node would put in an error context.
+#[derive(Debug)]
+pub struct SystemError {
+    pub errno: i32,
+    pub code: String,
+    pub message: String,
+}
+
+impl SystemError {
+    fn from_io(error: std::io::Error, code: &str) -> Self {
+        Self {
+            errno: error.raw_os_error().unwrap_or(0),
+            code: code.to_string(),
+            message: error.to_string(),
+        }
+    }
+}
+
+fn hostname() -> Result<String, SystemError> {
     let mut buf = [0u8; 256];
     // SAFETY: `buf` is a valid, correctly sized buffer and `len` reports the
     // size on entry, as `gethostname` requires.
     let result = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(SystemError::from_io(
+            std::io::Error::last_os_error(),
+            "ERR_SYSTEM_ERROR",
+        ));
     }
     // SAFETY: `gethostname` null-terminates within the buffer on success, or
     // leaves it unterminated only when it truncated, which the length check
@@ -865,12 +931,23 @@ unsafe fn hardware_address(addr: *const libc::sockaddr) -> (String, bool) {
 
 fn get_home_directory(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
     match home_directory() {
         Some(home) => set_string(scope, &mut rv, &home),
-        None => throw(scope, "uv_os_homedir: no home directory"),
+        // `uv_os_homedir` reports `UV_ENOENT` when neither `HOME` nor the
+        // passwd entry names a directory.
+        None => report_system_error(
+            scope,
+            &args,
+            "uv_os_homedir",
+            &SystemError {
+                errno: -libc::ENOENT,
+                code: "ERR_SYSTEM_ERROR".to_string(),
+                message: "no home directory".to_string(),
+            },
+        ),
     }
 }
 
@@ -1012,11 +1089,11 @@ fn get_priority(
     let pid = args.get(0).int32_value(scope).unwrap_or(0);
     match priority(pid) {
         Ok(value) => rv.set(v8::Integer::new(scope, value).into()),
-        Err(message) => throw(scope, &message),
+        Err(error) => report_system_error(scope, &args, "uv_os_getpriority", &error),
     }
 }
 
-fn priority(pid: i32) -> Result<i32, String> {
+fn priority(pid: i32) -> Result<i32, SystemError> {
     // SAFETY: `getpriority` is called with the caller's own pid, which cannot
     // race with anything.
     unsafe {
@@ -1024,7 +1101,10 @@ fn priority(pid: i32) -> Result<i32, String> {
         let value = libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t);
         let errno = *libc::__errno_location();
         if errno != 0 {
-            return Err(std::io::Error::from_raw_os_error(errno).to_string());
+            return Err(SystemError::from_io(
+                std::io::Error::from_raw_os_error(errno),
+                "ERR_SYSTEM_ERROR",
+            ));
         }
         Ok(value)
     }
@@ -1037,21 +1117,22 @@ fn set_priority(
 ) {
     let pid = args.get(0).int32_value(scope).unwrap_or(0);
     let value = args.get(1).int32_value(scope).unwrap_or(0);
-    let result = match set_process_priority(pid, value) {
-        Ok(()) => 0,
-        Err(message) => {
-            throw(scope, &message);
-            return;
-        }
-    };
-    rv.set(v8::Number::new(scope, result as f64).into());
+    if let Err(error) = set_process_priority(pid, value) {
+        report_system_error(scope, &args, "uv_os_setpriority", &error);
+        return;
+    }
+    // Node returns the errno, which is 0 on success.
+    rv.set(v8::Number::new(scope, 0.0).into());
 }
 
-fn set_process_priority(pid: i32, value: i32) -> Result<(), String> {
+fn set_process_priority(pid: i32, value: i32) -> Result<(), SystemError> {
     // SAFETY: as in `priority`; the args are plain integers.
     let result = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, value) };
     if result != 0 {
-        return Err(std::io::Error::last_os_error().to_string());
+        return Err(SystemError::from_io(
+            std::io::Error::last_os_error(),
+            "ERR_SYSTEM_ERROR",
+        ));
     }
     Ok(())
 }
