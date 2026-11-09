@@ -85,15 +85,13 @@ impl ParsedValue {
                 _ => None,
             },
             kind::STRING_LIST => match option.default {
-                DefaultValue::List(items) => {
-                    Some(Self::List(items.iter().map(|item| (*item).to_string()).collect()))
-                }
+                DefaultValue::List(items) => Some(Self::List(
+                    items.iter().map(|item| (*item).to_string()).collect(),
+                )),
                 _ => None,
             },
             kind::HOST_PORT => match option.default {
-                DefaultValue::HostPort(host, port) => {
-                    Some(Self::HostPort(host.to_string(), port))
-                }
+                DefaultValue::HostPort(host, port) => Some(Self::HostPort(host.to_string(), port)),
                 _ => None,
             },
             // `kNoOp`/`kV8Option` have no field in Node either, so they stay
@@ -146,12 +144,7 @@ pub fn value_of(name: &str) -> Option<ParsedValue> {
 /// Every parsed value, in table order, for a caller that wants them all.
 #[must_use]
 pub fn all_values() -> Option<Vec<(String, ParsedValue)>> {
-    PARSED.with(|parsed| {
-        parsed
-            .borrow()
-            .as_ref()
-            .map(|store| store.values.clone())
-    })
+    PARSED.with(|parsed| parsed.borrow().as_ref().map(|store| store.values.clone()))
 }
 
 /// The parsed values for this process.
@@ -440,11 +433,23 @@ pub const IMPLIES: &[(&str, &str, bool)] = &[
     ("--watch-path", "--watch", true),
     ("--eval", "[has_eval_string]", true),
     ("--report-signal", "--report-on-signal", true),
-    ("--experimental-shadow-realm", "--harmony-shadow-realm", true),
-    ("--harmony-shadow-realm", "--experimental-shadow-realm", true),
+    (
+        "--experimental-shadow-realm",
+        "--harmony-shadow-realm",
+        true,
+    ),
+    (
+        "--harmony-shadow-realm",
+        "--experimental-shadow-realm",
+        true,
+    ),
     ("--build-snapshot-config", "--build-snapshot", true),
     ("--use-openssl-ca", "[ssl_openssl_cert_store]", true),
-    ("--node-memory-debug", "--debug-arraybuffer-allocations", true),
+    (
+        "--node-memory-debug",
+        "--debug-arraybuffer-allocations",
+        true,
+    ),
     ("--node-memory-debug", "--verify-base-objects", true),
 ];
 
@@ -461,9 +466,9 @@ pub fn namespace_seen(argv: &[String], namespace: OptionNamespace) -> bool {
             None => (argument.as_str(), None),
         };
         let name = normalize_underscores(name);
-        let name = name.strip_prefix("--no-").map_or(name.clone(), |rest| {
-            format!("--{rest}")
-        });
+        let name = name
+            .strip_prefix("--no-")
+            .map_or(name.clone(), |rest| format!("--{rest}"));
         OPTIONS
             .iter()
             .any(|option| option.name == name && option.namespace == namespace)
@@ -633,7 +638,10 @@ mod tests {
             store.value_of("[has_bench_samples]"),
             Some(ParsedValue::Bool(true))
         );
-        assert_eq!(store.value_of("--bench-samples"), Some(ParsedValue::UInt(3)));
+        assert_eq!(
+            store.value_of("--bench-samples"),
+            Some(ParsedValue::UInt(3))
+        );
     }
 
     #[test]

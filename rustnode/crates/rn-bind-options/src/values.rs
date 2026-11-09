@@ -305,7 +305,9 @@ pub fn options_as_flags() -> Vec<String> {
                     flags.push(option.name.to_string());
                 }
             }
-            CliValue::Number(number) => flags.push(format!("{}={}", option.name, format_number(number))),
+            CliValue::Number(number) => {
+                flags.push(format!("{}={}", option.name, format_number(number)))
+            }
             CliValue::Text(text) => {
                 if !text.is_empty() {
                     flags.push(format!("{}={text}", option.name));

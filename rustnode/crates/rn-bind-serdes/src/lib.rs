@@ -52,6 +52,7 @@
 
 mod delegate;
 mod deserializer;
+mod ipc;
 mod serializer;
 
 use rn_core::{BindingModule, InstallCtx};
@@ -104,6 +105,10 @@ impl BindingModule for Serdes {
 /// Registers the `serdes` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Serdes);
+    // `ipc_serdes` is a second namespace rather than a member of `serdes`: Node
+    // declares it separately in `src/node_ipc_serdes.cc`, `lib/**` binds it by
+    // that name, and `rn-compat` checks each namespace against its own contract.
+    registry.register_module(ipc::IpcSerdes);
 }
 
 fn set(
