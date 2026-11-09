@@ -605,6 +605,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-js2c"
+version = "0.1.0"
+
+[[package]]
 name = "rn-module"
 version = "0.1.0"
 dependencies = [
