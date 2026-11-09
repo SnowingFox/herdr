@@ -1,5 +1,6 @@
 async_context_frame
 async_wrap
+blob
 buffer
 builtins
 cares_wrap
@@ -20,6 +21,7 @@ heap_utils
 http_parser
 icu
 internal_only_v8
+ipc_serdes
 js_stream
 messaging
 mksnapshot
@@ -34,6 +36,7 @@ process_methods
 process_wrap
 report
 serdes
+signal_wrap
 spawn_sync
 stream_wrap
 string_decoder
