@@ -2,13 +2,16 @@ async_context_frame
 async_wrap
 buffer
 builtins
+cares_wrap
 config
 constants
+contextify
 credentials
 diagnostics_channel
 encoding_binding
 errors
 fs
+glob
 icu
 messaging
 mksnapshot
@@ -30,4 +33,5 @@ url
 url_pattern
 util
 uv
+v8
 zlib
