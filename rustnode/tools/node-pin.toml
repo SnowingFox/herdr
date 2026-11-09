@@ -1,0 +1,16 @@
+# Node source rustnode is built against.
+#
+# The JavaScript layer in vendor/libnode-js is copied byte-identical from this
+# revision. Bumping the pin means re-copying lib/** and regenerating
+# vendor/libnode-js/LIBJS.sha256 in the same commit.
+[node]
+repository = "https://github.com/nodejs/node"
+commit = "f344e7f552e"
+version = "28.0.0"
+v8_version = "15.6.75"
+v8_crate = "152.2.0"
+
+[counts]
+builtin_files = 435
+internal_binding_namespaces = 73
+test_files_parallel = 5161

@@ -1,0 +1,12 @@
+[package]
+name = "contract-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Records internalBinding shapes from a real Node binary"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
