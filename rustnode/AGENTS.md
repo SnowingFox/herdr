@@ -108,5 +108,41 @@ are vendored C/C++ and are compiled by `cc-rs` at build time. Two consequences:
   gate will fail the same way until it is set.
 - The first build of these crates is slow on purpose. The artifacts cache in
   `target/` from then on.
+- Linking a g++-compiled object needs `libstdc++`, whose `.so` symlink lives
+  only in the GCC version directory here, so `check.sh` also adds
+  `-L /usr/lib/gcc/x86_64-linux-gnu/13` to `RUSTFLAGS`.
+
+## Debugging a binding called with the wrong arguments
+
+`RUSTNODE_DEBUG_BINDING=1` makes `compileFunctionForCJSLoader` print the kinds of
+the arguments it received. This exists because a binding that *coerces* its
+arguments hides the caller's bug: `string_arg` used to call `to_string`, so an
+object arrived as the source text `[object Object]` and the loader threw
+`SyntaxError: Unexpected identifier 'Object'` with nothing pointing at the
+binding. Node's C++ uses `CHECK(args[0]->IsString())` for exactly this reason.
+
+Bindings are type-strict now. If you add one that takes a string, use
+`v8::Local::<v8::String>::try_from(...)` and throw a `TypeError`; do not coerce.
+
+## A missing private symbol is silent
+
+`util.privateSymbols` must install every entry of `rn_core::PRIVATE_SYMBOLS`.
+A missing one does not throw: `let { x } = privateSymbols` leaves `x` as
+`undefined`, and `object[undefined]` is the *string* key `"undefined"`, so every
+missing symbol collapses onto one shared property. That made a child module read
+its parent `Module` object as its own source, and the symptom was a type error
+inside the CommonJS loader. `rn-core` has a test pinning the installed set.
+
+## Do not weaken a count to make something fit
+
+`BUILTIN_FILE_COUNT` (435) and the `sha256sum -c` in `tools/verify-libjs.sh` are
+the checks that keep `vendor/libnode-js/lib/**` byte-identical to Node. They have
+already caught real drift. If a new builtin does not fit that tree, extend the
+*generator* — the id scheme already maps `deps/...` to `internal/deps/...` — do
+not change the number.
+
+The same rule applies to `rn-compat`'s contract files, the deferred-reach
+baseline, and every test expectation. A check that was edited until it passed is
+not a check.
 
 
