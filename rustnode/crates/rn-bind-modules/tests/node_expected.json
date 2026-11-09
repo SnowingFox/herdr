@@ -1,0 +1,63 @@
+{
+  "read_plain": {
+    "array": [
+      "plain-pkg",
+      "index.js",
+      "none",
+      "__undefined__",
+      "__undefined__",
+      "<root>/fx/plain/package.json"
+    ]
+  },
+  "read_modtype": {
+    "array": [
+      "mod-pkg",
+      "m.mjs",
+      "module",
+      "__undefined__",
+      "__undefined__",
+      "<root>/fx/modtype/package.json"
+    ]
+  },
+  "read_malformed": "THREW:ERR_INVALID_PACKAGE_CONFIG",
+  "read_absent": "__undefined__",
+  "read_exports": {
+    "array": [
+      "scope-pkg",
+      "__undefined__",
+      "module",
+      "__undefined__",
+      "{\".\":\"./i.js\"}",
+      "<root>/fx/scope/node_modules/pkg/package.json"
+    ]
+  },
+  "scope_plain": {
+    "array": [
+      "plain-pkg",
+      "index.js",
+      "none",
+      "__undefined__",
+      "__undefined__",
+      "<root>/fx/plain/package.json"
+    ]
+  },
+  "scope_pkg": {
+    "array": [
+      "scope-pkg",
+      "__undefined__",
+      "module",
+      "__undefined__",
+      "{\".\":\"./i.js\"}",
+      "<root>/fx/scope/node_modules/pkg/package.json"
+    ]
+  },
+  "scope_malformed": "THREW:ERR_INVALID_PACKAGE_CONFIG",
+  "type_plain": "none",
+  "type_modtype": "module",
+  "type_bad_url": "THREW:ERR_INVALID_URL",
+  "nearest_type_inner_trailing": "commonjs",
+  "nearest_type_inner_file": "commonjs",
+  "nearest_type_nm": "none",
+  "nearest_type_parent": "module",
+  "nearest_type_none": "__undefined__"
+}
