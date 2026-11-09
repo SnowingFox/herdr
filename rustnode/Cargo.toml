@@ -1,17 +1,9 @@
 [workspace]
 resolver = "2"
-members = [
-    "crates/rn-v8-sys",
-    "crates/rn-core",
-    "crates/rn-io",
-    "crates/rn-bindings",
-    "crates/rn-module",
-    "crates/rn-napi",
-    "crates/rn-cli",
-    "tools/contract-gen",
-    "tools/compat",
-    "tools/harness",
-]
+# Glob members so every parallel workstream owns its own crate directory and
+# never edits this file. Adding a crate means adding one directory.
+members = ["crates/*", "tools/*"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -29,6 +21,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 parking_lot = "0.12"
+rn-v8-sys = { path = "crates/rn-v8-sys" }
+rn-core = { path = "crates/rn-core" }
+rn-io = { path = "crates/rn-io" }
+rn-bindings = { path = "crates/rn-bindings" }
+rn-module = { path = "crates/rn-module" }
+rn-napi = { path = "crates/rn-napi" }
 
 [profile.release]
 opt-level = 3
