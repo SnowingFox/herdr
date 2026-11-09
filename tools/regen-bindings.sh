@@ -14,12 +14,24 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
 crates=()
+skipped=()
 for dir in crates/rn-bind-*; do
   [ -d "$dir" ] || continue
   name="$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)"
   [ -n "$name" ] || continue
-  crates+=("$name")
+  # A crate joins the registry by exporting `pub fn register`. Without it the
+  # crate is mid-landing: report it and leave it out, so an unfinished crate
+  # cannot break the build for everyone else.
+  if grep -rqs "pub fn register" "$dir/src"; then
+    crates+=("$name")
+  else
+    skipped+=("$name")
+  fi
 done
+
+if [ ${#skipped[@]} -gt 0 ]; then
+  echo "skipped (no pub fn register yet): ${skipped[*]}" >&2
+fi
 
 if [ ${#crates[@]} -eq 0 ]; then
   echo "no rn-bind-* crates found" >&2
