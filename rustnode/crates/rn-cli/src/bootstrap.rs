@@ -125,7 +125,7 @@ pub fn wrap_require_with_scheme_support(scope: &mut v8::PinScope, loaders: &Boot
     };
 
     let global = scope.get_current_context().global(scope);
-    let _ = set(scope, global, "require", wrapped.into());
+    let _ = set_global(scope, global, "require", wrapped.into());
     rn_core::hook_slot::replace_require(scope, wrapped);
 }
 
@@ -155,7 +155,7 @@ pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
         .and_then(|binding| call_with_string(scope, binding, "messaging"))
         .and_then(|messaging| get_property(scope, messaging, "structuredClone"))
     {
-        let _ = set(scope, global, "structuredClone", value);
+        let _ = set_global(scope, global, "structuredClone", value);
     }
 
     // `TextEncoder` and `TextDecoder` live in `internal/encoding`, which only
@@ -163,7 +163,7 @@ pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
     if let Some(encoding) = call_require(scope, require, "internal/encoding") {
         for name in ["TextEncoder", "TextDecoder"] {
             if let Some(value) = get_property(scope, encoding, name) {
-                let _ = set(scope, global, name, value);
+                let _ = set_global(scope, global, name, value);
             }
         }
     }
@@ -176,7 +176,7 @@ pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
     if let Some(buffer) = call_require(scope, require, "buffer") {
         for name in ["Buffer", "btoa", "atob"] {
             if let Some(value) = get_property(scope, buffer, name) {
-                let _ = set(scope, global, name, value);
+                let _ = set_global(scope, global, name, value);
             }
         }
     }
@@ -283,7 +283,7 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
     if let Some(url) = call_require(scope, require, "internal/url") {
         for name in ["URL", "URLSearchParams"] {
             if let Some(value) = get_property(scope, url, name) {
-                let _ = set(scope, global, name, value);
+                let _ = set_global(scope, global, name, value);
             }
         }
     }
@@ -294,14 +294,14 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
     if let Some(events) = call_require(scope, require, "internal/event_target") {
         for name in ["Event", "EventTarget", "CustomEvent"] {
             if let Some(value) = get_property(scope, events, name) {
-                let _ = set(scope, global, name, value);
+                let _ = set_global(scope, global, name, value);
             }
         }
     }
 
     // `global` is Node's alias for `globalThis`, and `test/common` and many
     // fixtures assign through it.
-    let _ = set(scope, global, "global", global.into());
+    let _ = set_global(scope, global, "global", global.into());
 
     install_process_event_emitter(scope, require, global);
 
@@ -334,7 +334,7 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
     // ordinary property whose body loads `undici` on first call, so that even
     // reading `typeof fetch` does not compile the client.
     if let Some(fetch) = lazy_fetch(scope, require) {
-        let _ = set(scope, global, "fetch", fetch);
+        let _ = set_global(scope, global, "fetch", fetch);
     }
     let _ = internal_binding;
 }
@@ -760,7 +760,7 @@ pub fn install_cjs_loader<'s>(
     // of that name.
     let global_require = wrap_cjs_require_with_builtin_fallback(scope, file_require, require)
         .unwrap_or(file_require);
-    set(scope, global, "require", global_require.into())?;
+    set_global(scope, global, "require", global_require.into())?;
 
     // `module`, `exports`, `__filename` and `__dirname` are CommonJS wrapper
     // parameters, not globals, so the real values are installed by
@@ -935,10 +935,10 @@ pub fn bootstrap_realm(
     run_per_context(scope, primordials)?;
 
     let process = process_object(scope, script_args, exec_argv)?;
-    set(scope, global, "process", process.into())?;
+    set_global(scope, global, "process", process.into())?;
     // `realm.js` reads `primordials` as a bare global inside its wrapper, so the
     // object has to be reachable both there and through the parameter below.
-    set(scope, global, "primordials", primordials.into())?;
+    set_global(scope, global, "primordials", primordials.into())?;
 
     let get_linked_binding = function_of(scope, "getLinkedBinding", get_linked_binding)?;
     let get_internal_binding = internal_binding_dispatcher(scope, registry)?;
@@ -972,7 +972,7 @@ pub fn bootstrap_realm(
     // the same way Node exposes it to a CommonJS module.
     let require = rn_core::hook_slot::require(scope);
     if let Some(require) = require {
-        set(scope, global, "require", require.into())?;
+        set_global(scope, global, "require", require.into())?;
     }
 
     Ok(Bootstrapped {
@@ -1299,6 +1299,63 @@ fn set(
     let key = v8::String::new(scope, name).ok_or("cannot allocate a property name")?;
     object.set(scope, key.into(), value);
     Ok(())
+}
+
+/// Defines a property on the global object the way Node defines its globals.
+///
+/// A bare `object.set` creates an enumerable property, and `for (const name in
+/// globalThis)` then sees it. That difference is observable and load-bearing:
+/// `test/common/index.js` enumerates `globalThis` at exit and fails the test on
+/// any name it does not recognise, while Node's own globals are non-enumerable.
+/// Installing `Buffer`, `URL` and `primordials` enumerably made 388 files fail
+/// with "Unexpected global(s) found".
+///
+/// The property is written with `set` first, which gives it the writable and
+/// configurable flags Node's globals have, and then `Object.defineProperty` is
+/// used to clear only `enumerable`. There is no single V8 call in this crate
+/// that sets all three flags at once, and doing the second half in JavaScript
+/// states the intent in one line instead of juggling three descriptors.
+fn set_global(
+    scope: &mut v8::PinScope,
+    global: v8::Local<v8::Object>,
+    name: &str,
+    value: v8::Local<v8::Value>,
+) -> Result<(), String> {
+    set(scope, global, name, value)?;
+    let key = v8::String::new(scope, name).ok_or("cannot allocate a property name")?;
+    let descriptor = v8::Object::new(scope);
+    let enumerable = v8::String::new(scope, "enumerable").ok_or("cannot allocate enumerable")?;
+    descriptor.set(
+        scope,
+        enumerable.into(),
+        v8::Boolean::new(scope, false).into(),
+    );
+    let Some(define_property) = object_define_property(scope) else {
+        return Err("cannot reach Object.defineProperty".to_string());
+    };
+    define_property
+        .call(
+            scope,
+            v8::undefined(scope).into(),
+            &[global.into(), key.into(), descriptor.into()],
+        )
+        .ok_or_else(|| format!("cannot redefine the global {name}"))?;
+    Ok(())
+}
+
+/// `Object.defineProperty`, looked up once per call.
+///
+/// Reaching it through the intrinsic rather than a captured handle keeps this
+/// usable from the bootstrap, which runs before any module could have saved a
+/// reference.
+fn object_define_property<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    let global = scope.get_current_context().global(scope);
+    let name = v8::String::new(scope, "Object")?;
+    let object = global.get(scope, name.into())?;
+    let object = v8::Local::<v8::Object>::try_from(object).ok()?;
+    let name = v8::String::new(scope, "defineProperty")?;
+    let function = object.get(scope, name.into())?;
+    v8::Local::<v8::Function>::try_from(function).ok()
 }
 
 /// Placeholder for a loader entry that is not available yet.
