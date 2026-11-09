@@ -261,6 +261,47 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
         let _ = expose_lazy.call(scope, util, &[global.into(), id.into(), array.into()]);
     }
 
+    // WebCrypto, from the `exposed-window-or-worker` half of Node's web
+    // bootstrap. It is not in `exposed-wildcard`, so the loop above never
+    // installs it, and a script run as a file therefore had no `crypto` global
+    // at all — `globalThis.crypto.subtle` was `undefined` in 82 files. `-e` mode
+    // hid this, because `addBuiltinLibsToObject` installs every builtin as a
+    // lazy global and `crypto` then resolves to the `node:crypto` module.
+    //
+    // The shape is Node's: `crypto` is replaceable so a script may assign it and
+    // the three constructors are plain lazy interfaces. Node gates this block on
+    // `internalBinding('config').hasOpenSSL`; this build always links OpenSSL —
+    // `process.versions.openssl` is read from the linked library above — so the
+    // branch is unconditional rather than read from a config field that is a
+    // constant here.
+    if let Some(define_lazy) = get_property(scope, util, "defineReplaceableLazyAttribute") {
+        if let Ok(define_lazy) = v8::Local::<v8::Function>::try_from(define_lazy) {
+            if let (Some(id), Some(keys)) = (
+                v8::String::new(scope, "internal/crypto/webcrypto"),
+                names_array(scope, &["crypto"]),
+            ) {
+                let _ = define_lazy.call(
+                    scope,
+                    util,
+                    &[
+                        global.into(),
+                        id.into(),
+                        keys.into(),
+                        v8::Boolean::new(scope, false).into(),
+                    ],
+                );
+            }
+        }
+    }
+    for name in ["Crypto", "CryptoKey", "SubtleCrypto"] {
+        if let (Some(id), Some(array)) = (
+            v8::String::new(scope, "internal/crypto/webcrypto"),
+            names_array(scope, &[name]),
+        ) {
+            let _ = expose_lazy.call(scope, util, &[global.into(), id.into(), array.into()]);
+        }
+    }
+
     // `DOMException` is an `[Exposed=*]` interface that
     // `internal/bootstrap/web/exposed-wildcard.js` publishes through
     // `internalBinding('messaging').exposeLazyDOMExceptionProperty(globalThis)`.

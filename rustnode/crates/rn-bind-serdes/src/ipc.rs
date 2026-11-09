@@ -133,7 +133,7 @@ fn view_type_index(view: v8::Local<v8::Object>) -> u32 {
 fn bytes_per_element(type_index: u32) -> usize {
     match type_index {
         3 | 4 => 2,
-        5 | 6 | 7 => 4,
+        5..=7 => 4,
         8 | 11 | 12 => 8,
         // Int8, Uint8, Uint8Clamped, DataView and Buffer.
         _ => 1,
@@ -254,7 +254,7 @@ fn shallow_copy<'s>(
             continue;
         };
         let descriptor = PropertyDescriptor::new_from_value(value);
-        copy.define_property(scope, key.into(), &descriptor);
+        copy.define_property(scope, key, &descriptor);
     }
     Some(copy)
 }
