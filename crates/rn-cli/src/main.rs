@@ -100,8 +100,9 @@ fn main() {
     // the CLI still runs, because `-e` on a bare global is useful for debugging
     // the bootstrap itself; the reason is printed so a failure is never silent.
     let mut runtime = None;
+    let mut realm_require: Option<v8::Global<v8::Function>> = None;
     match bootstrap::bootstrap_realm(scope, registry, &argv_rest, &options.exec_argv) {
-        Ok(loaders) => {
+        Ok(mut loaders) => {
             if options.expose_internals() {
                 bootstrap::expose_internals(scope, &loaders);
             }
@@ -144,71 +145,44 @@ fn main() {
                 }
             }
             let _ = loaders.internal_binding;
+            // Taken last: every step above reads `loaders.require`, and taking it
+            // first left `install_early_globals` without a loader, which silently
+            // dropped the `Buffer` global.
+            realm_require = loaders.require.take();
         }
         Err(message) => eprintln!("rustnode: realm bootstrap failed: {message}"),
     }
 
+    // A file is loaded through the CommonJS loader as the main module, so it gets
+    // the wrapper parameters (`module`, `exports`, `__filename`, `__dirname`), a
+    // `require` anchored at its own directory, and an entry in `require.cache`
+    // under its filename — exactly what Node does for `node script.js`. `-e` has
+    // no file, so it is compiled as a bare script against the global object.
+    //
+    // The file's text is deliberately not read here: the loader reads it, and a
+    // second read would bypass the loader's source handling (and its cache).
     let mut print_result = false;
-    let source = match options.source {
-        args::Source::Eval { code, print } => {
-            print_result = print;
-            code
-        }
-        args::Source::Empty => "0".to_string(),
+    let (value, caught) = match &options.source {
         args::Source::File(_) => {
-            let path = script_path.unwrap_or_default();
-            match std::fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(error) => {
-                    eprintln!("rustnode: cannot open {path}: {error}");
-                    std::process::exit(1);
+            // The resolved absolute path, not the raw argument: `Module._load`
+            // treats its request as a specifier, so a relative one would be
+            // resolved against the loader's paths instead of the cwd.
+            let caught = match (realm_require.as_ref(), script_path.as_ref()) {
+                (Some(require), Some(path)) => {
+                    let require = v8::Local::new(scope, require);
+                    bootstrap::run_main_module(scope, require, path)
+                        .err()
+                        .map(|message| format!("Uncaught {message}"))
                 }
-            }
+                _ => Some("Uncaught the realm bootstrap left no require".to_string()),
+            };
+            (None, caught)
         }
-    };
-
-    let origin = match v8::String::new(scope, "evalmachine.<anonymous>") {
-        Some(name) => v8::ScriptOrigin::new(
-            scope,
-            name.into(),
-            0,
-            0,
-            false,
-            0,
-            None,
-            false,
-            false,
-            false,
-            None,
-        ),
-        None => {
-            eprintln!("rustnode: cannot allocate script name");
-            std::process::exit(1);
+        args::Source::Eval { code, print } => {
+            print_result = *print;
+            evaluate_script(scope, code)
         }
-    };
-
-    let code = match v8::String::new(scope, &source) {
-        Some(code) => code,
-        None => {
-            eprintln!("rustnode: input contains invalid UTF-8");
-            std::process::exit(1);
-        }
-    };
-
-    let (value, caught) = {
-        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
-        let scope = &mut try_catch.init();
-        let value =
-            v8::Script::compile(scope, code, Some(&origin)).and_then(|script| script.run(scope));
-        let caught = if scope.has_caught() {
-            scope.exception().map(|exception| {
-                let text = exception.to_rust_string_lossy(scope);
-                format!("Uncaught {text}")
-            })
-        } else {
-            None
-        };
-        (value, caught)
+        args::Source::Empty => evaluate_script(scope, "0"),
     };
 
     if let Some(message) = caught {
@@ -254,6 +228,51 @@ fn main() {
     if exit_requested || rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED) {
         std::process::exit(1);
     }
+}
+
+/// Compiles and runs `source` as a bare script and reports the result.
+///
+/// This is the `-e`/`-p` path, which Node also evaluates as a top-level script
+/// rather than as a CommonJS module. The returned pair is the script's completion
+/// value (for `-p`) and the `Uncaught ...` message when the script threw.
+fn evaluate_script<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: &str,
+) -> (Option<v8::Local<'s, v8::Value>>, Option<String>) {
+    let Some(name) = v8::String::new(scope, "evalmachine.<anonymous>") else {
+        eprintln!("rustnode: cannot allocate script name");
+        std::process::exit(1);
+    };
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        name.into(),
+        0,
+        0,
+        false,
+        0,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let Some(code) = v8::String::new(scope, source) else {
+        eprintln!("rustnode: input contains invalid UTF-8");
+        std::process::exit(1);
+    };
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut try_catch.init();
+    let value =
+        v8::Script::compile(scope, code, Some(&origin)).and_then(|script| script.run(scope));
+    let caught = if scope.has_caught() {
+        scope.exception().map(|exception| {
+            let text = exception.to_rust_string_lossy(scope);
+            format!("Uncaught {text}")
+        })
+    } else {
+        None
+    };
+    (value, caught)
 }
 
 /// Passes the command-line flags that belong to V8 through to it.

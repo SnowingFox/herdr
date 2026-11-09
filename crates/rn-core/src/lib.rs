@@ -22,4 +22,4 @@ pub use binding::{BindingRegistry, Installer, Namespace};
 pub use env::Env;
 pub use error::KernelError;
 pub use queue::TaskQueue;
-pub use symbol::{define_mark, symbol, CONTEXTIFY_CONTEXT, HOST_DEFINED_OPTION};
+pub use symbol::{define_mark, symbol, CONTEXTIFY_CONTEXT, HOST_DEFINED_OPTION, PRIVATE_SYMBOLS};
