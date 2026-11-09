@@ -265,3 +265,25 @@ not on the global object. `internal/webstreams/**` loads correctly; the
 globals are simply not wired, because `internal/bootstrap/node.js` never runs
 in this build. `util.inspect`'s own test needs `ReadableStream`, and is the one
 remaining failure in the Node test smoke set.
+
+### `DOMException` is not a real `Error` subclass
+
+`new DOMException('m','N')` reports `[object Object]` and `instanceof Error`
+is `false`; Node gives `[object DOMException]` and `true`. The properties are
+data properties on the instance rather than prototype accessors, so
+`util.inspect` renders `{}` where Node renders `[object DOMException] { ... }`.
+
+Node's own implementation is `lib/internal/per_context/domexception.js`, which
+is vendored and correct. It cannot be `require`d, because it reads `primordials`
+and `privateSymbols` as bare globals — it has to be *called* with those injected,
+the way `run_per_context` already calls `primordials.js`.
+
+The missing piece is small and specific: `run_per_context` in
+`crates/rn-cli/src/bootstrap.rs` builds a `private_symbols` object and passes it
+as an argument, but never exposes it as a global, so `domexception.js` has
+nothing to read. Exposing it, then running that file through the same path,
+should let the vendored implementation replace the hand-built one.
+
+Two workers independently hit this and both reverted their attempts rather than
+leave half-working surgery, which is why it is recorded here rather than guessed
+at in the code.
