@@ -15,8 +15,32 @@
 //! `immediateInfo` is a `Uint32Array(3)` of `[count, refCount, hasOutstanding]`
 //! and `timeoutInfo` is an `Int32Array(1)` holding the ref count. Node's
 //! JavaScript writes `timeoutInfo[0]` directly, so a copy here would drift.
+//!
+//! # Who counts what
+//!
+//! `lib/internal/timers.js` maintains the counters itself: `incRefCount()` does
+//! `timeoutInfo[0]++` and only calls `toggleTimerRef(true)` when that made the
+//! count one. So `toggleTimerRef` and `toggleImmediateRef` must *record* the
+//! libuv-style ref state and must not write the counters — writing them would
+//! double-count every timer.
+//!
+//! The loop asks [`timer_handle`] and [`immediate_ref_count`] whether the process
+//! has anything left to wait for, and those are two different measurements on
+//! purpose:
+//!
+//! * A timer is libuv's single `uv_timer_t`, so "alive" means *started and
+//!   ref'd*, exactly as `uv__loop_alive()` asks. `scheduleTimer` starts it and
+//!   [`stop_timer_handle`] stops it when `processTimers` reports nothing ref'd.
+//! * Immediates have no handle of their own in this runtime yet, and
+//!   `processImmediate()` decrements `immediateInfo[1]` without toggling the ref
+//!   bit, so the count is the only signal that stays correct after a run.
+//!
+//! `timeoutInfo[0]` is deliberately not the timer signal: `listOnTimeout()`
+//! decrements it directly when a timer fires, and a script that writes the array
+//! (`internalBinding('timers').timeoutInfo[0] = 7`) would otherwise pin the
+//! process forever. Node reads its handle state, not the array.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use rn_core::{AliasedUint8Array, BindingModule, Element, InstallCtx};
 use rn_v8_sys::v8;
@@ -54,11 +78,72 @@ thread_local! {
         immediate: None,
         timer: None,
     }) };
-    /// Durations `scheduleTimer` has been asked to wake at, in milliseconds.
+    /// libuv's timer handle state, which is what decides whether the loop is
+    /// alive.
     ///
-    /// The event loop that would honour these does not exist yet; recording
-    /// them keeps the call honest instead of pretending a timer was armed.
-    static SCHEDULED: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+    /// Node's `Environment` owns one `uv_timer_t` for all JavaScript timers, and
+    /// three calls drive it:
+    ///
+    /// * `scheduleTimer(ms)` is `uv_timer_start(&timer_, RunTimers, ms, 0)`,
+    ///   which both arms the handle and makes it *active*.
+    /// * `processTimers` is `RunTimers`. Its return value is a deadline when a
+    ///   ref'd timer is pending, and `Node`'s C++ reacts by restarting the handle
+    ///   for a positive value and calling `uv_timer_stop` for a value of zero or
+    ///   less. Stopping is what makes the handle *inactive*.
+    /// * `toggleTimerRef(bool)` is `uv_ref`/`uv_unref` on that same handle.
+    ///
+    /// The loop is kept alive by an active *and* ref'd handle, which is why both
+    /// bits are tracked here rather than one count. `timeoutInfo[0]` looks like it
+    /// would answer the same question, but `listOnTimeout()` decrements it
+    /// directly when a timer fires, without calling `toggleTimerRef`, and a script
+    /// that writes the array would otherwise pin the process forever.
+    static TIMER_HANDLE: Cell<TimerHandle> = const { Cell::new(TimerHandle::new()) };
+    /// `libuv`'s ref state for the check handle that runs immediates.
+    static IMMEDIATE_REF_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// libuv's per-handle state for the one timer handle a Node environment owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerHandle {
+    /// `uv_is_active`: started by `scheduleTimer`, stopped when `processTimers`
+    /// reports no ref'd deadline.
+    active: bool,
+    /// `uv_has_ref`: whether the handle keeps the loop alive.
+    refed: bool,
+}
+
+impl TimerHandle {
+    /// A handle before `scheduleTimer` has ever started it.
+    ///
+    /// libuv's `uv_timer_init` leaves a handle active=false and ref'd=true, which
+    /// is the state this reproduces: not started, and ready to keep the loop alive
+    /// once it is.
+    pub const fn new() -> Self {
+        Self {
+            active: false,
+            refed: true,
+        }
+    }
+
+    /// Whether the handle is both started and ref'd, i.e. whether it keeps the
+    /// loop alive.
+    pub fn keeps_loop_alive(&self) -> bool {
+        self.active && self.refed
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn is_refed(&self) -> bool {
+        self.refed
+    }
+}
+
+impl Default for TimerHandle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 struct TimerInfo {
@@ -135,9 +220,12 @@ fn get_libuv_now(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    // `uv_now` is the loop's cached monotonic time in milliseconds. The loop
-    // does not exist yet, so this reads the clock directly, which is what the
-    // loop does when it refreshes that cache.
+    // `uv_now` is the loop's cached monotonic time in milliseconds, refreshed
+    // once per loop turn. Reading the clock directly is what libuv does at the
+    // same point: `uv__update_time()` before timers run, and no other read
+    // inside a turn. A timer that fires therefore sees the time the turn
+    // started, not the time its own callback ran, which is why
+    // `insert()`'s `_idleStart` and `listOnTimeout`'s `diff` agree.
     rv.set(v8::Number::new(scope, now_ms()).into());
 }
 
@@ -160,15 +248,25 @@ fn schedule_timer(
     let Some(duration) = args.get(0).integer_value(scope) else {
         return;
     };
-    SCHEDULED.with(|scheduled| {
-        let mut scheduled = scheduled.borrow_mut();
-        // Only the earliest deadline matters to a loop, and the list is kept
-        // short so a long-lived process cannot grow it without bound.
-        scheduled.push(duration);
-        if scheduled.len() > 1024 {
-            scheduled.drain(..512);
-        }
+    // `lib/internal/timers.js` calls this with the *duration* of a newly created
+    // list, and only when that list expires before any it already knew about.
+    // libuv's `uv_timer_start` takes a deadline, so the conversion is here, at
+    // the boundary where the two conventions meet.
+    // `uv_timer_start` both arms the handle and marks it active. Marking it
+    // active here rather than at `processTimers()` time is what makes a timer
+    // scheduled during a turn keep the loop alive for one more turn.
+    TIMER_HANDLE.with(|handle| {
+        let mut state = handle.get();
+        state.active = true;
+        handle.set(state);
     });
+    let Some(loop_handle) = rn_io::current_loop() else {
+        // No loop yet. During bootstrap that is the normal state: the deadline
+        // is recorded on the handle so a later turn sees it, but there is
+        // nothing to wake.
+        return;
+    };
+    loop_handle.wake_at(now_ms() + duration as f64);
 }
 
 fn setup_timers(
@@ -198,21 +296,11 @@ fn toggle_immediate_ref(
     _rv: v8::ReturnValue,
 ) {
     let increment = args.get(0).boolean_value(scope);
-    INFO.with(|info| {
-        if let Some(info) = info.borrow().as_ref() {
-            let current = info.immediate.get(IMMEDIATE_REF_COUNT).unwrap_or(0);
-            let next = if increment {
-                current.saturating_add(1)
-            } else {
-                current.saturating_sub(1)
-            };
-            info.immediate.set(IMMEDIATE_REF_COUNT, next);
-            // `hasOutstanding` is derived: any ref'd immediate keeps the loop
-            // alive, which is the only thing the count is used for.
-            info.immediate
-                .set(IMMEDIATE_HAS_OUTSTANDING, u32::from(next > 0));
-        }
-    });
+    // This is `uv_ref`/`uv_unref` on the loop's check handle, nothing more.
+    // `lib/internal/timers.js` already adjusted `immediateInfo[1]` before
+    // calling, so writing that array here would count every immediate twice and
+    // leave the loop thinking there was always one more outstanding.
+    IMMEDIATE_REF_ACTIVE.with(|active| active.set(increment));
 }
 
 fn toggle_timer_ref(
@@ -221,27 +309,48 @@ fn toggle_timer_ref(
     _rv: v8::ReturnValue,
 ) {
     let increment = args.get(0).boolean_value(scope);
-    INFO.with(|info| {
-        if let Some(info) = info.borrow().as_ref() {
-            let current = info.timeout.get(TIMEOUT_REF_COUNT).unwrap_or(0);
-            let next = if increment {
-                current.saturating_add(1)
-            } else {
-                current.saturating_sub(1)
-            };
-            info.timeout.set(TIMEOUT_REF_COUNT, next);
-            // Node writes the same count into the `immediateInfo` count slot so
-            // `process._getActiveHandles` can report timers without a second
-            // array.
-            info.immediate.set(IMMEDIATE_COUNT, next);
-        }
+    // `uv_ref`/`uv_unref`. The counter in `timeoutInfo[0]` is maintained by
+    // `incRefCount`/`decRefCount` in JavaScript, so writing it here would count
+    // every timer twice.
+    TIMER_HANDLE.with(|handle| {
+        let mut state = handle.get();
+        state.refed = increment;
+        handle.set(state);
     });
+}
+
+/// libuv's state for the loop's timer handle.
+///
+/// The loop asks this rather than the shared counters: `keeps_loop_alive()` is
+/// `uv_is_active(handle) && uv_has_ref(handle)`, which is exactly the condition
+/// libuv's `uv__loop_alive()` applies to every handle it holds.
+pub fn timer_handle() -> TimerHandle {
+    TIMER_HANDLE.with(Cell::get)
+}
+
+/// Stops the timer handle, as Node's C++ does when `processTimers` reports no
+/// ref'd timer left.
+///
+/// `uv_timer_stop` leaves the ref bit alone: the next `scheduleTimer` marks the
+/// handle active again without needing another `uv_ref`. That is why this is a
+/// separate operation from [`timer_handle`], which only reports.
+pub fn stop_timer_handle() {
+    TIMER_HANDLE.with(|handle| {
+        let mut state = handle.get();
+        state.active = false;
+        handle.set(state);
+    });
+}
+
+/// Whether the loop's check handle is ref'd.
+pub fn immediate_ref_active() -> bool {
+    IMMEDIATE_REF_ACTIVE.with(Cell::get)
 }
 
 /// Runs the timer callback `setupTimers` installed, if there is one.
 ///
-/// `lib/internal/timers.js` normally drives this itself; the runtime calls it
-/// when it has to process a due timer from the native side.
+/// Kept for callers that only want the side effects; a caller that needs the
+/// deadline the callback reports should use [`run_timers`].
 pub fn call_timer_callback(scope: &mut v8::PinScope) {
     let callback = CALLBACKS.with(|callbacks| {
         callbacks
@@ -256,6 +365,9 @@ pub fn call_timer_callback(scope: &mut v8::PinScope) {
 }
 
 /// Runs the immediate callback `setupTimers` installed, if there is one.
+///
+/// Kept for callers that only want the side effects; a caller that needs to know
+/// whether anything ran should use [`run_immediates`].
 pub fn call_immediate_callback(scope: &mut v8::PinScope) {
     let callback = CALLBACKS.with(|callbacks| {
         callbacks
@@ -267,6 +379,147 @@ pub fn call_immediate_callback(scope: &mut v8::PinScope) {
     if let Some(callback) = callback {
         let _ = callback.call(scope, v8::undefined(scope).into(), &[]);
     }
+}
+
+/// Runs the timer callback `setupTimers` installed with `now_ms` as its
+/// argument, and returns what it reported.
+///
+/// `lib/internal/timers.js`'s `processTimers(now)` returns the deadline the loop
+/// should arm next, using libuv's sign convention:
+///
+/// * `0` — no timers left at all.
+/// * positive — the next deadline, with a ref'd timer behind it.
+/// * negative — the next deadline, but every timer is `unref()`'d.
+///
+/// The sign is folded into [`TimerRun`] here, at the one place that has to know
+/// it, so no caller can read `-0` or a negative deadline as a deadline in the
+/// past.
+///
+/// A callback that throws is caught here rather than left pending. A pending
+/// exception on the isolate is printed by V8's own default reporter — to stdout,
+/// with V8's formatting — which is neither Node's output nor Node's stream. The
+/// exception travels back to the caller as
+/// [`TimerRun::Threw`], which reports it the way Node does.
+pub fn run_timers(scope: &mut v8::PinScope, now_ms: f64) -> TimerRun {
+    let Some(callback) = timer_callback(scope) else {
+        return TimerRun::NotInstalled;
+    };
+    let argument = v8::Number::new(scope, now_ms).into();
+    match call_catching(scope, callback, &[argument]) {
+        Ok(Some(result)) => match result.number_value(scope) {
+            Some(value) if value < 0.0 => TimerRun::Next {
+                at_ms: -value,
+                refed: false,
+            },
+            Some(value) if value > 0.0 => TimerRun::Next {
+                at_ms: value,
+                refed: true,
+            },
+            _ => TimerRun::Idle,
+        },
+        // A callback that reported nothing at all is not an error: `processTimers`
+        // always returns a number, so this is the "the function was replaced"
+        // case and there is no deadline to arm.
+        Ok(None) => TimerRun::Idle,
+        Err(exception) => {
+            record_uncaught(scope, exception);
+            TimerRun::Threw
+        }
+    }
+}
+
+/// What running the timer phase found.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TimerRun {
+    /// `processTimers()` has not been installed; the phase cannot run.
+    NotInstalled,
+    /// The callback threw. The exception was formatted to stderr and the
+    /// process's exit was requested.
+    Threw,
+    /// No timer is pending.
+    Idle,
+    /// The next deadline, and whether a ref'd timer is behind it.
+    Next { at_ms: f64, refed: bool },
+}
+
+/// Runs the immediate callback `setupTimers` installed.
+///
+/// Returns whether a callback was installed, which is false during the bootstrap
+/// window before `internal/bootstrap/node.js` runs. A throw is caught and
+/// reported, for the same reason as in [`run_timers`].
+pub fn run_immediates(scope: &mut v8::PinScope) -> bool {
+    let Some(callback) = immediate_callback(scope) else {
+        return false;
+    };
+    if let Err(exception) = call_catching(scope, callback, &[]) {
+        record_uncaught(scope, exception);
+    }
+    true
+}
+
+/// Calls `callable`, turning a throw into `Err`.
+///
+/// The exception is captured as a `Global` before the `TryCatch` closes, because
+/// a `Local` from inside the catch scope cannot escape it and the caller needs to
+/// format the error after this returns.
+fn call_catching<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    callable: v8::Local<'s, v8::Function>,
+    arguments: &[v8::Local<'s, v8::Value>],
+) -> Result<Option<v8::Local<'s, v8::Value>>, v8::Global<v8::Value>> {
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut try_catch.init();
+    let result = callable.call(scope, v8::undefined(scope).into(), arguments);
+    if scope.has_caught() {
+        let caught = scope
+            .exception()
+            .map(|exception| v8::Global::new(scope, exception))
+            .unwrap_or_else(|| {
+                let undefined: v8::Local<v8::Value> = v8::undefined(scope).into();
+                v8::Global::new(scope, undefined)
+            });
+        return Err(caught);
+    }
+    Ok(result)
+}
+
+/// Prints an uncaught callback exception the way Node does and asks the process
+/// to exit non-zero.
+fn record_uncaught(scope: &mut v8::PinScope, exception: v8::Global<v8::Value>) {
+    let exception = v8::Local::new(scope, &exception);
+    let text = rn_errors::format_exception(scope, exception, false);
+    rn_errors::write_uncaught(scope, &text);
+}
+
+/// Whether `setupTimers` has been given the callbacks the loop needs.
+///
+/// Before `internal/bootstrap/node.js` runs this is false, and the loop must not
+/// run timer phases it cannot service.
+pub fn timers_installed() -> bool {
+    CALLBACKS.with(|callbacks| {
+        let callbacks = callbacks.borrow();
+        callbacks.timer.is_some() && callbacks.immediate.is_some()
+    })
+}
+
+fn timer_callback<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    CALLBACKS.with(|callbacks| {
+        callbacks
+            .borrow()
+            .timer
+            .as_ref()
+            .map(|callback| v8::Local::new(scope, callback))
+    })
+}
+
+fn immediate_callback<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    CALLBACKS.with(|callbacks| {
+        callbacks
+            .borrow()
+            .immediate
+            .as_ref()
+            .map(|callback| v8::Local::new(scope, callback))
+    })
 }
 
 /// The ref'd timer count from the shared array.
@@ -285,6 +538,20 @@ pub fn immediate_ref_count() -> u32 {
         info.borrow()
             .as_ref()
             .and_then(|info| info.immediate.get(IMMEDIATE_REF_COUNT))
+            .unwrap_or(0)
+    })
+}
+
+/// How many immediates are queued, ref'd or not.
+///
+/// This is `immediateInfo[0]`, which `Immediate`'s constructor increments and
+/// `processImmediate()` decrements. The loop reads it to know that the check
+/// phase has work, which is why the poll phase must not block.
+pub fn immediate_count() -> u32 {
+    INFO.with(|info| {
+        info.borrow()
+            .as_ref()
+            .and_then(|info| info.immediate.get(IMMEDIATE_COUNT))
             .unwrap_or(0)
     })
 }

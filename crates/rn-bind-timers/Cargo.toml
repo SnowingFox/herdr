@@ -9,5 +9,7 @@ description = "internalBinding('timers') for rustnode"
 
 [dependencies]
 rn-core.workspace = true
+rn-errors = { path = "../rn-errors" }
+rn-io.workspace = true
 rn-v8-sys.workspace = true
 libc.workspace = true

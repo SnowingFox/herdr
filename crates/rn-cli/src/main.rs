@@ -1,5 +1,6 @@
 mod args;
 mod bootstrap;
+mod event_loop;
 
 use rn_bindings::install_all;
 use rn_core::Env;
@@ -49,6 +50,13 @@ fn main() {
     v8::V8::initialize();
 
     let mut isolate = v8::Isolate::new(Default::default());
+    // Node runs V8 with an explicit microtask policy: the embedder decides when
+    // the queue drains, through `runMicrotasks()` in
+    // `lib/internal/process/task_queues.js` and the loop's own checkpoints.
+    // V8's default `Auto` policy drains whenever a script's call depth drops to
+    // zero, which would run promise callbacks *before* the tick queue and make
+    // `process.nextTick` lose to a `.then` — Node guarantees the opposite.
+    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
     let scope = &mut scope.init();
     let context = v8::Context::new(scope, Default::default());
@@ -91,6 +99,7 @@ fn main() {
     // Node's own bootstrap defines `internalBinding` and `require`. When it fails
     // the CLI still runs, because `-e` on a bare global is useful for debugging
     // the bootstrap itself; the reason is printed so a failure is never silent.
+    let mut runtime = None;
     match bootstrap::bootstrap_realm(scope, registry, &argv_rest, &options.exec_argv) {
         Ok(loaders) => {
             if options.expose_internals() {
@@ -101,7 +110,24 @@ fn main() {
             // this stands in for it until `contextify` unblocks the real one.
             bootstrap::wrap_require_with_scheme_support(scope, &loaders);
             bootstrap::install_early_globals(scope, &loaders);
-            let _ = (loaders.internal_binding, loaders.require);
+            // The loop's JavaScript half is installed before the script runs,
+            // because a script may call `setTimeout` on its first line. A
+            // failure here is reported rather than fatal: a synchronous script
+            // still runs, and saying why timers will not fire is more useful
+            // than refusing to start.
+            match loaders.require.as_ref() {
+                Some(require) => {
+                    let require = v8::Local::new(scope, require);
+                    match event_loop::RuntimeHooks::install(scope, require) {
+                        Ok(hooks) => runtime = Some(hooks),
+                        Err(message) => eprintln!("rustnode: timers unavailable: {message}"),
+                    }
+                }
+                None => {
+                    eprintln!("rustnode: timers unavailable: the realm bootstrap left no require")
+                }
+            }
+            let _ = loaders.internal_binding;
         }
         Err(message) => eprintln!("rustnode: realm bootstrap failed: {message}"),
     }
@@ -180,12 +206,37 @@ fn main() {
         }
     }
 
+    // The script body has run. Everything it queued — timers, immediates, ticks,
+    // promise callbacks — is what the loop exists for, so it starts here rather
+    // than letting the process exit with that work still pending.
+    //
+    // The first drain happens before the first phase: Node runs the script and
+    // then checks the microtask queue, which is why a `.then` scheduled in the
+    // script body runs before the process exits and before any timer.
+    let mut exit_requested = false;
+    if let Some(hooks) = runtime.as_ref() {
+        hooks.drain(scope);
+        match event_loop::run_loop(scope, hooks) {
+            Ok(rn_io::StopReason::ExitRequested | rn_io::StopReason::TurnLimit) => {
+                exit_requested = true;
+            }
+            Ok(rn_io::StopReason::Idle) => {}
+            Err(message) => eprintln!("rustnode: the event loop could not start: {message}"),
+        }
+        // A microtask queued by the last callback in the last turn still has to
+        // run, and Node drains once more before exiting.
+        hooks.drain(scope);
+    }
+
     // A script that reports failure through `process.exitCode` rather than a
     // throw is how every one of Node's own tests fails, so the status has to
     // travel out of the interpreter. An explicit `process.exit()` already
     // terminated the process before reaching here.
     if let Some(code) = bootstrap::read_exit_code(scope) {
         std::process::exit(code);
+    }
+    if exit_requested || rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED) {
+        std::process::exit(1);
     }
 }
 

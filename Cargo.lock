@@ -1032,6 +1032,8 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rn-core",
+ "rn-errors",
+ "rn-io",
  "rn-v8-sys",
 ]
 
@@ -1157,6 +1159,8 @@ dependencies = [
 name = "rn-cli"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-task-queue",
+ "rn-bind-timers",
  "rn-bindings",
  "rn-builtins",
  "rn-core",
