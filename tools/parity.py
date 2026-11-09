@@ -138,6 +138,20 @@ out.unicode = {
 };
 
 console.log(JSON.stringify(out, null, 2));
+
+// `console.log` is the surface every script actually sees, and it formats
+// through `util.inspect` rather than JSON. Covered separately from `out`
+// because the difference is in the printed text, not in a returned value.
+console.log([1, 2, 3]);
+console.log({ a: 1, b: { c: 2 } });
+console.log('str', 42, null, undefined);
+console.log(new Map([[1, 2]]), new Set([1, 2]));
+console.log([1, [2, [3, [4]]]]);
+console.log('quote " and backslash \\');
+console.log(function named() {});
+console.log(Symbol('s'), 10n);
+console.log();
+console.log('percent %s and %d are literal here', 'x');
 """
 
 

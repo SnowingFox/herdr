@@ -207,6 +207,35 @@ fn btoa_and_atob_round_trip() {
 }
 
 #[test]
+fn console_log_formats_the_way_node_does() {
+    // `console.log` is `util.format`, so the first argument is a format string
+    // and objects are inspected rather than JSON-serialized. Both were wrong
+    // and neither shows up in a contract check.
+    let out = rustnode(&[
+        "-e",
+        "console.log([1, 2, 3]);\n\
+         console.log({ a: 1, b: { c: 2 } });\n\
+         console.log('str', 42, null, undefined);\n\
+         console.log(new Map([[1, 2]]));\n\
+         console.log('%s-%d', 'v', 42);",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "[ 1, 2, 3 ]\n\
+         { a: 1, b: { c: 2 } }\n\
+         str 42 null undefined\n\
+         Map(1) { 1 => 2 }\n\
+         v-42\n"
+    );
+}
+
+#[test]
+fn console_error_also_formats() {
+    let out = rustnode(&["-e", "console.error({ a: [1] })"]);
+    assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "{ a: [ 1 ] }");
+}
+
+#[test]
 fn a_script_reports_failure_through_the_exit_code() {
     // Node's own tests fail by setting `process.exitCode`, not by throwing, so
     // a runtime that ignores it would report every test as passing.
