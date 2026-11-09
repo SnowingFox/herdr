@@ -17,3 +17,4 @@ serde_json.workspace = true
 tracing.workspace = true
 rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-zlib = { path = "../rn-bind-zlib" }
+rn-permission = { path = "../rn-permission" }

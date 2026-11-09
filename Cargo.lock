@@ -613,6 +613,7 @@ dependencies = [
  "rn-bind-zlib",
  "rn-core",
  "rn-io",
+ "rn-permission",
  "rn-v8-sys",
  "serde",
  "serde_json",
@@ -695,6 +696,14 @@ dependencies = [
  "libc",
  "rn-core",
  "thiserror",
+]
+
+[[package]]
+name = "rn-permission"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
 ]
 
 [[package]]
