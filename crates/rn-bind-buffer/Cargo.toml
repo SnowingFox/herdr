@@ -1,0 +1,18 @@
+[package]
+name = "rn-bind-buffer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('buffer') for rustnode"
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# `v8::simdutf` is the simdutf copy V8 already links, so using it adds no
+# dependency artifact; `codec` needs it for exact UTF-8 validation.
+v8.workspace = true
