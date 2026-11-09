@@ -33,6 +33,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_url::register(registry);
     rn_bind_url_pattern::register(registry);
     rn_bind_uv::register(registry);
+    rn_bind_v8::register(registry);
     rn_bind_zlib::register(registry);
     rn_builtins::register(registry);
     rn_errors::register(registry);

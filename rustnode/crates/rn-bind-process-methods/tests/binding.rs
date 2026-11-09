@@ -101,10 +101,43 @@ fn uptime_is_a_small_non_negative_number_of_seconds() {
 
 #[test]
 fn rss_reports_real_resident_memory() {
+    let output = run(&format!("{PRELUDE} console.log(pm.rss() > 0);"));
+    assert_eq!(output, "true");
+}
+
+#[test]
+fn memory_usage_fills_the_callers_float64_array() {
+    // `lib/internal/process/per_thread.js` owns a `Float64Array(5)` and reads
+    // `[rss, heapTotal, heapUsed, external, arrayBuffers]` out of it, so the
+    // binding has to write into that array rather than return an object.
     let output = run(&format!(
-        "{PRELUDE} console.log(pm.rss() > 0, pm.memoryUsage().rss > 0);"
+        "{PRELUDE}
+        const fields = new Float64Array(5);
+        pm.memoryUsage(fields);
+        console.log(
+          fields.every((value) => typeof value === 'number'),
+          fields[0] > 0, fields[1] > 0, fields[2] > 0, fields[3] >= 0,
+          fields[2] <= fields[1]
+        );"
     ));
-    assert_eq!(output, "true true");
+    assert_eq!(output, "true true true true true true");
+}
+
+#[test]
+fn memory_usage_reports_a_moving_heap() {
+    // The heap figures come from V8, so retaining memory has to raise them.
+    // A constant would mean the array was filled with placeholders.
+    let output = run(&format!(
+        "{PRELUDE}
+        const before = new Float64Array(5);
+        pm.memoryUsage(before);
+        const keep = [];
+        for (let i = 0; i < 200000; i++) keep.push({{ i, text: 'filler-' + i }});
+        const after = new Float64Array(5);
+        pm.memoryUsage(after);
+        console.log(after[2] > before[2], keep.length);"
+    ));
+    assert_eq!(output, "true 200000");
 }
 
 #[test]

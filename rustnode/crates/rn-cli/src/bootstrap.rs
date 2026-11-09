@@ -180,6 +180,88 @@ pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
             }
         }
     }
+
+    install_process_methods(scope, require, global);
+}
+
+/// Calls `function(argument)` with `undefined` as the receiver.
+fn call_with_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    function: v8::Local<'s, v8::Value>,
+    argument: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let function = v8::Local::<v8::Function>::try_from(function).ok()?;
+    function.call(scope, v8::undefined(scope).into(), &[argument])
+}
+
+/// Installs the `process` methods `internal/process/per_thread.js` wraps.
+///
+/// `internal/bootstrap/node.js` does this during pre-execution, which cannot run
+/// yet. The wrapper is the vendored one rather than a substitute: it owns the
+/// `Float64Array`s the native calls fill and turns them into the objects user
+/// code sees, so `process.memoryUsage()` reports real numbers exactly as it does
+/// in Node.
+///
+/// Nothing is installed when the module or the binding is missing, so a name
+/// that does not work is visibly absent rather than present and wrong.
+fn install_process_methods<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+    global: v8::Local<'s, v8::Object>,
+) {
+    let Some(binding) = call_require(scope, require, "internal/bootstrap/realm")
+        .and_then(|exports| get_property(scope, exports, "internalBinding"))
+        .and_then(|binding| call_with_string(scope, binding, "process_methods"))
+    else {
+        return;
+    };
+
+    let Some(per_thread) = call_require(scope, require, "internal/process/per_thread") else {
+        return;
+    };
+    let Some(wrap) = get_property(scope, per_thread, "wrapProcessMethods") else {
+        return;
+    };
+    let Some(wrapped) = call_with_value(scope, wrap, binding) else {
+        return;
+    };
+    let Some(process) = get_property(scope, global.into(), "process")
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+    else {
+        return;
+    };
+
+    for name in [
+        "memoryUsage",
+        "cpuUsage",
+        "threadCpuUsage",
+        "resourceUsage",
+        "loadEnvFile",
+        "_rawDebug",
+        "kill",
+        "execve",
+    ] {
+        if let Some(value) = get_property(scope, wrapped, name) {
+            let _ = set(scope, process, name, value);
+        }
+    }
+
+    // `exit` stays the bootstrap's stub: the wrapper's version calls
+    // `process.reallyExit`, and replacing the stub would change what `-e` does
+    // before the event loop exists.
+
+    // `memoryUsage.rss` is `process_methods.rss`, assigned through the function
+    // object rather than returned by the wrapper.
+    if let (Some(memory_usage), Some(rss)) = (
+        get_property(scope, wrapped, "memoryUsage"),
+        get_property(scope, binding, "rss"),
+    ) {
+        if let Ok(function) = v8::Local::<v8::Function>::try_from(memory_usage) {
+            if let Some(key) = v8::String::new(scope, "rss") {
+                function.set(scope, key.into(), rss);
+            }
+        }
+    }
 }
 
 fn call_require<'s>(
