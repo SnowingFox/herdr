@@ -44,4 +44,5 @@ url_pattern
 util
 uv
 v8
+worker
 zlib
