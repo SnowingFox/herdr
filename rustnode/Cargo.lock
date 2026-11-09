@@ -808,6 +808,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-cjs-lexer"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bind-config"
 version = "0.1.0"
 dependencies = [
@@ -1155,6 +1165,7 @@ dependencies = [
  "rn-bind-async-wrap",
  "rn-bind-buffer",
  "rn-bind-cares",
+ "rn-bind-cjs-lexer",
  "rn-bind-config",
  "rn-bind-contextify",
  "rn-bind-crypto",

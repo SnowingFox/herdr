@@ -3,6 +3,7 @@ async_wrap
 buffer
 builtins
 cares_wrap
+cjs_lexer
 config
 constants
 contextify
