@@ -205,3 +205,42 @@ fn btoa_and_atob_round_trip() {
     let out = rustnode(&["-e", "console.log(btoa('hi'), atob('aGk='))"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "aGk= hi");
 }
+
+#[test]
+fn a_script_reports_failure_through_the_exit_code() {
+    // Node's own tests fail by setting `process.exitCode`, not by throwing, so
+    // a runtime that ignores it would report every test as passing.
+    let out = rustnode(&["-e", "process.exitCode = 3"]);
+    assert_eq!(out.status.code(), Some(3));
+
+    let out = rustnode(&["-e", "process.exitCode = 0"]);
+    assert_eq!(out.status.code(), Some(0));
+
+    // Unset means 0, and a throw still wins over an explicit code.
+    let out = rustnode(&["-e", "1"]);
+    assert_eq!(out.status.code(), Some(0));
+
+    let out = rustnode(&["-e", "process.exitCode = 3; throw new Error('boom')"]);
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn a_script_file_reports_its_exit_code_too() {
+    // The same path has to work for a file, which is how the harness runs a
+    // test: `node test/parallel/test-x.js`.
+    let dir = std::env::temp_dir().join("rustnode-exit-code");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("fails.js");
+    std::fs::write(
+        &path,
+        "console.log('about to fail');\nprocess.exitCode = 4;\n",
+    )
+    .expect("write script");
+    let out = rustnode(&[path.to_str().expect("utf8 path")]);
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "about to fail",
+        "the script must still run to completion"
+    );
+}
