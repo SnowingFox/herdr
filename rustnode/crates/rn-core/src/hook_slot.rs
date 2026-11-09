@@ -42,7 +42,10 @@ pub const IMPORT_META: Hook = Hook::ImportMeta;
 pub const IMPORT_META_RESOLVE: Hook = Hook::ImportMetaResolve;
 
 /// The loaders `realm.js` installs, once it has.
-type Loaders = (Option<v8::Global<v8::Function>>, Option<v8::Global<v8::Function>>);
+type Loaders = (
+    Option<v8::Global<v8::Function>>,
+    Option<v8::Global<v8::Function>>,
+);
 
 thread_local! {
     /// The `internalBinding` and `require` functions Node's `realm.js` installs
