@@ -747,6 +747,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-glob"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bind-icu"
 version = "0.1.0"
 dependencies = [
@@ -924,6 +933,7 @@ dependencies = [
  "rn-bind-diagnostics-channel",
  "rn-bind-encoding",
  "rn-bind-fs",
+ "rn-bind-glob",
  "rn-bind-icu",
  "rn-bind-messaging",
  "rn-bind-mksnapshot",

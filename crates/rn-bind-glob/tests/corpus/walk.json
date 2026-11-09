@@ -1,0 +1,246 @@
+{
+ "tree": "t2",
+ "entries": [
+  {
+   "label": "star-star-js",
+   "pattern": "**/*.js",
+   "exclude": [],
+   "maxDepth": null,
+   "option": null,
+   "expected": [
+    "top.js",
+    "b/sub/three.js",
+    "a/one.js",
+    "a/sub/two.js"
+   ]
+  },
+  {
+   "label": "star-star-dot",
+   "pattern": "**/*",
+   "exclude": [],
+   "maxDepth": null,
+   "option": "dot",
+   "expected": [
+    ".dot.js",
+    ".git",
+    "a",
+    "abslink",
+    "b",
+    "c",
+    "top.js",
+    "c/four.txt",
+    "b/linktoa",
+    "b/sub",
+    "b/sub/three.js",
+    "a/one.js",
+    "a/sub",
+    "a/sub/two.js",
+    ".git/objects",
+    ".git/objects/o.js"
+   ]
+  },
+  {
+   "label": "star-dot",
+   "pattern": "*",
+   "exclude": [],
+   "maxDepth": null,
+   "option": "dot",
+   "expected": [
+    ".dot.js",
+    ".git",
+    "a",
+    "abslink",
+    "b",
+    "c",
+    "top.js"
+   ]
+  },
+  {
+   "label": "globstar-dot",
+   "pattern": "**",
+   "exclude": [],
+   "maxDepth": null,
+   "option": "dot",
+   "expected": [
+    ".",
+    "abslink",
+    "top.js",
+    "c",
+    "c/four.txt",
+    "b",
+    "b/linktoa",
+    "b/sub",
+    "b/sub/three.js",
+    "a",
+    "a/one.js",
+    "a/sub",
+    "a/sub/two.js"
+   ]
+  },
+  {
+   "label": "star-star-js-follow",
+   "pattern": "**/*.js",
+   "exclude": [],
+   "maxDepth": null,
+   "option": "follow",
+   "expected": [
+    "top.js",
+    "b/sub/three.js",
+    "b/linktoa/one.js",
+    "b/linktoa/sub/two.js",
+    "a/one.js",
+    "a/sub/two.js"
+   ]
+  },
+  {
+   "label": "globstar-follow",
+   "pattern": "**",
+   "exclude": [],
+   "maxDepth": null,
+   "option": "follow",
+   "expected": [
+    ".",
+    "top.js",
+    "c",
+    "c/four.txt",
+    "b",
+    "b/sub",
+    "b/sub/three.js",
+    "b/linktoa",
+    "b/linktoa/one.js",
+    "b/linktoa/sub",
+    "b/linktoa/sub/two.js",
+    "abslink",
+    "abslink/four.txt",
+    "a",
+    "a/one.js",
+    "a/sub",
+    "a/sub/two.js"
+   ]
+  },
+  {
+   "label": "depth0",
+   "pattern": "**/*.js",
+   "exclude": [],
+   "maxDepth": 0,
+   "option": null,
+   "expected": []
+  },
+  {
+   "label": "depth1",
+   "pattern": "**/*.js",
+   "exclude": [],
+   "maxDepth": 1,
+   "option": null,
+   "expected": [
+    "top.js"
+   ]
+  },
+  {
+   "label": "depth2",
+   "pattern": "**/*.js",
+   "exclude": [],
+   "maxDepth": 2,
+   "option": null,
+   "expected": [
+    "top.js",
+    "a/one.js"
+   ]
+  },
+  {
+   "label": "exclude-a",
+   "pattern": "**/*.js",
+   "exclude": [
+    "/tmp/tree/t2/a/**"
+   ],
+   "maxDepth": null,
+   "option": null,
+   "expected": [
+    "top.js",
+    "b/sub/three.js"
+   ],
+   "note": "exclude resolved against cwd, as lib/internal/fs/glob.js does"
+  },
+  {
+   "label": "exclude-js",
+   "pattern": "**/*",
+   "exclude": [
+    "/tmp/tree/t2/**/*.js"
+   ],
+   "maxDepth": null,
+   "option": null,
+   "expected": [
+    "a",
+    "abslink",
+    "b",
+    "c",
+    "c/four.txt",
+    "b/linktoa",
+    "b/sub",
+    "a/sub"
+   ]
+  },
+  {
+   "label": "types",
+   "pattern": "**/*.js",
+   "exclude": [],
+   "maxDepth": null,
+   "option": "types-paths",
+   "expected": [
+    "top.js",
+    "b/sub/three.js",
+    "a/one.js",
+    "a/sub/two.js"
+   ]
+  },
+  {
+   "label": "braces",
+   "pattern": "{a,b}/**/*.js",
+   "exclude": [],
+   "maxDepth": null,
+   "option": null,
+   "expected": [
+    "b/sub/three.js",
+    "a/one.js",
+    "a/sub/two.js"
+   ]
+  },
+  {
+   "label": "nested-globstar",
+   "pattern": "**/sub/**",
+   "exclude": [],
+   "maxDepth": null,
+   "option": null,
+   "expected": [
+    "b/sub",
+    "b/sub/three.js",
+    "a/sub",
+    "a/sub/two.js"
+   ]
+  },
+  {
+   "label": "cwd-subdir",
+   "pattern": "**/*.js",
+   "exclude": [],
+   "maxDepth": null,
+   "option": "cwd:a",
+   "expected": [
+    "one.js",
+    "sub/two.js"
+   ]
+  },
+  {
+   "label": "parent-pattern",
+   "pattern": "../**/*.js",
+   "exclude": [],
+   "maxDepth": null,
+   "option": "cwd:a",
+   "expected": [
+    "../top.js",
+    "../b/sub/three.js",
+    "../a/one.js",
+    "../a/sub/two.js"
+   ]
+  }
+ ]
+}

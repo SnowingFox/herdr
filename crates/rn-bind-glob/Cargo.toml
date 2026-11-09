@@ -1,0 +1,15 @@
+[package]
+name = "rn-bind-glob"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('glob') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
