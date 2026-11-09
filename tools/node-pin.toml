@@ -6,7 +6,14 @@
 [node]
 repository = "https://github.com/nodejs/node"
 commit = "f344e7f552e"
+# The vendored lib/ tree, the V8 headers and the test suite come from this
+# revision, which reports itself as 28.0.0.
 version = "28.0.0"
+# Node 28 is not published yet; the newest released binary is a v27 alpha with
+# the same V8 base. Contract recording uses that binary and stamps the
+# producing version into each run, so a version difference stays visible
+# instead of being silently absorbed.
+recorder_version = "v27.0.0-alpha.0.0.0"
 v8_version = "15.6.75"
 v8_crate = "152.2.0"
 
