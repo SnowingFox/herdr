@@ -33,11 +33,14 @@ rn-bind-modules = { path = "../rn-bind-modules" }
 rn-bind-options = { path = "../rn-bind-options" }
 rn-bind-os = { path = "../rn-bind-os" }
 rn-bind-performance = { path = "../rn-bind-performance" }
+rn-bind-pipe-wrap = { path = "../rn-bind-pipe-wrap" }
 rn-bind-process-methods = { path = "../rn-bind-process-methods" }
 rn-bind-report = { path = "../rn-bind-report" }
+rn-bind-stream-wrap = { path = "../rn-bind-stream-wrap" }
 rn-bind-string-decoder = { path = "../rn-bind-string-decoder" }
 rn-bind-symbols = { path = "../rn-bind-symbols" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
+rn-bind-tcp-wrap = { path = "../rn-bind-tcp-wrap" }
 rn-bind-timers = { path = "../rn-bind-timers" }
 rn-bind-trace-events = { path = "../rn-bind-trace-events" }
 rn-bind-url = { path = "../rn-bind-url" }

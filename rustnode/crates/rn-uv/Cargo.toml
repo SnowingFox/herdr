@@ -1,0 +1,17 @@
+[package]
+name = "rn-uv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "libuv handle plumbing shared by rustnode's socket namespaces"
+
+[dependencies]
+libuv-sys2.workspace = true
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
