@@ -1,0 +1,23 @@
+[package]
+name = "rn-bind-url"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('url') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# Servo's WHATWG URL parser. `src/node_url.cc` is backed by ada, which
+# implements the same standard, so the parser is a spec implementation either
+# way; see the crate docs for the measured agreement with Node and the places
+# it deliberately does not match.
+url = "2.5"
+# The UTS #46 / Punycode half of WHATWG domain parsing. `url` depends on the
+# same crate, so naming it directly pins one copy rather than adding a second.
+idna = "1"
+
+[dev-dependencies]
+serde_json.workspace = true
