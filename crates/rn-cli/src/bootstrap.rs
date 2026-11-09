@@ -579,6 +579,39 @@ fn install_process_methods<'s>(
         }
     }
 
+    // The uncaught-exception hooks and `_fatalException`, which
+    // `internal/bootstrap/node.js` installs from `internal/process/execution`:
+    //
+    // ```js
+    // process._fatalException = onGlobalUncaughtException;
+    // process.setUncaughtExceptionCaptureCallback = setUncaughtExceptionCaptureCallback;
+    // process.addUncaughtExceptionCaptureCallback = addUncaughtExceptionCaptureCallback;
+    // process.hasUncaughtExceptionCaptureCallback = hasUncaughtExceptionCaptureCallback;
+    // ```
+    //
+    // `lib/domain.js` calls `setUncaughtExceptionCaptureCallback` and
+    // `internal/errors.js` names it in a message, so a missing one is a
+    // `TypeError` from inside the domain machinery.
+    if let Some(execution) = call_require(scope, require, "internal/process/execution") {
+        for name in [
+            "onGlobalUncaughtException",
+            "setUncaughtExceptionCaptureCallback",
+            "addUncaughtExceptionCaptureCallback",
+            "hasUncaughtExceptionCaptureCallback",
+        ] {
+            // `_fatalException` is the name `onGlobalUncaughtException` is
+            // installed under; the rest keep their own.
+            let target = if name == "onGlobalUncaughtException" {
+                "_fatalException"
+            } else {
+                name
+            };
+            if let Some(value) = get_property(scope, execution, name) {
+                let _ = set(scope, process, target, value);
+            }
+        }
+    }
+
     for name in [
         "memoryUsage",
         "cpuUsage",
