@@ -79,6 +79,87 @@ pub const CONTEXTIFY_CONTEXT: &str = "node:contextify:context";
 /// `importModuleDynamically` id.
 pub const HOST_DEFINED_OPTION: &str = "node:host_defined_option_symbol";
 
+/// Every `PER_ISOLATE_PRIVATE_SYMBOL_PROPERTIES` entry, as
+/// `(the name `util.privateSymbols` exposes, Node's description)`.
+///
+/// Copied from `src/env_properties.h` at the pinned revision. The exposed name
+/// is the C++ member, and the description is the string Node passes to
+/// `v8::Private::ForApi`, which is *not* always the member name: `napi_type_tag`
+/// is described as `node:napi:type_tag`.
+///
+/// `lib/**` destructures these by exposed name and then uses the symbol as a
+/// property key, so a missing entry is not an error it can report: the
+/// destructured binding is `undefined`, `object[undefined]` collapses every
+/// missing symbol onto the single string key `"undefined"`, and the read back
+/// later returns whatever the last write happened to leave there. That is
+/// exactly how `require()` lost its source text: `loader.js` writes
+/// `module[kModuleSource]` and `loadSource()` reads it as a cache, so with
+/// `kModuleSource` undefined a child module saw its *parent* object as its own
+/// source and the compile step received a `Module` where a string belonged.
+pub const PRIVATE_SYMBOLS: &[(&str, &str)] = &[
+    ("arrow_message_private_symbol", "node:arrowMessage"),
+    (
+        "contextify_context_private_symbol",
+        "node:contextify:context",
+    ),
+    ("decorated_private_symbol", "node:decorated"),
+    (
+        "empty_context_frame_sentinel_symbol",
+        "node:empty_context_frame_sentinel",
+    ),
+    (
+        "ffi_pointer_address_private_symbol",
+        "node:ffi:pointer_address",
+    ),
+    ("transfer_mode_private_symbol", "node:transfer_mode"),
+    (
+        "host_defined_option_symbol",
+        "node:host_defined_option_symbol",
+    ),
+    (
+        "js_transferable_wrapper_private_symbol",
+        "node:js_transferable_wrapper",
+    ),
+    (
+        "entry_point_module_private_symbol",
+        "node:entry_point_module",
+    ),
+    (
+        "entry_point_promise_private_symbol",
+        "node:entry_point_promise",
+    ),
+    ("module_source_private_symbol", "node:module_source"),
+    (
+        "module_export_names_private_symbol",
+        "node:module_export_names",
+    ),
+    (
+        "module_circular_visited_private_symbol",
+        "node:module_circular_visited",
+    ),
+    ("module_export_private_symbol", "node:module_export"),
+    (
+        "module_first_parent_private_symbol",
+        "node:module_first_parent",
+    ),
+    (
+        "module_last_parent_private_symbol",
+        "node:module_last_parent",
+    ),
+    ("napi_type_tag", "node:napi:type_tag"),
+    ("napi_wrapper", "node:napi:wrapper"),
+    (
+        "untransferable_object_private_symbol",
+        "node:untransferableObject",
+    ),
+    ("exit_info_private_symbol", "node:exit_info_private_symbol"),
+    ("promise_trace_id", "node:promise_trace_id"),
+    (
+        "source_map_data_private_symbol",
+        "node:source_map_data_private_symbol",
+    ),
+];
+
 /// Defines `key` on `object` so the mark stays out of enumeration.
 ///
 /// Non-enumerable, non-writable and non-configurable: `for..in`, `Object.keys` and
@@ -111,5 +192,70 @@ mod tests {
         assert_eq!(HOST_DEFINED_OPTION, "node:host_defined_option_symbol");
         // The `util` contract lists this property by exactly this spelling.
         assert!(!CONTEXTIFY_CONTEXT.is_empty());
+    }
+
+    #[test]
+    fn every_contract_private_symbol_is_in_the_table() {
+        // `contracts/util.json` is the recorded shape of
+        // `internalBinding('util').privateSymbols`, recorded from the pinned Node
+        // binary. A name in the contract but not in the table is the defect this
+        // table exists to prevent: `lib/**` destructures it, gets `undefined`, and
+        // then collapses every missing name onto the string key `"undefined"`.
+        //
+        // Read the contract here rather than hard-code the list, so a re-pin that
+        // adds a private symbol fails this test instead of silently leaving the
+        // new name uninstalled.
+        let contract = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/util.json"),
+        )
+        .expect("contracts/util.json is readable");
+        let contract: serde_json::Value =
+            serde_json::from_str(&contract).expect("contracts/util.json is valid JSON");
+        let recorded = contract["members"]["privateSymbols"]["properties"]
+            .as_array()
+            .expect("privateSymbols records a property list");
+
+        let installed: Vec<&str> = PRIVATE_SYMBOLS.iter().map(|(name, _)| *name).collect();
+        let mut missing: Vec<&str> = Vec::new();
+        for name in recorded {
+            let name = name.as_str().expect("a property name is a string");
+            if !installed.contains(&name) {
+                missing.push(name);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "private symbols recorded in the contract but not installed: {missing:?}"
+        );
+        assert_eq!(
+            installed.len(),
+            recorded.len(),
+            "the table must not install names the contract does not record"
+        );
+    }
+
+    #[test]
+    fn the_exposed_names_are_unique() {
+        // A duplicate would install one symbol under two names, so a write through
+        // one would be visible through the other. Node's table has no duplicate
+        // members; this catches a copy error in the table above.
+        let mut names: Vec<&str> = PRIVATE_SYMBOLS.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "a private symbol name is duplicated");
+
+        let mut descriptions: Vec<&str> = PRIVATE_SYMBOLS
+            .iter()
+            .map(|(_, description)| *description)
+            .collect();
+        descriptions.sort_unstable();
+        let before = descriptions.len();
+        descriptions.dedup();
+        assert_eq!(
+            before,
+            descriptions.len(),
+            "two private symbols share a description, so they would resolve to one identity"
+        );
     }
 }

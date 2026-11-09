@@ -354,12 +354,55 @@ pub fn install_cjs_loader<'s>(
         .unwrap_or(file_require);
     set(scope, global, "require", global_require.into())?;
 
-    // `module` and `exports` are globals in a CommonJS module's scope, and a
-    // script run from a file expects them the way Node provides them.
-    for name in ["module", "exports", "__filename", "__dirname"] {
-        if let Some(value) = get_property(scope, module.into(), name) {
-            let _ = set(scope, global, name, value);
-        }
+    // `module`, `exports`, `__filename` and `__dirname` are CommonJS wrapper
+    // parameters, not globals, so the real values are installed by
+    // [`run_main_module`] for the entry file and by the wrapper for every
+    // `require()`d module. The loader's `Module` constructor has no static
+    // values to mirror here.
+    Ok(())
+}
+
+/// Runs `filename` as the CommonJS main module.
+///
+/// A file run as `rustnode script.js` is not a bare script: Node loads it
+/// through the same CommonJS loader `require()` uses, so it gets the wrapper
+/// parameters (`module`, `exports`, `__filename`, `__dirname`), a resolved
+/// `require` anchored at its own directory, and an entry in `require.cache`
+/// under its own filename. Evaluating the text as a plain script instead gives
+/// it none of those, and the difference is visible to any program that reads
+/// `__filename` or assigns to `module.exports`.
+///
+/// `module` is `process.mainModule`, which `require.main` mirrors, so it has to
+/// be the instance the loader created rather than a second one.
+pub fn run_main_module<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+    filename: &str,
+) -> Result<(), String> {
+    let loader = call_require(scope, require, "internal/modules/cjs/loader")
+        .ok_or("internal/modules/cjs/loader did not load")?;
+    let module =
+        get_property(scope, loader, "Module").ok_or("the commonjs loader has no Module")?;
+    let module = v8::Local::<v8::Object>::try_from(module)
+        .map_err(|_| "the commonjs loader's Module is not an object")?;
+    let load = get_property(scope, module.into(), "_load").ok_or("Module has no _load")?;
+    let load =
+        v8::Local::<v8::Function>::try_from(load).map_err(|_| "Module._load is not a function")?;
+
+    let filename =
+        v8::String::new(scope, filename).ok_or("cannot allocate the main module filename")?;
+    let parent = v8::null(scope).into();
+    let is_main = v8::Boolean::new(scope, true).into();
+
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut try_catch.init();
+    let _ = load.call(scope, module.into(), &[filename.into(), parent, is_main]);
+    if scope.has_caught() {
+        let message = scope
+            .exception()
+            .map(|exception| exception.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        return Err(message);
     }
     Ok(())
 }

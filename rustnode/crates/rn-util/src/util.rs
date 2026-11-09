@@ -8,7 +8,6 @@
 //! listed in [`DEFERRED`] with the reason, so the contract check reports it
 //! instead of letting the JS layer read `undefined`.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use rn_core::{BindingModule, InstallCtx};
@@ -87,14 +86,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
 const SKIP_STRINGS: u32 = 1 << 0;
 const SKIP_SYMBOLS: u32 = 1 << 1;
 
-thread_local! {
-    /// Per-isolate private symbols, so identity is stable across calls.
-    ///
-    /// `lib/**` compares these by identity, so they cannot be recreated per
-    /// call; Node keeps them on the isolate for the same reason.
-    static SYMBOLS: RefCell<Option<SymbolSet>> = const { RefCell::new(None) };
-}
-
 /// What `defineLazyProperties` was told to resolve a property from.
 ///
 /// Node's `source` is either an internal module id, where the value is a named
@@ -106,11 +97,6 @@ enum LazySource {
     Module(String),
     /// `defineLazyProperties(target, { x: 'internal/streams/duplex' }, ['x'])`
     PerKey(HashMap<String, String>),
-}
-
-struct SymbolSet {
-    arrow_message: v8::Global<v8::Symbol>,
-    decorated: v8::Global<v8::Symbol>,
 }
 
 pub struct Util;
@@ -228,61 +214,36 @@ fn install_predicates(scope: &mut v8::PinScope, object: v8::Local<v8::Object>) {
     }
 }
 
-/// Installs the private symbols `lib/internal/util.js` destructures.
+/// Installs `util.privateSymbols`, the table of per-isolate private names
+/// `lib/**` destructures.
 ///
-/// Identity matters: `internal/errors` attaches an arrow message under one of
-/// these and reads it back later, so recreating them per call would break the
-/// lookup silently.
+/// Every entry in [`rn_core::PRIVATE_SYMBOLS`] is installed, because a missing
+/// one is silent: `const { x } = privateSymbols` leaves `x` as `undefined`, and
+/// `object[undefined]` is the string key `"undefined"`, so every missing name
+/// shares one property. `lib/internal/modules/cjs/loader.js` caches a module's
+/// source under `module[kModuleSource]` and returns it from `loadSource()`, so
+/// with that symbol missing a child module read its *parent* `Module` object
+/// back as its own source text and `wrapSafe` received an object.
+///
+/// Identity matters as much as presence: `contextify` marks a sandbox with
+/// `contextify_context_private_symbol` and `lib/internal/vm.js` reads it back,
+/// and `internal/errors` stores an arrow message the same way. Both come from
+/// the shared table in `rn_core`, so the crate that writes a mark and the one
+/// that reads it agree on the key.
 fn install_symbols<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<v8::Object>,
 ) -> Result<(), String> {
-    let (arrow, decorated) = SYMBOLS.with(|symbols| {
-        let existing = symbols.borrow();
-        match existing.as_ref() {
-            Some(set) => (
-                v8::Local::new(scope, &set.arrow_message),
-                v8::Local::new(scope, &set.decorated),
-            ),
-            None => {
-                drop(existing);
-                let arrow_key = v8::String::new(scope, "nodejs.arrow_message_private_symbol")
-                    .expect("symbol key");
-                let decorated_key =
-                    v8::String::new(scope, "nodejs.decorated_private_symbol").expect("symbol key");
-                let arrow = v8::Symbol::for_key(scope, arrow_key);
-                let decorated = v8::Symbol::for_key(scope, decorated_key);
-                let mut symbols = symbols.borrow_mut();
-                *symbols = Some(SymbolSet {
-                    arrow_message: v8::Global::new(scope, arrow),
-                    decorated: v8::Global::new(scope, decorated),
-                });
-                (arrow, decorated)
-            }
-        }
-    });
-
     let private = v8::Object::new(scope);
-    if let Some(key) = v8::String::new(scope, "arrow_message_private_symbol") {
-        private.set(scope, key.into(), arrow.into());
-    }
-    if let Some(key) = v8::String::new(scope, "decorated_private_symbol") {
-        private.set(scope, key.into(), decorated.into());
-    }
-    // The `contextify` mark has to be the same object `contextify.makeContext`
-    // writes and `lib/internal/vm.js`'s `isContext` reads, so it comes from the
-    // shared per-isolate table rather than being created here.
-    if let Some(key) = v8::String::new(scope, "contextify_context_private_symbol") {
-        let symbol = rn_core::symbol(scope, rn_core::CONTEXTIFY_CONTEXT);
+    for (name, description) in rn_core::PRIVATE_SYMBOLS {
+        let symbol = rn_core::symbol(scope, description);
+        let key = v8::String::new(scope, name)
+            .ok_or_else(|| format!("cannot allocate the private symbol key {name}"))?;
         private.set(scope, key.into(), symbol.into());
     }
-    if let Some(key) = v8::String::new(scope, "host_defined_option_symbol") {
-        let symbol = rn_core::symbol(scope, rn_core::HOST_DEFINED_OPTION);
-        private.set(scope, key.into(), symbol.into());
-    }
-    if let Some(key) = v8::String::new(scope, "privateSymbols") {
-        object.set(scope, key.into(), private.into());
-    }
+    let key =
+        v8::String::new(scope, "privateSymbols").ok_or("cannot allocate the privateSymbols key")?;
+    object.set(scope, key.into(), private.into());
     Ok(())
 }
 
