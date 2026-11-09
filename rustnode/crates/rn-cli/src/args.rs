@@ -127,16 +127,18 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
 /// Accepting them silently would make a test look like it exercised the feature
 /// when it did not, so they are recorded in [`Options::unimplemented`].
 ///
-/// `--experimental-bench` is deliberately absent: the flag now reaches Node's
-/// option layer through [`rn_bind_options::Store`], which is what
-/// `lib/internal/bootstrap/realm.js` reads to add `node:bench` to the
-/// user-requireable set. Warning about it would claim a working feature is
-/// missing.
+/// A flag belongs here only while the *behaviour* behind it is absent. Three
+/// were removed once `rn-bind-options` started publishing their values, because
+/// warning about them had become a lie that some tests read:
+///
+/// * `--experimental-bench` — `node:bench` is now requireable.
+/// * `--experimental-stream-iter` — `stream/iter` resolves to the vendored
+///   implementation, and the `test-quic-stream-iteration*` files pass.
+/// * `--allow-natives-syntax` — forwarded to V8, so `%DebugPrint` and the other
+///   natives intrinsics parse instead of throwing `SyntaxError`.
 const UNIMPLEMENTED: &[&str] = &[
-    "--allow-natives-syntax",
     "--experimental-network-inspection",
     "--experimental-shadow-realm",
-    "--experimental-stream-iter",
     "--experimental-vm-modules",
     "--experimental-web-worker",
     "--js-source-phase-imports",
@@ -148,7 +150,7 @@ const UNIMPLEMENTED: &[&str] = &[
 /// They still travel through the generic `--experimental-` branch, but must not
 /// be reported as unimplemented, because `lib/**` now acts on them: each is read
 /// back through `internalBinding('options')` by the vendored JavaScript.
-const IMPLEMENTED_EXPERIMENTAL: &[&str] = &["--experimental-bench"];
+const IMPLEMENTED_EXPERIMENTAL: &[&str] = &["--experimental-bench", "--experimental-stream-iter"];
 
 /// Parses the command line, or returns the message to print on a bad flag.
 pub fn parse(args: &[String]) -> Result<Options, String> {

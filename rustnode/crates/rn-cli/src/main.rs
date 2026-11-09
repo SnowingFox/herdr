@@ -369,11 +369,22 @@ fn forward_v8_flags(args: &[String]) {
     const FORWARDED: &[&str] = &["--max-old-space-size=", "--stack-size="];
     /// V8 flags spelled with no value.
     ///
-    /// Both spellings appear in Node's own test headers — `--expose-gc` and
+    /// Both spellings appear in Node's test headers — `--expose-gc` and
     /// `--expose_gc` — and V8 accepts either, so both are forwarded. Matching
     /// only the dashed form left `test-abortsignal-drop-settled-signals.mjs`
     /// failing on a flag the harness had already passed through.
-    const FORWARDED_BARE: &[&str] = &["--expose-gc", "--expose_gc"];
+    ///
+    /// `--allow-natives-syntax` is here for the same reason and is the same kind
+    /// of flag: V8 consumes it and Node stores no field for it, so accepting it
+    /// without forwarding leaves `%DebugPrint` and friends as a `SyntaxError`.
+    /// `lib/internal/test_runner/runner.js` names these two as the examples of
+    /// options that must be propagated by hand.
+    const FORWARDED_BARE: &[&str] = &[
+        "--expose-gc",
+        "--expose_gc",
+        "--allow-natives-syntax",
+        "--allow_natives_syntax",
+    ];
 
     for argument in args {
         if FORWARDED.iter().any(|prefix| argument.starts_with(prefix))
