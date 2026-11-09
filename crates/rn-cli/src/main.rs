@@ -87,6 +87,7 @@ fn main() {
             // can resolve a specifier; Node's user-land loader does that, and
             // this stands in for it until `contextify` unblocks the real one.
             bootstrap::wrap_require_with_scheme_support(scope, &loaders);
+            bootstrap::install_early_globals(scope, &loaders);
             let _ = (loaders.internal_binding, loaders.require);
         }
         Err(message) => eprintln!("rustnode: realm bootstrap failed: {message}"),
