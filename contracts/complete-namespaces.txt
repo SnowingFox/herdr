@@ -12,6 +12,7 @@ encoding_binding
 errors
 fs
 glob
+http_parser
 icu
 messaging
 mksnapshot

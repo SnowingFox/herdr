@@ -1,0 +1,21 @@
+[package]
+name = "rn-bind-http-parser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('http_parser') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+
+[build-dependencies]
+# Compiles the vendored llhttp. Node parses HTTP with this generated C state
+# machine; hand-writing a replacement is how request-smuggling bugs appear, so
+# only the glue around it is rewritten here.
+cc = "1"
+
+[dev-dependencies]
+serde_json.workspace = true
