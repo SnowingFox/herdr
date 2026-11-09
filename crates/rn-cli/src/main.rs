@@ -166,6 +166,14 @@ fn main() {
             println!("{}", value.to_rust_string_lossy(scope));
         }
     }
+
+    // A script that reports failure through `process.exitCode` rather than a
+    // throw is how every one of Node's own tests fails, so the status has to
+    // travel out of the interpreter. An explicit `process.exit()` already
+    // terminated the process before reaching here.
+    if let Some(code) = bootstrap::read_exit_code(scope) {
+        std::process::exit(code);
+    }
 }
 
 fn install_globals(scope: &mut v8::PinScope, args: &[String]) -> Result<(), String> {

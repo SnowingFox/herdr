@@ -386,7 +386,30 @@ fn process_object<'s>(
     let pid = v8::Integer::new(scope, std::process::id() as i32);
     set(scope, process, "pid", pid.into())?;
 
+    // `process.exitCode` is how a test script reports failure, and every one of
+    // Node's own tests relies on it: a script that sets it and returns exits
+    // with that status. It has to stay an assignment target that the CLI reads
+    // on the way out, so it starts at `undefined` — Node's default — and the
+    // exit path substitutes 0 for that.
+    set(scope, process, "exitCode", v8::undefined(scope).into())?;
+
     Ok(process)
+}
+
+/// Reads `process.exitCode` the way the interpreter would use it.
+///
+/// Returns `None` when it is unset, which means exit 0. A value that is not a
+/// number is Node's `ERR_INVALID_ARG_TYPE`, but this bootstrap has no
+/// `internal/errors` to throw it with yet, so an unusable value falls back to
+/// the process status rather than silently becoming 0.
+pub fn read_exit_code(scope: &mut v8::PinScope) -> Option<i32> {
+    let global = scope.get_current_context().global(scope);
+    let process = get_property(scope, global.into(), "process")?;
+    let code = get_property(scope, process, "exitCode")?;
+    if code.is_undefined() || code.is_null() {
+        return None;
+    }
+    code.integer_value(scope).map(|code| code as i32)
 }
 
 /// The architecture name Node uses, which is GYP's `target_arch`.
