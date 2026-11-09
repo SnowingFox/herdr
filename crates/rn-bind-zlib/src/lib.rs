@@ -72,16 +72,15 @@ impl BindingModule for Zlib {
         "zlib"
     }
 
-    fn deferred(&self) -> &'static [(&'static str, &'static str)] {
-        DEFERRED
-    }
-
     fn members(&self) -> &'static [&'static str] {
         &[
             "Zlib",
             "BrotliEncoder",
             "BrotliDecoder",
+            "ZstdCompress",
+            "ZstdDecompress",
             "crc32",
+            "crc32c",
             "ZLIB_VERSION",
         ]
     }
@@ -98,27 +97,15 @@ impl BindingModule for Zlib {
     }
 }
 
-/// Members the `zlib` namespace needs but this crate does not install yet.
-pub const DEFERRED: &[(&str, &str)] = &[
-    (
-        "ZstdCompress",
-        "zstd streaming handle; deflate, gzip and brotli cover the JS paths in use",
-    ),
-    (
-        "ZstdDecompress",
-        "zstd streaming handle; same scope as ZstdCompress",
-    ),
-    (
-        "crc32c",
-        "Castagnoli CRC used only by zlib.crc32 with the castagnoli option",
-    ),
-];
-
 /// Registers the `zlib` namespace with the runtime.
+///
+/// Members come from `BindingModule::members`, which is what `rn-compat` checks
+/// against `contracts/zlib.json`. Nothing is declared deferred: all eight
+/// members Node exposes are installed, including `crc32c` and the two zstd
+/// constructors.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Zlib);
 }
-
 #[cfg(test)]
 mod tests {
     use super::Zlib;
@@ -128,14 +115,21 @@ mod tests {
     fn namespace_and_members_match_the_javascript_call_sites() {
         let binding = Zlib;
         assert_eq!(binding.namespace(), "zlib");
+        // These are the eight own properties `internalBinding('zlib')` returns
+        // in Node: the five stream classes plus the two checksums and the
+        // version string. `lib/zlib.js` destructures `crc32`, `crc32c` and
+        // `ZLIB_VERSION` at module scope and constructs all five classes.
         assert_eq!(
             binding.members(),
             &[
                 "Zlib",
                 "BrotliEncoder",
                 "BrotliDecoder",
+                "ZstdCompress",
+                "ZstdDecompress",
                 "crc32",
-                "ZLIB_VERSION"
+                "crc32c",
+                "ZLIB_VERSION",
             ]
         );
     }

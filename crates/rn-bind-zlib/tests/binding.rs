@@ -150,7 +150,10 @@ fn namespace_members() {
           zlib: typeof binding.Zlib,
           encoder: typeof binding.BrotliEncoder,
           decoder: typeof binding.BrotliDecoder,
+          zstdCompress: typeof binding.ZstdCompress,
+          zstdDecompress: typeof binding.ZstdDecompress,
           crc32: typeof binding.crc32,
+          crc32c: typeof binding.crc32c,
           version: binding.ZLIB_VERSION,
           methods: ['init', 'write', 'writeSync', 'params', 'reset', 'close']
             .filter((name) => typeof binding.Zlib.prototype[name] === 'function'),
@@ -159,24 +162,32 @@ fn namespace_members() {
     );
     assert_eq!(
         result,
-        r#"{"zlib":"function","encoder":"function","decoder":"function","crc32":"function","version":"1.3.1","methods":["init","write","writeSync","params","reset","close"]}"#
+        r#"{"zlib":"function","encoder":"function","decoder":"function","zstdCompress":"function","zstdDecompress":"function","crc32":"function","crc32c":"function","version":"1.3.1","methods":["init","write","writeSync","params","reset","close"]}"#
     );
 }
 
 fn crc32_value() {
     let result = eval_with_binding(
         r#"
-        const { crc32 } = globalThis.__zlibBinding;
+        const { crc32, crc32c } = globalThis.__zlibBinding;
         const fromString = crc32('hello world');
         const fromBytes = crc32(asciiBytes('hello world'));
         // The seed parameter must be honoured, exactly as lib/zlib.js expects.
         const seeded = crc32('world', crc32('hello '));
-        JSON.stringify({ fromString, fromBytes, seeded, hex: fromString.toString(16) });
+        JSON.stringify({
+          fromString,
+          fromBytes,
+          seeded,
+          hex: fromString.toString(16),
+          // The Castagnoli variant is a distinct algorithm.
+          castagnoli: crc32c('123456789').toString(16),
+          castagnoliSeeded: crc32c('456789', crc32c('123')) === crc32c('123456789'),
+        });
         "#,
     );
     assert_eq!(
         result,
-        r#"{"fromString":222957957,"fromBytes":222957957,"seeded":222957957,"hex":"d4a1185"}"#
+        r#"{"fromString":222957957,"fromBytes":222957957,"seeded":222957957,"hex":"d4a1185","castagnoli":"e3069283","castagnoliSeeded":true}"#
     );
 }
 
@@ -502,6 +513,29 @@ fn handle_lifetime_is_safe() {
     assert_eq!(
         closed,
         r#"{"message":"zlib binding closed","errno":-2,"code":"Z_STREAM_ERROR"}"#
+    );
+
+    // The zstd constructors exist for namespace shape, but report clearly that
+    // they are unimplemented rather than surfacing a `TypeError` from
+    // `new undefined()`.
+    let zstd = eval_sequence(&[r#"
+        (() => {
+          const binding = globalThis.__zlibBinding;
+          const outcomes = {};
+          for (const name of ['ZstdCompress', 'ZstdDecompress']) {
+            try {
+              new binding[name]();
+              outcomes[name] = 'constructed';
+            } catch (error) {
+              outcomes[name] = error.message;
+            }
+          }
+          return JSON.stringify(outcomes);
+        })();
+        "#]);
+    assert_eq!(
+        zstd,
+        r#"{"ZstdCompress":"zstd is not implemented by rn-bind-zlib","ZstdDecompress":"zstd is not implemented by rn-bind-zlib"}"#
     );
 
     // Re-initializing a closed handle must work, which is what the JS does when
