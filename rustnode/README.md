@@ -37,6 +37,8 @@ reaches through `internalBinding()`.
 crates/rn-v8-sys    pinned V8 identity and linkage
 crates/rn-core      Env, BaseObject, AsyncWrap kernel
 crates/rn-bindings   the 73 internalBinding namespaces
+crates/rn-builtin-codegen
+                    compiles a builtin, and generates its V8 code cache
 crates/rn-module    CJS and ESM loading
 crates/rn-io        event loop backends
 crates/rn-napi      Node-API for prebuilt addons
