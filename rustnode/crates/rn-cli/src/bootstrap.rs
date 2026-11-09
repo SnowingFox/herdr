@@ -76,13 +76,14 @@ pub fn bootstrap_realm(
     scope: &mut v8::PinScope,
     registry: &'static rn_core::BindingRegistry,
     script_args: &[String],
+    exec_argv: &[String],
 ) -> Result<Bootstrapped, String> {
     let global = scope.get_current_context().global(scope);
 
     let primordials = v8::Object::new(scope);
     run_per_context(scope, primordials)?;
 
-    let process = process_object(scope, script_args)?;
+    let process = process_object(scope, script_args, exec_argv)?;
     set(scope, global, "process", process.into())?;
     // `realm.js` reads `primordials` as a bare global inside its wrapper, so the
     // object has to be reachable both there and through the parameter below.
@@ -164,6 +165,7 @@ fn run_per_context(
 fn process_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     script_args: &[String],
+    exec_argv: &[String],
 ) -> Result<v8::Local<'s, v8::Object>, String> {
     let process = v8::Object::new(scope);
 
@@ -200,9 +202,11 @@ fn process_object<'s>(
 
     // `process.argv` is `[execPath, ...scriptArgs]`, so the executing script's
     // arguments have to be visible here or `process.argv` lies about what ran.
-    let exec_path = std::env::args()
-        .next()
-        .unwrap_or_else(|| "rustnode".to_string());
+    // `script_args` already carries the resolved script path in front when one
+    // was given, which is where Node puts it too.
+    let exec_path = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| std::env::args().next().unwrap_or_default());
     let mut argv_values = vec![exec_path];
     argv_values.extend(script_args.iter().cloned());
     let argv = v8::Array::new(scope, argv_values.len() as i32);
@@ -212,7 +216,15 @@ fn process_object<'s>(
         }
     }
     set(scope, process, "argv", argv.into())?;
-    set(scope, process, "execArgv", v8::Array::new(scope, 0).into())?;
+    // `execArgv` is the runtime flags a child process would inherit, so it keeps
+    // `-e`/`-p` and their source but never the executable or the script path.
+    let exec_array = v8::Array::new(scope, exec_argv.len() as i32);
+    for (index, value) in exec_argv.iter().enumerate() {
+        if let Some(text) = v8::String::new(scope, value) {
+            exec_array.set_index(scope, index as u32, text.into());
+        }
+    }
+    set(scope, process, "execArgv", exec_array.into())?;
     set(scope, process, "env", v8::Object::new(scope).into())?;
 
     let pid = v8::Integer::new(scope, std::process::id() as i32);
