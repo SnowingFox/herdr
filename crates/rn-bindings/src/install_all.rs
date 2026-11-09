@@ -17,6 +17,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_icu::register(registry);
     rn_bind_messaging::register(registry);
     rn_bind_mksnapshot::register(registry);
+    rn_bind_modules::register(registry);
     rn_bind_options::register(registry);
     rn_bind_os::register(registry);
     rn_bind_performance::register(registry);

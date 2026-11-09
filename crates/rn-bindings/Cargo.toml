@@ -25,6 +25,7 @@ rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-icu = { path = "../rn-bind-icu" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-bind-mksnapshot = { path = "../rn-bind-mksnapshot" }
+rn-bind-modules = { path = "../rn-bind-modules" }
 rn-bind-options = { path = "../rn-bind-options" }
 rn-bind-os = { path = "../rn-bind-os" }
 rn-bind-performance = { path = "../rn-bind-performance" }

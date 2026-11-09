@@ -671,6 +671,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-modules"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bind-options"
 version = "0.1.0"
 dependencies = [
@@ -803,6 +813,7 @@ dependencies = [
  "rn-bind-icu",
  "rn-bind-messaging",
  "rn-bind-mksnapshot",
+ "rn-bind-modules",
  "rn-bind-options",
  "rn-bind-os",
  "rn-bind-performance",
