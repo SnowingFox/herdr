@@ -10,6 +10,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_async_context::register(registry);
     rn_bind_async_wrap::register(registry);
     rn_bind_buffer::register(registry);
+    rn_bind_cares::register(registry);
     rn_bind_config::register(registry);
     rn_bind_diagnostics_channel::register(registry);
     rn_bind_encoding::register(registry);

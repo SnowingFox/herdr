@@ -702,6 +702,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-cares"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-bind-uv",
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bind-config"
 version = "0.1.0"
 dependencies = [
@@ -908,6 +919,7 @@ dependencies = [
  "rn-bind-async-context",
  "rn-bind-async-wrap",
  "rn-bind-buffer",
+ "rn-bind-cares",
  "rn-bind-config",
  "rn-bind-diagnostics-channel",
  "rn-bind-encoding",
