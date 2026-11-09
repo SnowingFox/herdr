@@ -17,7 +17,6 @@
 //! JavaScript layer reaches a Rust namespace, so it is where the binding registry
 //! is consulted.
 
-use rn_core::{BindingModule, InstallCtx};
 use rn_js2c::builtin_by_id;
 use rn_v8_sys::v8;
 
@@ -32,7 +31,7 @@ pub struct Bootstrapped {
 /// Runs the bootstrap and returns the loaders it created.
 pub fn bootstrap_realm(
     scope: &mut v8::PinScope,
-    registry: &rn_core::BindingRegistry,
+    registry: &'static rn_core::BindingRegistry,
 ) -> Result<Bootstrapped, String> {
     let global = scope.get_current_context().global(scope);
 
@@ -156,9 +155,12 @@ fn process_object<'s>(
 /// `undefined` that fails much later and much less clearly.
 fn internal_binding_dispatcher<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _registry: &rn_core::BindingRegistry,
+    registry: &'static rn_core::BindingRegistry,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(get_internal_binding).build(scope);
+    let external = v8::External::new(scope, registry as *const _ as *mut std::ffi::c_void);
+    let template = v8::FunctionTemplate::builder(get_internal_binding)
+        .data(external.into())
+        .build(scope);
     let function = template
         .get_function(scope)
         .ok_or("cannot allocate getInternalBinding")?;
@@ -178,56 +180,20 @@ fn get_internal_binding(
         return;
     };
     let name = name.to_rust_string_lossy(scope);
-    match install_namespace(scope, &name) {
+
+    let Ok(external) = v8::Local::<v8::External>::try_from(args.data()) else {
+        throw(scope, "getInternalBinding was called without a registry");
+        return;
+    };
+    // SAFETY: the pointer comes from a `&'static BindingRegistry` in
+    // `internal_binding_dispatcher`, so it outlives every callback that can
+    // read it.
+    let registry = unsafe { &*(external.value() as *const rn_core::BindingRegistry) };
+
+    match registry.install(scope, &name) {
         Ok(object) => rv.set(object.into()),
-        Err(message) => throw(scope, &message),
+        Err(message) => throw(scope, message.as_str()),
     }
-}
-
-/// Installs one namespace, caching the result on the global so a second call
-/// returns the same object.
-fn install_namespace<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    name: &str,
-) -> Result<v8::Local<'s, v8::Object>, String> {
-    let global = scope.get_current_context().global(scope);
-    let cache_key = format!("__rustnodeBinding_{name}");
-    if let Some(key) = v8::String::new(scope, &cache_key) {
-        if let Some(existing) = global.get(scope, key.into()) {
-            if let Ok(object) = v8::Local::<v8::Object>::try_from(existing) {
-                return Ok(object);
-            }
-        }
-    }
-
-    let object = match name {
-        "builtins" => install(scope, &rn_builtins::Builtins)?,
-        "errors" => install(scope, &rn_errors::Errors)?,
-        "module_wrap" => install(scope, &rn_module_wrap::ModuleWrapBinding)?,
-        "util" => install(scope, &rn_util::Util)?,
-        "types" => install(scope, &rn_util::Types)?,
-        other => {
-            return Err(format!(
-                "internalBinding('{other}') is not available: the namespace has no Rust implementation yet"
-            ))
-        },
-    };
-
-    if let Some(key) = v8::String::new(scope, &cache_key) {
-        global.set(scope, key.into(), object.into());
-    }
-    Ok(object)
-}
-
-fn install<'s, M: BindingModule>(
-    scope: &mut v8::PinScope<'s, '_>,
-    module: &M,
-) -> Result<v8::Local<'s, v8::Object>, String> {
-    let mut async_ids = rn_core::AsyncIds::new();
-    let mut ctx = InstallCtx {
-        async_ids: &mut async_ids,
-    };
-    module.install(scope, &mut ctx)
 }
 
 fn set(

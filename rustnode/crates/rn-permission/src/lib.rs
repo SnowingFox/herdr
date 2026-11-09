@@ -58,7 +58,5 @@ pub use path::{resolve_path, wildcard_if_dir, RadixTree};
 /// The binding is installed with a permissive model by default; the CLI is what
 /// turns enforcement on from `--permission` and the `--allow-*` flags.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(rn_core::Namespace::from_module(
-        &PermissionBinding::from_model(PermissionModel::disabled()),
-    ));
+    registry.register_module(PermissionBinding::from_model(PermissionModel::disabled()));
 }

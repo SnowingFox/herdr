@@ -116,7 +116,7 @@ pub const DEFERRED: &[(&str, &str)] = &[
 
 /// Registers the `zlib` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(rn_core::Namespace::from_module(&Zlib));
+    registry.register_module(Zlib);
 }
 
 #[cfg(test)]
