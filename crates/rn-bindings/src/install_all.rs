@@ -14,4 +14,5 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_errors::register(registry);
     rn_module_wrap::register(registry);
     rn_permission::register(registry);
+    rn_util::register(registry);
 }
