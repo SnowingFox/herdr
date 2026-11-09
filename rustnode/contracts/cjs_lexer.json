@@ -1,0 +1,11 @@
+{
+  "namespace": "cjs_lexer",
+  "reachable": true,
+  "members": {
+    "parse": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "namespace": "options",
+  "reachable": true,
+  "members": {
+    "envSettings": {
+      "kind": "object",
+      "properties": [
+        "kAllowedInEnvvar",
+        "kDisallowedInEnvvar"
+      ],
+      "origin": "both"
+    },
+    "getCLIOptionsInfo": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCLIOptionsValues": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getEmbedderOptions": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getEnvOptionsInputType": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getNamespaceOptionsInputType": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getOptionsAsFlags": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "parseNodeOptionsEnvVar": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "types": {
+      "kind": "object",
+      "properties": [
+        "kBoolean",
+        "kHostPort",
+        "kInteger",
+        "kNoOp",
+        "kString",
+        "kStringList",
+        "kUInteger",
+        "kV8Option"
+      ],
+      "origin": "both"
+    }
+  }
+}

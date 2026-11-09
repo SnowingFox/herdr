@@ -1,0 +1,16 @@
+{
+  "namespace": "async_context_frame",
+  "reachable": true,
+  "members": {
+    "getContinuationPreservedEmbedderData": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setContinuationPreservedEmbedderData": {
+      "kind": "function",
+      "arity": 1,
+      "origin": "both"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "namespace": "heap_utils",
+  "reachable": true,
+  "members": {
+    "buildEmbedderGraph": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "createHeapSnapshotStream": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "triggerHeapSnapshot": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

@@ -1,0 +1,258 @@
+{
+  "namespace": "v8",
+  "reachable": true,
+  "members": {
+    "GCProfiler": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "cachedDataVersionTag": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "detailLevel": {
+      "kind": "object",
+      "properties": [
+        "BRIEF",
+        "DETAILED"
+      ],
+      "origin": "both"
+    },
+    "getCppHeapStatistics": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getHashSeed": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "heapCodeStatisticsBuffer": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ],
+      "origin": "both"
+    },
+    "heapSpaceStatisticsBuffer": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ],
+      "origin": "both"
+    },
+    "heapStatisticsBuffer": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9"
+      ],
+      "origin": "both"
+    },
+    "isStringOneByteRepresentation": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "kBytecodeAndMetadataSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kCPUProfilerMetaDataSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kCodeAndMetadataSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kDoesZapGarbageIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kExternalMemoryIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kExternalScriptSourceSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kHeapSizeLimitIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kHeapSpaces": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "10",
+        "11",
+        "12",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "length"
+      ],
+      "origin": "both"
+    },
+    "kMallocedMemoryIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kNumberOfDetachedContextsIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kNumberOfNativeContextsIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kPeakMallocedMemoryIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kPhysicalSpaceSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSamplingForceGC": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSamplingIncludeObjectsCollectedByMajorGC": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSamplingIncludeObjectsCollectedByMinorGC": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSamplingNoFlags": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSpaceAvailableSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSpaceSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSpaceUsedSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTotalAllocatedBytes": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTotalAvailableSize": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTotalGlobalHandlesSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTotalHeapSizeExecutableIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTotalHeapSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTotalPhysicalSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kUsedGlobalHandlesSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kUsedHeapSizeIndex": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "setFlagsFromString": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setHeapProfileNearHeapLimit": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setHeapSnapshotNearHeapLimit": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "startCpuProfile": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "startHeapProfile": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "stopCpuProfile": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "stopHeapProfile": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "updateHeapCodeStatisticsBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "updateHeapSpaceStatisticsBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "updateHeapStatisticsBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

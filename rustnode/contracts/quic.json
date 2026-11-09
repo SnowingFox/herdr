@@ -1,0 +1,547 @@
+{
+  "namespace": "quic",
+  "reachable": false,
+  "unreachable_reason": "No such binding: quic",
+  "members": {
+    "CC_ALGO_BBR_STR": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "CC_ALGO_CUBIC_STR": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "CC_ALGO_RENO_STR": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "CLOSECONTEXT_BIND_FAILURE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "CLOSECONTEXT_CLOSE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "CLOSECONTEXT_LISTEN_FAILURE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "CLOSECONTEXT_RECEIVE_FAILURE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "CLOSECONTEXT_SEND_FAILURE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "CLOSECONTEXT_START_FAILURE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "DEFAULT_CIPHERS": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "DEFAULT_GROUPS": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "DEFAULT_PREFERRED_ADDRESS_POLICY": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "Endpoint": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_ENDPOINT_BOUND": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_ENDPOINT_BUSY": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_ENDPOINT_CLOSING": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_ENDPOINT_LISTENING": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_ENDPOINT_MAX_CONNECTIONS_PER_HOST": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_ENDPOINT_MAX_CONNECTIONS_TOTAL": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_ENDPOINT_PENDING_CALLBACKS": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_ENDPOINT_RECEIVING": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_APPLICATION_TYPE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_CLOSING": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_GRACEFUL_CLOSE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_HANDSHAKE_COMPLETED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_HANDSHAKE_CONFIRMED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_HEADERS_SUPPORTED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_INTERNAL_ERROR_CODE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_LAST_DATAGRAM_ID": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_LISTENER_FLAGS": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_MAX_DATAGRAM_SIZE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_MAX_PENDING_DATAGRAMS": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_NO_ERROR_CODE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_PRIORITY_SUPPORTED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_REQUEST_REJECTED_CODE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_SILENT_CLOSE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_STATELESS_RESET": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_STREAM_CALLBACKS_SUPPORTED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_STREAM_OPEN_ALLOWED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_SESSION_WRAPPED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_BUDGET": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_FIN_RECEIVED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_FIN_SENT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_HAS_OUTBOUND": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_HAS_READER": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_ID": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_PENDING": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_READ_ENDED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_RECEIVED_EARLY_DATA": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_RESET": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_RESET_CODE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_SIZE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_WANTS_BLOCK": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_WANTS_RESET": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_WANTS_STOP_SENDING": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_WRITE_DESIRED_SIZE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATE_STREAM_WRITE_ENDED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_BYTES_RECEIVED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_BYTES_SENT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_CLIENT_SESSIONS": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_CREATED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_DESTROYED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_IMMEDIATE_CLOSE_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_IMMEDIATE_CLOSE_RATE_LIMITED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_PACKETS_BLOCKED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_PACKETS_RECEIVED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_PACKETS_SENT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_RETRY_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_RETRY_RATE_LIMITED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_SERVER_BUSY_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_SERVER_SESSIONS": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_SESSION_CREATION_RATE_LIMITED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_STATELESS_RESET_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_STATELESS_RESET_RATE_LIMITED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_VERSION_NEGOTIATION_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_ENDPOINT_VERSION_NEGOTIATION_RATE_LIMITED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_BIDI_IN_STREAM_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_BIDI_OUT_STREAM_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_BLOCK_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_BYTES_IN_FLIGHT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_BYTES_LOST": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_BYTES_RECEIVED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_BYTES_RECV": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_BYTES_SENT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_CLOSING_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_CREATED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_CWND": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_DATAGRAMS_ACKNOWLEDGED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_DATAGRAMS_LOST": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_DATAGRAMS_RECEIVED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_DATAGRAMS_SENT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_DESTROYED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_HANDSHAKE_COMPLETED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_HANDSHAKE_CONFIRMED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_LATEST_RTT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_MAX_BYTES_IN_FLIGHT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_MIN_RTT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_PING_RECV": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_PKT_DISCARDED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_PKT_LOST": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_PKT_RECV": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_PKT_SENT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_RTTVAR": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_SMOOTHED_RTT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_SSTHRESH": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_STREAMS_IDLE_TIMED_OUT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_UNI_IN_STREAM_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_SESSION_UNI_OUT_STREAM_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_ACKED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_BYTES_ACCUMULATED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_BYTES_RECEIVED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_BYTES_SENT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_COUNT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_CREATED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_DESTROYED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_FINAL_SIZE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_MAX_BYTES_ACCUMULATED": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_MAX_OFFSET": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_MAX_OFFSET_ACK": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_MAX_OFFSET_RECV": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_OPENED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "IDX_STATS_STREAM_RECEIVED_AT": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "PREFERRED_ADDRESS_IGNORE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "PREFERRED_ADDRESS_USE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "QUIC_STREAM_HEADERS_FLAGS_NONE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "QUIC_STREAM_HEADERS_FLAGS_TERMINAL": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "QUIC_STREAM_HEADERS_KIND_HINTS": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "QUIC_STREAM_HEADERS_KIND_INITIAL": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "QUIC_STREAM_HEADERS_KIND_TRAILING": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "STREAM_DIRECTION_BIDIRECTIONAL": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "STREAM_DIRECTION_UNIDIRECTIONAL": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "sendHeaders": {
+      "kind": "function",
+      "origin": "static"
+    },
+    "setCallbacks": {
+      "kind": "function",
+      "origin": "static"
+    },
+    "setHeadersInterest": {
+      "kind": "function",
+      "origin": "static"
+    }
+  }
+}

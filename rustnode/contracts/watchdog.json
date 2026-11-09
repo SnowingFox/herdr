@@ -1,0 +1,11 @@
+{
+  "namespace": "watchdog",
+  "reachable": true,
+  "members": {
+    "TraceSigintWatchdog": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

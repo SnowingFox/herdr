@@ -1,0 +1,60 @@
+{
+  "namespace": "worker",
+  "reachable": true,
+  "members": {
+    "Worker": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getEnvMessagePort": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isInternalThread": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "isMainThread": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "kCodeRangeSizeMb": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kMaxOldGenerationSizeMb": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kMaxYoungGenerationSizeMb": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kStackSizeMb": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTotalResourceLimitCount": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "ownsProcessState": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "resourceLimits": {
+      "kind": "undefined",
+      "origin": "both"
+    },
+    "threadId": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "threadName": {
+      "kind": "string",
+      "origin": "both"
+    }
+  }
+}

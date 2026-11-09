@@ -1,0 +1,36 @@
+{
+  "namespace": "icu",
+  "reachable": true,
+  "members": {
+    "decode": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "getConverter": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "getStringWidth": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "hasConverter": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "icuErrName": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "transcode": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}
