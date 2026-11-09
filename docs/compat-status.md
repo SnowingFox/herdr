@@ -1,8 +1,9 @@
 # Compatibility status
 
 rustnode claims Node compatibility structurally: the V8 engine and all 435
-builtin JavaScript files are the same ones Node 28 ships, so the only thing that
-can differ is the native layer written in Rust. That claim is only worth
+`lib/**` builtin JavaScript files are the same ones Node 28 ships, plus the
+`deps/undici/undici.js` bundle Node's js2c embeds alongside them, so the only
+thing that can differ is the native layer written in Rust. That claim is only worth
 something if it is checked, so four gates check it. Each gate can fail on its
 own, and each answers a different question.
 
@@ -40,14 +41,24 @@ cd rustnode
 ./tools/verify-libjs.sh
 ```
 
-It prints `vendor/libnode-js matches the pinned Node revision (435 files)` and
-exits 0, or names the modified file and exits 1. The check is a plain
+It prints
+`vendor/libnode-js matches the pinned Node revision (435 lib files, 1 deps file)`
+and exits 0, or names the modified file and exits 1. The check is a plain
 `sha256sum -c` against `vendor/libnode-js/LIBJS.sha256` plus a file count, so it
-needs no network and no Node binary. **Current state: passing, 435 files.**
+needs no network and no Node binary. **Current state: passing, 435 `lib/` files
+and 1 `deps/` file.**
 
 If a genuine Node bug requires a JavaScript change, that is a design decision,
 not a local edit: it means the native layer cannot express what the JavaScript
 expects, and the fix belongs in Rust.
+
+`vendor/libnode-js/deps/undici/undici.js` is frozen the same way, for the same
+reason. Node's js2c embeds `lib/**` and an explicit `deps_files` list into one
+builtin table, and `lib/**` requires that bundle by id — without it,
+`require('internal/deps/undici/undici')` throws `Missing internal module` and
+`fetch`, `Response`, `FormData` and the WebAssembly streaming callback are all
+unreachable. The two trees are counted separately (435 and 1): a single total
+would let one gain a file while the other lost one and still balance.
 
 ## Gate 2: binding contracts
 

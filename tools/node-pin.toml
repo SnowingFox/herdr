@@ -1,8 +1,8 @@
 # Node source rustnode is built against.
 #
 # The JavaScript layer in vendor/libnode-js is copied byte-identical from this
-# revision. Bumping the pin means re-copying lib/** and regenerating
-# vendor/libnode-js/LIBJS.sha256 in the same commit.
+# revision. Bumping the pin means re-copying lib/** and deps/**, and regenerating
+# vendor/libnode-js/LIBJS.sha256, all in the same commit.
 [node]
 repository = "https://github.com/nodejs/node"
 commit = "f344e7f552e"
@@ -18,6 +18,16 @@ v8_version = "15.6.75"
 v8_crate = "152.2.0"
 
 [counts]
+# `lib/**` and `deps/**` are counted separately because they are separate
+# inputs to Node's js2c: `library_files` globs `lib/`, while `deps_files` is an
+# explicit list in `node.gyp`. One combined total would let either tree gain a
+# file while the other lost one and still balance, so both counts are exact.
 builtin_files = 435
+# Node's js2c embeds `deps/undici/undici.js`, the self-contained esbuild bundle
+# `lib/**` requires as `internal/deps/undici/undici`. It is the only
+# `deps_files` entry rustnode vendors, so this is 1 rather than a glob over
+# undici's own source tree, which is thousands of files and none of them
+# builtins.
+deps_files = 1
 internal_binding_namespaces = 73
 test_files_parallel = 5161

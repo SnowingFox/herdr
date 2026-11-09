@@ -5,9 +5,16 @@ Node's `js2c` step, as Rust data.
 Node does not ship `lib/**` as files at run time. `tools/js2c.cc` embeds every
 builtin in a generated `node_javascript.cc`, and `BuiltinLoader` reads them from a
 `BuiltinSourceMap` keyed by id. This crate does the same thing at build time:
-`build.rs` walks `vendor/libnode-js/lib/**`, verifies each file against
-`vendor/libnode-js/LIBJS.sha256`, and emits a static table that `src/lib.rs`
-`include!`s. There is no runtime file I/O to load a builtin.
+`build.rs` walks `vendor/libnode-js/lib/**` and `vendor/libnode-js/deps/**`,
+verifies each file against `vendor/libnode-js/LIBJS.sha256`, and emits a static
+table that `src/lib.rs` `include!`s. There is no runtime file I/O to load a
+builtin.
+
+Two trees exist because Node's js2c is handed two: `lib/**` is globbed, and
+`deps_files` is an explicit list in `node.gyp`. The one `deps/` file vendored here
+is `deps/undici/undici.js`, which `lib/**` requires as
+`internal/deps/undici/undici`. Each tree keeps its own exact count — 435 and 1 —
+so neither can absorb the other's drift.
 
 ## API
 
@@ -57,6 +64,7 @@ Derivation, from `tools/js2c.cc::GetFileId`:
 | `lib/internal/fs/promises.js` | `internal/fs/promises` |
 | `lib/internal/readline/emitKeypressEvents.js` | `internal/readline/emitKeypressEvents` |
 | `deps/acorn/acorn/dist/acorn.js` | `internal/deps/acorn/acorn/dist/acorn` |
+| `deps/undici/undici.js` | `internal/deps/undici/undici` |
 
 The `.js`/`.mjs` suffix is stripped, then a `deps/` prefix becomes
 `internal/deps/` and a `lib/` prefix is dropped. Case is preserved; nothing else
@@ -80,14 +88,16 @@ Classification, from `src/builtin_info.cc::GetBuiltinSourceType` and
 
 ## Frozen data
 
-- `build.rs` verifies every file against `LIBJS.sha256` and fails the build
-  naming the file that drifted.
+- `build.rs` verifies every file in both trees against `LIBJS.sha256` and fails
+  the build naming the file that drifted.
 - The table digest is pinned in `tests/builtins.rs`, so a re-pin that changes
   ids, kinds, categories or text cannot pass by regenerating the manifest alone.
-- `./tools/verify-libjs.sh` remains the outer gate: 435 files, byte-identical.
+- `./tools/verify-libjs.sh` remains the outer gate: 435 `lib/` files and 1
+  `deps/` file, byte-identical, with both counts enforced.
 
-On an intentional Node re-pin: update `tools/node-pin.toml`, re-copy `lib/**`,
-regenerate `LIBJS.sha256`, refresh `TABLE_DIGEST`, all in one commit.
+On an intentional Node re-pin: update `tools/node-pin.toml`, re-copy `lib/**`
+and `deps/**`, regenerate `LIBJS.sha256`, refresh `TABLE_DIGEST`, all in one
+commit.
 
 ## Why not compressed
 

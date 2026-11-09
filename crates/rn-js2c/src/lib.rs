@@ -12,7 +12,8 @@
 //!
 //! 1. the **id** — the string key of Node's `BuiltinSourceMap`, also what
 //!    `lib/internals` passes to `require()`;
-//! 2. the **source text** — byte-identical to `vendor/libnode-js/lib/**`;
+//! 2. the **source text** — byte-identical to `vendor/libnode-js/lib/**` and
+//!    `vendor/libnode-js/deps/**`;
 //! 3. the **kind** — determines how V8 compiles it and which parameters wrap it
 //!    (`node::builtins::BuiltinSourceType`).
 //!
@@ -49,11 +50,24 @@
 //!
 //! V8 wants a `v8::String` of JavaScript source; every consumer of [`Builtin`]
 //! hands the text straight to `ScriptCompiler`. A compressed blob would need a
-//! decoder on the startup path for a 5.9 MB payload whose pages are only touched
-//! for the builtins actually compiled, so decompression would trade cheap demand
-//! paging for CPU on every first require, and would make the embedded bytes
-//! unverifiable against `LIBJS.sha256`. Plain `&'static str` also lets rustc
-//! deduplicate and place the data in rodata with no custom linker work.
+//! decoder on the startup path for a payload whose pages are only touched for the
+//! builtins actually compiled, so decompression would trade cheap demand paging
+//! for CPU on every first require, and would make the embedded bytes unverifiable
+//! against `LIBJS.sha256`. Plain `&'static str` also lets rustc deduplicate and
+//! place the data in rodata with no custom linker work.
+//!
+//! # The two vendored trees
+//!
+//! Node's js2c is handed `lib/**` and an explicit `deps_files` list, and it
+//! embeds both into one flat map. rustnode vendors the same two trees and merges
+//! them the same way, so `require('internal/deps/undici/undici')` resolves out of
+//! the same table as `require('fs')`.
+//!
+//! They stay separate everywhere a count is checked
+//! ([`scheme::BUILTIN_FILE_COUNT`] for `lib/**`, [`scheme::DEPS_FILE_COUNT`] for
+//! `deps/**`), because one combined total could stay constant while a file moved
+//! from one tree to the other, and the freeze would report success for a tree
+//! Node's js2c would no longer reproduce.
 
 #![deny(missing_docs)]
 
@@ -248,6 +262,10 @@ impl std::fmt::Display for ManifestMismatch {
 /// generator cannot see edits made after it ran, and the build error is not
 /// available to a compat report.
 ///
+/// The manifest covers both vendored trees, keyed by js2c path, so this walks the
+/// whole embedded table rather than only `lib/`: a `deps/` builtin whose file was
+/// removed or edited after the build is reported here like any other.
+///
 /// `manifest` is the file's text; passing it in keeps this free of file I/O so
 /// it can also validate a manifest captured from a release.
 pub fn verify_against_manifest(manifest: &str) -> Result<(), Vec<ManifestMismatch>> {
@@ -272,7 +290,7 @@ pub fn verify_against_manifest(manifest: &str) -> Result<(), Vec<ManifestMismatc
     let recorded: BTreeMap<String, String> = recorded.into_iter().collect();
 
     for builtin in BUILTINS.iter() {
-        let js2c_path = format!("lib/{}.js", builtin.id);
+        let js2c_path = scheme::js2c_path_for(builtin.id);
         match recorded.get(&js2c_path) {
             None => mismatches.push(ManifestMismatch::Unlisted { id: builtin.id }),
             Some(expected) => {
@@ -337,25 +355,32 @@ pub fn table_digest() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheme::BUILTIN_FILE_COUNT;
+    use crate::scheme::{BUILTIN_FILE_COUNT, DEPS_FILE_COUNT};
+
+    /// Every builtin, because a manifest is checked across both vendored trees.
+    const TOTAL_BUILTINS: usize = BUILTIN_FILE_COUNT + DEPS_FILE_COUNT;
 
     /// First few manifest lines for real builtins, so the positive case does not
-    /// need the whole file.
+    /// need the whole file. The js2c path comes from the same inverse rule the
+    /// check uses, so the fixture cannot hide a wrong path mapping.
     fn manifest_prefix() -> String {
         let mut out = String::new();
         for builtin in BUILTINS.iter().take(3) {
             let digest = sha256::digest_hex(builtin.source.as_bytes());
-            out.push_str(&format!("{digest}  lib/{}.js\n", builtin.id));
+            out.push_str(&format!(
+                "{digest}  {}\n",
+                scheme::js2c_path_for(builtin.id)
+            ));
         }
         out
     }
 
     #[test]
     fn manifest_check_reports_unlisted_builtins() {
-        // A manifest covering only the first three builtins: the other 432 must
-        // each be reported by name, not just counted.
+        // A manifest covering only the first three builtins: every other one must
+        // be reported by name, not just counted.
         let mismatches = verify_against_manifest(&manifest_prefix()).expect_err("must not pass");
-        assert_eq!(mismatches.len(), BUILTIN_FILE_COUNT - 3);
+        assert_eq!(mismatches.len(), TOTAL_BUILTINS - 3);
         assert!(
             mismatches
                 .iter()
@@ -367,6 +392,17 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, ManifestMismatch::Unlisted { id: "zlib" })),
             "the last builtin must be reported: {mismatches:?}"
+        );
+        // The deps builtin is the one entry a lib-only walk could never produce,
+        // so requiring it by name is what makes the check cover both trees.
+        assert!(
+            mismatches.iter().any(|m| matches!(
+                m,
+                ManifestMismatch::Unlisted {
+                    id: "internal/deps/undici/undici"
+                }
+            )),
+            "the deps builtin must be reported too: {mismatches:?}"
         );
     }
 
@@ -384,7 +420,10 @@ mod tests {
             } else {
                 digest
             };
-            manifest.push_str(&format!("{digest}  lib/{}.js\n", builtin.id));
+            manifest.push_str(&format!(
+                "{digest}  {}\n",
+                scheme::js2c_path_for(builtin.id)
+            ));
         }
 
         let mismatches = verify_against_manifest(&manifest).expect_err("must not pass");
@@ -407,7 +446,10 @@ mod tests {
         let mut manifest = String::new();
         for builtin in BUILTINS.iter() {
             let digest = sha256::digest_hex(builtin.source.as_bytes());
-            manifest.push_str(&format!("{digest}  lib/{}.js\n", builtin.id));
+            manifest.push_str(&format!(
+                "{digest}  {}\n",
+                scheme::js2c_path_for(builtin.id)
+            ));
         }
         manifest.push_str(&format!("{}  lib/removed_builtin.js\n", "0".repeat(64)));
 
@@ -444,7 +486,8 @@ mod tests {
         // The single-space form is NOT accepted: `sha256sum` writes two spaces,
         // and splitting on one would silently accept a path with a leading space.
         let digest = sha256::digest_hex(BUILTINS[0].source.as_bytes());
-        let line = format!("{digest} lib/{}.js\n", BUILTINS[0].id);
+        let first_path = scheme::js2c_path_for(BUILTINS[0].id);
+        let line = format!("{digest} {first_path}\n");
         let mismatches = verify_against_manifest(&line).expect_err("must fail");
         assert!(matches!(
             mismatches[0],
@@ -457,7 +500,10 @@ mod tests {
         let mut manifest = String::new();
         for builtin in BUILTINS.iter() {
             let digest = sha256::digest_hex(builtin.source.as_bytes());
-            manifest.push_str(&format!("{digest}  lib/{}.js\n", builtin.id));
+            manifest.push_str(&format!(
+                "{digest}  {}\n",
+                scheme::js2c_path_for(builtin.id)
+            ));
         }
         // Blank lines are tolerated, as the real file may end with one.
         manifest.push('\n');

@@ -57,7 +57,7 @@ impl BindingModule for Builtins {
 
         // `builtinIds` is the only table `realm.js` reads before anything else,
         // so it is the only one built here. `builtinCategories` and `natives`
-        // cost real time over all 435 builtins and nothing in the bootstrap
+        // cost real time over all 436 builtins and nothing in the bootstrap
         // reads them; they are accessors that build once, on first use. See
         // `lazy_member` for why the cache behind them is not on the object.
         let ids = id_array(scope);
@@ -163,7 +163,7 @@ fn cached<'s>(
 /// Nothing in the bootstrap reads it: `realm.js` derives its public and internal
 /// id lists by filtering `builtinIds`, and this split is only consulted by a
 /// caller that asks for `process.binding('builtins').builtinCategories`.
-/// Building it eagerly allocated two arrays over all 435 ids on every start for
+/// Building it eagerly allocated two arrays over all 436 ids on every start for
 /// a value most processes never look at.
 fn categories_getter(
     scope: &mut v8::PinScope,
@@ -177,7 +177,7 @@ fn categories_getter(
 
 /// Getter for `natives`, the legacy `process.binding('natives')` table.
 ///
-/// This is the expensive one: it materialises all 435 builtin sources as V8
+/// This is the expensive one: it materialises all 436 builtin sources as V8
 /// strings — about 1.25 MB of text — and cost several milliseconds on every
 /// start. Node builds the same object lazily too:
 /// `internal/legacy/processbinding.js` reaches it only through
