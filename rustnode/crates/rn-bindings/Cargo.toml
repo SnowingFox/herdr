@@ -19,4 +19,5 @@ rn-bind-config = { path = "../rn-bind-config" }
 rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-zlib = { path = "../rn-bind-zlib" }
 rn-builtins = { path = "../rn-builtins" }
+rn-errors = { path = "../rn-errors" }
 rn-permission = { path = "../rn-permission" }
