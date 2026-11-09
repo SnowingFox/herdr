@@ -15,7 +15,7 @@ pub mod hook_slot;
 pub mod queue;
 
 pub use abi::{BindingModule, InstallCtx};
-pub use aliased_buffer::AliasedUint8Array;
+pub use aliased_buffer::{AliasedUint8Array, Element};
 pub use async_wrap::AsyncIds;
 pub use binding::{BindingRegistry, Installer, Namespace};
 pub use env::Env;

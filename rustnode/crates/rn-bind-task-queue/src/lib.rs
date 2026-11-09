@@ -75,13 +75,13 @@ impl BindingModule for TaskQueue {
         scope: &mut v8::PinScope<'s, '_>,
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
-        let tick_info = AliasedUint8Array::new(scope, TICK_INFO_FIELDS)?;
+        let tick_info = AliasedUint8Array::new(scope, TICK_INFO_FIELDS, rn_core::Element::Byte)?;
         let array = tick_info.array(scope);
         TICK_INFO.with(|slot| *slot.borrow_mut() = Some(tick_info));
 
         let object = v8::Object::new(scope);
         let values: [(&str, v8::Local<v8::Value>); 6] = [
-            ("tickInfo", array.into()),
+            ("tickInfo", array),
             ("promiseRejectEvents", promise_reject_events(scope)),
             (
                 "enqueueMicrotask",
@@ -139,7 +139,7 @@ pub fn has_rejection_to_warn() -> bool {
 pub fn set_tick_flag(field: usize, value: bool) {
     TICK_INFO.with(|slot| {
         if let Some(info) = slot.borrow().as_ref() {
-            info.set(field, u8::from(value));
+            info.set(field, u32::from(value));
         }
     });
 }
