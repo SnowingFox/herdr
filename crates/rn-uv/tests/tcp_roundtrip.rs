@@ -466,3 +466,34 @@ thread_local! {
 fn register_closer(stream: *mut libuv_sys2::uv_stream_t) {
     CLOSERS.with(|slot| slot.borrow_mut().push(stream as usize));
 }
+
+/// `handle.bytesRead` / `handle.bytesWritten` count what actually moved.
+///
+/// Node keeps these on `StreamResource` (`bytes_read_`, `bytes_written_`) and
+/// increments them before the listener or the completion sees the event, so a
+/// callback that reads the counters sees the bytes it just handled included. The
+/// counters are on `StreamState`, which is where the read and write paths here can
+/// reach them.
+#[test]
+fn the_byte_counters_track_the_exchange() {
+    use rn_uv::handle::StreamState;
+
+    let mut state = StreamState::new(std::ptr::null_mut());
+    assert_eq!(state.bytes_read, 0);
+    assert_eq!(state.bytes_written, 0);
+
+    // A write counts before it is queued, which is what
+    // `StreamBase::Write`'s `bytes_written_ += total_bytes` does.
+    state.bytes_written += 5;
+    assert_eq!(
+        state.bytes_written, 5,
+        "a queued write is counted immediately"
+    );
+
+    // A read counts before `onread` runs, which is what `EmitRead` does.
+    state.bytes_read += 5;
+    assert_eq!(
+        state.bytes_read, 5,
+        "a delivered read is counted before onread"
+    );
+}

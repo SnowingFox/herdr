@@ -398,8 +398,9 @@ unsafe extern "C" fn on_read(
         drop(take_allocation());
         return;
     };
-    // SAFETY: `state` is the owner pointer, live while the handle is.
-    let state = unsafe { &*state };
+    // SAFETY: `state` is the owner pointer, live while the handle is, and nothing
+    // else borrows it during this callback.
+    let state = unsafe { &mut *state };
 
     let allocation = if status > 0 { take_allocation() } else { None };
     if status <= 0 {

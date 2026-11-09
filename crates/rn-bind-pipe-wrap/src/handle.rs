@@ -27,10 +27,6 @@ pub struct PipeHandle {
     /// `PipeWrap::SocketType`: [`crate::SOCKET`], [`crate::SERVER`] or
     /// [`crate::IPC`].
     pub kind: i32,
-    /// Bytes read so far, for `handle.bytesRead`.
-    pub bytes_read: u64,
-    /// Bytes handed to writes so far, for `handle.bytesWritten`.
-    pub bytes_written: u64,
     /// The finalizer registration, parked here so it lives as long as the
     /// handle.
     pub weak: Option<v8::Weak<v8::Object>>,
@@ -58,8 +54,6 @@ impl PipeHandle {
             pipe,
             state: StreamState::new(stream),
             kind,
-            bytes_read: 0,
-            bytes_written: 0,
             weak: None,
         }))
     }
