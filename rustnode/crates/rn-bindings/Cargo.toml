@@ -22,3 +22,4 @@ rn-builtins = { path = "../rn-builtins" }
 rn-errors = { path = "../rn-errors" }
 rn-module-wrap = { path = "../rn-module-wrap" }
 rn-permission = { path = "../rn-permission" }
+rn-util = { path = "../rn-util" }

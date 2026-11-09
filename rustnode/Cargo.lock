@@ -627,6 +627,7 @@ dependencies = [
  "rn-io",
  "rn-module-wrap",
  "rn-permission",
+ "rn-util",
  "rn-v8-sys",
  "serde",
  "serde_json",
@@ -647,10 +648,15 @@ name = "rn-cli"
 version = "0.1.0"
 dependencies = [
  "rn-bindings",
+ "rn-builtins",
  "rn-core",
+ "rn-errors",
  "rn-io",
+ "rn-js2c",
  "rn-module",
+ "rn-module-wrap",
  "rn-napi",
+ "rn-util",
  "rn-v8-sys",
  "tracing",
  "tracing-subscriber",
@@ -738,6 +744,14 @@ dependencies = [
 
 [[package]]
 name = "rn-permission"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-util"
 version = "0.1.0"
 dependencies = [
  "rn-core",

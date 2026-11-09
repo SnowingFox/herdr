@@ -12,6 +12,11 @@ name = "rustnode"
 path = "src/main.rs"
 
 [dependencies]
+rn-util = { path = "../rn-util" }
+rn-module-wrap = { path = "../rn-module-wrap" }
+rn-errors = { path = "../rn-errors" }
+rn-builtins = { path = "../rn-builtins" }
+rn-js2c = { path = "../rn-js2c" }
 rn-core = { path = "../rn-core" }
 rn-bindings = { path = "../rn-bindings" }
 rn-module = { path = "../rn-module" }

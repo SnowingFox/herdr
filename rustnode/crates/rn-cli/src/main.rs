@@ -1,3 +1,5 @@
+mod bootstrap;
+
 use rn_bindings::install_all;
 use rn_core::Env;
 use rn_v8_sys::v8;
@@ -39,6 +41,16 @@ fn main() {
     if let Err(message) = install_globals(scope, &args) {
         eprintln!("rustnode: {message}");
         std::process::exit(1);
+    }
+
+    // Node's own bootstrap defines `internalBinding` and `require`. When it fails
+    // the CLI still runs, because `-e` on a bare global is useful for debugging
+    // the bootstrap itself; the reason is printed so a failure is never silent.
+    match bootstrap::bootstrap_realm(scope, &registry) {
+        Ok(loaders) => {
+            let _ = (loaders.internal_binding, loaders.require);
+        },
+        Err(message) => eprintln!("rustnode: realm bootstrap failed: {message}"),
     }
 
     let mut print_result = false;

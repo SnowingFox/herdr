@@ -41,6 +41,49 @@ pub const IMPORT_META: Hook = Hook::ImportMeta;
 /// Callback behind `import.meta.resolve`.
 pub const IMPORT_META_RESOLVE: Hook = Hook::ImportMetaResolve;
 
+thread_local! {
+    /// The `internalBinding` and `require` functions Node's `realm.js` installs
+    /// through `setInternalLoaders`.
+    ///
+    /// Every builtin compiled after the bootstrap closes over these, and the CLI
+    /// needs `require` to run a user script, so they have to outlive the call
+    /// that stored them.
+    static LOADERS: RefCell<(Option<v8::Global<v8::Function>>, Option<v8::Global<v8::Function>>)> =
+        const { RefCell::new((None, None)) };
+}
+
+/// Records the loaders `realm.js` installed.
+pub fn set_internal_loaders(
+    internal_binding: v8::Global<v8::Function>,
+    require: v8::Global<v8::Function>,
+) {
+    LOADERS.with(|loaders| {
+        *loaders.borrow_mut() = (Some(internal_binding), Some(require));
+    });
+}
+
+/// Returns a local handle to the installed `require`, if the bootstrap ran.
+pub fn require<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    LOADERS.with(|loaders| {
+        loaders
+            .borrow()
+            .1
+            .as_ref()
+            .map(|require| v8::Local::new(scope, require))
+    })
+}
+
+/// Returns a local handle to the installed `internalBinding`, if it ran.
+pub fn internal_binding<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    LOADERS.with(|loaders| {
+        loaders
+            .borrow()
+            .0
+            .as_ref()
+            .map(|binding| v8::Local::new(scope, binding))
+    })
+}
+
 /// Writes text to the process standard error.
 type StderrWriter = Box<dyn Fn(&str)>;
 
