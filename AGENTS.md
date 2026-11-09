@@ -75,8 +75,25 @@ that to a stub that returns something plausible: `rn-compat` reports declared
 deferrals as a pass and undeclared gaps as a failure, so a deferral is visible and
 a lie is not.
 
+`tools/deferred-reach.py` asks the follow-up question the contract cannot: does
+`lib/**` reach this absent member while a module is still loading? Only *calls*
+count. `const { crc32c } = binding` binds `undefined` and is harmless, and
+feature-detecting with `if (crc32c === undefined)` is legitimate; calling it at
+module scope is what makes `require()` throw, which is the real failure the tool
+exists to catch. The tool rejects a `DEFERRED` block it cannot parse rather than
+reporting zero deferrals, so reword or reformat entries freely but keep them
+parseable `("member", "reason")` pairs.
+
 ## Where the reference source is
 
 `/workspace/node` is a sparse checkout of the pinned Node revision. Read
 `src/**` and `lib/**` there; never push to or modify it, its origin is
 `nodejs/node`.
+
+## Cargo's `tools/*` workspace glob
+
+`tools/` is a workspace member glob, so any directory in it needs a
+`Cargo.toml`. `__pycache__` is ignored in `.gitignore` for that reason: importing
+one of the Python tools into a test left one behind and the whole workspace
+failed to load with a missing manifest.
+
