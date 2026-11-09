@@ -12,9 +12,24 @@ use std::path::{Path, PathBuf};
 use rn_js2c::{builtin_by_id, builtin_ids, builtin_sources, BuiltinCategory, BuiltinKind};
 
 /// Same count `./tools/verify-libjs.sh` asserts and `tools/node-pin.toml`
-/// records. Repeated literally on purpose: an accidental change to the crate's
-/// constant must not be able to move this test's expectation with it.
+/// records for `lib/**`. Repeated literally on purpose: an accidental change to
+/// the crate's constant must not be able to move this test's expectation with it.
+///
+/// This is `lib/**` only, and it stays 435. The `deps/**` tree Node's js2c also
+/// embeds is counted separately ([`EXPECTED_DEPS_BUILTINS`]) so the two can
+/// never explain each other's drift.
 const EXPECTED_BUILTINS: usize = 435;
+
+/// Number of builtins vendored from `deps/**`, which is the one esbuild bundle
+/// `lib/**` requires as `internal/deps/undici/undici`. Node's `node.gyp` lists
+/// its `deps_files` explicitly, so this is a pinned number rather than a glob.
+const EXPECTED_DEPS_BUILTINS: usize = 1;
+
+/// Total embedded entries: the `lib/**` tree plus the `deps/**` tree.
+const EXPECTED_TOTAL: usize = EXPECTED_BUILTINS + EXPECTED_DEPS_BUILTINS;
+
+/// The one builtin id that comes from `deps/**`.
+const UNDICI_ID: &str = "internal/deps/undici/undici";
 
 fn rustnode_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is rustnode/crates/rn-js2c. Walk up instead of assuming
@@ -41,11 +56,22 @@ fn vendored_lib() -> PathBuf {
     rustnode_root().join("vendor/libnode-js/lib")
 }
 
-/// Every `.js` file under the vendored tree, as `lib/<relative>` js2c paths.
-fn vendored_js_paths() -> BTreeSet<String> {
-    let root = vendored_lib();
+fn vendored_deps() -> PathBuf {
+    rustnode_root().join("vendor/libnode-js/deps")
+}
+
+/// Whether an embedded id came from the `deps/**` tree.
+///
+/// The id prefix is the only thing the id itself can say about its origin, so
+/// this is the same rule `rn_js2c::scheme::js2c_path_for` inverts.
+fn is_deps_id(id: &str) -> bool {
+    id.starts_with("internal/deps/")
+}
+
+/// Every `.js` file under one vendored tree, as `<prefix><relative>` js2c paths.
+fn vendored_js_paths(root: &Path, prefix: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let mut pending = vec![root.clone()];
+    let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         for entry in fs::read_dir(&dir).expect("vendored tree is readable") {
             let path = entry.expect("directory entry is readable").path();
@@ -53,31 +79,52 @@ fn vendored_js_paths() -> BTreeSet<String> {
                 pending.push(path);
             } else if path.extension().is_some_and(|ext| ext == "js") {
                 let relative = path
-                    .strip_prefix(&root)
+                    .strip_prefix(root)
                     .expect("path is under the vendored root")
                     .to_str()
                     .expect("vendored paths are UTF-8");
-                out.insert(format!("lib/{relative}"));
+                out.insert(format!("{prefix}{relative}"));
             }
         }
     }
     out
 }
 
+/// On-disk path of the file behind an embedded id, in whichever tree holds it.
+fn path_for_id(id: &str) -> PathBuf {
+    if let Some(rest) = id.strip_prefix("internal/deps/") {
+        vendored_deps().join(format!("{rest}.js"))
+    } else {
+        vendored_lib().join(format!("{id}.js"))
+    }
+}
+
 #[test]
 fn every_vendored_file_is_embedded_exactly_once() {
     assert_eq!(
         builtin_sources().len(),
+        EXPECTED_TOTAL,
+        "embedded builtin count must match both pinned Node trees \
+         ({} under lib/ plus {} under deps/)",
         EXPECTED_BUILTINS,
-        "embedded builtin count must match the pinned Node tree"
+        EXPECTED_DEPS_BUILTINS
     );
 
-    let on_disk = vendored_js_paths();
+    // Each tree is counted where it is, so one gaining a file while the other
+    // loses one cannot balance out into a passing total.
+    let lib_on_disk = vendored_js_paths(&vendored_lib(), "lib/");
     assert_eq!(
-        on_disk.len(),
+        lib_on_disk.len(),
         EXPECTED_BUILTINS,
         "vendor/libnode-js/lib must still hold {} .js files",
         EXPECTED_BUILTINS
+    );
+    let deps_on_disk = vendored_js_paths(&vendored_deps(), "deps/");
+    assert_eq!(
+        deps_on_disk.len(),
+        EXPECTED_DEPS_BUILTINS,
+        "vendor/libnode-js/deps must still hold {} .js file",
+        EXPECTED_DEPS_BUILTINS
     );
 
     let embedded: BTreeSet<String> = builtin_sources()
@@ -86,14 +133,26 @@ fn every_vendored_file_is_embedded_exactly_once() {
         .collect();
     assert_eq!(
         embedded.len(),
-        EXPECTED_BUILTINS,
+        EXPECTED_TOTAL,
         "every builtin id must be unique; a duplicate means two files collapsed onto one id"
+    );
+    assert_eq!(
+        embedded
+            .iter()
+            .filter(|id| is_deps_id(id))
+            .collect::<Vec<_>>(),
+        vec![&UNDICI_ID.to_string()],
+        "exactly one builtin must come from deps/, and it must be the undici bundle"
     );
 
     // Rebuild the id each embedded entry must have from the file on disk, and
-    // require the two sets to be equal. A file added to the vendored tree
+    // require the two sets to be equal. A file added to either vendored tree
     // without regenerating fails here with the missing id named.
-    let expected_ids: BTreeSet<String> = on_disk.iter().map(|p| id_for_js2c_path(p)).collect();
+    let expected_ids: BTreeSet<String> = lib_on_disk
+        .iter()
+        .chain(deps_on_disk.iter())
+        .map(|p| id_for_js2c_path(p))
+        .collect();
     assert_eq!(
         embedded,
         expected_ids,
@@ -105,20 +164,27 @@ fn every_vendored_file_is_embedded_exactly_once() {
 
 /// The id rule, restated independently of the crate's implementation so a bug in
 /// `scheme::get_file_id` cannot satisfy this test trivially.
+///
+/// Both vendored trees are handled, because js2c rewrites a `deps/` prefix to
+/// `internal/deps/` and the crate's `get_file_id` must agree with that.
 fn id_for_js2c_path(js2c_path: &str) -> String {
-    js2c_path
-        .strip_prefix("lib/")
-        .expect("js2c path starts with lib/")
+    let stripped = js2c_path
         .strip_suffix(".js")
-        .expect("js2c path ends with .js")
-        .to_string()
+        .expect("js2c path ends with .js");
+    if let Some(rest) = stripped.strip_prefix("deps/") {
+        format!("internal/deps/{rest}")
+    } else {
+        stripped
+            .strip_prefix("lib/")
+            .expect("js2c path starts with lib/ or deps/")
+            .to_string()
+    }
 }
 
 #[test]
 fn each_builtin_source_is_byte_identical_to_the_vendored_file() {
-    let root = vendored_lib();
     for builtin in builtin_sources() {
-        let path = root.join(format!("{}.js", builtin.id()));
+        let path = path_for_id(builtin.id());
         let on_disk = fs::read(&path)
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
         let on_disk = String::from_utf8(on_disk)
@@ -136,7 +202,7 @@ fn each_builtin_source_is_byte_identical_to_the_vendored_file() {
 #[test]
 fn ids_are_sorted_so_lookup_is_a_binary_search() {
     let ids = builtin_ids();
-    assert_eq!(ids.len(), EXPECTED_BUILTINS);
+    assert_eq!(ids.len(), EXPECTED_TOTAL);
     let mut sorted = ids.to_vec();
     sorted.sort_unstable();
     assert_eq!(
@@ -281,7 +347,25 @@ fn kinds_match_the_ids_node_classifies() {
     assert_eq!(counts(BuiltinKind::BootstrapScript), 8);
     assert_eq!(counts(BuiltinKind::PerContextScript), 3);
     assert_eq!(counts(BuiltinKind::MainScript), 14);
-    assert_eq!(counts(BuiltinKind::Function), 409);
+    // 409 of the `lib/` functions plus the undici bundle from `deps/`, which
+    // Node classifies as `kFunction` too (it is the one `deps/` id whose path is
+    // not under `internal/deps/v8/tools/`, the only module bucket).
+    assert_eq!(counts(BuiltinKind::Function), 409 + EXPECTED_DEPS_BUILTINS);
+
+    // The undici bundle is the one entry a `lib/`-only generator could never
+    // produce, so pin its classification explicitly rather than only the totals.
+    let undici = builtin_by_id(UNDICI_ID).expect("the deps bundle is embedded");
+    assert_eq!(undici.kind(), BuiltinKind::Function);
+    assert_eq!(
+        undici.category(),
+        BuiltinCategory::Internal,
+        "a deps builtin may never be reachable as a core module"
+    );
+    assert_eq!(
+        undici.parameters(),
+        BuiltinKind::Function.parameters(),
+        "it is compiled as an ordinary CommonJS function"
+    );
 }
 
 #[test]
@@ -289,7 +373,7 @@ fn core_and_internal_split_matches_realm_bootstrap() {
     let core: Vec<_> = rn_js2c::core_ids().collect();
     let internal: Vec<_> = rn_js2c::internal_ids().collect();
 
-    assert_eq!(core.len() + internal.len(), EXPECTED_BUILTINS);
+    assert_eq!(core.len() + internal.len(), EXPECTED_TOTAL);
     assert!(
         core.iter().all(|id| !id.starts_with("internal/")),
         "no core module may live under internal/"
@@ -299,8 +383,18 @@ fn core_and_internal_split_matches_realm_bootstrap() {
         "every internal module must live under internal/"
     );
     // Node's `lib/` has 73 top-level core modules; that number is stable enough
-    // to catch a whole directory being classified the wrong way round.
+    // to catch a whole directory being classified the wrong way round. It is
+    // unchanged by the deps tree: every `deps/` id starts with `internal/`, so a
+    // core count that moved here would mean the split, not the tree, changed.
     assert_eq!(core.len(), 73, "core module count: {core:?}");
+    assert!(
+        core.iter().all(|id| !is_deps_id(id)),
+        "no deps builtin may be reachable as a core module: {core:?}"
+    );
+    assert!(
+        internal.len() == EXPECTED_TOTAL - 73,
+        "the internal side must hold every non-core builtin, deps included"
+    );
 }
 
 #[test]
@@ -354,6 +448,17 @@ fn lookup_misses_are_clean() {
         builtin_by_id("fs").map(|b| b.source())
     );
     assert_eq!(rn_js2c::source("nope"), None);
+    // The deps bundle is reachable by its js2c id and by nothing else: the
+    // filesystem path that produced it is not a second way to ask for it.
+    assert!(rn_js2c::exists(UNDICI_ID));
+    assert!(
+        builtin_by_id("deps/undici/undici").is_none(),
+        "the js2c path is not an id"
+    );
+    assert!(
+        builtin_by_id("undici").is_none(),
+        "the bundle is not a core module"
+    );
 }
 
 #[test]
@@ -362,7 +467,7 @@ fn natives_covers_every_id_once() {
     // legacy `process.binding('natives')` view must have exactly the same
     // entries in the same order.
     let natives: BTreeMap<_, _> = rn_js2c::natives().collect();
-    assert_eq!(natives.len(), EXPECTED_BUILTINS);
+    assert_eq!(natives.len(), EXPECTED_TOTAL);
     for builtin in builtin_sources() {
         assert_eq!(natives.get(builtin.id()), Some(&builtin.source()));
     }
@@ -374,13 +479,14 @@ fn natives_covers_every_id_once() {
 
 #[test]
 fn totals_are_plausible() {
-    assert_eq!(rn_js2c::builtin_count(), EXPECTED_BUILTINS);
+    assert_eq!(rn_js2c::builtin_count(), EXPECTED_TOTAL);
     let total = rn_js2c::source_bytes();
-    // The vendored tree is ~5.9 MB now. Assert a band rather than an exact byte
-    // count: a Node re-pin moves this number legitimately, while a generator
-    // that silently dropped or duplicated payloads would fall out of it.
+    // The vendored trees are ~6.8 MB now: ~5.9 MB of `lib/**` plus the 831,314
+    // byte undici bundle. Assert a band rather than an exact byte count: a Node
+    // re-pin moves this number legitimately, while a generator that silently
+    // dropped or duplicated payloads would fall out of it.
     assert!(
-        (5_000_000..8_000_000).contains(&total),
+        (6_000_000..9_000_000).contains(&total),
         "embedded source is {total} bytes, outside the expected band"
     );
     assert_eq!(
@@ -389,6 +495,16 @@ fn totals_are_plausible() {
             .iter()
             .map(|b| b.source_len())
             .sum::<usize>()
+    );
+
+    // The bundle is the single largest entry, and it is the one whose absence
+    // would otherwise show up only as a runtime `Missing internal module`. Pin
+    // its size so a truncated download or a half-written copy fails here.
+    let undici = builtin_by_id(UNDICI_ID).expect("the deps bundle is embedded");
+    assert_eq!(
+        undici.source_len(),
+        831_314,
+        "the undici bundle is not the size the pinned revision ships"
     );
 }
 
@@ -407,9 +523,9 @@ fn totals_are_plausible() {
 ///    if the manifest were regenerated to match — a manifest of hashes cannot see
 ///    a change in how a builtin is classified.
 ///
-/// On an intentional re-pin: update `tools/node-pin.toml`, re-copy `lib/**`,
-/// regenerate `LIBJS.sha256`, then replace the digest below with the value the
-/// failure prints. All of that belongs in one commit.
+/// On an intentional re-pin: update `tools/node-pin.toml`, re-copy `lib/**` and
+/// `deps/**`, regenerate `LIBJS.sha256`, then replace the digest below with the
+/// value the failure prints. All of that belongs in one commit.
 #[test]
 fn vendored_tree_matches_the_embedded_copy() {
     let manifest = rustnode_root().join("vendor/libnode-js/LIBJS.sha256");
@@ -435,6 +551,7 @@ fn vendored_tree_matches_the_embedded_copy() {
     );
 }
 
-/// Digest of the whole table: 435 builtins, 5,948,693 source bytes, 73 core.
-/// Covers id, kind, category, source length and source text for every entry.
-const TABLE_DIGEST: &str = "f75326383d78953099ba32bea6eb84e7e9ca52423d939cb3b3f870e05ddb0915";
+/// Digest of the whole table: 436 builtins (435 under `lib/`, 1 under `deps/`),
+/// 73 core. Covers id, kind, category, source length and source text for every
+/// entry.
+const TABLE_DIGEST: &str = "039aab74a8b77710dab83e3ebaa3724aaa1209eeb6176192b03325aec741d577";

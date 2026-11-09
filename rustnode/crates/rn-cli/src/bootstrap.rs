@@ -243,12 +243,39 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
             "internal/webstreams/queuingstrategies",
             &["ByteLengthQueuingStrategy", "CountQueuingStrategy"][..],
         ),
+        // `internal/deps/undici/undici` reads these three at module scope
+        // (`webidl.is.Blob = MakeTypeAssertion(Blob)` and neighbours), so a
+        // global object whose descriptors get walked — which
+        // `test-util-inspect.js` does through `fullObjectGraph(globalThis)` —
+        // forces undici to load and fails without them. Node installs them from
+        // `internal/bootstrap/web/exposed-window-or-worker.js`, the same module
+        // this function mirrors.
+        ("internal/worker/io", &["MessageChannel", "MessagePort"][..]),
+        ("internal/blob", &["Blob"][..]),
+        ("internal/file", &["File"][..]),
     ] {
         let (Some(id), Some(array)) = (v8::String::new(scope, module), names_array(scope, names))
         else {
             continue;
         };
         let _ = expose_lazy.call(scope, util, &[global.into(), id.into(), array.into()]);
+    }
+
+    // `DOMException` is an `[Exposed=*]` interface that
+    // `internal/bootstrap/web/exposed-wildcard.js` publishes through
+    // `internalBinding('messaging').exposeLazyDOMExceptionProperty(globalThis)`.
+    // That module cannot run here — it aborts on the missing `inspector`
+    // binding — so the same binding call is made directly. `internal/blob.js`
+    // and `internal/util.js` construct it, and Node's own
+    // `test/parallel/test-util-inspect.js` inspects its prototype.
+    if let Some(namespace) = v8::String::new(scope, "messaging") {
+        if let Some(messaging) = internal_binding.call(scope, global.into(), &[namespace.into()]) {
+            if let Some(expose) = get_property(scope, messaging, "exposeLazyDOMExceptionProperty") {
+                if let Ok(expose) = v8::Local::<v8::Function>::try_from(expose) {
+                    let _ = expose.call(scope, messaging, &[global.into()]);
+                }
+            }
+        }
     }
 
     // `URL` and `URLSearchParams` are not lazy in Node: `internal/url` is small

@@ -813,13 +813,27 @@ fn new_quota_exceeded_error(
 
 fn expose_lazy_dom_exception_property(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
 ) {
-    // Node installs a lazy getter for `DOMException` on the target. The
-    // constructor here is already installed eagerly, so the lazy hook has
-    // nothing left to do; accepting it keeps `js_transferable.js` loadable.
-    let _ = scope;
+    // Node installs a lazy accessor for `DOMException` on the target. Two things
+    // need the property to exist: `internal/bootstrap/web/exposed-wildcard.js`
+    // calls this during pre-execution, and `internal/blob.js` throws
+    // `lazyDOMException(...)` from `arrayBuffer()` and the stream error path.
+    //
+    // The constructor is installed eagerly rather than lazily because it is a
+    // single function template that `MessagePort` already needs: there is nothing
+    // to defer, and an accessor that only forwards to the constructor would add a
+    // getter to the startup path for no saving.
+    let target = match v8::Local::<v8::Object>::try_from(args.get(0)) {
+        Ok(target) => target,
+        Err(_) => scope.get_current_context().global(scope),
+    };
+    let Some(key) = v8::String::new(scope, "DOMException") else {
+        return;
+    };
+    let constructor = dom_exception_constructor(scope);
+    target.set(scope, key.into(), constructor);
 }
 
 fn set_deserializer_create_object_function(

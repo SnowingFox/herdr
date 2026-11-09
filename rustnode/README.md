@@ -8,7 +8,7 @@ parts that only exist to glue them to the OS.
 | Layer | Source | Status |
 | --- | --- | --- |
 | JavaScript engine | V8, pinned to the version Node 28 ships | reused unchanged |
-| Node builtin JS (`lib/**`, 435 files) | vendored byte-identical from Node 28 | reused unchanged, hash-frozen |
+| Node builtin JS (`lib/**` 435 files + `deps/undici/undici.js`) | vendored byte-identical from Node 28 | reused unchanged, hash-frozen |
 | Native layer (`src/**`, ~156k lines of C++) | this repository, Rust | being rewritten |
 | Event loop | libuv semantics first, io_uring backend later | in progress |
 
@@ -24,8 +24,10 @@ reaches through `internalBinding()`.
 
 ## Guarantees enforced in CI
 
-- `vendor/libnode-js/LIBJS.sha256` freezes all 435 builtin files. Any edit fails
-  the build, so behaviour cannot drift into a JS fork.
+- `vendor/libnode-js/LIBJS.sha256` freezes all 435 `lib/**` builtin files and the
+  `deps/undici/undici.js` bundle. Any edit fails the build, so behaviour cannot
+  drift into a JS fork. The two trees keep separate exact counts, so one gaining
+  a file while the other loses one cannot balance out.
 - `contracts/*.json` records the exact shape every `internalBinding()` namespace
   must expose, captured from a real Node binary. `rn-compat` fails the build
   when a Rust namespace does not match.

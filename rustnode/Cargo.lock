@@ -787,6 +787,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-blob"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-buffer"
 version = "0.1.0"
 dependencies = [
@@ -1238,6 +1246,7 @@ version = "0.1.0"
 dependencies = [
  "rn-bind-async-context",
  "rn-bind-async-wrap",
+ "rn-bind-blob",
  "rn-bind-buffer",
  "rn-bind-cares",
  "rn-bind-cjs-lexer",

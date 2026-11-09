@@ -48,8 +48,8 @@ process: `rn-builtins::compile` went straight to
 `ScriptCompiler::CompileFunction` with no cache.
 
 **`natives` cost 4.1–4.6 ms.** `internalBinding('builtins')` eagerly built the
-`{ id: source }` table over all 435 builtins — 1.25 MB of V8 strings — and
-`realm.js` never reads it. `builtinCategories` (two more 435-element arrays) is
+`{ id: source }` table over all 436 builtins — 1.25 MB of V8 strings — and
+`realm.js` never reads it. `builtinCategories` (two more 436-element arrays) is
 equally unread at startup. Node builds `natives` lazily through
 `process.binding('natives')`.
 
@@ -63,7 +63,7 @@ callers cannot observe a difference. A self-replacing accessor was tried first
 and re-enters itself through `define_own_property`, so the cache lives outside
 the object.
 
-`natives` still returns all 435 sources, with the same identity across reads.
+`natives` still returns all 436 sources, with the same identity across reads.
 Nothing is removed, so the member list still matches `contracts/builtins.json`.
 
 ### 2. Builtins boot from a build-time code cache (measured −13 ms)

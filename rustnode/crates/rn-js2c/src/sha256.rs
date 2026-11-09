@@ -3,7 +3,7 @@
 //!
 //! Compiled into the library and into `build.rs`. FIPS 180-4, no dependencies.
 //! The unit tests check the standard vectors, and the integration tests check
-//! every one of the 435 digests recorded in the vendored manifest, so the
+//! every one of the 436 digests recorded in the vendored manifest, so the
 //! implementation is validated against coreutils output rather than only against
 //! itself.
 
