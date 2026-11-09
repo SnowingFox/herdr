@@ -593,6 +593,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-buffer"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+ "v8",
+]
+
+[[package]]
 name = "rn-bind-config"
 version = "0.1.0"
 dependencies = [
@@ -652,6 +662,7 @@ name = "rn-bindings"
 version = "0.1.0"
 dependencies = [
  "rn-bind-async-context",
+ "rn-bind-buffer",
  "rn-bind-config",
  "rn-bind-diagnostics-channel",
  "rn-bind-fs",
