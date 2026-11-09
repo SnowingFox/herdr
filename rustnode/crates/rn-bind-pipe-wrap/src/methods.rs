@@ -29,11 +29,13 @@ impl StreamHandle for PipeHandle {
     }
 
     fn bytes_read(&self) -> u64 {
-        self.bytes_read
+        // The counters live on `StreamState` because `rn_uv::stream` is what
+        // increments them, matching `StreamResource::bytes_read_`.
+        self.state.bytes_read
     }
 
     fn bytes_written(&self) -> u64 {
-        self.bytes_written
+        self.state.bytes_written
     }
 }
 

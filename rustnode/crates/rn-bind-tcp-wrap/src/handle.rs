@@ -47,10 +47,6 @@ pub struct TcpHandle {
     pub state: StreamState,
     /// `TCPWrap::SocketType`: [`crate::SOCKET`] or [`crate::SERVER`].
     pub kind: i32,
-    /// Bytes read so far, for `handle.bytesRead`.
-    pub bytes_read: u64,
-    /// Bytes handed to writes so far, for `handle.bytesWritten`.
-    pub bytes_written: u64,
     /// The finalizer registration, parked here so it lives as long as the
     /// handle.
     pub weak: Option<v8::Weak<v8::Object>>,
@@ -76,8 +72,6 @@ impl TcpHandle {
             tcp,
             state: StreamState::new(stream),
             kind,
-            bytes_read: 0,
-            bytes_written: 0,
             weak: None,
         }))
     }
@@ -90,8 +84,6 @@ impl TcpHandle {
             tcp,
             state: StreamState::new(stream),
             kind,
-            bytes_read: 0,
-            bytes_written: 0,
             weak: None,
         })
     }

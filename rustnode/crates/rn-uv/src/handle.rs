@@ -86,6 +86,10 @@ pub struct StreamState {
     pub state: HandleState,
     /// The JS function stored as `handle.onread`.
     pub on_read: Option<JsCallback>,
+    /// Bytes read so far, `StreamResource::bytes_read_`.
+    pub bytes_read: u64,
+    /// Bytes handed to writes so far, `StreamResource::bytes_written_`.
+    pub bytes_written: u64,
     /// The object this state belongs to, rooted.
     ///
     /// Node keeps the reverse mapping (`handle[owner_symbol]`), which works
@@ -102,6 +106,8 @@ impl StreamState {
             stream,
             state: HandleState::Initialized,
             on_read: None,
+            bytes_read: 0,
+            bytes_written: 0,
             owner_object: None,
         }
     }
@@ -210,11 +216,16 @@ impl Drop for Allocation {
 /// to the shared `streamBaseState` first, because `onStreamRead` reads them
 /// before it looks at its argument.
 pub fn deliver_read(
-    state: &StreamState,
+    state: &mut StreamState,
     stream_base_state: &rn_core::AliasedUint8Array,
     status: isize,
     allocation: Option<Allocation>,
 ) {
+    if status > 0 {
+        // `StreamResource::EmitRead` counts before the listener sees the bytes, so
+        // `handle.bytesRead` is already up to date inside `onread`.
+        state.bytes_read += status as u64;
+    }
     let Some(on_read) = state.on_read.clone() else {
         return;
     };

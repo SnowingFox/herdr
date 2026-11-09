@@ -97,6 +97,9 @@ pub fn write_buffer<'s>(
     if !state.is_alive() {
         return WriteResult::Status(EINVAL);
     }
+    // `StreamBase::Write` counts the bytes before it dispatches, so
+    // `handle.bytesWritten` includes a write that is still queued.
+    state.bytes_written += total as u64;
     let stream = state.stream;
 
     let Some(request) = request.or_else(|| write_wrap(scope)) else {
@@ -189,6 +192,7 @@ pub fn write_string<'s>(
     if !state.is_alive() {
         return WriteResult::Status(EINVAL);
     }
+    state.bytes_written += length as u64;
     let stream = state.stream;
 
     let Some(request) = request.or_else(|| write_wrap(scope)) else {
