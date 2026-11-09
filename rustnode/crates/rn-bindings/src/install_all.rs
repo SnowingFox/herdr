@@ -14,6 +14,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_os::register(registry);
     rn_bind_process_methods::register(registry);
     rn_bind_task_queue::register(registry);
+    rn_bind_timers::register(registry);
     rn_bind_zlib::register(registry);
     rn_builtins::register(registry);
     rn_errors::register(registry);

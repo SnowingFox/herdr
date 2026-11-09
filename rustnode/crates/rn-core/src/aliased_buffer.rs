@@ -14,33 +14,41 @@ use std::cell::Cell;
 
 use rn_v8_sys::v8;
 
-/// The element width of the typed array a buffer is exposed as.
+/// The element type of the typed array a buffer is exposed as.
 ///
 /// Node's JavaScript indexes these arrays by element, so the width is part of
-/// the contract: `tickInfo` is a `Uint8Array(2)` and `hrtimeBuffer` is a
-/// `Uint32Array(3)`. Exposing the bytes of a `Uint32Array` as bytes would make
-/// `buffer[1]` mean something different on each side.
+/// the contract: `tickInfo` is a `Uint8Array(2)`, `hrtimeBuffer` is a
+/// `Uint32Array(3)`, `immediateInfo` is a `Uint32Array(3)` and `timeoutInfo` is
+/// an `Int32Array(1)`. Exposing the bytes of one as another would make an index
+/// mean something different on each side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Element {
     /// A `Uint8Array`, one byte per element.
     Byte,
     /// A `Uint32Array`, four bytes per element, native endianness.
     Word,
+    /// An `Int32Array`, four bytes per element, native endianness.
+    SignedWord,
 }
 
 impl Element {
     fn width(self) -> usize {
         match self {
             Self::Byte => 1,
-            Self::Word => 4,
+            Self::Word | Self::SignedWord => 4,
         }
     }
 
-    /// Renders one element's bytes as the array would report them.
+    /// Renders one element's bytes as the unsigned bit pattern.
+    ///
+    /// Every accessor returns `u32` and the signed variants reinterpret, which
+    /// keeps one code path for the four types.
     fn decode(self, bytes: &[u8]) -> u32 {
         match self {
             Self::Byte => bytes[0] as u32,
-            Self::Word => u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            Self::Word | Self::SignedWord => {
+                u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            }
         }
     }
 
@@ -48,7 +56,21 @@ impl Element {
     fn encode(self, value: u32) -> [u8; 4] {
         match self {
             Self::Byte => (value & 0xff).to_ne_bytes(),
-            Self::Word => value.to_ne_bytes(),
+            Self::Word | Self::SignedWord => value.to_ne_bytes(),
+        }
+    }
+
+    /// Creates the typed array of this element type.
+    fn array<'s>(
+        self,
+        scope: &mut v8::PinScope<'s, '_>,
+        buffer: v8::Local<'s, v8::ArrayBuffer>,
+        elements: usize,
+    ) -> Option<v8::Local<'s, v8::Value>> {
+        match self {
+            Self::Byte => v8::Uint8Array::new(scope, buffer, 0, elements).map(Into::into),
+            Self::Word => v8::Uint32Array::new(scope, buffer, 0, elements).map(Into::into),
+            Self::SignedWord => v8::Int32Array::new(scope, buffer, 0, elements).map(Into::into),
         }
     }
 }
@@ -89,14 +111,9 @@ impl AliasedUint8Array {
         );
         let backing_store: v8::SharedRef<v8::BackingStore> = backing_store.into();
         let buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
-        let array: v8::Local<v8::Value> = match element {
-            Element::Byte => v8::Uint8Array::new(scope, buffer, 0, elements)
-                .ok_or("cannot allocate the aliased typed array")?
-                .into(),
-            Element::Word => v8::Uint32Array::new(scope, buffer, 0, elements)
-                .ok_or("cannot allocate the aliased typed array")?
-                .into(),
-        };
+        let array = element
+            .array(scope, buffer, elements)
+            .ok_or("cannot allocate the aliased typed array")?;
         let data = buffer
             .data()
             .map(|data| data.as_ptr().cast::<u8>())

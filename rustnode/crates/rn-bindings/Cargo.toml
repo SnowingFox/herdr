@@ -22,6 +22,7 @@ rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-os = { path = "../rn-bind-os" }
 rn-bind-process-methods = { path = "../rn-bind-process-methods" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
+rn-bind-timers = { path = "../rn-bind-timers" }
 rn-bind-zlib = { path = "../rn-bind-zlib" }
 rn-builtins = { path = "../rn-builtins" }
 rn-errors = { path = "../rn-errors" }
