@@ -1,0 +1,11 @@
+{
+  "namespace": "stream_pipe",
+  "reachable": true,
+  "members": {
+    "StreamPipe": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

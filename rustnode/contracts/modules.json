@@ -1,0 +1,102 @@
+{
+  "namespace": "modules",
+  "reachable": true,
+  "members": {
+    "cachedCodeTypes": {
+      "kind": "object",
+      "properties": [
+        "kCommonJS",
+        "kESM",
+        "kStrippedTypeScript"
+      ],
+      "origin": "both"
+    },
+    "compileCacheStatus": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "length"
+      ],
+      "origin": "both"
+    },
+    "enableCompileCache": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "flushCompileCache": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCompileCacheDir": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCompileCacheEntry": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getNearestParentPackageJSON": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getNearestParentPackageJSONType": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getPackageScopeConfig": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getPackageType": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getRootPackageJSON": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getWasmCompileCacheEntry": {
+      "kind": "function",
+      "origin": "static"
+    },
+    "moduleFormats": {
+      "kind": "object",
+      "properties": [
+        "kCommonJS",
+        "kModule"
+      ],
+      "origin": "both"
+    },
+    "parsePackageJSON": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "readPackageJSON": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "saveCompileCacheEntry": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "saveWasmCompileCacheEntry": {
+      "kind": "function",
+      "origin": "static"
+    }
+  }
+}

@@ -1,0 +1,395 @@
+{
+  "namespace": "fs",
+  "reachable": true,
+  "members": {
+    "CpDirJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "FSReqCallback": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "FileHandle": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ReadFileJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "StatWatcher": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "WriteFileJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "access": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "bigintStatFsValues": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7"
+      ],
+      "origin": "runtime"
+    },
+    "bigintStatValues": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "2",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27",
+        "28",
+        "29",
+        "3",
+        "30",
+        "31",
+        "32",
+        "33",
+        "34",
+        "35",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9"
+      ],
+      "origin": "runtime"
+    },
+    "chmod": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "chown": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "close": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "copyFile": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "cpSyncCheckPaths": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "cpSyncCopyDir": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "cpSyncOverrideFile": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "existsSync": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "fchmod": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "fchown": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "fdatasync": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "fstat": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "fsync": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ftruncate": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "futimes": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getFormatOfExtensionlessFile": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "handleToFd": {
+      "kind": "function",
+      "origin": "static"
+    },
+    "internalModuleStat": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "kFsStatsFieldsNumber": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kUsePromises": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "lchown": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "legacyMainResolve": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "link": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "lstat": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "lutimes": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "mkdir": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "mkdtemp": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "mkstemp": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "open": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "openFileHandle": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "read": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "readBuffers": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "readFileUtf8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "readdir": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "readdirRecursive": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "readlink": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "realpath": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "rename": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "rmSync": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "rmdir": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "stat": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "statFsValues": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7"
+      ],
+      "origin": "runtime"
+    },
+    "statValues": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "2",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27",
+        "28",
+        "29",
+        "3",
+        "30",
+        "31",
+        "32",
+        "33",
+        "34",
+        "35",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9"
+      ],
+      "origin": "runtime"
+    },
+    "statfs": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "symlink": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "unlink": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "utimes": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "writeBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "writeBuffers": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "writeFileUtf8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "writeString": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

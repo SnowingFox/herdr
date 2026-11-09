@@ -1,0 +1,39 @@
+{
+  "namespace": "encoding_binding",
+  "reachable": true,
+  "members": {
+    "decodeUTF8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "encodeInto": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "encodeIntoResults": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1"
+      ],
+      "origin": "both"
+    },
+    "encodeUtf8String": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "toASCII": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "toUnicode": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    }
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "namespace": "os",
+  "reachable": true,
+  "members": {
+    "getAvailableParallelism": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCPUs": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getFreeMem": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getHomeDirectory": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getHostname": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getInterfaceAddresses": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getLoadAvg": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getOSInformation": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getPriority": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getTotalMem": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getUptime": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getUserInfo": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isBigEndian": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "setPriority": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

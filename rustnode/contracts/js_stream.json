@@ -1,0 +1,11 @@
+{
+  "namespace": "js_stream",
+  "reachable": true,
+  "members": {
+    "JSStream": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

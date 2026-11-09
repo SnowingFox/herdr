@@ -1,0 +1,665 @@
+{
+  "namespace": "crypto",
+  "reachable": true,
+  "members": {
+    "AESCipherJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "Argon2Job": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ChaCha20Poly1305CipherJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "CheckPrimeJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "CipherBase": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "DHBitsJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "DhKeyPairGenJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "DiffieHellman": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "DiffieHellmanGroup": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "DsaKeyPairGenJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ECDH": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ECDHConvertKey": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "EcKeyPairGenJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "HKDFJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "Hash": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "HashJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "Hmac": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "HmacJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "KEMDecapsulateJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "KEMEncapsulateJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "KangarooTwelveJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "KeyObjectHandle": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "KmacJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "Mac": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "NamedKeyPairGenJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "OPENSSL_EC_EXPLICIT_CURVE": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "OPENSSL_EC_NAMED_CURVE": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "PBKDF2Job": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "RSACipherJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "RSA_PKCS1_PSS_PADDING": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "RandomBytesJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "RandomPrimeJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "RsaKeyPairGenJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ScryptJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "SecretKeyGenJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "SecureContext": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "Sign": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "SignJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "TurboShakeJob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "Verify": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "X509_CHECK_FLAG_MULTI_LABEL_WILDCARDS": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "X509_CHECK_FLAG_NEVER_CHECK_SUBJECT": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "X509_CHECK_FLAG_NO_WILDCARDS": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "X509_CHECK_FLAG_SINGLE_LABEL_SUBDOMAINS": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "addBlockedSPKIForTesting": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "certExportChallenge": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "certExportPublicKey": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "certVerifySpkac": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "clearBlockedSPKIsForTesting": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "createCryptoKeyClass": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "createNativeKeyObjectClass": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "createX509CertificateClass": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getBundledRootCertificates": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCachedAliases": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCachedMacAliases": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCertificateCompressionAlgorithms": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCipherInfo": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCiphers": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCryptoKeySlots": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCurves": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getExtraCACertificates": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getFipsCrypto": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getFipsCryptoGeneration": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getHashes": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getKeyObjectSlots": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getMacs": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getOpenSSLSecLevelCrypto": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getSSLCiphers": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getSystemCACertificates": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getUserRootCertificates": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getX509CertificateSnapshot": {
+      "kind": "function",
+      "origin": "static"
+    },
+    "isCryptoKey": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isKeyAlgorithmAvailable": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isKeyObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isX509Certificate": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "kCryptoJobAsync": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kCryptoJobSync": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kCryptoJobWebCrypto": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKEMDecapsulate": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "kKEMEncapsulate": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "kKeyEncodingPKCS1": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyEncodingPKCS8": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyEncodingSEC1": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyEncodingSPKI": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyFormatDER": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyFormatJWK": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyFormatPEM": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyFormatRawPrivate": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyFormatRawPublic": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyFormatRawSeed": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyFormatStore": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyTypePrivate": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyTypePublic": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyTypeSecret": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_CBC_128": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_CBC_192": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_CBC_256": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_CTR_128": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_CTR_192": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_CTR_256": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_GCM_128": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_GCM_192": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_GCM_256": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_KW_128": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_KW_192": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_KW_256": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_OCB_128": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_OCB_192": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantAES_OCB_256": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantRSA_OAEP": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantRSA_PSS": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kKeyVariantRSA_SSA_PKCS1_v1_5": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSigEncDER": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSigEncP1363": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSignJobModeSign": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSignJobModeVerify": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTypeArgon2d": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTypeArgon2i": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kTypeArgon2id": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kWebCryptoCipherDecrypt": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kWebCryptoCipherEncrypt": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kWebCryptoKeyFormatJWK": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "kWebCryptoKeyFormatPKCS8": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kWebCryptoKeyFormatRaw": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kWebCryptoKeyFormatSPKI": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "oneShotDigest": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "parsePKCS12": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "parseX509": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "parseX509Snapshot": {
+      "kind": "function",
+      "origin": "static"
+    },
+    "privateDecrypt": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "privateEncrypt": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "publicDecrypt": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "publicEncrypt": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "randomFillSync": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "resetRootCertStore": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "secureBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "secureHeapUsed": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setFipsCrypto": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setupFipsIndicatorChannel": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "startLoadingCertificatesOffThread": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "testFipsCrypto": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "timingSafeEqual": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

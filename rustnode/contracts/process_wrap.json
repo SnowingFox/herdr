@@ -1,0 +1,25 @@
+{
+  "namespace": "process_wrap",
+  "reachable": true,
+  "members": {
+    "Process": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "constants": {
+      "kind": "object",
+      "properties": [
+        "kProcessFlagDetached",
+        "kProcessFlagWindowsHide",
+        "kProcessFlagWindowsVerbatimArguments"
+      ],
+      "origin": "both"
+    },
+    "getEnvPairs": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

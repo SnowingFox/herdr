@@ -1,0 +1,28 @@
+{
+  "namespace": "tty_wrap",
+  "reachable": true,
+  "members": {
+    "TTY": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "UV_TTY_MODE_IO": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_TTY_MODE_NORMAL": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_TTY_MODE_RAW_VT": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "isTTY": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

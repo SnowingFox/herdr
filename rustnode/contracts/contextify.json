@@ -1,0 +1,48 @@
+{
+  "namespace": "contextify",
+  "reachable": true,
+  "members": {
+    "ContextifyScript": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "compileFunction": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "compileFunctionForCJSLoader": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "constants": {
+      "kind": "object",
+      "properties": [
+        "measureMemory"
+      ],
+      "origin": "both"
+    },
+    "containsModuleSyntax": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "makeContext": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "measureMemory": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "runInterruptible": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

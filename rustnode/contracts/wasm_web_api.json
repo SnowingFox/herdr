@@ -1,0 +1,11 @@
+{
+  "namespace": "wasm_web_api",
+  "reachable": true,
+  "members": {
+    "setImplementation": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

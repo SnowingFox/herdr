@@ -1,0 +1,46 @@
+{
+  "namespace": "glob",
+  "reachable": true,
+  "members": {
+    "globStart": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "globSync": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "hasMagic": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "kFlagDot": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kFlagFollowSymlinks": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kFlagMatchBase": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kFlagWindows": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kFlagWithFileTypes": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "matchesGlob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

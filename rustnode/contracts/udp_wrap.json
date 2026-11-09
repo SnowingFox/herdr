@@ -1,0 +1,25 @@
+{
+  "namespace": "udp_wrap",
+  "reachable": true,
+  "members": {
+    "SendWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "UDP": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "constants": {
+      "kind": "object",
+      "properties": [
+        "UV_UDP_IPV6ONLY",
+        "UV_UDP_REUSEADDR",
+        "UV_UDP_REUSEPORT"
+      ],
+      "origin": "both"
+    }
+  }
+}

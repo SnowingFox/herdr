@@ -1,0 +1,66 @@
+{
+  "namespace": "messaging",
+  "reachable": true,
+  "members": {
+    "DOMException": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "MessageChannel": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "MessagePort": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "QuotaExceededError": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "broadcastChannel": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "drainMessagePort": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "exposeLazyDOMExceptionProperty": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "moveMessagePortToContext": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "receiveMessageOnPort": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setDeserializerCreateObjectFunction": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "stopMessagePort": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "structuredClone": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

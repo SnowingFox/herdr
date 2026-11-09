@@ -1,0 +1,47 @@
+{
+  "namespace": "timers",
+  "reachable": true,
+  "members": {
+    "getLibuvNow": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "immediateInfo": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2"
+      ],
+      "origin": "both"
+    },
+    "scheduleTimer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setupTimers": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "timeoutInfo": {
+      "kind": "object",
+      "properties": [
+        "0"
+      ],
+      "origin": "both"
+    },
+    "toggleImmediateRef": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "toggleTimerRef": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

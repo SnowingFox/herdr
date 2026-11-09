@@ -1,0 +1,120 @@
+{
+  "namespace": "inspector",
+  "reachable": true,
+  "members": {
+    "Connection": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "MainThreadConnection": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "asyncTaskCanceled": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "asyncTaskFinished": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "asyncTaskScheduled": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "asyncTaskStarted": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "callAndPauseOnStart": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "console": {
+      "kind": "object",
+      "properties": [
+        "assert",
+        "clear",
+        "context",
+        "count",
+        "countReset",
+        "debug",
+        "dir",
+        "dirxml",
+        "error",
+        "group",
+        "groupCollapsed",
+        "groupEnd",
+        "info",
+        "log",
+        "profile",
+        "profileEnd",
+        "table",
+        "time",
+        "timeEnd",
+        "timeLog",
+        "timeStamp",
+        "trace",
+        "warn"
+      ],
+      "origin": "both"
+    },
+    "consoleCall": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "emitProtocolEvent": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isEnabled": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "open": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "putNetworkResource": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "registerAsyncHook": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setConsoleExtensionInstaller": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setupNetworkTracking": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "url": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "waitForDebugger": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

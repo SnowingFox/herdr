@@ -1,0 +1,45 @@
+{
+  "namespace": "trace_events",
+  "reachable": true,
+  "members": {
+    "CategorySet": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCategoryEnabledBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getEnabledCategories": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "hasAgent": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isTraceCategoryEnabled": {
+      "kind": "function",
+      "arity": 1,
+      "origin": "both"
+    },
+    "setTraceCategoryStateUpdateHandler": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "trace": {
+      "kind": "function",
+      "arity": 5,
+      "origin": "both"
+    },
+    "usePerfetto": {
+      "kind": "boolean",
+      "origin": "both"
+    }
+  }
+}

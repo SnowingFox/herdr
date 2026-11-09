@@ -1,0 +1,26 @@
+{
+  "namespace": "tcp_wrap",
+  "reachable": true,
+  "members": {
+    "TCP": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "TCPConnectWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "constants": {
+      "kind": "object",
+      "properties": [
+        "SERVER",
+        "SOCKET",
+        "UV_TCP_IPV6ONLY",
+        "UV_TCP_REUSEPORT"
+      ],
+      "origin": "both"
+    }
+  }
+}

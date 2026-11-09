@@ -1,0 +1,21 @@
+{
+  "namespace": "fs_dir",
+  "reachable": true,
+  "members": {
+    "DirHandle": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "opendir": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "opendirSync": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

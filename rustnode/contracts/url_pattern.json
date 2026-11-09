@@ -1,0 +1,11 @@
+{
+  "namespace": "url_pattern",
+  "reachable": true,
+  "members": {
+    "URLPattern": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}
