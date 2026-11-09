@@ -215,6 +215,39 @@ fn cjs_only_conflicts_are_detected_through_the_reparse() {
 }
 
 #[test]
+fn the_reparse_is_what_decides_the_ambiguous_messages() {
+    // The four cases here all reach the module reparse, and only the reparse
+    // separates them: `func(await 1)` parses as a module and `if(await 1)` does
+    // not (it becomes an `if` with no body). A message table alone would answer
+    // `true` for both, and a keyword scan would answer `true` for neither.
+    let results = module_syntax(
+        r#"
+        'func(await 1)',
+        'if(await 1)',
+        'x = await 1',
+        'const = 1',
+        '"use strict"; with(a) {}',
+        'function f(){',
+        "#,
+    );
+    let expected = [
+        ("\"func(await 1)\"", true),
+        ("\"if(await 1)\"", false),
+        ("\"x = await 1\"", true),
+        ("\"const = 1\"", false),
+        ("\"\\\"use strict\\\"; with(a) {}\"", false),
+        ("\"function f(){\"", false),
+    ];
+    for (line, (label, want)) in results.lines().zip(expected) {
+        assert_eq!(
+            line,
+            format!("{label}={want}"),
+            "misclassified a message that depends on the reparse"
+        );
+    }
+}
+
+#[test]
 fn the_no_cjs_variables_flag_suppresses_the_reparse() {
     // `lib/internal/process/execution.js` passes `'no CJS variables'` for `--eval`
     // bodies, where the wrapper parameters do not exist, so `const module = 1` is
