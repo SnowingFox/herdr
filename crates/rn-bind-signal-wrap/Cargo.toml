@@ -1,0 +1,18 @@
+[package]
+name = "rn-bind-signal-wrap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('signal_wrap') for rustnode"
+
+[dependencies]
+libuv-sys2.workspace = true
+rn-core.workspace = true
+rn-uv.workspace = true
+rn-v8-sys.workspace = true
+v8.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
