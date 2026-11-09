@@ -12,17 +12,23 @@ This environment installs a commit hook outside the repository, at
 rules forbid AI co-author lines, so a commit made with plain `git commit` will be
 wrong even though nothing in the repository did it.
 
-Commit with `--no-verify`:
+Commit with the hooks path neutralised:
 
 ```bash
-git -c user.name="rustnode" -c user.email="rustnode@local" \
-  commit --no-verify -m "..." 
+git -c core.hooksPath=/dev/null -c user.name="rustnode" \
+  -c user.email="rustnode@local" commit -m "..."
 ```
 
-If a commit already carries the trailer, rewrite it rather than leaving it:
+`--no-verify` is NOT enough. The hook that adds the trailer is
+`prepare-commit-msg`, which git runs even under `--no-verify`, and it runs again
+on every commit a rebase replays, so a rebase also re-adds it.
+
+If a commit already carries the trailer, rewrite it rather than leaving it. The
+filter-branch invocation is not enough on its own either, because `filter-branch`
+commits as it goes; unset the hooks path for it too:
 
 ```bash
-FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f \
+FILTER_BRANCH_SQUELCH_WARNING=1 git -c core.hooksPath=/dev/null filter-branch -f \
   --msg-filter 'grep -vF "Co-authored-by:" || true' -- "$(git merge-base HEAD origin/master)"..HEAD
 ```
 
