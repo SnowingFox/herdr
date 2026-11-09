@@ -156,6 +156,10 @@ fn main() {
                     // `.mjs` entry point therefore failed with
                     // `ERR_INTERNAL_ASSERTION` until this ran first.
                     bootstrap::install_stdio(scope);
+                    // After stdio: the real console binds to `process.stdout`
+                    // lazily, and it must reach the same write queue rather than
+                    // a second descriptor. See `install_console`.
+                    bootstrap::install_console(scope, require);
                     bootstrap::prepare_execution(scope, require);
                     // `node -e` exposes builtins as lazy globals; a script file
                     // does not, which is why this is gated on the source. Node's

@@ -9,9 +9,11 @@
 //!
 //! Three layers, each testable on its own:
 //!
-//! * [`codec`] is the byte arithmetic: hex, base64, UTF-8, UCS-2 and the byte
-//!   search. It has no V8 types at all, so it is unit-tested directly and
-//!   compared against a real `node` binary in `tests/`.
+//! * [`rn_core::codec`] is the byte arithmetic: hex, base64, UTF-8, UCS-2 and the
+//!   byte search. It has no V8 types at all, so it is unit-tested directly and
+//!   compared against a real `node` binary in `tests/`. It lives in the kernel
+//!   crate rather than here because `StreamBase`'s write path encodes strings
+//!   too, and `rn-uv` cannot depend on a binding crate.
 //! * [`args`] lifts JavaScript arguments out of V8 — the `ParseArrayIndex`,
 //!   `ParseEncoding` and `ArrayBufferView` accessors `node_buffer.cc` uses.
 //! * [`encoding`], [`bytes`] and [`misc`] are the members themselves, written as
@@ -44,7 +46,6 @@
 
 pub mod args;
 pub mod bytes;
-pub mod codec;
 pub mod encoding;
 pub mod install;
 pub mod misc;

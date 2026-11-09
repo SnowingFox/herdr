@@ -23,9 +23,9 @@ use rn_v8_sys::v8;
 use rn_v8_sys::v8::Local;
 
 use crate::bytes;
-use crate::codec::Encoding;
 use crate::encoding;
 use crate::misc;
+use rn_core::codec::Encoding;
 
 /// Binds a Rust callback as a namespace function.
 macro_rules! mkfn {

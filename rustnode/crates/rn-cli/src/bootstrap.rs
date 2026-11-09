@@ -577,6 +577,37 @@ pub fn install_stdio<'s>(scope: &mut v8::PinScope<'s, '_>) {
     }
 }
 
+/// Replaces the bootstrap's `console` stub with Node's real global console.
+///
+/// The stub in `bootstrap.js` writes with a synchronous native call straight to
+/// descriptor 1. That is *not* what `console.log` does in Node: the real console
+/// is a `Console` bound to `process.stdout`/`process.stderr`, so its output goes
+/// through the same writable stream, and therefore through the same ordered write
+/// queue. The difference is observable the moment those two are mixed:
+///
+/// ```text
+/// process.stdout.write('A'); process.stdout.write('B'); console.log('C');
+/// ```
+///
+/// prints `ABC` in Node and `ACB` with the stub, because the stub bypasses the
+/// queue `A` and `B` are still sitting in.
+///
+/// `internal/console/global` is the module `lib/console.js` re-exports, and its
+/// `Console` binds to `process.stdout` lazily on first use — which is why this
+/// has to run *after* [`install_stdio`], or the binding captures nothing.
+///
+/// Nothing is installed when the module is missing, so a broken console stays a
+/// missing name instead of a half-built one.
+pub fn install_console<'s>(scope: &mut v8::PinScope<'s, '_>, require: v8::Local<'s, v8::Function>) {
+    let Some(console) = call_require(scope, require, "internal/console/global") else {
+        return;
+    };
+    let global = scope.get_current_context().global(scope);
+    if let Some(key) = v8::String::new(scope, "console") {
+        global.set(scope, key.into(), console);
+    }
+}
+
 /// Reads the `primordials` global the realm bootstrap installs.
 fn primordials_from_global<'s>(
     scope: &mut v8::PinScope<'s, '_>,

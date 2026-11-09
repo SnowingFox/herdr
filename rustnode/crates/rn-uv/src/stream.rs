@@ -138,6 +138,41 @@ pub fn publish(outcome: &WriteOutcome) {
     with_state(|state| outcome.publish(state));
 }
 
+/// `LibuvStreamWrap::DoTryWrite`: hand as much as possible to `uv_try_write`.
+///
+/// This is the first half of `StreamBase::Write`, and skipping it changes
+/// observable behaviour rather than just performance. `uv_try_write` completes a
+/// write *synchronously* when the descriptor accepts it, which means no
+/// `uv_write_t` is ever created — and an outstanding write request is precisely
+/// what keeps the event loop alive. Node's stdout pipe takes the whole string on
+/// the first call, so `process.stdout.write` alone does not hold the process
+/// open; without this, every write left a pending request behind and an unref'd
+/// timer had something to keep the loop turning for.
+///
+/// Returns the number of bytes written, or `0` when nothing was taken. `ENOSYS`
+/// and `EAGAIN` are *not* failures: Node treats them as "this stream cannot do
+/// that" and falls through to the queued path, so they return `0` too.
+///
+/// # Safety
+///
+/// `stream` must be a live stream and every entry in `buffers` must point at
+/// storage that stays valid for the call.
+pub unsafe fn try_write(stream: *mut uv::uv_stream_t, buffers: &mut [uv::uv_buf_t]) -> usize {
+    if buffers.is_empty() {
+        return 0;
+    }
+    // SAFETY: the caller guarantees the stream is live and the buffers are valid
+    // for the duration of the call.
+    let status = unsafe { uv::uv_try_write(stream, buffers.as_mut_ptr(), buffers.len() as u32) };
+    if status == uv::uv_errno_t_UV_ENOSYS || status == uv::uv_errno_t_UV_EAGAIN {
+        return 0;
+    }
+    if status < 0 {
+        return 0;
+    }
+    status as usize
+}
+
 /// Issues `uv_write` and returns libuv's status.
 ///
 /// `owned` keeps any string backing storage alive until the completion fires.

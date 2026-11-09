@@ -1,9 +1,16 @@
-//! The byte/string conversions behind every `*Slice` and `*Write` member.
+//! The byte/string conversions behind `Buffer`, the string decoder, and every
+//! `StreamBase` string write.
 //!
 //! These are plain Rust functions over `&[u8]` and `&str`, deliberately kept
 //! free of V8 types so they can be unit-tested exhaustively against a real
 //! `node` binary without spinning an isolate. The binding layer only lifts
 //! arguments out of JavaScript and calls into here.
+//!
+//! They live in the kernel crate because more than one binding needs them:
+//! `internalBinding('buffer')` and `internalBinding('string_decoder')` decode
+//! with them, and `StreamBase::Write*` encodes with them — and `rn-uv` implements
+//! `StreamBase` but cannot depend on a binding crate. Keeping one copy is what
+//! stops the two sides drifting on the encodings that are not textbook.
 //!
 //! # Why not a crate
 //!
@@ -374,6 +381,79 @@ pub fn encode_ucs2(units: &[u16], max: usize) -> Vec<u8> {
     out
 }
 
+/// `StringBytes::StorageSize`: the byte capacity [`write`] may need for `units`.
+///
+/// Node over-estimates on purpose — "always at least big enough, but may have
+/// some extra" — because the exact size costs a second pass over the string and
+/// the buffer is allocated once. Only `utf8` can expand past one byte per unit,
+/// so only `utf8` gets a three-bytes-per-unit bound.
+///
+/// The `max` a caller passes to [`write`] is this value. It has to be the same
+/// estimate rather than a tighter one: `hex`, `base64` and `base64url` *decode*
+/// their input, and `write` sizes its scratch buffer from `max`.
+pub fn storage_size(units: &[u16], encoding: Encoding) -> usize {
+    match encoding {
+        Encoding::Ascii | Encoding::Binary => units.len(),
+        // `StringBytes::StorageSize` uses 3 * length for both of these, even
+        // though a four-byte scalar needs only two units.
+        Encoding::Utf8 | Encoding::Buffer => units.len() * 3,
+        Encoding::Ucs2 => units.len() * 2,
+        // `simdutf::base64_length_from_binary` on the *input* length, which is
+        // an upper bound rather than the decoded size.
+        Encoding::Base64 | Encoding::Base64Url => {
+            base64_encoded_len(units.len(), encoding == Encoding::Base64Url)
+        }
+        // Two characters per byte; an odd trailing digit is dropped.
+        Encoding::Hex => units.len() / 2,
+    }
+}
+
+/// `StringBytes::Write`: encode code units as bytes, truncated to `max`.
+///
+/// This is the one encoder `StreamBase::Write*` uses. It is reachable for every
+/// `enum encoding`, because `lib/internal/stream_base_commons.js` converts a
+/// chunk with `Buffer.from(data, encoding)` only when the stream has the
+/// "decode strings" flag; `net.Socket` does not, so `writeUtf8String` and friends
+/// receive the raw string plus the name of the encoding the caller asked for.
+///
+/// The encodings are *not* uniform, which is the whole reason this is one
+/// function instead of a call to `encode_utf8`:
+///
+/// * `ascii` and `latin1` take the low byte of every code unit. They do **not**
+///   mask the high bit on the way in — `StringBytes::Encode` masks on the way
+///   *out* — so `'ÿ'` becomes `0xff` here and reads back as `0x7f`.
+/// * `utf8` replaces unpaired surrogates with U+FFFD and truncates only at a
+///   character boundary.
+/// * `ucs2` is little-endian UTF-16, so `"hi"` is four bytes.
+/// * `hex`, `base64` and `base64url` *decode* their input rather than encode it.
+pub fn write(units: &[u16], encoding: Encoding, max: usize) -> Vec<u8> {
+    match encoding {
+        Encoding::Utf8 | Encoding::Buffer => encode_utf8(units, max),
+        Encoding::Ascii | Encoding::Binary => {
+            let count = units.len().min(max);
+            units[..count]
+                .iter()
+                .map(|unit| (*unit & 0xff) as u8)
+                .collect()
+        }
+        Encoding::Ucs2 => encode_ucs2(units, max),
+        Encoding::Hex => {
+            let text: Vec<u8> = units.iter().map(|unit| (*unit & 0xff) as u8).collect();
+            let mut out = vec![0u8; max];
+            let written = decode_hex(&text, &mut out);
+            out.truncate(written);
+            out
+        }
+        Encoding::Base64 | Encoding::Base64Url => {
+            let text: Vec<u8> = units.iter().map(|unit| (*unit & 0xff) as u8).collect();
+            let mut out = vec![0u8; max];
+            let written = decode_base64_forgiving(&text, &mut out);
+            out.truncate(written);
+            out
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hex
 // ---------------------------------------------------------------------------
@@ -713,6 +793,103 @@ mod tests {
         assert_eq!(decode_base64_forgiving(b"Y", &mut out), 0);
         assert_eq!(decode_base64_forgiving(b"YQ", &mut out), 1);
         assert_eq!(out[0], b'a');
+    }
+
+    /// The units of a JavaScript string, which is what `write` takes.
+    fn units(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    #[test]
+    fn string_write_uses_the_low_byte_for_ascii_and_latin1() {
+        // `node -e "process.stdout.write('\u00e9\u00ffhi','latin1')"` is
+        // `e9 ff 68 69`. The high bit is *not* cleared on the way in:
+        // `StringBytes::Encode` masks it when reading back.
+        assert_eq!(
+            write(&units("\u{00e9}\u{00ff}hi"), Encoding::Binary, 8),
+            b"\xe9\xffhi"
+        );
+        // `ascii` narrows the same way; `0xff` stays `0xff` here.
+        assert_eq!(
+            write(&units("\u{00e9}\u{00ff}hi"), Encoding::Ascii, 8),
+            b"\xe9\xffhi"
+        );
+    }
+
+    #[test]
+    fn string_write_encodes_utf8_and_ucs2_differently() {
+        assert_eq!(write(&units("hi"), Encoding::Utf8, 8), b"hi");
+        // `ucs2` is UTF-16LE, so each unit is two bytes.
+        assert_eq!(write(&units("hi"), Encoding::Ucs2, 8), b"h\0i\0");
+        // A multi-byte scalar widens in UTF-8 and stays one unit in UCS-2.
+        assert_eq!(write(&units("\u{00e9}"), Encoding::Utf8, 8), b"\xc3\xa9");
+        assert_eq!(write(&units("\u{00e9}"), Encoding::Ucs2, 8), b"\xe9\0");
+    }
+
+    #[test]
+    fn string_write_decodes_hex_and_base64_rather_than_encoding_them() {
+        // These two *decode* their input, which is what Node's `StringBytes::Write`
+        // does for them: `process.stdout.write('6869','hex')` writes `hi`.
+        assert_eq!(write(&units("6869"), Encoding::Hex, 8), b"hi");
+        assert_eq!(write(&units("aGVsbG8="), Encoding::Base64, 8), b"hello");
+        assert_eq!(write(&units("aGVsbG8"), Encoding::Base64Url, 8), b"hello");
+    }
+
+    #[test]
+    fn string_write_truncates_to_max() {
+        // Truncation stops at a character boundary for UTF-8, and a two-byte
+        // scalar needs the whole `max` to appear.
+        assert_eq!(write(&units("abc"), Encoding::Utf8, 2), b"ab");
+        assert_eq!(write(&units("\u{00e9}a"), Encoding::Utf8, 1), b"");
+        assert_eq!(write(&units("abc"), Encoding::Binary, 2), b"ab");
+        // UCS-2 needs two bytes per unit, so `max` 3 carries one unit.
+        assert_eq!(write(&units("abc"), Encoding::Ucs2, 3), b"a\0");
+    }
+
+    #[test]
+    fn storage_size_is_at_least_the_bytes_write_produces() {
+        // The contract `StringBytes::StorageSize` states: always big enough.
+        // Every encoding is checked because a too-small estimate would truncate
+        // a write silently.
+        for encoding in [
+            Encoding::Ascii,
+            Encoding::Binary,
+            Encoding::Utf8,
+            Encoding::Buffer,
+            Encoding::Ucs2,
+            Encoding::Hex,
+            Encoding::Base64,
+            Encoding::Base64Url,
+        ] {
+            for text in [
+                "",
+                "a",
+                "hi",
+                "héllo",
+                "\u{00e9}\u{00ff}",
+                "日本語",
+                "aGVsbG8=",
+            ] {
+                let units = units(text);
+                let capacity = storage_size(&units, encoding);
+                let produced = write(&units, encoding, capacity);
+                assert!(
+                    produced.len() <= capacity,
+                    "{encoding:?} on {text:?}: wrote {} bytes into {capacity}",
+                    produced.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unpaired_surrogate_becomes_one_replacement_character() {
+        // `'a\ud800b'` is three code units but four UTF-8 bytes, because the
+        // lone surrogate is replaced rather than dropped.
+        assert_eq!(
+            write(&[0x61, 0xD800, 0x62], Encoding::Utf8, 16),
+            "a\u{fffd}b".as_bytes()
+        );
     }
 
     #[test]
