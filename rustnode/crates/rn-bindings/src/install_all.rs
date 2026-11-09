@@ -13,6 +13,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_cares::register(registry);
     rn_bind_config::register(registry);
     rn_bind_contextify::register(registry);
+    rn_bind_crypto::register(registry);
     rn_bind_diagnostics_channel::register(registry);
     rn_bind_encoding::register(registry);
     rn_bind_fs::register(registry);
