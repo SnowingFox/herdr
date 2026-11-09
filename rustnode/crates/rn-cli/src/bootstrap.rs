@@ -552,6 +552,33 @@ fn install_process_methods<'s>(
         return;
     };
 
+    // `internal/bootstrap/node.js` copies the POSIX credential getters onto
+    // `process` when the binding reports support:
+    //
+    // ```js
+    // const credentials = internalBinding('credentials');
+    // if (credentials.implementsPosixCredentials) {
+    //   process.getuid = credentials.getuid;
+    //   ...
+    // }
+    // ```
+    //
+    // That bootstrap module cannot run here, so the same five assignments are
+    // made directly. They are ordinary assignments, not definitions: Node writes
+    // them the same way, which is why `process.getuid` is enumerable and
+    // replaceable.
+    if let Some(credentials) = call_require(scope, require, "internal/bootstrap/realm")
+        .and_then(|exports| get_property(scope, exports, "internalBinding"))
+        .and_then(|binding| call_with_string(scope, binding, "credentials"))
+        .and_then(|credentials| v8::Local::<v8::Object>::try_from(credentials).ok())
+    {
+        for name in ["getuid", "geteuid", "getgid", "getegid", "getgroups"] {
+            if let Some(value) = get_property(scope, credentials.into(), name) {
+                let _ = set(scope, process, name, value);
+            }
+        }
+    }
+
     for name in [
         "memoryUsage",
         "cpuUsage",
@@ -600,7 +627,9 @@ fn install_process_methods<'s>(
     // keeps the argument validation (`parseFileMode`, the cwd cache) exactly as
     // Node has it; `test/common/index.js` calls `process.umask(0o022)` before any
     // test runs, so a missing `umask` aborts the whole suite.
-    install_process_state_switch(scope);
+    if let Some(message) = install_process_state_switch(scope) {
+        eprintln!("rustnode: process state unavailable: {message}");
+    }
 }
 
 /// Runs `internal/bootstrap/switches/does_own_process_state`.
@@ -615,8 +644,8 @@ fn install_process_methods<'s>(
 /// reached through the ordinary `require`, which would call it as a CommonJS
 /// function and leave `internalBinding` undefined. Calling it here is the same
 /// thing `BuiltinLoader::CompileAndCall` does for a bootstrap script.
-fn install_process_state_switch<'s>(scope: &mut v8::PinScope<'s, '_>) {
-    run_bootstrap_script(scope, "internal/bootstrap/switches/does_own_process_state");
+fn install_process_state_switch<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<String> {
+    run_bootstrap_script(scope, "internal/bootstrap/switches/does_own_process_state")
 }
 
 /// Runs one `internal/bootstrap/**` script with the parameters its kind declares.

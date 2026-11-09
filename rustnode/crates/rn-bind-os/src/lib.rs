@@ -295,15 +295,93 @@ fn supplementary_groups() -> Vec<i32> {
     groups.into_iter().map(|group| group as i32).collect()
 }
 
+/// Resolves a uid that may be a number or a user name, after
+/// `src/node_credentials.cc`'s `uid_by_name`.
+///
+/// `is_uint32` rather than `int32_value`: V8's numeric accessors *coerce*, so
+/// `int32_value` answers `Some(0)` for the string `"nobody"` and every name
+/// would become uid 0. Node guards with
+/// `args[0]->IsUint32() || args[0]->IsString()` for the same reason, and
+/// `lib/internal/bootstrap/switches/does_own_process_state.js` validates the
+/// argument before it ever reaches here.
+fn resolve_uid(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Option<libc::uid_t> {
+    if value.is_uint32() {
+        return Some(value.uint32_value(scope)? as libc::uid_t);
+    }
+    let name = std::ffi::CString::new(value.to_string(scope)?.to_rust_string_lossy(scope)).ok()?;
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
+    let mut buffer = vec![0 as libc::c_char; 8192];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for its stated length, and `entry` and
+    // `buffer` outlive the call.
+    let status = unsafe {
+        libc::getpwnam_r(
+            name.as_ptr(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status == 0 && !result.is_null() {
+        // SAFETY: `result` points into `entry`, which `getpwnam_r` filled.
+        Some(unsafe { entry.assume_init() }.pw_uid)
+    } else {
+        None
+    }
+}
+
+/// Resolves a gid that may be a number or a group name, after
+/// `src/node_credentials.cc`'s `gid_by_name`.
+fn resolve_gid(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Option<libc::gid_t> {
+    if value.is_uint32() {
+        return Some(value.uint32_value(scope)? as libc::gid_t);
+    }
+    let name = std::ffi::CString::new(value.to_string(scope)?.to_rust_string_lossy(scope)).ok()?;
+    let mut entry = std::mem::MaybeUninit::<libc::group>::zeroed();
+    let mut buffer = vec![0 as libc::c_char; 8192];
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: as in `resolve_uid`.
+    let status = unsafe {
+        libc::getgrnam_r(
+            name.as_ptr(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status == 0 && !result.is_null() {
+        // SAFETY: `result` points into `entry`, which `getgrnam_r` filled.
+        Some(unsafe { entry.assume_init() }.gr_gid)
+    } else {
+        None
+    }
+}
+
 fn set_uid(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let id = args.get(0).int32_value(scope).unwrap_or(-1);
-    // SAFETY: a single integer argument; failure is reported through errno.
-    let result = unsafe { libc::setuid(id as libc::uid_t) };
-    rv.set(v8::Integer::new(scope, result).into());
+    // `1` is the "unknown credential" answer the JavaScript wrapper turns into
+    // `ERR_UNKNOWN_CREDENTIAL`; a libc failure throws with its errno instead.
+    let Some(uid) = resolve_uid(scope, args.get(0)) else {
+        rv.set(v8::Integer::new(scope, 1).into());
+        return;
+    };
+    // SAFETY: a single id; failure is reported through errno.
+    if unsafe { libc::setuid(uid) } == -1 {
+        throw_errno(scope, "setuid");
+        return;
+    }
+    rv.set(v8::Integer::new(scope, 0).into());
 }
 
 fn set_euid(
@@ -311,10 +389,16 @@ fn set_euid(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let id = args.get(0).int32_value(scope).unwrap_or(-1);
+    let Some(uid) = resolve_uid(scope, args.get(0)) else {
+        rv.set(v8::Integer::new(scope, 1).into());
+        return;
+    };
     // SAFETY: as in `set_uid`.
-    let result = unsafe { libc::seteuid(id as libc::uid_t) };
-    rv.set(v8::Integer::new(scope, result).into());
+    if unsafe { libc::seteuid(uid) } == -1 {
+        throw_errno(scope, "seteuid");
+        return;
+    }
+    rv.set(v8::Integer::new(scope, 0).into());
 }
 
 fn set_gid(
@@ -322,10 +406,16 @@ fn set_gid(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let id = args.get(0).int32_value(scope).unwrap_or(-1);
+    let Some(gid) = resolve_gid(scope, args.get(0)) else {
+        rv.set(v8::Integer::new(scope, 1).into());
+        return;
+    };
     // SAFETY: as in `set_uid`.
-    let result = unsafe { libc::setgid(id as libc::gid_t) };
-    rv.set(v8::Integer::new(scope, result).into());
+    if unsafe { libc::setgid(gid) } == -1 {
+        throw_errno(scope, "setgid");
+        return;
+    }
+    rv.set(v8::Integer::new(scope, 0).into());
 }
 
 fn set_egid(
@@ -333,10 +423,16 @@ fn set_egid(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let id = args.get(0).int32_value(scope).unwrap_or(-1);
+    let Some(gid) = resolve_gid(scope, args.get(0)) else {
+        rv.set(v8::Integer::new(scope, 1).into());
+        return;
+    };
     // SAFETY: as in `set_uid`.
-    let result = unsafe { libc::setegid(id as libc::gid_t) };
-    rv.set(v8::Integer::new(scope, result).into());
+    if unsafe { libc::setegid(gid) } == -1 {
+        throw_errno(scope, "setegid");
+        return;
+    }
+    rv.set(v8::Integer::new(scope, 0).into());
 }
 
 fn set_groups(
@@ -345,20 +441,27 @@ fn set_groups(
     mut rv: v8::ReturnValue,
 ) {
     let Ok(array) = v8::Local::<v8::Array>::try_from(args.get(0)) else {
-        rv.set(v8::Integer::new(scope, -1).into());
+        rv.set(v8::Integer::new(scope, 1).into());
         return;
     };
     let mut groups = Vec::with_capacity(array.length() as usize);
     for index in 0..array.length() {
-        if let Some(value) = array.get_index(scope, index) {
-            if let Some(group) = value.int32_value(scope) {
-                groups.push(group as libc::gid_t);
-            }
-        }
+        let Some(value) = array.get_index(scope, index) else {
+            return;
+        };
+        let Some(gid) = resolve_gid(scope, value) else {
+            // One-based, which is what the wrapper's `groups[result - 1]` reads.
+            rv.set(v8::Integer::new_from_unsigned(scope, index + 1).into());
+            return;
+        };
+        groups.push(gid);
     }
     // SAFETY: `groups` owns exactly `groups.len()` initialised entries.
-    let result = unsafe { libc::setgroups(groups.len(), groups.as_ptr()) };
-    rv.set(v8::Integer::new(scope, result).into());
+    if unsafe { libc::setgroups(groups.len(), groups.as_ptr()) } == -1 {
+        throw_errno(scope, "setgroups");
+        return;
+    }
+    rv.set(v8::Integer::new(scope, 0).into());
 }
 
 fn init_groups(
@@ -366,22 +469,116 @@ fn init_groups(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let Some(user) = args.get(0).to_string(scope) else {
-        rv.set(v8::Integer::new(scope, -1).into());
+    // `1` means the user is unknown and `2` the group, which the wrapper turns
+    // into `ERR_UNKNOWN_CREDENTIAL` naming the right one.
+    let Some(uid) = resolve_uid(scope, args.get(0)) else {
+        rv.set(v8::Integer::new(scope, 1).into());
         return;
     };
-    let user = user.to_rust_string_lossy(scope);
-    let group = args.get(1).int32_value(scope).unwrap_or(0) as libc::gid_t;
-    let name = match std::ffi::CString::new(user) {
-        Ok(name) => name,
-        Err(_) => {
-            rv.set(v8::Integer::new(scope, -1).into());
-            return;
+    let Some(gid) = resolve_gid(scope, args.get(1)) else {
+        rv.set(v8::Integer::new(scope, 2).into());
+        return;
+    };
+    // `initgroups` takes a user *name*, so the id is looked up back to one.
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
+    let mut buffer = vec![0 as libc::c_char; 8192];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is valid for its stated length, and `entry` and
+    // `buffer` outlive the call.
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        rv.set(v8::Integer::new(scope, 1).into());
+        return;
+    }
+    // SAFETY: `result` points into `entry`, which `getpwuid_r` filled, and
+    // `pw_name` points into `buffer`, which is still alive.
+    let name = unsafe { entry.assume_init() }.pw_name;
+    if name.is_null() {
+        rv.set(v8::Integer::new(scope, 1).into());
+        return;
+    }
+    // SAFETY: `name` is NUL-terminated inside `buffer`.
+    if unsafe { libc::initgroups(name, gid) } == -1 {
+        throw_errno(scope, "initgroups");
+        return;
+    }
+    rv.set(v8::Integer::new(scope, 0).into());
+}
+
+/// `UVException`: an error carrying `errno`, `code`, `syscall` and the message
+/// form `lib/**` and Node's own tests expect.
+///
+/// The shape is `node::UVException`'s, not `Environment::ThrowErrnoException`'s:
+/// the message is `"<CODE>, <strerror>"` with the code *inside* it, `errno` is
+/// the positive number, and `code` is the symbolic name (`EPERM`). Node's
+/// `does_own_process_state` wrapper rethrows this object unchanged, so a test
+/// comparing `e.code` or the message sees these fields.
+fn throw_errno(scope: &mut v8::PinScope<'_, '_>, syscall: &str) {
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EINVAL);
+    // `uv_err_name` is the symbolic spelling; libc's `strerror` is the text
+    // after the comma.
+    let code = match errno {
+        libc::EPERM => "EPERM",
+        libc::ENOENT => "ENOENT",
+        libc::ESRCH => "ESRCH",
+        libc::EINTR => "EINTR",
+        libc::EIO => "EIO",
+        libc::EACCES => "EACCES",
+        libc::EFAULT => "EFAULT",
+        libc::EINVAL => "EINVAL",
+        libc::ENOMEM => "ENOMEM",
+        libc::ENOSYS => "ENOSYS",
+        _ => "UNKNOWN",
+    };
+    // SAFETY: `strerror` returns a static string for any int, and it is never
+    // null for a valid errno on glibc.
+    let detail = unsafe {
+        let pointer = libc::strerror(errno);
+        if pointer.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(pointer)
+                .to_string_lossy()
+                .into_owned()
         }
     };
-    // SAFETY: `name` is a valid NUL-terminated string and lives for the call.
-    let result = unsafe { libc::initgroups(name.as_ptr(), group) };
-    rv.set(v8::Integer::new(scope, result).into());
+    let message = format!("{code}, {detail}");
+    let Some(text) = v8::String::new(scope, &message) else {
+        return;
+    };
+    let error = v8::Exception::error(scope, text);
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(error) {
+        for (name, value) in [
+            ("errno", v8::Integer::new(scope, errno).into()),
+            (
+                "code",
+                v8::String::new(scope, code)
+                    .map(|text| text.into())
+                    .unwrap_or_else(|| v8::undefined(scope).into()),
+            ),
+            (
+                "syscall",
+                v8::String::new(scope, syscall)
+                    .map(|text| text.into())
+                    .unwrap_or_else(|| v8::undefined(scope).into()),
+            ),
+        ] {
+            if let Some(key) = v8::String::new(scope, name) {
+                object.set(scope, key.into(), value);
+            }
+        }
+    }
+    scope.throw_exception(error);
 }
 
 fn get_hostname(
