@@ -749,14 +749,10 @@ fn member_list_tracks_node_minus_documented_deferrals() {
     .collect();
 
     // Documented in README.md under "Deliberately deferred".
-    let deferred: std::collections::BTreeSet<&str> = [
-        "cpSyncCheckPaths",
-        "cpSyncCopyDir",
-        "cpSyncOverrideFile",
-        "openFileHandle",
-    ]
-    .into_iter()
-    .collect();
+    let deferred: std::collections::BTreeSet<&str> =
+        ["cpSyncCopyDir", "cpSyncOverrideFile", "openFileHandle"]
+            .into_iter()
+            .collect();
 
     // Not in Node's `fs` namespace: the request constructor the JS instantiates,
     // and the promise-mode sentinel it forwards.
