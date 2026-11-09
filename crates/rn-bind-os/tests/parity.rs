@@ -141,3 +141,50 @@ fn user_info_reports_the_current_uid() {
         assert_eq!(uid, unsafe { libc::getuid() } as f64);
     });
 }
+
+#[test]
+fn a_failed_call_fills_the_error_context_and_returns_undefined() {
+    // `lib/os.js` wraps these calls in `getCheckedFunction`, which passes a
+    // fresh object and throws `ERR_SYSTEM_ERROR` when the call returns
+    // undefined. Returning an error instead of filling the object would bypass
+    // that and lose the errno, so the contract has to be checked directly.
+    with_isolate(|scope| {
+        let object = install(scope);
+        let key = v8::String::new(scope, "getPriority").expect("key");
+        let function =
+            v8::Local::<v8::Function>::try_from(object.get(scope, key.into()).expect("fn"))
+                .expect("a function");
+
+        // A pid that cannot exist, with the context object the caller passes.
+        let context = v8::Object::new(scope);
+        let pid = v8::Integer::new(scope, i32::MAX);
+        let result = function
+            .call(scope, object.into(), &[pid.into(), context.into()])
+            .expect("the call to return");
+
+        assert!(
+            result.is_undefined(),
+            "a failed call must return undefined, not throw"
+        );
+
+        let read = |name: &str| {
+            let key = v8::String::new(scope, name).expect("key");
+            context.get(scope, key.into())
+        };
+        // `errno`, `code`, `message` and `syscall` are what
+        // `CollectUVExceptionInfo` writes.
+        let errno = read("errno").expect("errno");
+        assert!(
+            errno.number_value(scope).is_some(),
+            "the context must carry the errno"
+        );
+        assert!(read("code").expect("code").is_string());
+        assert!(read("syscall").expect("syscall").is_string());
+        assert_eq!(
+            read("syscall")
+                .expect("syscall")
+                .to_rust_string_lossy(scope),
+            "uv_os_getpriority"
+        );
+    });
+}
