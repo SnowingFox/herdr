@@ -37,6 +37,13 @@ fn main() {
     // JavaScript keeps working instead of crashing inside V8's `CHECK`.
     v8::V8::set_flags_from_string("--no-freeze-flags-after-init");
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Flags that V8 owns are handed to it before initialization, the way Node's
+    // `V8::Initialize` path does. `--max-old-space-size` is the one observable
+    // through `v8.getHeapStatistics().heap_size_limit`, so ignoring it made that
+    // field a fixed 1.5 GB no matter what the command line said.
+    forward_v8_flags(&args);
+
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
@@ -47,7 +54,6 @@ fn main() {
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let options = match args::parse(&args) {
         Ok(options) => options,
         Err(message) => {
@@ -180,6 +186,31 @@ fn main() {
     // terminated the process before reaching here.
     if let Some(code) = bootstrap::read_exit_code(scope) {
         std::process::exit(code);
+    }
+}
+
+/// Passes the command-line flags that belong to V8 through to it.
+///
+/// Node splits its arguments into its own and V8's, and hands the V8 half over
+/// before `V8::Initialize`. rustnode accepts the same flags, so the ones that
+/// are only meaningful to V8 have to reach it too — otherwise a flag is accepted
+/// and silently does nothing, which is the failure mode `Options::unimplemented`
+/// exists to avoid but cannot catch for a flag that *is* implemented elsewhere.
+///
+/// Only the flags listed here are forwarded. Everything else rustnode handles
+/// itself, and forwarding it would change V8's behaviour behind rustnode's back.
+fn forward_v8_flags(args: &[String]) {
+    /// V8 flags that are also Node flags and are implemented by passing them
+    /// through. `--max-old-space-size` sizes the old generation, which is what
+    /// `v8.getHeapStatistics().heap_size_limit` reports.
+    const FORWARDED: &[&str] = &["--max-old-space-size=", "--stack-size="];
+
+    for argument in args {
+        if FORWARDED.iter().any(|prefix| argument.starts_with(prefix)) {
+            // V8 spells its flags with underscores as well as dashes; the dashed
+            // form is what the command line takes and V8 accepts both.
+            v8::V8::set_flags_from_string(argument);
+        }
     }
 }
 
