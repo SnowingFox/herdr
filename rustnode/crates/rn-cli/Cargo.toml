@@ -19,6 +19,9 @@ rn-builtins = { path = "../rn-builtins" }
 rn-js2c = { path = "../rn-js2c" }
 rn-core = { path = "../rn-core" }
 rn-bindings = { path = "../rn-bindings" }
+# `process.versions.openssl` has to report the version this binary actually
+# linked, so the CLI reads it from the crypto binding rather than hardcoding.
+rn-bind-crypto = { path = "../rn-bind-crypto" }
 rn-module = { path = "../rn-module" }
 rn-io = { path = "../rn-io" }
 rn-napi = { path = "../rn-napi" }
