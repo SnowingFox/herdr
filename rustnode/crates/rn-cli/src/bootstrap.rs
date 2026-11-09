@@ -129,6 +129,75 @@ pub fn wrap_require_with_scheme_support(scope: &mut v8::PinScope, loaders: &Boot
     rn_core::hook_slot::replace_require(scope, wrapped);
 }
 
+/// Installs the globals that only need bindings which already exist.
+///
+/// `internal/bootstrap/node.js` is what normally defines `Buffer`,
+/// `structuredClone`, `TextEncoder` and the timer functions, and it cannot run
+/// until `url`, `contextify`, `v8` and `crypto` land. The modules behind these
+/// four do not depend on any of those, so they are installed here to move the
+/// global surface forward without waiting: each is the vendored Node
+/// implementation, not a reimplementation.
+///
+/// Anything that needs a missing binding is skipped silently rather than half
+/// installed, so a module that starts working later is picked up automatically
+/// and one that does not leaves no broken global behind.
+pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
+    let Some(require) = loaders.require.as_ref() else {
+        return;
+    };
+    let require = v8::Local::new(scope, require);
+    let global = scope.get_current_context().global(scope);
+
+    // `structuredClone` comes straight from the messaging binding, which does a
+    // real V8 serializer round trip.
+    if let Some(value) = call_require(scope, require, "internal/bootstrap/realm")
+        .and_then(|exports| get_property(scope, exports, "internalBinding"))
+        .and_then(|binding| call_with_string(scope, binding, "messaging"))
+        .and_then(|messaging| get_property(scope, messaging, "structuredClone"))
+    {
+        let _ = set(scope, global, "structuredClone", value);
+    }
+
+    // `TextEncoder` and `TextDecoder` live in `internal/encoding`, which only
+    // needs the encoding binding.
+    if let Some(encoding) = call_require(scope, require, "internal/encoding") {
+        for name in ["TextEncoder", "TextDecoder"] {
+            if let Some(value) = get_property(scope, encoding, name) {
+                let _ = set(scope, global, name, value);
+            }
+        }
+    }
+}
+
+fn call_require<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+    id: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let id = v8::String::new(scope, id)?;
+    require.call(scope, v8::undefined(scope).into(), &[id.into()])
+}
+
+fn call_with_string<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    function: v8::Local<'s, v8::Value>,
+    argument: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let function = v8::Local::<v8::Function>::try_from(function).ok()?;
+    let argument = v8::String::new(scope, argument)?;
+    function.call(scope, v8::undefined(scope).into(), &[argument.into()])
+}
+
+fn get_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Value>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let object = v8::Local::<v8::Object>::try_from(object).ok()?;
+    let key = v8::String::new(scope, name)?;
+    object.get(scope, key.into())
+}
+
 /// `BuiltinModule.normalizeRequirableId`, reached through the realm exports.
 fn normalize_requirable_id<'s>(
     scope: &mut v8::PinScope<'s, '_>,

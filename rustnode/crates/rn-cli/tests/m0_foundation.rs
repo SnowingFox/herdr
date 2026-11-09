@@ -157,3 +157,32 @@ fn a_relative_specifier_is_not_treated_as_a_builtin() {
         "the specifier must survive untouched so the loader can report it"
     );
 }
+
+#[test]
+fn structured_clone_is_a_real_serializer_round_trip() {
+    // It comes from the messaging binding, so a cycle has to survive and a
+    // copied object has to stop sharing identity with the original.
+    let out = rustnode(&[
+        "-e",
+        "const o = {n: 1}; o.self = o; const c = structuredClone(o);\n\
+         console.log(c.self === c, c === o, c.n);",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true false 1");
+}
+
+#[test]
+fn text_encoder_and_decoder_are_the_node_implementations() {
+    // `internal/encoding` is the vendored Node module, so the encoding label and
+    // the byte values have to match Node's rather than be plausible.
+    let out = rustnode(&[
+        "-e",
+        "const e = new TextEncoder();\n\
+         console.log(e.encoding, JSON.stringify(Array.from(e.encode('héllo'))));\n\
+         const d = new TextDecoder();\n\
+         console.log(d.encoding, d.decode(new Uint8Array([104, 195, 169, 108, 108, 111])));",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "utf-8 [104,195,169,108,108,111]\nutf-8 héllo"
+    );
+}
