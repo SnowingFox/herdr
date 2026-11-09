@@ -56,6 +56,7 @@ struct Options {
     report: bool,
     fail_on_unimplemented: bool,
     quiet: bool,
+    baseline: Baseline,
 }
 
 /// One namespace's outcome after checking.
@@ -81,6 +82,7 @@ struct Row {
 
 const USAGE: &str = "\
 usage: rn-compat contracts [<contracts-dir>] [--report] [--fail-on-unimplemented] [--quiet]
+                           [--baseline <file>] [--write-baseline <file>]
 
   contracts                  check the Rust registry against contracts/
   contracts <dir>            check against another directory
@@ -88,7 +90,19 @@ usage: rn-compat contracts [<contracts-dir>] [--report] [--fail-on-unimplemented
                              (unless --fail-on-unimplemented also finds gaps)
   --fail-on-unimplemented    with --report, exit 1 when a contract has no
                              Rust namespace yet
-  --quiet                    only print problems";
+  --quiet                    only print problems
+  --baseline <file>          exit 1 if any namespace that used to be complete
+                             no longer is; the ratchet that stops coverage
+                             sliding backwards while unregistered namespaces
+                             are still tolerated
+  --write-baseline <file>    record the currently complete namespaces";
+
+/// Options for the coverage ratchet.
+#[derive(Debug, Default)]
+struct Baseline {
+    read: Option<PathBuf>,
+    write: Option<PathBuf>,
+}
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut options = Options {
@@ -96,12 +110,21 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         ..Options::default()
     };
     let mut saw_subcommand = false;
-    for arg in args {
+    let mut arguments = args.iter();
+    while let Some(arg) = arguments.next() {
         match arg.as_str() {
             "contracts" if !saw_subcommand => saw_subcommand = true,
             "--report" => options.report = true,
             "--fail-on-unimplemented" => options.fail_on_unimplemented = true,
             "--quiet" => options.quiet = true,
+            "--baseline" => match arguments.next() {
+                Some(path) => options.baseline.read = Some(PathBuf::from(path)),
+                None => return Err(format!("--baseline needs a path\n\n{USAGE}")),
+            },
+            "--write-baseline" => match arguments.next() {
+                Some(path) => options.baseline.write = Some(PathBuf::from(path)),
+                None => return Err(format!("--write-baseline needs a path\n\n{USAGE}")),
+            },
             "-h" | "--help" => return Err(USAGE.to_string()),
             other if other.starts_with('-') => {
                 return Err(format!("unknown option: {other}\n\n{USAGE}"));
@@ -264,6 +287,12 @@ impl Row {
     fn is_mismatch(&self) -> bool {
         self.implemented && self.claimed && !self.missing.is_empty()
     }
+
+    /// True when every recorded member is installed or declared deferred. This
+    /// is the set the coverage ratchet protects.
+    fn is_complete(&self) -> bool {
+        self.implemented && self.missing.is_empty()
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -357,7 +386,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 options.contracts_dir.display()
             );
         }
-        return Ok(());
+        return check_baseline(&options.baseline, &rows);
     }
 
     for row in &mismatches {
@@ -366,6 +395,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     eprintln!("{} namespace(s) failed their contract", mismatches.len());
+    std::process::exit(1);
+}
+
+/// Namespaces whose contract is fully covered right now.
+fn complete_namespaces(rows: &[Row]) -> Vec<String> {
+    let mut names: Vec<String> = rows
+        .iter()
+        .filter(|row| row.is_complete())
+        .map(|row| row.namespace.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The coverage ratchet.
+///
+/// Unregistered namespaces are bring-up state and never fail the check, which is
+/// right while dozens are missing. The hazard is the other direction: a namespace
+/// that works today can regress to absent or partial, and the tolerant check
+/// would call that a pass. `zlib` did exactly that, reporting a green contract
+/// while `require('zlib')` could not load. A recorded baseline turns that
+/// regression into a failure while leaving new coverage free to land.
+fn check_baseline(baseline: &Baseline, rows: &[Row]) -> Result<(), Box<dyn std::error::Error>> {
+    let complete = complete_namespaces(rows);
+
+    if let Some(path) = &baseline.write {
+        let text = format!(
+            "{}\n",
+            complete
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        std::fs::write(path, text)?;
+        println!(
+            "wrote {} complete namespace(s) to {}",
+            complete.len(),
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let Some(path) = &baseline.read else {
+        return Ok(());
+    };
+    let text = std::fs::read_to_string(path)?;
+    let recorded: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    let regressed: Vec<&str> = recorded
+        .iter()
+        .copied()
+        .filter(|name| !complete.iter().any(|done| done == name))
+        .collect();
+
+    if regressed.is_empty() {
+        println!(
+            "coverage ratchet holds: {} namespace(s) recorded complete are still complete",
+            recorded.len()
+        );
+        return Ok(());
+    }
+
+    for name in &regressed {
+        let row = rows.iter().find(|row| row.namespace == *name);
+        let detail = match row {
+            Some(row) if !row.implemented => "no longer registered".to_string(),
+            Some(row) if row.missing_count() > 0 => {
+                format!("{} member(s) missing", row.missing_count())
+            }
+            Some(_) => "registered but claims no members".to_string(),
+            None => "the contract no longer exists".to_string(),
+        };
+        eprintln!("'{name}' regressed: {detail}");
+    }
+    eprintln!(
+        "{} namespace(s) regressed from complete. Fix them, or rewrite the \
+         baseline with --write-baseline if the loss is deliberate.",
+        regressed.len()
+    );
     std::process::exit(1);
 }
 
@@ -555,6 +667,12 @@ mod deferral_tests {
         Namespace::new(name, members).with_deferred(deferred)
     }
 
+    /// A registered namespace that claims no members, which is what a
+    /// placeholder looks like.
+    fn placeholder(name: &str) -> Namespace {
+        Namespace::new(name, &[])
+    }
+
     fn contract(name: &str, members: &[&str]) -> NamespaceContract {
         NamespaceContract {
             namespace: name.to_string(),
@@ -606,5 +724,42 @@ mod deferral_tests {
         );
         assert!(rows[0].missing.is_empty());
         assert!(rows[0].deferred.is_empty());
+    }
+
+    #[test]
+    fn a_complete_namespace_is_what_the_ratchet_records() {
+        let rows = check(
+            &[contract("fs", &["open"]), contract("os", &["tmpdir"])],
+            &[namespace("fs", &["open"], &[]), placeholder("os")],
+        );
+        // `os` is registered but claims nothing, so it is not coverage; a
+        // placeholder must never be recorded as complete.
+        assert_eq!(complete_namespaces(&rows), vec!["fs".to_string()]);
+    }
+
+    #[test]
+    fn a_declared_deferral_still_counts_as_complete() {
+        // The contract treats a written deferral as honest coverage, and the
+        // ratchet follows the same rule so it never demands the impossible.
+        let rows = check(
+            &[contract("fs", &["open", "close"])],
+            &[namespace("fs", &["open"], &[("close", "needs the loop")])],
+        );
+        assert!(rows[0].missing.is_empty());
+        assert_eq!(complete_namespaces(&rows), vec!["fs".to_string()]);
+    }
+
+    #[test]
+    fn a_regression_to_placeholder_drops_out_of_coverage() {
+        // This is the `zlib` shape: the namespace still exists, so the tolerant
+        // check stays quiet, but it no longer covers its contract. The ratchet
+        // is what notices.
+        let rows = check(&[contract("fs", &["open"])], &[placeholder("fs")]);
+        assert!(rows[0].implemented, "the namespace is still there");
+        assert!(!rows[0].is_mismatch(), "a placeholder is bring-up state");
+        assert!(
+            complete_namespaces(&rows).is_empty(),
+            "but it is not coverage"
+        );
     }
 }

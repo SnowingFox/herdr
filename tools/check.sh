@@ -39,7 +39,10 @@ step "lints"
 cargo clippy --workspace --all-targets -- -D warnings
 
 step "binding shapes against the recorded contracts"
-cargo run -q -p rn-compat -- contracts
+# `--baseline` is the coverage ratchet: an unregistered namespace is bring-up
+# state and passes, but one that used to cover its contract and no longer does
+# is a regression. Without it a namespace could silently drop to a placeholder.
+cargo run -q -p rn-compat -- contracts --baseline contracts/complete-namespaces.txt
 
 step "deferred members reached at module scope"
 # A declared deferral passes the contract check by design, so this is the only
