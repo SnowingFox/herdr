@@ -68,9 +68,13 @@ struct Row {
     /// no members yet. Placeholder gaps are bring-up work, not mismatches;
     /// once a namespace claims any member it must claim all of them.
     claimed: bool,
+    /// Members neither installed nor declared deferred: real mismatches.
     missing: Vec<String>,
     /// Recorded kind per missing member, for the problem lines.
     missing_kinds: Vec<String>,
+    /// Members the crate declares it does not install yet, with reasons.
+    /// Declared gaps are reported but never failed.
+    deferred: Vec<String>,
     required: usize,
     reachable: bool,
 }
@@ -146,15 +150,26 @@ fn check(contracts: &[NamespaceContract], registry: &[Namespace]) -> Vec<Row> {
                 claimed: false,
                 missing: Vec::new(),
                 missing_kinds: Vec::new(),
+                deferred: Vec::new(),
                 required: contract.members.len(),
                 reachable: contract.reachable,
             });
             continue;
         };
-        let missing: Vec<(&String, &MemberContract)> = contract
+        let gap: Vec<(&String, &MemberContract)> = contract
             .members
             .iter()
             .filter(|(member, _)| !namespace.members.contains(*member))
+            .collect();
+        let deferred: Vec<String> = gap
+            .iter()
+            .filter(|(member, _)| namespace.deferred.contains_key(*member))
+            .map(|(member, _)| (*member).clone())
+            .collect();
+        let missing: Vec<(&String, &MemberContract)> = gap
+            .iter()
+            .filter(|(member, _)| !namespace.deferred.contains_key(*member))
+            .copied()
             .collect();
         rows.push(Row {
             namespace: contract.namespace.clone(),
@@ -165,6 +180,7 @@ fn check(contracts: &[NamespaceContract], registry: &[Namespace]) -> Vec<Row> {
                 .iter()
                 .map(|(_, member)| member.kind.clone())
                 .collect(),
+            deferred,
             required: contract.members.len(),
             reachable: contract.reachable,
         });
@@ -181,13 +197,14 @@ fn print_report(rows: &[Row]) {
         .max("namespace".len());
 
     println!(
-        "{:<width$}  {:>9}  {:>7}  status",
+        "{:<width$}  {:>9}  {:>7}  {:>9}  status",
         "namespace",
         "recorded",
         "missing",
+        "deferred",
         width = width
     );
-    println!("{}", "-".repeat(width + 30));
+    println!("{}", "-".repeat(width + 40));
     for row in rows {
         let status = if !row.implemented {
             if row.reachable {
@@ -204,10 +221,11 @@ fn print_report(rows: &[Row]) {
         };
         let missing = row.missing_count().to_string();
         println!(
-            "{:<width$}  {:>9}  {:>7}  {status}",
+            "{:<width$}  {:>9}  {:>7}  {:>9}  {status}",
             row.namespace,
             row.required,
             missing,
+            row.deferred.len(),
             width = width
         );
     }
@@ -220,10 +238,11 @@ fn print_report(rows: &[Row]) {
     let recorded: usize = rows.iter().map(|row| row.required).sum();
     let missing: usize = rows.iter().map(Row::missing_count).sum();
     let mismatched = rows.iter().filter(|row| row.is_mismatch()).count();
-    println!("{}", "-".repeat(width + 30));
+    let deferred: usize = rows.iter().map(|row| row.deferred.len()).sum();
+    println!("{}", "-".repeat(width + 40));
     println!(
         "{implemented}/{} namespaces registered, {satisfied} satisfied, {mismatched} mismatched, \
-         {recorded} members recorded, {missing} missing",
+         {recorded} members recorded, {missing} missing, {deferred} declared deferred",
         rows.len()
     );
 }
@@ -525,5 +544,67 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(parse_args(&args).is_err(), "unknown flags are rejected");
+    }
+}
+
+#[cfg(test)]
+mod deferral_tests {
+    use super::*;
+
+    fn namespace(name: &str, members: &[&str], deferred: &[(&str, &str)]) -> Namespace {
+        Namespace::new(name, members).with_deferred(deferred)
+    }
+
+    fn contract(name: &str, members: &[&str]) -> NamespaceContract {
+        NamespaceContract {
+            namespace: name.to_string(),
+            reachable: true,
+            members: members
+                .iter()
+                .map(|member| {
+                    (
+                        (*member).to_string(),
+                        MemberContract {
+                            kind: "function".to_string(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn declared_deferral_is_not_a_mismatch() {
+        let rows = check(
+            &[contract("fs", &["open", "cpSyncCopyDir"])],
+            &[namespace(
+                "fs",
+                &["open"],
+                &[("cpSyncCopyDir", "lands with cp -r")],
+            )],
+        );
+        assert!(rows[0].missing.is_empty());
+        assert_eq!(rows[0].deferred, vec!["cpSyncCopyDir".to_string()]);
+        assert!(!rows[0].is_mismatch());
+    }
+
+    #[test]
+    fn undeclared_gap_still_fails() {
+        let rows = check(
+            &[contract("fs", &["open", "close"])],
+            &[namespace("fs", &["open"], &[])],
+        );
+        assert_eq!(rows[0].missing, vec!["close".to_string()]);
+        assert!(rows[0].is_mismatch());
+    }
+
+    #[test]
+    fn deferring_an_installed_member_is_harmless() {
+        let rows = check(
+            &[contract("fs", &["open"])],
+            &[namespace("fs", &["open"], &[("open", "gone")])],
+        );
+        assert!(rows[0].missing.is_empty());
+        assert!(rows[0].deferred.is_empty());
     }
 }
