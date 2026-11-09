@@ -17,6 +17,7 @@ serde_json.workspace = true
 tracing.workspace = true
 rn-bind-async-context = { path = "../rn-bind-async-context" }
 rn-bind-config = { path = "../rn-bind-config" }
+rn-bind-diagnostics-channel = { path = "../rn-bind-diagnostics-channel" }
 rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-os = { path = "../rn-bind-os" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
