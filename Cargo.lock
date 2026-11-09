@@ -668,6 +668,7 @@ dependencies = [
 name = "rn-bind-string-decoder"
 version = "0.1.0"
 dependencies = [
+ "rn-bindings",
  "rn-core",
  "rn-v8-sys",
 ]

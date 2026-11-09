@@ -10,3 +10,9 @@ description = "internalBinding('string_decoder') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+
+[dev-dependencies]
+# The integration test builds the registry exactly as `rn-cli` does, so it can
+# prove `internalBinding('string_decoder')` resolves. Cargo permits this edge
+# because it is dev-only: `rn-bindings` depends on this crate, not the reverse.
+rn-bindings = { path = "../rn-bindings" }
