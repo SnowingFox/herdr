@@ -20,6 +20,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
+# East-Asian Width and general-category data, which is what
+# `icu.getStringWidth` needs for `util.inspect` column counting.
+unicode-width = "0.2"
 parking_lot = "0.12"
 rn-v8-sys = { path = "crates/rn-v8-sys" }
 rn-core = { path = "crates/rn-core" }

@@ -21,6 +21,9 @@ rn-bind-buffer = { path = "../rn-bind-buffer" }
 rn-bind-config = { path = "../rn-bind-config" }
 rn-bind-diagnostics-channel = { path = "../rn-bind-diagnostics-channel" }
 rn-bind-fs = { path = "../rn-bind-fs" }
+rn-bind-icu = { path = "../rn-bind-icu" }
+rn-bind-messaging = { path = "../rn-bind-messaging" }
+rn-bind-mksnapshot = { path = "../rn-bind-mksnapshot" }
 rn-bind-options = { path = "../rn-bind-options" }
 rn-bind-os = { path = "../rn-bind-os" }
 rn-bind-performance = { path = "../rn-bind-performance" }
@@ -30,6 +33,8 @@ rn-bind-string-decoder = { path = "../rn-bind-string-decoder" }
 rn-bind-symbols = { path = "../rn-bind-symbols" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 rn-bind-timers = { path = "../rn-bind-timers" }
+rn-bind-trace-events = { path = "../rn-bind-trace-events" }
+rn-bind-url-pattern = { path = "../rn-bind-url-pattern" }
 rn-bind-uv = { path = "../rn-bind-uv" }
 rn-bind-zlib = { path = "../rn-bind-zlib" }
 rn-builtins = { path = "../rn-builtins" }
