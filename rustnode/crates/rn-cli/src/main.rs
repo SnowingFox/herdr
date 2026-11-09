@@ -49,7 +49,7 @@ fn main() {
     match bootstrap::bootstrap_realm(scope, &registry) {
         Ok(loaders) => {
             let _ = (loaders.internal_binding, loaders.require);
-        },
+        }
         Err(message) => eprintln!("rustnode: realm bootstrap failed: {message}"),
     }
 

@@ -190,7 +190,8 @@ predicate!(is_map_iterator, |value| {
         .unwrap_or(false)
 });
 
-predicate!(is_module_namespace_object, |value| value.is_module_namespace_object());
+predicate!(is_module_namespace_object, |value| value
+    .is_module_namespace_object());
 
 // Recognises an error from any realm, so an error thrown inside a `vm` context
 // still reads as a native error.
@@ -220,7 +221,8 @@ predicate!(is_set_iterator, |value| {
         .unwrap_or(false)
 });
 
-predicate!(is_shared_array_buffer, |value| value.is_shared_array_buffer());
+predicate!(is_shared_array_buffer, |value| value
+    .is_shared_array_buffer());
 
 predicate!(is_string_object, |value| {
     v8::Local::<v8::Object>::try_from(value)
