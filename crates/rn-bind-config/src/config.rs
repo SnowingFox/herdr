@@ -58,7 +58,13 @@ pub const VALUES: &[Member] = &[
     // `#if HAVE_INSPECTOR`. The inspector is built unless --without-inspector.
     // `lib/inspector.js` throws ERR_INSPECTOR_NOT_AVAILABLE when this is false,
     // so it must only become false together with the `inspector` binding.
-    ("hasInspector", Value::Bool(true)),
+    //
+    // It is false now: `internalBinding('inspector')` has no implementation, and
+    // `lib/v8.js` reads this flag at module scope to decide whether to load
+    // `internalBinding('profiler')`. Reporting true made `require('v8')` fail on
+    // a namespace the build does not have, which is the same lie as reporting
+    // `process.features.inspector` true. Flip both when the inspector lands.
+    ("hasInspector", Value::Bool(false)),
     // `#ifdef NODE_NO_BROWSER_GLOBALS`, set by --no-browser-globals. Default
     // builds keep the browser globals, so this is false.
     ("noBrowserGlobals", Value::Bool(false)),
