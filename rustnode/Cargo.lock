@@ -625,6 +625,7 @@ dependencies = [
  "rn-core",
  "rn-errors",
  "rn-io",
+ "rn-module-wrap",
  "rn-permission",
  "rn-v8-sys",
  "serde",
@@ -716,6 +717,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "rn-module-wrap"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
 ]
 
 [[package]]
