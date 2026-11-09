@@ -808,9 +808,15 @@ parser.execute('not a buffer');
     );
 }
 
-/// `consume` is not implemented because the runtime has no `StreamBase` handles;
-/// it must say so rather than accept a socket it will never read.
-fn consume_reports_that_stream_handles_are_unavailable() {
+/// `consume` resolves its argument to a `StreamBase` handle, which is what Node
+/// `CHECK`s. A plain object has no stream attached under the pairing symbol, so
+/// the closest honest equivalent is a throw that names the requirement.
+///
+/// The message is deliberately about the *argument*, not about the runtime:
+/// `tcp_wrap` and `pipe_wrap` publish real stream handles, and the pairing is
+/// what `StreamBase::FromObject` unwraps in Node. A caller passing `{}` is a
+/// caller bug in both runtimes.
+fn consume_rejects_a_non_stream_handle() {
     let message = eval_expecting_throw(
         r#"
 const parser = makeParser('request');
@@ -818,9 +824,27 @@ parser.consume({});
 "#,
     );
     assert!(
-        message.contains("StreamBase"),
-        "the message explains the missing prerequisite: {message}"
+        message.contains("stream handle"),
+        "the message names what consume needs: {message}"
     );
+}
+
+/// `unconsume` on a parser that was never consuming is a silent no-op.
+///
+/// This is `Parser::Unconsume`'s early return for `stream_ == nullptr`, and
+/// `lib/internal/http/common.js`'s `freeParser` depends on it: it calls
+/// `unconsume` whenever `parser._consumed` is set, including for sockets whose
+/// handle it never had.
+fn unconsume_without_consume_is_a_no_op() {
+    let value = eval(
+        r#"
+const parser = makeParser('request');
+parser.unconsume();
+parser.unconsume();
+'no-op';
+"#,
+    );
+    assert_eq!(value.trim(), "no-op", "unconsume must not throw");
 }
 
 /// Every case above, in one test.
@@ -859,5 +883,6 @@ fn http_parser_binding_end_to_end() {
     expired_reports_and_unlinks_a_stale_connection();
     initialize_rejects_an_unknown_parser_type();
     execute_rejects_a_non_view();
-    consume_reports_that_stream_handles_are_unavailable();
+    consume_rejects_a_non_stream_handle();
+    unconsume_without_consume_is_a_no_op();
 }
