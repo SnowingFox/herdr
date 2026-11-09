@@ -628,6 +628,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-encoding"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-fs"
 version = "0.1.0"
 dependencies = [
@@ -790,6 +798,7 @@ dependencies = [
  "rn-bind-buffer",
  "rn-bind-config",
  "rn-bind-diagnostics-channel",
+ "rn-bind-encoding",
  "rn-bind-fs",
  "rn-bind-icu",
  "rn-bind-messaging",
