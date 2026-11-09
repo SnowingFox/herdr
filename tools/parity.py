@@ -137,6 +137,58 @@ out.unicode = {
   emoji: '\u{1F600}'.length,
 };
 
+// The surface that landed most recently. Each of these was, at some point, a
+// namespace that did not exist, so pinning the observable behaviour here keeps
+// a regression from being noticed only when a test suite happens to cover it.
+const crypto = require('crypto');
+const { URL, URLSearchParams } = require('url');
+
+out.crypto = {
+  sha256: crypto.createHash('sha256').update('abc').digest('hex'),
+  sha1: crypto.createHash('sha1').update('abc').digest('hex'),
+  md5: crypto.createHash('md5').update('abc').digest('hex'),
+  hmac: crypto.createHmac('sha256', 'key').update('abc').digest('hex'),
+  // Length only: the bytes are random by definition.
+  randomLength: crypto.randomBytes(16).length,
+  hasSha256: crypto.getHashes().includes('sha256'),
+};
+
+out.url = {
+  href: new URL('https://user:pw@example.com:8443/a/b?q=1#f').href,
+  origin: new URL('https://example.com:8443/x').origin,
+  search: new URL('https://example.com/x?a=1&b=2').search,
+  searchParams: new URLSearchParams('a=1&b=2&b=3').toString(),
+  pathname: new URL('https://example.com/a%20b/c').pathname,
+  fileUrl: new URL('file:///tmp/x.txt').pathname,
+  relative: new URL('../c', 'https://example.com/a/b/').href,
+  invalid: (() => {
+    try {
+      new URL('not a url');
+      return 'parsed';
+    } catch (error) {
+      return error.code;
+    }
+  })(),
+};
+
+out.dns = {
+  // A literal address resolves without a lookup, so this is deterministic.
+  ipv4: require('dns').lookup('127.0.0.1', { family: 4 }, () => {}) === undefined,
+};
+
+out.zlib = {
+  gzipLength: require('zlib').gzipSync(Buffer.from('hello')).length,
+  roundTrip: require('zlib').gunzipSync(
+    require('zlib').gzipSync(Buffer.from('hello')),
+  ).toString(),
+  crc32: require('zlib').crc32('123456789').toString(16),
+};
+
+// `zlib.crc32c` exists in Node 28 and is installed here, but the reference
+// `node` used for comparison is v22, which predates the API. Comparing it would
+// fail on the reference side rather than on a real difference, so the value is
+// checked by the crate's own test against the published check constant instead.
+
 console.log(JSON.stringify(out, null, 2));
 
 // `console.log` is the surface every script actually sees, and it formats
@@ -152,6 +204,12 @@ console.log(function named() {});
 console.log(Symbol('s'), 10n);
 console.log();
 console.log('percent %s and %d are literal here', 'x');
+
+// Ordering, printed at exit so the loop has to run for this to appear.
+queueMicrotask(() => console.log('microtask'));
+process.nextTick(() => console.log('nextTick'));
+setTimeout(() => console.log('timeout'), 0);
+
 """
 
 
