@@ -110,6 +110,22 @@ fn main() {
             // this stands in for it until `contextify` unblocks the real one.
             bootstrap::wrap_require_with_scheme_support(scope, &loaders);
             bootstrap::install_early_globals(scope, &loaders);
+            // The CommonJS loader turns `require` from a builtin lookup into a
+            // real module loader, which is what makes `require('./file.js')`
+            // work. It is the vendored `lib/internal/modules/cjs/loader.js`,
+            // not a Rust reimplementation: resolution order, the cache, the
+            // `node_modules` walk and `package.json` `exports` are all already
+            // correct there.
+            if let Some(require) = loaders.require.as_ref() {
+                let require = v8::Local::new(scope, require);
+                if let Err(message) = bootstrap::install_cjs_loader(scope, require, &script_path) {
+                    // A failure is reported rather than fatal, for the same
+                    // reason the bootstrap itself is: a script using only
+                    // builtins still runs, and saying why file requires do not
+                    // work is more useful than refusing to start.
+                    eprintln!("rustnode: commonjs loader unavailable: {message}");
+                }
+            }
             // The loop's JavaScript half is installed before the script runs,
             // because a script may call `setTimeout` on its first line. A
             // failure here is reported rather than fatal: a synchronous script

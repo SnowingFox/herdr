@@ -273,6 +273,139 @@ fn call_require<'s>(
     require.call(scope, v8::undefined(scope).into(), &[id.into()])
 }
 
+/// Installs the real CommonJS loader over the builtin-only one.
+///
+/// `realm.js` hands out a loader that resolves builtin ids and nothing else.
+/// `lib/internal/modules/cjs/loader.js` is the loader Node actually uses: it
+/// resolves relative and absolute paths, walks `node_modules`, honours
+/// `package.json` `exports`, caches by resolved filename, and compiles through
+/// `contextify`. Running the vendored file is the whole point of this project,
+/// so this wires it up rather than reimplementing any of that.
+///
+/// `createRequire(filename)` produces a `require` bound to a file, which is
+/// what a CommonJS module's own `require` is. For `-e` there is no file, so the
+/// working directory stands in and `require('./x')` resolves relative to the
+/// process's cwd the way Node's `-e` does.
+pub fn install_cjs_loader<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+    script_path: &Option<String>,
+) -> Result<(), String> {
+    let loader = call_require(scope, require, "internal/modules/cjs/loader")
+        .ok_or("internal/modules/cjs/loader did not load")?;
+    let loader = v8::Local::<v8::Object>::try_from(loader)
+        .map_err(|_| "the commonjs loader is not an object")?;
+
+    // `initializeCJS` freezes the builtin id list and initialises the search
+    // paths. It runs after `--expose-internals` so the internal ids are
+    // included, which is why Node calls it here and not at load time.
+    if let Some(initialize) = get_property(scope, loader.into(), "initializeCJS") {
+        if let Ok(initialize) = v8::Local::<v8::Function>::try_from(initialize) {
+            initialize
+                .call(scope, loader.into(), &[])
+                .ok_or("initializeCJS threw")?;
+        }
+    }
+    let module =
+        get_property(scope, loader.into(), "Module").ok_or("the commonjs loader has no Module")?;
+    let module =
+        v8::Local::<v8::Object>::try_from(module).map_err(|_| "Module is not an object")?;
+    let create_require =
+        get_property(scope, module.into(), "createRequire").ok_or("Module has no createRequire")?;
+    let create_require = v8::Local::<v8::Function>::try_from(create_require)
+        .map_err(|_| "createRequire is not a function")?;
+
+    // A module's `require` is anchored at its own filename. `-e` has none, so
+    // the cwd is used, which is what makes `node -e "require('./x')"` and this
+    // agree.
+    let anchor = match script_path {
+        Some(path) => path.clone(),
+        None => {
+            let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+            cwd.join("evalmachine.<anonymous>")
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    let Some(anchor) = v8::String::new(scope, &anchor) else {
+        return Err("cannot allocate the require anchor".to_string());
+    };
+    let file_require = create_require
+        .call(scope, module.into(), &[anchor.into()])
+        .ok_or("createRequire threw")?;
+    let file_require = v8::Local::<v8::Function>::try_from(file_require)
+        .map_err(|_| "createRequire did not return a function")?;
+    let file_require = v8::Global::new(scope, file_require);
+
+    let global = scope.get_current_context().global(scope);
+    let file_require = v8::Local::new(scope, file_require);
+    // Only the global `require` is replaced. `hook_slot` keeps the realm loader
+    // on purpose: every builtin compiled after the realm bootstrap closes over
+    // it, and `lib/zlib.js` requires `internal/streams/transform` through that
+    // closure. Swapping the slot would send a builtin's own internal requires
+    // through the filesystem loader, where `internal/...` is not a path.
+    //
+    // The global gets a wrapper instead of the raw file loader so a specifier
+    // the loader cannot resolve as a path still reaches the realm loader. That
+    // is what keeps `--expose-internals` working: `require('internal/util')` is
+    // a builtin, not a file, and the CommonJS loader would look for a directory
+    // of that name.
+    let global_require = wrap_cjs_require_with_builtin_fallback(scope, file_require, require)
+        .unwrap_or(file_require);
+    set(scope, global, "require", global_require.into())?;
+
+    // `module` and `exports` are globals in a CommonJS module's scope, and a
+    // script run from a file expects them the way Node provides them.
+    for name in ["module", "exports", "__filename", "__dirname"] {
+        if let Some(value) = get_property(scope, module.into(), name) {
+            let _ = set(scope, global, name, value);
+        }
+    }
+    Ok(())
+}
+
+/// Wraps the CommonJS `require` so a builtin id still resolves.
+///
+/// The CommonJS loader handles `node:` ids itself through
+/// `BuiltinModule.normalizeRequirableId`, but a bare `internal/...` id is only
+/// a builtin when `--expose-internals` put it in the user-facing list, and even
+/// then the loader resolves it through `BuiltinModule` rather than the
+/// filesystem. This tries the file loader first and falls back to the realm
+/// loader, which is the loader that knows every builtin id.
+fn wrap_cjs_require_with_builtin_fallback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    file_require: v8::Local<'s, v8::Function>,
+    realm_require: v8::Local<'s, v8::Function>,
+) -> Option<v8::Local<'s, v8::Function>> {
+    // A V8 callback cannot capture the two loaders, so the wrapper is built in
+    // JavaScript the same way the `node:` wrapper is.
+    let source = "(function (fileRequire, realmRequire) {\n\
+                  \x20 function isBuiltinId(id) {\n\
+                  \x20   return typeof id === 'string' &&\n\
+                  \x20     (id.startsWith('internal/') || id.startsWith('node:'));\n\
+                  \x20 }\n\
+                  \x20 return function require(id) {\n\
+                  \x20   if (isBuiltinId(id)) {\n\
+                  \x20     try { return realmRequire(id.replace(/^node:/, '')); }\n\
+                  \x20     catch (error) {\n\
+                  \x20       if (!/Missing internal module/.test(String(error && error.message))) throw error;\n\
+                  \x20     }\n\
+                  \x20   }\n\
+                  \x20   return fileRequire(id);\n\
+                  \x20 };\n\
+                  })";
+    let source = v8::String::new(scope, source)?;
+    let factory = v8::Script::compile(scope, source, None)?;
+    let factory = factory.run(scope)?;
+    let factory = v8::Local::<v8::Function>::try_from(factory).ok()?;
+    let wrapped = factory.call(
+        scope,
+        v8::undefined(scope).into(),
+        &[file_require.into(), realm_require.into()],
+    )?;
+    v8::Local::<v8::Function>::try_from(wrapped).ok()
+}
+
 fn call_with_string<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     function: v8::Local<'s, v8::Value>,
@@ -471,7 +604,27 @@ fn process_object<'s>(
         }
     }
     set(scope, process, "execArgv", exec_array.into())?;
-    set(scope, process, "env", v8::Object::new(scope).into())?;
+
+    // `process.execPath` and `process.env` are not decoration: the CommonJS
+    // loader's `Module._initPaths` resolves the global module search path from
+    // `path.resolve(process.execPath, '..', '..')`, and `path.resolve` of
+    // `undefined` throws inside `Module._initPaths`. `process.env` is read the
+    // same way through `safeGetenv('HOME')`.
+    let exec_path = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(value) = v8::String::new(scope, &exec_path) {
+        set(scope, process, "execPath", value.into())?;
+    }
+    let env = v8::Object::new(scope);
+    for (key, value) in std::env::vars() {
+        if let (Some(key), Some(value)) =
+            (v8::String::new(scope, &key), v8::String::new(scope, &value))
+        {
+            let _ = env.set(scope, key.into(), value.into());
+        }
+    }
+    set(scope, process, "env", env.into())?;
 
     // `process.features` is read at module scope by `lib/internal/crypto/**`,
     // which destructures `openssl_is_boringssl` immediately. Each flag must
