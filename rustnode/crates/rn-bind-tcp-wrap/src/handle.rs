@@ -207,6 +207,15 @@ pub fn constructor<'s>(
                 .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
+        // `AsyncWrap`'s id, which `lib/net.js` reads as
+        // `this._handle.getAsyncId()` on both the connect and the server paths.
+        (
+            "getAsyncId",
+            v8::FunctionTemplate::builder(crate::methods::get_async_id)
+                .length(0)
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .build(scope),
+        ),
     ] {
         prototype.set(key(scope, name)?.into(), template.into());
     }

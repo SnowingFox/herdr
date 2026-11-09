@@ -1194,6 +1194,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-wasm-web-api"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-worker"
 version = "0.1.0"
 dependencies = [
@@ -1260,6 +1268,7 @@ dependencies = [
  "rn-bind-url-pattern",
  "rn-bind-uv",
  "rn-bind-v8",
+ "rn-bind-wasm-web-api",
  "rn-bind-worker",
  "rn-bind-zlib",
  "rn-builtins",
@@ -1374,6 +1383,7 @@ dependencies = [
 name = "rn-module-wrap"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-symbols",
  "rn-core",
  "rn-v8-sys",
 ]
@@ -1399,6 +1409,7 @@ dependencies = [
 name = "rn-util"
 version = "0.1.0"
 dependencies = [
+ "libuv-sys2",
  "rn-core",
  "rn-v8-sys",
 ]

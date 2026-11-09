@@ -631,8 +631,12 @@ mod tests {
 
         // Options whose field default is true invert the other way: the
         // option reports `true` and the negation reports `false`.
-        let negated = position("--no-experimental-webstorage");
-        let plain = position("--experimental-webstorage");
+        // `--require-module` defaults to true (`DEFINE_BOOL_FIELD(require_module)
+        // = true` in `src/node_options.h`), which is what the previous example
+        // here relied on: `--experimental-webstorage` became default-false with
+        // the SQLite gate, because this build links no SQLite.
+        let negated = position("--no-require-module");
+        let plain = position("--require-module");
         assert_eq!(negated + 1, plain);
         assert_eq!(entries[negated].1, CliValue::Bool(false));
         assert_eq!(entries[plain].1, CliValue::Bool(true));

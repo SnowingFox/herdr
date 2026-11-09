@@ -519,36 +519,62 @@ fn install_process_methods<'s>(
 /// function and leave `internalBinding` undefined. Calling it here is the same
 /// thing `BuiltinLoader::CompileAndCall` does for a bootstrap script.
 fn install_process_state_switch<'s>(scope: &mut v8::PinScope<'s, '_>) {
-    let Some(builtin) =
-        rn_js2c::builtin_by_id("internal/bootstrap/switches/does_own_process_state")
-    else {
-        return;
-    };
-    let Some(function) =
-        rn_builtins::compile(scope, builtin.id(), builtin.source(), builtin.kind())
-    else {
-        return;
-    };
+    run_bootstrap_script(scope, "internal/bootstrap/switches/does_own_process_state");
+}
+
+/// Runs one `internal/bootstrap/**` script with the parameters its kind declares.
+///
+/// Returns the script's error message when it threw, which is more useful than
+/// silence: these scripts install the `process` surface and a half-applied one is
+/// worse than a reported gap.
+pub fn run_bootstrap_script(scope: &mut v8::PinScope<'_, '_>, id: &str) -> Option<String> {
+    let builtin = rn_js2c::builtin_by_id(id)?;
+    let function = rn_builtins::compile(scope, builtin.id(), builtin.source(), builtin.kind())?;
     let global = scope.get_current_context().global(scope);
-    let Some(process) = get_property(scope, global.into(), "process") else {
-        return;
-    };
-    let (Some(require), Some(internal_binding)) = (
-        rn_core::hook_slot::require(scope),
-        rn_core::hook_slot::internal_binding(scope),
-    ) else {
-        return;
-    };
-    let Some(primordials) = primordials_from_global(scope) else {
-        return;
-    };
+    let process = get_property(scope, global.into(), "process")?;
+    let require = rn_core::hook_slot::require(scope)?;
+    let internal_binding = rn_core::hook_slot::internal_binding(scope)?;
+    let primordials = primordials_from_global(scope)?;
     let arguments = [
         process,
         require.into(),
         internal_binding.into(),
         primordials,
     ];
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut try_catch.init();
     let _ = function.call(scope, v8::undefined(scope).into(), &arguments);
+    if scope.has_caught() {
+        return Some(
+            scope
+                .exception()
+                .map(|exception| exception.to_rust_string_lossy(scope))
+                .unwrap_or_default(),
+        );
+    }
+    None
+}
+
+/// Installs `process.stdout`, `stdin` and `stderr` from Node's own bootstrap.
+///
+/// Node defines all three as lazy getters in
+/// `internal/bootstrap/switches/is_main_thread.js`, which is why every
+/// `process.stdout` accessor in `lib/**` assumes a real `tty.WriteStream` or
+/// `net.Socket` with `on`/`once`/`removeListener` on it. Without this,
+/// `process.stdout` is `undefined`, `patchProcessObject`'s
+/// `initializeGlobalConsole(globalConsole)` binds a console to nothing, and the
+/// first `console.error` — which is what `process.emitWarning` reaches for —
+/// throws `Cannot read properties of undefined (reading 'removeListener')`
+/// instead of printing.
+///
+/// `internal/bootstrap/node.js` runs this during the real bootstrap; the CLI
+/// could not earlier because it needs `tty_wrap` and `internal/process/signal`,
+/// both of which exist now.
+pub fn install_stdio<'s>(scope: &mut v8::PinScope<'s, '_>) {
+    if let Some(message) = run_bootstrap_script(scope, "internal/bootstrap/switches/is_main_thread")
+    {
+        eprintln!("rustnode: stdio unavailable: {message}");
+    }
 }
 
 /// Reads the `primordials` global the realm bootstrap installs.
@@ -657,51 +683,6 @@ pub fn install_cjs_loader<'s>(
     Ok(())
 }
 
-/// Runs `filename` as the CommonJS main module.
-///
-/// A file run as `rustnode script.js` is not a bare script: Node loads it
-/// through the same CommonJS loader `require()` uses, so it gets the wrapper
-/// parameters (`module`, `exports`, `__filename`, `__dirname`), a resolved
-/// `require` anchored at its own directory, and an entry in `require.cache`
-/// under its own filename. Evaluating the text as a plain script instead gives
-/// it none of those, and the difference is visible to any program that reads
-/// `__filename` or assigns to `module.exports`.
-///
-/// `module` is `process.mainModule`, which `require.main` mirrors, so it has to
-/// be the instance the loader created rather than a second one.
-pub fn run_main_module<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    require: v8::Local<'s, v8::Function>,
-    filename: &str,
-) -> Result<(), String> {
-    let loader = call_require(scope, require, "internal/modules/cjs/loader")
-        .ok_or("internal/modules/cjs/loader did not load")?;
-    let module =
-        get_property(scope, loader, "Module").ok_or("the commonjs loader has no Module")?;
-    let module = v8::Local::<v8::Object>::try_from(module)
-        .map_err(|_| "the commonjs loader's Module is not an object")?;
-    let load = get_property(scope, module.into(), "_load").ok_or("Module has no _load")?;
-    let load =
-        v8::Local::<v8::Function>::try_from(load).map_err(|_| "Module._load is not a function")?;
-
-    let filename =
-        v8::String::new(scope, filename).ok_or("cannot allocate the main module filename")?;
-    let parent = v8::null(scope).into();
-    let is_main = v8::Boolean::new(scope, true).into();
-
-    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
-    let scope = &mut try_catch.init();
-    let _ = load.call(scope, module.into(), &[filename.into(), parent, is_main]);
-    if scope.has_caught() {
-        let message = scope
-            .exception()
-            .map(|exception| exception.to_rust_string_lossy(scope))
-            .unwrap_or_default();
-        return Err(message);
-    }
-    Ok(())
-}
-
 /// Wraps the CommonJS `require` so a builtin id still resolves.
 ///
 /// The CommonJS loader handles `node:` ids itself through
@@ -780,7 +761,81 @@ fn normalize_requirable_id<'s>(
     v8::Local::<v8::Function>::try_from(normalize).ok()
 }
 
-/// Runs the bootstrap and returns the loaders it created.
+/// Runs `internal/process/pre_execution` before any user code.
+///
+/// Node's entry point is not the script: `internal/main/run_main_module`
+/// requires `prepareMainThreadExecution()` and only then calls
+/// `Module.runMain`. That function is what installs the ESM loader
+/// (`initializeESM`), the extension format map, the `process` methods and the
+/// `--require` preloads, and it asserts at the end that no user module has run
+/// yet — so calling it from user code cannot work. `Module._compile` sets the
+/// guard the moment it evaluates a user file, and `initializeModuleLoaders`
+/// then throws `ERR_INTERNAL_ASSERTION`.
+///
+/// That is the whole reason a `.mjs` entry point failed with
+/// `ERR_INTERNAL_ASSERTION`: the CLI ran the script through the CommonJS
+/// loader, which delegated to the ESM loader, which found its own one-time
+/// initialization had never happened and could no longer happen.
+///
+/// A failure is reported rather than fatal: the steps below it have all worked
+/// without pre-execution so far, and a precise message is more useful than
+/// refusing to start.
+pub fn prepare_execution<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+) {
+    let Some(pre_execution) = call_require(scope, require, "internal/process/pre_execution") else {
+        eprintln!(
+            "rustnode: pre-execution unavailable: internal/process/pre_execution did not load"
+        );
+        return;
+    };
+    let Some(prepare) = get_property(scope, pre_execution, "prepareMainThreadExecution") else {
+        return;
+    };
+    let Ok(prepare) = v8::Local::<v8::Function>::try_from(prepare) else {
+        return;
+    };
+    // `expandArgv1` is false: the CLI has already resolved the entry point into
+    // `process.argv`, and letting pre-execution re-resolve it would run Node's
+    // `Module._findPath` a second time without changing the answer.
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut try_catch.init();
+    let expand_argv1: v8::Local<v8::Value> = v8::Boolean::new(scope, false).into();
+    let _ = prepare.call(scope, pre_execution, &[expand_argv1]);
+    if scope.has_caught() {
+        let message = scope
+            .exception()
+            .map(|exception| exception.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        eprintln!("rustnode: pre-execution failed: {message}");
+    }
+}
+
+/// Loads `filename` as the main module, through Node's own entry-point path.
+///
+/// `internal/modules/run_main` is what decides between the CommonJS loader and
+/// the ESM loader, and it is the same function `Module.runMain` exposes, so the
+/// decision procedure is Node's rather than a reimplementation here: `.mjs`,
+/// `.wasm` and a `.js` inside a `"type": "module"` package go to the ESM loader,
+/// everything else to the CommonJS loader.
+///
+/// It returns a promise when the entry point's graph has a top-level await. The
+/// caller has to drain the microtask queue for it, which is why the value is
+/// returned instead of dropped.
+pub fn run_main<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+    filename: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let run_main = call_require(scope, require, "internal/modules/run_main")?;
+    let execute = get_property(scope, run_main, "executeUserEntryPoint")?;
+    let execute = v8::Local::<v8::Function>::try_from(execute).ok()?;
+    let filename = v8::String::new(scope, filename)?;
+    execute.call(scope, v8::undefined(scope).into(), &[filename.into()])
+}
+
+/// Runs the realm bootstrap and returns the loaders it created.
 pub fn bootstrap_realm(
     scope: &mut v8::PinScope,
     registry: &'static rn_core::BindingRegistry,

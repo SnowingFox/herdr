@@ -8,5 +8,6 @@ repository.workspace = true
 description = "internalBinding('util') and internalBinding('types') for rustnode"
 
 [dependencies]
+libuv-sys2.workspace = true
 rn-core.workspace = true
 rn-v8-sys.workspace = true

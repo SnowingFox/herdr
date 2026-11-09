@@ -57,7 +57,14 @@ from dataclasses import dataclass, field
 #
 #   HAVE_OPENSSL=1              node.gypi, node_use_openssl defaults to true
 #   HAVE_INSPECTOR=1            node.gypi, v8_enable_inspector defaults to 1
-#   HAVE_SQLITE=1               node.gypi, node_use_sqlite defaults to true
+#   HAVE_SQLITE=0               node.gypi defaults node_use_sqlite to true, but
+#                               rustnode links no SQLite, and the two options it
+#                               gates (`--experimental-sqlite`,
+#                               `--experimental-webstorage`) both turn on at module
+#                               scope in `pre_execution` and then require the
+#                               `sqlite`/`webstorage` bindings. Reporting them as
+#                               enabled is the failure mode this table exists to
+#                               avoid: a `true` for a subsystem that is absent.
 #   HAVE_AMARO=1                node.gyp, node_use_amaro defaults to true
 #   HAVE_FFI=1                  node.gyp, node_use_ffi defaults to false but
 #                               configure_ffi() enables it on x64/arm64 with the
@@ -81,7 +88,7 @@ MACROS = {
     "NODE_WANT_INTERNALS": "1",
     "HAVE_OPENSSL": "1",
     "HAVE_INSPECTOR": "1",
-    "HAVE_SQLITE": "1",
+    "HAVE_SQLITE": "0",
     "HAVE_AMARO": "1",
     "HAVE_FFI": "1",
     "HAVE_DTLS": "0",
@@ -611,7 +618,7 @@ MACROS_CONSTANTS: dict[str, int] = {
     "true": 1,
     "false": 0,
     "HAVE_FFI": 1,
-    "HAVE_SQLITE": 1,
+    "HAVE_SQLITE": 0,
     "HAVE_AMARO": 1,
     "HAVE_INSPECTOR": 1,
     "HAVE_OPENSSL": 1,

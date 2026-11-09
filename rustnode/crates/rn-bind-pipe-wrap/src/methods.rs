@@ -131,6 +131,16 @@ pub fn has_reference(
     rv.set(v8::Boolean::new(scope, referenced).into());
 }
 
+/// `AsyncWrap::GetAsyncId`; see the `tcp_wrap` copy for why `net` needs it.
+pub fn get_async_id(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let id = pipe::with_handle(args.this(), |handle| handle.state.async_id).unwrap_or(0);
+    rv.set(v8::Number::new(scope, id as f64).into());
+}
+
 /// `StreamBase::ReadStartJS`.
 pub fn read_start(
     scope: &mut v8::PinScope<'_, '_>,
