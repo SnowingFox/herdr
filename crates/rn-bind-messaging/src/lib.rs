@@ -833,7 +833,17 @@ fn expose_lazy_dom_exception_property(
         return;
     };
     let constructor = dom_exception_constructor(scope);
-    target.set(scope, key.into(), constructor);
+    // `define_property` rather than `set`: Node installs every global
+    // non-enumerably, and `test/common/index.js` fails a test for any global
+    // name it does not recognise when it walks `globalThis`. A `set` here made
+    // `DOMException` visible to that walk.
+    let descriptor = v8::PropertyDescriptor::new_from_value_writable(constructor, true);
+    if target
+        .define_property(scope, key.into(), &descriptor)
+        .is_none()
+    {
+        target.set(scope, key.into(), constructor);
+    }
 }
 
 fn set_deserializer_create_object_function(

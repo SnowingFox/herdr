@@ -13,6 +13,22 @@
   process.exit = globalThis.__exit || (() => {});
   process.platform = 'linux';
 
+  // The four `__`-prefixed globals above are a hand-off from Rust, not part of
+  // Node's global surface, so they are deleted once copied. Leaving them
+  // visible is not harmless: `test/common/index.js` enumerates `globalThis` at
+  // exit and fails the test on any name it does not recognise, so a leftover
+  // shim turns into "Unexpected global(s) found" in every file that uses
+  // `common` — which was 388 of them.
+  for (const name of ['__argv', '__stdout', '__stderr', '__v8Version', '__exit']) {
+    try {
+      delete globalThis[name];
+    } catch {
+      // A non-configurable property would have thrown from the Rust side too;
+      // nothing here can make it removable, and the rest of the bootstrap
+      // still has to run.
+    }
+  }
+
   // `console.log` is `util.format` plus a newline: the first argument is a
   // format string when it contains a `%` directive, and a non-string argument
   // is inspected. Plain space-joining gets both wrong — `console.log('a %s b',
