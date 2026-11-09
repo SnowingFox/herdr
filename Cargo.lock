@@ -464,6 +464,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libuv-sys2"
+version = "1.53.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58de9994f8d4774f47ec62220c61fb257604c70c7e2ad2588e2e8f631b4cc2f2"
+dependencies = [
+ "bindgen",
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "libz-rs-sys"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -603,6 +614,12 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "potential_utf"
@@ -856,6 +873,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-pipe-wrap"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "rn-bind-process-methods"
 version = "0.1.0"
 dependencies = [
@@ -872,6 +901,17 @@ dependencies = [
  "rn-core",
  "rn-v8-sys",
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rn-bind-stream-wrap"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
  "serde_json",
 ]
 
@@ -898,6 +938,18 @@ version = "0.1.0"
 dependencies = [
  "rn-core",
  "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-bind-tcp-wrap"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -989,11 +1041,14 @@ dependencies = [
  "rn-bind-options",
  "rn-bind-os",
  "rn-bind-performance",
+ "rn-bind-pipe-wrap",
  "rn-bind-process-methods",
  "rn-bind-report",
+ "rn-bind-stream-wrap",
  "rn-bind-string-decoder",
  "rn-bind-symbols",
  "rn-bind-task-queue",
+ "rn-bind-tcp-wrap",
  "rn-bind-timers",
  "rn-bind-trace-events",
  "rn-bind-url",
@@ -1136,6 +1191,17 @@ version = "0.1.0"
 dependencies = [
  "rn-core",
  "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-uv"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libuv-sys2",
+ "rn-core",
+ "rn-v8-sys",
+ "tracing",
 ]
 
 [[package]]
