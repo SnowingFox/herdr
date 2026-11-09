@@ -16,8 +16,10 @@ fs
 fs_dir
 fs_event_wrap
 glob
+heap_utils
 http_parser
 icu
+internal_only_v8
 js_stream
 messaging
 mksnapshot
@@ -48,5 +50,6 @@ url_pattern
 util
 uv
 v8
+wasm_web_api
 worker
 zlib
