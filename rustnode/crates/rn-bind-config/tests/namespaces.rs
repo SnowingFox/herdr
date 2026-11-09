@@ -233,7 +233,20 @@ fn config_values_match_a_default_linux_release_build() {
     );
     assert_eq!(Config::get("hasTracing"), Some(Value::Bool(true)));
     assert_eq!(Config::get("hasNodeOptions"), Some(Value::Bool(true)));
-    assert_eq!(Config::get("hasInspector"), Some(Value::Bool(true)));
+    // The one value here that deliberately differs from a stock Node build.
+    // `config.hasInspector` means "this binary was compiled with the
+    // inspector", and this one was not: `internalBinding('inspector')` has no
+    // implementation. `lib/v8.js` reads the flag at module scope to decide
+    // whether to load `internalBinding('profiler')`, so reporting a stock
+    // build's `true` makes `require('v8')` fail on a namespace that is not
+    // there. The recorded Node value is true; see the note on
+    // `config_values_match_a_live_node_recording` for why it is expected to
+    // disagree until the inspector lands.
+    assert_eq!(
+        Config::get("hasInspector"),
+        Some(Value::Bool(false)),
+        "this build has no inspector, and the flag must say so"
+    );
     assert_eq!(
         Config::get("noBrowserGlobals"),
         Some(Value::Bool(false)),
@@ -285,7 +298,11 @@ fn config_values_match_a_live_node_recording() {
         ("hasSmallICU", Value::Bool(false)),
         ("hasTracing", Value::Bool(true)),
         ("hasNodeOptions", Value::Bool(true)),
-        ("hasInspector", Value::Bool(true)),
+        // Recorded from a stock Node, which has the inspector. This is the only
+        // value that is allowed to disagree, and only for this reason: the
+        // build genuinely lacks `internalBinding('inspector')`, so reporting
+        // `true` would be a claim the binary cannot honour. Drop the exception
+        // (and the corresponding assertion above) when the inspector lands.
         ("noBrowserGlobals", Value::Bool(false)),
         ("bits", Value::int(64)),
     ] {
@@ -295,6 +312,13 @@ fn config_values_match_a_live_node_recording() {
             "{name} disagrees with Node"
         );
     }
+
+    // Checked separately because its expected value legitimately differs.
+    assert_eq!(
+        Config::get("hasInspector"),
+        Some(Value::Bool(false)),
+        "the recording says true, but this build has no inspector binding"
+    );
 }
 
 #[test]
