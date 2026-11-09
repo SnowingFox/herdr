@@ -365,6 +365,35 @@ fn brotli_decoder_constructor<'s>(
     );
 }
 
+/// `new binding.ZstdCompress()`.
+///
+/// Zstd is its own `node_zlib_mode` family with a separate parameter namespace,
+/// pledged source sizes and `ZSTD_e_*` directives; implementing it is a distinct
+/// piece of work from the zlib/Brotli contract this crate targets. The
+/// constructor is registered anyway because `lib/zlib.js` builds both zstd
+/// handles unconditionally — in `createDefaultHandle`, which every
+/// `zstdCompress*`/`zstdDecompress*` call reaches. Without the property the
+/// namespace shape would be wrong; with it, using zstd reports a clear
+/// "unsupported" instead of failing as a `TypeError`.
+fn zstd_compress_constructor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue,
+) {
+    let _ = args.this();
+    throw(scope, "zstd is not implemented by rn-bind-zlib");
+}
+
+/// `new binding.ZstdDecompress()`; see [`zstd_compress_constructor`].
+fn zstd_decompress_constructor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue,
+) {
+    let _ = args.this();
+    throw(scope, "zstd is not implemented by rn-bind-zlib");
+}
+
 // ---------------------------------------------------------------------------
 // Prototype methods
 // ---------------------------------------------------------------------------
@@ -799,7 +828,8 @@ fn define_class<'s>(
     Ok(())
 }
 
-/// Installs `Zlib`, `BrotliEncoder` and `BrotliDecoder`.
+/// Installs `Zlib`, `BrotliEncoder`, `BrotliDecoder`, `ZstdCompress` and
+/// `ZstdDecompress`.
 pub(crate) fn install_constructors<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
@@ -821,6 +851,18 @@ pub(crate) fn install_constructors<'s>(
         target,
         "BrotliDecoder",
         v8::FunctionTemplate::builder(brotli_decoder_constructor).build(scope),
+    )?;
+    define_class(
+        scope,
+        target,
+        "ZstdCompress",
+        v8::FunctionTemplate::builder(zstd_compress_constructor).build(scope),
+    )?;
+    define_class(
+        scope,
+        target,
+        "ZstdDecompress",
+        v8::FunctionTemplate::builder(zstd_decompress_constructor).build(scope),
     )?;
     Ok(())
 }
