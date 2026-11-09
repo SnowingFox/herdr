@@ -1,0 +1,141 @@
+{
+  "empty": {
+    "exports": [],
+    "reexports": []
+  },
+  "whitespace": {
+    "exports": [],
+    "reexports": []
+  },
+  "plain_script": {
+    "exports": [],
+    "reexports": []
+  },
+  "object_shorthand": {
+    "exports": [
+      "a",
+      "b"
+    ],
+    "reexports": []
+  },
+  "object_named": {
+    "exports": [],
+    "reexports": []
+  },
+  "object_mixed": {
+    "exports": [
+      "a"
+    ],
+    "reexports": []
+  },
+  "exports_dot": {
+    "exports": [
+      "x"
+    ],
+    "reexports": []
+  },
+  "exports_dedup": {
+    "exports": [
+      "a",
+      "b"
+    ],
+    "reexports": []
+  },
+  "module_exports_dot": {
+    "exports": [
+      "z"
+    ],
+    "reexports": []
+  },
+  "bracket_quoted": {
+    "exports": [
+      "quoted",
+      "double"
+    ],
+    "reexports": []
+  },
+  "define_property_value": {
+    "exports": [
+      "d1"
+    ],
+    "reexports": []
+  },
+  "define_property_getter": {
+    "exports": [],
+    "reexports": []
+  },
+  "es_module_marker": {
+    "exports": [
+      "__esModule",
+      "real"
+    ],
+    "reexports": []
+  },
+  "nested_member": {
+    "exports": [],
+    "reexports": []
+  },
+  "shadowed_exports": {
+    "exports": [
+      "nope"
+    ],
+    "reexports": []
+  },
+  "reexport_direct": {
+    "exports": [],
+    "reexports": [
+      "./other"
+    ]
+  },
+  "reexport_spread": {
+    "exports": [],
+    "reexports": [
+      "./spread"
+    ]
+  },
+  "reexport_babel": {
+    "exports": [],
+    "reexports": [
+      "./z"
+    ]
+  },
+  "reexport_object_keys": {
+    "exports": [],
+    "reexports": []
+  },
+  "esm_import": {
+    "exports": [],
+    "reexports": []
+  },
+  "esm_export": {
+    "exports": [],
+    "reexports": []
+  },
+  "unterminated_string": {
+    "exports": [],
+    "reexports": []
+  },
+  "unbalanced_brace": {
+    "exports": [],
+    "reexports": []
+  },
+  "unicode_escape": {
+    "exports": [
+      "ab"
+    ],
+    "reexports": []
+  },
+  "multiline": {
+    "exports": [
+      "one",
+      "two"
+    ],
+    "reexports": []
+  },
+  "template_literal": {
+    "exports": [
+      "t"
+    ],
+    "reexports": []
+  }
+}

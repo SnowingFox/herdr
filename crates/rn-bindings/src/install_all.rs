@@ -11,6 +11,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_async_wrap::register(registry);
     rn_bind_buffer::register(registry);
     rn_bind_cares::register(registry);
+    rn_bind_cjs_lexer::register(registry);
     rn_bind_config::register(registry);
     rn_bind_contextify::register(registry);
     rn_bind_crypto::register(registry);

@@ -1,0 +1,22 @@
+[package]
+name = "rn-bind-cjs-lexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('cjs_lexer') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+
+[build-dependencies]
+# Compiles the vendored merve. This lexer decides which names a CommonJS module
+# statically exports, and `lib/**` feeds that answer to ESM interop; a
+# hand-written replacement would agree with itself and disagree with Node, so
+# only the glue around it is rewritten here.
+cc = "1"
+
+[dev-dependencies]
+serde_json.workspace = true

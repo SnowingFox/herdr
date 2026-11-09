@@ -65,4 +65,10 @@ step "the vendored llhttp is unchanged"
 # thing the binding exists to reproduce.
 ./tools/verify-llhttp.sh
 
+step "the vendored merve is unchanged"
+# Same reasoning one namespace over: the CommonJS export analysis decides what an
+# ESM `import` of a CommonJS file sees, and a local edit to the lexer would
+# change that answer without failing anything else.
+./tools/verify-merve.sh
+
 printf '\nall checks passed\n'
