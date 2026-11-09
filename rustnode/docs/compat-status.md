@@ -3,22 +3,30 @@
 rustnode claims Node compatibility structurally: the V8 engine and all 435
 builtin JavaScript files are the same ones Node 28 ships, so the only thing that
 can differ is the native layer written in Rust. That claim is only worth
-something if it is checked, so three gates check it. Each gate can fail on its
+something if it is checked, so four gates check it. Each gate can fail on its
 own, and each answers a different question.
 
 | Gate | Question it answers | Fails when |
 | --- | --- | --- |
 | lib freeze | has anyone edited Node's JavaScript? | a vendored file differs from the pinned copy |
+| llhttp freeze | has anyone edited Node's HTTP parser? | a vendored C file differs from the pinned copy |
 | binding contracts | does a Rust `internalBinding()` namespace expose what the JavaScript reads? | a recorded member is missing |
 | Node test suite | how much of Node actually behaves the same? | a test file exits non-zero |
 
-Run all three from `rustnode/`:
+Run all four from `rustnode/`:
 
 ```bash
 ./tools/verify-libjs.sh
+./tools/verify-llhttp.sh
 cargo run -p rn-compat
 ./tools/run-node-tests.sh
 ```
+
+`llhttp` is the one piece of native code that is *not* rewritten: HTTP parsing is
+a security surface, and two parsers disagreeing about where a request ends is the
+whole request-smuggling vulnerability class. `vendor/llhttp` is Node's generated C
+state machine, compiled unchanged; only the V8 glue around it is Rust. See
+`vendor/llhttp/README.md`.
 
 ## Gate 1: lib freeze
 

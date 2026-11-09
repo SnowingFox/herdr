@@ -59,4 +59,10 @@ python3 tools/smoke.py --self-test
 step "the vendored JavaScript is unchanged"
 ./tools/verify-libjs.sh
 
+step "the vendored llhttp is unchanged"
+# The HTTP parser is C copied from Node's tree and never patched: a local edit
+# would change parse behaviour away from the one Node ships, which is the only
+# thing the binding exists to reproduce.
+./tools/verify-llhttp.sh
+
 printf '\nall checks passed\n'

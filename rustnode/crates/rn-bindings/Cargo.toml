@@ -25,6 +25,7 @@ rn-bind-diagnostics-channel = { path = "../rn-bind-diagnostics-channel" }
 rn-bind-encoding = { path = "../rn-bind-encoding" }
 rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-glob = { path = "../rn-bind-glob" }
+rn-bind-http-parser = { path = "../rn-bind-http-parser" }
 rn-bind-icu = { path = "../rn-bind-icu" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-bind-mksnapshot = { path = "../rn-bind-mksnapshot" }
