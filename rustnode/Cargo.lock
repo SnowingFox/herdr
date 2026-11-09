@@ -585,6 +585,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-config"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-fs"
 version = "0.1.0"
 dependencies = [
@@ -609,6 +618,7 @@ dependencies = [
 name = "rn-bindings"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-config",
  "rn-bind-fs",
  "rn-bind-zlib",
  "rn-core",
