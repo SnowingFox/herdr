@@ -10,3 +10,6 @@ description = "Runs the Node test suite against rustnode"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
