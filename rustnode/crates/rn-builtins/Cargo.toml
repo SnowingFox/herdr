@@ -1,0 +1,13 @@
+[package]
+name = "rn-builtins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('builtins') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-js2c = { path = "../rn-js2c" }
+rn-v8-sys.workspace = true

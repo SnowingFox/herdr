@@ -621,6 +621,7 @@ dependencies = [
  "rn-bind-config",
  "rn-bind-fs",
  "rn-bind-zlib",
+ "rn-builtins",
  "rn-core",
  "rn-io",
  "rn-permission",
@@ -628,6 +629,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "rn-builtins"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-js2c",
+ "rn-v8-sys",
 ]
 
 [[package]]
