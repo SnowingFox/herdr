@@ -13,6 +13,7 @@ pub mod error;
 pub mod handle;
 pub mod hook_slot;
 pub mod queue;
+pub mod symbol;
 
 pub use abi::{BindingModule, InstallCtx};
 pub use aliased_buffer::{AliasedUint8Array, Element};
@@ -21,3 +22,4 @@ pub use binding::{BindingRegistry, Installer, Namespace};
 pub use env::Env;
 pub use error::KernelError;
 pub use queue::TaskQueue;
+pub use symbol::{define_mark, symbol, CONTEXTIFY_CONTEXT, HOST_DEFINED_OPTION};

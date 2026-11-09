@@ -269,6 +269,17 @@ fn install_symbols<'s>(
     if let Some(key) = v8::String::new(scope, "decorated_private_symbol") {
         private.set(scope, key.into(), decorated.into());
     }
+    // The `contextify` mark has to be the same object `contextify.makeContext`
+    // writes and `lib/internal/vm.js`'s `isContext` reads, so it comes from the
+    // shared per-isolate table rather than being created here.
+    if let Some(key) = v8::String::new(scope, "contextify_context_private_symbol") {
+        let symbol = rn_core::symbol(scope, rn_core::CONTEXTIFY_CONTEXT);
+        private.set(scope, key.into(), symbol.into());
+    }
+    if let Some(key) = v8::String::new(scope, "host_defined_option_symbol") {
+        let symbol = rn_core::symbol(scope, rn_core::HOST_DEFINED_OPTION);
+        private.set(scope, key.into(), symbol.into());
+    }
     if let Some(key) = v8::String::new(scope, "privateSymbols") {
         object.set(scope, key.into(), private.into());
     }
