@@ -124,6 +124,14 @@ struct StdioPipe {
     runner: *mut Runner,
     /// The pipe's lifecycle, mirroring `SyncProcessStdioPipe::Lifecycle`.
     state: PipeState,
+    /// Whether `uv_pipe_init` actually initialised the handle.
+    ///
+    /// `PipeState::Initialized` is the *pre-init* state, which is the state a
+    /// pipe is left in when `uv_pipe_init` fails. libuv cannot close a handle
+    /// it never initialised — `uv_close` dispatches on `handle->type`, which is
+    /// still zero — so closing has to be decided by this flag rather than by the
+    /// lifecycle alone.
+    initialised: bool,
     /// The write request issued for `input`.
     write_request: Box<std::mem::MaybeUninit<uv::uv_write_t>>,
     /// The shutdown request issued after the input.
@@ -154,6 +162,7 @@ impl StdioPipe {
             error: 0,
             runner: std::ptr::null_mut(),
             state: PipeState::Initialized,
+            initialised: false,
             write_request: Box::new(std::mem::MaybeUninit::zeroed()),
             shutdown_request: Box::new(std::mem::MaybeUninit::zeroed()),
         }
@@ -181,9 +190,31 @@ struct Runner {
     /// The private loop, valid from `run` until `close_handles`.
     loop_pointer: *mut uv::uv_loop_t,
     /// libuv's process handle; only spawned into when the options parsed.
-    process: Box<uv::uv_process_t>,
-    /// Whether `uv_spawn` was reached, so closing knows whether to close it.
+    ///
+    /// `uv_spawn` initialises this in place, and it registers the handle on the
+    /// loop even when the child never starts: the `exec()` failure path returns
+    /// before `uv__handle_start` but after `uv__handle_init`, so the handle is
+    /// still in `loop->handle_queue` and its loop-level `child_watcher` has
+    /// already been started. Both have to be closed before the loop can be
+    /// released; see [`Runner::close_handles`].
+    process: Box<std::mem::MaybeUninit<uv::uv_process_t>>,
+    /// Whether `uv_spawn` returned success, so the child really ran.
     spawned: bool,
+    /// Whether `uv_spawn` registered the handle on the loop at all.
+    ///
+    /// True whenever `uv_spawn` was reached, including the `exec()` failure
+    /// case where `spawned` stays false. The distinction is what lets
+    /// `close_handles` tell "never touched libuv" (nothing to close) apart from
+    /// "libuv knows about this handle but there is no child" (must close).
+    process_registered: bool,
+    /// Whether `uv_close` has been called on the process handle.
+    process_closing: bool,
+    /// Whether `close_handles` actually released the private loop.
+    ///
+    /// False when libuv refused to close it, which only happens if a handle was
+    /// left unclosed. Recorded so a test can assert the loop was released rather
+    /// than inferring it from the absence of a crash.
+    loop_released: bool,
     /// The pipes, one entry per stdio descriptor (null for ignore/inherit).
     stdio: Vec<Option<Box<StdioPipe>>>,
     /// The `killSignal`, used by the timeout.
@@ -561,11 +592,11 @@ fn run(scope: &mut v8::PinScope<'_, '_>, options: v8::Local<v8::Object>) -> Opti
 
     let mut runner = Runner {
         loop_pointer: ptr::null_mut(),
-        process: Box::new(unsafe {
-            // SAFETY: `uv_process_t` is plain C data, and `uv_spawn` fills it.
-            std::mem::zeroed()
-        }),
+        process: Box::new(std::mem::MaybeUninit::zeroed()),
         spawned: false,
+        process_registered: false,
+        process_closing: false,
+        loop_released: false,
         stdio: pipes,
         kill_signal,
         max_buffer,
@@ -608,6 +639,34 @@ fn run(scope: &mut v8::PinScope<'_, '_>, options: v8::Local<v8::Object>) -> Opti
 }
 
 impl Runner {
+    /// A runner with nothing but the option-independent defaults set.
+    ///
+    /// Test-only: production code builds this through [`run`] from JavaScript
+    /// options. This exists so the native close path can be tested without an
+    /// isolate.
+    #[cfg(test)]
+    fn test_runner(stdio: Vec<Option<Box<StdioPipe>>>) -> Self {
+        Self {
+            loop_pointer: ptr::null_mut(),
+            process: Box::new(std::mem::MaybeUninit::zeroed()),
+            spawned: false,
+            process_registered: false,
+            process_closing: false,
+            loop_released: false,
+            stdio,
+            kill_signal: SIGTERM,
+            max_buffer: 0,
+            buffered: 0,
+            error: 0,
+            pipe_error: 0,
+            exit_status: -1,
+            term_signal: -1,
+            killed: false,
+            timer: None,
+            lifecycle: Lifecycle::Uninitialized,
+        }
+    }
+
     /// `SyncProcessRunner::TryInitializeAndRunLoop` plus the close/collect tail.
     fn execute(&mut self, native: &mut uv::uv_process_options_t, timeout: u64) -> Outcome {
         let loop_pointer = Box::into_raw(Box::new(unsafe {
@@ -648,6 +707,7 @@ impl Runner {
                 self.set_error(status);
                 break;
             }
+            pipe.initialised = true;
         }
         // The containers hold raw stream pointers, so they are filled directly
         // rather than through a helper that would need `self` borrowed twice.
@@ -690,12 +750,26 @@ impl Runner {
         if self.error == 0 {
             // SAFETY: the loop is live, the handle storage is a zeroed
             // `uv_process_t`, and `native` points at live option data.
-            let status = unsafe { uv::uv_spawn(loop_pointer, &mut *self.process, native) };
+            let status = unsafe { uv::uv_spawn(loop_pointer, self.process.as_mut_ptr(), native) };
+            // `uv_spawn` calls `uv__handle_init` before it does anything that can
+            // fail, so the handle is on the loop's `handle_queue` from this point
+            // on whether or not the child started. A failed `exec()` is the case
+            // that matters: the call returns `UV_ENOENT` (or similar) after
+            // registering the handle *and* starting the loop's internal
+            // `child_watcher` for `SIGCHLD`, which `uv__process_close` is what
+            // stops. Leaving both behind is what makes `uv_loop_close` refuse the
+            // loop, and a refused loop that is freed anyway leaves a dangling
+            // node in libuv's process-global signal tree for the next
+            // `uv_signal_start` to walk.
+            self.process_registered = true;
             if status != 0 {
                 self.set_error(status);
             } else {
                 self.spawned = true;
-                self.process.data = ptr::from_mut(self).cast();
+                // SAFETY: `uv_spawn` succeeded, so the handle is initialised.
+                if let Some(raw) = unsafe { self.process.as_mut_ptr().as_mut() } {
+                    raw.data = ptr::from_mut(self).cast();
+                }
                 for pipe in self.stdio.iter_mut().flatten() {
                     if let Err(status) = start_pipe(pipe) {
                         if self.pipe_error == 0 {
@@ -733,7 +807,13 @@ impl Runner {
             signal: self.term_signal,
             // `uv_process_t::pid` is the child's pid, retained after the handle is
             // closed, and 0 when the spawn never ran.
-            pid: if self.spawned { self.process.pid } else { 0 },
+            pid: if self.spawned {
+                // SAFETY: `spawned` is only set after `uv_spawn` returned success,
+                // which is what initialises the storage.
+                unsafe { self.process.as_ptr().as_ref() }.map_or(0, |process| process.pid)
+            } else {
+                0
+            },
             output,
         }
     }
@@ -746,9 +826,10 @@ impl Runner {
         }
 
         for pipe in self.stdio.iter_mut().flatten() {
-            if matches!(pipe.state, PipeState::Initialized | PipeState::Started) {
+            if pipe.initialised && matches!(pipe.state, PipeState::Initialized | PipeState::Started)
+            {
                 pipe.state = PipeState::Closing;
-                // SAFETY: the pipe is live and not closing.
+                // SAFETY: `uv_pipe_init` succeeded and the pipe is not closing.
                 unsafe { uv::uv_close(pipe.stream().cast(), Some(pipe_close_callback)) };
             }
         }
@@ -765,11 +846,28 @@ impl Runner {
             }
         }
 
-        if self.spawned {
-            // SAFETY: the handle is live and not closing.
+        if self.process_registered && !self.process_closing {
+            // `uv_spawn` registered this handle on the loop even when the child
+            // never ran, so it must be closed either way. Closing a handle whose
+            // `exec()` failed is also what stops the loop's internal
+            // `child_watcher`, because `uv__process_close` sees the loop's
+            // process queue empty and calls `uv_signal_stop` on it. Without that
+            // the `SIGCHLD` watcher stays linked in libuv's process-global signal
+            // tree, `uv_loop_close` answers `UV_EBUSY`, and the tree is left
+            // holding a pointer into this loop's freed storage.
+            self.process_closing = true;
+            // SAFETY: `uv_spawn` was reached, so the handle is initialised.
             unsafe {
-                let handle = std::ptr::from_mut(&mut *self.process).cast::<uv::uv_handle_t>();
-                uv::uv_close(handle, None);
+                let handle = self.process.as_mut_ptr().cast::<uv::uv_handle_t>();
+                // Not every `uv_spawn` failure leaves the handle queued: the
+                // stdio-open path calls `uv__queue_remove` itself, and closing a
+                // handle that is no longer in `handle_queue` would corrupt the
+                // loop's lists. `uv__handle_init` links the handle to itself when
+                // it is not in a queue, so a self-linked `handle_queue` is the
+                // test for "already detached".
+                if is_still_queued(handle) {
+                    uv::uv_close(handle, None);
+                }
             }
         }
 
@@ -777,12 +875,32 @@ impl Runner {
         // fires before the loop is released.
         // SAFETY: the loop is live and nothing else is running on it.
         unsafe { uv::uv_run(self.loop_pointer, uv::uv_run_mode_UV_RUN_DEFAULT) };
+        // The loop cannot be released while any handle is still queued on it, and
+        // `uv_loop_close` reports that as `UV_EBUSY` rather than releasing it. The
+        // answer is checked rather than ignored: freeing a loop libuv refused to
+        // close is precisely how a dangling signal-tree node outlives this call.
         // SAFETY: every handle on the loop has been closed and run to completion.
-        unsafe { uv::uv_loop_close(self.loop_pointer) };
-        // SAFETY: the loop is closed, so the box can be released.
+        let status = unsafe { uv::uv_loop_close(self.loop_pointer) };
+        if status != 0 {
+            // Nothing here can clean the loop up: a second close attempt would
+            // make the same checks fail. The storage is deliberately leaked so
+            // libuv's own bookkeeping stays consistent — a few hundred bytes once
+            // per failed run is far cheaper than a use-after-free in a
+            // process-global structure, and the alternative is a crash in an
+            // unrelated part of the process later.
+            tracing::error!(
+                status,
+                "spawn_sync: uv_loop_close refused the private loop; leaking it"
+            );
+            self.loop_pointer = ptr::null_mut();
+            self.lifecycle = Lifecycle::HandlesClosed;
+            return;
+        }
+        // SAFETY: the loop is closed and nothing else refers to it.
         drop(unsafe { Box::from_raw(self.loop_pointer) });
         self.loop_pointer = ptr::null_mut();
         self.lifecycle = Lifecycle::HandlesClosed;
+        self.loop_released = true;
     }
 
     fn set_error(&mut self, error: i32) {
@@ -816,21 +934,25 @@ impl Runner {
         self.killed = true;
 
         if self.exit_status < 0 && self.spawned {
-            // SAFETY: the handle is live.
-            let status = unsafe { uv::uv_process_kill(&mut *self.process, self.kill_signal) };
-            if status < 0 && status != uv::uv_errno_t_UV_ESRCH {
-                self.set_error(status);
-                // SAFETY: as above. The result is deliberately ignored: there may
-                // be no privilege to signal the child.
-                unsafe { uv::uv_process_kill(&mut *self.process, libc::SIGKILL) };
+            // SAFETY: `spawned` means `uv_spawn` succeeded, so the handle is
+            // initialised and points at a live child.
+            if let Some(process) = unsafe { self.process.as_mut_ptr().as_mut() } {
+                let status = unsafe { uv::uv_process_kill(process, self.kill_signal) };
+                if status < 0 && status != uv::uv_errno_t_UV_ESRCH {
+                    self.set_error(status);
+                    // SAFETY: as above. The result is deliberately ignored: there
+                    // may be no privilege to signal the child.
+                    unsafe { uv::uv_process_kill(process, libc::SIGKILL) };
+                }
             }
         }
         // Closing the pipes is what lets the loop finish when the child spawned a
         // grandchild that inherited them.
         for pipe in self.stdio.iter_mut().flatten() {
-            if matches!(pipe.state, PipeState::Initialized | PipeState::Started) {
+            if pipe.initialised && matches!(pipe.state, PipeState::Initialized | PipeState::Started)
+            {
                 pipe.state = PipeState::Closing;
-                // SAFETY: the pipe is live and not closing.
+                // SAFETY: `uv_pipe_init` succeeded and the pipe is not closing.
                 unsafe { uv::uv_close(pipe.stream().cast(), Some(pipe_close_callback)) };
             }
         }
@@ -1127,6 +1249,28 @@ fn number_option(
     }
 }
 
+/// Whether libuv's own `handle_queue` still links a handle into the loop.
+///
+/// `uv__handle_init` inserts the handle into `loop->handle_queue`. Two failure
+/// paths in `uv_spawn` take it back out again (`uv__queue_remove`), which leaves
+/// the node pointing at itself rather than at neighbours. Closing a handle in
+/// that state would make `uv__queue_remove` write through the handle's own
+/// address and corrupt the loop, so the queue linkage is checked first.
+///
+/// # Safety
+///
+/// `handle` must be a handle `uv_spawn` initialised, so its `handle_queue` is
+/// readable and either self-linked or linked into a live loop.
+unsafe fn is_still_queued(handle: *mut uv::uv_handle_t) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: the caller guarantees the handle is initialised.
+    let node = unsafe { &(*handle).handle_queue };
+    let address = std::ptr::from_ref(node);
+    node.next != address.cast_mut() || node.prev != address.cast_mut()
+}
+
 /// Reads a boolean option, defaulting to false.
 fn bool_option(scope: &v8::PinScope<'_, '_>, object: v8::Local<v8::Object>, name: &str) -> bool {
     let _ = scope;
@@ -1136,4 +1280,73 @@ fn bool_option(scope: &v8::PinScope<'_, '_>, object: v8::Local<v8::Object>, name
             !value.is_null() && !value.is_undefined() && !value.is_false()
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed `exec()` still registers the process handle, so the private loop
+    /// must be closable afterwards.
+    ///
+    /// This is the invariant the SIGSEGV came from: `uv_spawn` initialises the
+    /// `uv_process_t` and starts the loop's `SIGCHLD` `child_watcher` before it
+    /// tries `exec()`, and only `uv__process_close` undoes both. `uv_loop_close`
+    /// reports a loop that still has such a handle as `UV_EBUSY`; freeing it
+    /// anyway leaves a node in libuv's process-global signal tree that the next
+    /// `uv_signal_start` walks and dereferences.
+    ///
+    /// The assertions are on [`Runner`]'s own bookkeeping, so they fail if
+    /// `close_handles` stops closing a handle that `uv_spawn` registered — which
+    /// is exactly the regression this pins.
+    #[test]
+    fn a_failed_spawn_leaves_the_private_loop_closable() {
+        let missing = CString::new("/nonexistent/rustnode-test-binary").expect("no NUL here");
+        let mut argv = vec![missing.as_ptr() as *mut c_char, ptr::null_mut()];
+        let mut containers = vec![
+            uv::uv_stdio_container_t {
+                flags: uv::uv_stdio_flags_UV_IGNORE,
+                // SAFETY: the union's variants are plain data.
+                data: unsafe { std::mem::zeroed() },
+            };
+            3
+        ];
+        let mut native = uv::uv_process_options_t {
+            exit_cb: Some(exit_callback),
+            file: missing.as_ptr(),
+            args: argv.as_mut_ptr(),
+            env: ptr::null_mut(),
+            cwd: ptr::null(),
+            flags: 0,
+            stdio_count: containers.len() as i32,
+            stdio: containers.as_mut_ptr(),
+            uid: 0,
+            gid: 0,
+        };
+
+        let mut runner = Runner::test_runner(Vec::new());
+        let outcome = runner.execute(&mut native, 0);
+
+        assert_eq!(
+            outcome.error,
+            uv::uv_errno_t_UV_ENOENT,
+            "a missing binary must report ENOENT"
+        );
+        assert!(
+            runner.process_registered,
+            "uv_spawn registers the handle even when exec() fails"
+        );
+        assert!(
+            !runner.spawned,
+            "there is no child, so the handle must not be treated as alive"
+        );
+        assert!(
+            runner.process_closing,
+            "the registered handle must be closed or libuv keeps its SIGCHLD watcher"
+        );
+        assert!(
+            runner.loop_released,
+            "the private loop must be released; a refused loop is leaked, not freed"
+        );
+    }
 }
