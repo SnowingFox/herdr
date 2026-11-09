@@ -98,6 +98,27 @@ impl BindingModule for Zlib {
     }
 }
 
+/// Members the `zlib` namespace needs but this crate does not install yet.
+pub const DEFERRED: &[(&str, &str)] = &[
+    (
+        "ZstdCompress",
+        "zstd streaming handle; deflate, gzip and brotli cover the JS paths in use",
+    ),
+    (
+        "ZstdDecompress",
+        "zstd streaming handle; same scope as ZstdCompress",
+    ),
+    (
+        "crc32c",
+        "Castagnoli CRC used only by zlib.crc32 with the castagnoli option",
+    ),
+];
+
+/// Registers the `zlib` namespace with the runtime.
+pub fn register(registry: &mut rn_core::BindingRegistry) {
+    registry.register(rn_core::Namespace::from_module(&Zlib));
+}
+
 #[cfg(test)]
 mod tests {
     use super::Zlib;
@@ -119,24 +140,3 @@ mod tests {
         );
     }
 }
-
-/// Registers the `zlib` namespace with the runtime.
-pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(rn_core::Namespace::from_module(&Zlib));
-}
-
-/// Members the `zlib` namespace needs but this crate does not install yet.
-pub const DEFERRED: &[(&str, &str)] = &[
-    (
-        "ZstdCompress",
-        "zstd streaming handle; deflate, gzip and brotli cover the JS paths in use",
-    ),
-    (
-        "ZstdDecompress",
-        "zstd streaming handle; same scope as ZstdCompress",
-    ),
-    (
-        "crc32c",
-        "Castagnoli CRC used only by zlib.crc32 with the castagnoli option",
-    ),
-];
