@@ -18,9 +18,12 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_diagnostics_channel::register(registry);
     rn_bind_encoding::register(registry);
     rn_bind_fs::register(registry);
+    rn_bind_fs_dir::register(registry);
+    rn_bind_fs_event_wrap::register(registry);
     rn_bind_glob::register(registry);
     rn_bind_http_parser::register(registry);
     rn_bind_icu::register(registry);
+    rn_bind_js_stream::register(registry);
     rn_bind_messaging::register(registry);
     rn_bind_mksnapshot::register(registry);
     rn_bind_modules::register(registry);
@@ -31,6 +34,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_process_methods::register(registry);
     rn_bind_process_wrap::register(registry);
     rn_bind_report::register(registry);
+    rn_bind_serdes::register(registry);
     rn_bind_spawn_sync::register(registry);
     rn_bind_stream_wrap::register(registry);
     rn_bind_string_decoder::register(registry);

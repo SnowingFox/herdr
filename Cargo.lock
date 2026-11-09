@@ -875,6 +875,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-fs-dir"
+version = "0.1.0"
+dependencies = [
+ "rn-bind-fs",
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+ "v8",
+]
+
+[[package]]
+name = "rn-bind-fs-event-wrap"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "v8",
+]
+
+[[package]]
 name = "rn-bind-glob"
 version = "0.1.0"
 dependencies = [
@@ -900,6 +923,17 @@ dependencies = [
  "rn-core",
  "rn-v8-sys",
  "unicode-width",
+]
+
+[[package]]
+name = "rn-bind-js-stream"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "v8",
 ]
 
 [[package]]
@@ -1001,6 +1035,16 @@ dependencies = [
  "rn-v8-sys",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rn-bind-serdes"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+ "v8",
 ]
 
 [[package]]
@@ -1185,9 +1229,12 @@ dependencies = [
  "rn-bind-diagnostics-channel",
  "rn-bind-encoding",
  "rn-bind-fs",
+ "rn-bind-fs-dir",
+ "rn-bind-fs-event-wrap",
  "rn-bind-glob",
  "rn-bind-http-parser",
  "rn-bind-icu",
+ "rn-bind-js-stream",
  "rn-bind-messaging",
  "rn-bind-mksnapshot",
  "rn-bind-modules",
@@ -1198,6 +1245,7 @@ dependencies = [
  "rn-bind-process-methods",
  "rn-bind-process-wrap",
  "rn-bind-report",
+ "rn-bind-serdes",
  "rn-bind-spawn-sync",
  "rn-bind-stream-wrap",
  "rn-bind-string-decoder",

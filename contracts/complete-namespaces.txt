@@ -13,9 +13,12 @@ diagnostics_channel
 encoding_binding
 errors
 fs
+fs_dir
+fs_event_wrap
 glob
 http_parser
 icu
+js_stream
 messaging
 mksnapshot
 module_wrap
@@ -28,6 +31,7 @@ pipe_wrap
 process_methods
 process_wrap
 report
+serdes
 spawn_sync
 stream_wrap
 string_decoder

@@ -1,0 +1,17 @@
+[package]
+name = "rn-bind-js-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('js_stream') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-uv.workspace = true
+rn-v8-sys.workspace = true
+v8.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
