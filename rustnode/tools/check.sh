@@ -41,6 +41,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 step "binding shapes against the recorded contracts"
 cargo run -q -p rn-compat -- contracts
 
+step "deferred members reached at module scope"
+# A declared deferral passes the contract check by design, so this is the only
+# gate that catches a member `lib/**` calls while a module loads. It is part of
+# the gate because it silently failed open once already.
+./tools/deferred-reach.py
+
 step "the vendored JavaScript is unchanged"
 ./tools/verify-libjs.sh
 
