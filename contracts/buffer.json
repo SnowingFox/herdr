@@ -1,0 +1,202 @@
+{
+  "namespace": "buffer",
+  "reachable": true,
+  "members": {
+    "arrayBufferAlignedOffset": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "asciiSlice": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "asciiWriteStatic": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "atob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "base64Slice": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "base64Write": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "base64urlSlice": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "base64urlWrite": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "btoa": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "byteLengthUtf8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "byteLengthUtf8Fast": {
+      "kind": "function",
+      "origin": "static"
+    },
+    "compare": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "compareOffset": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "copy": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "copyArrayBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "createUnsafeArrayBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "fill": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "hexSlice": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "hexWrite": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "indexOfBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "indexOfNumber": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "indexOfString": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isAscii": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isLatin1": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isUtf8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "kMaxLength": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kStringMaxLength": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "latin1Slice": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "latin1WriteStatic": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "mask": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setBufferPrototype": {
+      "kind": "function",
+      "origin": "static"
+    },
+    "setDetachKey": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "stringLengthUtf8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "swap16": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "swap32": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "swap64": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ucs2Slice": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ucs2Write": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "utf8Slice": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "utf8WriteStatic": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

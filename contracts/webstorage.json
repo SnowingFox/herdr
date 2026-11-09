@@ -1,0 +1,15 @@
+{
+  "namespace": "webstorage",
+  "reachable": true,
+  "members": {
+    "Storage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "kConstructorKey": {
+      "kind": "symbol",
+      "origin": "both"
+    }
+  }
+}

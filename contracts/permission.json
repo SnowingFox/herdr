@@ -1,0 +1,21 @@
+{
+  "namespace": "permission",
+  "reachable": true,
+  "members": {
+    "drop": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "has": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "takeRemovedEnvVarWarning": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

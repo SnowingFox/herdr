@@ -1,0 +1,77 @@
+{
+  "namespace": "sqlite",
+  "reachable": true,
+  "members": {
+    "Database": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "Session": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "Statement": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "backup": {
+      "kind": "function",
+      "arity": 2,
+      "origin": "both"
+    },
+    "constants": {
+      "kind": "object",
+      "properties": [
+        "SQLITE_ALTER_TABLE",
+        "SQLITE_ANALYZE",
+        "SQLITE_ATTACH",
+        "SQLITE_CHANGESET_ABORT",
+        "SQLITE_CHANGESET_CONFLICT",
+        "SQLITE_CHANGESET_CONSTRAINT",
+        "SQLITE_CHANGESET_DATA",
+        "SQLITE_CHANGESET_FOREIGN_KEY",
+        "SQLITE_CHANGESET_NOTFOUND",
+        "SQLITE_CHANGESET_OMIT",
+        "SQLITE_CHANGESET_REPLACE",
+        "SQLITE_COPY",
+        "SQLITE_CREATE_INDEX",
+        "SQLITE_CREATE_TABLE",
+        "SQLITE_CREATE_TEMP_INDEX",
+        "SQLITE_CREATE_TEMP_TABLE",
+        "SQLITE_CREATE_TEMP_TRIGGER",
+        "SQLITE_CREATE_TEMP_VIEW",
+        "SQLITE_CREATE_TRIGGER",
+        "SQLITE_CREATE_VIEW",
+        "SQLITE_CREATE_VTABLE",
+        "SQLITE_DELETE",
+        "SQLITE_DENY",
+        "SQLITE_DETACH",
+        "SQLITE_DROP_INDEX",
+        "SQLITE_DROP_TABLE",
+        "SQLITE_DROP_TEMP_INDEX",
+        "SQLITE_DROP_TEMP_TABLE",
+        "SQLITE_DROP_TEMP_TRIGGER",
+        "SQLITE_DROP_TEMP_VIEW",
+        "SQLITE_DROP_TRIGGER",
+        "SQLITE_DROP_VIEW",
+        "SQLITE_DROP_VTABLE",
+        "SQLITE_FUNCTION",
+        "SQLITE_IGNORE",
+        "SQLITE_INSERT",
+        "SQLITE_OK",
+        "SQLITE_PRAGMA",
+        "SQLITE_READ",
+        "SQLITE_RECURSIVE",
+        "SQLITE_REINDEX",
+        "SQLITE_SAVEPOINT",
+        "SQLITE_SELECT",
+        "SQLITE_TRANSACTION",
+        "SQLITE_UPDATE"
+      ],
+      "origin": "both"
+    }
+  }
+}

@@ -1,0 +1,136 @@
+{
+  "namespace": "types",
+  "reachable": true,
+  "members": {
+    "isAnyArrayBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isArgumentsObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isArrayBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isAsyncFunction": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isBigIntObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isBooleanObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isBoxedPrimitive": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isDate": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isExternal": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isGeneratorFunction": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isGeneratorObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isMap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isMapIterator": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isModuleNamespaceObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isNativeError": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isNumberObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isPromise": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isProxy": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isRegExp": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isSet": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isSetIterator": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isSharedArrayBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isStringObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isSymbolObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isWeakMap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isWeakSet": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    }
+  }
+}

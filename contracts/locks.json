@@ -1,0 +1,28 @@
+{
+  "namespace": "locks",
+  "reachable": true,
+  "members": {
+    "LOCK_MODE_EXCLUSIVE": {
+      "kind": "string",
+      "origin": "both"
+    },
+    "LOCK_MODE_SHARED": {
+      "kind": "string",
+      "origin": "both"
+    },
+    "LOCK_STOLEN_ERROR": {
+      "kind": "string",
+      "origin": "both"
+    },
+    "query": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "request": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

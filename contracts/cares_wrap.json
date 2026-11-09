@@ -1,0 +1,87 @@
+{
+  "namespace": "cares_wrap",
+  "reachable": true,
+  "members": {
+    "AF_INET": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "AF_INET6": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "AF_UNSPEC": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "AI_ADDRCONFIG": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "AI_ALL": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "AI_V4MAPPED": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "ChannelWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "DNS_ORDER_IPV4_FIRST": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "DNS_ORDER_IPV6_FIRST": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "DNS_ORDER_VERBATIM": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "GetAddrInfoReqWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "GetNameInfoReqWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "QueryReqWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "canonicalizeIP": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "convertIpv6StringToBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getaddrinfo": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getnameinfo": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "strerror": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    }
+  }
+}

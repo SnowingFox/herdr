@@ -1,0 +1,11 @@
+{
+  "namespace": "internal_only_v8",
+  "reachable": false,
+  "unreachable_reason": "No such binding: internal_only_v8",
+  "members": {
+    "queryObjects": {
+      "kind": "function",
+      "origin": "static"
+    }
+  }
+}

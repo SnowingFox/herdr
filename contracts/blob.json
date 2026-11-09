@@ -1,0 +1,36 @@
+{
+  "namespace": "blob",
+  "reachable": true,
+  "members": {
+    "concat": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "createBlob": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "createBlobFromFilePath": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getDataObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "revokeObjectURL": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "storeDataObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

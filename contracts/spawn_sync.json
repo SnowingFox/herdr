@@ -1,0 +1,11 @@
+{
+  "namespace": "spawn_sync",
+  "reachable": true,
+  "members": {
+    "spawn": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

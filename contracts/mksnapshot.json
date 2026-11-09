@@ -1,0 +1,42 @@
+{
+  "namespace": "mksnapshot",
+  "reachable": true,
+  "members": {
+    "anonymousMainPath": {
+      "kind": "string",
+      "origin": "both"
+    },
+    "compileSerializeMain": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isBuildingSnapshotBuffer": {
+      "kind": "object",
+      "properties": [
+        "0"
+      ],
+      "origin": "both"
+    },
+    "runEmbedderPreload": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setDeserializeCallback": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setDeserializeMainFunction": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setSerializeCallback": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

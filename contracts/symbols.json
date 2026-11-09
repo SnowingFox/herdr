@@ -1,0 +1,114 @@
+{
+  "namespace": "symbols",
+  "reachable": true,
+  "members": {
+    "async_id_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "builtin_source_text_module_hdo": {
+      "kind": "symbol",
+      "origin": "runtime"
+    },
+    "constructor_key_symbol": {
+      "kind": "symbol",
+      "origin": "runtime"
+    },
+    "embedder_module_hdo": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "ffi_sb_arguments_symbol": {
+      "kind": "symbol",
+      "origin": "runtime"
+    },
+    "ffi_sb_invoke_slow_symbol": {
+      "kind": "symbol",
+      "origin": "runtime"
+    },
+    "ffi_sb_return_symbol": {
+      "kind": "symbol",
+      "origin": "runtime"
+    },
+    "ffi_sb_shared_buffer_symbol": {
+      "kind": "symbol",
+      "origin": "runtime"
+    },
+    "fs_use_promises_symbol": {
+      "kind": "symbol",
+      "origin": "runtime"
+    },
+    "handle_onclose": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "imported_cjs_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "messaging_clone_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "messaging_deserialize_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "messaging_transfer_list_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "messaging_transfer_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "no_message_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "oninit": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "onpskexchange": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "owner_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "resource_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "source_text_module_default_hdo": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "trigger_async_id_symbol": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "vm_context_no_contextify": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "vm_dynamic_import_default_internal": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "vm_dynamic_import_main_context_default": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "vm_dynamic_import_missing_flag": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "vm_dynamic_import_no_callback": {
+      "kind": "symbol",
+      "origin": "both"
+    }
+  }
+}

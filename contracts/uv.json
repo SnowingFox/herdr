@@ -1,0 +1,393 @@
+{
+  "namespace": "uv",
+  "reachable": true,
+  "members": {
+    "UV_DIRENT_BLOCK": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "UV_DIRENT_CHAR": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "UV_DIRENT_DIR": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "UV_DIRENT_FIFO": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "UV_DIRENT_FILE": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "UV_DIRENT_LINK": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "UV_DIRENT_SOCKET": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "UV_DIRENT_UNKNOWN": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "UV_E2BIG": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EACCES": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EADDRINUSE": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EADDRNOTAVAIL": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAFNOSUPPORT": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAGAIN": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EAI_ADDRFAMILY": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_AGAIN": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_BADFLAGS": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_BADHINTS": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_CANCELED": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_FAIL": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_FAMILY": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_MEMORY": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_NODATA": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_NONAME": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_OVERFLOW": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_PROTOCOL": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_SERVICE": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EAI_SOCKTYPE": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EALREADY": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EBADF": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EBUSY": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ECANCELED": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ECHARSET": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ECONNABORTED": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ECONNREFUSED": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ECONNRESET": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EDESTADDRREQ": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EEXIST": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EFAULT": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EFBIG": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EFTYPE": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EHOSTDOWN": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EHOSTUNREACH": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EILSEQ": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EINTR": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EINVAL": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EIO": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EISCONN": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EISDIR": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ELOOP": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EMFILE": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EMLINK": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EMSGSIZE": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENAMETOOLONG": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENETDOWN": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENETUNREACH": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENFILE": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ENOBUFS": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENODATA": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENODEV": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENOENT": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ENOEXEC": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENOMEM": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENONET": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENOPROTOOPT": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENOSPC": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ENOSYS": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ENOTCONN": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ENOTDIR": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ENOTEMPTY": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ENOTSOCK": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENOTSUP": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENOTTY": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ENXIO": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EOF": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EOVERFLOW": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EPERM": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EPIPE": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_EPROTO": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EPROTONOSUPPORT": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EPROTOTYPE": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ERANGE": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EREMOTEIO": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EROFS": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ESHUTDOWN": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ESOCKTNOSUPPORT": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ESPIPE": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_ESRCH": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ETIMEDOUT": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_ETXTBSY": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EUNATCH": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "UV_EXDEV": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "UV_UNKNOWN": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "errname": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "getErrorMap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "getErrorMessage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    }
+  }
+}

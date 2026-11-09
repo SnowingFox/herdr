@@ -1,0 +1,173 @@
+{
+  "namespace": "ffi",
+  "reachable": true,
+  "members": {
+    "DynamicLibrary": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "charIsSigned": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "exportBytes": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCurrentEventLoop": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getFloat32": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getFloat64": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getInt16": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getInt32": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getInt64": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getInt8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getRawPointer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getUint16": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getUint32": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getUint64": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getUint8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "kFastArguments": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "kFastBufferInvoke": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "kSbArguments": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "kSbInvokeSlow": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "kSbReturn": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "kSbSharedBuffer": {
+      "kind": "symbol",
+      "origin": "both"
+    },
+    "setFloat32": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setFloat64": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setInt16": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setInt32": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setInt64": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setInt8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setUint16": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setUint32": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setUint64": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setUint8": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "toArrayBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "toBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "toString": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "uintptrMax": {
+      "kind": "bigint",
+      "origin": "both"
+    }
+  }
+}
