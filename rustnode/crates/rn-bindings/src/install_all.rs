@@ -7,6 +7,7 @@ use rn_core::BindingRegistry;
 
 /// Registers every namespace this build implements.
 pub fn install_all(registry: &mut BindingRegistry) {
+    rn_bind_config::register(registry);
     rn_bind_fs::register(registry);
     rn_bind_zlib::register(registry);
     rn_permission::register(registry);
