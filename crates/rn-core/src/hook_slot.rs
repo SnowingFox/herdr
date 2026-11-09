@@ -74,7 +74,9 @@ pub fn require<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8:
 }
 
 /// Returns a local handle to the installed `internalBinding`, if it ran.
-pub fn internal_binding<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+pub fn internal_binding<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Function>> {
     LOADERS.with(|loaders| {
         loaders
             .borrow()

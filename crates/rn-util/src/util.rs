@@ -56,15 +56,30 @@ pub const MEMBERS: &[&str] = &[
 
 /// Members the namespace needs but this crate does not install yet.
 pub const DEFERRED: &[(&str, &str)] = &[
-    ("getCallSites", "structured CallSite records; needs the stack formatting work"),
-    ("getCallerLocation", "positional caller lookup, lands with structured stacks"),
+    (
+        "getCallSites",
+        "structured CallSite records; needs the stack formatting work",
+    ),
+    (
+        "getCallerLocation",
+        "positional caller lookup, lands with structured stacks",
+    ),
     (
         "previewEntries",
         "Map/Set previews for util.inspect; needs the entry iteration protocol",
     ),
-    ("getSharedArrayBufferGrowable", "growable SAB flag, follows the buffer namespace"),
-    ("parseEnv", "NODE_OPTIONS env parsing, owned by the CLI option surface"),
-    ("shouldAbortOnUncaughtToggle", "debug toggle read by the abort-on-uncaught path"),
+    (
+        "getSharedArrayBufferGrowable",
+        "growable SAB flag, follows the buffer namespace",
+    ),
+    (
+        "parseEnv",
+        "NODE_OPTIONS env parsing, owned by the CLI option surface",
+    ),
+    (
+        "shouldAbortOnUncaughtToggle",
+        "debug toggle read by the abort-on-uncaught path",
+    ),
 ];
 
 /// Property filter bits from V8's `PropertyFilter`, used by
@@ -222,8 +237,8 @@ fn install_symbols<'s>(
             ),
             None => {
                 drop(existing);
-                let arrow_key =
-                    v8::String::new(scope, "nodejs.arrow_message_private_symbol").expect("symbol key");
+                let arrow_key = v8::String::new(scope, "nodejs.arrow_message_private_symbol")
+                    .expect("symbol key");
                 let decorated_key =
                     v8::String::new(scope, "nodejs.decorated_private_symbol").expect("symbol key");
                 let arrow = v8::Symbol::for_key(scope, arrow_key);
@@ -234,7 +249,7 @@ fn install_symbols<'s>(
                     decorated: v8::Global::new(scope, decorated),
                 });
                 (arrow, decorated)
-            },
+            }
         }
     });
 
@@ -256,7 +271,9 @@ fn construct_shared_array_buffer(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let Some(length) = args.get(0).number_value(scope) else { return };
+    let Some(length) = args.get(0).number_value(scope) else {
+        return;
+    };
     let backing_store = v8::SharedArrayBuffer::new_backing_store(scope, length as usize);
     let backing_store: v8::SharedRef<v8::BackingStore> = backing_store.into();
     let buffer = v8::SharedArrayBuffer::with_backing_store(scope, &backing_store);
@@ -278,20 +295,30 @@ fn define_lazy_properties(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
 ) {
-    let Ok(target) = v8::Local::<v8::Object>::try_from(args.get(0)) else { return };
-    let Ok(keys) = v8::Local::<v8::Array>::try_from(args.get(2)) else { return };
+    let Ok(target) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        return;
+    };
+    let Ok(keys) = v8::Local::<v8::Array>::try_from(args.get(2)) else {
+        return;
+    };
 
     let length = keys.length();
     for index in 0..length {
-        let Some(value) = keys.get_index(scope, index) else { continue };
-        let Ok(name) = v8::Local::<v8::String>::try_from(value) else { continue };
+        let Some(value) = keys.get_index(scope, index) else {
+            continue;
+        };
+        let Ok(name) = v8::Local::<v8::String>::try_from(value) else {
+            continue;
+        };
         let name_text = name.to_rust_string_lossy(scope);
 
         // A lazy property is a getter that computes once and then becomes a data
         // property. The computed value is cached on the target under a private
         // key so the second read is a plain property read.
         let template = v8::FunctionTemplate::builder(lazy_getter).build(scope);
-        let Some(getter) = template.get_function(scope) else { continue };
+        let Some(getter) = template.get_function(scope) else {
+            continue;
+        };
         let cache_key = format!("__rustnode_lazy_{name_text}");
         if let Some(key) = v8::String::new(scope, &cache_key) {
             LAZY.with(|lazy| {
@@ -300,7 +327,12 @@ fn define_lazy_properties(
                     .or_default()
                     .insert(name_text.clone(), v8::Global::new(scope, getter));
             });
-            target.define_own_property(scope, name.into(), v8::undefined(scope).into(), Default::default());
+            target.define_own_property(
+                scope,
+                name.into(),
+                v8::undefined(scope).into(),
+                Default::default(),
+            );
             let _ = key;
         }
         let _ = getter;
@@ -358,7 +390,9 @@ fn get_external_value(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let Ok(external) = v8::Local::<v8::External>::try_from(args.get(0)) else { return };
+    let Ok(external) = v8::Local::<v8::External>::try_from(args.get(0)) else {
+        return;
+    };
     // The value is an opaque pointer, exposed as a Number the way Node does,
     // since there is no integer type wide enough in JavaScript.
     let pointer = external.value() as usize;
@@ -370,14 +404,21 @@ fn get_own_non_index_properties(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let Ok(object) = v8::Local::<v8::Object>::try_from(args.get(0)) else { return };
-    let filter = args.get(1).number_value(scope).unwrap_or(SKIP_SYMBOLS as f64) as u32;
+    let Ok(object) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        return;
+    };
+    let filter = args
+        .get(1)
+        .number_value(scope)
+        .unwrap_or(SKIP_SYMBOLS as f64) as u32;
 
     let mut names: Vec<v8::Local<'_, v8::Name>> = Vec::new();
     if let Some(properties) = object.get_own_property_names(scope, Default::default()) {
         let length = properties.length();
         for index in 0..length {
-            let Some(entry) = properties.get_index(scope, index) else { continue };
+            let Some(entry) = properties.get_index(scope, index) else {
+                continue;
+            };
             if filter & SKIP_STRINGS != 0 && entry.is_string() {
                 continue;
             }
@@ -459,7 +500,9 @@ fn mark_promise_as_handled(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
 ) {
-    let Ok(promise) = v8::Local::<v8::Promise>::try_from(args.get(0)) else { return };
+    let Ok(promise) = v8::Local::<v8::Promise>::try_from(args.get(0)) else {
+        return;
+    };
     promise.mark_as_handled();
     let _ = scope;
 }
@@ -501,7 +544,10 @@ mod tests {
     #[test]
     fn every_deferral_names_a_real_member() {
         for (member, reason) in DEFERRED {
-            assert!(MEMBERS.contains(member), "{member} is deferred but not required");
+            assert!(
+                MEMBERS.contains(member),
+                "{member} is deferred but not required"
+            );
             assert!(!reason.is_empty(), "{member} has no reason");
         }
     }

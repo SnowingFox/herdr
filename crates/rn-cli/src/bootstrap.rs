@@ -17,7 +17,6 @@
 //! JavaScript layer reaches a Rust namespace, so it is where the binding registry
 //! is consulted.
 
-
 use rn_core::{BindingModule, InstallCtx};
 use rn_js2c::builtin_by_id;
 use rn_v8_sys::v8;
@@ -51,9 +50,8 @@ pub fn bootstrap_realm(
 
     let realm = builtin_by_id("internal/bootstrap/realm")
         .ok_or("the realm bootstrap is missing from the builtin table")?;
-    let function =
-        rn_builtins::compile(scope, realm.id(), realm.source(), realm.kind())
-            .ok_or("failed to compile internal/bootstrap/realm")?;
+    let function = rn_builtins::compile(scope, realm.id(), realm.source(), realm.kind())
+        .ok_or("failed to compile internal/bootstrap/realm")?;
 
     let arguments = [
         process.into(),
@@ -83,13 +81,17 @@ pub fn bootstrap_realm(
     }
 
     Ok(Bootstrapped {
-        internal_binding: rn_core::hook_slot::internal_binding(scope).map(|function| v8::Global::new(scope, function)),
+        internal_binding: rn_core::hook_slot::internal_binding(scope)
+            .map(|function| v8::Global::new(scope, function)),
         require: require.map(|function| v8::Global::new(scope, function)),
     })
 }
 
 /// Runs `internal/per_context/primordials` with the parameters its kind declares.
-fn run_per_context(scope: &mut v8::PinScope, primordials: v8::Local<v8::Object>) -> Result<(), String> {
+fn run_per_context(
+    scope: &mut v8::PinScope,
+    primordials: v8::Local<v8::Object>,
+) -> Result<(), String> {
     let builtin = builtin_by_id("internal/per_context/primordials")
         .ok_or("primordials is missing from the builtin table")?;
     let function = rn_builtins::compile(scope, builtin.id(), builtin.source(), builtin.kind())
@@ -115,15 +117,17 @@ fn run_per_context(scope: &mut v8::PinScope, primordials: v8::Local<v8::Object>)
 /// Node's `process` is created by `lib/internal/bootstrap/node.js`, which needs
 /// far more of the runtime than exists yet. This is the subset `realm.js` itself
 /// touches: the load-list array it appends to, and the accessors it defines.
-fn process_object<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Object>, String> {
+fn process_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Result<v8::Local<'s, v8::Object>, String> {
     let process = v8::Object::new(scope);
 
     let load_list = v8::Array::new(scope, 0);
     set(scope, process, "moduleLoadList", load_list.into())?;
 
     let versions = v8::Object::new(scope);
-    let v8_version = v8::String::new(scope, v8::V8::get_version())
-        .ok_or("cannot allocate the V8 version")?;
+    let v8_version =
+        v8::String::new(scope, v8::V8::get_version()).ok_or("cannot allocate the V8 version")?;
     set(scope, versions, "v8", v8_version.into())?;
     let node_version = v8::String::new(scope, "28.0.0").ok_or("cannot allocate a version")?;
     set(scope, versions, "node", node_version.into())?;
@@ -170,7 +174,9 @@ fn get_internal_binding(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let Some(name) = args.get(0).to_string(scope) else { return };
+    let Some(name) = args.get(0).to_string(scope) else {
+        return;
+    };
     let name = name.to_rust_string_lossy(scope);
     match install_namespace(scope, &name) {
         Ok(object) => rv.set(object.into()),
@@ -257,7 +263,9 @@ fn function_of<'s>(
 }
 
 fn throw(scope: &mut v8::PinScope, message: &str) {
-    let Some(message) = v8::String::new(scope, message) else { return };
+    let Some(message) = v8::String::new(scope, message) else {
+        return;
+    };
     let exception = v8::Exception::error(scope, message);
     scope.throw_exception(exception);
 }
