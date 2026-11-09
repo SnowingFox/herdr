@@ -26,6 +26,7 @@ task_queue
 timers
 trace_events
 types
+url
 url_pattern
 util
 uv

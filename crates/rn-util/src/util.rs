@@ -93,10 +93,19 @@ thread_local! {
     /// `lib/**` compares these by identity, so they cannot be recreated per
     /// call; Node keeps them on the isolate for the same reason.
     static SYMBOLS: RefCell<Option<SymbolSet>> = const { RefCell::new(None) };
-    /// Lazy properties registered by `defineLazyProperties`, keyed by target
-    /// object address and then property name.
-    static LAZY: RefCell<HashMap<usize, HashMap<String, v8::Global<v8::Function>>>> =
-        RefCell::new(HashMap::new());
+}
+
+/// What `defineLazyProperties` was told to resolve a property from.
+///
+/// Node's `source` is either an internal module id, where the value is a named
+/// export, or an object mapping each property name to its own module id, where
+/// the value is that module's whole exports object.
+#[derive(Clone)]
+enum LazySource {
+    /// `defineLazyProperties(target, 'internal/streams/duplex', ['x'])`
+    Module(String),
+    /// `defineLazyProperties(target, { x: 'internal/streams/duplex' }, ['x'])`
+    PerKey(HashMap<String, String>),
 }
 
 struct SymbolSet {
@@ -290,17 +299,44 @@ fn construct_shared_array_buffer(
 /// of the startup path while still exposing them as ordinary properties. It is
 /// given `(target, name, keys)` or `(target, keys, enumerable)`; only the accessor
 /// part is behaviour, the rest is bookkeeping the caller already did.
-fn define_lazy_properties(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+/// `defineLazyProperties(target, source, keys, enumerable = true)`.
+///
+/// Node defines, for each key, a lazy data property: the first read calls
+/// `require(source)` and replaces the property with the resulting value. Two
+/// shapes of `source` exist and both are used by `lib/**`:
+///
+/// * a module id, where the value is that module's named export;
+/// * an object mapping each key to its own module id, where the value is the
+///   whole exports object of that module.
+///
+/// `lib/stream.js` uses both on the same object, so the source is carried per
+/// property in the accessor's data slot rather than assumed uniform.
+fn define_lazy_properties<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
     let Ok(target) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        throw_type_error(scope, "defineLazyProperties needs a target object");
         return;
     };
+    let source = args.get(1);
     let Ok(keys) = v8::Local::<v8::Array>::try_from(args.get(2)) else {
+        throw_type_error(scope, "defineLazyProperties needs an array of keys");
         return;
     };
+    let per_key = match LazySource::read(scope, source) {
+        Some(source) => source,
+        None => {
+            throw_type_error(
+                scope,
+                "defineLazyProperties source must be a string or an object",
+            );
+            return;
+        }
+    };
+    // Node's default is enumerable, and only an explicit `false` turns it off.
+    let enumerable = args.length() < 4 || args.get(3).is_undefined() || args.get(3).is_true();
 
     let length = keys.length();
     for index in 0..length {
@@ -308,69 +344,149 @@ fn define_lazy_properties(
             continue;
         };
         let Ok(name) = v8::Local::<v8::String>::try_from(value) else {
-            continue;
+            throw_type_error(scope, "defineLazyProperties keys must be strings");
+            return;
         };
         let name_text = name.to_rust_string_lossy(scope);
-
-        // A lazy property is a getter that computes once and then becomes a data
-        // property. The computed value is cached on the target under a private
-        // key so the second read is a plain property read.
-        let template = v8::FunctionTemplate::builder(lazy_getter).build(scope);
-        let Some(getter) = template.get_function(scope) else {
+        // The id and whether the whole module is the value travel with the
+        // property, so the getter needs no side table to resolve it.
+        let (id, whole_module) = per_key.resolve(&name_text);
+        let Some(id) = v8::String::new(scope, &id) else {
             continue;
         };
-        let cache_key = format!("__rustnode_lazy_{name_text}");
-        if let Some(key) = v8::String::new(scope, &cache_key) {
-            LAZY.with(|lazy| {
-                lazy.borrow_mut()
-                    .entry(target_address(target))
-                    .or_default()
-                    .insert(name_text.clone(), v8::Global::new(scope, getter));
-            });
-            target.define_own_property(
-                scope,
-                name.into(),
-                v8::undefined(scope).into(),
-                Default::default(),
-            );
-            let _ = key;
-        }
-        let _ = getter;
+        let data = lazy_data(scope, id.into(), whole_module);
+        // `PropertyAttribute` is not `Copy`, and every key gets the same one.
+        let attributes = if enumerable {
+            v8::PropertyAttribute::NONE
+        } else {
+            v8::PropertyAttribute::DONT_ENUM
+        };
+        target.set_lazy_data_property_with_data(
+            scope,
+            name.into(),
+            lazy_property_getter,
+            data,
+            attributes,
+            v8::SideEffectType::HasSideEffect,
+            v8::SideEffectType::HasSideEffect,
+        );
     }
 }
 
-/// A stable address for an object within one isolate, used only as a table key.
-fn target_address(object: v8::Local<v8::Object>) -> usize {
-    let raw: *const v8::Object = &*object;
-    raw as usize
+/// The accessor data slot for one lazy property: `{ id, wholeModule }`.
+///
+/// This is `info.Data()` in Node's `DefineLazyPropertiesGetter`. V8's callback
+/// data slot is statically sized, so this is a two-field plain object rather
+/// than any kind of captured closure.
+fn lazy_data<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    id: v8::Local<'s, v8::Value>,
+    whole_module: bool,
+) -> v8::Local<'s, v8::Value> {
+    let data = v8::Object::new(scope);
+    let (Some(id_key), Some(whole_key), Some(whole)) = (
+        v8::String::new(scope, "id"),
+        v8::String::new(scope, "wholeModule"),
+        Some(v8::Boolean::new(scope, whole_module)),
+    ) else {
+        return v8::undefined(scope).into();
+    };
+    let _ = data.set(scope, id_key.into(), id);
+    let _ = data.set(scope, whole_key.into(), whole.into());
+    data.into()
 }
 
-fn lazy_getter(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+/// Throws a `TypeError` the way a V8 binding reports a bad argument.
+fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    if let Some(message) = v8::String::new(scope, message) {
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+    }
+}
+
+impl LazySource {
+    fn read<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        source: v8::Local<'s, v8::Value>,
+    ) -> Option<Self> {
+        if let Ok(id) = v8::Local::<v8::String>::try_from(source) {
+            return Some(Self::Module(id.to_rust_string_lossy(scope)));
+        }
+        let object = v8::Local::<v8::Object>::try_from(source).ok()?;
+        let names = object.get_own_property_names(scope, Default::default())?;
+        let mut per_key = HashMap::new();
+        for index in 0..names.length() {
+            let key = names.get_index(scope, index)?;
+            let value = object.get(scope, key)?;
+            let Ok(id) = v8::Local::<v8::String>::try_from(value) else {
+                continue;
+            };
+            per_key.insert(
+                key.to_rust_string_lossy(scope),
+                id.to_rust_string_lossy(scope),
+            );
+        }
+        Some(Self::PerKey(per_key))
+    }
+
+    /// The module id for one property, and whether that module is the value.
+    fn resolve(&self, name: &str) -> (String, bool) {
+        match self {
+            Self::Module(id) => (id.clone(), false),
+            Self::PerKey(map) => (map.get(name).cloned().unwrap_or_default(), true),
+        }
+    }
+}
+
+/// Resolves a lazily defined property on first read.
+///
+/// This is `DefineLazyPropertiesGetter` from `src/node_util.cc`: it calls the
+/// realm's `require` with the recorded id and returns either the named export
+/// or, for the per-key form, the module itself.
+fn lazy_property_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    key: v8::Local<'s, v8::Name>,
+    args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
-    let target = args.this();
-    let address = target_address(target);
-    let names: Vec<String> = LAZY.with(|lazy| {
-        lazy.borrow()
-            .get(&address)
-            .map(|entries| entries.keys().cloned().collect())
-            .unwrap_or_default()
-    });
-    if let Some(name) = names.first() {
-        let getter = LAZY.with(|lazy| {
-            lazy.borrow()
-                .get(&address)
-                .and_then(|entries| entries.get(name))
-                .map(|getter| v8::Local::new(scope, getter))
-        });
-        if let Some(getter) = getter {
-            if let Some(value) = getter.call(scope, target.into(), &[]) {
-                rv.set(value);
-            }
-        }
+    let data = args.data();
+    let Some(id) = get_property(scope, data, "id") else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let whole_module = get_property(scope, data, "wholeModule")
+        .map(|value| value.boolean_value(scope))
+        .unwrap_or(false);
+    let Some(require) = rn_core::hook_slot::require(scope) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let Some(module) = require.call(scope, v8::undefined(scope).into(), &[id]) else {
+        return;
+    };
+    if whole_module {
+        // The module id form maps a property straight at a module's exports,
+        // which is how `stream.js` binds `Duplex` to `internal/streams/duplex`.
+        rv.set(module);
+        return;
     }
+    let Ok(module) = v8::Local::<v8::Object>::try_from(module) else {
+        rv.set(module);
+        return;
+    };
+    if let Some(value) = module.get(scope, key.into()) {
+        rv.set(value);
+    }
+}
+
+fn get_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Value>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let object = v8::Local::<v8::Object>::try_from(object).ok()?;
+    let key = v8::String::new(scope, name)?;
+    object.get(scope, key.into())
 }
 
 fn get_constructor_name(

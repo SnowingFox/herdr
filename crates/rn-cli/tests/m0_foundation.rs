@@ -236,6 +236,46 @@ fn console_error_also_formats() {
 }
 
 #[test]
+fn lazily_defined_properties_resolve_on_first_read() {
+    // `defineLazyProperties` is a C++ function in Node and `lib/stream.js`
+    // depends on it: a broken version leaves `stream.Transform` present but
+    // `undefined`, which makes `zlib` fail with `Class extends value undefined`.
+    // Both source shapes that `lib/**` uses are exercised here.
+    let out = rustnode(&[
+        "--expose-internals",
+        "-e",
+        "const realm = require('internal/bootstrap/realm');\n\
+         const util = realm.internalBinding('util');\n\
+         const named = {};\n\
+         util.defineLazyProperties(named, 'path', ['join']);\n\
+         const whole = {};\n\
+         util.defineLazyProperties(whole, { Duplex: 'internal/streams/duplex' }, ['Duplex']);\n\
+         console.log(typeof named.join, typeof whole.Duplex);",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "function function"
+    );
+}
+
+#[test]
+fn stream_and_zlib_work_through_lazy_properties() {
+    // The end-to-end consequence: `stream`'s lazy exports have to be real, and
+    // `zlib` builds `ZlibBase` on `stream.Transform`.
+    let out = rustnode(&[
+        "-e",
+        "const zlib = require('zlib');\n\
+         const stream = require('stream');\n\
+         const gz = zlib.gzipSync(Buffer.from('hello'));\n\
+         console.log(typeof stream.Transform, gz.length, zlib.gunzipSync(gz).toString());",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "function 25 hello"
+    );
+}
+
+#[test]
 fn a_script_reports_failure_through_the_exit_code() {
     // Node's own tests fail by setting `process.exitCode`, not by throwing, so
     // a runtime that ignores it would report every test as passing.
