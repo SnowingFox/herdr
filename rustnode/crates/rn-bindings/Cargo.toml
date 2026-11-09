@@ -20,6 +20,7 @@ rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 rn-bind-buffer = { path = "../rn-bind-buffer" }
 rn-bind-cares = { path = "../rn-bind-cares" }
 rn-bind-config = { path = "../rn-bind-config" }
+rn-bind-contextify = { path = "../rn-bind-contextify" }
 rn-bind-diagnostics-channel = { path = "../rn-bind-diagnostics-channel" }
 rn-bind-encoding = { path = "../rn-bind-encoding" }
 rn-bind-fs = { path = "../rn-bind-fs" }
