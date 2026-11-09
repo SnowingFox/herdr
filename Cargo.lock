@@ -722,6 +722,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-contextify"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-bind-modules",
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bind-diagnostics-channel"
 version = "0.1.0"
 dependencies = [
@@ -939,6 +950,7 @@ dependencies = [
  "rn-bind-buffer",
  "rn-bind-cares",
  "rn-bind-config",
+ "rn-bind-contextify",
  "rn-bind-diagnostics-channel",
  "rn-bind-encoding",
  "rn-bind-fs",

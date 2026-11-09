@@ -1,0 +1,21 @@
+[package]
+name = "rn-bind-contextify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('contextify') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# The on-disk compile cache and its key derivation live in the `modules`
+# namespace crate because `module.enableCompileCache()` owns them there. The
+# CommonJS loader's compile step reads the same store, so reusing it keeps one
+# cache rather than two that disagree.
+rn-bind-modules = { path = "../rn-bind-modules" }
+libc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
