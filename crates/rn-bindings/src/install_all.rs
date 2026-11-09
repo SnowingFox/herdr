@@ -28,7 +28,9 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_performance::register(registry);
     rn_bind_pipe_wrap::register(registry);
     rn_bind_process_methods::register(registry);
+    rn_bind_process_wrap::register(registry);
     rn_bind_report::register(registry);
+    rn_bind_spawn_sync::register(registry);
     rn_bind_stream_wrap::register(registry);
     rn_bind_string_decoder::register(registry);
     rn_bind_symbols::register(registry);
@@ -36,6 +38,8 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_tcp_wrap::register(registry);
     rn_bind_timers::register(registry);
     rn_bind_trace_events::register(registry);
+    rn_bind_tty_wrap::register(registry);
+    rn_bind_udp_wrap::register(registry);
     rn_bind_url::register(registry);
     rn_bind_url_pattern::register(registry);
     rn_bind_uv::register(registry);

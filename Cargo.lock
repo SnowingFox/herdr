@@ -968,6 +968,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-process-wrap"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "rn-bind-report"
 version = "0.1.0"
 dependencies = [
@@ -976,6 +989,19 @@ dependencies = [
  "rn-v8-sys",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rn-bind-spawn-sync"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1043,6 +1069,32 @@ version = "0.1.0"
 dependencies = [
  "rn-core",
  "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-bind-tty-wrap"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "rn-bind-udp-wrap"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "rn-bind-async-wrap",
+ "rn-bind-uv",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -1120,7 +1172,9 @@ dependencies = [
  "rn-bind-performance",
  "rn-bind-pipe-wrap",
  "rn-bind-process-methods",
+ "rn-bind-process-wrap",
  "rn-bind-report",
+ "rn-bind-spawn-sync",
  "rn-bind-stream-wrap",
  "rn-bind-string-decoder",
  "rn-bind-symbols",
@@ -1128,6 +1182,8 @@ dependencies = [
  "rn-bind-tcp-wrap",
  "rn-bind-timers",
  "rn-bind-trace-events",
+ "rn-bind-tty-wrap",
+ "rn-bind-udp-wrap",
  "rn-bind-url",
  "rn-bind-url-pattern",
  "rn-bind-uv",

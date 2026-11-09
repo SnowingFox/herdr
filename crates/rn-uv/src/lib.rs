@@ -31,6 +31,7 @@ pub mod callback;
 pub mod handle;
 pub mod stream;
 pub mod stream_base;
+pub mod streams;
 pub mod uv_loop;
 
 pub use libuv_sys2 as sys;

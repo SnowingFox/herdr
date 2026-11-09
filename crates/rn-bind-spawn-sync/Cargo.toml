@@ -1,0 +1,21 @@
+[package]
+name = "rn-bind-spawn-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('spawn_sync') for rustnode"
+
+[dependencies]
+libuv-sys2.workspace = true
+rn-core.workspace = true
+rn-uv.workspace = true
+tracing.workspace = true
+rn-v8-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
