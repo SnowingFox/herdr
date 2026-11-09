@@ -62,7 +62,7 @@ fn main() {
     // Node's own bootstrap defines `internalBinding` and `require`. When it fails
     // the CLI still runs, because `-e` on a bare global is useful for debugging
     // the bootstrap itself; the reason is printed so a failure is never silent.
-    match bootstrap::bootstrap_realm(scope, registry) {
+    match bootstrap::bootstrap_realm(scope, registry, &options.script_args) {
         Ok(loaders) => {
             if options.expose_internals() {
                 bootstrap::expose_internals(scope, &loaders);

@@ -75,13 +75,14 @@ pub fn expose_internals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
 pub fn bootstrap_realm(
     scope: &mut v8::PinScope,
     registry: &'static rn_core::BindingRegistry,
+    script_args: &[String],
 ) -> Result<Bootstrapped, String> {
     let global = scope.get_current_context().global(scope);
 
     let primordials = v8::Object::new(scope);
     run_per_context(scope, primordials)?;
 
-    let process = process_object(scope)?;
+    let process = process_object(scope, script_args)?;
     set(scope, global, "process", process.into())?;
     // `realm.js` reads `primordials` as a bare global inside its wrapper, so the
     // object has to be reachable both there and through the parameter below.
@@ -159,8 +160,10 @@ fn run_per_context(
 /// Node's `process` is created by `lib/internal/bootstrap/node.js`, which needs
 /// far more of the runtime than exists yet. This is the subset `realm.js` itself
 /// touches: the load-list array it appends to, and the accessors it defines.
+/// Builds the `process` object, including the script arguments as `argv`.
 fn process_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
+    script_args: &[String],
 ) -> Result<v8::Local<'s, v8::Object>, String> {
     let process = v8::Object::new(scope);
 
@@ -177,10 +180,37 @@ fn process_object<'s>(
 
     let version = v8::String::new(scope, "v28.0.0").ok_or("cannot allocate a version")?;
     set(scope, process, "version", version.into())?;
-    let platform = v8::String::new(scope, "linux").ok_or("cannot allocate the platform name")?;
-    set(scope, process, "platform", platform.into())?;
 
-    let argv = v8::Array::new(scope, 0);
+    // These are the platform facts `os.arch()`, `os.platform()` and
+    // `process.release` read straight back out, so they have to be the real
+    // values rather than placeholders. `internal/bootstrap/node.js` normally
+    // sets them through `patchProcessObject`; that file cannot run yet, and a
+    // hardcoded "linux" would be wrong on macOS and Windows.
+    let platform = node_platform();
+    let platform = v8::String::new(scope, platform).ok_or("cannot allocate the platform name")?;
+    set(scope, process, "platform", platform.into())?;
+    let arch =
+        v8::String::new(scope, node_arch()).ok_or("cannot allocate the architecture name")?;
+    set(scope, process, "arch", arch.into())?;
+
+    let release = v8::Object::new(scope);
+    let release_name = v8::String::new(scope, "node").ok_or("cannot allocate the release name")?;
+    set(scope, release, "name", release_name.into())?;
+    set(scope, process, "release", release.into())?;
+
+    // `process.argv` is `[execPath, ...scriptArgs]`, so the executing script's
+    // arguments have to be visible here or `process.argv` lies about what ran.
+    let exec_path = std::env::args()
+        .next()
+        .unwrap_or_else(|| "rustnode".to_string());
+    let mut argv_values = vec![exec_path];
+    argv_values.extend(script_args.iter().cloned());
+    let argv = v8::Array::new(scope, argv_values.len() as i32);
+    for (index, value) in argv_values.iter().enumerate() {
+        if let Some(text) = v8::String::new(scope, value) {
+            argv.set_index(scope, index as u32, text.into());
+        }
+    }
     set(scope, process, "argv", argv.into())?;
     set(scope, process, "execArgv", v8::Array::new(scope, 0).into())?;
     set(scope, process, "env", v8::Object::new(scope).into())?;
@@ -189,6 +219,33 @@ fn process_object<'s>(
     set(scope, process, "pid", pid.into())?;
 
     Ok(process)
+}
+
+/// The architecture name Node uses, which is GYP's `target_arch`.
+///
+/// Rust says `x86_64` where GYP says `x64`, and `lib/**` compares against Node's
+/// spelling: `os.arch()` returns it verbatim, and `lib/internal/*` branches on
+/// `x64` and `arm64` by name.
+fn node_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64",
+        other => other,
+    }
+}
+
+/// The platform name Node uses, which is not the Rust target's OS name.
+///
+/// Node says `win32` and `sunos` where Rust says `windows` and `solaris`, and
+/// `lib/**` compares against Node's spelling in dozens of places.
+fn node_platform() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "win32",
+        "solaris" => "sunos",
+        other => other,
+    }
 }
 
 /// Builds `getInternalBinding`, which resolves a namespace out of the registry.

@@ -25,9 +25,11 @@ RUSTNODE = os.path.join(ROOT, "target", "debug", "rustnode")
 
 
 def rustnode_binary():
+    # The debug build comes first: it is the one under active development, and
+    # preferring a stale release binary silently tests old behaviour.
     for candidate in (
-        os.path.join(ROOT, "target", "release", "rustnode"),
         os.path.join(ROOT, "target", "debug", "rustnode"),
+        os.path.join(ROOT, "target", "release", "rustnode"),
     ):
         if os.path.isfile(candidate):
             return candidate
