@@ -1,0 +1,16 @@
+[package]
+name = "rn-js2c"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node's js2c step: builtin JavaScript embedded as static data for V8"
+
+# Intentionally dependency-free. This crate is generated data plus pure
+# lookups; the V8 side lives in rn-core and the binding crates. Keeping it
+# dependency-free keeps `cargo build -p rn-js2c` to a single rustc invocation
+# even though it embeds ~6 MB of source text.
+[dependencies]
+
+[build-dependencies]
