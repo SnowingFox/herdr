@@ -20,16 +20,24 @@ use rn_js2c::{builtin_by_id, builtin_ids, builtin_sources, BuiltinCategory, Buil
 /// never explain each other's drift.
 const EXPECTED_BUILTINS: usize = 435;
 
-/// Number of builtins vendored from `deps/**`, which is the one esbuild bundle
-/// `lib/**` requires as `internal/deps/undici/undici`. Node's `node.gyp` lists
-/// its `deps_files` explicitly, so this is a pinned number rather than a glob.
-const EXPECTED_DEPS_BUILTINS: usize = 1;
+/// Number of builtins vendored from `deps/**`. Node's `node.gyp` lists its
+/// `deps_files` explicitly, so this is a pinned number rather than a glob: the
+/// undici bundle plus the two acorn files `internal/repl/*` and the ESM module
+/// job parse with.
+const EXPECTED_DEPS_BUILTINS: usize = 3;
 
 /// Total embedded entries: the `lib/**` tree plus the `deps/**` tree.
 const EXPECTED_TOTAL: usize = EXPECTED_BUILTINS + EXPECTED_DEPS_BUILTINS;
 
-/// The one builtin id that comes from `deps/**`.
+/// The undici bundle, named where a test checks one specific deps builtin.
 const UNDICI_ID: &str = "internal/deps/undici/undici";
+
+/// The builtin ids that come from `deps/**`, in id order.
+const DEPS_IDS: &[&str] = &[
+    "internal/deps/acorn/acorn-walk/dist/walk",
+    "internal/deps/acorn/acorn/dist/acorn",
+    "internal/deps/undici/undici",
+];
 
 fn rustnode_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is rustnode/crates/rn-js2c. Walk up instead of assuming
@@ -136,13 +144,19 @@ fn every_vendored_file_is_embedded_exactly_once() {
         EXPECTED_TOTAL,
         "every builtin id must be unique; a duplicate means two files collapsed onto one id"
     );
+    let mut deps_ids: Vec<String> = embedded
+        .iter()
+        .filter(|id| is_deps_id(id))
+        .map(|id| (*id).to_string())
+        .collect();
+    deps_ids.sort();
     assert_eq!(
-        embedded
+        deps_ids,
+        DEPS_IDS
             .iter()
-            .filter(|id| is_deps_id(id))
+            .map(|id| (*id).to_string())
             .collect::<Vec<_>>(),
-        vec![&UNDICI_ID.to_string()],
-        "exactly one builtin must come from deps/, and it must be the undici bundle"
+        "the deps/ builtins must be exactly the files vendored from node.gyp's deps_files"
     );
 
     // Rebuild the id each embedded entry must have from the file on disk, and
@@ -551,7 +565,7 @@ fn vendored_tree_matches_the_embedded_copy() {
     );
 }
 
-/// Digest of the whole table: 436 builtins (435 under `lib/`, 1 under `deps/`),
+/// Digest of the whole table: 438 builtins (435 under `lib/`, 3 under `deps/`),
 /// 73 core. Covers id, kind, category, source length and source text for every
 /// entry.
-const TABLE_DIGEST: &str = "039aab74a8b77710dab83e3ebaa3724aaa1209eeb6176192b03325aec741d577";
+const TABLE_DIGEST: &str = "88a0f79212193035771601a4087e99d384436839351e1cf9afb2ca30e460a0a1";

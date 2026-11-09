@@ -1,3 +1,5 @@
+b95392d79457d0357555c5ed3e56302d074b92dff119bcf3b44179500b10e9df  deps/acorn/acorn/dist/acorn.js
+1aa9615d8ea06e2126a21a4c21eb7b8b97a69e5eda256f06d2c48834a57cbf0e  deps/acorn/acorn-walk/dist/walk.js
 cf59d63bd9815167f97176c4901fe6641c4754ed9d10fb7357facd8bf1e4dfe4  deps/undici/undici.js
 e87a46a29cc96a9bc6025475220ca0c54e083a7d9aa53708919d0971506e87e2  lib/assert.js
 07c94fd4322f33fb366bec83977c7aa4816802a0deb1a4ab54c1093d0c05a524  lib/assert/strict.js
