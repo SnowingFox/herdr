@@ -29,6 +29,7 @@ rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-fs-dir = { path = "../rn-bind-fs-dir" }
 rn-bind-fs-event-wrap = { path = "../rn-bind-fs-event-wrap" }
 rn-bind-glob = { path = "../rn-bind-glob" }
+rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
 rn-bind-http-parser = { path = "../rn-bind-http-parser" }
 rn-bind-icu = { path = "../rn-bind-icu" }
 rn-bind-js-stream = { path = "../rn-bind-js-stream" }

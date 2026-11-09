@@ -56,6 +56,10 @@ fn main() {
     // crate documents `FunctionCallbackArguments::get_isolate` as unsound while
     // a callback scope is open, and one always is during a binding call.
     rn_module_wrap::install_isolate_callbacks(&mut isolate);
+    // `v8.writeHeapSnapshot` needs `take_heap_snapshot`, an `Isolate` method,
+    // and a binding callback cannot obtain a `&mut Isolate` soundly. Recording
+    // the isolate here is the same arrangement the ESM handlers use.
+    rn_bind_heap_utils::set_snapshot_isolate(&mut isolate);
     // Node runs V8 with an explicit microtask policy: the embedder decides when
     // the queue drains, through `runMicrotasks()` in
     // `lib/internal/process/task_queues.js` and the loop's own checkpoints.

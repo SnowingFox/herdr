@@ -1420,10 +1420,7 @@ mod tests {
             phase_constant(v8::ModuleImportPhase::kSource),
             K_SOURCE_PHASE
         );
-        assert_eq!(
-            phase_constant(v8::ModuleImportPhase::kDefer),
-            K_DEFER_PHASE
-        );
+        assert_eq!(phase_constant(v8::ModuleImportPhase::kDefer), K_DEFER_PHASE);
         assert_eq!(
             phase_constant(v8::ModuleImportPhase::kEvaluation),
             K_EVALUATION_PHASE

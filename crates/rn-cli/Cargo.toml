@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 rn-util = { path = "../rn-util" }
 rn-module-wrap = { path = "../rn-module-wrap" }
+rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
 rn-errors = { path = "../rn-errors" }
 rn-builtins = { path = "../rn-builtins" }
 rn-js2c = { path = "../rn-js2c" }
