@@ -250,7 +250,7 @@ predicate!(is_weak_set, |value| {
 
 /// Registers the `types` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(rn_core::Namespace::from_module(&Types));
+    registry.register_module(Types);
 }
 
 #[cfg(test)]

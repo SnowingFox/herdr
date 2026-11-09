@@ -1,4 +1,9 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+
+use rn_v8_sys::v8;
+
+use crate::{AsyncIds, BindingModule, InstallCtx};
 
 /// One `internalBinding(name)` namespace exposed to the JavaScript layer.
 #[derive(Debug, Clone)]
@@ -86,10 +91,42 @@ impl From<String> for Namespace {
     }
 }
 
+/// A binding module erased behind one object-safe interface.
+///
+/// `install` takes its lifetimes late-bound, so a `Box<dyn Installer>` can hold
+/// any crate's module without the registry knowing its concrete type. That is
+/// what lets `register_module` be the only thing a new binding crate writes.
+pub trait Installer {
+    /// Builds the object `internalBinding(namespace)` returns.
+    fn install<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        ctx: &mut InstallCtx<'_>,
+    ) -> Result<v8::Local<'s, v8::Object>, String>;
+}
+
+impl<M: BindingModule> Installer for M {
+    fn install<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        ctx: &mut InstallCtx<'_>,
+    ) -> Result<v8::Local<'s, v8::Object>, String> {
+        BindingModule::install(self, scope, ctx)
+    }
+}
+
 /// Registry handed to the isolate bootstrap.
 #[derive(Default)]
 pub struct BindingRegistry {
     namespaces: Vec<Namespace>,
+    /// Installers keyed by namespace name, so `internalBinding(name)` resolves
+    /// through this one table instead of a hand-written match in the CLI. A
+    /// namespace can be registered without one: that is how a contract-only
+    /// placeholder stays visible to `rn-compat` without pretending to work.
+    installers: BTreeMap<String, Box<dyn Installer>>,
+    /// Namespaces installed by this runtime, so a second `internalBinding` call
+    /// for the same name returns the same object.
+    installed: RefCell<BTreeMap<String, v8::Global<v8::Object>>>,
 }
 
 impl BindingRegistry {
@@ -99,6 +136,16 @@ impl BindingRegistry {
 
     pub fn register(&mut self, namespace: Namespace) {
         self.namespaces.push(namespace);
+    }
+
+    /// Registers a namespace together with the module that builds it.
+    ///
+    /// This is the whole wiring a binding crate needs: declare the trait impl,
+    /// call this from its `register`, and `internalBinding` finds it.
+    pub fn register_module<M: BindingModule + 'static>(&mut self, module: M) {
+        self.register(Namespace::from_module(&module));
+        self.installers
+            .insert(module.namespace().to_string(), Box::new(module));
     }
 
     pub fn namespaces(&self) -> &[Namespace] {
@@ -115,5 +162,39 @@ impl BindingRegistry {
         self.namespaces
             .iter()
             .find(|namespace| namespace.name == name)
+    }
+
+    /// Whether `internalBinding(name)` can build an object.
+    pub fn can_install(&self, name: &str) -> bool {
+        self.installers.contains_key(name)
+    }
+
+    /// Builds one namespace, reusing the object from an earlier call.
+    ///
+    /// Node caches bindings per isolate, and so must rustnode: `lib/**` relies
+    /// on `internalBinding('util')` returning the identical object twice, and
+    /// several namespaces hold state (zlib streams, the fs request table) that
+    /// would silently split if the second call rebuilt it.
+    pub fn install<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        name: &str,
+    ) -> Result<v8::Local<'s, v8::Object>, String> {
+        if let Some(existing) = self.installed.borrow().get(name) {
+            return Ok(v8::Local::new(scope, existing));
+        }
+
+        let installer = self.installers.get(name).ok_or_else(|| {
+            format!("internalBinding('{name}'): the namespace has no Rust implementation yet")
+        })?;
+        let mut async_ids = AsyncIds::new();
+        let mut ctx = InstallCtx {
+            async_ids: &mut async_ids,
+        };
+        let object = installer.install(scope, &mut ctx)?;
+        self.installed
+            .borrow_mut()
+            .insert(name.to_string(), v8::Global::new(scope, object));
+        Ok(object)
     }
 }

@@ -346,7 +346,7 @@ fn function<'s>(
 
 /// Registers the `errors` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(rn_core::Namespace::from_module(&Errors));
+    registry.register_module(Errors);
 }
 
 #[cfg(test)]

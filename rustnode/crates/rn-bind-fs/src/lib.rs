@@ -36,9 +36,7 @@ mod testsupport;
 
 pub use install::Fs;
 
-use rn_core::Namespace;
-
 /// Registers the `fs` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(Namespace::from_module(&Fs));
+    registry.register_module(Fs);
 }

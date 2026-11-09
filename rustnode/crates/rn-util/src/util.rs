@@ -526,7 +526,7 @@ impl Default for Util {
 
 /// Registers the `util` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(rn_core::Namespace::from_module(&Util));
+    registry.register_module(Util);
 }
 
 #[cfg(test)]
