@@ -13,6 +13,14 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.96.1}"
+# `vendor/merve` is C++ and cc-rs picks `c++`, which on this image resolves to
+# clang++ without the GCC C++ include paths, so it fails on `<cstddef>`. g++
+# is installed and works. Pinning it here keeps the gate reproducible instead
+# of depending on what `c++` happens to be.
+export CXX="${CXX:-g++}"
+# Linking a g++-compiled object needs libstdc++, whose `.so` symlink lives only
+# in the GCC version directory here, not on the default linker search path.
+export RUSTFLAGS="${RUSTFLAGS:-} -L /usr/lib/gcc/x86_64-linux-gnu/13"
 quick=0
 [ "${1:-}" = "--quick" ] && quick=1
 

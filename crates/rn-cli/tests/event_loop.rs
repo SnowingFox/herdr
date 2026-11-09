@@ -142,11 +142,25 @@ fn an_unrefed_deadline_still_fires_while_refed_work_keeps_the_loop_turning() {
     // The deadline is already due by the time the immediate finishes, so the
     // timer phase at the top of the next turn runs it. This is the other half of
     // `unref()`: it means "do not wait for me", not "never run me".
+    //
+    // The order of these two is deliberately not asserted. A 0ms timer and a
+    // `setImmediate` race by definition — the timer fires in the next timer
+    // phase, which is after the current poll phase, and a loaded scheduler can
+    // put either first. Node's own documentation calls this order
+    // non-deterministic. What this test is about is that the unref'd timer runs
+    // *at all* while something else keeps the loop turning, so that is what it
+    // checks, on both runtimes.
     let printed = same_as_node(
         "setTimeout(() => console.log('timer'), 0).unref();\n\
          setImmediate(() => console.log('immediate'));",
     );
-    assert_eq!(printed, "immediate\ntimer\n");
+    let mut lines: Vec<&str> = printed.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(
+        lines,
+        ["immediate", "timer"],
+        "both callbacks must run, got {printed:?}"
+    );
 }
 
 #[test]

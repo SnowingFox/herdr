@@ -143,10 +143,10 @@ pub fn compile_function<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let Some(code) = string_arg(scope, &args, 0) else {
+    let Some(code) = string_arg(&args, 0) else {
         return throw_type_error(scope, "compileFunction requires source text");
     };
-    let Some(filename) = string_arg(scope, &args, 1) else {
+    let Some(filename) = string_arg(&args, 1) else {
         return throw_type_error(scope, "compileFunction requires a filename");
     };
     let line_offset = args.get(2).int32_value(scope).unwrap_or(0);
@@ -329,10 +329,39 @@ pub fn compile_function_for_cjs_loader<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s, v8::Value>,
 ) {
-    let Some(code) = string_arg(scope, &args, 0) else {
+    // A binding called with the wrong argument shape is otherwise invisible:
+    // the failure surfaces as a syntax error or a wrong value far from here.
+    // This prints the argument kinds on demand so the next person does not have
+    // to bisect a loader to find out what it actually passed.
+    if std::env::var_os("RUSTNODE_DEBUG_BINDING").is_some() {
+        let kinds: Vec<String> = (0..args.length())
+            .map(|index| {
+                let value = args.get(index);
+                if value.is_string() {
+                    let text = value.to_rust_string_lossy(scope);
+                    let head: String = text.chars().take(60).collect();
+                    format!("string({:?})", head)
+                } else if value.is_undefined() {
+                    "undefined".to_string()
+                } else if value.is_boolean() {
+                    format!("boolean({})", value.boolean_value(scope))
+                } else if value.is_object() {
+                    format!("object({})", value.to_rust_string_lossy(scope))
+                } else {
+                    "other".to_string()
+                }
+            })
+            .collect();
+        eprintln!(
+            "compileFunctionForCJSLoader argc={} kinds=[{}]",
+            args.length(),
+            kinds.join(", ")
+        );
+    }
+    let Some(code) = string_arg(&args, 0) else {
         return throw_type_error(scope, "compileFunctionForCJSLoader requires source text");
     };
-    let Some(filename) = string_arg(scope, &args, 1) else {
+    let Some(filename) = string_arg(&args, 1) else {
         return throw_type_error(scope, "compileFunctionForCJSLoader requires a filename");
     };
     let should_detect_module = args.get(3).is_true();
@@ -580,12 +609,20 @@ fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     scope.throw_exception(exception);
 }
 
+/// Reads a string argument, rejecting anything that is not already a string.
+///
+/// This used to call `to_string`, which converts whatever it is given. That was
+/// wrong in a way that cost a long bisect: `lib/internal/modules/cjs/loader.js`
+/// passed an object as the source, `to_string` turned it into the literal text
+/// `[object Object]`, and the result was a `SyntaxError: Unexpected identifier
+/// 'Object'` thrown from inside the loader with nothing pointing at the binding.
+/// Node's C++ uses `CHECK(args[0]->IsString())` for the same reason — a binding
+/// that silently coerces hides the caller's bug behind a confusing error.
 fn string_arg<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
     index: i32,
 ) -> Option<v8::Local<'s, v8::String>> {
-    args.get(index).to_string(scope)
+    v8::Local::<v8::String>::try_from(args.get(index)).ok()
 }
 
 /// Collects an array argument into objects, rejecting non-object elements.
