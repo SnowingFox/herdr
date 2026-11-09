@@ -14,14 +14,14 @@ use crate::table::{ALIASES, OPTIONS};
 /// `--abort-on-uncaught-exception` (a V8 flag Node's internals read as a
 /// boolean) and `--stack-trace-limit` (a V8 flag whose value Node stores as an
 /// integer). Both are copied here.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CliValue {
     Undefined,
     Bool(bool),
     Number(f64),
-    Text(&'static str),
-    TextList(&'static [&'static str]),
-    HostPort(&'static str, u16),
+    Text(String),
+    TextList(Vec<String>),
+    HostPort(String, u16),
 }
 
 impl CliValue {
@@ -51,15 +51,17 @@ impl CliValue {
                 _ => Self::Undefined,
             },
             kind::STRING => match option.default {
-                DefaultValue::Str(text) => Self::Text(text),
+                DefaultValue::Str(text) => Self::Text(text.to_string()),
                 _ => Self::Undefined,
             },
             kind::STRING_LIST => match option.default {
-                DefaultValue::List(items) => Self::TextList(items),
+                DefaultValue::List(items) => {
+                    Self::TextList(items.iter().map(|item| (*item).to_string()).collect())
+                }
                 _ => Self::Undefined,
             },
             kind::HOST_PORT => match option.default {
-                DefaultValue::HostPort(host, port) => Self::HostPort(host, port),
+                DefaultValue::HostPort(host, port) => Self::HostPort(host.to_string(), port),
                 _ => Self::Undefined,
             },
             _ => Self::Undefined,
@@ -74,13 +76,19 @@ impl CliValue {
 /// *first* (`AddOption`'s loop pushes the pair before falling through to the
 /// common push for the option itself), which decides the property order of
 /// the returned object, so it is reproduced exactly.
+///
+/// Values come from [`crate::parsed`] when the CLI installed a parsed argv, and
+/// from the table's declared defaults otherwise. That fallback is what keeps a
+/// library consumer — a test binary, `rn-compat` — seeing exactly what it saw
+/// before a parser existed.
 #[must_use]
 pub fn cli_values() -> Vec<(String, CliValue)> {
     let mut entries = Vec::with_capacity(OPTIONS.len() * 2);
     for option in OPTIONS {
-        let value = CliValue::of(option);
+        let value = crate::parsed::value_of(option.name)
+            .map_or_else(|| CliValue::of(option), |parsed| parsed.as_cli_value());
         if option.kind == kind::BOOLEAN {
-            if let (Some(negated), CliValue::Bool(flag)) = (option.negated_name(), value) {
+            if let (Some(negated), CliValue::Bool(flag)) = (option.negated_name(), value.clone()) {
                 entries.push((negated, CliValue::Bool(!flag)));
             }
         }
@@ -254,31 +262,41 @@ pub fn namespace_options_input_types() -> Vec<(OptionNamespace, Vec<InputType>)>
 /// * `kHostPort` reports `--flag=host:port`, omitting the port when it is 0
 ///   and skipping the entry when both host and port are empty.
 ///
-/// rustnode starts every process with no options, so only options whose
-/// declared default is itself reportable appear: `--v8-pool-size=4`,
-/// `--max-http-header-size=16384` and the rest of the non-zero numerics, plus
-/// the `kHostPort` and non-empty `kString` defaults. That is exactly what Node
-/// reports for `node -e ''` with an empty `NODE_OPTIONS`, which is what a
-/// caller comparing the two will see.
+/// Values come from [`crate::parsed`] when the CLI installed a parsed argv, and
+/// from the table's defaults otherwise. The distinction is not cosmetic: the
+/// benchmark runner rebuilds a child's command line from this list, so a
+/// process that dropped `--experimental-bench` here would spawn children that
+/// cannot load `node:bench`.
 #[must_use]
 pub fn options_as_flags() -> Vec<String> {
+    // The bench namespace only participates when the flag that gates it is on.
+    // Reading the parsed value rather than the default is what makes the
+    // runner's own child processes work.
+    let bench_enabled = crate::parsed::value_of("--experimental-bench")
+        .map(|value| matches!(value, crate::parsed::ParsedValue::Bool(true)))
+        .unwrap_or(false);
+
     let mut flags = Vec::new();
     for option in OPTIONS {
         if option.name.is_empty() || option.is_internal() {
             continue;
         }
-        if option.namespace == OptionNamespace::Bench {
-            // `experimental_bench` is false in a process started with no
-            // arguments, so every benchmark-runner option is skipped.
+        if option.namespace == OptionNamespace::Bench && !bench_enabled {
             continue;
         }
-        match option.kind {
-            kind::NO_OP | kind::V8_OPTION => continue,
-            kind::BOOLEAN => {
-                let DefaultValue::Bool(value) = option.default else {
-                    continue;
-                };
-                if value == option.default_is_true {
+        if option.kind == kind::NO_OP || option.kind == kind::V8_OPTION {
+            continue;
+        }
+
+        // The value to report: the parsed one when there is a store, otherwise
+        // the table default. `CliValue` already unifies both shapes.
+        let value = crate::parsed::value_of(option.name)
+            .map_or_else(|| CliValue::of(option), |parsed| parsed.as_cli_value());
+
+        match value {
+            CliValue::Undefined => continue,
+            CliValue::Bool(current) => {
+                if current == option.default_is_true {
                     continue;
                 }
                 if option.default_is_true {
@@ -287,38 +305,18 @@ pub fn options_as_flags() -> Vec<String> {
                     flags.push(option.name.to_string());
                 }
             }
-            kind::INTEGER => {
-                let DefaultValue::Int(value) = option.default else {
-                    continue;
-                };
-                flags.push(format!("{}={value}", option.name));
-            }
-            kind::U_INTEGER => {
-                let DefaultValue::Uint(value) = option.default else {
-                    continue;
-                };
-                flags.push(format!("{}={value}", option.name));
-            }
-            kind::STRING => {
-                let DefaultValue::Str(value) = option.default else {
-                    continue;
-                };
-                if !value.is_empty() {
-                    flags.push(format!("{}={value}", option.name));
+            CliValue::Number(number) => flags.push(format!("{}={}", option.name, format_number(number))),
+            CliValue::Text(text) => {
+                if !text.is_empty() {
+                    flags.push(format!("{}={text}", option.name));
                 }
             }
-            kind::STRING_LIST => {
-                let DefaultValue::List(values) = option.default else {
-                    continue;
-                };
-                for value in values {
-                    flags.push(format!("{}={value}", option.name));
+            CliValue::TextList(items) => {
+                for item in items {
+                    flags.push(format!("{}={item}", option.name));
                 }
             }
-            kind::HOST_PORT => {
-                let DefaultValue::HostPort(host, port) = option.default else {
-                    continue;
-                };
+            CliValue::HostPort(host, port) => {
                 if host.is_empty() && port == 0 {
                     continue;
                 }
@@ -330,10 +328,22 @@ pub fn options_as_flags() -> Vec<String> {
                     flags.push(format!("{}={host}:{port}", option.name));
                 }
             }
-            _ => continue,
         }
     }
     flags
+}
+
+/// A number as `GetOptionsAsFlags` spells it.
+///
+/// The C++ switch streams an `int64_t` or `uint64_t` into a string, so an
+/// integral value never gains a fractional part. `CliValue` stores both as
+/// `f64`, so the formatting has to put the integer form back.
+fn format_number(number: f64) -> String {
+    if number.fract() == 0.0 {
+        format!("{}", number as i64)
+    } else {
+        format!("{number}")
+    }
 }
 
 /// A `NODE_OPTIONS` tokenizer error, matching the text
@@ -565,19 +575,19 @@ mod tests {
 
         // A string field with an empty default still reports the empty string,
         // not undefined: `getOptionValue('--title')` relies on that.
-        assert_eq!(entries["--title"], CliValue::Text(""));
-        assert_eq!(entries["--input-type"], CliValue::Text(""));
-        assert_eq!(entries["--conditions"], CliValue::TextList(&[]));
+        assert_eq!(entries["--title"], CliValue::Text(String::new()));
+        assert_eq!(entries["--input-type"], CliValue::Text(String::new()));
+        assert_eq!(entries["--conditions"], CliValue::TextList(Vec::new()));
         assert_eq!(entries["--stack-trace-limit"], CliValue::Number(10.0));
         assert_eq!(entries["--v8-pool-size"], CliValue::Number(4.0));
         assert_eq!(entries["--max-http-header-size"], CliValue::Number(16384.0));
         assert_eq!(
             entries["--trace-event-file-pattern"],
-            CliValue::Text("node_trace.${rotation}.log")
+            CliValue::Text("node_trace.${rotation}.log".to_string())
         );
         assert_eq!(
             entries["--inspect-port"],
-            CliValue::HostPort("127.0.0.1", 9229)
+            CliValue::HostPort("127.0.0.1".to_string(), 9229)
         );
     }
 

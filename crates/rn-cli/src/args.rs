@@ -28,6 +28,14 @@ pub struct Options {
     pub exec_argv: Vec<String>,
     /// Flags accepted but whose behaviour is not implemented yet.
     pub unimplemented: Vec<String>,
+    /// The option layer's view of the same argv.
+    ///
+    /// `lib/**` reads option values through `internalBinding('options')`, and
+    /// that binding reports the table's declared defaults unless the process's
+    /// argv was parsed. `--experimental-bench` is the clearest example: without
+    /// this, `lib/internal/bootstrap/realm.js` sees `false` and leaves
+    /// `node:bench` unrequireable no matter what the command line said.
+    pub parsed: rn_bind_options::Store,
 }
 
 impl Options {
@@ -118,9 +126,14 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
 ///
 /// Accepting them silently would make a test look like it exercised the feature
 /// when it did not, so they are recorded in [`Options::unimplemented`].
+///
+/// `--experimental-bench` is deliberately absent: the flag now reaches Node's
+/// option layer through [`rn_bind_options::Store`], which is what
+/// `lib/internal/bootstrap/realm.js` reads to add `node:bench` to the
+/// user-requireable set. Warning about it would claim a working feature is
+/// missing.
 const UNIMPLEMENTED: &[&str] = &[
     "--allow-natives-syntax",
-    "--experimental-bench",
     "--experimental-network-inspection",
     "--experimental-shadow-realm",
     "--experimental-stream-iter",
@@ -129,6 +142,13 @@ const UNIMPLEMENTED: &[&str] = &[
     "--js-source-phase-imports",
     "--permission",
 ];
+
+/// Experimental flags whose behaviour *is* implemented.
+///
+/// They still travel through the generic `--experimental-` branch, but must not
+/// be reported as unimplemented, because `lib/**` now acts on them: each is read
+/// back through `internalBinding('options')` by the vendored JavaScript.
+const IMPLEMENTED_EXPERIMENTAL: &[&str] = &["--experimental-bench"];
 
 /// Parses the command line, or returns the message to print on a bad flag.
 pub fn parse(args: &[String]) -> Result<Options, String> {
@@ -207,7 +227,13 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             // The experimental surface is broad and most of it gates modules
             // that have not landed. Record and accept, so a script that merely
             // mentions one still boots.
-            unimplemented.insert(argument.clone());
+            //
+            // `--experimental-bench` is the exception: it is implemented, so
+            // reporting it missing would be a lie that some tests read. The
+            // other flags stay in `unimplemented` and say so.
+            if !IMPLEMENTED_EXPERIMENTAL.contains(&argument.as_str()) {
+                unimplemented.insert(argument.clone());
+            }
             options.exec_argv.push(argument.clone());
             index += 1;
             continue;
@@ -238,6 +264,13 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
 
 fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
     options.unimplemented = unimplemented.into_iter().collect();
+    // The options binding's own parser, fed the flags this CLI accepted. It is
+    // a second pass over the same argv by design: this parser decides *what
+    // rustnode does*, and `rn-bind-options` decides *what Node's option layer
+    // reports*, so one implementation cannot quietly become the authority for
+    // both. The flags only — never the script path or its arguments, which
+    // Node's parser stops at too.
+    options.parsed = rn_bind_options::Store::parse(&options.exec_argv);
     options
 }
 
