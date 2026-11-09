@@ -18,4 +18,5 @@ tracing.workspace = true
 rn-bind-config = { path = "../rn-bind-config" }
 rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-zlib = { path = "../rn-bind-zlib" }
+rn-builtins = { path = "../rn-builtins" }
 rn-permission = { path = "../rn-permission" }
