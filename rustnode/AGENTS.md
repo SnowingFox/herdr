@@ -97,3 +97,16 @@ parseable `("member", "reason")` pairs.
 one of the Python tools into a test left one behind and the whole workspace
 failed to load with a missing manifest.
 
+## The C++ toolchain
+
+`vendor/merve` (the CommonJS export lexer) and `vendor/llhttp` (the HTTP parser)
+are vendored C/C++ and are compiled by `cc-rs` at build time. Two consequences:
+
+- **`CXX=g++` is required on this image.** cc-rs defaults to `c++`, which here
+  resolves to `clang++` without the GCC C++ include paths, so it fails on
+  `<cstddef>`. `tools/check.sh` exports it; a bare `cargo build` outside the
+  gate will fail the same way until it is set.
+- The first build of these crates is slow on purpose. The artifacts cache in
+  `target/` from then on.
+
+
