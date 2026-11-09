@@ -714,8 +714,9 @@ fn patch_process_object(
 ) {
     // Node uses this to attach `title`, `argv`, `execArgv`, `pid`, `ppid`,
     // `execPath`, `debugPort` and `versions` to the `process` object it created
-    // in C++. rustnode builds `process` in JavaScript, so this has only the
-    // properties that genuinely need the native side.
+    // in C++. rustnode builds `process` in JavaScript, so this fills in the
+    // platform metadata the JavaScript layer cannot derive: `arch`, `platform`
+    // and `release`, which `os.arch()` and `os.release()` read straight back.
     let Ok(process) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
         return;
     };
@@ -735,25 +736,65 @@ fn patch_process_object(
             v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE,
         );
     }
-    let values: [(&str, v8::Local<v8::Value>); 2] = [
+
+    // `process.release.name` is what identifies the runtime, and `os.release()`
+    // reads the kernel version through the `getOSInformation` binding instead.
+    let release = v8::Object::new(scope);
+    let release_name = string_value(scope, "node");
+    let _ = set(scope, release, "name", release_name);
+
+    let values: [(&str, v8::Local<v8::Value>); 5] = [
         ("ppid", v8::Integer::new(scope, ppid).into()),
         (
             "execPath",
-            v8::String::new(
+            string_value(
                 scope,
                 &std::env::current_exe()
                     .map(|path| path.to_string_lossy().into_owned())
                     .unwrap_or_default(),
-            )
-            .map(|text| text.into())
-            .unwrap_or_else(|| v8::undefined(scope).into()),
+            ),
         ),
+        ("arch", string_value(scope, node_arch())),
+        ("platform", string_value(scope, node_platform())),
+        ("release", release.into()),
     ];
     for (name, value) in values {
         if let Some(key) = v8::String::new(scope, name) {
             process.set(scope, key.into(), value);
         }
     }
+}
+
+/// The architecture name Node uses, which is GYP's `target_arch`.
+///
+/// Rust says `x86_64` where GYP says `x64`, and `lib/**` compares against Node's
+/// spelling.
+fn node_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "x86" => "ia32",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64",
+        other => other,
+    }
+}
+
+/// The platform name Node uses, which is not the Rust target's OS name.
+///
+/// Node says `win32` and `sunos` where Rust says `windows` and `solaris`, and
+/// `lib/**` compares against Node's spelling in dozens of places.
+fn node_platform() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => "win32",
+        "solaris" => "sunos",
+        other => other,
+    }
+}
+
+fn string_value<'s>(scope: &mut v8::PinScope<'s, '_>, value: &str) -> v8::Local<'s, v8::Value> {
+    v8::String::new(scope, value)
+        .map(|text| text.into())
+        .unwrap_or_else(|| v8::undefined(scope).into())
 }
 
 fn reset_stdio_for_testing(
