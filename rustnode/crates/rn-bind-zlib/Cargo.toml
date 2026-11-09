@@ -1,0 +1,22 @@
+[package]
+name = "rn-bind-zlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('zlib') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# Pure-Rust zlib C ABI: gives deflateParams/deflateSetDictionary/inflateSetDictionary
+# with the exact zlib semantics lib/zlib.js relies on, without a C toolchain.
+libz-rs-sys = { version = "=0.6.8", default-features = false, features = ["std"] }
+# Pure-Rust Brotli encoder/decoder with the streaming BrotliEncoderCompressStream
+# equivalent.
+brotli = { version = "=8.0.4", default-features = false, features = ["std"] }
+brotli-decompressor = { version = "=5.0.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+serde_json.workspace = true
