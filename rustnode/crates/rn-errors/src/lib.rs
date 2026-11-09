@@ -268,7 +268,19 @@ fn process_fatal_exception_handler<'s>(
 /// Prints the exception and sets the process exit code.
 fn report(scope: &mut v8::PinScope, error: v8::Local<v8::Value>, from_promise: bool) {
     let text = format_exception(scope, error, from_promise);
-    rn_core::hook_slot::write_stderr(&text);
+    write_uncaught(scope, &text);
+}
+
+/// Writes an already-formatted uncaught exception to standard error and asks
+/// the process to exit non-zero.
+///
+/// The event loop calls this when a timer or immediate callback throws: the
+/// exception was raised outside any `try` the user wrote, so Node prints it and
+/// exits rather than handing it to a caller that no longer exists. It is
+/// separate from [`format_exception`] so the loop can format inside its own
+/// `TryCatch` scope and write outside it, where V8 handles are no longer valid.
+pub fn write_uncaught(scope: &mut v8::PinScope, text: &str) {
+    rn_core::hook_slot::write_stderr(text);
     rn_core::hook_slot::set_flag(scope, rn_core::hook_slot::EXIT_REQUESTED, true);
 }
 

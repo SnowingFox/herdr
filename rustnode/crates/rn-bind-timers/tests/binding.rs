@@ -63,7 +63,12 @@ fn javascript_writes_to_timeout_info_are_visible_to_rust() {
 }
 
 #[test]
-fn toggling_a_timer_ref_updates_the_shared_counters() {
+fn toggling_a_timer_ref_leaves_the_shared_counters_to_javascript() {
+    // `lib/internal/timers.js` owns `timeoutInfo[0]`: `incRefCount()` increments
+    // it and only then calls `toggleTimerRef(true)`. A binding that also wrote
+    // the counter would count every timer twice. Measured against real `node`,
+    // `toggleTimerRef(true)` on its own leaves `timeoutInfo` at `[0]`, so this
+    // pins that the toggle records ref state and nothing else.
     let output = run(&format!(
         "{PRELUDE}
         const before = timers.timeoutInfo[0];
@@ -73,11 +78,14 @@ fn toggling_a_timer_ref_updates_the_shared_counters() {
         const afterRemove = timers.timeoutInfo[0];
         console.log(before, afterAdd, afterRemove);"
     ));
-    assert_eq!(output, "0 1 0");
+    assert_eq!(output, "0 0 0");
 }
 
 #[test]
-fn toggling_an_immediate_ref_updates_the_ref_and_outstanding_flags() {
+fn toggling_an_immediate_ref_leaves_the_shared_counters_to_javascript() {
+    // Same contract as `toggleTimerRef`: `Immediate#ref()` writes
+    // `immediateInfo[1]` and `[2]` itself, so the binding only records ref state.
+    // Real `node` leaves both arrays untouched when the toggle is called alone.
     let output = run(&format!(
         "{PRELUDE}
         timers.toggleImmediateRef(true);
@@ -86,9 +94,7 @@ fn toggling_an_immediate_ref_updates_the_ref_and_outstanding_flags() {
         const released = [timers.immediateInfo[1], timers.immediateInfo[2]];
         console.log(held.join(','), released.join(','));"
     ));
-    // The ref count and the derived "outstanding" flag must move together:
-    // the loop reads the flag, not the count.
-    assert_eq!(output, "1,1 0,0");
+    assert_eq!(output, "0,0 0,0");
 }
 
 #[test]
