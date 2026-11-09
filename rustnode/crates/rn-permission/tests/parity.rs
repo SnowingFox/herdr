@@ -185,3 +185,42 @@ fn non_filesystem_denials_match_node() {
     assert_eq!(denied.permission(), "WASI");
     assert_eq!(denied.resource(), "");
 }
+
+/// Node does not defend against symlink escapes, and neither does this model.
+///
+/// `doc/api/permissions.md`, "Limitations and Known Issues": "Symbolic links
+/// will be followed even to locations outside of the set of paths that access
+/// has been granted to." The check compares the path the caller passed, so a
+/// path that is inside a granted directory but resolves, through a symlink, to
+/// something outside it is granted.
+///
+/// This pins the behaviour deliberately: it is what Node does, and "fixing" it
+/// here would both diverge from Node and cost a `realpath` per check. It is
+/// recorded as a test so the gap is explicit rather than assumed absent.
+#[test]
+fn a_symlink_outside_the_grant_is_not_resolved() {
+    use std::os::unix::fs::symlink;
+
+    let root = std::env::temp_dir().join(format!("rn-permission-symlink-{}", std::process::id()));
+    let granted = root.join("granted");
+    let secret = root.join("secret");
+    std::fs::create_dir_all(&granted).expect("create granted dir");
+    std::fs::create_dir_all(&secret).expect("create secret dir");
+    std::fs::write(secret.join("key.pem"), b"secret").expect("write secret");
+
+    let link = granted.join("escape");
+    let _ = std::fs::remove_file(&link);
+    symlink(&secret, &link).expect("create symlink");
+
+    let granted = granted.to_str().expect("utf-8").to_string();
+    let model = read_model(&[&granted]);
+
+    // The granted path itself is allowed...
+    assert!(has(&model, &format!("{granted}/readme.txt")));
+    // ...and so is the path through the symlink, because it is still spelled
+    // with the granted prefix. Node answers the same.
+    assert!(has(&model, &format!("{granted}/escape/key.pem")));
+    // The secret's real path is denied, which is the only thing the check can
+    // see.
+    assert!(!has(&model, secret.to_str().expect("utf-8")));
+}
