@@ -1,0 +1,13 @@
+[package]
+name = "rn-bind-block-list"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('block_list') for rustnode"
+
+[dependencies]
+libuv-sys2.workspace = true
+rn-core.workspace = true
+rn-v8-sys.workspace = true

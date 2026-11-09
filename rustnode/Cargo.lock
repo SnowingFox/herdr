@@ -795,6 +795,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-block-list"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-buffer"
 version = "0.1.0"
 dependencies = [
@@ -1259,6 +1268,7 @@ dependencies = [
  "rn-bind-async-context",
  "rn-bind-async-wrap",
  "rn-bind-blob",
+ "rn-bind-block-list",
  "rn-bind-buffer",
  "rn-bind-cares",
  "rn-bind-cjs-lexer",
@@ -1355,6 +1365,7 @@ dependencies = [
  "rn-module-wrap",
  "rn-napi",
  "rn-util",
+ "rn-uv",
  "rn-v8-sys",
  "tracing",
  "tracing-subscriber",

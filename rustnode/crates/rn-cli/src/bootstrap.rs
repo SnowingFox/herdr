@@ -1140,6 +1140,15 @@ fn process_object<'s>(
     let openssl_version = v8::String::new(scope, &rn_bind_crypto::engine::openssl_version())
         .ok_or("cannot allocate the OpenSSL version")?;
     set(scope, versions, "openssl", openssl_version.into())?;
+    // The libuv the binary actually links, from `uv_version_string`. Node's test
+    // suite branches on this: `test-blocklist.js` expects an overlong zone
+    // suffix on a mixed-notation IPv6 address to parse only from libuv 1.53, so
+    // a missing value would fail with a `split` of `undefined` rather than a
+    // statement about the runtime.
+    let uv_version = rn_uv::uv_version_string()
+        .and_then(|version| v8::String::new(scope, &version))
+        .ok_or("cannot allocate the libuv version")?;
+    set(scope, versions, "uv", uv_version.into())?;
     set(scope, process, "versions", versions.into())?;
 
     let version = v8::String::new(scope, "v28.0.0").ok_or("cannot allocate a version")?;

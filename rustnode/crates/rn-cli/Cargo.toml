@@ -29,6 +29,9 @@ rn-bindings = { path = "../rn-bindings" }
 rn-bind-crypto = { path = "../rn-bind-crypto" }
 rn-module = { path = "../rn-module" }
 rn-io = { path = "../rn-io" }
+# `process.versions.uv` reports the libuv this binary linked, which `rn-uv`
+# reads from `uv_version_string` rather than from a manifest.
+rn-uv = { path = "../rn-uv" }
 rn-bind-timers = { path = "../rn-bind-timers" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
