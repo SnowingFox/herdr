@@ -50,6 +50,12 @@ fn main() {
     v8::V8::initialize();
 
     let mut isolate = v8::Isolate::new(Default::default());
+    // `import.meta` and `import()` are dispatched by V8 through isolate-level
+    // handlers rather than `internalBinding()`, so they are installed here,
+    // where a `&mut Isolate` exists. A binding callback cannot do it: the v8
+    // crate documents `FunctionCallbackArguments::get_isolate` as unsound while
+    // a callback scope is open, and one always is during a binding call.
+    rn_module_wrap::install_isolate_callbacks(&mut isolate);
     // Node runs V8 with an explicit microtask policy: the embedder decides when
     // the queue drains, through `runMicrotasks()` in
     // `lib/internal/process/task_queues.js` and the loop's own checkpoints.
@@ -139,6 +145,14 @@ fn main() {
                         Ok(hooks) => runtime = Some(hooks),
                         Err(message) => eprintln!("rustnode: timers unavailable: {message}"),
                     }
+                    // Node's `internal/main/run_main_module` runs pre-execution
+                    // before it runs anything else, and the ESM loader refuses
+                    // to initialize afterwards: `initializeModuleLoaders`
+                    // asserts that no user module has been executed yet. Every
+                    // `.mjs` entry point therefore failed with
+                    // `ERR_INTERNAL_ASSERTION` until this ran first.
+                    bootstrap::install_stdio(scope);
+                    bootstrap::prepare_execution(scope, require);
                     // `node -e` exposes builtins as lazy globals; a script file
                     // does not, which is why this is gated on the source. Node's
                     // own `eval_string.js` makes the same distinction.
@@ -161,26 +175,42 @@ fn main() {
         Err(message) => eprintln!("rustnode: realm bootstrap failed: {message}"),
     }
 
-    // A file is loaded through the CommonJS loader as the main module, so it gets
-    // the wrapper parameters (`module`, `exports`, `__filename`, `__dirname`), a
-    // `require` anchored at its own directory, and an entry in `require.cache`
-    // under its filename — exactly what Node does for `node script.js`. `-e` has
-    // no file, so it is compiled as a bare script against the global object.
+    // A file is loaded through Node's own entry-point path
+    // (`internal/modules/run_main.js::executeUserEntryPoint`), which picks the
+    // CommonJS or ESM loader from the file's format — `.mjs`, `.wasm`, or a
+    // `.js` in a `"type": "module"` package take the ESM path. `-e` has no
+    // file, so it is compiled as a bare script against the global object.
     //
     // The file's text is deliberately not read here: the loader reads it, and a
     // second read would bypass the loader's source handling (and its cache).
     let mut print_result = false;
+    let mut entry_promise: Option<v8::Global<v8::Promise>> = None;
     let (value, caught) = match &options.source {
         args::Source::File(_) => {
-            // The resolved absolute path, not the raw argument: `Module._load`
+            // The resolved absolute path, not the raw argument: the loader
             // treats its request as a specifier, so a relative one would be
             // resolved against the loader's paths instead of the cwd.
             let caught = match (realm_require.as_ref(), script_path.as_ref()) {
                 (Some(require), Some(path)) => {
                     let require = v8::Local::new(scope, require);
-                    bootstrap::run_main_module(scope, require, path)
-                        .err()
-                        .map(|message| format!("Uncaught {message}"))
+                    // A top-level await makes the entry point asynchronous: the
+                    // call returns the graph's promise and the module body
+                    // finishes during the microtask drain below, not before it.
+                    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+                    let scope = &mut try_catch.init();
+                    let result = bootstrap::run_main(scope, require, path);
+                    if scope.has_caught() {
+                        scope.exception().map(|exception| {
+                            format!("Uncaught {}", exception.to_rust_string_lossy(scope))
+                        })
+                    } else {
+                        if let Some(promise) =
+                            result.and_then(|value| v8::Local::<v8::Promise>::try_from(value).ok())
+                        {
+                            entry_promise = Some(v8::Global::new(scope, promise));
+                        }
+                        None
+                    }
                 }
                 _ => Some("Uncaught the realm bootstrap left no require".to_string()),
             };
@@ -211,9 +241,28 @@ fn main() {
     // The first drain happens before the first phase: Node runs the script and
     // then checks the microtask queue, which is why a `.then` scheduled in the
     // script body runs before the process exits and before any timer.
+    //
+    // A `.mjs` entry point with a top-level `await` is the one case where the
+    // script has *not* finished when the loader returns: it handed back the
+    // module graph's promise. Draining the microtask queue is what finishes it,
+    // and it must happen before the timers in the loop below so a top-level
+    // await resolves before `setTimeout(0)` — the order Node guarantees.
     let mut exit_requested = false;
     if let Some(hooks) = runtime.as_ref() {
         hooks.drain(scope);
+        // A rejection here is the module body throwing, which Node reports as an
+        // uncaught exception from the entry point. `triggerUncaughtException`
+        // already ran if the loader routed it through the fatal path; this
+        // catches the case where the promise simply settled rejected.
+        if let Some(entry) = entry_promise.take() {
+            let entry = v8::Local::new(scope, entry);
+            if entry.state() == v8::PromiseState::Rejected {
+                let exception = entry.result(scope);
+                eprintln!("Uncaught {}", exception.to_rust_string_lossy(scope));
+                hooks.drain(scope);
+                std::process::exit(1);
+            }
+        }
         match event_loop::run_loop(scope, hooks) {
             Ok(rn_io::StopReason::ExitRequested | rn_io::StopReason::TurnLimit) => {
                 exit_requested = true;

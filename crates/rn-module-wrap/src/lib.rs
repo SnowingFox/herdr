@@ -72,17 +72,31 @@ struct Entry {
     /// Wrapper object, so a callback can hand it back to JavaScript.
     object: Option<v8::Global<v8::Object>>,
     synthetic_steps: Option<v8::Global<v8::Function>>,
-    /// Modules a `link` resolved, consumed one per request at instantiate time.
+    /// Modules a `link` resolved, one per module request, indexed by that
+    /// request's position. Kept rather than consumed: V8 instantiates a module
+    /// more than once when a link failure is retried, and each pass resolves
+    /// every request again.
     linked: Vec<v8::Global<v8::Module>>,
+    /// How many requests the current instantiation has already resolved.
+    ///
+    /// V8 asks for a module's requests in source order, one call per request, so
+    /// a cursor reproduces Node's index contract without needing the request
+    /// index — which the `ResolveModuleCallback` signature here does not carry.
+    served: usize,
+    /// Whether `link()` has run. A synthetic module starts linked because it
+    /// has no dependencies, which is what Node's constructor does too.
+    is_linked: bool,
 }
 
 impl Entry {
-    fn new(module: v8::Global<v8::Module>) -> Self {
+    fn new(module: v8::Global<v8::Module>, synthetic: bool) -> Self {
         Self {
             module,
             object: None,
             synthetic_steps: None,
             linked: Vec::new(),
+            served: 0,
+            is_linked: synthetic,
         }
     }
 }
@@ -92,6 +106,7 @@ fn store_module(
     scope: &mut v8::PinScope,
     module: v8::Local<v8::Module>,
     object: v8::Local<v8::Object>,
+    synthetic: bool,
 ) -> Option<u64> {
     let hash = i32::from(module.get_identity_hash());
     let module = v8::Global::new(scope, module);
@@ -100,7 +115,7 @@ fn store_module(
         let mut registry = registry.borrow_mut();
         let id = registry.next;
         registry.next += 1;
-        let mut entry = Entry::new(module);
+        let mut entry = Entry::new(module, synthetic);
         entry.object = Some(object);
         registry.modules.insert(id, entry);
         registry.by_hash.insert(hash, id);
@@ -258,7 +273,7 @@ fn module_wrap_constructor<'s>(
     method!("getModuleRequests", module_requests);
     method!("instantiate", module_instantiate);
     method!("evaluate", module_evaluate);
-    method!("evaluateSync", module_evaluate);
+    method!("evaluateSync", module_evaluate_sync);
     method!("setExport", module_set_export);
     method!("getNamespace", module_namespace);
     method!("getStatus", module_status);
@@ -266,6 +281,17 @@ fn module_wrap_constructor<'s>(
     method!("hasTopLevelAwait", module_has_tla);
     method!("createCachedData", module_create_cached_data);
     method!("getModuleSourceObject", module_get_source_object);
+    method!("setModuleSourceObject", module_set_source_object);
+
+    // `hasAsyncGraph` is a lazy accessor on the instance, not a prototype
+    // method: `module_job.js` reads it as a property (`if (this.module
+    // .hasAsyncGraph)`), and `lib/internal/vm/module.js` forwards it through a
+    // getter of its own. Defining it on the prototype as a plain data property
+    // would freeze the answer at link time, which is wrong because V8 only
+    // knows the graph is async once the module is instantiated.
+    if let Some(key) = v8::String::new(scope, "hasAsyncGraph") {
+        prototype.set_accessor(scope, key.into(), has_async_graph);
+    }
 
     Ok(constructor)
 }
@@ -299,7 +325,7 @@ fn module_wrap_new<'s>(
         return;
     };
 
-    let Some(id) = store_module(scope, module, that) else {
+    let Some(id) = store_module(scope, module, that, synthetic) else {
         throw_error(scope, "cannot register module");
         return;
     };
@@ -455,14 +481,34 @@ fn module_link<'s>(
         resolved.push(v8::Global::new(scope, module));
     }
 
+    // The count is checked here rather than at instantiate time because a
+    // mismatch means the JS loader and V8 disagree about the module's import
+    // list, and every later resolve would pick a module by the wrong index.
+    let request_count = module_of(scope, that)
+        .map(|module| module.get_module_requests().length())
+        .unwrap_or(0);
+    if request_count != resolved.len() {
+        throw_error(
+            scope,
+            "Module request count mismatch: V8 has a different number of module requests than the linked modules",
+        );
+        return;
+    }
     REGISTRY.with(|registry| {
         if let Some(entry) = registry.borrow_mut().modules.get_mut(&id) {
             entry.linked = resolved;
+            entry.is_linked = true;
         }
     });
 }
 
-/// V8 asks which module satisfies a module request during instantiation.
+/// V8 asks which module satisfies each module request during instantiation.
+///
+/// Node's `ResolveModule` indexes `linked_module_wraps_` by the request's
+/// position, through `InstantiateModule`'s index-based callback. The v8 crate
+/// exposes only the specifier/attributes variant, so this reproduces the index
+/// by a cursor: V8 resolves a module's requests in source order, one call per
+/// request, which is the same order `link()` stored them in.
 fn resolve_module_callback<'s>(
     context: v8::Local<'s, v8::Context>,
     _specifier: v8::Local<'s, v8::String>,
@@ -478,10 +524,9 @@ fn resolve_module_callback<'s>(
     let next = REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let entry = registry.modules.get_mut(&referrer_id)?;
-        if entry.linked.is_empty() {
-            return None;
-        }
-        Some(entry.linked.remove(0))
+        let module = entry.linked.get(entry.served)?;
+        entry.served += 1;
+        Some(module.clone())
     })?;
     Some(v8::Local::new(scope, &next))
 }
@@ -496,19 +541,26 @@ fn module_instantiate<'s>(
         throw_type_error(scope, "ModuleWrap instance is not initialized");
         return;
     };
-    let linked = id_of(scope, that)
+    // Each instantiation pass resolves the whole request list again, so the
+    // cursor starts from the beginning rather than continuing where a previous
+    // failed attempt stopped.
+    let ready = id_of(scope, that)
         .map(|id| {
             REGISTRY.with(|registry| {
-                registry
-                    .borrow()
-                    .modules
-                    .get(&id)
-                    .map(|entry| entry.linked.is_empty())
-                    .unwrap_or(true)
+                let mut registry = registry.borrow_mut();
+                let Some(entry) = registry.modules.get_mut(&id) else {
+                    return false;
+                };
+                entry.served = 0;
+                // Node's `Instantiate` tests `linked_`, not the length of the
+                // request list: a module with zero imports is linked as soon as
+                // `link([])` runs, and one that was never linked is an error
+                // even when it has nothing to resolve.
+                entry.is_linked
             })
         })
-        .unwrap_or(true);
-    if linked && module.get_module_requests().length() > 0 {
+        .unwrap_or(false);
+    if !ready {
         throw_error(scope, "module is not linked");
         return;
     }
@@ -518,6 +570,14 @@ fn module_instantiate<'s>(
     let _ = module.instantiate_module(scope, resolve_module_callback);
 }
 
+/// `evaluate(timeout, breakOnSigint)`: the asynchronous evaluation entry point.
+///
+/// Returns V8's evaluation promise, which settles once the module graph — and
+/// any top-level `await` in it — finishes. `module_job.js` awaits it for an
+/// async graph and ignores it otherwise.
+///
+/// A `None` return means evaluation threw and the exception is already pending,
+/// so it propagates without any rethrow here.
 fn module_evaluate<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -528,11 +588,99 @@ fn module_evaluate<'s>(
         throw_type_error(scope, "ModuleWrap instance is not initialized");
         return;
     };
-    // A `None` return means evaluation threw and the exception is already
-    // pending, so it propagates without any rethrow here.
     if let Some(value) = module.evaluate(scope) {
         rv.set(value);
     }
+}
+
+/// `evaluateSync()`: evaluate a graph that is known to have no top-level await.
+///
+/// Node's `EvaluateSync` checks the promise V8 returns settled *synchronously*
+/// and answers with the module namespace, which is what `runSync()` and the
+/// synthetic facades expect. Returning the promise instead — as one shared
+/// implementation used to — makes `job.runSync()` hand a pending promise to
+/// `populateCJSExportsFromESM` and every `require(esm)` sees an empty object.
+///
+/// A graph with top-level await never gets here: `module_job.js` rejects it with
+/// `ERR_REQUIRE_ASYNC_MODULE` before evaluating.
+fn module_evaluate_sync<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    let that = args.this();
+    let Some(module) = module_of(scope, that) else {
+        throw_type_error(scope, "ModuleWrap instance is not initialized");
+        return;
+    };
+    let Some(value) = module.evaluate(scope) else {
+        // The exception is pending; leave it that way.
+        return;
+    };
+    let Ok(promise) = v8::Local::<v8::Promise>::try_from(value) else {
+        throw_error(scope, "module evaluation did not return a promise");
+        return;
+    };
+    if promise.state() == v8::PromiseState::Rejected {
+        let exception = promise.result(scope);
+        scope.throw_exception(exception);
+        return;
+    }
+    rv.set(module.get_module_namespace());
+}
+
+/// `module.hasAsyncGraph`: whether this module or anything it imports has a
+/// top-level await.
+///
+/// V8 only knows the answer once the graph is instantiated, so reading it
+/// earlier is a usage error rather than `false`. Node throws
+/// `ERR_MODULE_NOT_INSTANTIATED` there; this throws the same message so the
+/// failure names the real problem instead of reporting a wrong `false`.
+fn has_async_graph<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _key: v8::Local<'s, v8::Name>,
+    args: v8::PropertyCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let holder = args.holder();
+    let Some(module) = module_of(scope, holder) else {
+        return;
+    };
+    if !matches!(
+        module.get_status(),
+        v8::ModuleStatus::Instantiated
+            | v8::ModuleStatus::Evaluating
+            | v8::ModuleStatus::Evaluated
+            | v8::ModuleStatus::Errored
+    ) {
+        throw_error(
+            scope,
+            "module has not been instantiated yet, hasAsyncGraph can only be accessed after instantiation",
+        );
+        return;
+    }
+    rv.set(v8::Boolean::new(scope, module.is_graph_async()).into());
+}
+
+/// `module.setModuleSourceObject(object)`: attach the compiled source of a
+/// module imported for its source phase.
+///
+/// Only WebAssembly and other embedder formats set this; `import ... source`
+/// over a normal module throws `ERR_SOURCE_PHASE_NOT_DEFINED` in
+/// `getModuleSourceObject`, which is the behaviour a module without one here
+/// should have.
+fn module_set_source_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue,
+) {
+    let that = args.this();
+    let value = args.get(0);
+    if !value.is_object() {
+        throw_type_error(scope, "setModuleSourceObject() requires an object");
+        return;
+    }
+    set_property(scope, that, "__rustnodeSourceObject", value);
 }
 
 fn module_set_export<'s>(
@@ -640,6 +788,19 @@ fn module_get_source_object<'s>(
     }
 }
 
+/// `getModuleRequests()`: one frozen request record per import of this module.
+///
+/// Node's loader reads `request.specifier`, `request.attributes` and
+/// `request.phase` (`internal/modules/esm/module_job.js` passes the record
+/// straight to `getOrCreateModuleJob`, which forwards `request.attributes` and
+/// `request.phase` into resolution). Returning the bare specifier strings — as
+/// this used to — makes every one of those `undefined`, and the first symptom is
+/// `Cannot find package 'undefined'`, several frames away from the cause.
+///
+/// This mirrors `createModuleRequestsContainer` and
+/// `createImportAttributesContainer` in `src/module_wrap.cc`: null-prototype
+/// objects frozen at every level, with the phase translated to Node's
+/// `ModulePhase` constant rather than V8's.
 fn module_requests<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -661,11 +822,82 @@ fn module_requests<'s>(
         let Ok(request) = v8::Local::<v8::ModuleRequest>::try_from(request) else {
             continue;
         };
-        let specifier = request.get_specifier();
-        array.set_index(scope, index as u32, specifier.into());
+        if let Some(record) = request_record(scope, &request) {
+            array.set_index(scope, index as u32, record.into());
+        }
     }
-    // Each entry is the request object the JS loader reads `.specifier` from.
     rv.set(array.into());
+}
+
+/// Builds one frozen `{ specifier, attributes, phase }` record.
+fn request_record<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    request: &v8::ModuleRequest,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let record = v8::Object::new(scope);
+    // `Object::new` gives a normal prototype; Node builds these on a null
+    // prototype so a polluted `Object.prototype` cannot shadow a field the
+    // loader reads.
+    if let Some(null) = null_prototype(scope) {
+        record.set_prototype(scope, null);
+    }
+
+    let specifier = request.get_specifier();
+    set_name(scope, record, "specifier", specifier.into())?;
+    let attributes = import_attributes(scope, &request.get_import_attributes())?;
+    set_name(scope, record, "attributes", attributes)?;
+    let phase = v8::Integer::new(scope, phase_constant(request.get_phase()));
+    set_name(scope, record, "phase", phase.into())?;
+
+    record.set_integrity_level(scope, v8::IntegrityLevel::Frozen);
+    Some(record)
+}
+
+/// Builds the frozen attributes object from V8's flat `[key, value, ...]` pair
+/// list.
+///
+/// `ModuleRequest::GetImportAttributes` returns keys and values alternating with
+/// a source offset after each pair, which is why the stride here is three and
+/// not two. The offsets are diagnostics for a syntax error that never gets this
+/// far, so they are skipped rather than published.
+fn import_attributes<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    raw: &v8::FixedArray,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let attributes = v8::Object::new(scope);
+    if let Some(null) = null_prototype(scope) {
+        attributes.set_prototype(scope, null);
+    }
+    let mut index = 0;
+    while index + 1 < raw.length() {
+        let (Some(key), Some(value)) = (raw.get(scope, index), raw.get(scope, index + 1)) else {
+            break;
+        };
+        let (Ok(key), Ok(value)) = (
+            v8::Local::<v8::String>::try_from(key),
+            v8::Local::<v8::String>::try_from(value),
+        ) else {
+            break;
+        };
+        attributes.set(scope, key.into(), value.into());
+        index += 3;
+    }
+    attributes.set_integrity_level(scope, v8::IntegrityLevel::Frozen);
+    Some(attributes.into())
+}
+
+/// V8's `ModuleImportPhase` as Node's `ModulePhase`.
+///
+/// The two enumerations have the same members but not the same numbers:
+/// V8 starts `kSource` at 0 while `src/module_wrap.h` starts `kSourcePhase` at
+/// 1, and the JS side compares against Node's values when it decides whether to
+/// link and evaluate a request.
+fn phase_constant(phase: v8::ModuleImportPhase) -> i32 {
+    match phase {
+        v8::ModuleImportPhase::kSource => K_SOURCE_PHASE,
+        v8::ModuleImportPhase::kDefer => K_DEFER_PHASE,
+        v8::ModuleImportPhase::kEvaluation => K_EVALUATION_PHASE,
+    }
 }
 
 fn create_required_module_facade(
@@ -681,12 +913,109 @@ fn set_dynamic_import<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
+    // Only the callback is recorded here. V8's dynamically-import handler is
+    // isolate-wide and can only be installed through `&mut Isolate`, which a
+    // function callback does not have (the v8 crate's
+    // `FunctionCallbackArguments::get_isolate` is documented as unsound while a
+    // `CallbackScope` is open, and one always is inside a binding call).
+    // [`install_isolate_callbacks`] does that once, from the CLI, and reads this
+    // slot on every call so a replacement callback takes effect immediately.
     store_hook(
         scope,
         args,
         rn_core::hook_slot::DYNAMIC_IMPORT,
         "dynamic import",
     );
+    // The referrer argument has to be the very symbol `internalBinding
+    // ('symbols')` publishes: the JS callback compares it by identity and throws
+    // when nothing matches.
+    if let Ok(referrer) = rn_bind_symbols::ensure(
+        scope,
+        "vm_dynamic_import_default_internal",
+        "vm_dynamic_import_default_internal",
+    ) {
+        rn_core::hook_slot::set_dynamic_import_referrer(scope, referrer.into());
+    }
+}
+
+/// The isolate-level handler for `import()`.
+///
+/// Node's `ImportModuleDynamically` resolves the referrer's host-defined option
+/// to a symbol and calls the JS loader with
+/// `(id, specifier, phase, attributes, referrerName)`, wrapping the result in a
+/// promise created in the referrer's context. This does the same, reading the
+/// JS callback from the hook slot rather than from a per-realm field, because a
+/// `fn` callback cannot capture one.
+fn host_dynamic_import<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    _host_defined_options: v8::Local<'s, v8::Data>,
+    resource_name: v8::Local<'s, v8::Value>,
+    specifier: v8::Local<'s, v8::String>,
+    import_attributes: v8::Local<'s, v8::FixedArray>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let Some(callback) = rn_core::hook_slot::dynamic_import(scope) else {
+        // `initializeESM()` has not run, so nothing can resolve this import.
+        // A thrown error names the real problem; returning `None` would surface
+        // as V8's generic "callback missing" instead.
+        throw_error(
+            scope,
+            "a dynamic import callback was not specified (internal/modules/esm/utils was never initialized)",
+        );
+        return None;
+    };
+    let attributes = import_attributes_from_flat(scope, &import_attributes)?;
+    // `vm_dynamic_import_default_internal` is the sentinel that makes the JS
+    // callback route an ordinary `import()` from a plain script to the default
+    // loader without emitting the `vm.USE_MAIN_CONTEXT_DEFAULT_LOADER`
+    // warning. It is the same value `prepareExecution` puts on the global for
+    // script contexts.
+    let referrer = rn_core::hook_slot::dynamic_import_referrer(scope)
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    let phase = v8::Integer::new(scope, K_EVALUATION_PHASE);
+    let arguments = [
+        referrer,
+        specifier.into(),
+        phase.into(),
+        attributes.into(),
+        resource_name,
+    ];
+    let result = callback.call(scope, v8::undefined(scope).into(), &arguments)?;
+
+    // The JS callback returns whatever the loader produced, which may be a
+    // promise or a plain namespace object (the embedder path returns the
+    // latter). Resolving a fresh promise with it gives V8 the single promise
+    // shape it expects in both cases.
+    let resolver = v8::PromiseResolver::new(scope)?;
+    resolver.resolve(scope, result)?;
+    Some(resolver.get_promise(scope))
+}
+
+/// Builds `{ key: value }` from V8's flat `[key, value, ...]` attribute list.
+///
+/// Unlike a module request's attributes this array has stride two: the
+/// dynamically-import callback is documented to leave the source offsets out.
+fn import_attributes_from_flat<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    raw: &v8::FixedArray,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let attributes = v8::Object::new(scope);
+    if let Some(null) = null_prototype(scope) {
+        attributes.set_prototype(scope, null);
+    }
+    let mut index = 0;
+    while index + 1 < raw.length() {
+        let (Some(key), Some(value)) = (raw.get(scope, index), raw.get(scope, index + 1)) else {
+            break;
+        };
+        if let (Ok(key), Ok(value)) = (
+            v8::Local::<v8::String>::try_from(key),
+            v8::Local::<v8::String>::try_from(value),
+        ) {
+            attributes.set(scope, key.into(), value.into());
+        }
+        index += 2;
+    }
+    Some(attributes)
 }
 
 fn set_initialize_import_meta<'s>(
@@ -694,9 +1023,171 @@ fn set_initialize_import_meta<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
+    // Recorded only; [`install_isolate_callbacks`] installs the isolate-wide
+    // handler from the CLI, where a `&mut Isolate` is available.
     store_hook(scope, args, rn_core::hook_slot::IMPORT_META, "import.meta");
 }
 
+/// Installs the two isolate-wide ESM handlers V8 needs.
+///
+/// `import.meta` and `import()` are not dispatched through
+/// `internalBinding()` at call time: V8 owns one handler per isolate, and the
+/// only API that sets it takes `&mut Isolate`. A binding callback cannot reach
+/// one (its `get_isolate` is documented unsound while the callback scope is
+/// open), so the CLI calls this once after the realm bootstrap, before any user
+/// code runs.
+///
+/// Both handlers read their JavaScript callback from
+/// [`rn_core::hook_slot`] on each call rather than capturing it, because a bare
+/// `fn` has no data slot; that also means `initializeESM()` replacing the
+/// callback later is picked up without re-installing anything here.
+pub fn install_isolate_callbacks(isolate: &mut v8::Isolate) {
+    isolate.set_host_initialize_import_meta_object_callback(host_initialize_import_meta);
+    isolate.set_host_import_module_dynamically_callback(host_dynamic_import);
+}
+
+/// The isolate-level handler for `import.meta`.
+///
+/// Node keeps `isMain` and the custom-callback registry on the `ModuleWrap`, and
+/// its `HostInitializeImportMetaObjectCallback` either runs
+/// `DefaultImportMetaObjectInitializer` for a loader-compiled module or calls
+/// into JS with `(hostDefinedOptions, meta, wrap)`.
+///
+/// This crate has no realm object to hang the "which callback applies" decision
+/// on, so the split is explicit: a module whose wrapper carries
+/// `__rustnodeCustomImportMeta` was registered by `vm.SourceTextModule` and gets
+/// the JS callback; everything else is a loader module and gets the default
+/// initializer, which is the entire documented surface —
+/// `dirname`, `filename`, `main`, `resolve`, `url`, in that order.
+///
+/// `extern "C"` because V8 takes a bare function pointer here, with no argument
+/// adaptation.
+unsafe extern "C" fn host_initialize_import_meta<'s>(
+    context: v8::Local<'s, v8::Context>,
+    module: v8::Local<'s, v8::Module>,
+    meta: v8::Local<'s, v8::Object>,
+) {
+    v8::callback_scope!(unsafe scope, context);
+    let Some(wrapper) = module_by_hash(scope, module) else {
+        return;
+    };
+    if get_property(scope, wrapper, "__rustnodeCustomImportMeta")
+        .map(|value| value.is_true())
+        .unwrap_or(false)
+    {
+        // A `vm.SourceTextModule`: let the JS registry decide, exactly as Node
+        // does, because the user-supplied `initializeImportMeta` lives there.
+        if let Some(callback) = rn_core::hook_slot::import_meta(scope) {
+            if let Some(id) = get_property(scope, wrapper, "__rustnodeHostDefinedOption") {
+                let _ = callback.call(
+                    scope,
+                    v8::undefined(scope).into(),
+                    &[id, meta.into(), wrapper.into()],
+                );
+            }
+        }
+        return;
+    }
+    initialize_import_meta_default(scope, wrapper, meta);
+}
+
+/// `DefaultImportMetaObjectInitializer` from `src/module_wrap.cc`.
+///
+/// The order matters: the test that watches this surface asserts
+/// `Reflect.ownKeys(import.meta)` is exactly
+/// `['dirname', 'filename', 'main', 'resolve', 'url']`, which is alphabetical,
+/// and `dirname`/`filename` only exist for `file:` URLs — a `data:` module has
+/// `['main', 'resolve', 'url']`.
+///
+/// `resolve` is a lazy accessor because its initializer is only installed on
+/// the main thread once the cascaded loader exists; reading the property is
+/// what creates the function, and it is created fresh per module so the module
+/// URL it closes over is right.
+fn initialize_import_meta_default<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    wrapper: v8::Local<'s, v8::Object>,
+    meta: v8::Local<'s, v8::Object>,
+) {
+    let Some(url) = get_property(scope, wrapper, "url") else {
+        return;
+    };
+    let Some(url_text) = url
+        .to_string(scope)
+        .map(|text| text.to_rust_string_lossy(scope))
+    else {
+        return;
+    };
+
+    if let Some(path) = file_url_to_path(&url_text) {
+        if let Some(dirname) = path_dirname(&path) {
+            if let Some(key) = v8::String::new(scope, "dirname") {
+                if let Some(value) = v8::String::new(scope, &dirname) {
+                    let _ = meta.create_data_property(scope, key.into(), value.into());
+                }
+            }
+        }
+        if let Some(key) = v8::String::new(scope, "filename") {
+            if let Some(value) = v8::String::new(scope, &path) {
+                let _ = meta.create_data_property(scope, key.into(), value.into());
+            }
+        }
+    }
+
+    let is_main = get_property(scope, wrapper, "isMain")
+        .map(|value| value.is_true())
+        .unwrap_or(false);
+    if let Some(key) = v8::String::new(scope, "main") {
+        let _ =
+            meta.create_data_property(scope, key.into(), v8::Boolean::new(scope, is_main).into());
+    }
+
+    if rn_core::hook_slot::has_import_meta_resolve() {
+        if let Some(key) = v8::String::new(scope, "resolve") {
+            let attributes = v8::PropertyAttribute::NONE;
+            let _ = meta.set_lazy_data_property_with_data(
+                scope,
+                key.into(),
+                import_meta_resolve,
+                url,
+                attributes,
+                v8::SideEffectType::HasSideEffect,
+                v8::SideEffectType::HasSideEffect,
+            );
+        }
+    }
+
+    if let Some(key) = v8::String::new(scope, "url") {
+        let _ = meta.create_data_property(scope, key.into(), url);
+    }
+}
+
+/// The lazy getter behind `import.meta.resolve`.
+///
+/// Node binds the cascaded loader into `createImportMetaResolve` at
+/// initialization and hands the module URL through the accessor's data slot, so
+/// this does the same: one `resolve` function per module URL.
+fn import_meta_resolve<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _key: v8::Local<'s, v8::Name>,
+    args: v8::PropertyCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(initializer) = rn_core::hook_slot::import_meta_resolve(scope) else {
+        return;
+    };
+    let url = args.data();
+    if let Some(value) = initializer.call(scope, v8::undefined(scope).into(), &[url]) {
+        rv.set(value);
+    }
+}
+
+/// `setImportMetaResolveInitializer` records the initializer that
+/// `import.meta.resolve` is built from.
+///
+/// Node keeps it on the realm and only reads it from
+/// `ImportMetaResolveLazyGetter`, so the lazy getter in
+/// [`initialize_import_meta_default`] is the only consumer. No isolate-level
+/// registration is involved, which is why this one can stay a plain store.
 fn set_import_meta_resolve<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -748,6 +1239,111 @@ fn set_property(
     if let Some(key) = v8::String::new(scope, name) {
         object.set(scope, key.into(), value);
     }
+}
+
+/// `set_property` as a `Result`, for call sites that must report an allocation
+/// failure rather than silently leaving the property out.
+fn set_property_checked(
+    scope: &mut v8::PinScope,
+    object: v8::Local<v8::Object>,
+    name: &str,
+    value: v8::Local<v8::Value>,
+) -> Option<()> {
+    let key = v8::String::new(scope, name)?;
+    object.set(scope, key.into(), value)?;
+    Some(())
+}
+
+fn set_name(
+    scope: &mut v8::PinScope,
+    object: v8::Local<v8::Object>,
+    name: &str,
+    value: v8::Local<v8::Value>,
+) -> Option<()> {
+    set_property_checked(scope, object, name, value)
+}
+
+fn get_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let key = v8::String::new(scope, name)?;
+    object.get(scope, key.into())
+}
+
+/// The value `Object.setPrototypeOf` needs to build a null-prototype object.
+///
+/// Node creates its request records and import-attribute objects with
+/// `Object::New(isolate, Null(isolate), ...)`, which is the same thing as
+/// creating a plain object and setting its prototype to `null`: a polluted
+/// `Object.prototype` then cannot shadow a field the loader reads.
+fn null_prototype<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Value>> {
+    Some(v8::null(scope).into())
+}
+
+/// `fileURLToPath` for the subset an `import.meta` URL can contain.
+///
+/// Returns `None` for anything that is not a `file:` URL, which is what makes a
+/// `data:` module's `import.meta` lack `dirname`/`filename`.
+///
+/// Node's version percent-decodes the path and rejects an encoded `/` or `\`
+/// (`ERR_INVALID_FILE_URL_PATH`). The decode has to happen before the check for
+/// that to be sound, and `%2F` is the case that matters: leaving it encoded
+/// would produce a path that looks inside a directory it is not.
+fn file_url_to_path(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("file://")?;
+    // `file:///tmp/x` has an empty authority; `file://host/x` is a form Node
+    // rejects on POSIX, and neither shape occurs for a module the loader found
+    // by walking the filesystem.
+    let path = rest.strip_prefix('/').map(|tail| format!("/{tail}"))?;
+    let path = path.split(['?', '#']).next().unwrap_or(&path);
+    let decoded = percent_decode(path)?;
+    if decoded.contains('/') && path.contains("%2F") {
+        return None;
+    }
+    Some(decoded)
+}
+
+/// Decodes `%XX` escapes as UTF-8, returning `None` on a malformed sequence.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            out.push((high << 4) | low);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// The directory part of a decoded file path, without a trailing separator.
+///
+/// `import.meta.dirname` is `/tmp` for `/tmp/x.mjs` and `/` for `/x.mjs`; Node
+/// slices at the last separator and keeps everything before it.
+fn path_dirname(path: &str) -> Option<String> {
+    let index = path.rfind('/')?;
+    Some(if index == 0 {
+        "/".to_string()
+    } else {
+        path[..index].to_string()
+    })
 }
 
 fn set(
@@ -811,6 +1407,63 @@ mod tests {
         assert_eq!(K_SOURCE_PHASE, 1);
         assert_eq!(K_DEFER_PHASE, 2);
         assert_eq!(K_EVALUATION_PHASE, 3);
+    }
+
+    #[test]
+    fn v8_phases_translate_to_node_numbers_not_v8_numbers() {
+        // The two enumerations have the same members and different numbers: V8
+        // starts `kSource` at 0, Node's `ModulePhase` starts `kSourcePhase` at 1.
+        // Handing V8's numbers to the JS loader would make every request look
+        // like a source-phase import, so the mapping is pinned rather than
+        // assumed.
+        assert_eq!(
+            phase_constant(v8::ModuleImportPhase::kSource),
+            K_SOURCE_PHASE
+        );
+        assert_eq!(
+            phase_constant(v8::ModuleImportPhase::kDefer),
+            K_DEFER_PHASE
+        );
+        assert_eq!(
+            phase_constant(v8::ModuleImportPhase::kEvaluation),
+            K_EVALUATION_PHASE
+        );
+        assert_ne!(K_SOURCE_PHASE, 0, "V8's kSource is 0; Node's is 1");
+    }
+
+    #[test]
+    fn file_urls_convert_to_paths() {
+        assert_eq!(
+            file_url_to_path("file:///tmp/a/b.mjs").as_deref(),
+            Some("/tmp/a/b.mjs")
+        );
+        // Percent escapes are decoded, which is what makes a spaced path the
+        // file it names rather than a path containing `%20`.
+        assert_eq!(
+            file_url_to_path("file:///tmp/x%20y/z.mjs").as_deref(),
+            Some("/tmp/x y/z.mjs")
+        );
+        assert_eq!(
+            file_url_to_path("file:///tmp/a%25b.mjs").as_deref(),
+            Some("/tmp/a%b.mjs")
+        );
+        // A `data:` module has no `dirname`/`filename`, which is what the
+        // `import.meta` test asserts.
+        assert_eq!(file_url_to_path("data:text/javascript,1"), None);
+        assert_eq!(file_url_to_path("node:path"), None);
+    }
+
+    #[test]
+    fn dirname_is_the_path_before_the_last_separator() {
+        assert_eq!(path_dirname("/tmp/a/b.mjs").as_deref(), Some("/tmp/a"));
+        assert_eq!(path_dirname("/b.mjs").as_deref(), Some("/"));
+    }
+
+    #[test]
+    fn percent_decoding_rejects_a_truncated_escape() {
+        assert_eq!(percent_decode("a%2"), None);
+        assert_eq!(percent_decode("a%zz"), None);
+        assert_eq!(percent_decode("a%2Fb").as_deref(), Some("a/b"));
     }
 
     #[test]

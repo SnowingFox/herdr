@@ -57,6 +57,7 @@ rn-bind-url = { path = "../rn-bind-url" }
 rn-bind-url-pattern = { path = "../rn-bind-url-pattern" }
 rn-bind-uv = { path = "../rn-bind-uv" }
 rn-bind-v8 = { path = "../rn-bind-v8" }
+rn-bind-wasm-web-api = { path = "../rn-bind-wasm-web-api" }
 rn-bind-worker = { path = "../rn-bind-worker" }
 rn-bind-zlib = { path = "../rn-bind-zlib" }
 rn-builtins = { path = "../rn-builtins" }

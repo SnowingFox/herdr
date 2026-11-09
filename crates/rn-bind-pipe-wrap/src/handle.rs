@@ -156,6 +156,15 @@ pub fn constructor<'s>(
                 .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
+        // `AsyncWrap`'s id. `lib/net.js` reads it for every socket it builds,
+        // and a pipe is one (a Unix socket or the stdio of a child process).
+        (
+            "getAsyncId",
+            v8::FunctionTemplate::builder(crate::methods::get_async_id)
+                .length(0)
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .build(scope),
+        ),
     ] {
         prototype.set(key(scope, name)?.into(), template.into());
     }

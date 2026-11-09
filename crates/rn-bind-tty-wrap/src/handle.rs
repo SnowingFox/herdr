@@ -156,6 +156,13 @@ pub fn constructor<'s>(
         .constructor_behavior(v8::ConstructorBehavior::Throw)
         .build(scope);
     prototype.set(crate::key(scope, "hasRef")?.into(), has_reference.into());
+    // `AsyncWrap`'s id. `tty.WriteStream` inherits from `net.Socket`, and
+    // `net.js` reads `this._handle.getAsyncId()` unconditionally.
+    let get_async_id = v8::FunctionTemplate::builder(methods::get_async_id)
+        .length(0)
+        .constructor_behavior(v8::ConstructorBehavior::Throw)
+        .build(scope);
+    prototype.set(crate::key(scope, "getAsyncId")?.into(), get_async_id.into());
 
     // `LibuvStreamWrap` / `StreamBase`.
     let stream_methods: [(&str, i32, v8::Local<v8::FunctionTemplate>); 9] = [

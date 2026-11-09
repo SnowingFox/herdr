@@ -290,9 +290,9 @@ pub static OPTIONS: &[OptionInfo] = &[
         help_text: "experimental node:sqlite module",
         kind: 2,
         env_setting: 0,
-        default_is_true: true,
+        default_is_true: false,
         namespace: OptionNamespace::None,
-        default: DefaultValue::Bool(true),
+        default: DefaultValue::Bool(false),
     },
     OptionInfo {
         name: "--experimental-stream-iter",
@@ -362,9 +362,9 @@ pub static OPTIONS: &[OptionInfo] = &[
         help_text: "experimental Web Storage API",
         kind: 2,
         env_setting: 0,
-        default_is_true: true,
+        default_is_true: false,
         namespace: OptionNamespace::None,
-        default: DefaultValue::Bool(true),
+        default: DefaultValue::Bool(false),
     },
     OptionInfo {
         name: "--localstorage-file",

@@ -180,6 +180,87 @@ pub fn prepare_stack_trace<'s>(
     callback.call(scope, v8::undefined(scope).into(), &argv)
 }
 
+/// Returns a local handle to one stored hook callback.
+fn stored<'s>(scope: &mut v8::PinScope<'s, '_>, hook: Hook) -> Option<v8::Local<'s, v8::Function>> {
+    STATE.with(|state| {
+        let state = state.borrow();
+        let callback = match hook {
+            Hook::PrepareStackTrace => state.prepare_stack_trace.as_ref(),
+            Hook::DynamicImport => state.dynamic_import.as_ref(),
+            Hook::ImportMeta => state.import_meta.as_ref(),
+            Hook::ImportMetaResolve => state.import_meta_resolve.as_ref(),
+            Hook::SourceMaps | Hook::ExitRequested => None,
+        }?;
+        Some(v8::Local::new(scope, callback))
+    })
+}
+
+/// The `import()` callback `internal/modules/esm/utils.js` installs.
+///
+/// V8's dynamically-import handler is a plain `fn` with no data slot, so it
+/// reads the real callback from here on every call. That also means the handler
+/// sees a later `setImportModuleDynamicallyCallback` immediately, which is what
+/// a second realm in the same isolate needs.
+pub fn dynamic_import<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    stored(scope, Hook::DynamicImport)
+}
+
+// Where `set_dynamic_import_referrer` parks the symbol, so
+// `dynamic_import_referrer` can hand it back. Documented on that function.
+thread_local! {
+    static DYNAMIC_IMPORT_REFERRER: RefCell<Option<v8::Global<v8::Value>>> =
+        const { RefCell::new(None) };
+}
+
+/// Records the sentinel symbol the dynamic-import callback receives.
+pub fn set_dynamic_import_referrer(scope: &mut v8::PinScope, referrer: v8::Local<v8::Value>) {
+    let referrer = v8::Global::new(scope, referrer);
+    DYNAMIC_IMPORT_REFERRER.with(|slot| {
+        *slot.borrow_mut() = Some(referrer);
+    });
+}
+
+/// The referrer symbol handed to the dynamic-import callback, once one has been
+/// recorded.
+///
+/// `importModuleDynamicallyCallback` in `internal/modules/esm/utils.js` compares
+/// this argument by identity against four well-known symbols and throws
+/// `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING` when none match, so it has to be the
+/// very symbol `internalBinding('symbols')` publishes: a symbol created here
+/// would be a different object with the same description and every `import()`
+/// would throw. `rn-core` cannot depend on the `symbols` binding crate, so
+/// [`set_dynamic_import_referrer`] records the real one and this hands it back.
+///
+/// rustnode has no per-module host options yet, so the recorded value is the
+/// `vm_dynamic_import_default_internal` sentinel, which routes an ordinary
+/// `import()` from any context to the default loader.
+pub fn dynamic_import_referrer<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    DYNAMIC_IMPORT_REFERRER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|referrer| v8::Local::new(scope, referrer))
+    })
+}
+
+/// The `vm.SourceTextModule` import.meta callback.
+pub fn import_meta<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    stored(scope, Hook::ImportMeta)
+}
+
+/// Whether `import.meta.resolve` has an initializer to hang its lazy getter on.
+pub fn has_import_meta_resolve() -> bool {
+    STATE.with(|state| state.borrow().import_meta_resolve.is_some())
+}
+
+/// The `import.meta.resolve` initializer, which closes over the loader.
+pub fn import_meta_resolve<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Function>> {
+    stored(scope, Hook::ImportMetaResolve)
+}
+
 pub fn set_flag(scope: &mut v8::PinScope, hook: Hook, value: bool) {
     let _ = scope;
     STATE.with(|state| {

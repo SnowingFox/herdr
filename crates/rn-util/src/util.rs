@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
+use libuv_sys2 as uv;
+
 /// Members exposed on the namespace object, matching `contracts/util.json`.
 pub const MEMBERS: &[&str] = &[
     "arrayBufferViewHasBuffer",
@@ -654,14 +656,53 @@ fn get_proxy_details(
     rv.set(v8::undefined(scope).into());
 }
 
+/// `internalBinding('util').guessHandleType`: the libuv handle kind behind a
+/// descriptor, as the index `internal/util.js` uses into its `handleTypes`
+/// array.
+///
+/// Returning the name as a string — as this used to — is silently wrong rather
+/// than loudly wrong: `guessHandleType` in `lib/internal/util.js` indexes
+/// `['TCP', 'TTY', 'UDP', 'FILE', 'PIPE', 'UNKNOWN']` with the value, and
+/// `handleTypes["FILE"]` is `undefined`. Every caller then compares
+/// `undefined === 'TTY'`, decides stdio is not a terminal *or* a file or pipe,
+/// and `createWritableStdioStream` falls through to its black-hole `default`
+/// branch. `process.stdout.write` printed nothing and no error said why.
+///
+/// The numbers are `GetUVHandleTypeCode` in `src/node_util.cc`, which exists
+/// precisely so this can stay an integer and skip the string round trip.
 fn guess_handle_type(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    // `'FILE'` is the only answer that is correct without inspecting the
-    // descriptor, and lib/internal/util.js only uses it to reject TTY handles.
-    rv.set(v8::String::new(scope, "FILE").expect("literal").into());
+    let Some(fd) = args.get(0).int32_value(scope) else {
+        return;
+    };
+    // `CHECK_GE(fd, 0)` in Node. A negative descriptor cannot name a handle, and
+    // `uv_guess_handle` is only defined for a real one.
+    if fd < 0 {
+        rv.set(v8::Integer::new(scope, HANDLE_TYPE_UNKNOWN).into());
+        return;
+    }
+    // SAFETY: `uv_guess_handle` only inspects the descriptor; it owns no state
+    // and cannot fail in a way that invalidates memory.
+    let kind = unsafe { uv::uv_guess_handle(fd) };
+    rv.set(v8::Integer::new(scope, handle_type_code(kind)).into());
+}
+
+/// `UV_UNKNOWN_HANDLE`'s index in `lib/internal/util.js`'s `handleTypes`.
+const HANDLE_TYPE_UNKNOWN: i32 = 5;
+
+/// `GetUVHandleTypeCode`, verbatim: the index of `handleTypes`.
+fn handle_type_code(kind: uv::uv_handle_type) -> i32 {
+    match kind {
+        uv::uv_handle_type_UV_TCP => 0,
+        uv::uv_handle_type_UV_TTY => 1,
+        uv::uv_handle_type_UV_UDP => 2,
+        uv::uv_handle_type_UV_FILE => 3,
+        uv::uv_handle_type_UV_NAMED_PIPE => 4,
+        _ => HANDLE_TYPE_UNKNOWN,
+    }
 }
 
 fn is_inside_node_modules(

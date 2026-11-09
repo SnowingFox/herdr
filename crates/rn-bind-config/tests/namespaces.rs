@@ -236,12 +236,14 @@ fn config_values_match_a_default_linux_release_build() {
     // The one value here that deliberately differs from a stock Node build.
     // `config.hasInspector` means "this binary was compiled with the
     // inspector", and this one was not: `internalBinding('inspector')` has no
-    // implementation. `lib/v8.js` reads the flag at module scope to decide
-    // whether to load `internalBinding('profiler')`, so reporting a stock
-    // build's `true` makes `require('v8')` fail on a namespace that is not
-    // there. The recorded Node value is true; see the note on
-    // `config_values_match_a_live_node_recording` for why it is expected to
-    // disagree until the inspector lands.
+    // implementation. Three call sites make that unavoidable —
+    // `internal/process/pre_execution.js` reaches the binding at module scope
+    // through `setupInspectorHooks`, `lib/v8.js` reads the flag at module scope
+    // to decide whether to load `internalBinding('profiler')`, and
+    // `lib/inspector.js` throws when it is false. Reporting a stock build's
+    // `true` breaks startup and `require('v8')` alike. The recorded Node value
+    // is true; see the note on `config_values_match_a_live_node_recording` for
+    // why it is expected to disagree until the inspector lands.
     assert_eq!(
         Config::get("hasInspector"),
         Some(Value::Bool(false)),
@@ -303,6 +305,7 @@ fn config_values_match_a_live_node_recording() {
         // build genuinely lacks `internalBinding('inspector')`, so reporting
         // `true` would be a claim the binary cannot honour. Drop the exception
         // (and the corresponding assertion above) when the inspector lands.
+        ("hasInspector", Value::Bool(false)),
         ("noBrowserGlobals", Value::Bool(false)),
         ("bits", Value::int(64)),
     ] {
