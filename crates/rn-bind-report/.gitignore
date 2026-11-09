@@ -1,0 +1,3 @@
+# Test artifacts: `writeReport` writes a report file for real, so the test that
+# exercises it produces one. These are outputs, never sources.
+report.*.json

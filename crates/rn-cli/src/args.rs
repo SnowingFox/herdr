@@ -147,11 +147,21 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
                 code: code.clone(),
                 print: argument == "-p" || argument == "--print",
             };
-            // Node keeps `-e`/`-p` out of `process.execArgv`: the flag selects
-            // the entry point, it is not part of the runtime configuration a
-            // child process would inherit.
+            // Node keeps `-e`/`-p` out of the *flags* it inherits, but it does
+            // put the flag and its source in `process.execArgv`, because a child
+            // process re-running the parent has to reproduce the same entry
+            // point. Only the leading `node` and the script path are absent.
+            options.exec_argv.push(argument.clone());
+            options.exec_argv.push(code.clone());
+            // Arguments after the source belong to the evaluated code, with an
+            // explicit `--` acting only as a separator (`node -e 'x' -- a`
+            // gives `['a']`, the same as `node -e 'x' a`).
             index += 2;
-            continue;
+            if args.get(index).map(String::as_str) == Some("--") {
+                index += 1;
+            }
+            options.script_args = args[index..].to_vec();
+            return Ok(finish(options, unimplemented));
         }
 
         // `--` ends flag parsing; everything after is the script and its args.
@@ -285,7 +295,9 @@ mod tests {
     #[test]
     fn a_separate_value_flag_consumes_two_arguments() {
         let options = parse_of(&["--require", "preload.js", "-e", "1"]).expect("parses");
-        assert_eq!(options.exec_argv, ["--require=preload.js"]);
+        // The value is joined into one entry, and the entry point follows it, so
+        // `execArgv` reproduces the whole invocation minus the script path.
+        assert_eq!(options.exec_argv, ["--require=preload.js", "-e", "1"]);
         assert!(matches!(options.source, Source::Eval { .. }));
     }
 
@@ -305,5 +317,35 @@ mod tests {
     fn no_arguments_means_nothing_to_run() {
         let options = parse_of(&[]).expect("parses");
         assert!(matches!(options.source, Source::Empty));
+    }
+
+    #[test]
+    fn eval_arguments_become_the_script_arguments() {
+        // `node -e 'x' a b` reports `['a', 'b']` after the executable, and an
+        // explicit `--` is only a separator, so it must not appear either.
+        let options = parse_of(&["-e", "x", "a", "b"]).expect("parses");
+        assert_eq!(options.script_args, ["a", "b"]);
+
+        let options = parse_of(&["-e", "x", "--", "a", "b"]).expect("parses");
+        assert_eq!(options.script_args, ["a", "b"]);
+
+        let options = parse_of(&["-e", "x", "--"]).expect("parses");
+        assert!(options.script_args.is_empty());
+    }
+
+    #[test]
+    fn eval_keeps_its_flag_and_source_in_exec_argv() {
+        // A child process inherits these to reproduce the same entry point, so
+        // unlike the script path they belong in `execArgv`.
+        let options = parse_of(&["--expose-internals", "-p", "1+1"]).expect("parses");
+        assert_eq!(options.exec_argv, ["--expose-internals", "-p", "1+1"]);
+        assert!(options.script_args.is_empty());
+    }
+
+    #[test]
+    fn a_script_path_is_not_in_exec_argv() {
+        let options = parse_of(&["--no-warnings", "app.js", "arg"]).expect("parses");
+        assert_eq!(options.exec_argv, ["--no-warnings"]);
+        assert_eq!(options.script_args, ["arg"]);
     }
 }

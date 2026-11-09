@@ -1,2 +1,7 @@
 /target
 /tools/harness/results
+
+# Python leaves these next to the tools that import modules. Cargo's `tools/*`
+# workspace glob would otherwise try to load `__pycache__` as a crate, which
+# fails the whole build with a missing Cargo.toml.
+__pycache__/

@@ -59,10 +59,26 @@ fn main() {
         std::process::exit(1);
     }
 
+    // `process.argv` is `[execPath, scriptPath?, ...scriptArgs]`. Node puts the
+    // resolved script path in `argv[1]` and omits that slot for `-e`/`-p`, where
+    // the arguments follow the executable directly. Resolving it here, rather
+    // than in the parser, keeps `Options` a faithful record of what was typed
+    // while `argv` matches what Node reports for the same command line.
+    let mut argv_rest: Vec<String> = Vec::new();
+    let mut script_path = None;
+    if let args::Source::File(path) = &options.source {
+        let resolved = std::path::absolute(path)
+            .map(|resolved| resolved.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.clone());
+        argv_rest.push(resolved.clone());
+        script_path = Some(resolved);
+    }
+    argv_rest.extend(options.script_args.iter().cloned());
+
     // Node's own bootstrap defines `internalBinding` and `require`. When it fails
     // the CLI still runs, because `-e` on a bare global is useful for debugging
     // the bootstrap itself; the reason is printed so a failure is never silent.
-    match bootstrap::bootstrap_realm(scope, registry, &options.script_args) {
+    match bootstrap::bootstrap_realm(scope, registry, &argv_rest, &options.exec_argv) {
         Ok(loaders) => {
             if options.expose_internals() {
                 bootstrap::expose_internals(scope, &loaders);
@@ -79,13 +95,16 @@ fn main() {
             code
         }
         args::Source::Empty => "0".to_string(),
-        args::Source::File(path) => match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) => {
-                eprintln!("rustnode: cannot open {path}: {error}");
-                std::process::exit(1);
+        args::Source::File(_) => {
+            let path = script_path.unwrap_or_default();
+            match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("rustnode: cannot open {path}: {error}");
+                    std::process::exit(1);
+                }
             }
-        },
+        }
     };
 
     let origin = match v8::String::new(scope, "evalmachine.<anonymous>") {

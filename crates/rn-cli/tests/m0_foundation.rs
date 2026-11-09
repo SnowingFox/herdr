@@ -56,3 +56,68 @@ fn linked_v8_matches_pin() {
     let version = String::from_utf8_lossy(&out.stdout);
     assert!(version.trim().starts_with("15.2."), "got {version}");
 }
+
+#[test]
+fn a_script_path_becomes_the_second_argument() {
+    // `process.argv[1]` is the script, which is how a program finds itself, and
+    // the arguments after it belong to the script.
+    let dir = std::env::temp_dir().join("rustnode-argv-script");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("argv.js");
+    std::fs::write(&path, "console.log(JSON.stringify(process.argv))").expect("write script");
+    let out = rustnode(&[path.to_str().expect("utf8 path"), "one", "two"]);
+    let printed = String::from_utf8_lossy(&out.stdout);
+    let printed = printed.trim();
+    let expected_path = std::path::absolute(&path)
+        .expect("an absolute path")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        printed.contains(&format!("\"{expected_path}\",\"one\",\"two\"]")),
+        "argv must be [execPath, script, args], got {printed}"
+    );
+}
+
+#[test]
+fn eval_arguments_follow_the_executable() {
+    // Node reports no script slot for `-e`, so the arguments start at index 1,
+    // and an explicit `--` is only a separator.
+    let out = rustnode(&[
+        "-e",
+        "console.log(JSON.stringify(process.argv.slice(1)))",
+        "--",
+        "a",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), r#"["a"]"#);
+
+    let out = rustnode(&[
+        "-e",
+        "console.log(JSON.stringify(process.argv.slice(1)))",
+        "a",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), r#"["a"]"#);
+
+    let out = rustnode(&["-p", "JSON.stringify(process.argv.length)"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "1");
+}
+
+#[test]
+fn exec_argv_reproduces_the_entry_point() {
+    // A child process inherits these, so they have to exclude the executable and
+    // any script path but keep `-e` and its source.
+    let out = rustnode(&[
+        "--expose-internals",
+        "-p",
+        "JSON.stringify(process.execArgv)",
+    ]);
+    let printed = String::from_utf8_lossy(&out.stdout);
+    let printed = printed.trim();
+    assert!(
+        printed.starts_with(r#"["--expose-internals","-p","#),
+        "got {printed}"
+    );
+    assert!(
+        !printed.contains("rustnode\""),
+        "the executable must not be in execArgv, got {printed}"
+    );
+}

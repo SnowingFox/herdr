@@ -37,6 +37,36 @@ fn run(script: &str, env: &[(&str, &str)]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn run_in(script: &str, cwd: &std::path::Path) -> String {
+    let mut command = Command::new(rustnode());
+    command
+        .current_dir(cwd)
+        .arg("--expose-internals")
+        .arg("-e")
+        .arg(script);
+    let output = command.output().expect("the rustnode binary must be built");
+    assert!(
+        output.status.success(),
+        "script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A disposable working directory. `writeReport` with no configured directory
+/// writes next to the cwd, so a test of that default must not run in the crate
+/// source tree.
+fn scratch_dir() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "rustnode-report-cwd-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&path);
+    std::fs::create_dir_all(&path).expect("a scratch directory");
+    path
+}
+
 const PRELUDE: &str = "const realm = require('internal/bootstrap/realm');\
 const report = realm.internalBinding('report');";
 
@@ -167,14 +197,27 @@ fn get_report_returns_the_document_without_writing_it() {
 #[test]
 fn a_report_can_be_written_when_the_directory_was_never_set() {
     // The default is the current directory, and a crash handler has to be able
-    // to write even when nothing configured a path.
-    let output = run(
+    // to write even when nothing configured a path. The cwd is a scratch
+    // directory because the report lands in it for real.
+    let cwd = scratch_dir();
+    let output = run_in(
         &format!(
             "{PRELUDE}
             const path = report.writeReport('default path', 'test', '', null);
-            console.log(path.length > 0, path.endsWith('.json'));"
+            console.log(path.length > 0, path.endsWith('.json'), path);"
         ),
-        &[],
+        &cwd,
     );
-    assert_eq!(output, "true true");
+    let mut fields = output.split(' ');
+    assert_eq!(fields.next(), Some("true"), "a path must be produced");
+    assert_eq!(fields.next(), Some("true"), "it must be a json report");
+    let written = PathBuf::from(fields.next().expect("the reported path"));
+    assert!(
+        written.starts_with(&cwd),
+        "an unconfigured directory means the cwd, got {}",
+        written.display()
+    );
+    assert!(written.is_file(), "the report must actually exist on disk");
+
+    let _ = std::fs::remove_dir_all(&cwd);
 }
