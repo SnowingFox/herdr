@@ -385,6 +385,12 @@ fn install(
         pointer.cast::<c_void>().cast_const(),
         0,
     );
+    // `process_wrap`'s stdio handling needs the `uv_stream_t` behind a handle it
+    // was handed, and it cannot read this crate's private allocation. Recording
+    // the pairing in `rn-uv` is how the two namespaces agree without either
+    // reaching into the other.
+    // SAFETY: `state_pointer` is the live state this function just installed.
+    unsafe { rn_uv::streams::attach(scope, object, state_pointer) };
     install_finalizer(scope, object, pointer);
 }
 

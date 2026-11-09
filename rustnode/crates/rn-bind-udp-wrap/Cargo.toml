@@ -1,0 +1,26 @@
+[package]
+name = "rn-bind-udp-wrap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('udp_wrap') for rustnode"
+
+[dependencies]
+libuv-sys2.workspace = true
+rn-core.workspace = true
+rn-uv.workspace = true
+tracing.workspace = true
+rn-v8-sys.workspace = true
+# `getAsyncId` hands out ids from the sequence `lib/internal/async_hooks.js`
+# advances, which lives in the `async_wrap` namespace. Minting a private counter
+# here would produce ids that never match what a hook saw.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
+# `bufferSize` reports a failure into an `ERR_SOCKET_BUFFER_SIZE` context, which
+# needs libuv's own `UV_E*` name and message strings. That table is the `uv`
+# namespace's, so the two cannot disagree about how an error reads.
+rn-bind-uv = { path = "../rn-bind-uv" }
+
+[dev-dependencies]
+serde_json.workspace = true

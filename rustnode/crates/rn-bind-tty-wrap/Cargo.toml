@@ -1,0 +1,18 @@
+[package]
+name = "rn-bind-tty-wrap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('tty_wrap') for rustnode"
+
+[dependencies]
+libuv-sys2.workspace = true
+rn-core.workspace = true
+rn-uv.workspace = true
+tracing.workspace = true
+rn-v8-sys.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

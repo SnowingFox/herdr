@@ -25,7 +25,9 @@ performance
 permission
 pipe_wrap
 process_methods
+process_wrap
 report
+spawn_sync
 stream_wrap
 string_decoder
 symbols
@@ -33,7 +35,9 @@ task_queue
 tcp_wrap
 timers
 trace_events
+tty_wrap
 types
+udp_wrap
 url
 url_pattern
 util

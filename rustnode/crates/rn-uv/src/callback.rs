@@ -29,13 +29,17 @@
 //! the closure so it cannot escape.
 
 use std::cell::RefCell;
-use std::ptr::NonNull;
 
 use rn_v8_sys::v8;
 
 thread_local! {
-    /// The isolate the bindings were installed into.
-    static ISOLATE: RefCell<Option<NonNull<v8::Isolate>>> = const { RefCell::new(None) };
+    /// The isolate the bindings were installed into, as the raw V8 pointer.
+    ///
+    /// It is the *real* isolate pointer, not the address of the Rust `Isolate`
+    /// wrapper: a wrapper reconstructed from its own address has no isolate annex,
+    /// and taking a handle scope from one panics. `as_raw_isolate_ptr` is the
+    /// supported way to keep an isolate reachable across a `uv_run` boundary.
+    static ISOLATE: RefCell<Option<v8::UnsafeRawIsolatePtr>> = const { RefCell::new(None) };
     /// The context the bindings were installed in, rooted.
     static CONTEXT: RefCell<Option<v8::Global<v8::Context>>> = const { RefCell::new(None) };
 }
@@ -48,10 +52,10 @@ thread_local! {
 pub fn remember_context(scope: &mut v8::PinScope<'_, '_>) {
     let isolate: &v8::Isolate = scope.as_ref();
     // SAFETY: the isolate outlives every scope taken from it (it is owned by the
-    // CLI's `main`), so keeping its address is sound for the process' life.
-    let pointer = std::ptr::from_ref(isolate);
+    // CLI's `main`), so keeping a pointer to it is sound for the process' life.
+    let pointer = unsafe { isolate.as_raw_isolate_ptr() };
     ISOLATE.with(|slot| {
-        *slot.borrow_mut() = NonNull::new(pointer.cast_mut());
+        *slot.borrow_mut() = Some(pointer);
     });
     let context = scope.get_current_context();
     CONTEXT.with(|slot| {
@@ -81,10 +85,10 @@ pub fn with_context<R>(
     let context = CONTEXT.with(|slot| slot.borrow().clone())?;
 
     // SAFETY: `isolate_pointer` came from `remember_context`, which stored the
-    // address of the isolate the bindings were installed into. It is still alive
-    // because the loop only runs from the CLI while the isolate exists, and a
-    // libuv completion can only fire from inside `uv_run`.
-    let mut isolate = unsafe { v8::Isolate::from_raw_ptr(isolate_pointer.as_ptr().cast()) };
+    // real isolate pointer for the isolate the bindings were installed into. It is
+    // still alive because the loop only runs from the CLI while the isolate
+    // exists, and a libuv completion can only fire from inside `uv_run`.
+    let mut isolate = unsafe { v8::Isolate::from_raw_isolate_ptr(isolate_pointer) };
 
     let storage = std::pin::pin!(v8::HandleScope::new(&mut isolate));
     let mut scope = storage.init();
