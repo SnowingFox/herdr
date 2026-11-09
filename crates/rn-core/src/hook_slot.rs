@@ -20,6 +20,12 @@ pub enum Hook {
     SourceMaps,
     /// Set when an uncaught exception was reported and the process must exit.
     ExitRequested,
+    /// `setImportModuleDynamicallyCallback`: V8 calls this for `import()`.
+    DynamicImport,
+    /// `setInitializeImportMetaObjectCallback`: fills in `import.meta`.
+    ImportMeta,
+    /// `setImportMetaResolveInitializer`: backs `import.meta.resolve`.
+    ImportMetaResolve,
 }
 
 /// V8 calls this to turn a stack trace into the `error.stack` string.
@@ -28,6 +34,12 @@ pub const CALLBACK: Hook = Hook::PrepareStackTrace;
 pub const SOURCE_MAPS: Hook = Hook::SourceMaps;
 /// Set when an uncaught exception was reported and the process must exit.
 pub const EXIT_REQUESTED: Hook = Hook::ExitRequested;
+/// Callback V8 invokes for a dynamic `import()`.
+pub const DYNAMIC_IMPORT: Hook = Hook::DynamicImport;
+/// Callback that populates `import.meta` for a module.
+pub const IMPORT_META: Hook = Hook::ImportMeta;
+/// Callback behind `import.meta.resolve`.
+pub const IMPORT_META_RESOLVE: Hook = Hook::ImportMetaResolve;
 
 /// Writes text to the process standard error.
 type StderrWriter = Box<dyn Fn(&str)>;
@@ -39,6 +51,9 @@ thread_local! {
 #[derive(Default)]
 struct HookState {
     prepare_stack_trace: Option<v8::Global<v8::Function>>,
+    dynamic_import: Option<v8::Global<v8::Function>>,
+    import_meta: Option<v8::Global<v8::Function>>,
+    import_meta_resolve: Option<v8::Global<v8::Function>>,
     source_maps_enabled: bool,
     exit_requested: bool,
     stderr: Option<StderrWriter>,
@@ -72,9 +87,16 @@ pub fn write_stderr(text: &str) {
 /// Stores the callback for a hook, replacing any previous one.
 pub fn store(scope: &mut v8::PinScope, hook: Hook, callback: v8::Global<v8::Function>) {
     let _ = scope;
-    if hook == Hook::PrepareStackTrace {
-        STATE.with(|state| state.borrow_mut().prepare_stack_trace = Some(callback));
-    }
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        match hook {
+            Hook::PrepareStackTrace => state.prepare_stack_trace = Some(callback),
+            Hook::DynamicImport => state.dynamic_import = Some(callback),
+            Hook::ImportMeta => state.import_meta = Some(callback),
+            Hook::ImportMetaResolve => state.import_meta_resolve = Some(callback),
+            Hook::SourceMaps | Hook::ExitRequested => {}
+        }
+    });
 }
 
 /// Calls the stored `PrepareStackTraceCallback` if there is one.
@@ -102,7 +124,10 @@ pub fn set_flag(scope: &mut v8::PinScope, hook: Hook, value: bool) {
         match hook {
             Hook::SourceMaps => state.source_maps_enabled = value,
             Hook::ExitRequested => state.exit_requested = value,
-            Hook::PrepareStackTrace => {}
+            Hook::PrepareStackTrace
+            | Hook::DynamicImport
+            | Hook::ImportMeta
+            | Hook::ImportMetaResolve => {}
         }
     });
 }
@@ -113,7 +138,10 @@ pub fn flag(hook: Hook) -> bool {
         match hook {
             Hook::SourceMaps => state.source_maps_enabled,
             Hook::ExitRequested => state.exit_requested,
-            Hook::PrepareStackTrace => false,
+            Hook::PrepareStackTrace
+            | Hook::DynamicImport
+            | Hook::ImportMeta
+            | Hook::ImportMetaResolve => false,
         }
     })
 }
