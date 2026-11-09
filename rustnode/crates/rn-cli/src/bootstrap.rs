@@ -224,6 +224,25 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
         ),
         ("internal/event_target", &["CustomEvent"][..]),
         ("internal/encoding", &["TextEncoder", "TextDecoder"][..]),
+        // `util.inspect`'s own test reads `ReadableStream`, and it is an
+        // `[Exposed=*]` interface in Node's `exposed-wildcard` bootstrap. The
+        // module loads fine here, so this is wiring rather than implementation.
+        (
+            "internal/webstreams/readablestream",
+            &["ReadableStream"][..],
+        ),
+        (
+            "internal/webstreams/writablestream",
+            &["WritableStream"][..],
+        ),
+        (
+            "internal/webstreams/transformstream",
+            &["TransformStream"][..],
+        ),
+        (
+            "internal/webstreams/queuingstrategies",
+            &["ByteLengthQueuingStrategy", "CountQueuingStrategy"][..],
+        ),
     ] {
         let (Some(id), Some(array)) = (v8::String::new(scope, module), names_array(scope, names))
         else {
@@ -480,9 +499,19 @@ fn install_process_methods<'s>(
         }
     }
 
-    // `exit` stays the bootstrap's stub: the wrapper's version calls
-    // `process.reallyExit`, and replacing the stub would change what `-e` does
-    // before the event loop exists.
+    // `process.exit` is `process.reallyExit` behind a check, and the wrapper's
+    // version is used here. The comment that used to sit here said `exit` stayed
+    // the bootstrap's stub because the wrapper calls `process.reallyExit`, but
+    // the stub was `globalThis.__exit`, which nothing ever set, so `process.exit`
+    // was a no-op function. `test/common` calls it, and any program that exits
+    // early needs it, so the real wrapper is installed and `reallyExit` is
+    // supplied from the binding.
+    if let Some(value) = get_property(scope, wrapped, "exit") {
+        let _ = set(scope, process, "exit", value);
+    }
+    if let Some(value) = get_property(scope, binding, "reallyExit") {
+        let _ = set(scope, process, "reallyExit", value);
+    }
 
     // `memoryUsage.rss` is `process_methods.rss`, assigned through the function
     // object rather than returned by the wrapper.
