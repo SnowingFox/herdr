@@ -9,5 +9,9 @@ description = "internalBinding('messaging') for rustnode"
 
 [dependencies]
 rn-core.workspace = true
+rn-bind-symbols = { path = "../rn-bind-symbols" }
 rn-v8-sys.workspace = true
 v8.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

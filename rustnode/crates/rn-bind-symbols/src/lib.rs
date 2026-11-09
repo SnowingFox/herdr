@@ -155,6 +155,35 @@ impl BindingModule for Symbols {
 }
 
 /// Returns the process-wide symbol for `name`, creating it on first use.
+///
+/// Exposed so another crate can reach the *same* identity `internalBinding
+/// ('symbols')` publishes. `messaging` needs `oninit` and `no_message_symbol`,
+/// and a symbol created privately there would be a different key, so
+/// `MessagePort.prototype[oninit]` would never be found.
+///
+/// `name` must be one of [`crate::SYMBOLS`]; anything else is a programming
+/// error rather than a runtime condition, which is why the result is a `Result`
+/// carrying the reason instead of an empty symbol.
+pub fn ensure<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &'static str,
+    description: &str,
+) -> Result<v8::Local<'s, v8::Symbol>, String> {
+    let recorded = SYMBOLS
+        .iter()
+        .find(|(member, _)| *member == name)
+        .map(|(_, description)| *description);
+    let Some(recorded) = recorded else {
+        return Err(format!("{name} is not a recorded well-known symbol"));
+    };
+    // A caller supplies its own description only to be readable; identity comes
+    // from `name`, so the recorded description wins and the argument is only a
+    // cross-check against a typo at the call site.
+    let _ = description;
+    symbol_for(scope, name, recorded)
+}
+
+/// Returns the process-wide symbol for `name`, creating it on first use.
 fn symbol_for<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &'static str,

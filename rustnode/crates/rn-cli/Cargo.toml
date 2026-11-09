@@ -26,6 +26,7 @@ rn-module = { path = "../rn-module" }
 rn-io = { path = "../rn-io" }
 rn-bind-timers = { path = "../rn-bind-timers" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
+rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-napi = { path = "../rn-napi" }
 rn-v8-sys = { path = "../rn-v8-sys" }
 tracing.workspace = true

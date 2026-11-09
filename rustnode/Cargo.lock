@@ -906,8 +906,10 @@ dependencies = [
 name = "rn-bind-messaging"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-symbols",
  "rn-core",
  "rn-v8-sys",
+ "serde_json",
  "v8",
 ]
 
@@ -1237,6 +1239,7 @@ name = "rn-cli"
 version = "0.1.0"
 dependencies = [
  "rn-bind-crypto",
+ "rn-bind-messaging",
  "rn-bind-task-queue",
  "rn-bind-timers",
  "rn-bindings",
