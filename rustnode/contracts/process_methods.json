@@ -1,0 +1,165 @@
+{
+  "namespace": "process_methods",
+  "reachable": true,
+  "members": {
+    "_debugEnd": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "_debugProcess": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "_getActiveHandles": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "_getActiveRequests": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "_kill": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "_rawDebug": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "abort": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "availableMemory": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "causeSegfault": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "chdir": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "constrainedMemory": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "cpuUsage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "cwd": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "dlopen": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "dlopenBinary": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "execve": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getActiveResourcesInfo": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "hrtime": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "hrtimeBigInt": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "hrtimeBuffer": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2"
+      ],
+      "origin": "both"
+    },
+    "loadEnvFile": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "memoryUsage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "patchProcessObject": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "reallyExit": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "resetStdioForTesting": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "resourceUsage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "rss": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setEmitWarningSync": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "threadCpuUsage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "umask": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "uptime": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "namespace": "sea",
+  "reachable": true,
+  "members": {
+    "getAsset": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getAssetKeys": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getMainCode": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isExperimentalSeaWarningNeeded": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isSea": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isVfsArchiveEnabled": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isVfsEnabled": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "mainCodePath": {
+      "kind": "unknown",
+      "origin": "static"
+    }
+  }
+}

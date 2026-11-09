@@ -1,0 +1,36 @@
+{
+  "namespace": "profiler",
+  "reachable": true,
+  "members": {
+    "endCoverage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setCoverageDirectory": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setSourceMapCacheGetter": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "startCoverage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "stopCoverage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "takeCoverage": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

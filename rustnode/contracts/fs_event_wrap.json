@@ -1,0 +1,11 @@
+{
+  "namespace": "fs_event_wrap",
+  "reachable": true,
+  "members": {
+    "FSEvent": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

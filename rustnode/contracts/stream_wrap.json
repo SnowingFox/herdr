@@ -1,0 +1,47 @@
+{
+  "namespace": "stream_wrap",
+  "reachable": true,
+  "members": {
+    "ShutdownWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "WriteWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "kArrayBufferOffset": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kBytesWritten": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kLastWriteErr": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kLastWriteWasAsync": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kReadBytesOrError": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "streamBaseState": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "origin": "both"
+    }
+  }
+}

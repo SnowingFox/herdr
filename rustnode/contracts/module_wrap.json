@@ -1,0 +1,72 @@
+{
+  "namespace": "module_wrap",
+  "reachable": true,
+  "members": {
+    "ModuleWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "createRequiredModuleFacade": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "kDeferPhase": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kErrored": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kEvaluated": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kEvaluating": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kEvaluationPhase": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kInstantiated": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kInstantiating": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kSourcePhase": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "kUninstantiated": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "setImportMetaResolveInitializer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setImportModuleDynamicallyCallback": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setInitializeImportMetaObjectCallback": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "throwIfPromiseRejected": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

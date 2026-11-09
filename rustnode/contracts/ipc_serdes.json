@@ -1,0 +1,16 @@
+{
+  "namespace": "ipc_serdes",
+  "reachable": true,
+  "members": {
+    "deserialize": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "serialize": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

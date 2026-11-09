@@ -1,0 +1,27 @@
+{
+  "namespace": "pipe_wrap",
+  "reachable": true,
+  "members": {
+    "Pipe": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "PipeConnectWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "constants": {
+      "kind": "object",
+      "properties": [
+        "IPC",
+        "SERVER",
+        "SOCKET",
+        "UV_READABLE",
+        "UV_WRITABLE"
+      ],
+      "origin": "both"
+    }
+  }
+}

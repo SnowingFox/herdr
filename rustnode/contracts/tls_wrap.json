@@ -1,0 +1,20 @@
+{
+  "namespace": "tls_wrap",
+  "reachable": true,
+  "members": {
+    "HAVE_SSL_TRACE": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "TLSWrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "wrap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

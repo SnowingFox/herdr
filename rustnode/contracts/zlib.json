@@ -1,0 +1,45 @@
+{
+  "namespace": "zlib",
+  "reachable": true,
+  "members": {
+    "BrotliDecoder": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "BrotliEncoder": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ZLIB_VERSION": {
+      "kind": "string",
+      "origin": "runtime"
+    },
+    "Zlib": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ZstdCompress": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "ZstdDecompress": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "crc32": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "crc32c": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

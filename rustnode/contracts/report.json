@@ -1,0 +1,106 @@
+{
+  "namespace": "report",
+  "reachable": true,
+  "members": {
+    "getCompact": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getDirectory": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getExcludeEnv": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getExcludeNetwork": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getFilename": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getReport": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getSignal": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setCompact": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setDirectory": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setExcludeEnv": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setExcludeNetwork": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setFilename": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setReportOnFatalError": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setReportOnSignal": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setReportOnUncaughtException": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setSignal": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "shouldReportOnFatalError": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "shouldReportOnSignal": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "shouldReportOnUncaughtException": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "writeReport": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

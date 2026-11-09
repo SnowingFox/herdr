@@ -1,0 +1,51 @@
+{
+  "namespace": "config",
+  "reachable": true,
+  "members": {
+    "bits": {
+      "kind": "number",
+      "origin": "runtime"
+    },
+    "getDefaultLocale": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "hasInspector": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "hasIntl": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "hasNodeOptions": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "hasOpenSSL": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "hasSmallICU": {
+      "kind": "unknown",
+      "origin": "static"
+    },
+    "hasTracing": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "isDebugBuild": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "noBrowserGlobals": {
+      "kind": "boolean",
+      "origin": "both"
+    },
+    "openSSLIsBoringSSL": {
+      "kind": "boolean",
+      "origin": "both"
+    }
+  }
+}

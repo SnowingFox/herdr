@@ -1,0 +1,66 @@
+{
+  "namespace": "errors",
+  "reachable": true,
+  "members": {
+    "exitCodes": {
+      "kind": "object",
+      "properties": [
+        "kAbort",
+        "kBootstrapFailure",
+        "kExceptionInFatalExceptionHandler",
+        "kGenericUserError",
+        "kInternalJSEvaluationFailure",
+        "kInternalJSParseError",
+        "kInvalidCommandLineArgument",
+        "kInvalidCommandLineArgument2",
+        "kInvalidFatalExceptionMonkeyPatching",
+        "kNoFailure",
+        "kProcessTimeout",
+        "kStartupSnapshotFailure",
+        "kUnsettledTopLevelAwait",
+        "kV8FatalError"
+      ],
+      "origin": "both"
+    },
+    "getErrorSourcePositions": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "noSideEffectsToString": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setEnhanceStackForFatalException": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setGetSourceMapErrorSource": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setMaybeCacheGeneratedSourceMap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setPrepareStackTraceCallback": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setSourceMapsEnabled": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "triggerUncaughtException": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

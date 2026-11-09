@@ -1,0 +1,11 @@
+{
+  "namespace": "wasi",
+  "reachable": true,
+  "members": {
+    "WASI": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    }
+  }
+}

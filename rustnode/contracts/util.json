@@ -1,0 +1,227 @@
+{
+  "namespace": "util",
+  "reachable": true,
+  "members": {
+    "arrayBufferViewHasBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "constants": {
+      "kind": "object",
+      "properties": [
+        "ALL_PROPERTIES",
+        "ONLY_CONFIGURABLE",
+        "ONLY_ENUMERABLE",
+        "ONLY_WRITABLE",
+        "SKIP_STRINGS",
+        "SKIP_SYMBOLS",
+        "kCloneable",
+        "kDisallowCloneAndTransfer",
+        "kExitCode",
+        "kExiting",
+        "kFulfilled",
+        "kHasExitCode",
+        "kPending",
+        "kRejected",
+        "kTransferable"
+      ],
+      "origin": "both"
+    },
+    "constructSharedArrayBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "defineLazyProperties": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCallSites": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getCallerLocation": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getConstructorName": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getExternalValue": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getOwnNonIndexProperties": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getPromiseDetails": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getProxyDetails": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "getSharedArrayBufferGrowable": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "guessHandleType": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isAnyArrayBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isArrayBuffer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isArrayBufferView": {
+      "kind": "function",
+      "arity": 1,
+      "origin": "runtime"
+    },
+    "isAsyncFunction": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isDataView": {
+      "kind": "function",
+      "arity": 1,
+      "origin": "runtime"
+    },
+    "isDate": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isExternal": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isInsideNodeModules": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "isMap": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isMapIterator": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isNativeError": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isPromise": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isRegExp": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isSet": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isSetIterator": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "isTypedArray": {
+      "kind": "function",
+      "arity": 1,
+      "origin": "runtime"
+    },
+    "isUint8Array": {
+      "kind": "function",
+      "arity": 1,
+      "origin": "runtime"
+    },
+    "markPromiseAsHandled": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "parseEnv": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "previewEntries": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "privateSymbols": {
+      "kind": "object",
+      "properties": [
+        "arrow_message_private_symbol",
+        "contextify_context_private_symbol",
+        "decorated_private_symbol",
+        "empty_context_frame_sentinel_symbol",
+        "entry_point_module_private_symbol",
+        "entry_point_promise_private_symbol",
+        "exit_info_private_symbol",
+        "ffi_pointer_address_private_symbol",
+        "host_defined_option_symbol",
+        "js_transferable_wrapper_private_symbol",
+        "module_circular_visited_private_symbol",
+        "module_export_names_private_symbol",
+        "module_export_private_symbol",
+        "module_first_parent_private_symbol",
+        "module_last_parent_private_symbol",
+        "module_source_private_symbol",
+        "napi_type_tag",
+        "napi_wrapper",
+        "promise_trace_id",
+        "source_map_data_private_symbol",
+        "transfer_mode_private_symbol",
+        "untransferable_object_private_symbol"
+      ],
+      "origin": "both"
+    },
+    "shouldAbortOnUncaughtToggle": {
+      "kind": "object",
+      "properties": [
+        "0"
+      ],
+      "origin": "both"
+    },
+    "sleep": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

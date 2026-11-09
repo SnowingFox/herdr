@@ -1,0 +1,42 @@
+{
+  "namespace": "task_queue",
+  "reachable": true,
+  "members": {
+    "enqueueMicrotask": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "promiseRejectEvents": {
+      "kind": "object",
+      "properties": [
+        "kPromiseHandlerAddedAfterReject",
+        "kPromiseRejectWithNoHandler"
+      ],
+      "origin": "both"
+    },
+    "runMicrotasks": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setPromiseRejectCallback": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setTickCallback": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "tickInfo": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1"
+      ],
+      "origin": "both"
+    }
+  }
+}

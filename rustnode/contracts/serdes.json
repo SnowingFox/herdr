@@ -1,0 +1,16 @@
+{
+  "namespace": "serdes",
+  "reachable": true,
+  "members": {
+    "Deserializer": {
+      "kind": "function",
+      "arity": 1,
+      "origin": "both"
+    },
+    "Serializer": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

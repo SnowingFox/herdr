@@ -1,0 +1,24 @@
+{
+  "namespace": "block_list",
+  "reachable": true,
+  "members": {
+    "AF_INET": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "AF_INET6": {
+      "kind": "number",
+      "origin": "both"
+    },
+    "BlockList": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "SocketAddress": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}

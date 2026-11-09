@@ -1,0 +1,221 @@
+{
+  "namespace": "async_wrap",
+  "reachable": true,
+  "members": {
+    "Providers": {
+      "kind": "object",
+      "properties": [
+        "ARGON2REQUEST",
+        "BLOBREADER",
+        "CHECKPRIMEREQUEST",
+        "CIPHERREQUEST",
+        "DERIVEBITSREQUEST",
+        "DIRHANDLE",
+        "DNSCHANNEL",
+        "DTLS_ENDPOINT",
+        "DTLS_SESSION",
+        "ELDHISTOGRAM",
+        "FILEHANDLE",
+        "FILEHANDLECLOSEREQ",
+        "FSEVENTWRAP",
+        "FSREQCALLBACK",
+        "FSREQPROMISE",
+        "GETADDRINFOREQWRAP",
+        "GETNAMEINFOREQWRAP",
+        "GLOBREQUEST",
+        "HASHREQUEST",
+        "HEAPSNAPSHOT",
+        "HTTP2PING",
+        "HTTP2SESSION",
+        "HTTP2SETTINGS",
+        "HTTP2STREAM",
+        "HTTPCLIENTREQUEST",
+        "HTTPINCOMINGMESSAGE",
+        "JSSTREAM",
+        "KEYEXPORTREQUEST",
+        "KEYGENREQUEST",
+        "KEYPAIRGENREQUEST",
+        "LOCKS",
+        "MESSAGEPORT",
+        "NONE",
+        "PBKDF2REQUEST",
+        "PIPECONNECTWRAP",
+        "PIPESERVERWRAP",
+        "PIPEWRAP",
+        "PROCESSWRAP",
+        "PROMISE",
+        "QUERYWRAP",
+        "QUIC_ENDPOINT",
+        "QUIC_LOGSTREAM",
+        "QUIC_SESSION",
+        "QUIC_STREAM",
+        "QUIC_UDP",
+        "RANDOMBYTESREQUEST",
+        "RANDOMPRIMEREQUEST",
+        "SCRYPTREQUEST",
+        "SHUTDOWNWRAP",
+        "SIGINTWATCHDOG",
+        "SIGNALWRAP",
+        "SIGNREQUEST",
+        "STATWATCHER",
+        "STREAMPIPE",
+        "TCPCONNECTWRAP",
+        "TCPSERVERWRAP",
+        "TCPWRAP",
+        "TLSWRAP",
+        "TTYWRAP",
+        "UDPSENDWRAP",
+        "UDPWRAP",
+        "VERIFYREQUEST",
+        "WORKER",
+        "WORKERCPUPROFILE",
+        "WORKERCPUUSAGE",
+        "WORKERHEAPPROFILE",
+        "WORKERHEAPSNAPSHOT",
+        "WORKERHEAPSTATISTICS",
+        "WRITEWRAP",
+        "ZLIB"
+      ],
+      "origin": "both"
+    },
+    "async_hook_fields": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8"
+      ],
+      "origin": "both"
+    },
+    "async_id_fields": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "2",
+        "3"
+      ],
+      "origin": "both"
+    },
+    "async_ids_stack": {
+      "kind": "object",
+      "properties": [
+        "0",
+        "1",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "2",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27",
+        "28",
+        "29",
+        "3",
+        "30",
+        "31",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9"
+      ],
+      "origin": "both"
+    },
+    "clearAsyncIdStack": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "constants": {
+      "kind": "object",
+      "properties": [
+        "kAfter",
+        "kAsyncIdCounter",
+        "kBefore",
+        "kCheck",
+        "kDefaultTriggerAsyncId",
+        "kDestroy",
+        "kExecutionAsyncId",
+        "kInit",
+        "kPromiseResolve",
+        "kStackLength",
+        "kTotals",
+        "kTriggerAsyncId",
+        "kUsesExecutionAsyncResource"
+      ],
+      "origin": "both"
+    },
+    "executionAsyncResource": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "execution_async_resources": {
+      "kind": "object",
+      "properties": [
+        "length"
+      ],
+      "origin": "both"
+    },
+    "getPromiseHooks": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "runtime"
+    },
+    "popAsyncContext": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "pushAsyncContext": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "queueDestroyAsyncId": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "registerDestroyHook": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setCallbackTrampoline": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setPromiseHooks": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    },
+    "setupHooks": {
+      "kind": "function",
+      "arity": 0,
+      "origin": "both"
+    }
+  }
+}
