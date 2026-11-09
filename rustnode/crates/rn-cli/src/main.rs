@@ -361,7 +361,12 @@ fn forward_v8_flags(args: &[String]) {
     /// in `node_options.cc`, so this is the faithful place for it.
     const FORWARDED: &[&str] = &["--max-old-space-size=", "--stack-size="];
     /// V8 flags spelled with no value.
-    const FORWARDED_BARE: &[&str] = &["--expose-gc"];
+    ///
+    /// Both spellings appear in Node's own test headers — `--expose-gc` and
+    /// `--expose_gc` — and V8 accepts either, so both are forwarded. Matching
+    /// only the dashed form left `test-abortsignal-drop-settled-signals.mjs`
+    /// failing on a flag the harness had already passed through.
+    const FORWARDED_BARE: &[&str] = &["--expose-gc", "--expose_gc"];
 
     for argument in args {
         if FORWARDED.iter().any(|prefix| argument.starts_with(prefix))
