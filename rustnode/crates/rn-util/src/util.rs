@@ -58,14 +58,6 @@ pub const MEMBERS: &[&str] = &[
 /// Members the namespace needs but this crate does not install yet.
 pub const DEFERRED: &[(&str, &str)] = &[
     (
-        "getCallerLocation",
-        "positional caller lookup, lands with structured stacks",
-    ),
-    (
-        "previewEntries",
-        "Map/Set previews for util.inspect; needs the entry iteration protocol",
-    ),
-    (
         "getSharedArrayBufferGrowable",
         "growable SAB flag, follows the buffer namespace",
     ),
@@ -79,10 +71,12 @@ pub const DEFERRED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Property filter bits from V8's `PropertyFilter`, used by
-/// `getOwnNonIndexProperties`.
-const SKIP_STRINGS: u32 = 1 << 0;
-const SKIP_SYMBOLS: u32 = 1 << 1;
+/// The `SKIP_SYMBOLS` bit, used as the default when a caller omits the filter.
+///
+/// `internal/util/inspect.js` always passes one, so this only covers a direct
+/// caller. It mirrors the `util.constants` table published above rather than
+/// re-deriving the value.
+const SKIP_SYMBOLS: u32 = 1 << 4;
 
 /// What `defineLazyProperties` was told to resolve a property from.
 ///
@@ -140,6 +134,7 @@ impl BindingModule for Util {
             "defineLazyProperties" => define_lazy_properties,
             "getConstructorName" => get_constructor_name,
             "getCallSites" => get_call_sites,
+            "getCallerLocation" => get_caller_location,
             "getExternalValue" => get_external_value,
             "getOwnNonIndexProperties" => get_own_non_index_properties,
             "getPromiseDetails" => get_promise_details,
@@ -147,11 +142,29 @@ impl BindingModule for Util {
             "guessHandleType" => guess_handle_type,
             "isInsideNodeModules" => is_inside_node_modules,
             "markPromiseAsHandled" => mark_promise_as_handled,
+            "previewEntries" => preview_entries,
             "sleep" => sleep,
         }
 
         // `constants` is a nested object rather than a function.
+        //
+        // `internal/util/inspect.js` destructures `ALL_PROPERTIES` and
+        // `ONLY_ENUMERABLE` from it to choose a property filter, and
+        // `internal/util/types.js` reads the `k*` promise and transfer-mode
+        // codes. Leaving the object empty — as this used to — made every one of
+        // those `undefined`, so `getOwnNonIndexProperties(value, undefined)`
+        // fell back to filter 0 (`ALL_PROPERTIES`) and `util.inspect` printed
+        // `[length]` even without `showHidden`.
         let constants = v8::Object::new(scope);
+        for (name, value) in UTIL_CONSTANTS {
+            let (Some(key), value) = (
+                v8::String::new(scope, name),
+                v8::Integer::new(scope, *value),
+            ) else {
+                continue;
+            };
+            constants.set(scope, key.into(), value.into());
+        }
         if let Some(key) = v8::String::new(scope, "constants") {
             object.set(scope, key.into(), constants.into());
         }
@@ -159,6 +172,31 @@ impl BindingModule for Util {
         Ok(object)
     }
 }
+
+/// `util.constants`, from `src/node_util.cc`'s `Initialize`.
+///
+/// The property filters are V8's `PropertyFilter` bits, which is why they are
+/// powers of two; `kPending` and friends are `v8::Promise::PromiseState`, and the
+/// transfer modes are `BaseObject::TransferMode`. Both of the latter are
+/// `util.inspect`'s own numbering, so none of these can be renumbered here.
+pub const UTIL_CONSTANTS: &[(&str, i32)] = &[
+    // `v8::PropertyFilter`.
+    ("ALL_PROPERTIES", 0),
+    ("ONLY_WRITABLE", 1 << 0),
+    ("ONLY_ENUMERABLE", 1 << 1),
+    ("ONLY_CONFIGURABLE", 1 << 2),
+    ("SKIP_STRINGS", 1 << 3),
+    ("SKIP_SYMBOLS", 1 << 4),
+    // `v8::Promise::PromiseState`, which `getPromiseDetails` reports.
+    ("kPending", 0),
+    ("kFulfilled", 1),
+    ("kRejected", 2),
+    // `BaseObject::TransferMode`, which `util.inspect` reads for a
+    // transferred object.
+    ("kDisallowCloneAndTransfer", 0),
+    ("kTransferable", 1),
+    ("kCloneable", 2),
+];
 
 /// The predicates `lib/**` reads from this namespace rather than from `types`.
 fn install_predicates(scope: &mut v8::PinScope, object: v8::Local<v8::Object>) {
@@ -492,6 +530,42 @@ fn get_constructor_name(
 /// (`// Frame 0 is node:util. It should be skipped.`). The frame above it is
 /// `lib/util.js`'s `getCallSites`, and that one *is* reported — callers index
 /// into the result expecting their own frame at `[1]`, not `[0]`.
+/// `getCallerLocation()`: `[line, column, scriptName]` for the frame that called
+/// the binding.
+///
+/// `internal/test_runner/{harness,test}.js` call it to attribute a `test()`/`it()`
+/// call to the file that made it, so a missing member makes every one of those
+/// tests throw `getCallerLocation is not a function`.
+///
+/// Node captures two frames — this binding, then its caller — and returns
+/// `undefined` when there are not exactly two, which is the case when the call
+/// comes from the top level of a script.
+fn get_caller_location(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    let Some(stack) = v8::StackTrace::current_stack_trace(scope, 2) else {
+        return;
+    };
+    if stack.get_frame_count() != 2 {
+        return;
+    }
+    let Some(frame) = stack.get_frame(scope, 1) else {
+        return;
+    };
+    let Some(file) = frame.get_script_name_or_source_url(scope) else {
+        return;
+    };
+    let line = i32::try_from(frame.get_line_number()).unwrap_or(-1);
+    let column = i32::try_from(frame.get_column()).unwrap_or(-1);
+    let result = v8::Array::new(scope, 3);
+    result.set_index(scope, 0, v8::Integer::new(scope, line).into());
+    result.set_index(scope, 1, v8::Integer::new(scope, column).into());
+    result.set_index(scope, 2, file.into());
+    rv.set(result.into());
+}
+
 fn get_call_sites(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -578,6 +652,27 @@ fn get_external_value(
     rv.set(v8::Number::new(scope, pointer as f64).into());
 }
 
+/// `getOwnNonIndexProperties(value, filter)`: the object's own non-index keys.
+///
+/// `src/node_util.cc` implements it as
+/// `GetPropertyNames(context, kOwnOnly, filter, kSkipIndices)`. The filter is the
+/// caller's, and it matters: `internal/util/inspect.js` passes `ALL_PROPERTIES`
+/// when `showHidden` is set, which is the only way `[length]: 3` reaches an
+/// array's output. Enumerating with `Default` — whose `ONLY_ENUMERABLE` skips
+/// `length` — silently dropped it, so `util.inspect([1,2,3], true)` printed
+/// `[ 1, 2, 3 ]` instead.
+///
+/// # Why this enumerates with `get_own_property_names`
+///
+/// `Object::get_property_names` with `KeyCollectionMode::OwnOnly` ignores
+/// `IndexFilter::SkipIndices` in this V8 binding: an array reports `["0", "1"]`
+/// where Node reports nothing, and a `deepStrictEqual` between two equal arrays
+/// then compares an extra key and fails with "same structure but are not
+/// reference-equal". `Object::get_own_property_names` returns exactly the key set
+/// Node's C++ produces — indices excluded, `length` included when it is
+/// non-enumerable, symbols included — so this uses it and applies the caller's
+/// string/symbol filter to the result. One V8 API short of Node's C++, and
+/// observably identical.
 fn get_own_non_index_properties(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -591,17 +686,26 @@ fn get_own_non_index_properties(
         .number_value(scope)
         .unwrap_or(SKIP_SYMBOLS as f64) as u32;
 
+    // The caller's filter, so `ALL_PROPERTIES` keeps `length` for
+    // `util.inspect(value, true)`. `get_own_property_names` accepts it directly
+    // and, unlike `get_property_names` with `OwnOnly`, does not consult an index
+    // filter at all — so indices have to be excluded here.
+    let names_args = v8::GetPropertyNamesArgs {
+        mode: v8::KeyCollectionMode::OwnOnly,
+        property_filter: property_filter(filter),
+        index_filter: v8::IndexFilter::SkipIndices,
+        key_conversion: v8::KeyConversionMode::ConvertToString,
+    };
+
     let mut names: Vec<v8::Local<'_, v8::Name>> = Vec::new();
-    if let Some(properties) = object.get_own_property_names(scope, Default::default()) {
+    if let Some(properties) = object.get_own_property_names(scope, names_args) {
         let length = properties.length();
         for index in 0..length {
             let Some(entry) = properties.get_index(scope, index) else {
                 continue;
             };
-            if filter & SKIP_STRINGS != 0 && entry.is_string() {
-                continue;
-            }
-            if filter & SKIP_SYMBOLS != 0 && entry.is_symbol() {
+            // An array index, which the "NonIndex" in the name excludes.
+            if is_array_index(scope, &entry) {
                 continue;
             }
             if let Ok(name) = v8::Local::<v8::Name>::try_from(entry) {
@@ -615,6 +719,87 @@ fn get_own_non_index_properties(
         array.set_index(scope, index as u32, name.into());
     }
     rv.set(array.into());
+}
+
+/// Whether a property key is a canonical array index (`0` ..= `2^32 - 2`).
+///
+/// V8's `IndexFilter::kSkipIndices` defines the excluded set as exactly the
+/// canonical numeric keys in that range, so a key that parses but does not
+/// round-trip (`"01"`, `"-1"`, `"4294967295"`) is an ordinary named property.
+fn is_array_index(scope: &mut v8::PinScope<'_, '_>, key: &v8::Local<v8::Value>) -> bool {
+    let Some(text) = key.to_string(scope) else {
+        return false;
+    };
+    let text = text.to_rust_string_lossy(scope);
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    // Leading zeros are not canonical, and `u32::MAX` is reserved for `length`.
+    if text.len() > 1 && text.starts_with('0') {
+        return false;
+    }
+    text.parse::<u32>()
+        .map(|value| value < u32::MAX)
+        .unwrap_or(false)
+}
+
+/// The `v8::PropertyFilter` bits a caller's numeric filter names.
+///
+/// `internal/util/inspect.js` passes the values
+/// `internalBinding('util').constants` publishes, so the numbers are V8's own
+/// `PropertyFilter` enum. The `v8` crate keeps that type's bits private — there
+/// is no `from_bits` — so the five known bits are rebuilt here. An unknown bit
+/// cannot be expressed and is dropped, which matches V8 ignoring bits it does
+/// not define.
+fn property_filter(filter: u32) -> v8::PropertyFilter {
+    let mut result = v8::PropertyFilter::ALL_PROPERTIES;
+    for (bit, value) in [
+        (1 << 0, v8::PropertyFilter::ONLY_WRITABLE),
+        (1 << 1, v8::PropertyFilter::ONLY_ENUMERABLE),
+        (1 << 2, v8::PropertyFilter::ONLY_CONFIGURABLE),
+        (1 << 3, v8::PropertyFilter::SKIP_STRINGS),
+        (1 << 4, v8::PropertyFilter::SKIP_SYMBOLS),
+    ] {
+        if filter & bit != 0 {
+            result = result | value;
+        }
+    }
+    result
+}
+
+/// `previewEntries(value[, checkKeyValue])`: the elements of a `Map`, `Set`,
+/// `WeakMap`, `WeakSet` or one of their iterators, for `util.inspect`'s preview.
+///
+/// `src/util.cc`'s `PreviewEntries` returns the array on its own unless a second
+/// argument is given, in which case it returns `[entries, isKeyValue]`. That
+/// distinction is observable: `util.inspect` calls the one-argument form for a
+/// `Set` and destructures the two-element form `true` for a `Map`, because a
+/// `Map`'s preview entries arrive flattened as `[k1, v1, k2, v2, ...]` and it has
+/// to know to regroup them.
+///
+/// `v8::Object::PreviewEntries` supplies both the array and that flag in one call,
+/// which is exactly what Node's C++ does.
+fn preview_entries(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    let Ok(object) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        return;
+    };
+    let (entries, is_key_value) = object.preview_entries(scope);
+    let Some(entries) = entries else {
+        return;
+    };
+    // One argument: the array itself, as `src/util.cc` does.
+    if args.length() == 1 {
+        rv.set(entries.into());
+        return;
+    }
+    let result = v8::Array::new(scope, 2);
+    result.set_index(scope, 0, entries.into());
+    result.set_index(scope, 1, v8::Boolean::new(scope, is_key_value).into());
+    rv.set(result.into());
 }
 
 /// Returns `[state, value]` for a promise, matching what `util.inspect` reads.

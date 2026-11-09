@@ -907,6 +907,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-heap-utils"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-http-parser"
 version = "0.1.0"
 dependencies = [
@@ -1240,6 +1248,7 @@ dependencies = [
  "rn-bind-fs-dir",
  "rn-bind-fs-event-wrap",
  "rn-bind-glob",
+ "rn-bind-heap-utils",
  "rn-bind-http-parser",
  "rn-bind-icu",
  "rn-bind-js-stream",
@@ -1298,6 +1307,7 @@ name = "rn-cli"
 version = "0.1.0"
 dependencies = [
  "rn-bind-crypto",
+ "rn-bind-heap-utils",
  "rn-bind-messaging",
  "rn-bind-task-queue",
  "rn-bind-timers",
