@@ -148,18 +148,26 @@ fn an_unrefed_deadline_still_fires_while_refed_work_keeps_the_loop_turning() {
     // phase, which is after the current poll phase, and a loaded scheduler can
     // put either first. Node's own documentation calls this order
     // non-deterministic. What this test is about is that the unref'd timer runs
-    // *at all* while something else keeps the loop turning, so that is what it
-    // checks, on both runtimes.
-    let printed = same_as_node(
-        "setTimeout(() => console.log('timer'), 0).unref();\n\
-         setImmediate(() => console.log('immediate'));",
-    );
-    let mut lines: Vec<&str> = printed.lines().collect();
-    lines.sort_unstable();
+    // *at all* while something else keeps the loop turning, so it compares the
+    // set of lines both runtimes printed rather than their order.
+    //
+    // `same_as_node` is deliberately not used here: it asserts the two outputs
+    // are byte-identical, which is exactly the race this test must not depend
+    // on. It flaked under `cargo test --workspace` for that reason.
+    let script = "setTimeout(() => console.log('timer'), 0).unref();\n\
+                  setImmediate(() => console.log('immediate'));";
+    let mut expected: Vec<String> = node(script).lines().map(str::to_string).collect();
+    let mut actual: Vec<String> = rustnode(script).lines().map(str::to_string).collect();
+    expected.sort_unstable();
+    actual.sort_unstable();
     assert_eq!(
-        lines,
+        actual, expected,
+        "both runtimes must print the same set of lines, in any order"
+    );
+    assert_eq!(
+        actual,
         ["immediate", "timer"],
-        "both callbacks must run, got {printed:?}"
+        "the unref'd timer must still run while ref'd work keeps the loop turning"
     );
 }
 
