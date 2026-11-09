@@ -10,6 +10,9 @@ description = "internalBinding('http_parser') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+# `consume(handle)` has to resolve a JavaScript stream handle to its
+# `uv_stream_t`, which is the pairing `rn-uv` owns for every binding.
+rn-uv.workspace = true
 
 [build-dependencies]
 # Compiles the vendored llhttp. Node parses HTTP with this generated C state

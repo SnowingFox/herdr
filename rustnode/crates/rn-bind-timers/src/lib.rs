@@ -618,39 +618,85 @@ unsafe fn run_timer_callback() {
     });
 }
 
-/// Restarts or stops the timer handle from `processTimers`' return value.
+/// Re-arms the timer handle from `processTimers`' return value.
 ///
-/// This is `TimerWrap::Restart`/`TimerWrap::Stop` in `src/timer_wrap.cc`, with
-/// the sign of the value choosing between them.
+/// This is `Environment::RunTimers` in `src/env.cc`, and the sign convention is
+/// three cases, not two:
+///
+/// | value | meaning | reaction |
+/// | --- | --- | --- |
+/// | `0` | no timer lists left | unref the handle |
+/// | `> 0` | next expiry, at least one *ref'd* timer behind it | re-arm for it, `uv_ref` |
+/// | `< 0` | `-expiry` of the next list, **no** ref'd timer behind it | re-arm for it, `uv_unref` |
+///
+/// The negative case is the one that is easy to get wrong, and getting it wrong
+/// is invisible until a second timer list exists. Treating a negative value as
+/// "stop" instead of "re-arm unref'd" drops the pending unref'd deadline: after
+/// the earlier list fires, `processTimers` returns `-expiry`, the handle stops,
+/// and nothing ever arms it again because `lib/internal/timers.js` only calls
+/// `scheduleTimer` when a *new* list beats `nextExpiry`. The next expiry is
+/// already known to it, so it stays silent and the timer never runs.
+///
+/// That is exactly the shape of the keep-alive failure: `lib/net.js` arms a 500ms
+/// unref'd connect timer beside an application timer, and any application timer
+/// longer than 500ms was dropped at the moment the connect timer fired. It is
+/// also why the failure looked delay-dependent rather than ref-dependent.
 fn apply_timer_result(value: Option<f64>) {
     let Some(value) = value else {
+        // `processTimers` was replaced or reported nothing, so there is no
+        // deadline to arm, matching Node's `ret.IsEmpty()` early return.
         stop_timer();
         return;
     };
-    if value > 0.0 {
-        // A ref'd deadline is still pending, so the handle is re-armed for it.
-        let Some(timer) = ensure_timer_handle() else {
-            return;
-        };
-        // `processTimers` returns an absolute deadline and `uv_timer_start` takes
-        // a delay, so the loop's cached time is subtracted here. The cache is
-        // refreshed first for the same reason `scheduleTimer` refreshes it: the
-        // callback that produced `value` may have taken milliseconds.
-        rn_uv::uv_loop::update_time();
-        let now = rn_uv::uv_loop::now_ms();
-        let delay = (value - now).max(0.0);
-        // SAFETY: `timer` is the live handle this module owns.
-        let status = unsafe { uv::uv_timer_start(timer, Some(on_timer), delay.ceil() as u64, 0) };
-        if status != 0 {
-            tracing::error!(status, "uv_timer_start failed while re-arming");
-        }
+    if value == 0.0 {
+        // Nothing is scheduled. Node does not stop the handle here — the one-shot
+        // timer is already inactive after firing — but it does drop the ref so an
+        // idle timer handle cannot keep the process alive.
+        unref_timer();
         return;
     }
-    // Zero and negative both mean "nothing here keeps the loop alive": zero is
-    // an empty list and a negative value is a deadline with only unref'd timers
-    // behind it. `uv_timer_stop` is what makes the handle inactive, and it leaves
-    // the ref bit alone, so the next `scheduleTimer` can start it again.
-    stop_timer();
+
+    let Some(timer) = ensure_timer_handle() else {
+        return;
+    };
+    // A negative value's magnitude is the absolute deadline, so both signs are
+    // re-armed; only the ref bit differs. `processTimers` reports an absolute
+    // deadline and `uv_timer_start` takes a delay, so the loop's cached time is
+    // subtracted. The cache is refreshed first for the same reason
+    // `scheduleTimer` refreshes it: the callback that produced `value` may have
+    // taken milliseconds.
+    rn_uv::uv_loop::update_time();
+    let now = rn_uv::uv_loop::now_ms();
+    let deadline = value.abs();
+    // `duration_ms > 0 ? duration_ms : 1` in Node: a deadline that has already
+    // passed is armed for one millisecond rather than zero, so the next iteration
+    // runs it after poll rather than spinning.
+    let delay = ((deadline - now) as u64).max(1);
+    // SAFETY: `timer` is the live handle this module owns.
+    let status = unsafe { uv::uv_timer_start(timer, Some(on_timer), delay, 0) };
+    if status != 0 {
+        tracing::error!(status, "uv_timer_start failed while re-arming");
+        return;
+    }
+    // `expiry_ms > 0 ? uv_ref(h) : uv_unref(h)`. Leaving a re-armed handle ref'd
+    // when only unref'd timers remain would hold the process open for a deadline
+    // that was explicitly excluded from keeping it alive.
+    // SAFETY: `timer` is the live handle this module owns.
+    unsafe {
+        if value > 0.0 {
+            uv::uv_ref(timer.cast());
+        } else {
+            uv::uv_unref(timer.cast());
+        }
+    }
+}
+
+/// `uv_unref`s the timer handle without touching its (already elapsed) arming.
+fn unref_timer() {
+    if let Some(timer) = timer_handle() {
+        // SAFETY: `timer` is the live handle this module owns.
+        unsafe { uv::uv_unref(timer.cast()) };
+    }
 }
 
 /// Stops the loop's timer handle, as `uv_timer_stop` does.
@@ -909,6 +955,85 @@ mod tests {
                 "check starts on demand"
             );
             assert_eq!(uv::uv_is_active(first.1.cast()), 0, "idle starts on demand");
+        }
+    }
+
+    #[test]
+    fn a_negative_process_timers_result_rearms_the_handle_instead_of_stopping_it() {
+        // `processTimers` returns `-expiry` when the next deadline has no ref'd
+        // timer behind it. Node's `Environment::RunTimers` re-arms for it and
+        // unrefs; treating the value as "stop" drops the pending deadline and the
+        // timer never fires, because `lib/internal/timers.js` only calls
+        // `scheduleTimer` for a *new* list that beats `nextExpiry` — the pending
+        // one is already known to it, so it stays silent forever.
+        //
+        // This asserts the handle really becomes active and ref-less, which is
+        // the pair that makes a later iteration expire it without keeping the
+        // process alive.
+        let timer = ensure_timer_handle().expect("the loop is creatable");
+        // A deadline in the future relative to the loop's cached clock, expressed
+        // the way `processTimers` does for the unref'd case.
+        rn_uv::uv_loop::update_time();
+        let now = rn_uv::uv_loop::now_ms();
+        apply_timer_result(Some(-(now + 60_000.0)));
+
+        // SAFETY: `timer` is the live handle this module owns.
+        unsafe {
+            assert_eq!(
+                uv::uv_is_active(timer.cast()),
+                1,
+                "a negative result must leave the handle armed"
+            );
+            assert_eq!(
+                uv::uv_has_ref(timer.cast()),
+                0,
+                "an unref'd deadline must not keep the process alive"
+            );
+            // Leave the loop as it was found, or the test process would stay
+            // alive for a minute.
+            uv::uv_timer_stop(timer);
+        }
+    }
+
+    #[test]
+    fn a_positive_process_timers_result_rearms_the_handle_refed() {
+        // The ref'd half of the same convention. Getting this backwards would
+        // let the process exit with a ref'd timer still pending.
+        let timer = ensure_timer_handle().expect("the loop is creatable");
+        rn_uv::uv_loop::update_time();
+        let now = rn_uv::uv_loop::now_ms();
+        apply_timer_result(Some(now + 60_000.0));
+
+        // SAFETY: `timer` is the live handle this module owns.
+        unsafe {
+            assert_eq!(
+                uv::uv_is_active(timer.cast()),
+                1,
+                "a positive result must leave the handle armed"
+            );
+            assert_eq!(
+                uv::uv_has_ref(timer.cast()),
+                1,
+                "a ref'd deadline must keep the process alive"
+            );
+            uv::uv_timer_stop(timer);
+        }
+    }
+
+    #[test]
+    fn a_zero_process_timers_result_leaves_no_ref_behind() {
+        // `0` is an empty timer set: the handle must not count as work, or the
+        // process would never exit once any timer had been used.
+        let timer = ensure_timer_handle().expect("the loop is creatable");
+        apply_timer_result(Some(0.0));
+        // SAFETY: `timer` is the live handle this module owns.
+        unsafe {
+            assert_eq!(
+                uv::uv_has_ref(timer.cast()),
+                0,
+                "an empty timer set is not work"
+            );
+            uv::uv_timer_stop(timer);
         }
     }
 }

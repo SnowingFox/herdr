@@ -241,7 +241,31 @@ pub struct Parser {
     /// parser outliving its JavaScript `ConnectionsList` still unlinks cleanly
     /// instead of pointing at freed memory.
     connections: Option<(SharedList, crate::connections::Entry)>,
+    /// The `StreamBase` handle `consume()` attached, i.e. Node's `stream_`.
+    ///
+    /// `None` is Node's `stream_ == nullptr`, which `Unconsume` reports as
+    /// "already unconsumed". This runtime's read path has a single listener
+    /// (`handle.onread`), so attaching records the handle rather than installing
+    /// a second listener; see [`Parser::consume`].
+    stream: Option<ConsumedStream>,
 }
+
+/// The handle a consuming parser is attached to.
+///
+/// The address is the `uv_stream_t`, which stays valid until the binding that
+/// owns it runs its close callback. A parser that outlives its socket is
+/// therefore possible here in a way Node's intrusive list makes impossible, so
+/// the pointer is only ever compared, never dereferenced: the record exists to
+/// answer "is this parser attached, and to what", which is all `unconsume` and
+/// the idempotence check need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsumedStream(pub *mut rn_uv::sys::uv_stream_t);
+
+// SAFETY: the pointer is never dereferenced by this crate (see above), so
+// carrying it across a thread boundary cannot create aliasing. This is only
+// needed because `v8::Global` and the rest of `Parser` are already `Send`-free;
+// the bound is not load-bearing beyond keeping the struct's auto traits stable.
+unsafe impl Send for ConsumedStream {}
 
 /// The body bytes collected inside one `execute`.
 ///
@@ -354,6 +378,7 @@ impl Parser {
             received_data: false,
             headers_completed: false,
             connections: None,
+            stream: None,
         }));
         let callbacks = ffi::Callbacks {
             user: raw.cast::<c_void>(),
@@ -606,6 +631,51 @@ impl Parser {
     /// `remove()`: stops further callbacks, Node's `is_being_freed_`.
     pub fn remove(&mut self) {
         self.being_freed = true;
+    }
+
+    /// `consume(handle)`: attaches this parser to a `StreamBase` handle.
+    ///
+    /// Returns `Ok(true)` when the attachment happened, `Ok(false)` when the
+    /// parser is already consuming a *different* stream, and `Err(())` only from
+    /// the caller's perspective (the wrapper reports that as a throw).
+    ///
+    /// # Why this records the handle instead of taking the read path over
+    ///
+    /// Node's `Parser` is a `StreamListener`, so `StreamBase::PushStreamListener`
+    /// installs it as the stream's active listener and libuv's reads land in
+    /// `OnStreamRead` → `Execute`. rustnode's equivalent read path
+    /// (`rn_uv::stream::deliver_read`) has one destination: it reads
+    /// `handle.onread` off the JavaScript object and calls it with an
+    /// `ArrayBuffer`. There is no listener stack to push onto, so "attaching" can
+    /// only mean "record the handle"; the bytes keep arriving through `onread`,
+    /// which `lib/internal/http/server.js` forwards into `execute` itself.
+    ///
+    /// The observable contract this still honours is the one the JavaScript layer
+    /// tests for: a consume is recorded, so `unconsume` has something to detach,
+    /// and a second `consume` on the same parser cannot silently switch streams.
+    /// What it does not give is the allocation-free path — that needs the
+    /// listener stack, and that is a change to the shared read path rather than
+    /// to this crate.
+    pub fn consume(&mut self, stream: *mut rn_uv::sys::uv_stream_t) -> bool {
+        if self.stream.is_some_and(|existing| existing.0 != stream) {
+            return false;
+        }
+        self.stream = Some(ConsumedStream(stream));
+        true
+    }
+
+    /// `unconsume()`: detaches, returning whether anything was attached.
+    ///
+    /// `Unconsume` in Node returns early when `stream_` is null, which is the
+    /// "already unconsumed" path `freeParser` depends on.
+    pub fn unconsume(&mut self) -> bool {
+        self.stream.take().is_some()
+    }
+
+    /// The handle [`Self::consume`] attached, for tests and `getCurrentBuffer`
+    /// consumers.
+    pub fn consumed_handle(&self) -> Option<*mut rn_uv::sys::uv_stream_t> {
+        self.stream.map(|stream| stream.0)
     }
 
     /// The buffer being parsed, for `getCurrentBuffer`.

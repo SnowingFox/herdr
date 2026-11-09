@@ -602,30 +602,84 @@ fn llhttp_of(object: v8::Local<v8::Object>) -> Option<*mut ffi::Llhttp> {
 
 /// `consume(handle)`.
 ///
-/// Attaching the parser to a `StreamBase` handle so it reads the socket itself
-/// needs the stream handles from `tcp_wrap`, which this runtime does not have.
-/// `lib/internal/http/server.js` only reaches this when
-/// `socket._handle.isStreamBase` is set, so refusing loudly is better than
-/// accepting the handle and never reading from it.
+/// Node's `Parser::Consume` is one line: `stream->PushStreamListener(parser)`.
+/// The parser becomes the stream's read listener, so libuv's reads go straight
+/// into `Execute` and the socket's JavaScript `onread` never runs. The socket
+/// stops looking like a readable stream (`socketOnData` and `'data'` are gone)
+/// and `parser[kOnExecute]` is what reports progress instead.
+///
+/// # What this does instead, and why it is honest
+///
+/// rustnode has real `StreamBase` handles now — `tcp_wrap` and `pipe_wrap` both
+/// publish `isStreamBase` and are driven by `rn_uv::stream` — but that read path
+/// has one listener: `deliver_read` reads `handle.onread` off the JavaScript
+/// object and calls it. There is no listener stack, so there is nowhere to
+/// "push" a parser that would displace `onread` without editing the read path
+/// itself.
+///
+/// Adding that stack is a change to `rn_uv::stream`, which every socket and pipe
+/// in the runtime is driven by. What it buys is the `onread`-free fast path: the
+/// bytes reach `Execute` without an `ArrayBuffer` allocation and without the
+/// `onStreamRead` frame. What it does **not** change is where the bytes come from
+/// or who reads them, because the existing `onread` path already forwards into
+/// `execute` (`lib/internal/http/server.js`'s `socketOnData`).
+///
+/// So this records the handle and leaves the forwarding to `onread`. The
+/// contract that matters is the one that would break if this did nothing at all:
+/// **exactly one reader must exist**. `lib/internal/http/server.js` guards the
+/// call with `socket._handle.isStreamBase && !socket._handle._consumed` and then
+/// sets `_consumed`, and `lib/internal/http/common.js`'s `freeParser` calls
+/// `unconsume` whenever `parser._consumed` is set. If `consume` returned without
+/// recording anything, `unconsume` would have nothing to detach and the two
+/// layers would both be attached.
+///
+/// `unconsume` is therefore a real detach of this record, not a no-op, and
+/// [`Parser::consumed_handle`] is what makes the pairing observable.
 fn parser_consume<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
-    throw(
-        scope,
-        "HTTPParser#consume is unavailable: rustnode has no StreamBase handles yet",
-    );
+    let handle = args.get(0);
+    let Ok(object) = v8::Local::<v8::Object>::try_from(handle) else {
+        // Node `CHECK(args[0]->IsObject())`; a throw keeps the isolate healthy
+        // and is the closest equivalent.
+        throw(scope, "consume() requires a stream handle");
+        return;
+    };
+
+    // `StreamBase::FromObject` unwraps the internal `StreamBase` pointer. A
+    // handle from another binding has none, and Node `CHECK_NOT_NULL`s it.
+    // SAFETY: the scope is live and the object is a live local, so any stream
+    // pointer attached to it belongs to a binding that outlives this call.
+    let Some(stream) = (unsafe { rn_uv::streams::stream_of(scope, object) }) else {
+        throw(scope, "consume() requires a stream handle");
+        return;
+    };
+
+    let Some(installed) = with_parser(args.this(), |parser| parser.consume(stream)) else {
+        throw(scope, "HTTPParser is not initialized");
+        return;
+    };
+    if !installed {
+        // A parser already attached to a different stream is a caller bug Node
+        // would not survive either; report it rather than silently switching.
+        throw(scope, "HTTPParser is already consuming another stream");
+    }
 }
 
 /// `unconsume()`.
+///
+/// `Parser::Unconsume` returns silently when `stream_` is null, which is the
+/// "already unconsumed" case `lib/internal/http/common.js` relies on: `freeParser`
+/// calls this whenever `parser._consumed` is set, including for parsers whose
+/// socket never had a stream handle.
 fn parser_unconsume<'s>(
     _scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
-    // `freeParser` calls this whenever `parser._consumed` is set, which cannot
-    // happen without a working `consume`, so there is nothing to detach.
+    with_parser(args.this(), |parser| parser.unconsume());
 }
 
 /// `getCurrentBuffer()`.
