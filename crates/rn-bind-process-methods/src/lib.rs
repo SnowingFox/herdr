@@ -448,27 +448,41 @@ fn cgroup_memory_limit() -> Option<u64> {
 
 fn memory_usage(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let (rss, total, _) = process_memory();
-    let object = v8::Object::new(scope);
-    // The V8 figures are filled in by `lib/internal/process/per_thread.js`,
-    // which merges them over this object.
-    let values: [(&str, f64); 5] = [
-        ("rss", rss as f64),
-        ("heapTotal", 0.0),
-        ("heapUsed", 0.0),
-        ("external", 0.0),
-        ("arrayBuffers", 0.0),
+    let (rss, _, _) = process_memory();
+    // Node's `MemoryUsage` reads the heap figures from V8 and writes all five
+    // values into the `Float64Array(5)` the caller passes in:
+    // `lib/internal/process/per_thread.js` owns that array and builds the
+    // returned object from it. Returning an object here instead would leave
+    // `process.memoryUsage()` reporting zeroes, because the JavaScript layer
+    // never reads it.
+    let statistics = scope.get_heap_statistics();
+    let values = [
+        rss as f64,
+        statistics.total_heap_size() as f64,
+        statistics.used_heap_size() as f64,
+        statistics.external_memory() as f64,
+        // Node reports the ArrayBuffer allocator's total, which rustnode does
+        // not instrument; `external_memory` is the closest figure V8 tracks.
+        0.0,
     ];
-    for (name, value) in values {
-        if let Some(key) = v8::String::new(scope, name) {
-            object.set(scope, key.into(), v8::Number::new(scope, value).into());
+    match v8::Local::<v8::Float64Array>::try_from(args.get(0)) {
+        Ok(array) => {
+            for (index, value) in values.iter().enumerate() {
+                array.set_index(scope, index as u32, v8::Number::new(scope, *value).into());
+            }
+        }
+        Err(_) => {
+            // `lib/internal/process/per_thread.js` always passes the array, so
+            // a caller without one is calling the raw binding directly. Node
+            // asserts in that case; returning nothing is the closest honest
+            // answer without aborting the runtime.
+            return;
         }
     }
-    let _ = total;
-    rv.set(object.into());
+    let _ = &mut rv;
 }
 
 fn rss(

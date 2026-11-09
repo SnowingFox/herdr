@@ -30,6 +30,13 @@ fn main() {
     // borrow, so the registry lives for the whole process.
     let registry: &'static rn_core::BindingRegistry = Box::leak(Box::new(registry));
 
+    // `v8.setFlagsFromString()` is a public API — `lib/v8.js` exports it — and
+    // V8 refuses to honour it once `PrepareForSnapshotSerialization` has frozen
+    // the flag list, which happens during `V8::Initialize`. Node disables the
+    // freeze before initializing for exactly this reason, so a flag set from
+    // JavaScript keeps working instead of crashing inside V8's `CHECK`.
+    v8::V8::set_flags_from_string("--no-freeze-flags-after-init");
+
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();

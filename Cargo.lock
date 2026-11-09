@@ -910,6 +910,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-v8"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bind-zlib"
 version = "0.1.0"
 dependencies = [
@@ -951,6 +960,7 @@ dependencies = [
  "rn-bind-url",
  "rn-bind-url-pattern",
  "rn-bind-uv",
+ "rn-bind-v8",
  "rn-bind-zlib",
  "rn-builtins",
  "rn-core",
