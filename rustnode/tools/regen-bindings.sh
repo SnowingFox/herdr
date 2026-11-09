@@ -15,8 +15,13 @@ cd "$root"
 
 crates=()
 skipped=()
-for dir in crates/rn-bind-*; do
+# Any crate that exports `register` joins the registry, whatever it is called,
+# so a workstream is not forced to name its crate a particular way.
+for dir in crates/*; do
   [ -d "$dir" ] || continue
+  case "$dir" in
+    crates/rn-core|crates/rn-v8-sys|crates/rn-io|crates/rn-cli|crates/rn-bindings|crates/rn-module|crates/rn-napi) continue ;;
+  esac
   name="$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)"
   [ -n "$name" ] || continue
   # A crate joins the registry by exporting `pub fn register`. Without it the
