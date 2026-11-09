@@ -133,8 +133,8 @@ pub fn constructor<'s>(
 fn raw_handle(object: v8::Local<v8::Object>) -> Option<*mut SignalHandle> {
     // SAFETY: the field only ever holds a pointer produced by `new`, and the
     // object is a live local so the allocation is alive.
-    let pointer =
-        unsafe { object.get_aligned_pointer_from_internal_field(HANDLE_FIELD, 0) } as *mut SignalHandle;
+    let pointer = unsafe { object.get_aligned_pointer_from_internal_field(HANDLE_FIELD, 0) }
+        as *mut SignalHandle;
     if pointer.is_null() {
         None
     } else {

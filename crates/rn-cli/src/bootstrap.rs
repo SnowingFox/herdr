@@ -1348,7 +1348,9 @@ fn set_global(
 /// Reaching it through the intrinsic rather than a captured handle keeps this
 /// usable from the bootstrap, which runs before any module could have saved a
 /// reference.
-fn object_define_property<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+fn object_define_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Function>> {
     let global = scope.get_current_context().global(scope);
     let name = v8::String::new(scope, "Object")?;
     let object = global.get(scope, name.into())?;
