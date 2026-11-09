@@ -277,6 +277,11 @@ fn throw(scope: &mut v8::PinScope, message: &str) {
     scope.throw_exception(exception);
 }
 
+/// Registers the `builtins` namespace with the runtime.
+pub fn register(registry: &mut rn_core::BindingRegistry) {
+    registry.register(rn_core::Namespace::from_module(&Builtins));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,9 +336,4 @@ mod tests {
             "categories must partition the table"
         );
     }
-}
-
-/// Registers the `builtins` namespace with the runtime.
-pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register(rn_core::Namespace::from_module(&Builtins));
 }
