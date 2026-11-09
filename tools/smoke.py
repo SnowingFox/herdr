@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -211,19 +212,92 @@ FIXTURES = {
 
 
 def classify(stderr):
-    """Whether a failure is a missing dependency or a real defect."""
-    missing = [
-        "has no Rust implementation yet",
-        "Missing internal module",
-        "is not a function",
-    ]
-    return "skip" if any(needle in stderr for needle in missing) else "fail"
+    """Whether a failure is a blocking dependency gap or a real defect.
+
+    `Missing internal module '<id>'` used to be an unconditional skip, which
+    hid a real hole: a *relative or absolute path* (`./helper.js`,
+    `/tmp/x.js`) is not a builtin at all, and the internal loader can never
+    resolve it no matter how many bindings land. Only a specifier that could
+    name a builtin is a genuine "waiting on a namespace" case.
+
+    A builtin id is either bare (`fs`) or rooted at `node:` / `internal/` /
+    `internal/deps/`. Everything else is a filesystem path, and failing to load
+    one is the missing commonjs loader rather than a missing binding.
+    """
+    if "has no Rust implementation yet" in stderr:
+        return "skip"
+    match = MISSING_MODULE.search(stderr)
+    if match:
+        return "skip" if is_builtin_specifier(match.group(1)) else "fail"
+    if "is not a function" in stderr:
+        return "skip"
+    return "fail"
+
+
+MISSING_MODULE = re.compile(r"Missing internal module '([^']*)'")
+
+
+def is_builtin_specifier(specifier):
+    """Whether `specifier` names something the builtin table could hold."""
+    if specifier.startswith("./") or specifier.startswith("../"):
+        return False
+    if specifier.startswith("/"):
+        return False
+    if specifier.startswith("node:"):
+        return True
+    return not specifier.startswith(".")
+
+
+#: Pairs of stderr and the verdict the classifier owes them. The distinction
+#: this table protects is the one the classifier got wrong: a module that cannot
+#: be found because a binding is missing is a dependency gap, while a path the
+#: loader cannot open at all is a missing feature and must be counted.
+CLASSIFY_CASES = [
+    (
+        "Uncaught Error: internalBinding('url'): the namespace has no Rust "
+        "implementation yet",
+        "skip",
+    ),
+    ("Uncaught TypeError: Missing internal module './rn-smoke-helper'", "fail"),
+    ("Uncaught TypeError: Missing internal module '/tmp/x.js'", "fail"),
+    ("Uncaught TypeError: Missing internal module '../common'", "fail"),
+    ("Uncaught TypeError: Missing internal module 'internal/fs/utils'", "skip"),
+    ("Uncaught TypeError: Missing internal module 'internal/deps/css'", "skip"),
+    ("Uncaught TypeError: Missing internal module 'node:path'", "skip"),
+    ("Uncaught TypeError: Missing internal module 'path'", "skip"),
+    ("Uncaught ReferenceError: Buffer is not defined", "fail"),
+    ("Uncaught Error [ERR_NO_CRYPTO]: no crypto support", "fail"),
+    ("Uncaught ReferenceError: setTimeout is not defined", "fail"),
+]
+
+
+def self_test():
+    """Runs `CLASSIFY_CASES`, which needs no binary."""
+    failures = 0
+    for stderr, want in CLASSIFY_CASES:
+        got = classify(stderr)
+        if got != want:
+            failures += 1
+            print(f"FAIL  want={want} got={got}  {stderr}")
+    if failures:
+        print(f"\n{failures} classifier case(s) failed")
+        return 1
+    print(f"smoke classifier: {len(CLASSIFY_CASES)} case(s) pass")
+    return 0
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the failure classifier only, without running the binary",
+    )
     args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
 
     binary = rustnode_binary()
     if binary is None:

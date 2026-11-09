@@ -2,8 +2,19 @@
 resolver = "2"
 # Glob members so every parallel workstream owns its own crate directory and
 # never edits this file. Adding a crate means adding one directory.
+#
+# The exclusions are not cosmetic: a cargo member glob requires every matching
+# directory to hold a Cargo.toml, so a stray `tools/__pycache__` from importing
+# one of the Python tools fails the whole workspace with a missing manifest.
+# Python and the test cache both write there, so they are named explicitly.
 members = ["crates/*", "tools/*"]
-exclude = ["vendor"]
+exclude = [
+    "vendor",
+    "tools/__pycache__",
+    "tools/harness/results",
+    "tools/compat/target",
+    "tools/contract-gen/target",
+]
 
 [workspace.package]
 version = "0.1.0"

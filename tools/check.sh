@@ -50,6 +50,12 @@ step "deferred members reached at module scope"
 # the gate because it silently failed open once already.
 ./tools/deferred-reach.py
 
+step "the smoke classifier still tells a gap from a defect"
+# The classifier decides whether a failure counts against the runtime or is
+# merely waiting on a binding. It got that wrong once, turning a missing
+# feature into a skip, so the rule is pinned rather than trusted.
+python3 tools/smoke.py --self-test
+
 step "the vendored JavaScript is unchanged"
 ./tools/verify-libjs.sh
 
