@@ -1,6 +1,7 @@
 async_context_frame
 async_wrap
 blob
+block_list
 buffer
 builtins
 cares_wrap

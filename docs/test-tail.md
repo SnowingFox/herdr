@@ -129,12 +129,21 @@ Startup snapshots. The flag is not in `rn-cli`'s accepted list. Accepting it
 would need `rn-bind-mksnapshot`'s snapshot build path to actually work, so this
 is not a parser tweak.
 
-### 25 files — `block_list` namespace missing
+### `block_list` — closed
 
 Four members (`BlockList`, `SocketAddress`, `AF_INET`, `AF_INET6`), but
-`BlockList` is a native rule engine: `addAddress`, `addRange`, `addSubnet`,
-`check`, with IPv4/IPv6 CIDR prefix matching. That is a real implementation for
-25 files. I judged it below the 20-file bar **relative to its cost** and left it.
+`BlockList` was a native rule engine: `addAddress`, `addRange`, `addSubnet`,
+`check`, with IPv4/IPv6 CIDR prefix matching. It is implemented now
+(`crates/rn-bind-block-list`), so this cluster is no longer a gap.
+
+Of the sample files that exercise it, `test-blocklist.js`,
+`test-net-blocklist.js`, `test-dgram-blocklist.js`, `test-net-server-blocklist.js`
+and `test-net-server-blocklist-fail-closed.js` pass. Three still fail for reasons
+outside this namespace: `test-blocklist-fast-api.js` needs `internalBinding('debug')`,
+`test-tls-spki-blocklist.js` needs `tls_wrap`, and `test-blocklist-clone.js` needs
+the messaging layer to round-trip a host object through `kClone`/`kDeserialize`
+(the hook is stored by `setDeserializerCreateObjectFunction` but never invoked, so
+the deserialised value arrives as a plain object).
 
 ### ~110 files — deferred asymmetric crypto
 

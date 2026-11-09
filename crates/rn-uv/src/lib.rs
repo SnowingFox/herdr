@@ -37,3 +37,24 @@ pub mod streams;
 pub mod uv_loop;
 
 pub use libuv_sys2 as sys;
+
+/// The libuv version the binary linked, as `uv_version_string` reports it.
+///
+/// `process.versions.uv` is the JavaScript view of this, and Node's test suite
+/// branches on it: `test-blocklist.js` expects an overlong zone suffix on a
+/// mixed-notation IPv6 address to parse only from libuv 1.53, so the value has
+/// to come from the library actually linked rather than from a manifest.
+pub fn uv_version_string() -> Option<String> {
+    // SAFETY: libuv returns a pointer to a static, NUL-terminated string that
+    // lives for the process, and it is never null.
+    let pointer = unsafe { libuv_sys2::uv_version_string() };
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: the pointer is static and NUL-terminated, as stated above.
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
