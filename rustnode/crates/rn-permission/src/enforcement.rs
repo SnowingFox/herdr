@@ -21,7 +21,7 @@
 //! ```
 //!
 //! so the two sides agree field for field. Other crates hold a
-//! [`PermissionGate`] and call a `deny_if_*` method; a `Some` result means
+//! [`PermissionGate`] and call a `deny_*` method; a `Some` result means
 //! "denied, throw this", `None` means "allowed".
 
 use rn_v8_sys::v8;
