@@ -1,0 +1,22 @@
+[package]
+name = "rn-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "rustnode executable"
+
+[[bin]]
+name = "rustnode"
+path = "src/main.rs"
+
+[dependencies]
+rn-core = { path = "../rn-core" }
+rn-bindings = { path = "../rn-bindings" }
+rn-module = { path = "../rn-module" }
+rn-io = { path = "../rn-io" }
+rn-napi = { path = "../rn-napi" }
+rn-v8-sys = { path = "../rn-v8-sys" }
+tracing.workspace = true
+tracing-subscriber.workspace = true
