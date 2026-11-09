@@ -354,10 +354,19 @@ fn forward_v8_flags(args: &[String]) {
     /// V8 flags that are also Node flags and are implemented by passing them
     /// through. `--max-old-space-size` sizes the old generation, which is what
     /// `v8.getHeapStatistics().heap_size_limit` reports.
+    ///
+    /// `--expose-gc` is here rather than in JavaScript for the same reason: it
+    /// is what makes V8 install the `gc()` global, and a hand-written `gc` would
+    /// not be the same function V8's tests call. Node lists it as a `V8Option`
+    /// in `node_options.cc`, so this is the faithful place for it.
     const FORWARDED: &[&str] = &["--max-old-space-size=", "--stack-size="];
+    /// V8 flags spelled with no value.
+    const FORWARDED_BARE: &[&str] = &["--expose-gc"];
 
     for argument in args {
-        if FORWARDED.iter().any(|prefix| argument.starts_with(prefix)) {
+        if FORWARDED.iter().any(|prefix| argument.starts_with(prefix))
+            || FORWARDED_BARE.contains(&argument.as_str())
+        {
             // V8 spells its flags with underscores as well as dashes; the dashed
             // form is what the command line takes and V8 accepts both.
             v8::V8::set_flags_from_string(argument);
