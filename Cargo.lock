@@ -625,6 +625,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-permission"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-v8-sys"
 version = "0.1.0"
 dependencies = [

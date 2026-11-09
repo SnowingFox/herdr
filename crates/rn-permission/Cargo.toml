@@ -1,0 +1,12 @@
+[package]
+name = "rn-permission"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('permission') and the permission model checks for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
