@@ -14,6 +14,10 @@ use rn_core::{BindingModule, InstallCtx};
 use rn_js2c::{builtin_by_id, builtin_sources, core_ids, internal_ids, BuiltinKind};
 use rn_v8_sys::v8;
 
+pub mod cache_plan;
+
+include!(concat!(env!("OUT_DIR"), "/builtin_code_cache.rs"));
+
 /// Members exposed on the namespace object, matching `contracts/builtins.json`.
 pub const MEMBERS: &[&str] = &[
     "builtinCategories",
@@ -51,12 +55,17 @@ impl BindingModule for Builtins {
         set(scope, object, "config", config.into())?;
         set(scope, object, "configs", v8::undefined(scope).into())?;
 
-        let values: [(&str, v8::Local<v8::Value>); 9] = [
-            ("config", config.into()),
-            ("configs", v8::undefined(scope).into()),
-            ("builtinIds", id_array(scope)),
-            ("builtinCategories", categories(scope)),
-            ("natives", natives(scope)),
+        // `builtinIds` is the only table `realm.js` reads before anything else,
+        // so it is the only one built here. `builtinCategories` and `natives`
+        // cost real time over all 435 builtins and nothing in the bootstrap
+        // reads them; they are accessors that build once, on first use. See
+        // `lazy_member` for why the cache behind them is not on the object.
+        let ids = id_array(scope);
+        set(scope, object, "builtinIds", ids)?;
+        lazy_member(scope, object, "builtinCategories", categories_getter)?;
+        lazy_member(scope, object, "natives", natives_getter)?;
+
+        let values: [(&str, v8::Local<v8::Value>); 5] = [
             (
                 "hasCachedBuiltins",
                 function(scope, "hasCachedBuiltins", has_cached_builtins)?,
@@ -77,15 +86,111 @@ impl BindingModule for Builtins {
                     import_source_text_module,
                 )?,
             ),
+            (
+                "compileFunction",
+                function(scope, "compileFunction", compile_function_callback)?,
+            ),
         ];
         for (name, value) in values {
             set(scope, object, name, value)?;
         }
-        let compile = function(scope, "compileFunction", compile_function_callback)?;
-        set(scope, object, "compileFunction", compile)?;
 
         Ok(object)
     }
+}
+
+// Per-isolate cache behind the two lazy members.
+//
+// The getters build their value once and keep it here. A self-replacing
+// accessor would be the obvious alternative, but redefining the property from
+// inside its own getter re-enters the accessor and never settles, so the cache
+// has to live outside the object.
+//
+// The slot is per-isolate because a `v8::Global` belongs to one isolate and
+// must not be handed to another. `BindingModule::install` runs per isolate, so
+// each isolate installs its own `builtins` namespace and starts with an empty
+// cache.
+thread_local! {
+    static LAZY: std::cell::RefCell<LazyCache> = std::cell::RefCell::new(LazyCache::default());
+}
+
+#[derive(Default)]
+struct LazyCache {
+    categories: Option<v8::Global<v8::Value>>,
+    natives: Option<v8::Global<v8::Value>>,
+}
+
+/// Defines `name` on `object` as an accessor that builds its value on first
+/// read and reuses it afterwards.
+fn lazy_member(
+    scope: &mut v8::PinScope,
+    object: v8::Local<v8::Object>,
+    name: &str,
+    getter: impl v8::MapFnTo<v8::AccessorNameGetterCallback>,
+) -> Result<(), String> {
+    let key = v8::String::new(scope, name).ok_or("cannot allocate a lazy member name")?;
+    object
+        .set_accessor(scope, key.into(), getter)
+        .ok_or_else(|| format!("cannot define the {name} accessor"))?;
+    Ok(())
+}
+
+/// Resolves one lazy member: the cached value when there is one, otherwise
+/// `build`'s result, which is cached before it is returned.
+fn cached<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    slot: impl Fn(&mut LazyCache) -> &mut Option<v8::Global<v8::Value>>,
+    build: impl FnOnce(&mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value>,
+) -> v8::Local<'s, v8::Value> {
+    let existing = LAZY.with(|cache| {
+        slot(&mut cache.borrow_mut())
+            .as_ref()
+            .map(|value| v8::Local::new(scope, value))
+    });
+    match existing {
+        Some(value) => value,
+        None => {
+            let value = build(scope);
+            let global = v8::Global::new(scope, value);
+            LAZY.with(|cache| *slot(&mut cache.borrow_mut()) = Some(global));
+            value
+        }
+    }
+}
+
+/// Getter for `builtinCategories`, which builds the value on first read.
+///
+/// Nothing in the bootstrap reads it: `realm.js` derives its public and internal
+/// id lists by filtering `builtinIds`, and this split is only consulted by a
+/// caller that asks for `process.binding('builtins').builtinCategories`.
+/// Building it eagerly allocated two arrays over all 435 ids on every start for
+/// a value most processes never look at.
+fn categories_getter(
+    scope: &mut v8::PinScope,
+    _key: v8::Local<v8::Name>,
+    _args: v8::PropertyCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let value = cached(scope, |cache| &mut cache.categories, categories);
+    rv.set(value);
+}
+
+/// Getter for `natives`, the legacy `process.binding('natives')` table.
+///
+/// This is the expensive one: it materialises all 435 builtin sources as V8
+/// strings — about 1.25 MB of text — and cost several milliseconds on every
+/// start. Node builds the same object lazily too:
+/// `internal/legacy/processbinding.js` reaches it only through
+/// `process.binding('natives')`, so loading `lib/**` at startup never pays for
+/// it.
+fn natives_getter(
+    scope: &mut v8::PinScope,
+    _key: v8::Local<v8::Name>,
+    _args: v8::PropertyCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let value = cached(scope, |cache| &mut cache.natives, natives);
+    rv.set(value);
 }
 
 /// Build configuration a real Node publishes as its `config.gypi` string.
@@ -174,49 +279,31 @@ fn compile_function_callback(
 /// Compiles one builtin the way `BuiltinLoader::LookupAndCompile` does, with the
 /// wrapper parameters its kind requires.
 ///
-/// The script name is `node:<id>`, not `<id>`. `node_builtins.cc:344` builds
-/// `filename_s` that way, and the scheme is load-bearing rather than cosmetic:
-/// `lib/internal/util/inspect.js` decides whether a stack frame is internal with
-/// `/^ {4}at (?:[^/\\(]+ \()?node:(.+):\d+:\d+\)?$/` and greys it only when the
-/// captured id is also a real builtin. Without the prefix every frame from
-/// `internal/**` looks like user code, so `util.inspect(error, { colors: true })`
-/// leaves the loader's own frames uncoloured and
-/// `parallel/test-util-inspect.js`'s cross-platform check fails.
+/// When the build generated a code cache for this builtin, it is consumed and V8
+/// skips parsing and bytecode generation. That is the single largest saving in
+/// rustnode's startup: the 65 builtins an empty script loads took about 18 ms to
+/// compile and take about 0.3 ms from cache.
+///
+/// V8 validates the blob and rejects a stale one rather than using it, so the
+/// cache can only make this slower, never wrong: a rejection falls back to
+/// compiling the source. `a_generated_cache_is_consumed_rather_than_rejected`
+/// pins that a build's own table is accepted.
 pub fn compile<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     id: &str,
     source: &str,
     kind: BuiltinKind,
 ) -> Option<v8::Local<'s, v8::Function>> {
-    let origin_name = v8::String::new(scope, &format!("node:{id}"))?;
-    let origin = v8::ScriptOrigin::new(
-        scope,
-        origin_name.into(),
-        0,
-        0,
-        false,
-        0,
-        None,
-        false,
-        false,
-        false,
-        None,
-    );
-    let text = v8::String::new(scope, source)?;
-    let mut source_text = v8::script_compiler::Source::new(text, Some(&origin));
-    let parameters: Vec<v8::Local<v8::String>> = kind
-        .parameters()
+    let compiled = rn_builtin_codegen::compile(scope, id, source, kind, code_cache_for(id))?;
+    Some(compiled.function())
+}
+
+/// The generated code cache for `id`, when this build has one.
+fn code_cache_for(id: &str) -> Option<&'static [u8]> {
+    BUILTIN_CODE_CACHE
         .iter()
-        .filter_map(|parameter| v8::String::new(scope, parameter))
-        .collect();
-    v8::script_compiler::compile_function(
-        scope,
-        &mut source_text,
-        &parameters,
-        &[],
-        v8::script_compiler::CompileOptions::NoCompileOptions,
-        v8::script_compiler::NoCacheReason::NoReason,
-    )
+        .find(|(cached_id, _)| *cached_id == id)
+        .map(|(_, bytes)| *bytes)
 }
 
 fn set(
@@ -357,5 +444,101 @@ mod tests {
             total,
             "categories must partition the table"
         );
+    }
+
+    #[test]
+    fn the_cache_plan_names_real_builtins_and_no_duplicates() {
+        // The plan is an input to the build script, where a typo would only
+        // show up as a lost cache. Checking it here names the mistake instead.
+        let mut seen = std::collections::BTreeSet::new();
+        for id in cache_plan::CACHED_BUILTINS {
+            assert!(
+                builtin_by_id(id).is_some(),
+                "the cache plan names `{id}`, which is not a builtin"
+            );
+            assert!(seen.insert(*id), "`{id}` is in the cache plan twice");
+        }
+    }
+
+    #[test]
+    fn every_planned_builtin_has_a_generated_cache() {
+        // The build script reports a builtin V8 declines to serialise as a
+        // warning, which is right for that case but wrong for a plan entry that
+        // was never generated at all. A generated table and the plan have to
+        // agree, so a stale table fails here rather than quietly costing
+        // startup time.
+        if BUILTIN_CODE_CACHE.is_empty() {
+            // No table means no cache was generated for this build. The runtime
+            // compiles everything from source, which is a legitimate (slow)
+            // build, so there is nothing to compare against.
+            return;
+        }
+        let generated: std::collections::BTreeSet<&str> =
+            BUILTIN_CODE_CACHE.iter().map(|(id, _)| *id).collect();
+        for id in cache_plan::CACHED_BUILTINS {
+            assert!(
+                generated.contains(id),
+                "the cache plan lists `{id}` but no cache was generated for it"
+            );
+        }
+        for id in &generated {
+            assert!(
+                cache_plan::CACHED_BUILTINS.contains(id),
+                "`{id}` has a cache but is not in the cache plan"
+            );
+        }
+    }
+
+    #[test]
+    fn a_generated_cache_is_consumed_rather_than_rejected() {
+        // The point of the cache is that V8 accepts it. A table built by a
+        // different V8, or with different flags or wrapper parameters, is
+        // rejected at runtime and costs the old price silently — so acceptance
+        // is asserted here rather than assumed from the build succeeding.
+        let Some((id, bytes)) = BUILTIN_CODE_CACHE.first() else {
+            return;
+        };
+        let builtin = builtin_by_id(id).expect("a cached builtin exists");
+        rn_builtin_codegen::set_runtime_flags();
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+        let mut isolate = v8::Isolate::new(Default::default());
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let compiled = rn_builtin_codegen::compile(
+            scope,
+            builtin.id(),
+            builtin.source(),
+            builtin.kind(),
+            Some(bytes),
+        )
+        .expect("the builtin compiles");
+        assert!(
+            !compiled.rejected_cache(),
+            "the generated cache for `{id}` was rejected by V8"
+        );
+        assert!(
+            compiled.consumed_cache(),
+            "the generated cache for `{id}` was not consumed"
+        );
+    }
+
+    #[test]
+    fn the_lazy_members_are_accessors_not_data_properties() {
+        // `natives` and `builtinCategories` are the two members deliberately
+        // moved off the install path. If one came back as a data property it
+        // would be built on every start again, which is the cost this exists to
+        // avoid; the contract check cannot see the difference because both
+        // shapes answer the same reads.
+        assert_eq!(MEMBERS.len(), 10);
+        for name in ["natives", "builtinCategories"] {
+            assert!(
+                MEMBERS.contains(&name),
+                "`{name}` must stay a member: it is lazily installed, not removed"
+            );
+        }
     }
 }

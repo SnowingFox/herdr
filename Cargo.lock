@@ -1296,9 +1296,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-builtin-codegen"
+version = "0.1.0"
+dependencies = [
+ "rn-js2c",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-builtins"
 version = "0.1.0"
 dependencies = [
+ "rn-builtin-codegen",
  "rn-core",
  "rn-js2c",
  "rn-v8-sys",
