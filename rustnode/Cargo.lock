@@ -1066,6 +1066,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-signal-wrap"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "v8",
+]
+
+[[package]]
 name = "rn-bind-spawn-sync"
 version = "0.1.0"
 dependencies = [
@@ -1274,6 +1286,7 @@ dependencies = [
  "rn-bind-process-wrap",
  "rn-bind-report",
  "rn-bind-serdes",
+ "rn-bind-signal-wrap",
  "rn-bind-spawn-sync",
  "rn-bind-stream-wrap",
  "rn-bind-string-decoder",
