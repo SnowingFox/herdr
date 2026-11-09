@@ -65,10 +65,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "parseEnv",
         "NODE_OPTIONS env parsing, owned by the CLI option surface",
     ),
-    (
-        "shouldAbortOnUncaughtToggle",
-        "debug toggle read by the abort-on-uncaught path",
-    ),
 ];
 
 /// The `SKIP_SYMBOLS` bit, used as the default when a caller omits the filter.
@@ -115,6 +111,18 @@ impl BindingModule for Util {
 
         install_predicates(scope, object);
         install_symbols(scope, object)?;
+
+        // `shouldAbortOnUncaughtToggle` is a `Uint8Array(1)` the JavaScript
+        // layer writes to signal "abort on uncaught exception" to the native
+        // fatal-error path. `internal/process/execution.js` indexes it directly
+        // (`shouldAbortOnUncaughtToggle[0] = 1`), so a missing one throws
+        // `Cannot set properties of undefined` from inside
+        // `setUncaughtExceptionCaptureCallback`.
+        let abort_toggle = rn_core::AliasedUint8Array::new(scope, 1, rn_core::Element::Byte)?;
+        let abort_array = abort_toggle.array(scope);
+        if let Some(key) = v8::String::new(scope, "shouldAbortOnUncaughtToggle") {
+            object.set(scope, key.into(), abort_array);
+        }
 
         macro_rules! install {
             ($($name:literal => $callback:expr),* $(,)?) => {

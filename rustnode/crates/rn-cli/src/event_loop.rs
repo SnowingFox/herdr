@@ -156,12 +156,12 @@ impl RuntimeHooks {
 
 /// Reports an uncaught exception and asks the process to exit non-zero.
 ///
-/// Node's `TriggerUncaughtException` prints the error and exits non-zero. The
-/// loop calls this from inside its own `TryCatch`, where the exception handle is
-/// still valid, so it takes the exception rather than fetching it.
+/// A callback that throws is a candidate for `process.setUncaughtExceptionCaptureCallback`
+/// and for an `uncaughtException` listener, so the report goes through Node's
+/// own order (`process._fatalException` first) rather than printing directly.
+/// When nothing handles it, the print-and-exit path still runs unchanged.
 fn report_uncaught(scope: &mut v8::PinScope, exception: v8::Local<v8::Value>) {
-    let text = rn_errors::format_exception(scope, exception, false);
-    rn_errors::write_uncaught(scope, &text);
+    rn_errors::report_uncaught_exception(scope, exception);
 }
 
 /// Runs `internal/util/debuglog`'s `initializeDebugEnv`, which Node's

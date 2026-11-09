@@ -750,12 +750,18 @@ fn call_catching<'s>(
     Ok(result)
 }
 
-/// Prints an uncaught callback exception the way Node does and asks the process
-/// to exit non-zero.
+/// Reports an uncaught callback exception the way Node does and asks the process
+/// to exit non-zero when nothing handled it.
+///
+/// A throw from a timer or immediate callback is an uncaught exception in the
+/// public sense: `process.setUncaughtExceptionCaptureCallback` and a
+/// `process.on('uncaughtException')` listener both have to see it before it is
+/// printed. `write_uncaught` skips them, so this goes through
+/// `report_uncaught_exception`, which calls `process._fatalException` first and
+/// only prints when it declines.
 fn record_uncaught(scope: &mut v8::PinScope, exception: v8::Global<v8::Value>) {
     let exception = v8::Local::new(scope, &exception);
-    let text = rn_errors::format_exception(scope, exception, false);
-    rn_errors::write_uncaught(scope, &text);
+    rn_errors::report_uncaught_exception(scope, exception);
 }
 
 /// Whether `setupTimers` has been given the callbacks the loop needs.

@@ -249,6 +249,30 @@ fn trigger_uncaught_exception(
     report(scope, error, from_promise);
 }
 
+/// Reports an uncaught exception the way Node does, giving `process` the first
+/// chance to handle it.
+///
+/// This is `TriggerUncaughtException`'s order: call `process._fatalException`
+/// and, when it returns `true`, stop — the handler took responsibility. Only a
+/// `false` answer, or no handler at all, reaches the print-and-exit path.
+///
+/// The event loop calls this rather than [`write_uncaught`] for a callback that
+/// threw, because `process.setUncaughtExceptionCaptureCallback` and
+/// `process.on('uncaughtException')` both live behind `_fatalException`. The
+/// loop's `TryCatch` has already ended by the time it reports, so the exception
+/// is passed in as a value rather than taken from the scope.
+pub fn report_uncaught_exception(scope: &mut v8::PinScope<'_, '_>, error: v8::Local<v8::Value>) {
+    if let Some(handler) = process_fatal_exception_handler(scope) {
+        let from_promise = v8::Boolean::new(scope, false);
+        let argv = [error, from_promise.into()];
+        let result = handler.call(scope, v8::undefined(scope).into(), &argv);
+        if result.is_some_and(|value| value.is_true()) {
+            return;
+        }
+    }
+    report(scope, error, false);
+}
+
 /// Reads `process._fatalException`, which is monkey-patchable on purpose.
 fn process_fatal_exception_handler<'s>(
     scope: &mut v8::PinScope<'s, '_>,
