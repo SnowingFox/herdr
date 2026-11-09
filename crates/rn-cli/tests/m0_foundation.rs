@@ -276,6 +276,42 @@ fn stream_and_zlib_work_through_lazy_properties() {
 }
 
 #[test]
+fn crypto_reports_the_openssl_it_linked_and_hashes_correctly() {
+    // `lib/internal/util.js` decides whether crypto exists by reading
+    // `process.versions.openssl` at module scope, so a missing version makes
+    // `require('crypto')` throw ERR_NO_CRYPTO even with the binding installed.
+    // The digest values are the published SHA-256 and HMAC-SHA256 of "abc".
+    let out = rustnode(&[
+        "-e",
+        "const c = require('crypto');\n\
+         console.log(process.versions.openssl.length > 0,\n\
+           c.createHash('sha256').update('abc').digest('hex'),\n\
+           c.createHmac('sha256', 'key').update('abc').digest('hex'));",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "true ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad \
+         9c196e32dc0175f86f4b1cb89289d6619de6bee699e4c378e68309ed97a1a6ab"
+    );
+}
+
+#[test]
+fn process_features_reports_what_the_binary_actually_has() {
+    // `lib/internal/crypto/**` destructures `openssl_is_boringssl` at module
+    // scope, so the object must exist. The flags must not overstate: TLS is not
+    // implemented, so it has to read false.
+    let out = rustnode(&[
+        "-e",
+        "const f = process.features;\n\
+         console.log(f.openssl_is_boringssl, f.tls, f.uv, typeof f.inspector);",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "false false true boolean"
+    );
+}
+
+#[test]
 fn a_script_reports_failure_through_the_exit_code() {
     // Node's own tests fail by setting `process.exitCode`, not by throwing, so
     // a runtime that ignores it would report every test as passing.

@@ -416,6 +416,14 @@ fn process_object<'s>(
     set(scope, versions, "v8", v8_version.into())?;
     let node_version = v8::String::new(scope, "28.0.0").ok_or("cannot allocate a version")?;
     set(scope, versions, "node", node_version.into())?;
+    // `lib/internal/util.js` decides at module scope whether crypto exists by
+    // reading `process.versions.openssl`: `const noCrypto =
+    // !process.versions.openssl`. Without it, `require('crypto')` throws
+    // ERR_NO_CRYPTO even though the binding is installed and working, so this
+    // has to be the version the binary actually linked, not a placeholder.
+    let openssl_version = v8::String::new(scope, &rn_bind_crypto::engine::openssl_version())
+        .ok_or("cannot allocate the OpenSSL version")?;
+    set(scope, versions, "openssl", openssl_version.into())?;
     set(scope, process, "versions", versions.into())?;
 
     let version = v8::String::new(scope, "v28.0.0").ok_or("cannot allocate a version")?;
@@ -464,6 +472,40 @@ fn process_object<'s>(
     }
     set(scope, process, "execArgv", exec_array.into())?;
     set(scope, process, "env", v8::Object::new(scope).into())?;
+
+    // `process.features` is read at module scope by `lib/internal/crypto/**`,
+    // which destructures `openssl_is_boringssl` immediately. Each flag must
+    // report what this binary actually has: a `true` for a subsystem that does
+    // not exist turns a clear "missing" into a wrong answer much later.
+    let features = v8::Object::new(scope);
+    let feature = |scope: &mut v8::PinScope<'_, '_>, name: &str, value: bool| {
+        if let Some(key) = v8::String::new(scope, name) {
+            let _ = set(scope, features, name, v8::Boolean::new(scope, value).into());
+            let _ = key;
+        }
+    };
+    // Real upstream OpenSSL is linked, not BoringSSL.
+    feature(scope, "openssl_is_boringssl", false);
+    // TLS itself is not implemented yet.
+    for name in ["tls", "tls_alpn", "tls_sni", "tls_ocsp"] {
+        feature(scope, name, false);
+    }
+    // The loop is libuv, and IPv6 works through it.
+    feature(scope, "uv", true);
+    feature(scope, "ipv6", true);
+    // Builtins are compiled into the binary by `rn-js2c`.
+    feature(scope, "cached_builtins", true);
+    // There is no inspector and no debug build.
+    feature(scope, "inspector", false);
+    feature(scope, "debug", cfg!(debug_assertions));
+    // Modules are requireable, and TypeScript stripping is not implemented.
+    feature(scope, "require_module", true);
+    if let Some(key) = v8::String::new(scope, "typescript") {
+        if let Some(value) = v8::String::new(scope, "strip") {
+            let _ = features.set(scope, key.into(), value.into());
+        }
+    }
+    set(scope, process, "features", features.into())?;
 
     let pid = v8::Integer::new(scope, std::process::id() as i32);
     set(scope, process, "pid", pid.into())?;
