@@ -585,6 +585,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-async-context"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-config"
 version = "0.1.0"
 dependencies = [
@@ -594,10 +602,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-diagnostics-channel"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-fs"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-bind-os"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-bind-task-queue"
+version = "0.1.0"
+dependencies = [
  "rn-core",
  "rn-v8-sys",
 ]
@@ -618,8 +651,12 @@ dependencies = [
 name = "rn-bindings"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-async-context",
  "rn-bind-config",
+ "rn-bind-diagnostics-channel",
  "rn-bind-fs",
+ "rn-bind-os",
+ "rn-bind-task-queue",
  "rn-bind-zlib",
  "rn-builtins",
  "rn-core",
