@@ -5,9 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Event loop backends for rustnode (libuv FFI first, io_uring later)"
+description = "Drives rustnode's libuv event loop and the JavaScript drain between iterations"
 
 [dependencies]
-libc.workspace = true
-tracing.workspace = true
-thiserror.workspace = true
+# The loop belongs to `rn-uv`; this crate drives it one iteration at a time
+# rather than owning a second readiness primitive. `libuv-sys2` is here for the
+# handle types the tests initialise, and `rn-core` for the shared exit flag the
+# uncaught-exception path raises from inside a callback.
+libuv-sys2.workspace = true
+rn-uv.workspace = true
+rn-core.workspace = true

@@ -9,7 +9,8 @@
 //!   `queueMicrotask`. Its `setupTaskQueue()` returns the tick pair and installs
 //!   the tick callback V8 runs as part of a microtask checkpoint.
 //! * `internal/timers.js` owns the timer lists and returns the two callbacks
-//!   `setupTimers()` hands to the native side.
+//!   `setupTimers()` hands to the native side. Those callbacks are what the
+//!   libuv timer and check handles run.
 //! * `internal/bootstrap/web/exposed-window-or-worker.js` is where Node installs
 //!   `setTimeout`, `setInterval`, `setImmediate`, their `clear` counterparts and
 //!   `queueMicrotask` as globals, so that file is what this reproduces rather
@@ -27,14 +28,14 @@
 //!
 //! # Ordering
 //!
-//! Node drains ticks and microtasks between every pair of loop phases, and it
-//! drains once after the script body before the loop starts. That is why a
-//! `.then` callback scheduled in the script body runs before the process exits,
-//! and why `process.nextTick` beats both a promise and a 0ms timer.
+//! The phases belong to libuv, which `rn-io` drives one iteration at a time.
+//! What stays here is the drain: Node checks the tick and microtask queues after
+//! every JavaScript callback, and the one point where the loop can be asked to
+//! do that is between two iterations. The script body is drained once before the
+//! loop starts, which is why a `.then` scheduled in the script runs before the
+//! process exits and why `process.nextTick` beats both a promise and a 0ms timer.
 
-use std::time::Duration;
-
-use rn_io::{Loop, Poller, Scheduler, StopReason};
+use rn_io::{Loop, Scheduler, StopReason};
 use rn_v8_sys::v8;
 
 /// The JavaScript entry points the loop calls every turn.
@@ -110,6 +111,21 @@ impl RuntimeHooks {
 
         install_timer_globals(scope, require)?;
         install_message_port_delivery(scope)?;
+        // The check phase carries more than `setImmediate`: a `MessagePort` is
+        // delivered from it, and a ref'd port keeps the process alive without
+        // owning a libuv handle of its own. Both facts live in
+        // `rn-bind-messaging`, so the owner of the phase is told about them.
+        //
+        // This has to happen here, at install time, and not when the loop starts:
+        // `postMessage()` from the script body queues a delivery *before* the
+        // loop exists, and it is `schedule` that arms the check handle. Wiring
+        // these up lazily left the first message unarmed, so the loop saw no
+        // work and exited.
+        rn_bind_timers::set_check_phase_hook(|scope| {
+            let _ = rn_bind_messaging::run_message_ports(scope);
+        });
+        rn_bind_timers::set_check_phase_pending(rn_bind_messaging::has_delivery_pending);
+        rn_bind_messaging::set_check_phase_armed(rn_bind_timers::arm_check_phase);
         Ok(Self {
             run_next_ticks: v8::Global::new(scope, run_next_ticks),
         })
@@ -174,6 +190,31 @@ fn initialize_debug_env<'s>(
     initialize
         .call(scope, debuglog, &[node_debug])
         .ok_or("initializeDebugEnv threw")?;
+    Ok(())
+}
+
+/// Installs Node's eval-mode builtin globals.
+///
+/// `node -e` and `node --eval` expose every requireable builtin as a lazy global
+/// (`lib/internal/main/eval_string.js` calls `addBuiltinLibsToObject` for exactly
+/// this reason), so `net.createServer()` works without a `require`. A script file
+/// does not get them, which is why this is separate from [`install_timer_globals`]
+/// and only called for `-e`.
+///
+/// A failure is reported rather than fatal: the globals are a convenience, and a
+/// script that does its own `require` still works without them.
+pub fn install_eval_builtins<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+) -> Result<(), String> {
+    let helpers = call_require(scope, require, "internal/modules/helpers")
+        .ok_or("internal/modules/helpers could not be loaded")?;
+    let add = function_property(scope, helpers, "addBuiltinLibsToObject")
+        .ok_or("internal/modules/helpers has no addBuiltinLibsToObject")?;
+    let global = scope.get_current_context().global(scope);
+    let name = v8::String::new(scope, "<eval>").ok_or("cannot allocate the eval module name")?;
+    add.call(scope, helpers, &[global.into(), name.into()])
+        .ok_or("addBuiltinLibsToObject threw")?;
     Ok(())
 }
 
@@ -250,37 +291,27 @@ fn define_global(
     Ok(())
 }
 
-/// The scheduler the loop drives: the tick queue, the timers binding and V8's
-/// microtask checkpoint.
+/// The scheduler the loop drives: V8's microtask checkpoint and the exit flag.
+///
+/// The timers themselves are not here. They are libuv handles
+/// (`rn_bind_timers`), so `uv_run` runs them; this type exists for the two
+/// questions libuv cannot answer — "drain the JavaScript queues" and "did the
+/// script ask to exit".
 pub struct V8Scheduler<'a, 's, 'i> {
     scope: &'a mut v8::PinScope<'s, 'i>,
     hooks: &'a RuntimeHooks,
-    /// The deadline the timer phase reported, and whether a ref'd timer is
-    /// behind it.
-    deadline: Option<f64>,
-    deadline_refed: bool,
-    /// Whether a callback threw, which stops the loop the way Node's
-    /// `TriggerUncaughtException` stops it.
-    exit_requested: bool,
 }
 
 impl<'a, 's, 'i> V8Scheduler<'a, 's, 'i> {
     pub fn new(scope: &'a mut v8::PinScope<'s, 'i>, hooks: &'a RuntimeHooks) -> Self {
-        Self {
-            scope,
-            hooks,
-            deadline: None,
-            deadline_refed: false,
-            exit_requested: false,
-        }
+        Self { scope, hooks }
     }
 
     /// Calls `callable`, converting a throw into an exit request.
     ///
     /// The result is dropped rather than returned because a `Local` from inside
-    /// the `TryCatch` scope cannot escape it. No phase needs the value back: they
-    /// ask the binding for their results instead, which keeps everything they
-    /// observe in this scheduler's own scope.
+    /// the `TryCatch` scope cannot escape it. No phase needs the value back,
+    /// which keeps everything they observe in this scheduler's own scope.
     fn call_catching(&mut self, callable: v8::Local<v8::Function>) {
         let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *self.scope));
         let scope = &mut try_catch.init();
@@ -289,117 +320,25 @@ impl<'a, 's, 'i> V8Scheduler<'a, 's, 'i> {
             if let Some(exception) = scope.exception() {
                 report_uncaught(scope, exception);
             }
-            self.exit_requested = true;
         }
     }
 }
 
 impl Scheduler for V8Scheduler<'_, '_, '_> {
-    fn run_timers(&mut self, now_ms: f64) {
-        match rn_bind_timers::run_timers(self.scope, now_ms) {
-            rn_bind_timers::TimerRun::Next { at_ms, refed } => {
-                self.deadline = Some(at_ms);
-                self.deadline_refed = refed;
-                if !refed {
-                    // `processTimers` reported a deadline with every timer
-                    // unref'd. Node's C++ calls `uv_timer_stop` in that case, so
-                    // the handle stops keeping the loop alive until the next
-                    // `scheduleTimer` starts it again.
-                    rn_bind_timers::stop_timer_handle();
-                }
-            }
-            rn_bind_timers::TimerRun::Idle | rn_bind_timers::TimerRun::NotInstalled => {
-                self.deadline = None;
-                self.deadline_refed = false;
-                // No timer is pending at all, which is the other `uv_timer_stop`
-                // case: a zero return means the list is empty.
-                rn_bind_timers::stop_timer_handle();
-            }
-            rn_bind_timers::TimerRun::Threw => {
-                // The exception was reported and the process is exiting; the
-                // handle is left stopped so the next check sees no work.
-                self.deadline = None;
-                self.deadline_refed = false;
-                rn_bind_timers::stop_timer_handle();
-                self.exit_requested = true;
-            }
-        }
-    }
-
-    fn run_pending(&mut self) {
-        // Deferred I/O callbacks are what this phase exists for, and no binding
-        // produces one yet: `fs` and the socket bindings still wrap the
-        // synchronous libc call. The phase still does what a pending callback
-        // would do first, which is drain ticks.
-        self.drain();
-    }
-
-    fn poll(&mut self, poller: &mut Poller, timeout: Option<Duration>) {
-        let _ = poller.wait(timeout);
-    }
-
-    fn run_immediates(&mut self) {
-        // `processImmediate()` runs every queued immediate and calls
-        // `runNextTicks()` between two of them, which is what orders a microtask
-        // queued by one immediate before the next immediate.
-        let _ = rn_bind_timers::run_immediates(self.scope);
-        // A `MessagePort` becomes readable the moment it is posted to, and Node
-        // delivers from a `uv_async_t` callback the loop runs in this phase.
-        // Delivery goes last so a message handler that queues an immediate does
-        // not run in the same phase the message arrived in.
-        let _ = rn_bind_messaging::run_message_ports(self.scope);
-    }
-
-    fn run_close(&mut self) {
-        // Closing a handle queues a microtask in Node. No handle can be closed
-        // yet, so the phase has nothing the loop's own drain does not already do.
-    }
-
     fn drain(&mut self) {
         let run_next_ticks = self.hooks.run_next_ticks(self.scope);
         self.call_catching(run_next_ticks);
     }
 
-    fn next_deadline(&self) -> Option<f64> {
-        self.deadline
-    }
-
-    fn has_refed_work(&self) -> bool {
-        // The timer half is libuv's `uv__loop_alive()` on the one timer handle:
-        // started and ref'd. The immediate half is its ref *count*, because
-        // `processImmediate()` decrements that count without toggling the ref
-        // bit, so the bit can stay set after the queue emptied. The shared
-        // counter array is not used for timers: `listOnTimeout()` writes it
-        // directly and a script could write it too.
-        rn_bind_timers::timer_handle().keeps_loop_alive()
-            || rn_bind_timers::immediate_ref_count() > 0
-            || rn_bind_task_queue::has_tick_scheduled()
-            // A ref'd port that is receiving keeps the process alive in Node,
-            // which is what makes `parentPort.on('message', ...)` pin a worker
-            // and `parentPort.unref()` let it exit.
-            || rn_bind_messaging::has_message_port_work()
-    }
-
-    fn has_pending_immediates(&self) -> bool {
-        // `immediateInfo[0]` is how many immediates are queued, which is what
-        // `processImmediate()` will run. The poll phase must not block while one
-        // is, because the check phase runs the moment poll returns.
-        rn_bind_timers::immediate_count() > 0
-    }
-
-    fn has_refed_deadline(&self) -> bool {
-        // Only a started, ref'd timer is worth waiting for. An `unref()`'d one
-        // still reports a deadline through `processTimers()`, so the deadline
-        // alone would make the poll block for work the process is not waiting on.
-        rn_bind_timers::timer_handle().keeps_loop_alive()
-    }
-
     fn exit_requested(&self) -> bool {
-        self.exit_requested || rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED)
+        rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED)
     }
 
-    fn now_ms(&self) -> f64 {
-        rn_bind_timers::now_ms()
+    fn has_external_work(&self) -> bool {
+        // A ref'd receiving `MessagePort` pins the process open in Node even
+        // though it owns no libuv handle, so libuv's own liveness answer is
+        // incomplete without it.
+        rn_bind_messaging::has_message_port_work()
     }
 }
 
@@ -409,13 +348,8 @@ pub fn run_loop<'s, 'i>(
     hooks: &RuntimeHooks,
 ) -> Result<StopReason, String> {
     let mut event_loop = Loop::new(rn_io::Backend::Libuv)?;
-    rn_io::install_loop(event_loop.handle());
-    let reason = {
-        let mut scheduler = V8Scheduler::new(scope, hooks);
-        event_loop.run(&mut scheduler, u32::MAX)
-    };
-    rn_io::uninstall_loop();
-    Ok(reason)
+    let mut scheduler = V8Scheduler::new(scope, hooks);
+    Ok(event_loop.run(&mut scheduler, u32::MAX))
 }
 
 fn call_require<'s>(

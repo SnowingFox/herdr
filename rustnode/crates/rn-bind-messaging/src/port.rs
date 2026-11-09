@@ -329,6 +329,23 @@ thread_local! {
     /// waiting. Without it a script whose only work is a `message` listener would
     /// exit immediately, where Node stays alive.
     static LIVE: RefCell<Vec<Rc<PortInner>>> = const { RefCell::new(Vec::new()) };
+
+    /// The callback that wakes the loop when a message is queued.
+    ///
+    /// Node signals a port's `uv_async_t` from `TriggerAsync`. rustnode has no
+    /// per-port handle, so the equivalent is to arm the check phase, and the
+    /// CLI registers the arming function here when it starts the loop. `None`
+    /// before that, which is why `schedule` tolerates it: a message queued during
+    /// bootstrap is still in `PENDING` and the first check phase runs it.
+    static CHECK_PHASE_ARMED: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
+/// Registers the function that wakes the loop's check phase.
+///
+/// Called once by the CLI when it starts the loop. One slot, replaced rather
+/// than accumulated: there is one loop and one check handle.
+pub fn set_check_phase_armed(armed: fn()) {
+    CHECK_PHASE_ARMED.with(|slot| slot.set(Some(armed)));
 }
 
 impl PortInner {
@@ -392,6 +409,14 @@ impl PortInner {
                 pending.push(Rc::clone(self));
             }
         });
+        // Node signals the port's `uv_async_t` here, which is what wakes the
+        // loop. rustnode delivers from the check phase instead, so arming the
+        // check handle is the equivalent wake: without it the message would sit
+        // in `PENDING` until some unrelated timer or immediate happened to keep
+        // the loop turning.
+        if let Some(armed) = CHECK_PHASE_ARMED.with(|slot| slot.get()) {
+            armed();
+        }
     }
 
     /// Marks this port as receiving and wakes it if messages are already queued.
@@ -452,6 +477,12 @@ impl PortInner {
                 closing.push(Rc::clone(self));
             }
         });
+        // The close event is dispatched from the check phase, so it needs the
+        // same wake a queued message does; otherwise `port.close()` would only
+        // emit `close` if some other handle happened to keep the loop running.
+        if let Some(armed) = CHECK_PHASE_ARMED.with(|slot| slot.get()) {
+            armed();
+        }
     }
 }
 
@@ -475,6 +506,17 @@ pub fn requeue(ports: Vec<Rc<PortInner>>) {
 /// Takes every port whose close event is owed.
 pub fn take_closing() -> Vec<Rc<PortInner>> {
     CLOSING.with(|closing| std::mem::take(&mut *closing.borrow_mut()))
+}
+
+/// Whether a delivery is queued for the check phase.
+///
+/// True when a posted message or a close event is waiting to be dispatched. This
+/// is what starts the check handle; [`any_keeps_loop_alive`] answers the
+/// different question of whether a port pins the process open.
+pub fn has_delivery_pending() -> bool {
+    let pending = PENDING.with(|queue| !queue.borrow().is_empty());
+    let closing = CLOSING.with(|queue| !queue.borrow().is_empty());
+    pending || closing
 }
 
 /// Whether any port is keeping the loop alive.

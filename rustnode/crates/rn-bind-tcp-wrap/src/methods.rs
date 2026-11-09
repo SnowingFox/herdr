@@ -37,27 +37,6 @@ impl StreamHandle for TcpHandle {
     }
 }
 
-thread_local! {
-    /// The handle an accept prepared, waiting for its JavaScript wrapper.
-    ///
-    /// `ConnectionWrap::OnConnection` has to build the accepted handle before it
-    /// can ask JavaScript for a wrapper, and a `uv_tcp_t` must not move after
-    /// initialisation, so the handle is parked here and the constructor adopts it
-    /// rather than creating a second one.
-    static PENDING_ACCEPT: std::cell::RefCell<Option<Box<TcpHandle>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Takes the parked accept handle, if there is one.
-pub fn take_pending_accept() -> Option<Box<TcpHandle>> {
-    PENDING_ACCEPT.with(|slot| slot.borrow_mut().take())
-}
-
-/// Parks a handle for the next `TCP` construction to adopt.
-fn park_accept(handle: Box<TcpHandle>) {
-    PENDING_ACCEPT.with(|slot| *slot.borrow_mut() = Some(handle));
-}
-
 /// `HandleWrap::Close`.
 pub fn close(
     scope: &mut v8::PinScope<'_, '_>,
@@ -478,13 +457,13 @@ unsafe extern "C" fn on_connection(server: *mut uv::uv_stream_t, status: i32) {
 
     // SAFETY: the box was just created above and libuv is done with it; the
     // wrapper construction below adopts it.
-    park_accept(unsafe { Box::from_raw(client) });
+    tcp::park_accept(unsafe { Box::from_raw(client) });
 
     rn_uv::callback::with_context(|scope| {
         let Some(object) = tcp::instantiate(scope) else {
             // The wrapper could not be built, so nothing will adopt the handle.
             // Close it rather than leaking the descriptor.
-            if let Some(orphan) = take_pending_accept() {
+            if let Some(orphan) = tcp::take_pending_accept() {
                 // SAFETY: the orphan is a handle nothing adopted.
                 unsafe {
                     uv::uv_close(handle::as_handle(orphan.stream()), None);

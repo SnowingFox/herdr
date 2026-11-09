@@ -139,6 +139,14 @@ fn main() {
                         Ok(hooks) => runtime = Some(hooks),
                         Err(message) => eprintln!("rustnode: timers unavailable: {message}"),
                     }
+                    // `node -e` exposes builtins as lazy globals; a script file
+                    // does not, which is why this is gated on the source. Node's
+                    // own `eval_string.js` makes the same distinction.
+                    if matches!(options.source, args::Source::Eval { .. }) {
+                        if let Err(message) = event_loop::install_eval_builtins(scope, require) {
+                            eprintln!("rustnode: builtin globals unavailable: {message}");
+                        }
+                    }
                 }
                 None => {
                     eprintln!("rustnode: timers unavailable: the realm bootstrap left no require")

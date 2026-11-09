@@ -9,28 +9,36 @@
 //! (`libuv-sys2`, which compiles the library from the source it vendors) and
 //! owns the one loop the process has.
 //!
-//! # Two owners of one loop
+//! # One loop, one owner
 //!
-//! The loop here is created on first use by whichever binding needs it, and is
-//! run by the CLI at the end of a script. The event-loop workstream owns
-//! scheduling decisions (timers, `process.nextTick`, when to block versus spin),
-//! so this crate deliberately keeps only what a *handle* needs:
+//! Every asynchronous handle in rustnode — `tcp_wrap`, `udp_wrap`, `pipe_wrap`,
+//! `process_wrap`, `tty_wrap`, and the scheduler's own timer, check and idle
+//! handles — hangs off this loop. [`run_once`] advances it by the amount libuv
+//! itself decides, which is the only way the phases a JavaScript timer sees are
+//! the phases Node's timer sees.
 //!
-//! * a place to register a JS callback and get it called back on the loop
-//!   thread,
-//! * [`run`] / [`run_once`] so the owner can drive the loop, and
-//! * [`loop_ptr`] for code that needs to hand libuv a loop.
+//! A second, `poll(2)`-based loop in `rn-io` used to sit beside this one and was
+//! the only loop anything pumped. That is gone: `rn-io` now drives *this* loop,
+//! and it does not own a readiness primitive of its own.
 //!
-//! Nothing here decides *when* to call [`run`]; that is the integration point
-//! documented on [`run`].
+//! # Why a keep-alive descriptor exists
+//!
+//! `uv__io_poll` returns immediately when the loop watches no file descriptor
+//! (`loop->nfds == 0`), so a loop with only a timer armed would spin at 100% CPU
+//! instead of sleeping until the deadline. Node avoids that by keeping an
+//! unreferenced `uv_async_t` for child-process notifications: the async
+//! watcher's descriptor gives the backend something to wait on, while the
+//! handle's `unref` keeps it from counting as work. [`LoopHandle::create`]
+//! creates the same handle for the same reason. Without it `setTimeout(f, 2000)`
+//! would burn two seconds of CPU rather than sleep for two seconds.
 //!
 //! # Why callbacks go through a `Global`
 //!
 //! A libuv completion fires from inside `uv_run`, which is a plain Rust call,
 //! not inside a V8 callback scope. The isolate is not re-entrant from there
 //! without telling V8 first. Every callback this crate registers therefore runs
-//! inside [`crate::CallbackScope`], which enters the isolate, opens a handle
-//! scope and a context scope, and only then touches JavaScript.
+//! inside [`with_context`], which enters the isolate, opens a handle scope and a
+//! context scope, and only then touches JavaScript.
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -67,6 +75,11 @@ thread_local! {
 /// The loop pointer plus everything that has to be dropped with it.
 struct LoopHandle {
     pointer: *mut uv::uv_loop_t,
+    /// The unreferenced async handle that gives the backend a descriptor.
+    ///
+    /// Never signalled: it exists so `uv__io_poll` can sleep instead of
+    /// returning at once on a loop with no watchers. See the module docs.
+    keepalive: *mut uv::uv_async_t,
 }
 
 // SAFETY: the loop is only ever touched from the thread that created it, which
@@ -89,9 +102,42 @@ impl LoopHandle {
         let mut boxed = unsafe { Box::from_raw(Box::into_raw(storage).cast::<uv::uv_loop_t>()) };
         let pointer = boxed.as_mut() as *mut uv::uv_loop_t;
         std::mem::forget(boxed);
-        Some(Self { pointer })
+        let keepalive = create_keepalive(pointer)?;
+        Some(Self { pointer, keepalive })
     }
 }
+
+/// Creates the unreferenced async handle that lets the backend sleep.
+///
+/// `uv_async_init` also registers the async watcher's descriptor, which is the
+/// only thing that stops `uv__io_poll` from returning immediately. The handle is
+/// started by `uv_async_init` and unref'd here, so it never keeps the loop
+/// alive: it contributes a descriptor, not work.
+fn create_keepalive(pointer: *mut uv::uv_loop_t) -> Option<*mut uv::uv_async_t> {
+    let mut storage = Box::new(std::mem::MaybeUninit::<uv::uv_async_t>::zeroed());
+    // SAFETY: `storage` is a live, aligned, zeroed `uv_async_t` and `pointer` is
+    // the loop `uv_loop_init` just initialised. The callback is never reached
+    // because nothing ever signals this handle, but libuv requires a non-null
+    // one.
+    let status = unsafe { uv::uv_async_init(pointer, storage.as_mut_ptr(), Some(keepalive_cb)) };
+    if status != 0 {
+        tracing::error!(status, "uv_async_init failed");
+        return None;
+    }
+    // SAFETY: `uv_async_init` succeeded, so the handle is initialised.
+    let boxed = unsafe { Box::from_raw(Box::into_raw(storage).cast::<uv::uv_async_t>()) };
+    let handle = Box::into_raw(boxed);
+    // SAFETY: `handle` is the live handle just initialised.
+    unsafe { uv::uv_unref(handle.cast()) };
+    Some(handle)
+}
+
+/// The keep-alive handle's callback. Nothing signals it, so it never runs.
+///
+/// # Safety
+///
+/// Called by libuv with a live handle if something ever signals it.
+unsafe extern "C" fn keepalive_cb(_handle: *mut uv::uv_async_t) {}
 
 /// Runs `body` with the process' loop, creating it on first use.
 ///
@@ -122,31 +168,73 @@ pub fn is_initialised() -> bool {
     LOOP.with(|cell| cell.borrow().is_some())
 }
 
+/// The address of the loop's keep-alive handle, or null before it exists.
+///
+/// Exposed so a test can assert the handle is started but unref'd: that pair is
+/// what gives the backend a descriptor to wait on without counting as work, and
+/// a regression in either half shows up as a spin or as a process that will not
+/// exit.
+pub fn keepalive_handle() -> *mut uv::uv_async_t {
+    LOOP.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(ptr::null_mut(), |handle| handle.keepalive)
+    })
+}
+
+/// The loop's cached clock, in milliseconds.
+///
+/// This is `uv_now`: the value libuv refreshed at the start of the current
+/// iteration. Within one JavaScript callback it does not advance, which is
+/// exactly what libuv gives Node's `processTimers(now)`.
+pub fn now_ms() -> f64 {
+    with_loop(|pointer| {
+        // SAFETY: `pointer` is the process' live loop.
+        unsafe { uv::uv_now(pointer) as f64 }
+    })
+    .unwrap_or(0.0)
+}
+
+/// Refreshes the loop's cached clock, as `uv_update_time` does.
+///
+/// Callers that compute a delay from an absolute deadline need this first, or
+/// the delay is measured from the previous iteration's time.
+pub fn update_time() {
+    if let Some(pointer) = loop_ptr() {
+        // SAFETY: `pointer` is the process' live loop.
+        unsafe { uv::uv_update_time(pointer) };
+    }
+}
+
+/// One step of the loop, blocking in poll as libuv sees fit.
+///
+/// This is `uv_run(UV_RUN_ONCE)`: the iteration runs pending, idle, prepare,
+/// poll, check, close and timers, and poll waits until a descriptor is ready or
+/// the earliest ref'd libuv timer is due. `uv__backend_timeout` is what decides
+/// that duration for us — zero when a callback is already runnable, the next
+/// timer deadline otherwise, and "ignore the timer" when every timer is unref'd.
+///
+/// Returns `true` when the loop still has referenced work pending.
+pub fn run_once_blocking() -> bool {
+    run_inner(uv::uv_run_mode_UV_RUN_ONCE)
+}
+
 /// One step of the loop, without blocking.
 ///
-/// Returns `true` when the loop still has referenced work pending. This is the
-/// blocking-free variant an embedding runtime uses between tasks; [`run`] is the
-/// one that blocks.
+/// This is `uv_run(UV_RUN_NOWAIT)`: poll returns immediately. It exists for
+/// tests and for callers that already know something is runnable; a loop driven
+/// entirely by it would spin, because libuv never gets to decide on a timeout.
 pub fn run_once() -> bool {
     run_inner(uv::uv_run_mode_UV_RUN_NOWAIT)
 }
 
 /// Runs the loop until it has no referenced handles or requests left.
 ///
-/// # Integration point
-///
-/// This function *is* the interface the event-loop workstream needs: it drives
-/// libuv to completion and returns `true` if the loop still had work (which
-/// only happens when every remaining handle is unreferenced, matching
-/// `uv_run`'s own return value). A CLI that grows a real scheduler should call
-/// [`run_once`] from its own tick loop rather than [`run`], because `run` blocks
-/// until the process has nothing to do — which is right for "run the script to
-/// completion" and wrong once timers and `process.nextTick` share the turn.
-///
-/// Timers are the one thing this crate does not own. `uv_run` handles them, but
-/// nothing here arms them: `setTimeout` needs `rn-bind-timers` and the
-/// `process.nextTick` queue to be connected to this loop, which is the loop
-/// workstream's job.
+/// Unlike [`run_once`], this does not return between iterations, so nothing in
+/// Rust can drain a microtask queue between two phases. `rn-io` therefore drives
+/// the loop one [`run_once`] at a time and leaves `run` for callers that only
+/// need the blocking behaviour. Both are the same loop; the difference is who
+/// regains control, not what runs.
 pub fn run() -> bool {
     run_inner(uv::uv_run_mode_UV_RUN_DEFAULT)
 }
@@ -209,7 +297,8 @@ pub fn stop() {
 ///
 /// Called when a process is shutting down deliberately. Any handle still open
 /// is closed first, because `uv_loop_close` refuses to release a loop that
-/// still owns handles.
+/// still owns handles. This is terminal: the scheduler's handles are closed with
+/// everything else, so nothing may arm a timer afterwards.
 pub fn shutdown() -> bool {
     let Some(pointer) = loop_ptr() else {
         return true;
@@ -230,6 +319,10 @@ pub fn shutdown() -> bool {
 }
 
 /// `uv_walk` callback used by [`shutdown`].
+///
+/// # Safety
+///
+/// Called by libuv for each live handle on the loop.
 unsafe extern "C" fn close_walked_handle(handle: *mut uv::uv_handle_t, _arg: *mut c_void) {
     if handle.is_null() {
         return;
@@ -357,5 +450,38 @@ mod tests {
     fn an_idle_loop_has_no_work() {
         assert!(!run_once());
         assert!(!is_active());
+    }
+
+    /// The keep-alive descriptor gives the backend something to wait on, and is
+    /// unreferenced so it never keeps the loop alive on its own.
+    ///
+    /// The descriptor count is the point: with `nfds == 0` libuv returns from
+    /// `uv__io_poll` without waiting, so a pending timer would spin.
+    #[test]
+    fn the_keepalive_handle_supplies_a_descriptor_without_counting_as_work() {
+        let pointer = loop_ptr().expect("the loop must be creatable");
+        let keepalive = keepalive_handle();
+        assert!(!keepalive.is_null());
+        // SAFETY: both pointers name the process' live loop and handle.
+        unsafe {
+            assert_eq!(uv::uv_is_active(keepalive.cast()), 1, "started by init");
+            assert_eq!(uv::uv_has_ref(keepalive.cast()), 0, "but never ref'd");
+            assert!(
+                (*pointer).nfds >= 1,
+                "the backend has a descriptor to wait on"
+            );
+        }
+        assert!(!is_active(), "an unref'd handle is not work");
+    }
+
+    #[test]
+    fn the_loop_clock_is_monotonic_milliseconds() {
+        update_time();
+        let first = now_ms();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        update_time();
+        let second = now_ms();
+        assert!(second >= first);
+        assert!(second - first >= 1.0, "the unit must be milliseconds");
     }
 }

@@ -260,3 +260,13 @@ pub fn run<'s>(scope: &mut v8::PinScope<'s, '_>) -> bool {
 pub fn has_work() -> bool {
     crate::port::any_keeps_loop_alive()
 }
+
+/// Whether a message or close event is queued for the check phase.
+///
+/// Distinct from [`has_work`]: a ref'd port pins the process open even with
+/// nothing queued, while a posted message needs the check phase to run once. The
+/// check handle is started from this predicate, so an idle port does not make the
+/// loop run a phase for nothing.
+pub fn has_delivery_pending() -> bool {
+    crate::port::has_delivery_pending()
+}

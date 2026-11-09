@@ -59,7 +59,10 @@ use rn_v8_sys::v8;
 
 use crate::port::{MessagePortData, PortInner};
 
-pub use crate::delivery::{emit_message_installed, install_emit_message, run as run_message_ports};
+pub use crate::delivery::{
+    emit_message_installed, has_delivery_pending, install_emit_message, run as run_message_ports,
+};
+pub use crate::port::set_check_phase_armed;
 
 /// Whether a `MessagePort` is still keeping the loop alive.
 ///
