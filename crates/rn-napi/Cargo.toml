@@ -1,0 +1,13 @@
+[package]
+name = "rn-napi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node-API implementation for rustnode"
+
+[dependencies]
+rn-core = { path = "../rn-core" }
+libc.workspace = true
+thiserror.workspace = true

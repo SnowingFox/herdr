@@ -1,0 +1,12 @@
+[package]
+name = "rn-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runs the Node test suite against rustnode"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

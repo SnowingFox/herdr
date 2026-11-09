@@ -1,0 +1,13 @@
+[package]
+name = "rn-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Event loop backends for rustnode (libuv FFI first, io_uring later)"
+
+[dependencies]
+libc.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

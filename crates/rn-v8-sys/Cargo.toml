@@ -1,0 +1,11 @@
+[package]
+name = "rn-v8-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pinned V8 build identity for rustnode"
+
+[dependencies]
+v8.workspace = true
