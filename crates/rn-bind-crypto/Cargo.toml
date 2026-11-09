@@ -1,0 +1,33 @@
+[package]
+name = "rn-bind-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('crypto') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# Real OpenSSL, compiled from source. This is deliberate and load-bearing: the
+# whole premise of rustnode is that only the native glue is rewritten, so every
+# digest, MAC, cipher and derivation has to be the same code Node runs. A
+# RustCrypto reimplementation would turn each algorithm into a compatibility
+# surface that has to be tested separately.
+#
+# `vendored` means the build compiles OpenSSL itself instead of linking a system
+# library, so a machine with no OpenSSL headers still builds. It costs about 30
+# seconds once per clean `target/`; the artifact caches from then on. `openssl-sys`
+# requires `openssl-src ^300`, so the 4.x line Node 28 vendors cannot be used yet
+# — see the crate docs for the resolved version and why.
+openssl = { version = "=0.10.82", features = ["vendored"] }
+# The raw `EVP_*` enumeration calls `getCiphers`/`getHashes` need. The safe
+# `openssl` crate does not expose the `do_all` walkers, and deriving the lists
+# from OpenSSL is a requirement here, so the sys crate is used directly for
+# exactly those calls.
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
+libc = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true
