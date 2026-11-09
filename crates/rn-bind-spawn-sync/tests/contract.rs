@@ -201,6 +201,45 @@ fn a_missing_binary_reports_enoent() {
     assert_eq!(report, "-2,true,true,true");
 }
 
+/// A failed spawn must not leave anything behind on libuv's process-global state.
+///
+/// `uv_spawn` calls `uv__handle_init` — which puts the `uv_process_t` on the
+/// loop's `handle_queue` — and starts the loop's internal `child_watcher` for
+/// `SIGCHLD` before it attempts `exec()`. When `exec()` fails the child never
+/// runs, so `Runner::close_handles` used to skip closing the process handle, and
+/// therefore never reached `uv__process_close`, which is the only thing that
+/// stops that `child_watcher`. `uv_loop_close` then answered `UV_EBUSY`, and the
+/// runner freed the loop anyway, leaving a node in libuv's process-global
+/// `uv__signal_tree` pointing into freed memory.
+///
+/// The symptom was a SIGSEGV in the *next* spawn that started a signal watcher,
+/// on any thread — `uv__signal_compare` dereferencing the stale node. This test
+/// fails the spawn and then spawns successfully in the same process, which is
+/// exactly the sequence that faulted. It is repeated because the original crash
+/// was intermittent under concurrency but unconditional in this order.
+#[test]
+fn a_failed_spawn_leaves_no_handle_behind_for_the_next_spawn() {
+    let report = eval(
+        r#"
+        const failed = __spawnSync.spawn({
+          file: '/nonexistent/rustnode-test-binary',
+          args: ['x'],
+          stdio: [{ type: 'ignore' }, { type: 'ignore' }, { type: 'ignore' }],
+        });
+        const spawned = __spawnSync.spawn({
+          file: '/bin/sh',
+          args: ['/bin/sh', '-c', 'exit 4'],
+          stdio: [{ type: 'ignore' }, { type: 'ignore' }, { type: 'ignore' }],
+        });
+        [failed.error, spawned.status, spawned.pid > 0].join(',')
+        "#,
+    );
+    assert_eq!(
+        report, "-2,4,true",
+        "the spawn after a failed one must still report its real exit code"
+    );
+}
+
 /// `options.input` is written to the child's stdin before the pipe shuts down.
 #[test]
 fn the_input_option_reaches_the_child() {
