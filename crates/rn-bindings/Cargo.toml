@@ -21,6 +21,7 @@ rn-bind-config = { path = "../rn-bind-config" }
 rn-bind-diagnostics-channel = { path = "../rn-bind-diagnostics-channel" }
 rn-bind-fs = { path = "../rn-bind-fs" }
 rn-bind-os = { path = "../rn-bind-os" }
+rn-bind-performance = { path = "../rn-bind-performance" }
 rn-bind-process-methods = { path = "../rn-bind-process-methods" }
 rn-bind-report = { path = "../rn-bind-report" }
 rn-bind-string-decoder = { path = "../rn-bind-string-decoder" }
