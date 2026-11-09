@@ -9,6 +9,9 @@ description = "Environment, object lifecycle and callback kernel for rustnode"
 
 [dependencies]
 rn-v8-sys = { path = "../rn-v8-sys" }
+# `codec` uses `v8::simdutf` for exact UTF-8 validation: it is the simdutf copy
+# V8 already links, so this adds no dependency artifact.
+v8.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 serde.workspace = true

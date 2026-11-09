@@ -11,7 +11,7 @@
 use rn_v8_sys::v8;
 
 use crate::args::{self, parse_index, require_view, Index};
-use crate::codec::Encoding;
+use rn_core::codec::Encoding;
 
 /// `compare(a, b)`: `-1`, `0` or `1` like `Buffer.compare`.
 ///
@@ -265,24 +265,24 @@ pub(crate) fn fill(
 /// `write` it does split a multi-byte character:
 /// `Buffer.alloc(3).fill('😀')` is `f0 9f 98`, and `.fill('é')` into one byte is
 /// `c3`. So this encodes without a length limit and truncates afterwards; using
-/// [`crate::codec::encode_utf8`] with `fill_length` would stop at a character
+/// [`rn_core::codec::encode_utf8`] with `fill_length` would stop at a character
 /// boundary and produce nothing instead.
 fn encode_fill_pattern(units: &[u16], encoding: Encoding, fill_length: usize) -> Vec<u8> {
     let whole = match encoding {
-        Encoding::Utf8 | Encoding::Buffer => crate::codec::encode_utf8(units, usize::MAX),
-        Encoding::Ucs2 => crate::codec::encode_ucs2(units, usize::MAX),
+        Encoding::Utf8 | Encoding::Buffer => rn_core::codec::encode_utf8(units, usize::MAX),
+        Encoding::Ucs2 => rn_core::codec::encode_ucs2(units, usize::MAX),
         Encoding::Ascii | Encoding::Binary => units_to_bytes(units),
         Encoding::Hex => {
             let text = units_to_bytes(units);
             let mut out = vec![0u8; text.len() / 2];
-            let written = crate::codec::decode_hex(&text, &mut out);
+            let written = rn_core::codec::decode_hex(&text, &mut out);
             out.truncate(written);
             out
         }
         Encoding::Base64 | Encoding::Base64Url => {
             let text = units_to_bytes(units);
             let mut out = vec![0u8; text.len()];
-            let written = crate::codec::decode_base64_forgiving(&text, &mut out);
+            let written = rn_core::codec::decode_base64_forgiving(&text, &mut out);
             out.truncate(written);
             out
         }
@@ -449,7 +449,7 @@ pub(crate) fn index_of_string(
                     if search_end < 2 || units.is_empty() {
                         return search_end;
                     }
-                    crate::codec::search_ucs2(
+                    rn_core::codec::search_ucs2(
                         haystack_bytes,
                         &units,
                         search_end,
@@ -457,7 +457,7 @@ pub(crate) fn index_of_string(
                         request.forward,
                     )
                 } else {
-                    crate::codec::search_bytes(
+                    rn_core::codec::search_bytes(
                         haystack_bytes,
                         &needle_bytes,
                         search_end,
@@ -478,20 +478,20 @@ pub(crate) fn index_of_string(
 /// The needle bytes for one encoding, as `StringBytes::Write` would produce.
 fn encode_needle(units: &[u16], encoding: Encoding) -> Vec<u8> {
     match encoding {
-        Encoding::Utf8 | Encoding::Buffer => crate::codec::encode_utf8(units, usize::MAX),
-        Encoding::Ucs2 => crate::codec::encode_ucs2(units, usize::MAX),
+        Encoding::Utf8 | Encoding::Buffer => rn_core::codec::encode_utf8(units, usize::MAX),
+        Encoding::Ucs2 => rn_core::codec::encode_ucs2(units, usize::MAX),
         Encoding::Ascii | Encoding::Binary => units_to_bytes(units),
         Encoding::Hex => {
             let text = units_to_bytes(units);
             let mut out = vec![0u8; text.len() / 2];
-            let written = crate::codec::decode_hex(&text, &mut out);
+            let written = rn_core::codec::decode_hex(&text, &mut out);
             out.truncate(written);
             out
         }
         Encoding::Base64 | Encoding::Base64Url => {
             let text = units_to_bytes(units);
-            let mut out = vec![0u8; crate::codec::base64_encoded_len(text.len(), false)];
-            let written = crate::codec::decode_base64_forgiving(&text, &mut out);
+            let mut out = vec![0u8; rn_core::codec::base64_encoded_len(text.len(), false)];
+            let written = rn_core::codec::decode_base64_forgiving(&text, &mut out);
             out.truncate(written);
             out
         }
@@ -526,8 +526,8 @@ pub(crate) fn index_of_buffer(
                     if search_end < 2 || needle_bytes.len() < 2 {
                         return search_end;
                     }
-                    let needle_units = crate::codec::decode_ucs2(&needle_bytes);
-                    crate::codec::search_ucs2(
+                    let needle_units = rn_core::codec::decode_ucs2(&needle_bytes);
+                    rn_core::codec::search_ucs2(
                         haystack_bytes,
                         &needle_units,
                         search_end,
@@ -535,7 +535,7 @@ pub(crate) fn index_of_buffer(
                         request.forward,
                     )
                 } else {
-                    crate::codec::search_bytes(
+                    rn_core::codec::search_bytes(
                         haystack_bytes,
                         &needle_bytes,
                         search_end,

@@ -92,35 +92,159 @@ pub fn write_buffer<'s>(
     let Some(buffer) = (unsafe { view_buffer(buffer) }) else {
         return WriteResult::Status(EINVAL);
     };
-    let total = buffer.len;
+    dispatch(scope, handle, request, vec![buffer], Vec::new(), owner)
+}
+
+/// `StreamBase::Write`: try the write synchronously, then queue what is left.
+///
+/// This is the order Node uses, and both halves are load-bearing:
+///
+/// * [`stream::try_write`] first. A pipe that accepts the bytes completes the
+///   write without creating a request, and that is what stops a lone
+///   `process.stdout.write` from holding the event loop open: an outstanding
+///   `uv_write_t` is itself a ref'd handle.
+/// * Otherwise `uv_write` the remainder, which reports asynchronously through
+///   `request.oncomplete`.
+///
+/// `owned` is storage the caller flattened for `buffers`; it must survive until
+/// the completion, so it is handed to the queued path. When the write completes
+/// synchronously it has served its purpose and is dropped here.
+fn dispatch<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    handle: &mut impl StreamHandle,
+    request: Option<v8::Local<'s, v8::Object>>,
+    mut buffers: Vec<uv::uv_buf_t>,
+    owned: Vec<Box<[u8]>>,
+    owner: v8::Local<'s, v8::Object>,
+) -> WriteResult<'s> {
+    let total: usize = buffers.iter().map(|buffer| buffer.len).sum();
     let state = handle.stream_state();
     if !state.is_alive() {
         return WriteResult::Status(EINVAL);
     }
-    // `StreamBase::Write` counts the bytes before it dispatches, so
-    // `handle.bytesWritten` includes a write that is still queued.
+    // `StreamBase::Write` counts before it dispatches, so `bytesWritten`
+    // includes a write that is still queued.
     state.bytes_written += total as u64;
     let stream = state.stream;
+
+    // SAFETY: the stream is live and `buffers` is valid for the call. If a
+    // request is queued below, the storage the buffers point at is kept alive by
+    // `owned` (strings) or by `req.buffer` (views).
+    let written = unsafe { stream::try_write(stream, &mut buffers) };
+    if written >= total {
+        // Everything was taken, so no request is created; `afterWriteDispatched`
+        // reads the zero as "completed synchronously".
+        stream::publish(&stream::WriteOutcome {
+            bytes: written,
+            asynchronous: false,
+            error: 0,
+        });
+        return WriteResult::Status(0);
+    }
+    // Slice off what landed, as `DoTryWrite` does: the partially written buffer
+    // keeps its tail, and fully written ones are discarded.
+    let mut remaining = written;
+    let mut start = 0;
+    while start < buffers.len() {
+        if buffers[start].len > remaining {
+            // SAFETY: `remaining` is less than this buffer's length, so the tail
+            // stays inside the allocation the caller provided.
+            buffers[start] = uv::uv_buf_t {
+                base: unsafe { buffers[start].base.add(remaining) },
+                len: buffers[start].len - remaining,
+            };
+            break;
+        }
+        remaining -= buffers[start].len;
+        start += 1;
+    }
+    buffers.drain(..start);
+    let pending: usize = buffers.iter().map(|buffer| buffer.len).sum();
 
     let Some(request) = request.or_else(|| write_wrap(scope)) else {
         return WriteResult::Status(EINVAL);
     };
-    // SAFETY: the buffer points into a view the caller keeps alive.
-    let status = unsafe {
-        stream::queue_write(
-            scope,
-            stream,
-            vec![buffer],
-            total,
-            request,
-            owner,
-            Vec::new(),
-        )
-    };
+    // SAFETY: the stream is live; `owned` keeps any flattened string bytes alive
+    // until the completion runs.
+    let status =
+        unsafe { stream::queue_write(scope, stream, buffers, pending, request, owner, owned) };
     WriteResult::from_status(status, request)
 }
 
+/// One encoded chunk of a write, and the storage that keeps it alive.
+///
+/// `uv_buf_t` is a raw pointer, so whatever it points at has to outlive the
+/// libuv completion. A buffer chunk's backing store is held by `req.buffer` in
+/// `lib/internal/stream_base_commons.js`; a string chunk has no such owner, so
+/// its bytes are flattened here and handed to [`stream::queue_write`] as `owned`
+/// storage that the completion drops.
+struct Chunk {
+    buffer: uv::uv_buf_t,
+    storage: Option<Box<[u8]>>,
+}
+
+/// Reads a chunk's encoding name out of the `writev` array.
+///
+/// `writevGeneric` builds the array as `[chunk, encoding, chunk, encoding, ...]`
+/// where each encoding is the name the caller passed to `write()`. An absent or
+/// unrecognised name is `utf8`, which is what `ParseEncoding`'s fall-through
+/// does — `lib/internal/streams/writable.js` has already rejected anything
+/// `Buffer.isEncoding` does not know, so this only ever sees real names.
+fn chunk_encoding(
+    scope: &mut v8::PinScope<'_, '_>,
+    chunks: v8::Local<v8::Array>,
+    index: u32,
+) -> rn_core::Encoding {
+    let Some(value) = chunks.get_index(scope, index) else {
+        return rn_core::Encoding::Utf8;
+    };
+    let Ok(name) = v8::Local::<v8::String>::try_from(value) else {
+        return rn_core::Encoding::Utf8;
+    };
+    encoding_from_name(&name.to_rust_string_lossy(scope))
+}
+
+/// `ParseEncoding`'s name table.
+///
+/// `buffer` is not a wire encoding and never reaches here — `writable.js` rejects
+/// it for a string chunk — so it falls back to `utf8` with every other unknown
+/// name.
+fn encoding_from_name(name: &str) -> rn_core::Encoding {
+    use rn_core::Encoding;
+    match name.to_ascii_lowercase().as_str() {
+        "latin1" | "binary" => Encoding::Binary,
+        "ascii" => Encoding::Ascii,
+        "ucs2" | "ucs-2" | "utf16le" | "utf-16le" => Encoding::Ucs2,
+        "hex" => Encoding::Hex,
+        "base64" => Encoding::Base64,
+        "base64url" => Encoding::Base64Url,
+        _ => Encoding::Utf8,
+    }
+}
+
+/// Copies a JavaScript string out as UTF-16 code units.
+///
+/// `StringBytes::Write` works from `String::ValueView`, which is the code units
+/// themselves; the encodings differ in how they narrow them, and `ucs2` needs the
+/// units unmodified, so the conversion cannot happen earlier.
+fn string_units(scope: &v8::Isolate, text: &v8::String) -> Vec<u16> {
+    let length = text.length();
+    if length == 0 {
+        return Vec::new();
+    }
+    let mut units = vec![0u16; length];
+    text.write_v2(scope, 0, &mut units, v8::WriteFlags::empty());
+    units
+}
+
 /// `StreamBase::Writev`: `writev(req, chunks, allBuffers)`.
+///
+/// With `allBuffers` false the array alternates `[chunk, encoding, ...]`, and
+/// each entry may be a `Buffer` or a string with a named encoding. Node does not
+/// pre-convert the strings: `StringBytes::Write` runs here, per chunk, because
+/// the encoding is per chunk. `net.Socket` never sets the "decode strings" flag,
+/// so a plain `process.stdout.write('x')` reaches this function with a *string*
+/// in slot 0 and `'utf8'` in slot 1.
 pub fn writev<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     handle: &mut impl StreamHandle,
@@ -129,93 +253,100 @@ pub fn writev<'s>(
     all_buffers: bool,
     owner: v8::Local<'s, v8::Object>,
 ) -> WriteResult<'s> {
-    // With `allBuffers` false the array alternates `[chunk, encoding, ...]`, and
-    // only the chunk slots hold data: `writevGeneric` has already converted every
-    // non-buffer chunk before calling this.
+    let count = if all_buffers {
+        chunks.length() as usize
+    } else {
+        chunks.length() as usize >> 1
+    };
     let stride = if all_buffers { 1 } else { 2 };
-    let mut buffers = Vec::new();
-    let mut total = 0usize;
-    let mut index = 0;
-    while index < chunks.length() {
-        let Some(value) = chunks.get_index(scope, index) else {
+
+    let mut encoded = Vec::with_capacity(count);
+    let mut storage_size = 0usize;
+    for index in 0..count {
+        let Some(value) = chunks.get_index(scope, (index * stride) as u32) else {
             return WriteResult::Status(EINVAL);
         };
-        // SAFETY: the caller keeps every chunk alive on `req.buffer`.
-        match unsafe { view_buffer(value) } {
-            Some(buffer) => {
-                total += buffer.len;
-                buffers.push(buffer);
-            }
-            None => return WriteResult::Status(EINVAL),
+        // `Buffer::HasInstance` first, exactly as Node does: a Buffer's bytes are
+        // already the wire form and its encoding slot is ignored.
+        // SAFETY: `lib/internal/stream_base_commons.js` keeps every chunk alive
+        // on `req.buffer`, which outlives the completion.
+        if let Some(buffer) = unsafe { view_buffer(value) } {
+            encoded.push(Chunk {
+                buffer,
+                storage: None,
+            });
+            continue;
         }
-        index += stride;
+        if all_buffers {
+            // `Writev` reads `Buffer::Data` unconditionally on this branch, so a
+            // non-buffer is a caller error rather than something to coerce.
+            return WriteResult::Status(EINVAL);
+        }
+        let Some(text) = value.to_string(scope) else {
+            return WriteResult::Status(EINVAL);
+        };
+        let encoding = chunk_encoding(scope, chunks, (index * stride + 1) as u32);
+        let units = string_units(scope, &text);
+        let mut bytes = rn_core::codec::write(
+            &units,
+            encoding,
+            rn_core::codec::storage_size(&units, encoding),
+        );
+        storage_size += bytes.len();
+        encoded.push(Chunk {
+            buffer: uv::uv_buf_t {
+                base: bytes.as_mut_ptr().cast(),
+                len: bytes.len(),
+            },
+            storage: Some(bytes.into_boxed_slice()),
+        });
     }
-
-    let state = handle.stream_state();
-    if !state.is_alive() {
-        return WriteResult::Status(EINVAL);
+    if storage_size > i32::MAX as usize {
+        // `if (storage_size > INT_MAX) return UV_ENOBUFS;`
+        return WriteResult::Status(uv::uv_errno_t_UV_ENOBUFS);
     }
-    let stream = state.stream;
-
-    let Some(request) = request.or_else(|| write_wrap(scope)) else {
-        return WriteResult::Status(EINVAL);
-    };
-    // SAFETY: as in `write_buffer`.
-    let status =
-        unsafe { stream::queue_write(scope, stream, buffers, total, request, owner, Vec::new()) };
-    WriteResult::from_status(status, request)
+    // `encoded` is fully built, so every `storage` box has its final address and
+    // the pointers above stay valid: moving a `Box<[u8]>` moves the box, not the
+    // bytes it points at.
+    let buffers: Vec<uv::uv_buf_t> = encoded.iter().map(|chunk| chunk.buffer).collect();
+    let owned: Vec<Box<[u8]>> = encoded
+        .into_iter()
+        .filter_map(|chunk| chunk.storage)
+        .collect();
+    dispatch(scope, handle, request, buffers, owned, owner)
 }
 
-/// `StreamBase::WriteString<UTF8>` and its siblings.
+/// `StreamBase::WriteString<Encoding>` — `writeUtf8String` and its three
+/// siblings.
 ///
-/// The string is flattened into a buffer the write owns, so the bytes stay valid
-/// until libuv's completion fires even though the JavaScript string may be
-/// collected immediately.
+/// The four prototype methods differ *only* in the encoding they name; the body
+/// is `WriteString`, which flattens the string with `StringBytes::Write`. So the
+/// encoding is a parameter here rather than four copies of this function, and
+/// `writeLatin1String` stops emitting UTF-8 by accident.
+///
+/// The bytes are flattened into storage the write owns, so they stay valid until
+/// libuv's completion fires even though the JavaScript string may be collected
+/// immediately.
 pub fn write_string<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     handle: &mut impl StreamHandle,
     request: Option<v8::Local<'s, v8::Object>>,
     text: v8::Local<v8::String>,
+    encoding: rn_core::Encoding,
     owner: v8::Local<'s, v8::Object>,
 ) -> WriteResult<'s> {
-    // `StringBytes::StorageSize` for UTF-8 is at most four bytes per code unit;
-    // `write_utf8_v2` reports how many it actually used.
-    let capacity = text.length().saturating_mul(4) + 4;
-    let mut storage = vec![0u8; capacity];
-    let written = text.write_utf8_v2(scope.as_ref(), &mut storage, v8::WriteFlags::empty(), None);
-    storage.truncate(written);
+    let units = string_units(scope.as_ref(), &text);
+    let storage = rn_core::codec::write(
+        &units,
+        encoding,
+        rn_core::codec::storage_size(&units, encoding),
+    );
     let mut storage = storage.into_boxed_slice();
-    let base = storage.as_mut_ptr();
-    let length = storage.len();
-
-    let state = handle.stream_state();
-    if !state.is_alive() {
-        return WriteResult::Status(EINVAL);
-    }
-    state.bytes_written += length as u64;
-    let stream = state.stream;
-
-    let Some(request) = request.or_else(|| write_wrap(scope)) else {
-        return WriteResult::Status(EINVAL);
-    };
     let buffer = uv::uv_buf_t {
-        base: base.cast(),
-        len: length,
+        base: storage.as_mut_ptr().cast(),
+        len: storage.len(),
     };
-    // SAFETY: `storage` is moved into the write, so its bytes outlive the
-    // completion.
-    let status = unsafe {
-        stream::queue_write(
-            scope,
-            stream,
-            vec![buffer],
-            length,
-            request,
-            owner,
-            vec![storage],
-        )
-    };
-    WriteResult::from_status(status, request)
+    dispatch(scope, handle, request, vec![buffer], vec![storage], owner)
 }
 
 /// What a write produced, in the shape `FinishWrite` returns it.

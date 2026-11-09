@@ -18,7 +18,7 @@
 
 use rn_v8_sys::v8;
 
-use crate::codec::Encoding;
+use rn_core::codec::Encoding;
 
 /// Turns an argument into a view, if it is one.
 pub fn as_view(value: v8::Local<v8::Value>) -> Option<v8::Local<v8::ArrayBufferView>> {

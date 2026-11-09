@@ -14,6 +14,7 @@
 use libuv_sys2 as uv;
 use rn_v8_sys::v8;
 
+use rn_core::Encoding;
 use rn_uv::addr;
 use rn_uv::handle::{self, HandleState};
 use rn_uv::stream_base::{self, StreamHandle, EBADF, EINVAL};
@@ -240,7 +241,7 @@ pub fn write_utf8<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    write_string(scope, &args, &mut rv);
+    write_string(scope, &args, &mut rv, Encoding::Utf8);
 }
 
 /// `writeAsciiString`.
@@ -249,7 +250,7 @@ pub fn write_ascii<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    write_string(scope, &args, &mut rv);
+    write_string(scope, &args, &mut rv, Encoding::Ascii);
 }
 
 /// `writeLatin1String`.
@@ -258,7 +259,7 @@ pub fn write_latin1<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    write_string(scope, &args, &mut rv);
+    write_string(scope, &args, &mut rv, Encoding::Binary);
 }
 
 /// `writeUcs2String`.
@@ -267,7 +268,7 @@ pub fn write_ucs2<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    write_string(scope, &args, &mut rv);
+    write_string(scope, &args, &mut rv, Encoding::Ucs2);
 }
 
 /// The shared body of the four `write*String` methods.
@@ -275,6 +276,7 @@ fn write_string<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
     rv: &mut v8::ReturnValue<'s>,
+    encoding: rn_core::Encoding,
 ) {
     let object = args.this();
     let request = v8::Local::<v8::Object>::try_from(args.get(0)).ok();
@@ -283,7 +285,7 @@ fn write_string<'s>(
         return;
     };
     let result = tcp::with_handle(object, |handle| {
-        stream_base::write_string(scope, handle, request, text, object)
+        stream_base::write_string(scope, handle, request, text, encoding, object)
     });
     match result {
         Some(result) => result.apply(scope, rv),

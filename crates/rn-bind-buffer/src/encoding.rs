@@ -21,7 +21,7 @@ use crate::args::{
     self, latin1_string, parse_index, require_string, require_view, string_to_units, utf16_string,
     Index,
 };
-use crate::codec::{self, Encoding};
+use rn_core::codec::{self, Encoding};
 
 /// Runs `*Slice`: decode `[start, end)` of the first argument.
 pub(crate) fn slice<'s>(
@@ -159,32 +159,10 @@ fn write_string_into(
 
 /// Encodes UTF-16 code units to bytes, truncated to `max`.
 pub(crate) fn encode_units(units: &[u16], encoding: Encoding, max: usize) -> Vec<u8> {
-    match encoding {
-        Encoding::Utf8 | Encoding::Buffer => codec::encode_utf8(units, max),
-        Encoding::Ascii | Encoding::Binary => {
-            // `StringBytes::Write` for ASCII and LATIN1 casts each code unit to
-            // a byte. `ascii` additionally clears the high bit; on the decode
-            // side that is `& 0x7f`, and `StringBytes` does not do it on the way
-            // in, so this must not either.
-            let bytes: Vec<u8> = units.iter().map(|unit| (*unit & 0xff) as u8).collect();
-            bytes[..bytes.len().min(max)].to_vec()
-        }
-        Encoding::Ucs2 => codec::encode_ucs2(units, max),
-        Encoding::Hex => {
-            let text: Vec<u8> = units.iter().map(|unit| (*unit & 0xff) as u8).collect();
-            let mut out = vec![0u8; max];
-            let written = codec::decode_hex(&text, &mut out);
-            out.truncate(written);
-            out
-        }
-        Encoding::Base64 | Encoding::Base64Url => {
-            let text: Vec<u8> = units.iter().map(|unit| (*unit & 0xff) as u8).collect();
-            let mut out = vec![0u8; max];
-            let written = codec::decode_base64_forgiving(&text, &mut out);
-            out.truncate(written);
-            out
-        }
-    }
+    // `Buffer#write` and `StreamBase::Write*` encode with the same function in
+    // Node (`StringBytes::Write`), so there is one implementation and it lives
+    // in the kernel crate where both callers can reach it.
+    codec::write(units, encoding, max)
 }
 
 /// `byteLengthUtf8`: the UTF-8 byte length of a string.
