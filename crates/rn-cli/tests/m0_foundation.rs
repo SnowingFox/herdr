@@ -313,3 +313,69 @@ fn a_script_file_reports_its_exit_code_too() {
         "the script must still run to completion"
     );
 }
+
+#[test]
+fn process_memory_usage_reports_real_numbers() {
+    // `per_thread.js` builds this object from the `Float64Array(5)` the binding
+    // fills, so the keys and their order come from Node and the numbers from
+    // this process. A zero anywhere would mean the array was never read.
+    let out = rustnode(&[
+        "-e",
+        "const usage = process.memoryUsage();\n\
+         console.log(Object.keys(usage).join(','),\n\
+         usage.rss > 0, usage.heapTotal > 0, usage.heapUsed > 0,\n\
+         usage.heapUsed <= usage.heapTotal);",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "rss,heapTotal,heapUsed,external,arrayBuffers true true true true"
+    );
+}
+
+#[test]
+fn process_memory_usage_moves_when_memory_is_retained() {
+    let out = rustnode(&[
+        "-e",
+        "const before = process.memoryUsage().heapUsed;\n\
+         const keep = [];\n\
+         for (let i = 0; i < 200000; i++) keep.push({ i, text: 'filler-' + i });\n\
+         console.log(process.memoryUsage().heapUsed > before, keep.length);",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true 200000");
+}
+
+#[test]
+fn the_heap_size_limit_follows_max_old_space_size() {
+    // V8 owns this flag, so it has to reach V8 before `V8::Initialize` or the
+    // reported limit is the default no matter what the command line asked for.
+    let out = rustnode(&[
+        "--max-old-space-size=64",
+        "--expose-internals",
+        "-e",
+        "const realm = require('internal/bootstrap/realm');\n\
+         const binding = realm.internalBinding('v8');\n\
+         binding.updateHeapStatisticsBuffer();\n\
+         console.log(binding.heapStatisticsBuffer[binding.kHeapSizeLimitIndex] < 400e6);",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true");
+}
+
+#[test]
+fn a_runtime_v8_flag_does_not_abort_the_process() {
+    // V8 freezes its flag list during initialization and setting one afterwards
+    // is a CHECK failure. `v8.setFlagsFromString` is public API, so the freeze
+    // has to be disabled the way Node disables it.
+    let out = rustnode(&[
+        "--expose-internals",
+        "-e",
+        "const realm = require('internal/bootstrap/realm');\n\
+         realm.internalBinding('v8').setFlagsFromString('--allow-natives-syntax');\n\
+         console.log('accepted');",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "accepted");
+}
