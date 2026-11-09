@@ -1,0 +1,18 @@
+[package]
+name = "rn-bind-report"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('report') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+libc.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

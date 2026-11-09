@@ -593,6 +593,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-async-wrap"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-config"
 version = "0.1.0"
 dependencies = [
@@ -628,9 +636,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-process-methods"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-bind-report"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-core",
+ "rn-v8-sys",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rn-bind-symbols"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-task-queue"
 version = "0.1.0"
 dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-bind-timers"
+version = "0.1.0"
+dependencies = [
+ "libc",
  "rn-core",
  "rn-v8-sys",
 ]
@@ -652,11 +697,16 @@ name = "rn-bindings"
 version = "0.1.0"
 dependencies = [
  "rn-bind-async-context",
+ "rn-bind-async-wrap",
  "rn-bind-config",
  "rn-bind-diagnostics-channel",
  "rn-bind-fs",
  "rn-bind-os",
+ "rn-bind-process-methods",
+ "rn-bind-report",
+ "rn-bind-symbols",
  "rn-bind-task-queue",
+ "rn-bind-timers",
  "rn-bind-zlib",
  "rn-builtins",
  "rn-core",
