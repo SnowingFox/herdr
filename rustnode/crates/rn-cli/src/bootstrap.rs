@@ -28,6 +28,49 @@ pub struct Bootstrapped {
     pub require: Option<v8::Global<v8::Function>>,
 }
 
+/// Makes `internal/*` builtins requireable, the way `--expose-internals` does.
+///
+/// Node calls `BuiltinModule.exposeInternals()` during pre-execution. Without
+/// it, `require('internal/test/binding')` throws and Node's own test suite
+/// cannot load its helpers, which is why so many tests fail with
+/// `Missing internal module`.
+pub fn expose_internals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
+    // `require('internal/bootstrap/realm')` returns the bootstrap's own
+    // `loaderExports`, which is where `BuiltinModule` lives.
+    let Some(require) = loaders.require.as_ref() else {
+        return;
+    };
+    let require = v8::Local::new(scope, require);
+    let Some(id) = v8::String::new(scope, "internal/bootstrap/realm") else {
+        return;
+    };
+    let Some(exports) = require.call(scope, v8::undefined(scope).into(), &[id.into()]) else {
+        return;
+    };
+    let Ok(exports) = v8::Local::<v8::Object>::try_from(exports) else {
+        return;
+    };
+    let Some(key) = v8::String::new(scope, "BuiltinModule") else {
+        return;
+    };
+    let Some(value) = exports.get(scope, key.into()) else {
+        return;
+    };
+    let Ok(function) = v8::Local::<v8::Function>::try_from(value) else {
+        return;
+    };
+    let Some(key) = v8::String::new(scope, "exposeInternals") else {
+        return;
+    };
+    let Some(value) = function.get(scope, key.into()) else {
+        return;
+    };
+    let Ok(expose) = v8::Local::<v8::Function>::try_from(value) else {
+        return;
+    };
+    let _ = expose.call(scope, function.into(), &[]);
+}
+
 /// Runs the bootstrap and returns the loaders it created.
 pub fn bootstrap_realm(
     scope: &mut v8::PinScope,
