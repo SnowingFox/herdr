@@ -109,6 +109,7 @@ impl RuntimeHooks {
         }
 
         install_timer_globals(scope, require)?;
+        install_message_port_delivery(scope)?;
         Ok(Self {
             run_next_ticks: v8::Global::new(scope, run_next_ticks),
         })
@@ -206,6 +207,29 @@ fn install_timer_globals<'s>(
         .ok_or("internal/process/task_queues has no queueMicrotask")?;
     define_global(scope, global, "queueMicrotask", queue_microtask)?;
     Ok(())
+}
+
+/// Installs the `emitMessage` function a `MessagePort` delivers through.
+///
+/// `lib/internal/worker/io.js` builds its ports on top of
+/// `internal/per_context/messageport`'s `emitMessage`, which Node's
+/// `GetEmitMessageFunction` looks up on the per-context exports object. That
+/// object does not exist here, so the builtin is compiled once and the function
+/// it produces is rooted by the messaging binding.
+///
+/// A failure is reported rather than fatal, for the same reason a missing timer
+/// is: a script that never creates a port runs fine, and saying why delivery
+/// will not happen is more useful than refusing to start.
+fn install_message_port_delivery(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
+    // `internal/per_context/messageport` is a per-context script, so it compiles
+    // as a function taking `(exports, primordials, privateSymbols,
+    // perIsolateSymbols)`. `rn-builtins::compile` is what applies that kind's
+    // parameter names.
+    let result = rn_bind_messaging::install_emit_message(scope, |scope| {
+        let builtin = rn_js2c::builtin_by_id("internal/per_context/messageport")?;
+        rn_builtins::compile(scope, builtin.id(), builtin.source(), builtin.kind())
+    });
+    result
 }
 
 /// Defines `name` on the global object as a writable, enumerable, configurable
@@ -319,6 +343,11 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
         // `runNextTicks()` between two of them, which is what orders a microtask
         // queued by one immediate before the next immediate.
         let _ = rn_bind_timers::run_immediates(self.scope);
+        // A `MessagePort` becomes readable the moment it is posted to, and Node
+        // delivers from a `uv_async_t` callback the loop runs in this phase.
+        // Delivery goes last so a message handler that queues an immediate does
+        // not run in the same phase the message arrived in.
+        let _ = rn_bind_messaging::run_message_ports(self.scope);
     }
 
     fn run_close(&mut self) {
@@ -345,6 +374,10 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
         rn_bind_timers::timer_handle().keeps_loop_alive()
             || rn_bind_timers::immediate_ref_count() > 0
             || rn_bind_task_queue::has_tick_scheduled()
+            // A ref'd port that is receiving keeps the process alive in Node,
+            // which is what makes `parentPort.on('message', ...)` pin a worker
+            // and `parentPort.unref()` let it exit.
+            || rn_bind_messaging::has_message_port_work()
     }
 
     fn has_pending_immediates(&self) -> bool {

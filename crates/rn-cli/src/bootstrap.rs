@@ -182,6 +182,240 @@ pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
     }
 
     install_process_methods(scope, require, global);
+    install_web_globals(scope);
+}
+
+/// Installs the web globals `test/common/index.js` needs before its first test.
+///
+/// Node's `pre_execution.js` runs `internal/bootstrap/web/exposed-wildcard`,
+/// which installs every `[Exposed=*]` interface. That module cannot run here: it
+/// reads `config.hasInspector`, which is `true` because the inspector is built
+/// into a real Node, and this build has no `inspector` binding at all, so the
+/// console setup throws and the whole module aborts before the globals are
+/// installed.
+///
+/// So the interfaces are installed directly, through the same
+/// `exposeLazyInterfaces` helper the module uses. A lazy interface is a getter
+/// that loads its module on first access, which is what keeps `require('fs')`
+/// from pulling in `abort_controller` at startup.
+fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
+    let Some(internal_binding) = rn_core::hook_slot::internal_binding(scope) else {
+        return;
+    };
+    let Some(require) = rn_core::hook_slot::require(scope) else {
+        return;
+    };
+    let Some(util) = call_require(scope, require, "internal/util") else {
+        return;
+    };
+    let Some(expose_lazy) = get_property(scope, util, "exposeLazyInterfaces") else {
+        return;
+    };
+    let Ok(expose_lazy) = v8::Local::<v8::Function>::try_from(expose_lazy) else {
+        return;
+    };
+
+    let global = scope.get_current_context().global(scope);
+    // `(target, moduleId, names)`.
+    for (module, names) in [
+        (
+            "internal/abort_controller",
+            &["AbortController", "AbortSignal"][..],
+        ),
+        ("internal/event_target", &["CustomEvent"][..]),
+        ("internal/encoding", &["TextEncoder", "TextDecoder"][..]),
+    ] {
+        let (Some(id), Some(array)) = (v8::String::new(scope, module), names_array(scope, names))
+        else {
+            continue;
+        };
+        let _ = expose_lazy.call(scope, util, &[global.into(), id.into(), array.into()]);
+    }
+
+    // `URL` and `URLSearchParams` are not lazy in Node: `internal/url` is small
+    // and needed by the loader itself.
+    if let Some(url) = call_require(scope, require, "internal/url") {
+        for name in ["URL", "URLSearchParams"] {
+            if let Some(value) = get_property(scope, url, name) {
+                let _ = set(scope, global, name, value);
+            }
+        }
+    }
+
+    // `Event` and `EventTarget` come from `internal/event_target`, which is the
+    // base class `MessagePort` is re-parented onto, so they have to be real
+    // rather than a second implementation.
+    if let Some(events) = call_require(scope, require, "internal/event_target") {
+        for name in ["Event", "EventTarget", "CustomEvent"] {
+            if let Some(value) = get_property(scope, events, name) {
+                let _ = set(scope, global, name, value);
+            }
+        }
+    }
+
+    // `global` is Node's alias for `globalThis`, and `test/common` and many
+    // fixtures assign through it.
+    let _ = set(scope, global, "global", global.into());
+
+    install_process_event_emitter(scope, require, global);
+
+    // The `undici` interfaces are exposed lazily in Node too: `fetch` loads the
+    // module on first call and the classes load it on first access, which is what
+    // keeps `require('fs')` from pulling in the whole HTTP client.
+    for (module, names) in [
+        (
+            "internal/deps/undici/undici",
+            &[
+                "FormData",
+                "Headers",
+                "Request",
+                "Response",
+                "MessageEvent",
+                "CloseEvent",
+                "ErrorEvent",
+            ][..],
+        ),
+        ("perf_hooks", &["performance"][..]),
+    ] {
+        let (Some(id), Some(array)) = (v8::String::new(scope, module), names_array(scope, names))
+        else {
+            continue;
+        };
+        let _ = expose_lazy.call(scope, util, &[global.into(), id.into(), array.into()]);
+    }
+
+    // `fetch` is a function rather than a lazy interface: Node defines it as an
+    // ordinary property whose body loads `undici` on first call, so that even
+    // reading `typeof fetch` does not compile the client.
+    if let Some(fetch) = lazy_fetch(scope, require) {
+        let _ = set(scope, global, "fetch", fetch);
+    }
+    let _ = internal_binding;
+}
+
+/// Makes `process` an `EventEmitter`.
+///
+/// `internal/bootstrap/node.js` does this by
+/// `ObjectSetPrototypeOf(process, EventEmitter.prototype)`, and the whole of
+/// `test/common` plus most of `lib/**` depends on it: `process.on('exit', ...)`
+/// is the first thing many tests do, and `process.emit` is how Node signals
+/// `uncaughtException`, `warning` and `worker`.
+///
+/// It runs here rather than inside `process_object` because the `events` module
+/// cannot be required until the realm bootstrap has installed the loaders.
+fn install_process_event_emitter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+    global: v8::Local<'s, v8::Object>,
+) {
+    let Some(process) = get_property(scope, global.into(), "process")
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+    else {
+        return;
+    };
+    let Some(events) = call_require(scope, require, "events") else {
+        return;
+    };
+    let Some(prototype) = get_property(scope, events, "EventEmitter")
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+        .and_then(|constructor| get_property(scope, constructor.into(), "prototype"))
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+    else {
+        return;
+    };
+    process.set_prototype(scope, prototype.into());
+
+    // `process.hrtime`, `process.hrtime.bigint`, `process.uptime` and
+    // `process.emitWarning` come from the same pre-execution setup. `hrtime` is
+    // destructured by `test/common` and most of `lib/**` reads it, and
+    // `emitWarning` is how the loader reports a deprecation, so both have to be
+    // the vendored implementations rather than stubs.
+    install_process_execution_methods(scope, require, process);
+}
+
+/// Installs `hrtime`, `uptime` and `emitWarning` on `process`.
+///
+/// `internal/process/per_thread.js` owns the `hrtime` wrappers and
+/// `internal/process/warning.js` owns `emitWarning`; both are run rather than
+/// reimplemented so the `Float64Array` handling and the warning queue are Node's.
+fn install_process_execution_methods<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+    process: v8::Local<'s, v8::Object>,
+) {
+    if let Some(per_thread) = call_require(scope, require, "internal/process/per_thread") {
+        for name in ["hrtime", "hrtimeBigInt"] {
+            if let Some(value) = get_property(scope, per_thread, name) {
+                let target = if name == "hrtimeBigInt" {
+                    // `process.hrtime.bigint`, not a separate global.
+                    let Some(hrtime) = get_property(scope, process.into(), "hrtime")
+                        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+                    else {
+                        continue;
+                    };
+                    hrtime
+                } else {
+                    process
+                };
+                let key = if name == "hrtimeBigInt" {
+                    "bigint"
+                } else {
+                    "hrtime"
+                };
+                let _ = set(scope, target, key, value);
+            }
+        }
+    }
+
+    if let Some(warning) = call_require(scope, require, "internal/process/warning") {
+        if let Some(value) = get_property(scope, warning, "emitWarning") {
+            let _ = set(scope, process, "emitWarning", value);
+        }
+    }
+
+    // `process.uptime` is a plain binding method.
+    if let Some(value) = call_require(scope, require, "internal/bootstrap/realm")
+        .and_then(|exports| get_property(scope, exports, "internalBinding"))
+        .and_then(|binding_fn| call_with_string(scope, binding_fn, "process_methods"))
+        .and_then(|methods| get_property(scope, methods, "uptime"))
+    {
+        let _ = set(scope, process, "uptime", value);
+    }
+}
+
+/// Builds Node's lazily-loading `fetch`.
+///
+/// A V8 callback cannot capture the loader, so the wrapper is written in
+/// JavaScript and given `require` as an argument, which is the same technique
+/// `wrap_require_with_scheme_support` uses for the same reason.
+fn lazy_fetch<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let source = "(function (require) {\n\
+                  \x20 let impl;\n\
+                  \x20 return function fetch(input, init = undefined) {\n\
+                  \x20   if (!impl) impl = require('internal/deps/undici/undici').fetch;\n\
+                  \x20   return impl(input, init);\n\
+                  \x20 };\n\
+                  })";
+    let source = v8::String::new(scope, source)?;
+    let factory = v8::Script::compile(scope, source, None)?.run(scope)?;
+    let factory = v8::Local::<v8::Function>::try_from(factory).ok()?;
+    factory.call(scope, v8::undefined(scope).into(), &[require.into()])
+}
+
+/// Builds a JavaScript string array from `names`.
+fn names_array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    names: &[&str],
+) -> Option<v8::Local<'s, v8::Array>> {
+    let array = v8::Array::new(scope, names.len() as i32);
+    for (index, name) in names.iter().enumerate() {
+        let value = v8::String::new(scope, name)?;
+        array.set_index(scope, index as u32, value.into());
+    }
+    Some(array)
 }
 
 /// Calls `function(argument)` with `undefined` as the receiver.
@@ -262,6 +496,67 @@ fn install_process_methods<'s>(
             }
         }
     }
+
+    // `process.abort`, `umask`, `chdir` and `cwd` come from Node's
+    // `does_own_process_state` switch, which also installs the credential
+    // setters. Running the vendored module instead of assigning each by hand
+    // keeps the argument validation (`parseFileMode`, the cwd cache) exactly as
+    // Node has it; `test/common/index.js` calls `process.umask(0o022)` before any
+    // test runs, so a missing `umask` aborts the whole suite.
+    install_process_state_switch(scope);
+}
+
+/// Runs `internal/bootstrap/switches/does_own_process_state`.
+///
+/// Node picks between this and `does_not_own_process_state` per environment; the
+/// main thread owns the process, and `is_main_thread` is the switch that selects
+/// this one.
+///
+/// This module is classified as a *bootstrap script*, not a function builtin: its
+/// id starts with `internal/bootstrap/`, so `kind_for` compiles it with
+/// `(process, require, internalBinding, primordials)`. It therefore cannot be
+/// reached through the ordinary `require`, which would call it as a CommonJS
+/// function and leave `internalBinding` undefined. Calling it here is the same
+/// thing `BuiltinLoader::CompileAndCall` does for a bootstrap script.
+fn install_process_state_switch<'s>(scope: &mut v8::PinScope<'s, '_>) {
+    let Some(builtin) =
+        rn_js2c::builtin_by_id("internal/bootstrap/switches/does_own_process_state")
+    else {
+        return;
+    };
+    let Some(function) =
+        rn_builtins::compile(scope, builtin.id(), builtin.source(), builtin.kind())
+    else {
+        return;
+    };
+    let global = scope.get_current_context().global(scope);
+    let Some(process) = get_property(scope, global.into(), "process") else {
+        return;
+    };
+    let (Some(require), Some(internal_binding)) = (
+        rn_core::hook_slot::require(scope),
+        rn_core::hook_slot::internal_binding(scope),
+    ) else {
+        return;
+    };
+    let Some(primordials) = primordials_from_global(scope) else {
+        return;
+    };
+    let arguments = [
+        process,
+        require.into(),
+        internal_binding.into(),
+        primordials,
+    ];
+    let _ = function.call(scope, v8::undefined(scope).into(), &arguments);
+}
+
+/// Reads the `primordials` global the realm bootstrap installs.
+fn primordials_from_global<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let global = scope.get_current_context().global(scope);
+    get_property(scope, global.into(), "primordials")
 }
 
 fn call_require<'s>(
@@ -712,6 +1007,52 @@ fn process_object<'s>(
     // on the way out, so it starts at `undefined` — Node's default — and the
     // exit path substitutes 0 for that.
     set(scope, process, "exitCode", v8::undefined(scope).into())?;
+
+    // `process.config` is serialized `config.gypi`: `internal/bootstrap/node.js`
+    // parses `internalBinding('builtins').config` and freezes the result. The
+    // whole of `test/common/index.js` reads `process.config.variables`
+    // immediately, so a missing `config` aborts every test in the suite.
+    //
+    // The object is built here rather than by parsing that JSON again because
+    // the `builtins` namespace's `config` string is the same one this
+    // reproduces, and doing it natively means it is available before any
+    // builtin that might read it.
+    let config = v8::Object::new(scope);
+    let config_variables = v8::Object::new(scope);
+    // The keys `test/common` and `lib/**` actually branch on. A key that is
+    // present but wrong is worse than an absent one, so only what this build
+    // genuinely has is listed.
+    for (name, value) in [
+        // ICU data is linked through `rn-bind-icu`.
+        ("v8_enable_i18n_support", 1),
+        // OpenSSL is linked, and not the BoringSSL fork.
+        ("node_use_openssl", 1),
+        ("node_shared_openssl", 0),
+        ("node_use_bundled_ca", 1),
+        ("node_shareable_openssl", 0),
+        ("node_target_type", 0),
+        // Neither tracing backend is compiled in.
+        ("node_use_dtrace", 0),
+        ("node_use_etw", 0),
+        ("node_use_perfetto", 0),
+        ("node_enable_v8_vtune_profiling", 0),
+        // V8 builds with the sandbox, matching the linked `v8` crate default.
+        ("v8_enable_sandbox", 1),
+        // Temporal is not compiled into this V8.
+        ("v8_enable_temporal_support", 0),
+    ] {
+        if let Some(key) = v8::String::new(scope, name) {
+            config_variables.set(scope, key.into(), v8::Integer::new(scope, value).into());
+        }
+    }
+    // `node_target_type` is the string `"executable"` in a real gyp file.
+    if let Some(key) = v8::String::new(scope, "node_target_type") {
+        if let Some(value) = v8::String::new(scope, "executable") {
+            config_variables.set(scope, key.into(), value.into());
+        }
+    }
+    set(scope, config, "variables", config_variables.into())?;
+    set(scope, process, "config", config.into())?;
 
     Ok(process)
 }
