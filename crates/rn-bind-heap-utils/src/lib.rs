@@ -2,8 +2,8 @@
 //!
 //! `lib/v8.js` loads this namespace at module scope, so `require('v8')` — and
 //! therefore a large part of the test suite — fails outright without it. Three
-//! members exist on the namespace; this crate implements one, defers one, and
-//! refuses one, and says why for each.
+//! members exist on the namespace: two are implemented here, and the third is
+//! deferred with a reason.
 //!
 //! # `triggerHeapSnapshot(filename, options)` — implemented
 //!
@@ -21,16 +21,13 @@
 //! are read and reported as unsupported rather than silently ignored — see
 //! [`DEFERRED`].
 //!
-//! # `createHeapSnapshotStream(options)` — deferred
+//! # `createHeapSnapshotStream(options)` — implemented
 //!
-//! A streaming snapshot needs the snapshot bytes delivered through a
-//! `libuv`-backed readable handle that `internal/heap_utils.js`'s
-//! `HeapSnapshotStream` wraps in a `Readable` — an `AsyncWrap` subclass with
-//! `readStart`/`readStop` and an `onread` callback. That is a real piece of
-//! native work (the `v8` crate's `take_heap_snapshot` pushes bytes to a Rust
-//! closure and has no back-pressure or partial-read contract), and nothing in
-//! the suite exercises it. `writeHeapSnapshot` — the documented API most callers
-//! use — does not need it.
+//! Returns the readable handle `lib/v8.js`'s `getHeapSnapshot()` wraps in
+//! `internal/heap_utils.js`'s `HeapSnapshotStream`, a `Readable`. The handle is
+//! the `AsyncWrap` + `StreamBase` surface `onStreamRead` drives: `readStart`
+//! pushes the snapshot through `onread` in 64 KiB chunks and then reports
+//! `UV_EOF`. See [`stream`] for what is reproduced and what is deliberately not.
 //!
 //! # `buildEmbedderGraph` — deferred
 //!
@@ -40,6 +37,8 @@
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
+
+pub mod stream;
 
 /// Members exposed on the namespace object, matching
 /// `contracts/heap_utils.json`.
@@ -53,19 +52,12 @@ pub const MEMBERS: &[&str] = &[
 ///
 /// `rn-compat` reports a declared deferral as a pass and an undeclared gap as a
 /// failure, so these are visible rather than silent.
-pub const DEFERRED: &[(&str, &str)] = &[
-    (
-        "createHeapSnapshotStream",
-        "needs a libuv-backed readable handle for the snapshot bytes; v8::take_heap_snapshot \
-         pushes them to a Rust closure with no partial-read contract, and nothing in the suite \
-         exercises the stream API",
-    ),
-    (
-        "buildEmbedderGraph",
-        "describes Node's BaseObject hierarchy to the inspector; rustnode has neither that \
-         hierarchy nor an inspector",
-    ),
-];
+pub const DEFERRED: &[(&str, &str)] = &[(
+    "buildEmbedderGraph",
+    "needs v8::HeapProfiler::AddBuildEmbedderGraphCallback with an EmbedderGraph subclass, and \
+     describes Node's BaseObject hierarchy to the inspector; the v8 crate exposes no embedder \
+     graph binding at all, and rustnode has neither that hierarchy nor an inspector",
+)];
 
 pub struct HeapUtils;
 
@@ -88,14 +80,105 @@ impl BindingModule for HeapUtils {
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
         let object = v8::Object::new(scope);
-        let template = v8::FunctionTemplate::builder(trigger_heap_snapshot).build(scope);
-        let function = template
-            .get_function(scope)
-            .ok_or("cannot allocate triggerHeapSnapshot")?;
-        let key = v8::String::new(scope, "triggerHeapSnapshot")
-            .ok_or("cannot allocate triggerHeapSnapshot key")?;
-        object.set(scope, key.into(), function.into());
+        // `lib/internal/stream_base_commons.js` reads this shared array, so a
+        // snapshot stream has to have created it before `onStreamRead` runs.
+        // `stream_wrap` normally creates it on install; doing it here as well
+        // keeps `heap_utils` usable on its own.
+        rn_uv::stream::state_array(scope);
+
+        let constructor = stream::constructor(scope)?;
+        let function = v8::Local::<v8::Function>::try_from(constructor)
+            .map_err(|_| "the HeapSnapshotStream constructor is not a function".to_string())?;
+        stream::remember_constructor(scope, function);
+
+        install_function(
+            scope,
+            object,
+            "createHeapSnapshotStream",
+            create_heap_snapshot_stream,
+        )?;
+        install_function(scope, object, "triggerHeapSnapshot", trigger_heap_snapshot)?;
         Ok(object)
+    }
+}
+
+/// Installs one native member on the namespace object.
+fn install_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+    callback: impl v8::MapFnTo<v8::FunctionCallback>,
+) -> Result<(), String> {
+    let template = v8::FunctionTemplate::builder(callback).build(scope);
+    let function = template
+        .get_function(scope)
+        .ok_or_else(|| format!("cannot allocate {name}"))?;
+    let key = v8::String::new(scope, name).ok_or_else(|| format!("cannot allocate {name} key"))?;
+    object.set(scope, key.into(), function.into());
+    Ok(())
+}
+
+/// `createHeapSnapshotStream(options)`.
+///
+/// `options` is `getHeapSnapshotOptions`' `Uint8Array([exposeInternals,
+/// exposeNumericValues])`. The `v8` crate's `take_heap_snapshot` exposes no
+/// options parameter, so the flags are parsed and reported as unsupported rather
+/// than silently ignored — the same gap [`trigger_heap_snapshot`] has, and for
+/// the same reason.
+///
+/// A failure to allocate the stream throws instead of returning `undefined`:
+/// `lib/v8.js`'s `getHeapSnapshot` asserts the handle is truthy, and an
+/// assertion failure there would name the wrong problem.
+fn create_heap_snapshot_stream(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let _options = snapshot_options(scope, args.get(0));
+
+    // One buffer, appended in order. `take_heap_snapshot` invokes the callback
+    // repeatedly with consecutive chunks of a single JSON document, and
+    // `try_reserve` keeps a huge snapshot from aborting the process on
+    // allocation failure: aborting the snapshot (`false`) is the contract's own
+    // way to stop, and the empty result is reported as the failure it is.
+    let mut bytes: Vec<u8> = Vec::new();
+    let snapshot = with_snapshot_isolate(|isolate| {
+        isolate.take_heap_snapshot(|chunk| match bytes.try_reserve(chunk.len()) {
+            Ok(()) => {
+                bytes.extend_from_slice(chunk);
+                true
+            }
+            Err(_) => false,
+        })
+    });
+    if snapshot.is_none() {
+        throw_error(
+            scope,
+            "createHeapSnapshotStream ran before the isolate was recorded",
+        );
+        return;
+    }
+
+    let Some(constructor) = stream::constructor_for(scope) else {
+        throw_error(
+            scope,
+            "createHeapSnapshotStream: the constructor is not installed",
+        );
+        return;
+    };
+    // A snapshot that produced no bytes is a failure, not an empty stream: V8
+    // returns early on an allocation failure, and `lib/v8.js` would otherwise
+    // hand back a `Readable` that ends immediately and parses as nothing.
+    if bytes.is_empty() {
+        throw_error(scope, "createHeapSnapshotStream: V8 produced no snapshot");
+        return;
+    }
+    match stream::create(scope, constructor, bytes) {
+        Some(object) => rv.set(object.into()),
+        None => throw_error(
+            scope,
+            "createHeapSnapshotStream: cannot allocate the stream",
+        ),
     }
 }
 

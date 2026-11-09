@@ -173,13 +173,22 @@ fn compile_function_callback(
 
 /// Compiles one builtin the way `BuiltinLoader::LookupAndCompile` does, with the
 /// wrapper parameters its kind requires.
+///
+/// The script name is `node:<id>`, not `<id>`. `node_builtins.cc:344` builds
+/// `filename_s` that way, and the scheme is load-bearing rather than cosmetic:
+/// `lib/internal/util/inspect.js` decides whether a stack frame is internal with
+/// `/^ {4}at (?:[^/\\(]+ \()?node:(.+):\d+:\d+\)?$/` and greys it only when the
+/// captured id is also a real builtin. Without the prefix every frame from
+/// `internal/**` looks like user code, so `util.inspect(error, { colors: true })`
+/// leaves the loader's own frames uncoloured and
+/// `parallel/test-util-inspect.js`'s cross-platform check fails.
 pub fn compile<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     id: &str,
     source: &str,
     kind: BuiltinKind,
 ) -> Option<v8::Local<'s, v8::Function>> {
-    let origin_name = v8::String::new(scope, id)?;
+    let origin_name = v8::String::new(scope, &format!("node:{id}"))?;
     let origin = v8::ScriptOrigin::new(
         scope,
         origin_name.into(),

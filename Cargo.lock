@@ -911,7 +911,9 @@ name = "rn-bind-heap-utils"
 version = "0.1.0"
 dependencies = [
  "rn-core",
+ "rn-uv",
  "rn-v8-sys",
+ "serde_json",
 ]
 
 [[package]]

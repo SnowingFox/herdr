@@ -9,4 +9,11 @@ description = "internalBinding('heap_utils') for rustnode"
 
 [dependencies]
 rn-core.workspace = true
+# The stream handle publishes `streamBaseState` and reads the four indices
+# `internal/stream_base_commons.js` reads back, so it shares that one buffer
+# with `stream_wrap`/`tcp_wrap` rather than keeping a copy.
+rn-uv.workspace = true
 rn-v8-sys.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
