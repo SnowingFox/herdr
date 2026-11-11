@@ -1456,7 +1456,7 @@ fn throw_coded(
             }
         }
         scope.throw_exception(exception);
-        Some(v8::Global::new(&**scope, exception))
+        Some(v8::Global::new(scope, exception))
     };
 
     let recorded = match in_scope(build) {
@@ -2345,7 +2345,7 @@ pub unsafe extern "C" fn napi_create_arraybuffer(
             unsafe { store(result, value) };
         },
         |scope| {
-            let buffer = v8::ArrayBuffer::new(&**scope, byte_length);
+            let buffer = v8::ArrayBuffer::new(scope, byte_length);
             if !data.is_null() {
                 // SAFETY: the caller passed a writable slot or null.
                 unsafe { data.write(buffer.data().map_or(std::ptr::null_mut(), |d| d.as_ptr())) };
@@ -2513,7 +2513,7 @@ pub unsafe extern "C" fn napi_create_buffer(
             unsafe { store(result, value) };
         },
         |scope| {
-            let buffer = v8::ArrayBuffer::new(&**scope, length);
+            let buffer = v8::ArrayBuffer::new(scope, length);
             if !data.is_null() {
                 // SAFETY: the caller passed a writable slot or null.
                 unsafe { data.write(buffer.data().map_or(std::ptr::null_mut(), |d| d.as_ptr())) };
@@ -2546,7 +2546,7 @@ pub unsafe extern "C" fn napi_create_buffer_copy(
             unsafe { store(result, value) };
         },
         |scope| {
-            let buffer = v8::ArrayBuffer::new(&**scope, length);
+            let buffer = v8::ArrayBuffer::new(scope, length);
             if let (Some(target), false) = (buffer.data(), length == 0) {
                 // SAFETY: `data` holds `length` readable bytes by the caller's
                 // contract, and `target` is `length` writable bytes V8 just
@@ -2621,7 +2621,7 @@ pub unsafe extern "C" fn napi_get_buffer_info(
         }
         let view =
             v8::Local::<v8::Uint8Array>::try_from(local).map_err(|_| NapiStatus::InvalidArg)?;
-        let buffer = view.buffer(&**scope).ok_or(NapiStatus::GenericFailure)?;
+        let buffer = view.buffer(scope).ok_or(NapiStatus::GenericFailure)?;
         let base = buffer.data();
         let offset = view.byte_offset();
         let length = view.byte_length();
@@ -2746,7 +2746,7 @@ pub unsafe extern "C" fn napi_get_typedarray_info(
         let view = v8::Local::<v8::ArrayBufferView>::try_from(local)
             .map_err(|_| NapiStatus::InvalidArg)?;
         let kind = crate::buffer::kind_of(&view).ok_or(NapiStatus::InvalidArg)?;
-        let buffer = view.buffer(&**scope).ok_or(NapiStatus::GenericFailure)?;
+        let buffer = view.buffer(scope).ok_or(NapiStatus::GenericFailure)?;
         let offset = view.byte_offset();
         let byte_length = view.byte_length();
         let element_size = crate::buffer::element_size(kind);
@@ -2852,7 +2852,7 @@ pub unsafe extern "C" fn napi_get_dataview_info(
         }
         let view =
             v8::Local::<v8::DataView>::try_from(local).map_err(|_| NapiStatus::InvalidArg)?;
-        let buffer = view.buffer(&**scope).ok_or(NapiStatus::GenericFailure)?;
+        let buffer = view.buffer(scope).ok_or(NapiStatus::GenericFailure)?;
         let offset = view.byte_offset();
         let length = view.byte_length();
         let base = buffer.data().map_or(std::ptr::null_mut(), |pointer| {
@@ -2907,7 +2907,7 @@ pub unsafe extern "C" fn napi_create_external(
             unsafe { store(result, value) };
         },
         |scope| {
-            let external = v8::External::new(&**scope, data);
+            let external = v8::External::new(scope, data);
             if let Some(finalize) = finalize_cb {
                 // The finalizer has to fire when the *External* dies, not when the
                 // handle goes out of scope, so it rides on V8's own weak callback.
@@ -2922,18 +2922,21 @@ pub unsafe extern "C" fn napi_create_external(
                         // V8 may run this on a GC thread, so the addon's callback is
                         // deferred to the loop's thread — the same reason a buffer's
                         // deleter defers.
-                        let _ = rn_core::finalizer::enqueue(move |scope| {
-                            let guard = crate::scope::ScopeGuard::enter(scope);
-                            // SAFETY: the addon's own callback with the pointers it
-                            // supplied; it is being told to release `data` now.
-                            unsafe {
-                                finalize(
-                                    env_address as *mut NapiEnv,
-                                    address as *mut c_void,
-                                    hint as *mut c_void,
-                                )
-                            };
-                            drop(guard);
+                        let _ = rn_core::finalizer::enqueue(move || {
+                            crate::scope::with_context(|scope| {
+                                let guard = crate::scope::ScopeGuard::enter(scope);
+                                // SAFETY: the addon's own callback with the
+                                // pointers it supplied; it is being told to
+                                // release `data` now.
+                                unsafe {
+                                    finalize(
+                                        env_address as *mut NapiEnv,
+                                        address as *mut c_void,
+                                        hint as *mut c_void,
+                                    )
+                                };
+                                drop(guard);
+                            });
                         });
                     }),
                 );
@@ -2943,12 +2946,12 @@ pub unsafe extern "C" fn napi_create_external(
                 // without that, which is the documented way to persist it past the
                 // scope that created it. The allocation it describes is reclaimed
                 // when the weak callback runs.
-                if let Some(raw) = weak.into_raw() {
-                    // SAFETY: `raw` came from `into_raw` on this handle, and
-                    // leaking it is the conservative choice `into_raw` documents:
-                    // the finalizer still owns the box and will run.
-                    std::mem::forget(raw);
-                }
+                // `into_raw` returns the allocation, which is deliberately not
+                // re-adopted: the finalizer it carries stays registered, and the
+                // box is reclaimed when the weak callback runs. Ignoring the
+                // pointer leaks the small `WeakData`, which is the conservative
+                // choice `into_raw` documents — freeing it would be the bug.
+                let _ = weak.into_raw();
             }
             Ok(to_napi(external.into()))
         },

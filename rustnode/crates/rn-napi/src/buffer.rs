@@ -71,18 +71,22 @@ unsafe extern "C" fn drop_external_buffer(
         let hint = buffer.finalize_hint as usize;
         // The closure is `Send` because it captures only addresses, and it runs
         // on the loop's thread where a scope exists.
-        let queued = rn_core::finalizer::enqueue(move |scope| {
-            let guard = crate::scope::ScopeGuard::enter(scope);
-            // SAFETY: the addon's own callback with the pointers it supplied. The
-            // addon owns `data` and is being told to release it now.
-            unsafe {
-                finalize(
-                    env as *mut NapiEnv,
-                    data as *mut c_void,
-                    hint as *mut c_void,
-                )
-            };
-            drop(guard);
+        let queued = rn_core::finalizer::enqueue(move || {
+            // Re-enter through `with_context`: it opens a handle scope and publishes
+            // it, which is what makes a `napi_*` call from this finalizer legal.
+            crate::scope::with_context(|scope| {
+                let guard = crate::scope::ScopeGuard::enter(scope);
+                // SAFETY: the addon's own callback with the pointers it supplied.
+                // The addon owns `data` and is being told to release it now.
+                unsafe {
+                    finalize(
+                        env as *mut NapiEnv,
+                        data as *mut c_void,
+                        hint as *mut c_void,
+                    )
+                };
+                drop(guard);
+            });
         });
         if !queued {
             tracing::error!(

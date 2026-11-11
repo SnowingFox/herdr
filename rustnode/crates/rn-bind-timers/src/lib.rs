@@ -524,7 +524,7 @@ unsafe extern "C" fn on_check(_handle: *mut uv::uv_check_t) {
     // thread, and a finalizer may queue an immediate of its own.
     if native_pending || rn_core::finalizer::has_pending() {
         rn_uv::callback::with_context(|scope| {
-            rn_core::finalizer::run_pending(scope);
+            rn_core::finalizer::run_pending();
             rn_core::native_immediates::run_and_clear(scope);
         });
     }

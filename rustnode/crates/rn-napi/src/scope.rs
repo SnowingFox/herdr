@@ -129,6 +129,7 @@ pub(crate) fn remember_context(scope: &mut v8::PinScope<'_, '_>) {
 /// Whether a context has been recorded, so a shim can report a real failure
 /// instead of a misleading one.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn has_context() -> bool {
     rn_uv::callback::has_context()
 }

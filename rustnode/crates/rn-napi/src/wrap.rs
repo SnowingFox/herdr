@@ -120,7 +120,7 @@ pub(crate) unsafe fn wrap_of<'s>(
     // `has_private` is what makes the read safe: without it a never-stored wrap
     // would be read as whatever the slot held, which is the internal-field bug
     // this module exists to avoid.
-    if object.has_private(scope, key)? != true {
+    if !object.has_private(scope, key)? {
         return None;
     }
     let value = object.get_private(scope, key)?;
@@ -186,18 +186,20 @@ unsafe fn finish_finalizer(pointer: *mut Wrap, defer: bool) {
             if defer {
                 // V8 may call the weak callback from a GC thread, so the addon's
                 // finalizer is deferred to the loop's thread where a scope exists.
-                let _ = rn_core::finalizer::enqueue(move |scope| {
-                    let guard = crate::scope::ScopeGuard::enter(scope);
-                    // SAFETY: the addon's own callback with the pointers it
-                    // supplied; it is being told to release `data` now.
-                    unsafe {
-                        finalize(
-                            env as *mut NapiEnv,
-                            data as *mut c_void,
-                            hint as *mut c_void,
-                        )
-                    };
-                    drop(guard);
+                let _ = rn_core::finalizer::enqueue(move || {
+                    crate::scope::with_context(|scope| {
+                        let guard = crate::scope::ScopeGuard::enter(scope);
+                        // SAFETY: the addon's own callback with the pointers it
+                        // supplied; it is being told to release `data` now.
+                        unsafe {
+                            finalize(
+                                env as *mut NapiEnv,
+                                data as *mut c_void,
+                                hint as *mut c_void,
+                            )
+                        };
+                        drop(guard);
+                    });
                 });
             } else {
                 // Already on the isolate's thread inside a scope
@@ -259,7 +261,7 @@ pub(crate) unsafe fn install<'s>(
     let external = v8::External::new(scope, pointer.cast());
     // A private property is invisible to JavaScript and cannot be shadowed by a
     // user property of the same name, which is why Node uses one.
-    if object.set_private(scope, key, external.into())? != true {
+    if !object.set_private(scope, key, external.into())? {
         // The store failed, so nothing owns the box; reclaim it rather than leak.
         drop(unsafe { Box::from_raw(pointer) });
         return None;

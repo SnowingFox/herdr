@@ -246,6 +246,7 @@ impl Env {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn cleanup_hook_count(&self) -> usize {
         self.cleanup_hooks.borrow().len()
     }

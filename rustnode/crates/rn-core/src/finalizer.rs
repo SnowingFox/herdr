@@ -48,7 +48,10 @@ use std::sync::{Mutex, OnceLock};
 /// `enqueue` runs on whichever thread V8 collected on, so a thread-local slot
 /// would be empty exactly when it is needed.
 fn wakeup() -> &'static Mutex<Option<fn()>> {
-    static WAKEUP: OnceLock<Mutex<Option<fn()>>> = OnceLock::new();
+    /// The registered wakeup, in a cell that is set once at install time and read
+    /// from any thread afterwards.
+    type Wakeup = Mutex<Option<fn()>>;
+    static WAKEUP: OnceLock<Wakeup> = OnceLock::new();
     WAKEUP.get_or_init(|| Mutex::new(None))
 }
 
@@ -86,13 +89,26 @@ fn wake() {
     }
 }
 
+/// The body of a deferred finalizer.
+///
+/// Takes no scope argument, and the queue is not generic over one. `PinScope` is
+/// invariant over its lifetime and context parameters, so a stored closure that
+/// named them could only be enqueued and drained from code that agreed on exactly
+/// those types — which the enqueue site (a GC thread in `rn-napi`) and the drain (a
+/// scheduler iteration) do not.
+///
+/// Each `rn-napi` finalizer instead re-enters through `rn-napi::scope::with_context`,
+/// which opens a handle scope and publishes it, so `napi_*` calls inside the
+/// finalizer resolve normally.
+pub type FinalizerBody = dyn FnOnce() + Send;
+
 /// One deferred finalizer.
 ///
 /// A boxed closure rather than a function pointer: a finalizer carries the addon's
-/// `napi_finalize`, its `data`, its `hint` and the `napi_env`. Those are four
-/// words of captured state, and there is one allocation per freed object at most,
-/// on a path that already allocated that object.
-type Pending = Box<dyn FnOnce(&mut rn_v8_sys::v8::PinScope<'_, '_>) + Send>;
+/// `napi_finalize`, its `data`, its `hint` and the `napi_env`. Those are four words
+/// of captured state, and there is at most one allocation per freed object, on a
+/// path that already allocated that object.
+type Pending = Box<FinalizerBody>;
 
 fn queue() -> &'static Mutex<Vec<Pending>> {
     static QUEUE: OnceLock<Mutex<Vec<Pending>>> = OnceLock::new();
@@ -107,7 +123,7 @@ fn queue() -> &'static Mutex<Vec<Pending>> {
 /// Returns `false` when the queue is poisoned, which means another thread panicked
 /// while holding it. The caller should treat that as "the finalizer will not run"
 /// rather than retrying, because the queue's contents are then unknown.
-pub fn enqueue(body: impl FnOnce(&mut rn_v8_sys::v8::PinScope<'_, '_>) + Send + 'static) -> bool {
+pub fn enqueue(body: impl FnOnce() + Send + 'static) -> bool {
     match queue().lock() {
         Ok(mut pending) => {
             pending.push(Box::new(body));
@@ -142,7 +158,7 @@ pub fn has_pending() -> bool {
 /// `while (!pending_finalizers.empty())` loop does: an addon deleting a reference
 /// inside a finalizer must not push the next finalizer into an iteration that may
 /// never come.
-pub fn run_pending(scope: &mut rn_v8_sys::v8::PinScope<'_, '_>) {
+pub fn run_pending() {
     loop {
         let batch = match queue().lock() {
             Ok(mut pending) => std::mem::take(&mut *pending),
@@ -152,7 +168,7 @@ pub fn run_pending(scope: &mut rn_v8_sys::v8::PinScope<'_, '_>) {
             return;
         }
         for finalizer in batch {
-            finalizer(scope);
+            finalizer();
         }
     }
 }
@@ -167,7 +183,7 @@ mod tests {
         // swallowed the entry would leave the finalizer waiting forever.
         let before = has_pending();
         assert!(
-            enqueue(|_| {}),
+            enqueue(|| {}),
             "enqueueing must not fail on an unpoisoned queue"
         );
         assert!(has_pending() || before, "the entry must be visible");
@@ -180,7 +196,7 @@ mod tests {
         let handle = std::thread::spawn(|| {
             let marker = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let inner = marker.clone();
-            assert!(enqueue(move |_| {
+            assert!(enqueue(move || {
                 inner.store(true, std::sync::atomic::Ordering::SeqCst);
             }));
             marker
