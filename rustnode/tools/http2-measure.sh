@@ -1,9 +1,24 @@
 #!/usr/bin/env bash
-# Measures the `test-http2*` family under the four-marker rule.
+# Measures the `test-http2*` family under the four-marker rule, repeated N times.
 #
-#   ./tools/http2-measure.sh <results-dir> [--tests <node-test-dir>]
+#   ./tools/http2-measure.sh <results-dir> [--tests <node-test-dir>] [--runs N]
 #
-# A file passes only when all five hold:
+# A single run cannot adjudicate a small change. Two runs of the *same* binary
+# disagreed on `test-http2-compat-errors.js`, and `test-http2-server-errors.js`
+# segfaults in six of eight runs, so a one-shot total carries about ±2 of noise and
+# an exit-code count overstates a pass rate for the same reason a single-file
+# `rc=0` is a false positive.
+#
+# So each file runs N times (default 3) and the result is a *distribution*:
+#
+#   test-http2-foo.js | 0 0 0 | stable-pass | ...
+#   test-http2-bar.js | 0 124 0 | unstable | ...
+#
+# The aggregate that decides anything is **files that pass in every run**. A file
+# that flips is marked `unstable` and counted on neither side, so it can neither
+# flatter nor damage a comparison.
+#
+# A file passes one run only when all five hold:
 #
 #   1. the process exits 0;
 #   2. no `✖` anywhere in stdout or stderr;
@@ -12,43 +27,84 @@
 #   4. no `1..0 # Skipped` at column zero;
 #   5. no `: # SKIP` anywhere.
 #
-# Exit status alone is not a pass: TAP files report failures inside their output
-# and a `common.skip()` exits 0, so an exit-code count overstates the result. That
-# is what these markers exist to catch.
+# Columns, per file:
 #
-# Per-file lines are written as `exit | markers | verdict`, then a summary.
+#   name | per-run outcomes | stability | markers seen | slowest run
+#
+# `stability` is `stable-pass`, `stable-fail` or `unstable`. `markers seen` is the
+# union across runs, so an `Uncaught` that only appears sometimes is still visible.
 #
 # Exit codes:
 #   0 every selected file was measured (whatever the verdicts were)
-#   1 the harness could not be built or the test tree is missing
+#   1 the binary or test tree is missing, or `--runs` is not a positive integer
 #   2 usage error
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-results="${1:-}"
-shift || true
+usage() {
+  echo "usage: tools/http2-measure.sh <results-dir> [--tests <dir>] [--runs N] [--only SUBSTR] [--limit N]" >&2
+}
+
+results=""
 tests_dir=""
+runs=3
+only=""
+limit=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --tests)
       tests_dir="${2:?--tests needs a directory}"
       shift 2
       ;;
-    *)
-      echo "usage: tools/http2-measure.sh <results-dir> [--tests <dir>]" >&2
+    --runs)
+      runs="${2:?--runs needs a count}"
+      shift 2
+      ;;
+    --only)
+      only="${2:?--only needs a substring}"
+      shift 2
+      ;;
+    --limit)
+      limit="${2:?--limit needs a count}"
+      shift 2
+      ;;
+    -h | --help)
+      usage
       exit 2
+      ;;
+    -*)
+      usage
+      exit 2
+      ;;
+    *)
+      if [ -n "$results" ]; then
+        usage
+        exit 2
+      fi
+      results="$1"
+      shift
       ;;
   esac
 done
 
 if [ -z "$results" ]; then
-  echo "usage: tools/http2-measure.sh <results-dir> [--tests <dir>]" >&2
+  usage
   exit 2
 fi
+case "$runs" in
+  '' | *[!0-9]*)
+    echo "rustnode: --runs must be a positive integer, got '$runs'" >&2
+    exit 1
+    ;;
+esac
+if [ "$runs" -lt 1 ]; then
+  echo "rustnode: --runs must be at least 1" >&2
+  exit 1
+fi
 
-binary="target/debug/rustnode"
+binary="${RUSTNODE_BIN:-target/debug/rustnode}"
 if [ ! -x "$binary" ]; then
   echo "rustnode: $binary is not executable; build it first" >&2
   exit 1
@@ -73,14 +129,23 @@ flags_of() {
   awk '/^\/\/ Flags:/{sub(/^\/\/ Flags:[[:space:]]*/, ""); print; exit}' "$1"
 }
 
-measure_one() {
+# One run. Prints `<outcome>|<markers>|<verdict>|<seconds>` and nothing else.
+#
+# The outcome is the exit status, which is what distinguishes a timeout (124) from
+# a crash (139/-11, 134/-6) from an ordinary failure, and it is the column that
+# makes an unstable file's shape legible.
+run_one() {
   local file="$1"
-  local name="${file#"$tests_dir"/}"
   local flags
   flags="$(flags_of "$file")"
+  local started ended status
+  started=$(date +%s%N)
   # shellcheck disable=SC2086 # the flags line is a space-separated list on purpose
+  set +e
   timeout 60 "$binary" $flags "$file" >"$work/out" 2>"$work/err"
-  local status=$?
+  status=$?
+  set -e
+  ended=$(date +%s%N)
   local markers=""
   if grep -q '✖' "$work/out" "$work/err" 2>/dev/null; then
     markers="${markers}X"
@@ -98,31 +163,81 @@ measure_one() {
   if [ "$status" -ne 0 ] || [ -n "$markers" ]; then
     verdict="FAIL"
   fi
-  printf '%s | %s | %s\n' "$name" "$status" "${markers:-none} | $verdict"
-  if [ "$verdict" = "PASS" ]; then
-    return 0
-  fi
-  return 1
+  printf '%s|%s|%s|%s' "$status" "${markers:-none}" "$verdict" "$(( (ended - started) / 1000000 ))"
 }
 
 mapfile -t files < <(ls "$tests_dir"/parallel/test-http2*.js | sort)
+# `--only` and `--limit` exist so the harness can be exercised on a handful of
+# files from the real tree — copying files out of it breaks their `../common`
+# require and makes every file fail for a reason that is not the code under test.
+if [ -n "$only" ]; then
+  filtered=()
+  for file in "${files[@]}"; do
+    case "$file" in
+      *"$only"*) filtered+=("$file") ;;
+    esac
+  done
+  files=("${filtered[@]+"${filtered[@]}"}")
+fi
+if [ "$limit" -gt 0 ] && [ "${#files[@]}" -gt "$limit" ]; then
+  files=("${files[@]:0:$limit}")
+fi
 total="${#files[@]}"
-pass=0
-fail=0
 printf 'HEAD %s\n' "$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 printf 'binary %s mtime %s\n' "$binary" "$(date -r "$binary" -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown)"
-printf 'files %d\n' "$total"
-# Written to a file and printed afterwards rather than piped into `tee`: a
-# pipeline would put the loop in a subshell, where the counters do not survive to
-# be reported.
-for file in "${files[@]}"; do
-  if measure_one "$file"; then
-    pass=$((pass + 1))
-  else
-    fail=$((fail + 1))
-  fi
-done >"$results/http2-files.txt"
-cat "$results/http2-files.txt"
+printf 'files %d runs %d\n' "$total" "$runs"
 
-printf '\nPASS=%s FAIL=%s TOTAL=%s\n' "$pass" "$fail" "$total"
+outcome_file="$results/http2-files.txt"
+: >"$outcome_file"
+for file in "${files[@]}"; do
+  name="${file#"$tests_dir"/}"
+  outcomes=()
+  markers_seen=""
+  slowest=0
+  passes=0
+  for ((run = 1; run <= runs; run++)); do
+    record="$(run_one "$file")"
+    IFS='|' read -r status markers verdict millis <<<"$record"
+    outcomes+=("$status")
+    if [ "$verdict" = "PASS" ]; then
+      passes=$((passes + 1))
+    fi
+    if [ "$markers" != "none" ]; then
+      case "$markers_seen" in
+        *"$markers"*) ;;
+        *) markers_seen="${markers_seen}${markers}" ;;
+      esac
+    fi
+    if [ "$millis" -gt "$slowest" ]; then
+      slowest="$millis"
+    fi
+  done
+  if [ "$passes" -eq "$runs" ]; then
+    stability="stable-pass"
+  elif [ "$passes" -eq 0 ]; then
+    stability="stable-fail"
+  else
+    stability="unstable"
+  fi
+  printf '%s | %s | %s | %s | %sms\n' \
+    "$name" "${outcomes[*]}" "$stability" "${markers_seen:-none}" "$slowest" >>"$outcome_file"
+done
+
+cat "$outcome_file"
+
+stable_pass="$(awk -F'|' '$3 ~ /stable-pass/' "$outcome_file" | wc -l)"
+stable_fail="$(awk -F'|' '$3 ~ /stable-fail/' "$outcome_file" | wc -l)"
+unstable="$(awk -F'|' '$3 ~ /unstable/' "$outcome_file" | wc -l)"
+
+printf '\nSTABLE_PASS=%s STABLE_FAIL=%s UNSTABLE=%s TOTAL=%s RUNS=%s\n' \
+  "$stable_pass" "$stable_fail" "$unstable" "$total" "$runs"
+
+# The unstable files are listed explicitly rather than left for a reader to find.
+# A crash majority in that list is a reproducible defect, not noise, and hiding it
+# inside an aggregate is how a real bug gets filed as "flaky" and forgotten.
+if [ "$unstable" -ne 0 ]; then
+  printf '\nunstable files (counted on neither side):\n'
+  awk -F'|' '$3 ~ /unstable/ {printf "  %s |%s | %s\n", $1, $2, $4}' "$outcome_file"
+fi
+
 exit 0
