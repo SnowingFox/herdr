@@ -68,7 +68,17 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.version }}
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to a commit, like every other action in this repository. The SHA
+      # is the one ci.yml, preview.yml and release.yml already use, and it is on
+      # the v2 line (`v2.9.2~21`), so this pin does not cross a major version.
+      #
+      # It does move off the floating `v2` tag, which today resolves to v2.9.3 —
+      # 57 commits newer, including several that change this action's own
+      # cleanup. Checked at both commits: `keepProfile` is
+      # `["build", ".fingerprint", "deps"]` and nothing preserves `gn_out/`, so
+      # the half-restored v8 case the repair step below handles is real on
+      # either one. The step stays necessary after this pin.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           workspaces: rustnode
 
