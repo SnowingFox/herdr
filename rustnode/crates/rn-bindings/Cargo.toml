@@ -34,6 +34,7 @@ rn-bind-glob = { path = "../rn-bind-glob" }
 rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
 rn-bind-http-parser = { path = "../rn-bind-http-parser" }
 rn-bind-icu = { path = "../rn-bind-icu" }
+rn-bind-inspector = { path = "../rn-bind-inspector" }
 rn-bind-js-stream = { path = "../rn-bind-js-stream" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-bind-mksnapshot = { path = "../rn-bind-mksnapshot" }

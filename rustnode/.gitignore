@@ -1,5 +1,9 @@
 /target
 /tools/harness/results
+# The result directories the inspector before/after measurement writes. They are
+# per-binary on purpose, and they are measurements rather than sources.
+/tools/harness/results-inspector-candidate
+/tools/harness/results-inspector-baseline
 
 # Python leaves these next to the tools that import modules. Cargo's `tools/*`
 # workspace glob would otherwise try to load `__pycache__` as a crate, which

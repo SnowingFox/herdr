@@ -26,6 +26,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_heap_utils::register(registry);
     rn_bind_http_parser::register(registry);
     rn_bind_icu::register(registry);
+    rn_bind_inspector::register(registry);
     rn_bind_js_stream::register(registry);
     rn_bind_messaging::register(registry);
     rn_bind_mksnapshot::register(registry);
