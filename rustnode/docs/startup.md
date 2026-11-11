@@ -117,10 +117,11 @@ shuffled together with node's runs in one batch.
 
 > **Historical figure.** Both the 23.0 ms and the 0.84x above measure *this cache
 > change at this tree*. `#26` (worker_threads) later added ~5 ms to startup, and
-> current `master` is ~0.76x against node, not 0.84x. See the regression section
-> further down ("The `#26` startup regression") for the mechanism and the
-> current measurement. The table and the comparison above are left as measured;
-> they are a real record of the cache work, not a statement about today.
+> current `master` is ~0.76x against node, not 0.84x. See the section further
+> down titled "The `#26` startup regression: 251 scans became 251 scans plus 251
+> allocations" for the mechanism and the current measurement. The table and the
+> comparison above are left as measured; they are a real record of the cache
+> work, not a statement about today.
 
 `tools/bench.py --samples 40`, one such run:
 
@@ -182,7 +183,14 @@ attributed to a commit by bisecting medians but not to a *phase*, which is
 exactly what happened to the 5 ms that `#26` added: two hand-checked mechanisms
 (binary size, the widened `has_external_work` predicate) were both wrong.
 
-## The `#26` startup regression: a quadratic option-list build
+## The `#26` startup regression: 251 scans became 251 scans plus 251 allocations
+
+`#26` did not make the option-list build quadratic. It was already
+O(lookups × entries) on every tree, because `Store::value_of` is a linear scan of
+the store. What `#26` added was a deep clone of the whole store *per lookup*: a
+build that was 251 scans became 251 scans plus 251 allocations of a 217-entry
+vector. Same class, a much worse constant. The rest of this section is the
+evidence for that, and for the ~5 ms it cost.
 
 `#26` (worker_threads) moved the parsed option store from a thread-local
 `Store` to a process-wide one so a worker inherits the parent's command line.
@@ -208,14 +216,13 @@ quoted, so `a_parsed_store_holds_only_the_options_that_have_a_default` in
 `rn-bind-options` pins the 217 *derived from the table* rather than as a
 literal: adding an option keeps the test honest.
 
-To be precise about the complexity, since the phrase "O(n²) lookup" is wrong for
-this code: `Store::value_of` was already a linear scan (`self.values.iter()
-.find(..)`), so one lookup was O(entries) before #26 and one lookup is
-O(entries) after. A *build* is O(lookups × entries) either way. The clone did
-not change the asymptotic class — it raised the constant and added ~54,500
-allocations, because each of the 251 lookups newly allocated and filled a
-217-entry vector before doing the same scan it always had. That allocation and
-copying is the ~5 ms.
+The scan and the clone are separate costs, and only the second one is new.
+`Store::value_of` is a linear scan (`self.values.iter().find(..)`), so one lookup
+was O(entries) before `#26` and is O(entries) after; a build is
+O(lookups × entries) either way. The clone did not change the class — each of the
+251 lookups newly allocated and filled a 217-entry vector before doing the same
+scan it always had. That allocation and copying is the ~5 ms, and it is why the
+heading above talks about allocations rather than about a complexity class.
 
 ### Two builds, from one cause — and a duplicate call that was not one
 
