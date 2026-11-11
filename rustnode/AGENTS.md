@@ -112,6 +112,20 @@ are vendored C/C++ and are compiled by `cc-rs` at build time. Two consequences:
   only in the GCC version directory here, so `check.sh` also adds
   `-L /usr/lib/gcc/x86_64-linux-gnu/13` to `RUSTFLAGS`.
 
+## A cached `target/` can restore v8 without its static library
+
+`v8` downloads a 198 MB `librusty_v8.a` into `target/<profile>/gn_out/obj/`
+and tells rustc to link it from there. `Swatinem/rust-cache` keeps only
+`build/`, `.fingerprint/` and `deps/` when it prunes a profile, and only for
+crates outside the workspace, so a restored tree can hold v8's build-script
+fingerprint while `gn_out/` is gone. The build script then never re-runs, its
+recorded `-L` points at a directory that no longer exists, and any unit that
+has to build or relink fails with `could not find native static library
+rusty_v8` even though nothing about the source or the lints changed. The fix is
+to drop v8's fingerprints when the archive is missing so the build script reruns;
+CI does that in rustnode-ci.yml, and the same prune is what makes a local
+`target/` copied between machines unsafe.
+
 ## Debugging a binding called with the wrong arguments
 
 `RUSTNODE_DEBUG_BINDING=1` makes `compileFunctionForCJSLoader` print the kinds of
