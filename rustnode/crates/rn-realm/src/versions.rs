@@ -148,11 +148,6 @@ pub const WITHHELD: &[(&str, &str)] = &[
          icu::TimeZone::getTZDataVersion, which is unavailable for the same \
          reason as cldr",
     ),
-    (
-        "sqlite",
-        "`node:sqlite` has no binding; publishing a version would make \
-         `hasSQLite` true and start running tests against a missing module",
-    ),
     ("libffi", "libffi is not linked"),
     ("lief", "LIEF is not linked"),
     (
@@ -199,6 +194,14 @@ pub fn table() -> Vec<Entry> {
         Entry {
             key: "openssl",
             value: rn_bind_crypto::engine::openssl_version(),
+        },
+        Entry {
+            key: "sqlite",
+            // The version of the amalgamation this binary actually links, not
+            // the pinned string: `test/common/index.js` derives `hasSQLite`
+            // from this value, and a wrong one would enable tests whose
+            // expectations belong to a different SQLite.
+            value: rn_bind_sqlite::sqlite_version().unwrap_or_default(),
         },
         Entry {
             key: "unicode",
@@ -392,11 +395,39 @@ mod tests {
         // These are the keys `test/common/index.js` turns into capability
         // flags. Publishing one for a feature that is not implemented converts
         // a skip into a failure, which is worse than the skip.
-        for key in ["sqlite", "napi", "libffi"] {
+        //
+        // `sqlite` used to be in this list with the reason "`node:sqlite` has no
+        // binding". That stopped being true when the namespace landed, so the
+        // key moved into `table()` and is asserted present below: withholding it
+        // now would suppress all 27 `node:sqlite` tests as skips, which is the
+        // failure mode this test exists to prevent, just inverted.
+        for key in ["napi", "libffi"] {
             assert!(
                 WITHHELD.iter().any(|(withheld, _)| *withheld == key),
                 "{key} must stay withheld until the feature works"
             );
         }
+        let table = table();
+        assert!(
+            table.iter().any(|entry| entry.key == "sqlite"),
+            "sqlite must be published now that node:sqlite is implemented"
+        );
+    }
+
+    #[test]
+    fn the_sqlite_version_is_the_linked_amalgamation() {
+        // Not a pinned literal: the value has to come from the library the
+        // binary actually links, because `hasSQLite` and therefore every
+        // `node:sqlite` test depends on it being truthful.
+        let table = table();
+        let sqlite = table
+            .iter()
+            .find(|entry| entry.key == "sqlite")
+            .expect("sqlite is published");
+        assert_eq!(
+            sqlite.value,
+            rn_bind_sqlite::sqlite_version().expect("a linked SQLite reports a version")
+        );
+        assert_eq!(sqlite.value, "3.54.1");
     }
 }

@@ -183,4 +183,10 @@ step "the vendored merve is unchanged"
 # change that answer without failing anything else.
 ./tools/verify-merve.sh
 
+step "the vendored SQLite is unchanged"
+# SQL semantics are `node:sqlite`'s whole compatibility surface, so the
+# amalgamation is held to the pinned Node revision rather than to whatever a
+# system library happens to be.
+./tools/verify-sqlite.sh
+
 printf '\nall checks passed\n'

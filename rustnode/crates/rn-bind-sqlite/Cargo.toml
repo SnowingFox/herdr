@@ -1,0 +1,28 @@
+[package]
+name = "rn-bind-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('sqlite') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# Extension loading is refused when the permission model is on, which is the
+# same rule `src/node_sqlite.cc` enforces through `env()->permission()`. The
+# crate holds the installed model, so read it rather than copying a flag.
+rn-permission.workspace = true
+# A SQL function callback re-enters V8 from inside SQLite, which needs the same
+# raw-isolate scope `rn-uv::callback::with_context` builds for libuv completions.
+rn-uv.workspace = true
+
+[build-dependencies]
+# Compiles the vendored SQLite amalgamation. Node links the same tree as a
+# static library; a system libsqlite3 is a different version on every host and
+# absent on Windows, which would make every SQL behaviour host-dependent.
+cc = "1"
+
+[dev-dependencies]
+serde_json.workspace = true

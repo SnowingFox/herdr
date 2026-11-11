@@ -145,6 +145,87 @@ pub fn wrap_require_with_scheme_support(scope: &mut v8::PinScope, loaders: &Boot
     rn_core::hook_slot::replace_require(scope, wrapped);
 }
 
+/// `require(`internal/...`)` from the realm loader.
+fn require_internal<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+    id: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let id = v8::String::new(scope, id)?;
+    require.call(scope, v8::undefined(scope).into(), &[id.into()])
+}
+
+/// Exposes the builtins a runtime option gates, exactly as Node does.
+///
+/// `realm.js` keeps `['sqlite', true, '--experimental-sqlite']` (and the rest of
+/// `builtinModulePolicies`) in a map, and exposes an entry only when its option
+/// is truthy. Node applies that in `internal/process/pre_execution.js:488` by
+/// calling `BuiltinModule.allowOptionGatedBuiltins(getOptionValue)`, which reads
+/// every policy in one pass.
+///
+/// rustnode does not run `pre_execution.js`, so the same call is made here with
+/// the vendored `getOptionValue` from `internal/options`. Passing the real
+/// accessor rather than a hand-written list is the point: the decision comes
+/// from the option parser and the policy table, so a future gated builtin is
+/// covered without a second edit, and an option this build defaults to false
+/// stays gated.
+///
+/// The alternative — calling `allowRequireByUsers` for a fixed list of ids —
+/// would expose a builtin whose option is off, which is the divergence this
+/// replaces.
+///
+/// This fixes the *allow-list*, not reachability. The CJS resolver currently
+/// bypasses the allow-list for `node:`-scheme ids, so a builtin this call
+/// correctly withholds can still be required — a pre-existing defect on master,
+/// tracked separately. The call is still correct and worth having, because the
+/// resolver fix will consume exactly this state.
+pub fn allow_option_gated_builtins(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
+    let Some(require) = loaders.require.as_ref() else {
+        return;
+    };
+    let require = v8::Local::new(scope, require);
+    // Two `require` calls, written out rather than through a closure: a closure
+    // borrowing `scope` immutably would conflict with the `&mut` the calls need.
+    let Some(realm) = require_internal(scope, require, "internal/bootstrap/realm") else {
+        return;
+    };
+    let Ok(realm) = v8::Local::<v8::Object>::try_from(realm) else {
+        return;
+    };
+    let Some(builtin_module) = get_property(scope, realm.into(), "BuiltinModule") else {
+        return;
+    };
+    let Ok(builtin_module) = v8::Local::<v8::Function>::try_from(builtin_module) else {
+        return;
+    };
+    let Some(allow) = get_property(scope, builtin_module.into(), "allowOptionGatedBuiltins") else {
+        return;
+    };
+    let Ok(allow) = v8::Local::<v8::Function>::try_from(allow) else {
+        return;
+    };
+
+    // The vendored accessor, not a reimplementation: it reads
+    // `internalBinding('options').getCLIOptionsValues()`, which is the parsed
+    // command line this process was started with.
+    let Some(options) = require_internal(scope, require, "internal/options") else {
+        return;
+    };
+    let Ok(options) = v8::Local::<v8::Object>::try_from(options) else {
+        return;
+    };
+    let Some(get_option_value) = get_property(scope, options.into(), "getOptionValue") else {
+        return;
+    };
+    let Ok(get_option_value) = v8::Local::<v8::Function>::try_from(get_option_value) else {
+        return;
+    };
+
+    // `allowOptionGatedBuiltins` takes `getOptionValue` and calls it once per
+    // policy, so it must be invoked with the receiver the loop expects.
+    let _ = allow.call(scope, builtin_module.into(), &[get_option_value.into()]);
+}
+
 /// Installs the globals that only need bindings which already exist.
 ///
 /// `internal/bootstrap/node.js` is what normally defines `Buffer`,
@@ -1732,11 +1813,28 @@ fn function_of<'s>(
     Ok(function.into())
 }
 
+/// Throws the error `getInternalBinding` reports for a namespace this build
+/// does not implement.
+///
+/// The `code` is `ERR_INVALID_MODULE`, the same one `throw_invalid_module`
+/// uses: Node's own `getInternalBinding` reports an unlinked binding through
+/// `ERR_INVALID_MODULE`, and a caller that only sees a bare message cannot tell
+/// a missing namespace from a typo or a failed load. `node:ffi` is the case that
+/// made this visible — the module loaded, warned that it was experimental, and
+/// then failed with `code: undefined`, which reads as a bug in the caller.
 fn throw(scope: &mut v8::PinScope, message: &str) {
     let Some(message) = v8::String::new(scope, message) else {
         return;
     };
     let exception = v8::Exception::error(scope, message);
+    if let (Ok(object), Some(code)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, "ERR_INVALID_MODULE"),
+    ) {
+        if let Some(key) = v8::String::new(scope, "code") {
+            let _ = object.set(scope, key.into(), code.into());
+        }
+    }
     scope.throw_exception(exception);
 }
 

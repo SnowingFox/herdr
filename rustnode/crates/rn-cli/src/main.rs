@@ -264,6 +264,21 @@ fn main() {
             // can resolve a specifier; Node's user-land loader does that, and
             // this stands in for it until `contextify` unblocks the real one.
             bootstrap::wrap_require_with_scheme_support(scope, &loaders);
+            // `realm.js` keeps every option-gated builtin in
+            // `builtinModulePolicies` and exposes an entry only when its option
+            // is truthy, which Node applies in
+            // `internal/process/pre_execution.js:488`. rustnode does not run
+            // `pre_execution.js`, so this applies the same call with the same
+            // `getOptionValue`. That makes the *allow-list* correct.
+            //
+            // It does not by itself make a builtin reachable or unreachable at
+            // the `require('node:...')` boundary: the CJS resolver currently
+            // bypasses the allow-list for `node:`-scheme ids, so `quic`, `dtls`
+            // and `bench` load even though `canBeRequiredByUsers` reports false
+            // for them. That is a pre-existing defect on master, tracked
+            // separately; this call is still the right shape because the
+            // resolver fix will consume its result.
+            bootstrap::allow_option_gated_builtins(scope, &loaders);
             bootstrap::install_early_globals(scope, &loaders);
             // The CommonJS loader turns `require` from a builtin lookup into a
             // real module loader, which is what makes `require('./file.js')`
