@@ -153,7 +153,7 @@ fn import_ec_point(bytes: &[u8], named_curve: Option<&str>) -> Result<PKey, KeyF
         .map_err(|_| KeyFormatError::InvalidData)?;
     let key = EcKey::from_public_key(&group, &point).map_err(|_| KeyFormatError::InvalidData)?;
     let pkey = OpenSslPKey::from_ec_key(key).map_err(|_| KeyFormatError::InvalidData)?;
-    Ok(PKey::from_public(pkey).ok_or(KeyFormatError::InvalidData)?)
+    PKey::from_public(pkey).ok_or(KeyFormatError::InvalidData)
 }
 
 /// Builds an EC key from a private scalar, which is the `raw-private` form.
@@ -203,8 +203,22 @@ fn ec_group(named_curve: Option<&str>) -> Result<EcGroup, KeyFormatError> {
     EcGroup::from_curve_name(nid).map_err(|_| KeyFormatError::UnknownCurve)
 }
 
+/// Resolves a curve name to its NID, for callers that start from a name.
+pub fn nid_of_curve(name: &str) -> Option<Nid> {
+    resolve_curve_nid(name)
+}
+
 /// Resolves a curve name through OpenSSL's short and long name tables.
 fn resolve_curve_nid(name: &str) -> Option<Nid> {
+    // The JWK/RFC 7518 spellings. `generateKeyPairSync` accepts them, so an
+    // import that only knew the OpenSSL names would reject a key the user just
+    // generated with `namedCurve: 'P-256'`.
+    match name {
+        "P-256" => return Some(Nid::X9_62_PRIME256V1),
+        "P-384" => return Some(Nid::SECP384R1),
+        "P-521" => return Some(Nid::SECP521R1),
+        _ => {}
+    }
     let Ok(c_name) = std::ffi::CString::new(name) else {
         return None;
     };

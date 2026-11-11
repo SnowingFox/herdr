@@ -15,7 +15,8 @@
 
 /// One entry from OpenSSL's error queue, unpacked.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenSslError {    /// The packed `unsigned long` OpenSSL returned.
+pub struct OpenSslError {
+    /// The packed `unsigned long` OpenSSL returned.
     pub packed: u64,
     /// The library's short id, e.g. `"EVP"`.
     pub library: String,
@@ -73,6 +74,30 @@ pub fn openssl_error() -> Option<OpenSslError> {
     }
 }
 
+/// Unpacks an already-popped packed OpenSSL error into its Node shape.
+///
+/// For callers that hold a packed value rather than a queue entry — most
+/// importantly `ThrowCryptoError`, which receives one from a `ParseFailure` and
+/// has to attach `library` and `reason` without touching the queue again.
+pub fn openssl_error_for(packed: u64) -> Option<OpenSslError> {
+    if packed == 0 {
+        return None;
+    }
+    // SAFETY: the two lookups only read a packed value, and the strings they
+    // return are static and NUL-terminated.
+    unsafe {
+        Some(OpenSslError {
+            packed,
+            library: short_library_name(
+                &c_string(openssl_sys::ERR_lib_error_string(packed)),
+                openssl_sys::ERR_GET_LIB(packed),
+            ),
+            reason: c_string(openssl_sys::ERR_reason_error_string(packed)),
+            message: error_string(packed),
+        })
+    }
+}
+
 /// `ERR_error_string_n`, which formats the packed value into the
 /// `error:XXXXXXXX:library::reason` form.
 fn error_string(packed: u64) -> String {
@@ -91,7 +116,10 @@ fn error_string(packed: u64) -> String {
     unsafe {
         ERR_error_string_n(packed, buffer.as_mut_ptr().cast(), buffer.len());
     }
-    let end = buffer.iter().position(|byte| *byte == 0).unwrap_or(buffer.len());
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
     String::from_utf8_lossy(&buffer[..end]).into_owned()
 }
 
@@ -184,10 +212,7 @@ pub fn failure_from(error: &openssl::error::ErrorStack) -> ParseFailure {
 /// binary links (**3.6.3**, not the 4.1.0 Node vendors) the marker is the *last*
 /// of five entries. Scanning the whole stack is what keeps the distinction on
 /// this version without weakening it: no other operation raises that reason.
-pub fn from_error_stack(
-    error: &openssl::error::ErrorStack,
-    had_passphrase: bool,
-) -> ParseFailure {
+pub fn from_error_stack(error: &openssl::error::ErrorStack, had_passphrase: bool) -> ParseFailure {
     let mut oldest: Option<OpenSslError> = None;
     let mut missing_passphrase = false;
     for entry in error.errors() {

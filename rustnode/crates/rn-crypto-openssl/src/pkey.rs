@@ -102,8 +102,11 @@ impl PKey {
         // would also work but would re-encode and re-parse a key that is already
         // in hand.
         use foreign_types::ForeignType;
-        // SAFETY: `key.as_ptr()` is a live `EVP_PKEY *` owned by `key`;
-        // `up_ref` adds one reference, which `from_ptr` then adopts.
+        // `PKey<Private>` and `PKey<Public>` are the same C pointer with a
+        // different type parameter, so `from_ptr` only re-labels the ownership
+        // type — but it adopts a reference, and `up_ref` is what supplies one.
+        // Without it both wrappers would free the same `EVP_PKEY`.
+        // SAFETY: `key.as_ptr()` is a live `EVP_PKEY *` owned by `key`.
         unsafe {
             openssl_sys::EVP_PKEY_up_ref(key.as_ptr());
             let promoted = OpenSslPKey::from_ptr(key.as_ptr());
@@ -121,7 +124,11 @@ impl PKey {
     }
 
     /// The `openssl` wrapper, for the operations this type does not model.
-    pub fn as_ref(&self) -> &openssl::pkey::PKeyRef<Private> {
+    ///
+    /// Named `openssl_ref` rather than `as_ref` because `as_ref` would be
+    /// confusable with `std::convert::AsRef::as_ref`, which this type does not
+    /// implement and should not appear to.
+    pub fn openssl_ref(&self) -> &openssl::pkey::PKeyRef<Private> {
         &self.inner
     }
 
@@ -143,11 +150,7 @@ impl PKey {
         // SAFETY: `raw()` is this key's live `EVP_PKEY *`; a null output buffer
         // asks only for the length, so nothing is written.
         let raw = unsafe {
-            openssl_sys::EVP_PKEY_get_raw_private_key(
-                self.raw(),
-                std::ptr::null_mut(),
-                &mut length,
-            )
+            openssl_sys::EVP_PKEY_get_raw_private_key(self.raw(), std::ptr::null_mut(), &mut length)
         };
         if raw == 1 {
             return true;
@@ -207,10 +210,23 @@ impl PKey {
         }
     }
 
+    /// Whether an EC key's parameters and public point are internally
+    /// consistent, which is `KeyObjectHandle::CheckEcKeyData`.
+    ///
+    /// A non-EC key answers `false` rather than failing: the caller
+    /// (`keys.js`'s `asymmetricKeyDetails` path) only asks for an EC key, and
+    /// Node's `DCHECK(key.isA(KeyAlgorithm::EC))` would abort on anything else.
+    pub fn ec_check(&self) -> bool {
+        let Ok(ec) = self.inner.ec_key() else {
+            return false;
+        };
+        ec.check_key().is_ok()
+    }
+
     /// `EVP_PKEY_CTX` for this key with key generation initialised, which the
     /// keygen jobs use.
     pub fn new_ctx(&self) -> Option<openssl::pkey_ctx::PkeyCtx<Private>> {
-        openssl::pkey_ctx::PkeyCtx::new(self.as_ref()).ok()
+        openssl::pkey_ctx::PkeyCtx::new(self.openssl_ref()).ok()
     }
 
     /// Encodes this key with a public-key encoding.
@@ -233,6 +249,17 @@ impl PKey {
             return Ok(None);
         }
         let bytes = match (format, config.encoding) {
+            // A PEM *type* is meaningful: `type: 'pkcs1'` writes
+            // `BEGIN RSA PUBLIC KEY`, and returning SPKI for it is a silent
+            // format change that `test-crypto-keygen-sync.js` catches with a
+            // regex on the header.
+            (KeyFormat::Pem, Some(KeyEncoding::Pkcs1)) => {
+                if !self.is_a(crate::algorithm::RSA) {
+                    return Err(failure(true));
+                }
+                let rsa = self.inner.rsa().map_err(|_| failure(false))?;
+                rsa.public_key_to_pem_pkcs1()
+            }
             (KeyFormat::Pem, _) => self.inner.public_key_to_pem(),
             (KeyFormat::Der, Some(KeyEncoding::Pkcs1)) => {
                 // PKCS#1 is RSA-only. For another type OpenSSL's `i2d_PUBKEY`
@@ -382,7 +409,7 @@ impl PKey {
     pub fn ec_private_scalar(&self) -> Option<Vec<u8>> {
         let ec = self.inner.ec_key().ok()?;
         let width = ec.group().order_bits().div_ceil(8) as i32;
-        Some(ec.private_key().to_vec_padded(width).ok()?)
+        ec.private_key().to_vec_padded(width).ok()
     }
 
     /// Exports the EC private key as SEC1 PKCS#8.
@@ -409,25 +436,60 @@ impl PKey {
     }
     /// The RSASSA-PSS parameters an `RSA-PSS` key was created with.
     ///
-    /// An *absent* parameters sequence means the key is unrestricted and Node
-    /// adds nothing; an *empty* sequence restricts the key to the defaults
-    /// (SHA-1, MGF1-SHA-1, salt length 20) and Node adds all three. The two cases
-    /// are distinguishable through `EVP_PKEY_get_utf8_string_param` failing for
-    /// an unrestricted key.
+    /// An *absent* parameters sequence means the key is unrestricted and Node adds
+    /// nothing; an *empty* sequence restricts the key to the defaults (SHA-1,
+    /// MGF1-SHA-1, salt length 20) and Node adds all three. Node tells the two
+    /// apart by asking for `saltlen`, which reads only when the sequence is
+    /// present — so `None` here means "unrestricted", not "read failed".
+    ///
+    /// The parameter names are OpenSSL's `OSSL_PKEY_PARAM_RSA_PSS_SALTLEN`
+    /// (`"saltlen"`), `OSSL_PKEY_PARAM_RSA_DIGEST` (`"digest"`) and
+    /// `OSSL_PKEY_PARAM_RSA_MGF1_DIGEST` (`"mgf1-digest"`). Guessing at
+    /// `"pss.digest-algorithm"` returns nothing even on a restricted key, which
+    /// makes every `rsa-pss` key look unrestricted.
     fn rsa_pss_params(&self) -> Option<RsaPssParams> {
         // SAFETY: `raw()` is the live key; the string parameters are copied into
-        // the buffers below and the error queue is cleared afterwards so a
-        // deliberate miss does not surface later.
+        // the buffers below and the queue is cleared so a deliberate miss does not
+        // surface later.
         unsafe {
-            let digest = utf8_param(self.raw(), c"pss.digest-algorithm")?;
-            let mgf1 = utf8_param(self.raw(), c"pss.mgf1-digest-algorithm");
-            let salt = int_param(self.raw(), c"pss.salt-length");
+            let salt_length = int_param(self.raw(), c"saltlen")?;
+            // A restricted key reports the salt length it will use. The two
+            // negative spellings mean "follow the digest", which is a *restricted*
+            // key too — `RSA_PSS_SALTLEN_DIGEST` (-1) and `_AUTO` (-2) — so the
+            // resolved digest size is reported instead of the sentinel, which is
+            // what `asymmetricKeyDetails.saltLength` is documented to be.
+            let salt_length = if salt_length < 0 {
+                digest_size(salt_length, &self.raw_digest_name())?
+            } else {
+                salt_length
+            };
+            // The provider may omit default SHA-1 parameters, so a missing digest
+            // means SHA-1 rather than a malformed key.
+            let digest = self
+                .raw_digest_name()
+                .map(|name| pss_digest_long_name(&name))
+                .unwrap_or_else(|| "sha1".to_string());
+            let mgf1_digest = utf8_param(self.raw(), c"mgf1-digest")
+                .map(|name| pss_digest_long_name(&name))
+                .unwrap_or_else(|| digest.clone());
             Some(RsaPssParams {
                 digest,
-                mgf1_digest: mgf1,
-                salt_length: salt.unwrap_or(-1),
+                mgf1_digest: Some(mgf1_digest),
+                salt_length,
             })
         }
+    }
+
+    /// The provider's own spelling of the key's digest, e.g. `"SHA2-256"`.
+    ///
+    /// # Safety-free by construction
+    ///
+    /// Reads only; the queue is cleared on a miss so a key without a digest does
+    /// not leave an entry for the next caller.
+    pub fn raw_digest_name(&self) -> Option<String> {
+        // SAFETY: `raw()` is the live key; the parameter is copied into the
+        // buffer below.
+        unsafe { utf8_param(self.raw(), c"digest") }
     }
 
     /// The modulus length and divisor length of a DSA key.
@@ -471,7 +533,8 @@ impl PKey {
         let mut pointer: *mut openssl_sys::BIGNUM = std::ptr::null_mut();
         // SAFETY: `raw()` is the live key and `name` is NUL-terminated; a success
         // hands back a new `BIGNUM` reference, adopted below.
-        let ok = unsafe { openssl_sys::EVP_PKEY_get_bn_param(self.raw(), name.as_ptr(), &mut pointer) };
+        let ok =
+            unsafe { openssl_sys::EVP_PKEY_get_bn_param(self.raw(), name.as_ptr(), &mut pointer) };
         if ok != 1 || pointer.is_null() {
             // SAFETY: thread-local error queue only.
             unsafe { openssl_sys::ERR_clear_error() };
@@ -527,6 +590,29 @@ impl EncodedKey {
     }
 }
 
+/// The salt length a negative sentinel stands for.
+///
+/// `RSA_PSS_SALTLEN_DIGEST` (-1) and `_AUTO` (-2) both mean "as long as the
+/// digest", and the reported value is that digest's size. `None` when the digest
+/// cannot be resolved, which means the parameters are malformed.
+fn digest_size(sentinel: i32, digest: &Option<String>) -> Option<i32> {
+    if sentinel != -1 && sentinel != -2 {
+        return None;
+    }
+    let name = digest.as_deref()?;
+    let c_name = std::ffi::CString::new(name).ok()?;
+    // SAFETY: NUL-terminated name, read-only lookups.
+    unsafe {
+        let md = openssl_sys::EVP_get_digestbyname(c_name.as_ptr());
+        if md.is_null() {
+            openssl_sys::ERR_clear_error();
+            return None;
+        }
+        let size = openssl_sys::EVP_MD_get_size(md);
+        (size > 0).then_some(size)
+    }
+}
+
 /// `asymmetricKeyDetails` for an RSA key.
 #[derive(Clone, Debug)]
 pub struct RsaDetail {
@@ -548,6 +634,39 @@ pub struct RsaPssParams {
     /// The salt length; -1 means "the digest length", which is OpenSSL's
     /// `RSA_PSS_SALTLEN_DIGEST`.
     pub salt_length: i32,
+}
+
+/// `RsaPssDigestLongName`: the long name for a digest the provider reported.
+///
+/// The provider answers with its own spelling — `"SHA2-256"` — and
+/// `asymmetricKeyDetails.hashAlgorithm` has to be the `OBJ_nid2ln` long name,
+/// `"sha256"`. Resolving through the name → NID → long-name chain is what makes
+/// the two agree; lowercasing the provider's string leaves `"sha2-256"`, which no
+/// Node test accepts.
+fn pss_digest_long_name(name: &str) -> String {
+    let Ok(c_name) = std::ffi::CString::new(name) else {
+        return name.to_ascii_lowercase();
+    };
+    // SAFETY: `c_name` is NUL-terminated and valid for the call; both lookups
+    // only read it and return static data.
+    unsafe {
+        let digest = openssl_sys::EVP_get_digestbyname(c_name.as_ptr());
+        if digest.is_null() {
+            openssl_sys::ERR_clear_error();
+            return name.to_ascii_lowercase();
+        }
+        let nid = openssl_sys::EVP_MD_get_type(digest);
+        if nid == openssl_sys::NID_undef {
+            return name.to_ascii_lowercase();
+        }
+        let long = openssl_sys::OBJ_nid2ln(nid);
+        if long.is_null() {
+            return name.to_ascii_lowercase();
+        }
+        std::ffi::CStr::from_ptr(long)
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 /// `asymmetricKeyDetails` for a DSA key.
@@ -639,7 +758,8 @@ mod tests {
     const RSA_PEM: &str = include_str!("../tests/data/rsa-2048.pem");
 
     fn rsa() -> PKey {
-        let key = OpenSslPKey::private_key_from_pem(RSA_PEM.as_bytes()).expect("the fixture parses");
+        let key =
+            OpenSslPKey::private_key_from_pem(RSA_PEM.as_bytes()).expect("the fixture parses");
         PKey::from_private(key)
     }
 
@@ -725,7 +845,9 @@ mod tests {
             })
             .expect("encryption succeeds")
             .expect("an encrypted PEM encoding");
-        assert!(encrypted.bytes.starts_with(b"-----BEGIN ENCRYPTED PRIVATE KEY-----"));
+        assert!(encrypted
+            .bytes
+            .starts_with(b"-----BEGIN ENCRYPTED PRIVATE KEY-----"));
     }
 
     #[test]
@@ -759,7 +881,10 @@ mod tests {
         assert_eq!(detail.modulus_length, 2048);
         // The fixture was generated with 65537 as the exponent.
         assert_eq!(detail.public_exponent, vec![0x01, 0x00, 0x01]);
-        assert!(detail.pss.is_none(), "a plain RSA key has no PSS parameters");
+        assert!(
+            detail.pss.is_none(),
+            "a plain RSA key has no PSS parameters"
+        );
     }
 
     #[test]
@@ -782,10 +907,12 @@ mod tests {
             .write_public(&PublicKeyEncoding::default())
             .expect("encoding succeeds")
             .expect("a PEM encoding");
-        let public =
-            OpenSslPKey::public_key_from_pem(&pem.bytes).expect("the public half parses");
+        let public = OpenSslPKey::public_key_from_pem(&pem.bytes).expect("the public half parses");
         let public = PKey::from_public(public).expect("converts");
-        assert!(!public.has_private(), "a public key has no private material");
+        assert!(
+            !public.has_private(),
+            "a public key has no private material"
+        );
         assert_eq!(public.bits(), 2048);
     }
 }

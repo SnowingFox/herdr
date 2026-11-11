@@ -69,6 +69,28 @@ pub const MEMBERS: &[&str] = &[
     "CipherBase",
     "AESCipherJob",
     "getCipherInfo",
+    // The `KeyObject` family. Installed by `rn-bind-crypto-keys`, which owns
+    // `src/crypto/crypto_keys.cc`. `KeyObjectHandle` is the handle class and
+    // `isKeyObject`/`getKeyObjectSlots` are the two queries over it;
+    // `createNativeKeyObjectClass` is already listed above because `lib/tls.js`
+    // reaches it at module scope, and the crate now supplies its real body rather
+    // than the base-class stand-in that used to live here.
+    "KeyObjectHandle",
+    "getKeyObjectSlots",
+    "isKeyObject",
+    // The key-generation jobs. `SecretKeyGenJob` and the three key-pair jobs the
+    // traditional API uses are here; `DsaKeyPairGenJob` and `DhKeyPairGenJob`
+    // stay deferred with their own slices.
+    "SecretKeyGenJob",
+    "RsaKeyPairGenJob",
+    "EcKeyPairGenJob",
+    "NamedKeyPairGenJob",
+    // The `RSAKeyVariant` values `keygen.js` puts in `RsaKeyPairGenJob`'s second
+    // slot. Without them the argument is `undefined`, the variant defaults to
+    // PKCS#1, and every `rsa-pss` generation silently produces a plain RSA key.
+    "kKeyVariantRSA_SSA_PKCS1_v1_5",
+    "kKeyVariantRSA_PSS",
+    "kKeyVariantRSA_OAEP",
     // Random.
     "randomFillSync",
     "secureBuffer",
@@ -172,7 +194,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     ("DsaKeyPairGenJob","Key generation is part of the asymmetric key surface, deferred with KeyObject."),
     ("ECDH","ECDH is part of the asymmetric key surface, deferred with KeyObject."),
     ("ECDHConvertKey","ECDH key conversion needs the EC key surface, deferred with KeyObject."),
-    ("EcKeyPairGenJob","Key generation is part of the asymmetric key surface, deferred with KeyObject."),
     (
         "KEMDecapsulateJob",
         "ML-KEM decapsulation needs the KeyObject surface and OpenSSL's KEM provider.",
@@ -185,14 +206,8 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "KangarooTwelveJob",
         "KT128/KT256 are not in the OpenSSL build `openssl-src` produces.",
     ),
-    (
-        "KeyObjectHandle",
-        "createPublicKey/createPrivateKey/createSecretKey and JWK export need the KeyObject \
-         class hierarchy. This is the largest deferred group and the next landing.",
-    ),
     ("KmacJob","KMAC needs the KeyObject surface for its key and is not in this OpenSSL build."),
     ("Mac","createMac needs the KeyObject surface for its key."),
-    ("NamedKeyPairGenJob","Key generation is part of the asymmetric key surface, deferred with KeyObject."),
     (
         "RSACipherJob",
         "RSA public/private encrypt and decrypt need the KeyObject surface.",
@@ -206,8 +221,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "RandomPrimeJob",
         "Prime generation is part of the key surface, deferred with KeyObject.",
     ),
-    ("RsaKeyPairGenJob","Key generation is part of the asymmetric key surface, deferred with KeyObject."),
-    ("SecretKeyGenJob","Generating a secret key produces a KeyObject, which is deferred."),
     (
         "SecureContext",
         "A TLS secure context needs the tls binding; this crate does not own it.",
@@ -263,10 +276,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "The root certificate store is part of the TLS/X.509 surface, deferred with SecureContext.",
     ),
     (
-        "getKeyObjectSlots",
-        "Exposes KeyObject internal slots to JavaScript, which needs the KeyObject class first.",
-    ),
-    (
         "getSystemCACertificates",
         "The root certificate store is part of the TLS/X.509 surface, deferred with SecureContext.",
     ),
@@ -285,10 +294,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     (
         "isKeyAlgorithmAvailable",
         "Asks whether a named key algorithm is usable; deferred with the key surface.",
-    ),
-    (
-        "isKeyObject",
-        "The KeyObject type test needs the KeyObject class, which is deferred.",
     ),
     (
         "isX509Certificate",
@@ -361,15 +366,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     (
         "kKeyVariantAES_OCB_256",
         "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    ("kKeyVariantRSA_OAEP", "RSA key variants, deferred with KeyObject."),
-    (
-        "kKeyVariantRSA_PSS",
-        "RSA key variants, deferred with KeyObject.",
-    ),
-    (
-        "kKeyVariantRSA_SSA_PKCS1_v1_5",
-        "RSA key variants, deferred with KeyObject.",
     ),
     (
         "kTypeArgon2d",
@@ -468,6 +464,15 @@ mod constants {
     pub const K_SIG_ENC_DER: i32 = 1;
     /// `kSigEncP1363`.
     pub const K_SIG_ENC_P1363: i32 = 2;
+
+    /// `kSignJobModeSign`.
+    /// `RSAKeyVariant` from `crypto_rsa.h`, which `keygen.js` passes as the
+    /// second argument of `RsaKeyPairGenJob`.
+    pub const K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5: i32 = 0;
+    /// `kKeyVariantRSA_PSS`.
+    pub const K_KEY_VARIANT_RSA_PSS: i32 = 1;
+    /// `kKeyVariantRSA_OAEP`.
+    pub const K_KEY_VARIANT_RSA_OAEP: i32 = 2;
 
     /// `kSignJobModeSign`.
     pub const K_SIGN_JOB_MODE_SIGN: i32 = 1;
@@ -603,12 +608,10 @@ impl BindingModule for Crypto {
                 .build(scope)
                 .get_function(scope),
             ),
-            (
-                "createNativeKeyObjectClass",
-                v8::FunctionTemplate::builder(crate::classes::create_native_key_object_class)
-                    .build(scope)
-                    .get_function(scope),
-            ),
+            // `createNativeKeyObjectClass` is not here: `rn-bind-crypto-keys`
+            // installs the real one, and installing a base-class stand-in first
+            // would leave two implementations of the same member where only the
+            // later one is reachable.
             (
                 "createCryptoKeyClass",
                 v8::FunctionTemplate::builder(crate::classes::create_crypto_key_class)
@@ -673,6 +676,12 @@ impl BindingModule for Crypto {
         // `src/node_crypto.cc` aggregates them too.
         rn_bind_crypto_dh::install_classes(scope, object)?;
         rn_bind_crypto_cipher::install_classes(scope, object)?;
+        // The `KeyObject` family. Same reasoning one translation unit over: it
+        // also lands on this object, because `src/node_crypto.cc` aggregates a
+        // dozen `Initialize` calls onto one `target`. This replaces the base-class
+        // stand-in that used to be installed above, so the `crate::classes`
+        // binding for `createNativeKeyObjectClass` must not be installed as well.
+        rn_bind_crypto_keys::install_classes(scope, object)?;
         // The job handles, whose instances expose `run()`.
         install_job_class(scope, object, "HashJob", hash_job)?;
         install_job_class(scope, object, "HmacJob", hmac_job)?;
@@ -727,6 +736,12 @@ impl BindingModule for Crypto {
                 "kWebCryptoKeyFormatJWK",
                 constants::K_WEBCRYPTO_KEY_FORMAT_JWK,
             ),
+            (
+                "kKeyVariantRSA_SSA_PKCS1_v1_5",
+                constants::K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5,
+            ),
+            ("kKeyVariantRSA_PSS", constants::K_KEY_VARIANT_RSA_PSS),
+            ("kKeyVariantRSA_OAEP", constants::K_KEY_VARIANT_RSA_OAEP),
             ("RSA_PKCS1_PSS_PADDING", constants::RSA_PKCS1_PSS_PADDING),
             ("OPENSSL_EC_NAMED_CURVE", constants::OPENSSL_EC_NAMED_CURVE),
             (

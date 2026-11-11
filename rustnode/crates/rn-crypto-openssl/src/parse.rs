@@ -221,9 +221,7 @@ pub fn parse_public_or_private_key(
                     }
                 }
                 KeyEncoding::Spki => parse_public_key_der(bytes, encoding),
-                KeyEncoding::Pkcs8 | KeyEncoding::Sec1 => {
-                    parse_private_key_der(bytes, encoding)
-                }
+                KeyEncoding::Pkcs8 | KeyEncoding::Sec1 => parse_private_key_der(bytes, encoding),
             }
         }
         _ => Err(failure(true)),
@@ -235,7 +233,9 @@ pub fn parse_private_key(bytes: &[u8], config: &PrivateKeyEncoding) -> ParseResu
     let format = config.format.unwrap_or(KeyFormat::Pem);
     match format {
         KeyFormat::Pem => parse_private_key_pem(bytes, config.passphrase.as_deref()),
-        KeyFormat::Der => parse_private_key_der(bytes, config.encoding.unwrap_or(KeyEncoding::Pkcs8)),
+        KeyFormat::Der => {
+            parse_private_key_der(bytes, config.encoding.unwrap_or(KeyEncoding::Pkcs8))
+        }
         _ => Err(failure(true)),
     }
 }
@@ -364,11 +364,8 @@ mod tests {
 
     #[test]
     fn a_private_pem_parses_as_a_private_key() {
-        let key = parse_private_key(
-            RSA_PRIVATE_PEM.as_bytes(),
-            &PrivateKeyEncoding::default(),
-        )
-        .expect("a private key");
+        let key = parse_private_key(RSA_PRIVATE_PEM.as_bytes(), &PrivateKeyEncoding::default())
+            .expect("a private key");
         assert!(key.has_private());
         assert_eq!(key.bits(), 2048);
     }
@@ -402,22 +399,13 @@ mod tests {
 
     #[test]
     fn pem_round_trips_both_kinds_through_the_generic_parser() {
-        let public = parse_public_or_private_key(
-            &rsa_public_pem(),
-            KeyFormat::Pem,
-            None,
-            None,
-        )
-        .expect("a public key");
+        let public = parse_public_or_private_key(&rsa_public_pem(), KeyFormat::Pem, None, None)
+            .expect("a public key");
         assert!(!public.has_private());
 
-        let private = parse_public_or_private_key(
-            RSA_PRIVATE_PEM.as_bytes(),
-            KeyFormat::Pem,
-            None,
-            None,
-        )
-        .expect("a private key");
+        let private =
+            parse_public_or_private_key(RSA_PRIVATE_PEM.as_bytes(), KeyFormat::Pem, None, None)
+                .expect("a private key");
         assert!(private.has_private());
     }
 
@@ -425,7 +413,11 @@ mod tests {
     fn der_pkcs1_distinguishes_the_two_halves() {
         let key = OpenSslPKey::private_key_from_pem(RSA_PRIVATE_PEM.as_bytes()).expect("fixture");
 
-        let private_der = key.rsa().expect("RSA").private_key_to_der().expect("exports");
+        let private_der = key
+            .rsa()
+            .expect("RSA")
+            .private_key_to_der()
+            .expect("exports");
         assert!(is_rsa_private_der(&private_der));
         let parsed = parse_public_or_private_key(
             &private_der,
@@ -489,8 +481,14 @@ mod tests {
     fn a_clear_failure_clears_the_queue() {
         // A failed parse must not leave its OpenSSL error behind for the next
         // `ThrowCryptoError` to report as this one's cause.
-        let _ = parse_private_key_pem(b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n", None);
-        assert!(crate::error::openssl_error().is_none(), "the queue is drained");
+        let _ = parse_private_key_pem(
+            b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+            None,
+        );
+        assert!(
+            crate::error::openssl_error().is_none(),
+            "the queue is drained"
+        );
         clear_error();
     }
 }

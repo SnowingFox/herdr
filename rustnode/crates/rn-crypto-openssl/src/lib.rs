@@ -29,13 +29,13 @@ mod pkey;
 mod raw;
 
 pub use algorithm::{
-    KeyAlgorithm, KeyAlgorithmName, DSA, EC, ED25519, ED448, ML_DSA_44, ML_DSA_65, ML_DSA_87,
+    KeyAlgorithm, KeyAlgorithmName, DH, DSA, EC, ED25519, ED448, ML_DSA_44, ML_DSA_65, ML_DSA_87,
     ML_KEM_1024, ML_KEM_512, ML_KEM_768, RSA, RSA_PSS, SM2, TABLE, X25519, X448,
 };
 pub use encode::{KeyEncoding, KeyFormat, PrivateKeyEncoding, PublicKeyEncoding};
 pub use error::{
     clear_error, failure, failure_from, failure_with_passphrase, from_error_stack, openssl_error,
-    OpenSslError, ParseError, ParseFailure, ParseResult,
+    openssl_error_for, OpenSslError, ParseError, ParseFailure, ParseResult,
 };
 pub use parse::{
     parse_private_key, parse_private_key_der, parse_private_key_pem, parse_public_key,
@@ -46,5 +46,5 @@ pub use pkey::{
 };
 pub use raw::{
     as_parse_failure, import_raw, import_raw_private_key, import_raw_public_key, import_raw_seed,
-    KeyFormatError,
+    nid_of_curve, KeyFormatError,
 };

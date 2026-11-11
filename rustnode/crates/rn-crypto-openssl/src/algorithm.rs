@@ -61,11 +61,7 @@ pub struct KeyAlgorithm {
 }
 
 impl KeyAlgorithm {
-    const fn new(
-        name: &'static str,
-        key_type_name: Option<&'static str>,
-        family: Family,
-    ) -> Self {
+    const fn new(name: &'static str, key_type_name: Option<&'static str>, family: Family) -> Self {
         Self {
             name,
             key_type_name,
@@ -127,10 +123,7 @@ impl KeyAlgorithm {
     /// Post-quantum families, which are `AKP` in JWK and use `alg` rather than
     /// `crv`.
     pub fn is_pqc(self) -> bool {
-        matches!(
-            self.family,
-            Family::MlDsa | Family::MlKem | Family::SlhDsa
-        )
+        matches!(self.family, Family::MlDsa | Family::MlKem | Family::SlhDsa)
     }
 
     /// EdDSA and XDH: the algorithms with an RFC 8037 raw public key.
@@ -258,30 +251,66 @@ pub const ML_KEM_768: KeyAlgorithm =
     KeyAlgorithm::new("ML-KEM-768", Some("ml-kem-768"), Family::MlKem);
 pub const ML_KEM_1024: KeyAlgorithm =
     KeyAlgorithm::new("ML-KEM-1024", Some("ml-kem-1024"), Family::MlKem);
-pub const SLH_DSA_SHA2_128F: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHA2-128f", Some("slh-dsa-sha2-128f"), Family::SlhDsa);
-pub const SLH_DSA_SHA2_128S: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHA2-128s", Some("slh-dsa-sha2-128s"), Family::SlhDsa);
-pub const SLH_DSA_SHA2_192F: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHA2-192f", Some("slh-dsa-sha2-192f"), Family::SlhDsa);
-pub const SLH_DSA_SHA2_192S: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHA2-192s", Some("slh-dsa-sha2-192s"), Family::SlhDsa);
-pub const SLH_DSA_SHA2_256F: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHA2-256f", Some("slh-dsa-sha2-256f"), Family::SlhDsa);
-pub const SLH_DSA_SHA2_256S: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHA2-256s", Some("slh-dsa-sha2-256s"), Family::SlhDsa);
-pub const SLH_DSA_SHAKE_128F: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHAKE-128f", Some("slh-dsa-shake-128f"), Family::SlhDsa);
-pub const SLH_DSA_SHAKE_128S: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHAKE-128s", Some("slh-dsa-shake-128s"), Family::SlhDsa);
-pub const SLH_DSA_SHAKE_192F: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHAKE-192f", Some("slh-dsa-shake-192f"), Family::SlhDsa);
-pub const SLH_DSA_SHAKE_192S: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHAKE-192s", Some("slh-dsa-shake-192s"), Family::SlhDsa);
-pub const SLH_DSA_SHAKE_256F: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHAKE-256f", Some("slh-dsa-shake-256f"), Family::SlhDsa);
-pub const SLH_DSA_SHAKE_256S: KeyAlgorithm =
-    KeyAlgorithm::new("SLH-DSA-SHAKE-256s", Some("slh-dsa-shake-256s"), Family::SlhDsa);
+pub const SLH_DSA_SHA2_128F: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHA2-128f",
+    Some("slh-dsa-sha2-128f"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHA2_128S: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHA2-128s",
+    Some("slh-dsa-sha2-128s"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHA2_192F: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHA2-192f",
+    Some("slh-dsa-sha2-192f"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHA2_192S: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHA2-192s",
+    Some("slh-dsa-sha2-192s"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHA2_256F: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHA2-256f",
+    Some("slh-dsa-sha2-256f"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHA2_256S: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHA2-256s",
+    Some("slh-dsa-sha2-256s"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHAKE_128F: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHAKE-128f",
+    Some("slh-dsa-shake-128f"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHAKE_128S: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHAKE-128s",
+    Some("slh-dsa-shake-128s"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHAKE_192F: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHAKE-192f",
+    Some("slh-dsa-shake-192f"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHAKE_192S: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHAKE-192s",
+    Some("slh-dsa-shake-192s"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHAKE_256F: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHAKE-256f",
+    Some("slh-dsa-shake-256f"),
+    Family::SlhDsa,
+);
+pub const SLH_DSA_SHAKE_256S: KeyAlgorithm = KeyAlgorithm::new(
+    "SLH-DSA-SHAKE-256s",
+    Some("slh-dsa-shake-256s"),
+    Family::SlhDsa,
+);
 
 /// Node's `kKeyAlgorithms`, in its order.
 ///

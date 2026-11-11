@@ -98,18 +98,6 @@ fn call_with_base_class<'s>(
     result
 }
 
-/// `createNativeKeyObjectClass(callback)`.
-pub(crate) fn create_native_key_object_class<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue,
-) {
-    match call_with_base_class(scope, &args, "createNativeKeyObjectClass") {
-        Some(value) => rv.set(value),
-        None => throw_type_error(scope, "createNativeKeyObjectClass needs a callback"),
-    }
-}
-
 /// `createCryptoKeyClass(callback)`.
 pub(crate) fn create_crypto_key_class<'s>(
     scope: &mut v8::PinScope<'s, '_>,

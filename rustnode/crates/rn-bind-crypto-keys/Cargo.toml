@@ -1,0 +1,27 @@
+[package]
+name = "rn-bind-crypto-keys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The KeyObject family for internalBinding('crypto')"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# The shared EVP_PKEY ownership, encoding and error layer. Every key encoding
+# question — PEM versus DER, PKCS#1 versus SPKI, what a failed parse means — is
+# answered there so this crate only has to describe the JavaScript-facing class.
+rn-crypto-openssl = { path = "../rn-crypto-openssl" }
+openssl = { version = "=0.10.82", features = ["vendored"] }
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
+foreign-types = "0.3"
+# The async job path queues onto the process loop, and its completion re-enters
+# V8 from inside `uv_run`, which needs `rn-uv`'s context primitive. The loop and
+# the callback discipline are that crate's, not a second copy here.
+rn-uv.workspace = true
+libuv-sys2.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
