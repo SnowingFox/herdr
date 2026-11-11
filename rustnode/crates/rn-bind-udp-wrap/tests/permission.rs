@@ -252,7 +252,7 @@ fn recv_start_is_gated_once_per_handle() {
     runtime::install(model);
     let report = with_context(|scope| {
         install(scope);
-        let bound = run(
+        run(
             scope,
             r#"
             const handle = new __udp.UDP();
@@ -264,11 +264,27 @@ fn recv_start_is_gated_once_per_handle() {
             handle.close();
             [status, started].join(',')
             "#,
-        );
-        bound
+        )
     });
     runtime::clear();
     assert_eq!(report, "0,0", "an allowed bind must allow recvStart");
+}
+
+#[test]
+fn an_allowed_socket_can_bind_and_send() {
+    // The permit half of the gate: an allowed `bind` must really bind, which
+    // `getsockname` proves by reporting the port the kernel assigned.
+    let report = eval_allowed(
+        r#"
+        const handle = new __udp.UDP();
+        const status = handle.bind('127.0.0.1', 0, 0);
+        const name = {};
+        handle.getsockname(name);
+        handle.close();
+        [status, name.address, name.port > 0].join(',')
+        "#,
+    );
+    assert_eq!(report, "0,127.0.0.1,true");
 }
 
 #[test]
