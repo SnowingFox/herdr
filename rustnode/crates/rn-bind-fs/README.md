@@ -109,6 +109,7 @@ matching `MKDirpSync`.
 | `internalModuleStat` | `0` file, `1` directory, `< 0` errno, for the module loader |
 | `handleToFd` | Windows-only; reports `ENOSYS` here |
 | `FSReqCallback` | the request-object constructor `new FSReqCallback()` needs |
+| `ReadFileJob`, `WriteFileJob` | one-shot open+fstat+read+close (or open+write+close) jobs on libuv's threadpool; `lib/fs.js` and `lib/internal/fs/promises.js` construct them for every `fs.readFile`/`fs.writeFile` with `options.buffer === undefined` |
 | `kUsePromises` | the sentinel that selects promise mode |
 
 `handleToFd` is present but not functional on Linux. `lib/internal/fs/streams.js`
@@ -193,7 +194,6 @@ stubbed so a caller gets a clear missing-member failure instead of a wrong answe
 | missing | why |
 | --- | --- |
 | `FileHandle` constructor and class | `lib/internal/fs/promises.js` builds `FileHandle` as an `AsyncWrap` with `StreamBase` behaviour, reference counting, `close` promises and structured-clone transfer. That is a handle-lifecycle feature shared with `net`/`http2`, not a filesystem call. `fs.promises.open()` needs it; plain `fs` does not. |
-| `ReadFileJob`, `WriteFileJob` | one-shot open+stat+read (or write+close) jobs that own a libuv work request. They exist purely to collapse three thread-pool round trips into one. Without a thread pool there is nothing to collapse; `lib/fs.js` falls back to `open`/`fstat`/`read`/`close`, which this crate implements, when `options.buffer` is set. |
 | `openFileHandle` | returns a `FileHandle`; blocked on the item above. |
 | `cpSyncCheckPaths`, `cpSyncCopyDir`, `cpSyncOverrideFile`, `CpDirJob` | the `fs.cp` fast paths. `lib/internal/fs/cp/cp-sync.js` only reaches them when no `filter` is supplied; with a `filter` it walks with `opendir`/`stat`/`copyFile`. `opendir` itself needs the `fs_dir` namespace. |
 | `opendir`, and the whole `fs_dir` namespace | `internalBinding('fs_dir')` is a separate binding: it owns `DIR*` handles with async iteration. Out of scope for this crate by namespace, and `Dir` in `lib/internal/fs/dir.js` uses it exclusively. |
@@ -201,6 +201,34 @@ stubbed so a caller gets a clear missing-member failure instead of a wrong answe
 | `internalModuleReadJSON`, `legacyMainResolve`, `getFormatOfExtensionlessFile` | read by `lib/internal/modules/helpers.js`. The latter two are helpers over the JSON reader, and `internalModuleReadJSON` has no call site left in this tree, so implementing it would be guesswork. All three belong to the module-loader crate. |
 | `scandir` as a public member | there is no such member in Node's namespace; `readdir` *is* the scandir binding. The syscall name `scandir` is still used in error messages, which is what Node reports. |
 | `FICLONE_FORCE` | `FICLONE` is attempted and honoured, but a forced reflink on a filesystem that supports neither reflink nor a fallback fails with `ENOTSUP` rather than degrading. Ordinary copies are correct. |
+
+`ReadFileJob` and `WriteFileJob` used to be on this list, with the reason "reads
+and writes go through read/readv until batching is measured as needed". That
+reason was wrong: `lib/fs.js` has no read/readv fallback on the `readFile` path.
+It tests `options.buffer === undefined` and then constructs the job directly, so
+the deferral cost a `TypeError` on every ordinary `fs.readFile` and
+`fs.writeFile` instead of costing performance. Both are real `uv_queue_work`
+jobs in `jobs.rs` now.
+
+## The one-shot file jobs
+
+`jobs.rs` owns both classes. The parts that are easy to get wrong:
+
+* **`run(path)` returns `undefined` when the work is queued.** The only value it
+  returns instead is the permission model's refusal, which `lib/fs.js` passes
+  straight to the caller's callback; nothing is scheduled in that case.
+* **`ondone` and `context` are plain properties.** The job object is opaque
+  otherwise: `run()` reads `ondone` off `this` and calls it with `this` as the
+  receiver, which is how `readFileAfterOneShot` reaches `this.context`.
+* **The `fd`/`size` hand-back is load-bearing.** A file larger than
+  `kReadFileBufferLength` (512 KiB) comes back as an open descriptor plus its
+  size, and `readFileAfterOneShot` switches to the chunked reader. Reporting
+  `-1` there truncates every large file to its first chunk, with no error.
+* **The async frame is captured and restored.** A threadpool completion is
+  neither a promise continuation nor a timer, so V8 restores no embedder frame
+  around it. Without the capture in `run()` and the restore in the completion,
+  `process.domain` and `AsyncLocalStorage` inside an `fs` callback answer with
+  the wrong scope. Node gets this from `AsyncWrap`/`MakeCallback`.
 
 libuv thread-pool semantics, `io_uring`, and permission-model checks are also not
 here. The permission checks live in JS (`lib/fs.js` calls `permission.isEnabled()`
@@ -218,6 +246,7 @@ before the binding); this crate does not add a second check.
 | `flags.rs` | libuv's open-flag encoding |
 | `dirent.rs` | `uv_dirent_type_t` and libuv's sort order |
 | `complete.rs` | deferred callback and promise delivery |
+| `jobs.rs` | `ReadFileJob`/`WriteFileJob`: the one-shot threadpool jobs |
 | `request.rs` | mode classification, error objects, the `kUsePromises` sentinel |
 | `args.rs` | JavaScript value to Rust operand conversion |
 

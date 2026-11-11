@@ -759,11 +759,19 @@ fn member_list_tracks_node_minus_documented_deferrals() {
     let ns_extras: std::collections::BTreeSet<&str> =
         ["FSReqCallback", "kUsePromises"].into_iter().collect();
 
+    // Constructed by `lib/fs.js`, but registered with `SetConstructorFunction`
+    // rather than `SetMethod`, so they are not in the `SetMethod` list above.
+    // Both are load-bearing: `fs.readFile` and `fs.writeFile` construct them
+    // unconditionally for `options.buffer === undefined`.
+    let job_classes: std::collections::BTreeSet<&str> =
+        ["ReadFileJob", "WriteFileJob"].into_iter().collect();
+
     let ours: std::collections::BTreeSet<&str> = Fs.members().iter().copied().collect();
     let expected: std::collections::BTreeSet<&str> = node
         .difference(&deferred)
         .copied()
         .chain(ns_extras.iter().copied())
+        .chain(job_classes.iter().copied())
         .collect();
 
     assert_eq!(ours, expected, "member list drifted from the contract");
@@ -793,5 +801,291 @@ fn sentinel_cannot_be_forged_through_a_global() {
     assert_eq!(
         out,
         r#"{"lookalikeThrew":true,"realIsPromise":true,"globalNotUsed":true}"#
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The one-shot file jobs
+// ---------------------------------------------------------------------------
+
+/// Runs `source` through the real `rustnode` binary.
+///
+/// The jobs are the one part of this namespace that cannot be tested through
+/// `run()` above: their completions arrive from inside `uv_run`, and a bare
+/// isolate with a microtask checkpoint has no loop to run. Driving the CLI is
+/// what exercises the queue, the pool thread and the `ondone` delivery in the
+/// order the JavaScript expects.
+fn run_in_binary(label: &str, source: &str) -> String {
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.pop();
+    path.pop();
+    path.push("target");
+    path.push(if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    });
+    path.push("rustnode");
+    let script = std::env::temp_dir().join(format!(
+        "rn-bind-fs-job-{label}-{}-{:?}.js",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::write(&script, source).expect("write the script");
+    let output = std::process::Command::new(&path)
+        .arg(&script)
+        .output()
+        .unwrap_or_else(|error| panic!("the rustnode binary must be built first: {error}"));
+    let _ = std::fs::remove_file(&script);
+    assert!(
+        output.status.success(),
+        "script failed with {:?}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[test]
+fn read_file_job_is_named_by_lib_fs_and_constructs() {
+    // `lib/fs.js` destructures both names from the namespace at load time and
+    // constructs them directly, so a missing entry is a `TypeError` before any
+    // syscall. `class_name` matters too: the error message a caller sees for a
+    // mis-shaped argument is built from it.
+    let out = run(r#"
+        const readJob = new fsBinding.ReadFileJob('/tmp/x', 0, 512, true);
+        const writeJob = new fsBinding.WriteFileJob('/tmp/x', 0, 0o666, new Uint8Array(1));
+        globalThis.__out = JSON.stringify({
+          readName: fsBinding.ReadFileJob.name,
+          writeName: fsBinding.WriteFileJob.name,
+          readRun: typeof readJob.run,
+          writeRun: typeof writeJob.run,
+          readIsInstance: readJob instanceof fsBinding.ReadFileJob,
+          writeIsInstance: writeJob instanceof fsBinding.WriteFileJob,
+        });
+        "#);
+    assert_eq!(
+        out,
+        r#"{"readName":"ReadFileJob","writeName":"WriteFileJob","readRun":"function","writeRun":"function","readIsInstance":true,"writeIsInstance":true}"#
+    );
+}
+
+#[test]
+fn read_file_job_delivers_the_five_argument_shape_for_a_whole_file() {
+    // `readFileAfterOneShot(err, buffer, fd, size, closeErr)`: a whole-file read
+    // reports `fd === -1` and the buffer, and that buffer has to be a real
+    // `Buffer` because `.toString(encoding)` and `Buffer.isBuffer` both run on it.
+    let dir = TempDir::new("job-oneshot");
+    let file = js_path(&dir.joined("small.txt"));
+    std::fs::write(dir.joined("small.txt"), b"hello job").expect("write");
+
+    let out = run_in_binary(
+        "oneshot",
+        &format!(
+            r#"
+const fs = require('fs');
+fs.readFile('{file}', (err, data) => {{
+  if (err) return console.log('ERR', err.message);
+  console.log(JSON.stringify({{
+    isBuffer: Buffer.isBuffer(data),
+    text: data.toString('utf8'),
+    length: data.length,
+  }}));
+}});
+"#
+        ),
+    );
+    assert_eq!(out, r#"{"isBuffer":true,"text":"hello job","length":9}"#);
+}
+
+#[test]
+fn read_file_job_reports_an_open_failure_as_its_first_argument() {
+    // The `err` row: `argv[0]` carries the `UVException`-shaped error and `fd`
+    // is `-1`, so `readFileAfterOneShot` takes the `context.callback(err)` arm.
+    let out = run_in_binary(
+        "enoent",
+        r#"
+const fs = require('fs');
+fs.readFile('/definitely/not/here/rn-fs-job', (err, data) => {
+  console.log(JSON.stringify({
+    code: err && err.code,
+    syscall: err && err.syscall,
+    errno: err && err.errno,
+    data: data === undefined ? 'undefined' : typeof data,
+  }));
+});
+"#,
+    );
+    assert_eq!(
+        out,
+        r#"{"code":"ENOENT","syscall":"open","errno":-2,"data":"undefined"}"#
+    );
+}
+
+#[test]
+fn a_file_above_the_read_limit_takes_the_chunked_path_without_truncation() {
+    // The `fd >= 0` row. `kReadFileBufferLength` is 512 KiB, so a 1.5 MiB file
+    // must come back as an open fd plus its size and be read by
+    // `readFileAfterOneShot`'s chunked reader. A job that reported `-1` here
+    // would hand back only the first chunk — a silent truncation, not an error —
+    // which is why the length and the content are both asserted.
+    let dir = TempDir::new("job-chunked");
+    let path = dir.joined("large.bin");
+    let size = 1536 * 1024;
+    let content: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+    std::fs::write(&path, &content).expect("write");
+    let file = js_path(&path);
+
+    let out = run_in_binary(
+        "chunked",
+        &format!(
+            r#"
+const fs = require('fs');
+fs.readFile('{file}', (err, data) => {{
+  if (err) return console.log('ERR', err.message);
+  let mismatch = -1;
+  for (let i = 0; i < data.length; i++) {{
+    if (data[i] !== (i % 251)) {{ mismatch = i; break; }}
+  }}
+  console.log(JSON.stringify({{ length: data.length, mismatch }}));
+}});
+"#
+        ),
+    );
+    assert_eq!(
+        out,
+        format!(r#"{{"length":{size},"mismatch":-1}}"#),
+        "a file above the limit must be read in full, not truncated"
+    );
+}
+
+#[test]
+fn write_file_job_writes_a_buffer_and_calls_ondone_once() {
+    // `WriteFileJob`'s completion takes one argument: `lib/fs.js` assigns a
+    // one-argument `ondone`, and anything else would silently be ignored.
+    let dir = TempDir::new("job-write");
+    let file = js_path(&dir.joined("out.bin"));
+    let written = dir.joined("out.bin");
+
+    let out = run_in_binary(
+        "write",
+        &format!(
+            r#"
+const fs = require('fs');
+let calls = 0;
+fs.writeFile('{file}', Buffer.from([1, 2, 3, 4]), (err) => {{
+  calls++;
+  console.log(JSON.stringify({{ err: err === null ? 'null' : String(err), calls }}));
+}});
+"#
+        ),
+    );
+    assert_eq!(out, r#"{"err":"null","calls":1}"#);
+    assert_eq!(
+        std::fs::read(&written).expect("read back"),
+        vec![1u8, 2, 3, 4]
+    );
+}
+
+#[test]
+fn write_file_job_reports_the_write_syscall_for_an_unwritable_path() {
+    let out = run_in_binary(
+        "write-enoent",
+        r#"
+const fs = require('fs');
+fs.writeFile('/definitely/not/here/rn-fs-job.bin', 'x', (err) => {
+  console.log(JSON.stringify({ code: err && err.code, syscall: err && err.syscall }));
+});
+"#,
+    );
+    assert_eq!(out, r#"{"code":"ENOENT","syscall":"open"}"#);
+}
+
+#[test]
+fn promises_read_file_resolves_through_the_job() {
+    // `internal/fs/promises.js` builds the same job and awaits `ondone`, so this
+    // is the path `fs.promises.readFile` takes for a file under the limit.
+    let dir = TempDir::new("job-promise");
+    std::fs::write(dir.joined("p.txt"), b"promised").expect("write");
+    let file = js_path(&dir.joined("p.txt"));
+
+    let out = run_in_binary(
+        "promise",
+        &format!(
+            r#"
+const fs = require('fs');
+fs.promises.readFile('{file}', 'utf8').then(
+  (text) => console.log(JSON.stringify({{ text }})),
+  (err) => console.log(JSON.stringify({{ err: err.message }})),
+);
+"#
+        ),
+    );
+    assert_eq!(out, r#"{"text":"promised"}"#);
+}
+
+#[test]
+fn a_write_above_the_chunk_size_still_lands_whole() {
+    // `internal/fs/promises.js` only takes the job path for a buffer at or below
+    // `kWriteFileMaxChunkSize` (512 KiB). This writes at that size through the
+    // callback form, where `lib/fs.js` has no such cutoff, so the job's write
+    // loop has to reach every byte.
+    let dir = TempDir::new("job-write-large");
+    let file = js_path(&dir.joined("large.bin"));
+    let written = dir.joined("large.bin");
+    let size = 1024 * 1024;
+
+    let out = run_in_binary(
+        "write-large",
+        &format!(
+            r#"
+const fs = require('fs');
+const data = Buffer.alloc({size}, 0x41);
+fs.writeFile('{file}', data, (err) => {{
+  console.log(JSON.stringify({{ err: err === null ? 'null' : String(err), length: data.length }}));
+}});
+"#
+        ),
+    );
+    assert_eq!(out, format!(r#"{{"err":"null","length":{size}}}"#));
+    let back = std::fs::read(&written).expect("read back");
+    assert_eq!(back.len(), size);
+    assert!(back.iter().all(|byte| *byte == 0x41));
+}
+
+#[test]
+fn a_job_completion_restores_the_async_frame_of_its_caller() {
+    // A `uv_queue_work` completion is neither a promise continuation nor a
+    // timer, so V8 restores no embedder frame around it on its own. Node's
+    // `AsyncWrap`/`MakeCallback` does, which is what makes `process.domain` and
+    // `AsyncLocalStorage.getStore()` inside an `fs` callback answer with the
+    // scope that started the call. Without the capture-and-restore in
+    // `jobs.rs` this reported `null` for the read and `true` for the timer,
+    // because libuv's timer phase runs through the JS timer machinery.
+    let dir = TempDir::new("job-domain");
+    std::fs::write(dir.joined("d.txt"), b"d").expect("write");
+    let file = js_path(&dir.joined("d.txt"));
+
+    let out = run_in_binary(
+        "domain",
+        &format!(
+            r#"
+const fs = require('fs');
+const domain = require('domain');
+const d = domain.create();
+d.run(() => {{
+  fs.readFile('{file}', () => {{
+    console.log(JSON.stringify({{ readFile: process.domain === d }}));
+  }});
+  fs.writeFile('{file}.out', 'x', () => {{
+    console.log(JSON.stringify({{ writeFile: process.domain === d }}));
+  }});
+}});
+"#
+        ),
+    );
+    assert_eq!(
+        out, "{\"readFile\":true}\n{\"writeFile\":true}",
+        "both job classes must deliver inside the caller's async frame"
     );
 }

@@ -4,13 +4,19 @@
 //! `lib/internal/fs/**` or `lib/internal/modules/**` reads it. The list was
 //! derived from those call sites and then diffed against the names
 //! `src/node_file.cc` registers with `SetMethod`: it is exactly that set minus
-//! four documented deferrals, plus `FSReqCallback` and `kUsePromises`.
+//! five documented deferrals, plus `FSReqCallback` and `kUsePromises`.
 //!
-//! The deferrals are `cpSyncCheckPaths`, `cpSyncCopyDir`, `cpSyncOverrideFile`
-//! and `openFileHandle`. The first three are `fs.cp` fast paths that only matter
-//! when no `filter` callback is supplied, and `openFileHandle` needs the
-//! `FileHandle` handle type. `README.md` explains each one. A test in
-//! `tests/js_contract.rs` pins the set so it cannot drift silently.
+//! The deferrals are `CpDirJob`, `FileHandle`, `StatWatcher`, `openFileHandle`
+//! and `cpSyncCopyDir`/`cpSyncOverrideFile`'s shared blocker. The `fs.cp` fast
+//! paths only matter when no `filter` callback is supplied, and the
+//! `FileHandle`-shaped members need the handle type. `README.md` explains each
+//! one. A test in `tests/js_contract.rs` pins the set so it cannot drift
+//! silently.
+//!
+//! `ReadFileJob` and `WriteFileJob` are installed, not deferred: `lib/fs.js`
+//! constructs them unconditionally for every ordinary `fs.readFile` and
+//! `fs.writeFile`, so their absence was a hard `TypeError` on that path rather
+//! than a slower fallback. `jobs.rs` owns them.
 //!
 //! Argument order is copied from the JS call sites verbatim, including the
 //! trailing "request" slot whose meaning `request::classify` decides.
@@ -96,6 +102,12 @@ impl BindingModule for Fs {
         let object = v8::Object::new(scope);
         install_sentinel(scope, object).ok_or("cannot allocate the kUsePromises symbol")?;
 
+        // `ReadFileJob` and `WriteFileJob` complete from inside `uv_run`, where
+        // there is no V8 scope and no entered context. Recording them here is
+        // what lets `jobs.rs` deliver `ondone` at all; every binding that calls
+        // back from the loop has to do this, and the record is idempotent.
+        rn_uv::callback::remember_context(scope);
+
         let mut installer = Installer { scope, object };
         installer.install_all()?;
         Ok(installer.object)
@@ -110,9 +122,7 @@ impl BindingModule for Fs {
 pub const DEFERRED: &[(&str, &str)] = &[
     ("CpDirJob", "cp -r recursion lives in the lib/ JS layer; the C++ job wrapper is not needed until the copy fast path lands"),
     ("FileHandle", "native FileHandle wrapper; lib/ uses the JS FileHandle over numeric fds for now"),
-    ("ReadFileJob", "batched read job; reads go through read/readv until batching is measured as needed"),
     ("StatWatcher", "fs.watchFile polling handle, needs the timer loop"),
-    ("WriteFileJob", "batched write job; writes go through write/writev until batching is measured as needed"),
     ("bigintStatFsValues", "bigint view of statfs fields, follows the BigInt stat surface"),
     ("bigintStatValues", "bigint view of stat fields, follows the BigInt stat surface"),
     ("cpSyncCopyDir", "cp -r directory recursion, lands with cp -r"),
@@ -178,6 +188,9 @@ pub const MEMBERS: &[&str] = &[
     "handleToFd",
     // Request constructor.
     "FSReqCallback",
+    // One-shot open+read+close / open+write+close jobs.
+    "ReadFileJob",
+    "WriteFileJob",
     "kUsePromises",
 ];
 
@@ -232,6 +245,7 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
         mkfn!(self, "internalModuleStat", internal_module_stat_binding);
         mkfn!(self, "handleToFd", handle_to_fd_binding);
         self.fs_req_callback()?;
+        self.file_jobs()?;
         Ok(())
     }
 
@@ -257,6 +271,30 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
             .get_function(self.scope)
             .ok_or("cannot allocate fs.FSReqCallback")?;
         self.define("FSReqCallback", function.into())
+    }
+
+    /// Defines the two one-shot file job constructors.
+    ///
+    /// `lib/fs.js` and `lib/internal/fs/promises.js` construct these
+    /// unconditionally for `options.buffer === undefined`, which is every
+    /// ordinary `fs.readFile` and `fs.writeFile` call, so a namespace without
+    /// them throws `TypeError: ReadFileJob is not a constructor` before any
+    /// syscall happens. `jobs.rs` explains the classes.
+    fn file_jobs(&mut self) -> Result<(), String> {
+        crate::jobs::install_job_class(
+            self.scope,
+            self.object,
+            "ReadFileJob",
+            crate::jobs::read_file_constructor,
+            crate::jobs::read_file_run,
+        )?;
+        crate::jobs::install_job_class(
+            self.scope,
+            self.object,
+            "WriteFileJob",
+            crate::jobs::write_file_constructor,
+            crate::jobs::write_file_run,
+        )
     }
 }
 
