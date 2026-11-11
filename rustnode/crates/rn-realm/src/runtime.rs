@@ -424,7 +424,7 @@ pub enum Settled {
 /// Node's `IsNothing()` branch does: it breaks out to the exit sequence. The
 /// exception has already gone through the fatal path, so by the time the caller
 /// reaches `exit` the status is 1 and `exit` has usually been emitted already.
-pub fn emit_before_exit(scope: &mut v8::PinScope, hooks: &RuntimeHooks) -> Settled {
+pub fn emit_before_exit(scope: &mut v8::PinScope, hooks: &Runtime) -> Settled {
     let emitted = match process_object(scope) {
         Some(process) => match function_property(scope, process.into(), "emit") {
             Some(emit) => emit_event(scope, process, emit, "beforeExit"),

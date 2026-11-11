@@ -362,7 +362,7 @@ fn main() {
         // `process.exitCode` with `kGenericUserError` and emits `exit`. Skipping
         // the emit made `process.on('exit', ...)` fire for every kind of exit
         // except the most common failure a script has.
-        let code = event_loop::emit_exit_after_failure(scope);
+        let code = rn_realm::runtime::emit_exit_after_failure(scope);
         std::process::exit(if code == 0 { 1 } else { code });
     }
 
@@ -426,7 +426,7 @@ fn main() {
     // returned because user code replaced `reallyExit`, or a fatal path that
     // emitted `exit` itself — is left alone and keeps the status it settled on.
     let code = match runtime.as_ref() {
-        Some(_) => event_loop::emit_exit(scope, 0),
+        Some(_) => rn_realm::runtime::emit_exit(scope, 0),
         None => bootstrap::read_exit_code(scope).unwrap_or(0),
     };
 
