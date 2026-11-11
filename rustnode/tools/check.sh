@@ -43,6 +43,21 @@ step "building the workspace and the CLI binary"
 cargo build --workspace
 cargo build -p rn-cli
 
+step "the per-context globals audit"
+# Every assertion reads the rustnode realm (`primordials`, `DOMException`, the
+# per-context symbol tables), so this needs the binary built above and cannot run
+# with system node. It lived outside the gate and reported 44/44 for a while
+# while 14 of those checks compared a value to itself.
+#
+# It runs *before* the cipher self-test, not after. That self-test deletes
+# `target/debug/rustnode`, fails the build on purpose, then restores the binary
+# by `cp`-ing a `mktemp` backup into the now-absent path, which gives it mode
+# 0600 — no execute bit. Cargo restores the mode on any real rebuild, so master's
+# remaining steps never noticed: the next one is `cargo test`, which rebuilds.
+# This is the first step that execs the binary directly, so running it first
+# keeps the audit's own result from depending on that restore behaviour.
+./target/debug/rustnode tools/per-context-audit.js
+
 step "the cipher control still reports a void run as a void run"
 # The control's exit contract — 3 for "the build failed, so there is no
 # verdict", distinct from 1 for "the control misbehaved" — is what stops a
