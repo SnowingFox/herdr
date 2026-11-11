@@ -168,14 +168,18 @@ fn chdir_returns_zero_then_a_negative_errno() {
 }
 
 #[test]
-fn a_deferred_member_is_absent_rather_than_wrong() {
-    // `dlopen` needs the addon loader. Reporting the member as present but
-    // non-functional would surface much later as a missing addon, so it must be
-    // genuinely absent and declared deferred in the contract.
+fn dlopen_is_installed_and_dlopen_binary_stays_deferred() {
+    // `dlopen` loads a real addon now, so it must be present. `dlopenBinary` loads
+    // one from bytes through a self-cleaning image and is still deferred; reporting
+    // it as present but non-functional would surface much later as a missing addon,
+    // so it must be genuinely absent.
+    //
+    // `execve` is the other deferred member, kept here so this test still pins the
+    // distinction between "implemented" and "declared missing".
     let output = run(&format!(
-        "{PRELUDE} console.log(typeof pm.dlopen, typeof pm.execve);"
+        "{PRELUDE} console.log(typeof pm.dlopen, typeof pm.dlopenBinary, typeof pm.execve);"
     ));
-    assert_eq!(output, "undefined undefined");
+    assert_eq!(output, "function undefined undefined");
 }
 
 #[test]

@@ -13,8 +13,15 @@ use std::path::Path;
 
 /// Suites this harness knows how to run, in the order the dashboard shows them.
 ///
-/// `addons`, `js-native-api` and `node-api` are compiled C++ fixtures and
-/// `cctest`/`fuzzers` are not JavaScript at all, so they are deliberately absent.
+/// `cctest` and `fuzzers` are not JavaScript at all, and `addons`/`js-native-api`
+/// are compiled fixtures whose runner needs `gyp`; all four stay out.
+///
+/// `node-api` **is** included, with one difference in selection: Node's
+/// `AddonTestConfiguration` selects every `*.js` file one directory down rather
+/// than the `test-*.js` names the other suites use. Those tests need a compiled
+/// `.node` fixture beside them, which is why the harness docs used to exclude the
+/// suite; `crates/rn-napi/tools/build-node-api-addons.py` builds the fixtures, so
+/// the suite is measurable and belongs in the table.
 pub const SUITES: &[&str] = &[
     "parallel",
     "sequential",
@@ -23,13 +30,23 @@ pub const SUITES: &[&str] = &[
     "pummel",
     "message",
     "known_issues",
+    "node-api",
 ];
+
+/// Suites whose tests are selected by Node's `AddonTestConfiguration`.
+///
+/// The rule is `os.path.isdir(subpath)` then every `*.js` in it, which is why these
+/// suites cannot go through [`is_test_file`].
+pub const ADDON_SUITES: &[&str] = &["node-api"];
 
 /// Suites that are safe to run concurrently.
 ///
 /// `sequential` exists precisely because those tests cannot share a machine with
-/// their siblings, so it is the one suite a parallel run still runs alone.
-pub const PARALLEL_SAFE_SUITES: &[&str] = &["parallel", "es-module", "internet", "message"];
+/// their siblings, so it is the one suite a parallel run still runs alone. The
+/// addon suites are included: each test gets its own process and its own
+/// `build/Release` fixture, so they do not contend.
+pub const PARALLEL_SAFE_SUITES: &[&str] =
+    &["parallel", "es-module", "internet", "message", "node-api"];
 
 /// Small default subset that finishes in seconds.
 ///
@@ -115,7 +132,11 @@ pub fn collect(root: &Path, filter: &Filter) -> Result<Selection, String> {
             continue;
         }
         let mut files = Vec::new();
-        walk(&suite_dir, root, &mut files)?;
+        if ADDON_SUITES.contains(suite) {
+            walk_addons(&suite_dir, root, &mut files)?;
+        } else {
+            walk(&suite_dir, root, &mut files)?;
+        }
         files.sort();
         for relative in files {
             if !filter.allows_name(&relative) {
@@ -162,6 +183,47 @@ fn collect_explicit(root: &Path, filter: &Filter) -> Result<Selection, String> {
         tests.truncate(limit);
     }
     Ok(Selection { tests })
+}
+
+/// Collects the `.js` files Node's `AddonTestConfiguration` would select.
+///
+/// Node's rule, from `test/testpy/__init__.py`:
+///
+/// ```python
+/// for subpath in os.listdir(path):
+///   if os.path.isdir(os.path.join(path, subpath)):
+///     result.extend([subpath, f[:-3]] for f in os.listdir(...) if f.endswith('.js'))
+/// ```
+///
+/// So: one directory down, every `.js`, regardless of name. A `test-` prefix is not
+/// required and most of these files do not have one — `test_async/test.js` is the
+/// shape. Only the first level is walked, matching the reference.
+fn walk_addons(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let inner =
+            std::fs::read_dir(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        for file in inner {
+            let file = file.map_err(|error| format!("{}: {error}", path.display()))?;
+            let file_path = file.path();
+            if file_path.extension().and_then(|value| value.to_str()) != Some("js") {
+                continue;
+            }
+            if !file_path.is_file() {
+                continue;
+            }
+            let relative = file_path
+                .strip_prefix(root)
+                .map_err(|_| format!("{} is outside {}", file_path.display(), root.display()))?;
+            out.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
 }
 
 fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) -> Result<(), String> {

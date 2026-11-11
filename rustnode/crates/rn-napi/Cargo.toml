@@ -9,5 +9,12 @@ description = "Node-API implementation for rustnode"
 
 [dependencies]
 rn-core = { path = "../rn-core" }
+rn-v8-sys.workspace = true
 libc.workspace = true
 thiserror.workspace = true
+# The loader is already in this dependency graph through `clang-sys` (a `v8`
+# build dependency), so using it adds no new third-party code. It provides
+# `dlopen`/`dlsym` on Unix and `LoadLibraryExW`/`GetProcAddress` on Windows with
+# the same API shape, which is what makes `platform/<os>.rs` a thin mapping
+# instead of two sets of syscalls.
+libloading = "0.8"

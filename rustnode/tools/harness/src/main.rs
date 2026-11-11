@@ -36,7 +36,7 @@ RUN OPTIONS:
     --tests <path>       path to the Node checkout's test/ directory (required)
     --suite <name>       run only this suite; repeatable. One of:
                          parallel, sequential, es-module, internet, pummel,
-                         message, known_issues
+                         message, known_issues, node-api
     --filter <substring> run only files whose path contains this text;
                          repeatable, case-insensitive
     --only <path>        run one exact test path, relative to test/;

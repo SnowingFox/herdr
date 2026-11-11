@@ -1096,6 +1096,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rn-core",
+ "rn-napi",
  "rn-v8-sys",
 ]
 
@@ -1514,7 +1515,9 @@ name = "rn-napi"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "libloading",
  "rn-core",
+ "rn-v8-sys",
  "thiserror",
 ]
 
