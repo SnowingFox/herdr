@@ -104,6 +104,11 @@ pub struct SessionState {
     pub destroyed: Cell<bool>,
     /// `is_closing()`: a GOAWAY was submitted, so new streams are refused.
     pub closing: Cell<bool>,
+    /// `setGracefulCloseInitiated()`: `setGracefulClose` ran, so the
+    /// `ongracefulclosecomplete` notification is armed.
+    pub graceful_close: Cell<bool>,
+    /// Whether that notification has fired, so it fires once.
+    pub graceful_close_notified: Cell<bool>,
     /// `is_receiving()`: inside `nghttp2_session_mem_recv`.
     ///
     /// `SendPendingData` must not run while this is set, because sending can close
@@ -209,6 +214,8 @@ impl SessionState {
             consumed: Cell::new(false),
             destroyed: Cell::new(false),
             closing: Cell::new(false),
+            graceful_close: Cell::new(false),
+            graceful_close_notified: Cell::new(false),
             receiving: Cell::new(false),
             sending: Cell::new(false),
             write_scheduled: Cell::new(false),
@@ -494,6 +501,7 @@ pub fn send_pending_data(scope: &mut v8::PinScope<'_, '_>, state: &SessionState)
         }
     }
     state.has_pending_data.set(status == 0);
+    maybe_notify_graceful_close(state);
     let _ = scope;
 }
 
@@ -594,6 +602,9 @@ fn receive_scope(scope: &mut v8::PinScope<'_, '_>, state: &SessionState, bytes: 
     // after pending RST_STREAM frames.
     if consumed >= 0 && !state.destroyed.get() {
         schedule_write(state);
+    }
+    if consumed >= 0 {
+        maybe_notify_graceful_close(state);
     }
     if consumed < 0 {
         let code = consumed as i32;
@@ -749,6 +760,57 @@ pub fn detach(session: &SessionState, socket_destroyed: bool) {
     }
     session.consumed.set(false);
     session.dispose();
+}
+
+/// `MaybeNotifyGracefulCloseComplete`: tell `core.js` the connection is drained.
+///
+/// `http2session.setGracefulClose()` sets a flag, and `core.js` installs
+/// `handle.ongracefulclosecomplete = this[kMaybeDestroy]` before calling it. Once
+/// nghttp2 neither wants to read nor write, that callback is what destroys the
+/// session — so a graceful `session.close()` completes only if this runs. Without
+/// it `close()` sends its GOAWAY and then waits forever: the exact timeout the
+/// measurement is full of.
+///
+/// Called after every write flush and after every receive, which is where Node
+/// calls it (`MaybeNotifyGracefulCloseComplete` at the end of `SendPendingData`
+/// and of the receive path).
+pub fn maybe_notify_graceful_close(state: &SessionState) {
+    if !state.graceful_close.get() {
+        return;
+    }
+    let Some(raw) = raw(state) else {
+        return;
+    };
+    // SAFETY: `raw` is live and both getters only read.
+    let (want_write, want_read) = unsafe {
+        (
+            ffi::nghttp2_session_want_write(raw),
+            ffi::nghttp2_session_want_read(raw),
+        )
+    };
+    if want_write != 0 || want_read != 0 {
+        return;
+    }
+    // The callback runs at most once: a second notification would destroy an
+    // already-destroyed session.
+    if state.graceful_close_notified.replace(true) {
+        return;
+    }
+    let _ = rn_uv::callback::with_context(|scope| {
+        let Some(object) = crate::session_object(scope, state) else {
+            return;
+        };
+        let Some(key) = v8::String::new(scope, "ongracefulclosecomplete") else {
+            return;
+        };
+        let Some(value) = object.get(scope, key.into()) else {
+            return;
+        };
+        let Ok(handler) = v8::Local::<v8::Function>::try_from(value) else {
+            return;
+        };
+        let _ = handler.call(scope, object.into(), &[]);
+    });
 }
 
 /// A GOAWAY with `code`, which is `Http2Session::Goaway`.

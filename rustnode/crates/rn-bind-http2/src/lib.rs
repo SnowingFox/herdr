@@ -112,21 +112,25 @@ pub const DEFERRED: &[(&str, &str)] = &[];
 /// smuggled into the member list.
 pub const KNOWN_GAPS: &[(&str, &str)] = &[
     (
+        "the readable side never emits 'end'",
+        "`on_stream_close` is the only thing that can end a stream's readable \
+         side, and nghttp2 does not deliver it while the outbound side still has \
+         an open DATA provider — so on a client stream the response body arrives \
+         and `'end'` never does. `core.js` gates every cleanup path on \
+         `_readableState.ended`, so the session is never destroyed, its socket \
+         stays ref'd and the process cannot exit. This is the 90 timeouts and it \
+         is *one* bug, not a family: it needs the provider to report EOF through \
+         `StreamBase` rather than from the pending queue, which is where the \
+         pull/pause protocol has to come from",
+    ),
+    (
         "socket teardown on destroy()",
         "`Http2Session.destroy()` calls `this.ondone` (finishSessionClose) and the \
          nghttp2 session is freed, but the consumed socket's libuv handle is not \
          closed, so a process that destroys a session with a live connection does \
-         not drain its loop and the file times out. Closing it needs the \
-         StreamBase ownership model that `Http2Stream` needs for the same reason, \
-         so both land together rather than as a patch here",
-    ),
-    (
-        "Http2Stream body delivery",
-        "`respond`/`info`/`trailers` submit real frames and a headers-only round \
-         trip completes, but the Duplex read pump needs a per-stream AsyncWrap \
-         identity (onread receiver, async id, backpressure) that this increment \
-         does not add. This is the 87 timeouts and 13 Uncaught files in the \
-         measurement",
+         not drain its loop. Closing another binding's handle from here would \
+         free state its owner still holds, so this waits for the same provider \
+         work as the entry above",
     ),
 ];
 

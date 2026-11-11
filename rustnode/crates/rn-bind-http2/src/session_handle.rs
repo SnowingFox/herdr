@@ -688,6 +688,14 @@ fn set_graceful_close(
 ) {
     if let Some(state) = with_state(args.this(), |state| state as *const SessionState) {
         // SAFETY: as `receive`.
-        unsafe { &*state }.closing.set(true);
+        let state = unsafe { &*state };
+        state.closing.set(true);
+        // `setGracefulCloseInitiated(true)`, then check immediately. The order in
+        // `core.js` is `this.goaway()` *then* `handle.setGracefulClose()`, so by
+        // the time this runs the GOAWAY has already been flushed and nothing else
+        // will call back in — waiting for a later flush means waiting forever,
+        // which is the `close()` timeout.
+        state.graceful_close.set(true);
+        crate::session::maybe_notify_graceful_close(state);
     }
 }

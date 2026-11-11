@@ -457,6 +457,12 @@ unsafe extern "C" fn on_stream_close(
             None => false,
         }
     };
+    // The readable side has to see EOF before `onStreamClose` can decide the
+    // stream ended cleanly. `core.js` checks `stream._readableState.ended`, and a
+    // stream whose readable side never emitted `'end'` is treated as aborted —
+    // so without this the client receives its DATA, never gets `'end'`, and the
+    // session's cleanup never runs. That is the whole timeout family.
+    crate::stream::end_readable(state, stream_id);
     let _ = rn_uv::callback::with_context(|scope| {
         let args = [
             v8::Integer::new(scope, error_code as i32).into(),

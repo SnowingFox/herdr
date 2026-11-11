@@ -57,6 +57,15 @@ pub struct StreamHandleState {
     pub object: RefCell<Option<v8::Global<v8::Object>>>,
     /// Whether the readable side has been started.
     pub reading: Cell<bool>,
+    /// `AsyncWrap`'s identity for this stream: the id `getAsyncId` reports and
+    /// the trigger id `async_hooks` records.
+    ///
+    /// Node's `Http2Stream` is an `AsyncWrap`, so every stream is an async
+    /// resource with its own id. `core.js` stores `handle.getAsyncId()` on
+    /// `async_id_symbol` and uses it for `defaultTriggerAsyncIdScope`, so a
+    /// placeholder id collapses a stream's async context onto whatever id it
+    /// borrowed — which is what `AsyncLocalStorage` reports as the wrong store.
+    pub async_wrap: rn_core::AsyncWrapState,
 }
 
 /// Builds the `Http2Stream` constructor and its prototype.
@@ -183,6 +192,14 @@ pub fn handle_for<'s>(
         options,
         object: RefCell::new(Some(v8::Global::new(scope.as_ref(), object))),
         reading: Cell::new(false),
+        // The id comes from the one sequence the JavaScript side also draws from,
+        // which is what `Environment::new_async_id` guarantees and what a local
+        // counter would not.
+        async_wrap: rn_core::AsyncWrapState {
+            async_id: rn_bind_async_wrap::next_async_id(),
+            trigger_async_id: current_trigger_async_id(),
+            provider: rn_core::async_wrap::PROVIDER_HTTP2STREAM,
+        },
     }));
     object.set_aligned_pointer_in_internal_field(STREAM_FIELD, state.cast::<std::ffi::c_void>(), 0);
 
@@ -262,6 +279,17 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
             v8::ArrayBuffer::with_backing_store(scope, &store).into();
         let _ = handler.call(scope, object.into(), &[buffer]);
     });
+}
+
+/// Makes `stream_id`'s readable side end, which is what `onStreamClose` inspects.
+///
+/// `StreamBase::ReadStop` plus a zero-length read is how Node ends a stream's
+/// readable side when nghttp2 reports the stream closed: the `Duplex` sees EOF and
+/// emits `'end'`, `core.js` marks the stream settled, and the session can finally
+/// destroy. Skipping it leaves `_readableState.ended` false forever, so every
+/// teardown path waits on an event that will never come.
+pub fn end_readable(session: &SessionState, stream_id: i32) {
+    emit_eof(session, stream_id);
 }
 
 /// Reports end-of-stream on `stream_id`'s readable side.
@@ -865,16 +893,22 @@ fn get_bytes_written(
 }
 
 /// `AsyncWrap::getAsyncId`.
-///
-/// A stream has no `AsyncWrap` of its own here, so there is no id to report.
-/// `core.js` only stores the value on `async_id_symbol` for context propagation,
-/// which is a separate slice; `-1` is the sentinel Node uses for "no id".
 fn get_async_id(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    rv.set(v8::Number::new(scope, -1.0).into());
+    let id = with_state(args.this(), |state| state.async_wrap.async_id())
+        .unwrap_or(rn_core::INVALID_ASYNC_ID);
+    rv.set(v8::Number::new(scope, id).into());
+}
+
+/// The async id that is currently executing, which becomes a stream's trigger.
+///
+/// `AsyncWrap`'s constructor reads `async_hooks.executionAsyncId()` for this, so
+/// that a stream created inside a `run()` is parented to whatever ran it.
+fn current_trigger_async_id() -> f64 {
+    rn_bind_async_wrap::execution_async_id()
 }
 
 #[cfg(test)]

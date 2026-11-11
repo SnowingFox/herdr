@@ -1060,6 +1060,7 @@ name = "rn-bind-http2"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "rn-bind-async-wrap",
  "rn-bind-stream-wrap",
  "rn-core",
  "rn-uv",
