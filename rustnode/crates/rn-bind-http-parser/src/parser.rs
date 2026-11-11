@@ -643,19 +643,23 @@ impl Parser {
     ///
     /// Node's `Parser` is a `StreamListener`, so `StreamBase::PushStreamListener`
     /// installs it as the stream's active listener and libuv's reads land in
-    /// `OnStreamRead` → `Execute`. rustnode's equivalent read path
-    /// (`rn_uv::stream::deliver_read`) has one destination: it reads
-    /// `handle.onread` off the JavaScript object and calls it with an
-    /// `ArrayBuffer`. There is no listener stack to push onto, so "attaching" can
-    /// only mean "record the handle"; the bytes keep arriving through `onread`,
-    /// which `lib/internal/http/server.js` forwards into `execute` itself.
+    /// `OnStreamRead` → `Execute`.
+    ///
+    /// The read path can do that now: `rn_uv::listener` implements the chain and
+    /// `rn_uv::stream` routes `on_alloc`/`on_read` through it, so there *is* a
+    /// stack to push onto. This crate does not use it yet, and "attaching" still
+    /// only means "record the handle": a parser pushed as a listener displaces
+    /// `onread` for the socket, which is a real behaviour change for HTTP server
+    /// sockets and belongs to this crate's owner rather than to the read path.
+    /// Until then the bytes keep arriving through `onread`, which
+    /// `lib/internal/http/server.js` forwards into `execute` itself.
     ///
     /// The observable contract this still honours is the one the JavaScript layer
     /// tests for: a consume is recorded, so `unconsume` has something to detach,
     /// and a second `consume` on the same parser cannot silently switch streams.
-    /// What it does not give is the allocation-free path — that needs the
-    /// listener stack, and that is a change to the shared read path rather than
-    /// to this crate.
+    /// What it does not give is the allocation-free path — that needs this parser
+    /// to become a `rn_uv::listener::StreamListener` and be pushed onto the
+    /// socket, which is a change to this crate.
     pub fn consume(&mut self, stream: *mut rn_uv::sys::uv_stream_t) -> bool {
         if self.stream.is_some_and(|existing| existing.0 != stream) {
             return false;

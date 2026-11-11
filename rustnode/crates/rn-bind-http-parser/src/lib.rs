@@ -611,18 +611,22 @@ fn llhttp_of(object: v8::Local<v8::Object>) -> Option<*mut ffi::Llhttp> {
 /// # What this does instead, and why it is honest
 ///
 /// rustnode has real `StreamBase` handles now — `tcp_wrap` and `pipe_wrap` both
-/// publish `isStreamBase` and are driven by `rn_uv::stream` — but that read path
-/// has one listener: `deliver_read` reads `handle.onread` off the JavaScript
-/// object and calls it. There is no listener stack, so there is nowhere to
-/// "push" a parser that would displace `onread` without editing the read path
-/// itself.
+/// publish `isStreamBase` and are driven by `rn_uv::stream` — and the read path
+/// has a listener chain: `rn_uv::listener` implements
+/// `StreamResource::PushStreamListener` and `rn_uv::stream` routes `on_alloc`
+/// and `on_read` through it. So there *is* somewhere to push a parser now.
 ///
-/// Adding that stack is a change to `rn_uv::stream`, which every socket and pipe
-/// in the runtime is driven by. What it buys is the `onread`-free fast path: the
-/// bytes reach `Execute` without an `ArrayBuffer` allocation and without the
-/// `onStreamRead` frame. What it does **not** change is where the bytes come from
-/// or who reads them, because the existing `onread` path already forwards into
-/// `execute` (`lib/internal/http/server.js`'s `socketOnData`).
+/// This crate does not push one yet, and the reason is behavioural rather than
+/// structural: a parser pushed as the socket's listener is what `onread` stops
+/// receiving, so the socket no longer looks like a readable JavaScript stream.
+/// That is the outcome Node has, and it is a change this crate's owner has to
+/// make deliberately rather than as a side effect of the read path gaining the
+/// mechanism. Until then the bytes keep arriving through `onread`, which
+/// `lib/internal/http/server.js`'s `socketOnData` forwards into `execute`.
+///
+/// What the chain buys when this crate does adopt it is the `onread`-free fast
+/// path: the bytes reach `Execute` without an `ArrayBuffer` allocation and
+/// without the `onStreamRead` frame.
 ///
 /// So this records the handle and leaves the forwarding to `onread`. The
 /// contract that matters is the one that would break if this did nothing at all:
