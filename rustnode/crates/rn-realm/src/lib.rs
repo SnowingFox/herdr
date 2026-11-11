@@ -1807,11 +1807,28 @@ fn function_of<'s>(
     Ok(function.into())
 }
 
+/// Throws the error `getInternalBinding` reports for a namespace this build
+/// does not implement.
+///
+/// The `code` is `ERR_INVALID_MODULE`, the same one `throw_invalid_module`
+/// uses: Node's own `getInternalBinding` reports an unlinked binding through
+/// `ERR_INVALID_MODULE`, and a caller that only sees a bare message cannot tell
+/// a missing namespace from a typo or a failed load. `node:ffi` is the case that
+/// made this visible — the module loaded, warned that it was experimental, and
+/// then failed with `code: undefined`, which reads as a bug in the caller.
 fn throw(scope: &mut v8::PinScope, message: &str) {
     let Some(message) = v8::String::new(scope, message) else {
         return;
     };
     let exception = v8::Exception::error(scope, message);
+    if let (Ok(object), Some(code)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, "ERR_INVALID_MODULE"),
+    ) {
+        if let Some(key) = v8::String::new(scope, "code") {
+            let _ = object.set(scope, key.into(), code.into());
+        }
+    }
     scope.throw_exception(exception);
 }
 
