@@ -64,7 +64,10 @@ registered the crate it was warning about, and `rn-core`'s
 the script's exclusion list for that reason, so removing `rn-core` from that
 list without checking the matcher would break the build.
 `tools/regen-bindings.test.sh` pins all of this, including a byte-for-byte
-comparison against the committed `install_all.rs`.
+comparison against the committed `install_all.rs`. It runs in `tools/check.sh`
+immediately before the regeneration, as a bare statement so its exit status is
+the gate's: a matcher regression turns the gate red instead of only being
+findable by running the tests by hand.
 
 ## Aliased buffers
 

@@ -26,6 +26,14 @@ quick=0
 
 step() { printf '\n== %s ==\n' "$1"; }
 
+step "the binding matcher still classifies crates correctly"
+# Runs before the regeneration, and as its own plain statement: a bare command's
+# status is the gate's status under `set -e`, whereas piping it into `tee` or
+# capturing it in `$( )` would let a failing matcher fall through to a green
+# gate. The tests are what justify the scanner's complexity, so they have to be
+# able to fail this gate rather than being runnable only by hand.
+./tools/regen-bindings.test.sh
+
 step "regenerating the binding registry"
 ./tools/regen-bindings.sh
 
