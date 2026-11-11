@@ -50,7 +50,10 @@ extern "C" {
     pub fn X509_STORE_add_crl(xs: *mut ffi::X509_STORE, x: *mut ffi::X509_CRL) -> c_int;
 
     /// `EVP_PKEY *PEM_read_bio_Parameters(BIO *bp, EVP_PKEY **x);`
-    pub fn PEM_read_bio_Parameters(bp: *mut ffi::BIO, x: *mut *mut ffi::EVP_PKEY) -> *mut ffi::EVP_PKEY;
+    pub fn PEM_read_bio_Parameters(
+        bp: *mut ffi::BIO,
+        x: *mut *mut ffi::EVP_PKEY,
+    ) -> *mut ffi::EVP_PKEY;
 
     /// `int X509_STORE_CTX_get1_issuer(X509 **issuer, X509_STORE_CTX *ctx, X509 *x);`
     ///

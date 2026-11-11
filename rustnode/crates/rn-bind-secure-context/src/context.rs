@@ -33,7 +33,7 @@ use std::os::raw::{c_int, c_long};
 
 use foreign_types::{ForeignType, ForeignTypeRef};
 use openssl::ssl::{SslContextBuilder, SslMethod, SslSessionCacheMode};
-use openssl::x509::{X509, X509Crl};
+use openssl::x509::{X509Crl, X509};
 use openssl_sys as ffi;
 
 use crate::ffi_extra;
@@ -251,7 +251,8 @@ impl Context {
 
         // SSLv2 is gone from the bundled OpenSSL and SSLv3 is disabled for
         // POODLE; Node sets both on every context it creates.
-        context.set_options(openssl::ssl::SslOptions::NO_SSLV2 | openssl::ssl::SslOptions::NO_SSLV3);
+        context
+            .set_options(openssl::ssl::SslOptions::NO_SSLV2 | openssl::ssl::SslOptions::NO_SSLV3);
 
         // Automatic certificate chaining. On by default in OpenSSL, off in
         // BoringSSL; set explicitly so the two agree.
@@ -384,7 +385,8 @@ impl Context {
             unsafe { ffi::EVP_PKEY_free(params) };
             return Err(ContextError::DhParamTooSmall);
         }
-        let warning = (prime_bits < 2048).then(|| "DH parameter is less than 2048 bits".to_string());
+        let warning =
+            (prime_bits < 2048).then(|| "DH parameter is less than 2048 bits".to_string());
 
         let context = self.context()?;
         // SAFETY: `params` is an owned `EVP_PKEY` of DH type and
@@ -482,7 +484,8 @@ impl Context {
     /// adds every remaining PEM block to the chain, and records the issuer for
     /// `getIssuer`. The same steps are done here.
     pub fn set_cert(&mut self, pem: &[u8]) -> Result<(), ContextError> {
-        let mut certificates = X509::stack_from_pem(pem).map_err(|_| ContextError::Pem("certificate"))?;
+        let mut certificates =
+            X509::stack_from_pem(pem).map_err(|_| ContextError::Pem("certificate"))?;
         if certificates.is_empty() {
             return Err(ContextError::Pem("certificate"));
         }
@@ -546,7 +549,8 @@ impl Context {
             );
             let mut issuer: *mut ffi::X509 = std::ptr::null_mut();
             let found = initialised == 1
-                && ffi_extra::X509_STORE_CTX_get1_issuer(&mut issuer, store_ctx, leaf.as_ptr()) == 1
+                && ffi_extra::X509_STORE_CTX_get1_issuer(&mut issuer, store_ctx, leaf.as_ptr())
+                    == 1
                 && !issuer.is_null();
             ffi::X509_STORE_CTX_free(store_ctx);
             if !found {
@@ -649,7 +653,10 @@ impl Context {
 
     /// `setTicketKeys`.
     pub fn set_ticket_keys(&mut self, bytes: &[u8; 48]) -> Result<(), ContextError> {
-        let keys = self.ticket_keys.as_mut().ok_or(ContextError::NotInitialised)?;
+        let keys = self
+            .ticket_keys
+            .as_mut()
+            .ok_or(ContextError::NotInitialised)?;
         keys.set(bytes);
         Ok(())
     }
@@ -923,6 +930,8 @@ mod tests {
         let mut context = Context::default();
         context.init(None, 0, 0).expect("init");
         context.add_root_certs().expect("add root certs");
-        assert!(context.add_ca_cert(b"-----BEGIN CERTIFICATE-----\nnot a cert\n").is_err());
+        assert!(context
+            .add_ca_cert(b"-----BEGIN CERTIFICATE-----\nnot a cert\n")
+            .is_err());
     }
 }

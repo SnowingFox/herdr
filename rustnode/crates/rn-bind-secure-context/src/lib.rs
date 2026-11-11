@@ -199,10 +199,7 @@ fn constructor(
 /// `ASSIGN_OR_RETURN_UNWRAP` produces, rather than a panic. A re-entrant borrow
 /// cannot happen because nothing in this crate calls back into V8 while holding
 /// it.
-fn with_state<R>(
-    this: v8::Local<v8::Object>,
-    body: impl FnOnce(&mut Context) -> R,
-) -> Option<R> {
+fn with_state<R>(this: v8::Local<v8::Object>, body: impl FnOnce(&mut Context) -> R) -> Option<R> {
     // SAFETY: the pointer was written by `constructor` into this object's field
     // 0, and nothing but its finalizer clears or replaces it.
     let pointer = unsafe { this.get_aligned_pointer_from_internal_field(CONTEXT_STATE_FIELD, 0) }
@@ -276,8 +273,9 @@ macro_rules! void_method {
 
 void_method!(add_root_certs, |context: &mut Context| context
     .add_root_certs());
-void_method!(set_allow_partial_trust_chain, |context: &mut Context| context
-    .set_allow_partial_trust_chain());
+void_method!(set_allow_partial_trust_chain, |context: &mut Context| {
+    context.set_allow_partial_trust_chain()
+});
 
 /// `setCiphers(list)`.
 fn set_ciphers(
@@ -482,9 +480,7 @@ fn set_session_timeout(
         throw_type_error(scope, "sessionTimeout must be an int32");
         return;
     };
-    match with_state(args.this(), |context| {
-        context.set_session_timeout(seconds)
-    }) {
+    match with_state(args.this(), |context| context.set_session_timeout(seconds)) {
         Some(Ok(())) => {}
         Some(Err(error)) => throw_context_error(scope, &error),
         None => throw_type_error(scope, "Invalid SecureContext receiver"),
@@ -573,9 +569,7 @@ fn get_ticket_keys(
     mut rv: v8::ReturnValue,
 ) {
     let result = with_state(args.this(), |context| {
-        context
-            .ticket_keys()
-            .map(|keys| keys.to_vec())
+        context.ticket_keys().map(|keys| keys.to_vec())
     });
     match result {
         Some(Ok(bytes)) => match buffer_from(scope, &bytes) {
@@ -686,11 +680,7 @@ macro_rules! stub_method {
         ) {
             throw_coded(
                 scope,
-                concat!(
-                    $method,
-                    " is not implemented in this build: ",
-                    $reason
-                ),
+                concat!($method, " is not implemented in this build: ", $reason),
                 "ERR_CRYPTO_UNSUPPORTED_OPERATION",
             );
         }
@@ -995,15 +985,15 @@ fn throw_context_error(scope: &mut v8::PinScope<'_, '_>, error: &ContextError) {
         | ContextError::Install(_) => {
             throw_coded(scope, &error.to_string(), "ERR_CRYPTO_OPERATION_FAILED")
         }
-        ContextError::Pem(_) => throw_coded(scope, &error.to_string(), "ERR_CRYPTO_OPERATION_FAILED"),
+        ContextError::Pem(_) => {
+            throw_coded(scope, &error.to_string(), "ERR_CRYPTO_OPERATION_FAILED")
+        }
         ContextError::DhParamTooSmall => {
             throw_coded(scope, &error.to_string(), "ERR_INVALID_ARG_VALUE")
         }
-        ContextError::NotInitialised => throw_coded(
-            scope,
-            &error.to_string(),
-            "ERR_CRYPTO_INVALID_STATE",
-        ),
+        ContextError::NotInitialised => {
+            throw_coded(scope, &error.to_string(), "ERR_CRYPTO_INVALID_STATE")
+        }
     }
 }
 

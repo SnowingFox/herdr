@@ -373,10 +373,7 @@ fn members_and_stubs_agree() {
     // Every stub is a real method, so a rename cannot silently leave a
     // deferral pointing at nothing.
     for (name, reason) in STUBS {
-        assert!(
-            !reason.is_empty(),
-            "the {name} stub needs a written reason"
-        );
+        assert!(!reason.is_empty(), "the {name} stub needs a written reason");
     }
     for (name, reason) in NAMESPACE_STUBS {
         assert!(
