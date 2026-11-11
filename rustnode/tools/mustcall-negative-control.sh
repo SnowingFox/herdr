@@ -16,9 +16,6 @@
 #   * every case's exit code is asserted, so "the runtime crashed" cannot be
 #     mistaken for "the runtime enforced mustCall".
 #
-# Exit codes: 0 the control behaved as required, 1 the control did not, 2 usage
-# error, 3 the run is void (build or setup failure) with no verdict.
-#
 # Usage:
 #   tools/mustcall-negative-control.sh            # this tree's binary
 #   tools/mustcall-negative-control.sh --quick    # skip the build, use the binary
@@ -32,6 +29,23 @@
 # `docs/compat-status.md`), so the control clones it sparsely on first use, at
 # the commit in `tools/node-pin.toml`. If the clone fails the control exits 3:
 # without Node's own `mustCall` there is nothing to measure.
+#
+# Provenance of the expected exit codes, stated precisely because this project
+# has already been bitten by a claim whose provenance was a different binary
+# than the one under test. The codes were recorded by running this exact case
+# list against a released node v22.23.4, NOT against the pinned 28.0.0 build
+# (which is not installable here). The behaviour of all six cases is governed by
+# `test/common/index.js`, whose file is byte-identical between v22 and the pin
+# (`diff` of the two `test/common/index.js` files is empty), so the codes are
+# expected to be identical -- but that is an argument from the source, not a
+# measurement on 28.0.0. Re-record with `RUSTNODE_MUSTCALL_BIN=<node28>` when a
+# Node 28 binary is available; the case list is the same, so it is one command:
+#
+#   RUSTNODE_MUSTCALL_BIN=/path/to/node28 tools/mustcall-negative-control.sh \
+#     --tests /path/to/node28/test
+#
+# Exit codes: 0 the control behaved as required, 1 the control did not, 2 usage
+# error, 3 the run is void (build or setup failure) with no verdict.
 
 set -uo pipefail
 
@@ -133,21 +147,48 @@ check() {
   return 1
 }
 
-# The whole point: on a runtime without a working exit event every
-# `mustCall`-wrapped callback in the suite is unenforced, so this case exits 0
-# and the headline pass count silently includes files whose assertions never ran.
+# Which cases can ONLY pass when the exit handler runs.
+#
+# This distinction is the difference between a control that measures something
+# and one that merely reads green, so it is spelled out here rather than left
+# to the case list:
+#
+#   never-called, at-least-never-called, must-succeed-never-called
+#       ONLY these fail when the handler does not run. A `mustCall` count is
+#       compared exclusively in a `process.on('exit')` handler, so an
+#       unsatisfied count is invisible unless that handler executes. Nothing
+#       else in the process reports it.
+#
+#   must-not-call-called
+#       Fails from the callback body via `assert.fail`, never reaching an exit
+#       handler. It is kept because it is part of the family and its Node
+#       behaviour is worth pinning, but a green result here is *not* evidence
+#       that exit fires -- it is the one case that would pass on a runtime with
+#       no exit event at all.
+#
+#   called, called-from-a-timer
+#       Must pass. They are the negative control for the control: a runtime
+#       that rejects everything cannot satisfy them, so they stop a blanket
+#       non-zero exit from reading as enforcement. They do not distinguish a
+#       working exit handler from a missing one, which is exactly why the three
+#       cases above lead.
 control() {
   echo "== mustCall enforcement control =="
   echo "binary: $binary"
   echo "tests:  $tests_dir"
   echo
 
-  check never-called 1 "an uncalled mustCall must fail the process"
-  check called 0 "a satisfied mustCall must not fail the process"
-  check called-from-a-timer 0 "a mustCall satisfied from the loop must not fail"
+  # Exit-handler-only. These are the verdict.
+  check never-called 1 "EXIT-HANDLER-ONLY: uncalled mustCall must fail"
+  check at-least-never-called 1 "EXIT-HANDLER-ONLY: mustCallAtLeast minimum"
+  check must-succeed-never-called 1 "EXIT-HANDLER-ONLY: mustSucceed delegates"
+
+  # Must pass, so a runtime that fails everything cannot read as enforcement.
+  check called 0 "satisfied mustCall must not fail"
+  check called-from-a-timer 0 "satisfied from the loop must not fail"
+
+  # Independent of the exit event; pinned, but not part of the verdict above.
   check must-not-call-called 1 "mustNotCall throws from the callback body"
-  check at-least-never-called 1 "mustCallAtLeast with a minimum must fail"
-  check must-succeed-never-called 1 "mustSucceed delegates to mustCall"
 
   echo
   if [ "$failures" -ne 0 ]; then
@@ -190,8 +231,10 @@ if ! locate_tests; then
 fi
 
 if [ "$mode" = "self-test" ]; then
-  self_test
-  exit $?
+  if ! self_test; then
+    exit 1
+  fi
+  exit 0
 fi
 
 if [ -n "${RUSTNODE_MUSTCALL_BIN:-}" ]; then
@@ -216,5 +259,7 @@ if [ ! -x "$binary" ]; then
   exit 3
 fi
 
-control
-exit $?
+if ! control; then
+  exit 1
+fi
+exit 0
