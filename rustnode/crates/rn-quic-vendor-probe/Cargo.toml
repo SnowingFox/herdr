@@ -15,4 +15,7 @@ cc = "1"
 # The same vendored OpenSSL `rn-bind-crypto` already builds, so this probe
 # answers the question against the OpenSSL version the project will actually
 # ship rather than whatever headers happen to be on the image.
-openssl-src = "=300.6.1+3.6.3"
+#
+# `=300.6.1` is the crate version; the `+3.6.3` build metadata it carries is not
+# part of the requirement. `Cargo.lock` pins the exact source.
+openssl-src = "=300.6.1"
