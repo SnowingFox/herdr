@@ -47,6 +47,27 @@ that was failing in an old run but passes now must read as passing without
 deleting history. The newest recorded outcome wins; totals count files, not
 recorded rows.
 
+**Passed, skipped and failed are three different things.** Node's `common.skip()`
+prints `1..0 # Skipped: <reason>` and then calls `process.exit(0)`, so a skipped
+file exits like a passing one; under `test/known_issues/**` it exits 1 instead,
+so a skipped file there exits like a failing one. The exit code therefore cannot
+classify a run, and the runner scans the *whole* stdout stream — not the truncated
+`stdout_head` — for a plan line at the start of a line. A test that merely
+mentions the marker inside a message does not match, because the text must sit in
+the first column.
+
+A skip is reported as its own outcome: it is neither a pass nor a failure, since
+it asserts nothing. `report` prints `passed`, `skipped` and `failed` as separate
+columns and computes the rate as `passed / (passed + failed)`, so skips are
+excluded from either side. `passed + skipped + failed` always equals the total, a
+cluster with nothing judged prints `—` instead of a `0.0%` that would read as
+total failure, and the skipped files are listed so the exclusion is auditable.
+
+Result rows written before `skipped` existed still load. A missing field means
+"not recorded", and the row's recorded stdout is used to recover the answer, so
+historical runs reclassify correctly instead of staying wrong forever. A recorded
+value always wins over the stdout text.
+
 **A run that measured something exits 0 even when nothing passes.** The number
 is the deliverable early on. Gate on `report` or on the result files, not on the
 runner's exit code.
@@ -55,9 +76,12 @@ runner's exit code.
 
 - Compiled fixtures (`addons`, `js-native-api`, `node-api`, `cctest`, `fuzzers`)
   are not JavaScript and are not selected.
-- Status files (`*.status`) and per-suite flags are ignored, so a test Node would
-  skip for this platform is reported as a failure. That is the conservative
-  direction: it never turns an unsupported feature into a pass.
+- Status files (`*.status`) and per-suite flags are ignored. A test Node's own
+  runner would skip by status file is *not* detected as a skip; it runs, and is
+  reported as whatever it does. Only the `1..0 # Skipped:` plan line that a test
+  prints about itself is honoured. Teaching the harness to read `*.status` and
+  the per-suite flag files is a separate decision, because it makes the recorded
+  numbers depend on a second input tree and changes which files are comparable.
 - `--test-reporter` and other flags Node's runner adds conditionally are not
   injected; only the file's own `// Flags:` line is honoured.
 - No retries and no flake detection. A test that is intermittent shows up as

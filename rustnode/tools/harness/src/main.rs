@@ -240,12 +240,11 @@ fn run_command(args: &[String]) -> Result<u8, String> {
     let mut announce = |result: &result::FileResult| {
         done += 1;
         if !quiet {
-            let status = if result.passed {
-                "pass"
-            } else if result.timed_out {
-                "timeout"
-            } else {
-                "fail"
+            let status = match result.outcome() {
+                result::Outcome::Passed => "pass",
+                result::Outcome::Skipped => "skip",
+                result::Outcome::Failed if result.timed_out => "timeout",
+                result::Outcome::Failed => "fail",
             };
             println!(
                 "  [{done}/{}] {status:<7} {:>6}ms {}",
@@ -260,15 +259,27 @@ fn run_command(args: &[String]) -> Result<u8, String> {
     let run_id = runner::run_id();
     let file_name = runner::result_file_name(&run_id, label.as_deref());
     let written = runner::write_results(&results, &file_name, &results_vec)?;
-    let passed_total = results_vec.iter().filter(|r| r.passed).count();
+    let passed_total = results_vec
+        .iter()
+        .filter(|r| r.outcome() == result::Outcome::Passed)
+        .count();
+    let skipped_total = results_vec
+        .iter()
+        .filter(|r| r.outcome() == result::Outcome::Skipped)
+        .count();
+    let failed_total = results_vec.len() - passed_total - skipped_total;
+    let judged = passed_total + failed_total;
     let total = results_vec.len();
 
+    // A skip is neither a pass nor a failure, so the headline rate is passes
+    // over files that actually ran, and the skipped count is printed next to it
+    // rather than folded into either side.
     println!(
-        "{passed_total}/{total} passed ({:.1}%)",
-        if total == 0 {
+        "{passed_total}/{judged} judged passed ({:.1}%); {skipped_total} skipped; {failed_total} failed; {total} total",
+        if judged == 0 {
             0.0
         } else {
-            passed_total as f64 / total as f64 * 100.0
+            passed_total as f64 / judged as f64 * 100.0
         }
     );
     println!("results written to {}", written.display());

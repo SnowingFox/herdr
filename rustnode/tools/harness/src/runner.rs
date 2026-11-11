@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::result::{suite_of, FileResult};
+use crate::result::{suite_of, FileResult, SkipScanner};
 use crate::select::{TestFile, PARALLEL_SAFE_SUITES};
 
 /// Bytes of stderr kept per test, enough to show the first failing assertion.
@@ -259,16 +259,22 @@ fn execute(
         }
     }
 
-    let (stdout_head, stderr_head) = collect_output(pipe_receiver);
+    let (stdout_head, stderr_head, skipped) = collect_output(pipe_receiver);
     let mut stderr_head = String::from_utf8_lossy(&stderr_head).trim_end().to_string();
     if timed_out && stderr_head.is_empty() {
         stderr_head = format!("timed out after {:?}", config.timeout);
     }
 
+    // A killed process never got to state its own verdict, so a skip line it
+    // printed before the timeout does not excuse the hang.
+    let skipped = skipped && !timed_out;
+    let passed = !timed_out && !skipped && exit_code == Some(0);
+
     FileResult {
         file: test.relative.clone(),
         suite: suite_of(&test.relative),
-        passed: !timed_out && exit_code == Some(0),
+        passed,
+        skipped: Some(skipped),
         exit_code,
         duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         timed_out,
@@ -286,19 +292,28 @@ enum Stream {
 }
 
 /// Starts a reader thread that forwards one pipe's first `cap` bytes.
+///
+/// The reader also keeps reading past `cap`: stdout is scanned for the skip plan
+/// line over the whole stream, because `stdout_head` keeps only the first couple
+/// of KiB and a skipped file may print before it skips. Discarding the rest
+/// without looking would make a long-running test's skip invisible.
 fn spawn_drain(
     mut pipe: impl Read + Send + 'static,
     cap: usize,
     stream: Stream,
-    sender: mpsc::Sender<(Stream, Vec<u8>)>,
+    sender: mpsc::Sender<(Stream, Vec<u8>, bool)>,
 ) {
     std::thread::spawn(move || {
         let mut kept = Vec::new();
+        let mut scanner = SkipScanner::new();
         let mut buffer = [0u8; 4096];
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
+                    if matches!(stream, Stream::Stdout) {
+                        scanner.push(&buffer[..read]);
+                    }
                     let room = cap.saturating_sub(kept.len());
                     kept.extend_from_slice(&buffer[..read.min(room)]);
                 }
@@ -306,7 +321,7 @@ fn spawn_drain(
                 Err(_) => break,
             }
         }
-        let _ = sender.send((stream, kept));
+        let _ = sender.send((stream, kept, scanner.found()));
     });
 }
 
@@ -315,21 +330,30 @@ fn spawn_drain(
 /// A killed test may have left a grandchild holding the pipe open. Blocking on
 /// that would turn a 30-second timeout into an unbounded wait, so a pipe that
 /// stays open past the grace period is abandoned with whatever it delivered.
-fn collect_output(receiver: mpsc::Receiver<(Stream, Vec<u8>)>) -> (Vec<u8>, Vec<u8>) {
+///
+/// The third element says whether the stdout stream carried a skip plan line. A
+/// pipe abandoned before its reader finished reports whatever the reader had
+/// scanned by then, which is the honest answer for output that was never
+/// delivered.
+fn collect_output(receiver: mpsc::Receiver<(Stream, Vec<u8>, bool)>) -> (Vec<u8>, Vec<u8>, bool) {
     let deadline = Instant::now() + DRAIN_GRACE;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    let mut skipped = false;
     let mut remaining = 2;
     while remaining > 0 {
         let left = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(left) {
-            Ok((Stream::Stdout, bytes)) => stdout = bytes,
-            Ok((Stream::Stderr, bytes)) => stderr = bytes,
+            Ok((Stream::Stdout, bytes, found)) => {
+                stdout = bytes;
+                skipped = found;
+            }
+            Ok((Stream::Stderr, bytes, _)) => stderr = bytes,
             Err(_) => break,
         }
         remaining -= 1;
     }
-    (stdout, stderr)
+    (stdout, stderr, skipped)
 }
 
 /// Puts the child in its own process group so the whole tree can be killed.
@@ -479,6 +503,99 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(!result.timed_out);
         assert_eq!(result.suite, "parallel");
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+    }
+
+    #[test]
+    fn a_plan_line_on_stdout_is_a_skip_not_a_pass() {
+        let tree = TempTree::new("skip");
+        // What `common.skip()` does: print the plan line, then exit 0.
+        let test = tree.script(
+            "test-skip.sh",
+            "printf '1..0 # Skipped: no IPv6 support\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.exit_code, Some(0), "the runtime really exits 0");
+        assert!(!result.passed, "a skip must not be recorded as a pass");
+        assert_eq!(result.skipped, Some(true));
+        assert_eq!(result.outcome(), crate::result::Outcome::Skipped);
+    }
+
+    #[test]
+    fn a_known_issues_style_skip_exiting_one_is_a_skip_not_a_failure() {
+        let tree = TempTree::new("skip-known-issues");
+        // `common.skip()` exits 1 under `test/known_issues/**`, so the exit code
+        // cannot tell this apart from a real assertion failure.
+        let test = tree.script(
+            "test-known-issues-skip.sh",
+            "printf '1..0 # Skipped: V8 inspector is disabled\\n'; exit 1\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.exit_code, Some(1));
+        assert!(!result.passed);
+        assert_eq!(result.outcome(), crate::result::Outcome::Skipped);
+    }
+
+    #[test]
+    fn the_skip_text_mid_line_is_not_a_skip() {
+        let tree = TempTree::new("skip-midline");
+        // A test that merely mentions the marker in a diagnostic, and passes.
+        let test = tree.script(
+            "test-mention.sh",
+            "printf 'note: 1..0 # Skipped: is what common.skip prints\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+        assert!(
+            result.stdout_head.contains("1..0 # Skipped:"),
+            "the text really is in the output: {}",
+            result.stdout_head
+        );
+
+        // And the same text mid-line must not rescue a genuinely failing file.
+        let failing = tree.script(
+            "test-mention-fail.sh",
+            "printf 'note: 1..0 # Skipped: is what common.skip prints\\n'; exit 1\n",
+        );
+        let failed = execute(&config, &config.working_dir(), "test", &failing);
+        assert_eq!(failed.outcome(), crate::result::Outcome::Failed);
+    }
+
+    #[test]
+    fn a_skip_printed_after_more_than_the_kept_stdout_is_still_a_skip() {
+        let tree = TempTree::new("skip-late");
+        // The marker lands past STDOUT_HEAD_BYTES, so the recorded head cannot
+        // carry it. The scanner sees the whole stream, so the verdict survives.
+        let test = tree.script(
+            "test-skip-late.sh",
+            "i=0; while [ $i -lt 300 ]; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; i=$((i+1)); done; \
+             printf '1..0 # Skipped: late skip\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Skipped);
+        assert!(
+            !result.stdout_head.contains("1..0 # Skipped:"),
+            "the head is supposed to be truncated, not the whole output: {} bytes",
+            result.stdout_head.len()
+        );
+    }
+
+    #[test]
+    fn a_hung_test_that_printed_a_skip_line_is_a_timeout_not_a_skip() {
+        let tree = TempTree::new("skip-then-hang");
+        let test = tree.script(
+            "test-skip-hang.sh",
+            "printf '1..0 # Skipped: then hung\\n'; sleep 30\n",
+        );
+        let mut config = shell_config(&tree);
+        config.timeout = Duration::from_millis(300);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert!(result.timed_out);
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
     }
 
     #[test]
