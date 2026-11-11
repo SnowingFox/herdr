@@ -1143,6 +1143,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-secure-context"
+version = "0.1.0"
+dependencies = [
+ "foreign-types",
+ "openssl",
+ "openssl-sys",
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
 name = "rn-bind-serdes"
 version = "0.1.0"
 dependencies = [
