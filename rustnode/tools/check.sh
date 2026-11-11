@@ -183,6 +183,12 @@ step "the vendored merve is unchanged"
 # change that answer without failing anything else.
 ./tools/verify-merve.sh
 
+step "the vendored nghttp2 is unchanged"
+# HTTP/2's frame state machine, HPACK tables and error strings are `node:http2`'s
+# compatibility surface, so the C library is held to the pinned Node revision
+# rather than to a system libnghttp2 whose version depends on the host.
+./tools/verify-nghttp2.sh
+
 step "the vendored SQLite is unchanged"
 # SQL semantics are `node:sqlite`'s whole compatibility surface, so the
 # amalgamation is held to the pinned Node revision rather than to whatever a

@@ -1,0 +1,25 @@
+[package]
+name = "rn-bind-http2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('http2') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# HTTP/2 runs over a socket, and the state that has to survive a `process.exit()`
+# is libuv's threadpool registration, so the transport half needs the same
+# callback machinery `rn-uv` builds for every other binding.
+rn-uv.workspace = true
+
+[build-dependencies]
+# Compiles the vendored nghttp2. Node links the same tree as a static library; a
+# system libnghttp2 is a different version on every host and absent on Windows,
+# which would make every protocol behaviour host-dependent.
+cc = "1"
+
+[dev-dependencies]
+serde_json.workspace = true

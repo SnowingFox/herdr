@@ -9,6 +9,9 @@ description = "the realm bootstrap shared by the main thread and worker threads"
 
 [dependencies]
 rn-bind-crypto = { path = "../rn-bind-crypto" }
+# `process.versions.nghttp2` comes from the linked library rather than from a
+# pinned string, so the published number names code the binary contains.
+rn-bind-http2 = { path = "../rn-bind-http2" }
 # `process.versions.sqlite` comes from the linked amalgamation, and the test
 # suite derives `hasSQLite` from it.
 rn-bind-sqlite = { path = "../rn-bind-sqlite" }
