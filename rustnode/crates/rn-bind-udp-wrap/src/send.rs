@@ -79,6 +79,12 @@ pub fn dispatch(
     rv: &mut v8::ReturnValue<'_>,
     family: u8,
 ) {
+    // `DoSend` checks the scope directly after the unwrap and before any of its
+    // `CHECK`s, so a denied send reports the denial rather than a status for a
+    // malformed argument list.
+    if crate::methods::deny_net(scope, rv, "", true) {
+        return;
+    }
     let Ok(request) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
         rv.set(v8::Integer::new(scope, EINVAL).into());
         return;

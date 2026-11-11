@@ -37,6 +37,8 @@ use crate::model::{AccessDenied, PermissionModel, PermissionScope, PermissionSha
 
 thread_local! {
     static MODEL: RefCell<Option<PermissionShared>> = const { RefCell::new(None) };
+    /// The IPC channel's descriptor, `-1` when this process has none.
+    static IPC_CHANNEL_FD: RefCell<i32> = const { RefCell::new(-1) };
 }
 
 /// Installs `model` as the process's model and returns the shared handle.
@@ -149,8 +151,62 @@ pub fn deny_wasi() -> Option<AccessDeniedError> {
 }
 
 /// Checks opening a network server or socket.
+///
+/// `resource` is the host (or socket path) as written. The `&str` is only
+/// dereferenced when the model is installed and enforcing, so a caller that has
+/// the text anyway — `tcp_wrap`'s connect, which already parsed it — pays
+/// nothing extra on a run without `--permission`, and nothing allocates.
 pub fn deny_net(resource: &str) -> Option<AccessDeniedError> {
     evaluate(|model| model.check_net(resource))
+}
+
+/// The descriptor of this process's IPC channel, if it has one.
+///
+/// `LibuvStreamWrap::IsProcessStdioOrIPCChannel` exempts the standard streams and
+/// the IPC channel from the `net` check, because adopting them is how a fork or
+/// cluster child talks to its parent and Node has already granted that channel
+/// by handing it over. `-1` means there is no channel, which is what a process
+/// started without `--ipc` sees.
+pub fn ipc_channel_fd() -> i32 {
+    IPC_CHANNEL_FD.with(|slot| *slot.borrow())
+}
+
+/// Records the IPC channel's descriptor for [`ipc_channel_fd`].
+///
+/// The child-process layer sets this once when it creates the channel. Nothing
+/// calls it yet: rustnode's fork has no IPC channel, so the exemption currently
+/// covers only `fd <= 2`.
+pub fn set_ipc_channel_fd(fd: i32) {
+    IPC_CHANNEL_FD.with(|slot| {
+        *slot.borrow_mut() = fd;
+    });
+}
+
+/// Whether adopting `fd` is allowed without the `net` permission.
+///
+/// Port of `LibuvStreamWrap::IsProcessStdioOrIPCChannel`.
+pub fn is_process_stdio_or_ipc_channel(fd: i32) -> bool {
+    fd >= 0 && (fd <= 2 || fd == ipc_channel_fd())
+}
+
+/// Whether the installed model is enforcing `addon` and has not granted it.
+///
+/// This is the half of `Environment::no_native_addons()` that comes from the
+/// permission model rather than from `--addons`: `InitializePermission` clears
+/// `options_->allow_native_addons` when `--permission` was given without
+/// `--allow-addons`, and *not* in audit mode, where the denial has to be
+/// published by the `addon` check instead.
+///
+/// `false` when no model is installed, which keeps a bare binding harness able to
+/// load addons the way Node's default does.
+pub fn enforces_addon_without_grant() -> bool {
+    MODEL.with(|slot| {
+        let slot = slot.borrow();
+        let Some(model) = slot.as_ref() else {
+            return false;
+        };
+        model.is_enabled() && !model.is_audit() && !model.has(PermissionScope::Addon, None)
+    })
 }
 
 /// Checks enabling the inspector.

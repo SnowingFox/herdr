@@ -237,6 +237,9 @@ pub fn sockaddr_for_family(
 pub const EBADF: i32 = uv::uv_errno_t_UV_EBADF;
 /// `UV_EINVAL`, for an argument Node's `CHECK` would have rejected.
 pub const EINVAL: i32 = uv::uv_errno_t_UV_EINVAL;
+/// `UV_EACCES`, the status `udp_wrap`'s permission checks return alongside the
+/// error they throw.
+pub const EACCES: i32 = uv::uv_errno_t_UV_EACCES;
 
 /// `AsyncWrap::kInvalidAsyncId`.
 const INVALID_ASYNC_ID: f64 = -1.0;

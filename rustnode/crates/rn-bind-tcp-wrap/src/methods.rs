@@ -422,6 +422,11 @@ pub fn get_write_queue_size(
 }
 
 /// `TCPWrap::Open`: adopt an existing descriptor.
+///
+/// Adopting a descriptor gives access to whatever it is connected to, so Node
+/// gates it — except for the standard streams and the IPC channel, which a child
+/// process is handed rather than opens. That exemption is why
+/// `process.stdin.pipe(process.stdout)` works under a bare `--permission`.
 pub fn open(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -430,6 +435,11 @@ pub fn open(
     let Some(fd) = args.get(0).integer_value(scope) else {
         return;
     };
+    if !rn_permission::runtime::is_process_stdio_or_ipc_channel(fd as i32)
+        && deny_net(scope, args.this(), &mut rv, "")
+    {
+        return;
+    }
     let status = tcp::with_handle(args.this(), |handle| {
         if !handle.state.is_alive() {
             return EBADF;
@@ -439,6 +449,64 @@ pub fn open(
     })
     .unwrap_or(EBADF);
     rv.set(v8::Integer::new(scope, status).into());
+}
+
+/// The `net` permission check every `TCPWrap` entry point makes.
+///
+/// `src/tcp_wrap.cc` runs it after `ASSIGN_OR_RETURN_UNWRAP` and before it reads
+/// or parses any other argument, so a receiver that is not a handle reports
+/// `UV_EBADF` and a real handle under `--permission` is denied before an
+/// invalid address or a malformed request object can change the answer.
+///
+/// Returns `false` after reporting on the return value, so the caller returns.
+/// `resource` is used only when the model is installed and enforcing, which is
+/// what keeps a run without `--permission` at a thread-local borrow and a
+/// boolean load.
+fn deny_net(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<v8::Object>,
+    rv: &mut v8::ReturnValue<'_>,
+    resource: &str,
+) -> bool {
+    if tcp::raw_handle(object).is_none() {
+        // `ASSIGN_OR_RETURN_UNWRAP` sets the return value and returns.
+        rv.set(v8::Integer::new(scope, EBADF).into());
+        return true;
+    }
+    match rn_permission::runtime::deny_net(resource) {
+        Some(denied) => {
+            denied.throw(scope);
+            true
+        }
+        None => false,
+    }
+}
+
+/// The same check for the members that report a denial as their return value
+/// rather than throwing it.
+///
+/// `ERR_ACCESS_DENIED_IF_INSUFFICIENT_PERMISSIONS` hands the error object back
+/// to `lib/net.js`, which turns it into an `ExceptionWithHostPort` whose
+/// `code` and `message` come from the error because
+/// `internal/errors.js::isPermissionModelError` recognises it. Throwing here
+/// would instead surface as a synchronous throw out of `socket.connect()`.
+fn deny_net_as_value(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<v8::Object>,
+    rv: &mut v8::ReturnValue<'_>,
+    resource: &str,
+) -> bool {
+    if tcp::raw_handle(object).is_none() {
+        rv.set(v8::Integer::new(scope, EBADF).into());
+        return true;
+    }
+    match rn_permission::runtime::deny_net(resource) {
+        Some(denied) => {
+            rv.set(denied.to_value(scope));
+            true
+        }
+        None => false,
+    }
 }
 
 /// `TCPWrap::Bind`: `bind(address, port, flags?)`.
@@ -465,6 +533,11 @@ fn bind_family(
     rv: &mut v8::ReturnValue<'_>,
     family: u8,
 ) {
+    // `TCPWrap::Bind` checks the socket before it reads the address, because the
+    // address is only parsed once the handle is known to be usable.
+    if deny_net(scope, args.this(), rv, "") {
+        return;
+    }
     let Some(address) = tcp::arg_string(scope, args, 0) else {
         rv.set(v8::Integer::new(scope, EINVAL).into());
         return;
@@ -511,6 +584,14 @@ pub fn listen(
 ) {
     let object = args.this();
     let backlog = tcp::arg_i32(scope, &args, 0);
+    // `src/tcp_wrap.cc` checks after `Int32Value(backlog)` and before
+    // `uv_listen`. The check has to come first for a second reason too: a
+    // denied listen must not register the handle with the loop as a listener or
+    // park `owner_object`, which would leave a handle that looks half-bound to
+    // the finalizer and to `onconnection`.
+    if deny_net(scope, object, &mut rv, "") {
+        return;
+    }
     let status = tcp::with_handle(object, |handle| {
         if !handle.state.is_alive() {
             return EINVAL;
@@ -652,6 +733,14 @@ fn connect_family(
         return;
     };
     let port = tcp::arg_i32(scope, args, 2) as u16;
+
+    // `ERR_ACCESS_DENIED_IF_INSUFFICIENT_PERMISSIONS` reports the denial as the
+    // return value rather than throwing, and names the address as written —
+    // `lib/net.js` has already resolved the name and passes the literal, so the
+    // resource is the same text a second call would see.
+    if deny_net_as_value(scope, object, rv, &address) {
+        return;
+    }
 
     let status = tcp::with_handle(object, |handle| {
         if !handle.state.is_alive() {

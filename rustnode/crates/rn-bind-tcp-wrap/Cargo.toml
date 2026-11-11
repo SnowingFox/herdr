@@ -15,6 +15,9 @@ rn-uv.workspace = true
 # registered hooks, and `getAsyncId` answers from the id space that namespace's
 # counter advances. A private counter here would hand out ids a hook never saw.
 rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
+# `bind`/`listen`/`connect`/`open` check the `net` scope, which the process's one
+# model answers through `rn_permission::runtime`.
+rn-permission = { path = "../rn-permission" }
 tracing.workspace = true
 rn-v8-sys.workspace = true
 

@@ -1672,13 +1672,52 @@ fn object_define_property<'s>(
     v8::Local::<v8::Function>::try_from(function).ok()
 }
 
-/// Placeholder for a loader entry that is not available yet.
+/// `getLinkedBinding`, the loader behind `process._linkedBinding()`.
+///
+/// `src/node_binding.cc`'s `GetLinkedBinding` checks the `addon` scope against the
+/// *module name* before it looks the binding up, so the denial names the binding
+/// rather than reporting the missing module. That order is what
+/// `test-permission-linked-binding.js` pins: it asks for `'missing'` and expects
+/// `ERR_ACCESS_DENIED` with `resource: 'missing'`.
+///
+/// Only the check is here: rustnode has no linked-binding registry, so a caller
+/// that passes the check still gets the `ERR_INVALID_MODULE` a build without that
+/// binding gives. `Environment::no_addon_permission_for_linked_bindings` is a
+/// worker-only exemption; a worker copies the model onto its own thread, and this
+/// thread-local check would then run there too, so the flag is not modelled.
 fn get_linked_binding(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
 ) {
-    throw(scope, "getLinkedBinding is not implemented yet");
+    let Ok(name) = v8::Local::<v8::String>::try_from(args.get(0)) else {
+        throw(scope, "The \"module\" argument must be of type string.");
+        return;
+    };
+    let name = name.to_rust_string_lossy(scope);
+    if let Some(denied) = rn_permission::runtime::deny_addon(&name) {
+        denied.throw(scope);
+        return;
+    }
+    throw_invalid_module(scope, &name);
+}
+
+/// Throws the `ERR_INVALID_MODULE` a missing linked binding reports.
+fn throw_invalid_module(scope: &mut v8::PinScope<'_, '_>, name: &str) {
+    let message = format!("No such binding was linked: {name}");
+    let Some(text) = v8::String::new(scope, &message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    if let (Ok(object), Some(code)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, "ERR_INVALID_MODULE"),
+    ) {
+        if let Some(key) = v8::String::new(scope, "code") {
+            let _ = object.set(scope, key.into(), code.into());
+        }
+    }
+    scope.throw_exception(exception);
 }
 
 fn function_of<'s>(

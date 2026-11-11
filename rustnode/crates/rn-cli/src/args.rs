@@ -455,6 +455,18 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
     // both. The flags only — never the script path or its arguments, which
     // Node's parser stops at too.
     options.parsed = rn_bind_options::Store::parse(&options.exec_argv);
+    // `Environment::InitializePermission` clears `allow_native_addons` when
+    // `--permission` (not `--permission-audit`) was given without
+    // `--allow-addons`, which is what makes `process.dlopen` throw
+    // `ERR_DLOPEN_DISABLED` before the permission check runs. The flag is
+    // published as `--addons`, so the derived value goes into the same store
+    // `getOptionValue('--addons')` reads. Audit mode deliberately keeps addons
+    // enabled so the `addon` check can publish the denial instead.
+    if config_wants_addons_disabled(&options.exec_argv) {
+        options
+            .parsed
+            .force("--addons", rn_bind_options::parsed::ParsedValue::Bool(false));
+    }
     // The permission model is the one thing this parser builds rather than
     // describes: `PermissionConfig::from_args` already reads these flags in both
     // spellings and owns the 68 tests that pin its grammar, so routing through
@@ -485,6 +497,31 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
         config,
     ));
     options
+}
+
+/// Whether `--permission` was given without `--allow-addons` and without audit
+/// mode, which is the case `Environment::InitializePermission` turns native
+/// addons off for.
+///
+/// `--permission-audit` is the exception: it leaves `allow_native_addons` alone so
+/// the `addon` scope check, not a disabled loader, produces the denial — and that
+/// denial is what gets published to `node:permission-model:addon`.
+fn config_wants_addons_disabled(argv: &[String]) -> bool {
+    let mut enforcing = false;
+    let mut audit = false;
+    let mut allow_addons = false;
+    for argument in argv {
+        match argument.split_once('=').map_or(argument.as_str(), |(name, _)| name) {
+            "--permission" => enforcing = true,
+            "--permission-audit" => {
+                enforcing = true;
+                audit = true;
+            }
+            "--allow-addons" => allow_addons = true,
+            _ => {}
+        }
+    }
+    enforcing && !audit && !allow_addons
 }
 
 /// The working directory the permission model resolves relative grants against.
