@@ -150,113 +150,187 @@ pub unsafe fn run(cell: *mut RefCell<WrapState>) -> CycleOutcome {
     // Nothing between the increment and the decrement calls into V8, so there is
     // no early return to guard against.
     state.library_call_depth = state.library_call_depth.saturating_add(1);
+    if let Some(handles) = state.callback.as_ref() {
+        handles.depth.set(state.library_call_depth);
+    }
     // SAFETY: `ssl` is the live SSL of this state, checked above, and `state` is
     // the borrow this call owns.
     unsafe {
-        clear_in(&mut state, ssl);
         clear_out(&mut state, ssl);
+        clear_in(&mut state, ssl);
         enc_out(&mut state, ssl);
     }
     state.library_call_depth = state.library_call_depth.saturating_sub(1);
+    // Read what the callback recorded, then write it into the state. The two
+    // steps are separate because `callback` is a field of `state`: reading and
+    // writing it in one borrow would need a mutable borrow of the whole.
+    let recorded = state.callback.as_ref().map(|handles| {
+        handles.depth.set(state.library_call_depth);
+        (
+            handles.established.get(),
+            handles.pending_done.get() || handles.pending_start.get(),
+            handles.clone_handles(),
+        )
+    });
+    let mut deliver = None;
+    if let Some((established, has_event, handles)) = recorded {
+        if established {
+            state.flags.established = true;
+        }
+        if has_event {
+            deliver = state
+                .object
+                .as_ref()
+                .map(|object| (object.clone(), handles));
+        }
+    }
+    drop(state);
+    // The events the info callback recorded are delivered now that no borrow is
+    // held and no SSL stack frame is below this call (R2). This is where
+    // `secureConnect` is reachable from the user's perspective.
+    if let Some((object, handles)) = deliver {
+        crate::callback::deliver_events(Some(&object), &handles);
+    }
     CycleOutcome::Cycled
 }
 
-/// `TLSWrap::ClearIn`: `SSL_read` until it wants more ciphertext.
+/// `TLSWrap::ClearOut` (`crypto_tls.cc:840`): `SSL_read`, cleartext **out**.
 ///
-/// Copies whatever `SSL_read` produces into `pending_output`, which `EncOut` then
-/// flushes. Node appends to a `StreamBase` read buffer and emits; the queue here
-/// is the same thing with an explicit owner.
+/// The name is Node's and it means "move cleartext *out* of the SSL", which is a
+/// read. Reading it as "clear the output" is exactly the mistake this doc exists
+/// to prevent: `ClearIn` is the `SSL_write` half, and an earlier version of this
+/// file had the two bodies transposed.
 ///
-/// Stops on anything that is not progress. `SSL_MODE_AUTO_RETRY` is what makes a
-/// non-application record (a session ticket, a handshake message) retry inside
-/// `SSL_read` instead of returning `WANT_READ` with data still buffered — that is
-/// why `Ssl::new` sets it.
+/// `SSL_read` is what advances a handshake waiting on the peer, which is why
+/// `start()`'s comment at `crypto_tls.cc:660` says "seems odd to read when we
+/// want to send". The cleartext goes to `pending_output`, and `EncOut` flushes
+/// the ciphertext a retry produces.
+///
+/// Batching: Node decrypts up to `kClearOutChunkSize` (64 KiB) of consecutive
+/// application-data records before emitting, which avoids one read event per
+/// record. The same accumulation is here, and the loop stops at anything that is
+/// not a plain application record so a callback a record type would trigger runs
+/// after the preceding data rather than in the middle of it.
 ///
 /// # Safety
 ///
 /// `ssl` must be the live `SSL` of the wrap that owns `state`, and `state` must be
 /// the borrow the caller holds for this call.
-pub unsafe fn clear_in(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
-    // `kClearInBufferSize`: 16 KiB, the largest TLS record's plaintext payload.
-    const BUFFER: usize = 16 * 1024;
+pub unsafe fn clear_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
+    /// `kClearOutChunkSize` (`crypto_tls.cc:838`).
+    const CHUNK: usize = 64 * 1024;
+    /// `SSL3_RT_HEADER_LENGTH`: 5 bytes of content type, version and length.
+    const TLS_RECORD_HEADER: usize = 5;
+    /// `SSL3_RT_APPLICATION_DATA`.
+    const TLS_RECORD_APPLICATION_DATA: u8 = 23;
+
     if state.flags.eof {
         return 0;
     }
-    let mut buffer = vec![0u8; BUFFER];
-    let mut total = 0usize;
+    let mut buffer = vec![0u8; CHUNK];
+    let mut length = 0usize;
     loop {
-        // SAFETY: `ssl` is live and `buffer` is `BUFFER` bytes.
+        // SAFETY: `ssl` is live and `buffer[length..]` is `CHUNK - length` bytes.
         let read = unsafe {
             ffi::SSL_read(
                 ssl,
-                buffer.as_mut_ptr().cast(),
-                BUFFER as std::os::raw::c_int,
+                buffer.as_mut_ptr().add(length).cast(),
+                (CHUNK - length) as std::os::raw::c_int,
             )
         };
         if read <= 0 {
+            // `SSL_get_error` must be read before anything else touches the
+            // error queue or the SSL, which is `crypto_tls.cc:921`'s note.
             // SAFETY: `read` is this call's own return value.
             let outcome = unsafe { IoOutcome::of(ssl, read, 0) };
             match outcome {
-                // An EOF or a close-notify ends the stream; the peer has said
-                // there is nothing more.
-                IoOutcome::ZeroReturn | IoOutcome::SyscallEof => {
+                IoOutcome::ZeroReturn => {
                     state.flags.eof = true;
                 }
-                // Nothing more to read right now. The handshake may still be in
-                // progress, which is increment 3's business.
-                IoOutcome::WantRead => break,
-                // The library wants its output drained first. `EncOut` runs after
-                // this phase, so the next cycle retries.
-                IoOutcome::WantWrite => break,
-                IoOutcome::Wrote(_) | IoOutcome::Failed(_) => {
-                    // A failure is recorded rather than thrown: `Cycle` runs from
-                    // a libuv completion where there is no JS frame to throw
-                    // into, and `lib/net.js` expects an `'error'` event instead.
-                    if let IoOutcome::Failed(reason) = outcome {
-                        state.error = Some(reason);
-                    }
-                    break;
+                IoOutcome::SyscallEof => {
+                    // A peer that closed without a close-notify. Node emits an
+                    // EOF read rather than an error, so `'end'` fires.
+                    state.flags.eof = true;
+                }
+                IoOutcome::WantRead | IoOutcome::WantWrite => {}
+                IoOutcome::Wrote(_) => {}
+                IoOutcome::Failed(reason) => {
+                    // `crypto_tls.cc:938`: the alert is in `enc_out_` and has to
+                    // reach the socket before the wrap is torn down, or the peer
+                    // sees a truncated stream instead of the alert.
+                    state.error = Some(reason);
                 }
             }
-            // A successful zero-length read cannot happen (`SSL_read > 0` is the
-            // only success), so the loop only continues after progress.
             break;
         }
         let count = read as usize;
-        buffer.resize(count, 0);
-        state.pending_output.extend_from_slice(&buffer);
-        buffer.resize(BUFFER, 0);
-        total += count;
+        length += count;
+
+        // Stop accumulating if the next buffered record is not application data,
+        // or if it is too short to be one — `crypto_tls.cc:903`. Without this, a
+        // renegotiation or a session ticket would be processed before the data
+        // that preceded it was emitted.
+        if length >= CHUNK {
+            break;
+        }
+        let Some(enc_in) = state.enc_in() else {
+            break;
+        };
+        let pending = enc_in.pending();
+        if pending < TLS_RECORD_HEADER {
+            break;
+        }
+        let header = enc_in.peek(TLS_RECORD_HEADER);
+        match header {
+            Some(bytes)
+                if bytes.len() == TLS_RECORD_HEADER && bytes[0] == TLS_RECORD_APPLICATION_DATA => {}
+            _ => break,
+        }
     }
-    total
+    if length > 0 {
+        buffer.truncate(length);
+        // Cleartext goes **up**, not out: this is the data `lib/net.js` emits as
+        // `'data'`. `pending_output` is the other direction — ciphertext on its way
+        // to the socket — and putting cleartext there would send plaintext over
+        // the wire inside the TLS record framing.
+        state.pending_cleartext_output.extend_from_slice(&buffer);
+    }
+    length
 }
 
-/// `TLSWrap::ClearOut`: `SSL_write` the cleartext the caller queued.
+/// `TLSWrap::ClearIn` (`crypto_tls.cc:1014`): `SSL_write`, cleartext **in**.
 ///
-/// When nothing is queued there is still work: `crypto_tls.cc:1354` notes that an
-/// empty `SSL_write` is not wanted, so the phase calls `SSL_read`-adjacent
-/// bookkeeping instead. Here the only bookkeeping that matters is the pending
-/// cleartext a previous `WANT_WRITE` parked, which is why it is retried first.
+/// Retries the cleartext a previous `SSL_write` could not accept. Node keeps the
+/// bytes in `pending_cleartext_input_` and this is the only place they are
+/// re-offered, which is why dropping them on `WANT_WRITE` truncates a large
+/// payload while a small one echoes fine.
+///
+/// On a hard failure the queued write is completed with `UV_EPROTO` and Node's
+/// `GetBIOError` text, which is `crypto_tls.cc:1046`.
 ///
 /// # Safety
 ///
-/// As [`clear_in`].
-pub unsafe fn clear_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
+/// As [`clear_out`].
+pub unsafe fn clear_in(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
     if state.pending_cleartext.is_empty() {
         return 0;
     }
     let data = std::mem::take(&mut state.pending_cleartext);
+    // `NodeBIO::set_allocate_tls_hint(bs->ByteLength())`, which sizes the output
+    // buffer for one record's ciphertext.
+    if let Some(enc_out) = state.enc_out() {
+        enc_out.throughput_hint(data.len());
+    }
     // SAFETY: `ssl` is live and `data` is valid for `data.len()` bytes.
     let written =
         unsafe { ffi::SSL_write(ssl, data.as_ptr().cast(), data.len() as std::os::raw::c_int) };
-    // SAFETY: `written` is this call's return value.
+    // SAFETY: `written` is this call's own return value.
     let outcome = unsafe { IoOutcome::of(ssl, written, written.max(0) as usize) };
     match outcome {
+        // All written.
         IoOutcome::Wrote(count) => count,
-        // `WANT_WRITE` or `WANT_READ`: put the bytes back so the next cycle
-        // retries them. This is the "saving data for later write" path at
-        // `crypto_tls.cc:1314`, and dropping them here is what would truncate a
-        // write under backpressure.
+        // `WANT_WRITE` or `WANT_READ`: push the bytes back so the next cycle
+        // retries them. `crypto_tls.cc:1056`.
         IoOutcome::WantWrite | IoOutcome::WantRead => {
             state.pending_cleartext = data;
             0
@@ -266,7 +340,11 @@ pub unsafe fn clear_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
             0
         }
         IoOutcome::Failed(reason) => {
+            // `crypto_tls.cc:1046`: the queued write is completed with the error
+            // rather than left waiting, and `write_callback_scheduled` is raised
+            // so the completion is actually invoked.
             state.error = Some(reason);
+            state.flags.write_callback_scheduled = true;
             0
         }
     }

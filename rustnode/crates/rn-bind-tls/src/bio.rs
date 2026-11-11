@@ -544,6 +544,21 @@ impl EncIn {
         0
     }
 
+    /// The next `count` bytes without consuming them, `NodeBIO::Peek`.
+    ///
+    /// Returns `None` when fewer than `count` bytes are buffered, which
+    /// `ClearOut`'s record-batching check treats as "stop accumulating and emit":
+    /// a partial header cannot be classified, so the batch ends at the boundary
+    /// Node's own `pending >= SSL3_RT_HEADER_LENGTH` test creates.
+    pub fn peek(&self, count: usize) -> Option<Vec<u8>> {
+        let buffer = unsafe { buffer_of(self.0) }?;
+        let buffer = buffer.try_borrow().ok()?;
+        if buffer.data.len() < count {
+            return None;
+        }
+        Some(buffer.data.iter().take(count).copied().collect())
+    }
+
     /// Discards everything buffered. `NodeBIO::Reset`.
     pub fn reset(&self) {
         if let Some(buffer) = unsafe { buffer_of(self.0) } {

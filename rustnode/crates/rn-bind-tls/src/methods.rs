@@ -90,25 +90,6 @@ macro_rules! pending_method {
     };
 }
 
-// Increment 3: the handshake state machine and the SSL_get_error retry loop.
-pending_method!(
-    pending_start,
-    "start",
-    3,
-    "it sends the ClientHello, which needs SSL_do_handshake and the retry loop"
-);
-pending_method!(
-    pending_set_verify_mode,
-    "setVerifyMode",
-    3,
-    "it calls SSL_set_verify and is read by the handshake state machine"
-);
-pending_method!(
-    pending_get_cipher,
-    "getCipher",
-    3,
-    "it reads SSL_get_current_cipher, which needs a completed handshake"
-);
 pending_method!(
     pending_renegotiate,
     "renegotiate",
@@ -209,12 +190,6 @@ pending_method!(
     "it needs a completed handshake to export from"
 );
 pending_method!(
-    pending_get_alpn_negotiated_protocol,
-    "getALPNNegotiatedProtocol",
-    4,
-    "it needs the ALPN callback to have negotiated a protocol"
-);
-pending_method!(
     pending_get_certificate,
     "getCertificate",
     4,
@@ -225,12 +200,6 @@ pending_method!(
     "getX509Certificate",
     4,
     "it needs a handshake that selected a certificate"
-);
-pending_method!(
-    pending_get_ephemeral_key_info,
-    "getEphemeralKeyInfo",
-    4,
-    "it reads the peer's ephemeral key, which needs a completed handshake"
 );
 pending_method!(
     pending_get_finished,
@@ -320,9 +289,9 @@ pub fn install_into<'s>(
         "receive" => method!(receive),
 
         // Increment 3: the handshake state machine and the SSL_get_error retry loop.
-        "start" => method!(pending_start),
-        "setVerifyMode" => method!(pending_set_verify_mode),
-        "getCipher" => method!(pending_get_cipher),
+        "start" => method!(start),
+        "setVerifyMode" => method!(set_verify_mode),
+        "getCipher" => method!(get_cipher),
         "renegotiate" => method!(pending_renegotiate),
 
         // Increment 4: the SSL callbacks, session resumption, and the queries that
@@ -342,10 +311,10 @@ pub fn install_into<'s>(
         "setServername" => method!(pending_set_servername),
         "setSession" => method!(pending_set_session),
         "exportKeyingMaterial" => method!(pending_export_keying_material),
-        "getALPNNegotiatedProtocol" => method!(pending_get_alpn_negotiated_protocol),
+        "getALPNNegotiatedProtocol" => method!(get_alpn_negotiated_protocol),
         "getCertificate" => method!(pending_get_certificate),
         "getX509Certificate" => method!(pending_get_x509_certificate),
-        "getEphemeralKeyInfo" => method!(pending_get_ephemeral_key_info),
+        "getEphemeralKeyInfo" => method!(get_ephemeral_key_info),
         "getFinished" => method!(pending_get_finished),
         "getPeerCertificate" => method!(pending_get_peer_certificate),
         "getPeerX509Certificate" => method!(pending_get_peer_x509_certificate),
@@ -421,6 +390,389 @@ fn receive<'s>(
     let _ = outcome;
     // Whatever `ClearIn`/`EncOut` produced now goes to the socket. The borrow is
     // taken and released before `flush`, which is R2.
+    let stream = with_state(object, |state| state.underlying).flatten();
+    if let Some(stream) = stream {
+        // SAFETY: `stream` is the wrap's own `underlying`, live while it holds it.
+        unsafe { crate::stream::flush(scope, object, stream, None) };
+    }
+}
+
+/// `TLSWrap::GetCipher` (`crypto_tls.cc:2060`), via `GetCipherInfo`.
+///
+/// `{name, standardName, version}`, from `SSL_get_current_cipher` — `crypto_common.cc:183`.
+/// `undefined` when no cipher is current (before the handshake), which is what
+/// `GetCipherInfo`'s `return MaybeLocal<Object>()` becomes.
+///
+/// This is read by `tlsSocket.getCipher()`, which `test-tls-*` calls on every
+/// established socket, and by `lib/internal/tls/wrap.js` when it builds the
+/// `'session'` object — so it is on the client's completion path, not an optional
+/// query.
+fn get_cipher<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let info = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return None;
+        }
+        // SAFETY: `ssl` is live, checked above. The cipher is owned by the SSL.
+        let cipher = unsafe { openssl_sys::SSL_get_current_cipher(ssl) };
+        if cipher.is_null() {
+            return None;
+        }
+        // All three names come from `SSL_CIPHER_*` accessors over the same
+        // struct; each is a static string owned by OpenSSL.
+        // SAFETY: `cipher` is live for the SSL's lifetime.
+        let name = unsafe { openssl_sys::SSL_CIPHER_get_name(cipher) };
+        // `SSL_CIPHER_standard_name` is OpenSSL's IANA spelling; `openssl-sys`
+        // does not declare it, so the standard name falls back to the OpenSSL
+        // name, which is what it is for every TLS 1.3 suite anyway.
+        // SAFETY: as above.
+        let version = unsafe { openssl_sys::SSL_CIPHER_get_version(cipher) };
+        let read = |pointer: *const std::os::raw::c_char| -> Option<String> {
+            if pointer.is_null() {
+                return None;
+            }
+            // SAFETY: OpenSSL returns NUL-terminated static strings for both.
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(pointer) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        Some((read(name), read(version)))
+    });
+
+    let Some(Some((name, version))) = info else {
+        // `GetCipherInfo` returns an empty `MaybeLocal<Object>`, which the
+        // binding turns into `undefined`.
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let object = v8::Object::new(scope);
+    let standard = name.clone();
+    for (field, value) in [
+        ("name", name),
+        ("standardName", standard),
+        ("version", version),
+    ] {
+        let Some(text) = value.and_then(|text| v8::String::new(scope, &text)) else {
+            continue;
+        };
+        if let Ok(field_key) = key(scope, field) {
+            let _ = object.set(scope, field_key.into(), text.into());
+        }
+    }
+    rv.set(object.into());
+}
+
+/// `TLSWrap::GetEphemeralKeyInfo` (`crypto_tls.cc:2264`).
+///
+/// `null` for a server, which is Node's first branch: a server has no ephemeral
+/// key of the *peer* to report. For a client it reads `SSL_get_peer_tmp_key`,
+/// which the handshake must have completed to have.
+///
+/// Both halves are needed before a client handshake can finish:
+/// `lib/internal/tls/wrap.js`'s `_finishInit` path reaches this through
+/// `getEphemeralKeyInfo` when building the `'session'` object, so a throw here
+/// stops `secureConnect` after the handshake has already succeeded.
+///
+/// The peer key's type is reported by name (`'ECDH'`/`'DH'`) plus its curve or
+/// bit size, which is what `tls.TLSSocket.getEphemeralKeyInfo` documents. OpenSSL
+/// exposes the parameters through `EVP_PKEY_get_base_id` and, for an EC key,
+/// `EVP_PKEY_get_group_name` in 3.x.
+fn get_ephemeral_key_info<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let is_server =
+        with_state(args.this(), |state| state.kind == crate::ssl::Kind::Server).unwrap_or(false);
+    if is_server {
+        // `crypto_tls.cc:2272`.
+        rv.set(v8::null(scope).into());
+        return;
+    }
+    let info = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return None;
+        }
+        // SAFETY: `ssl` is live, checked above, and `key` is a live local
+        // out-parameter. The key is owned by the SSL.
+        let mut key: *mut openssl_sys::EVP_PKEY = std::ptr::null_mut();
+        let ok = unsafe { openssl_sys::SSL_get_peer_tmp_key(ssl, &mut key) };
+        if ok == 0 || key.is_null() {
+            return None;
+        }
+        // `crypto_common.cc:223` branches on the key's algorithm, and the `type`
+        // it reports is a *family* name rather than the OpenSSL id: `'DH'` for
+        // Diffie-Hellman, `'ECDH'` for every elliptic-curve agreement including
+        // X25519 and X448, with the curve in `name`.
+        // SAFETY: `key` is live.
+        let base_id = unsafe { openssl_sys::EVP_PKEY_id(key) };
+        // SAFETY: `key` is live.
+        let size = unsafe { openssl_sys::EVP_PKEY_bits(key) };
+        match base_id {
+            openssl_sys::EVP_PKEY_DH => Some((DH_TYPE, None::<String>, size)),
+            openssl_sys::EVP_PKEY_X25519 => Some((ECDH_TYPE, Some("X25519".to_string()), size)),
+            openssl_sys::EVP_PKEY_X448 => Some((ECDH_TYPE, Some("X448".to_string()), size)),
+            openssl_sys::EVP_PKEY_EC => {
+                // `ncrypto::Ec::GetCurveId` then `OBJ_nid2sn`, which is the short
+                // name (`'prime256v1'`, `'secp384r1'`). The provider parameter
+                // `OSSL_PKEY_PARAM_GROUP_NAME` holds the same string on 3.x.
+                let mut buffer = [0 as std::os::raw::c_char; 128];
+                let mut out_len: usize = 0;
+                // SAFETY: `key` is live, `buffer` has 128 bytes, and `out_len`
+                // is a live local.
+                let read = unsafe {
+                    openssl_sys::EVP_PKEY_get_utf8_string_param(
+                        key,
+                        OSSL_PKEY_PARAM_GROUP_NAME.as_ptr().cast(),
+                        buffer.as_mut_ptr(),
+                        buffer.len(),
+                        &mut out_len,
+                    )
+                };
+                if read != 1 || out_len == 0 {
+                    return None;
+                }
+                // SAFETY: OpenSSL wrote `out_len` bytes into `buffer`.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), out_len) };
+                Some((
+                    ECDH_TYPE,
+                    Some(String::from_utf8_lossy(bytes).into_owned()),
+                    size,
+                ))
+            }
+            _ => None,
+        }
+    });
+
+    // `crypto_common.cc:249`: `GetEphemeralKey` **always returns an object** —
+    // `{}` when nothing was found, never `null`. Returning `null` breaks
+    // `lib/internal/tls/wrap.js`, which reads `.type` off the result, and a real
+    // TLS 1.3 connection genuinely returns `{}` because the peer's key is not
+    // exposed as a temporary key under 1.3.
+    let Some(Some((name, curve, size))) = info else {
+        rv.set(v8::Object::new(scope).into());
+        return;
+    };
+    let object = v8::Object::new(scope);
+    if let Ok(type_key) = key(scope, "type") {
+        if let Some(type_value) = v8::String::new(scope, name) {
+            let _ = object.set(scope, type_key.into(), type_value.into());
+        }
+    }
+    if let Ok(name_key) = key(scope, "name") {
+        // `crypto_common.cc:218`: `name` is `undefined` for a DH key, because
+        // there is no curve to report.
+        let value: v8::Local<v8::Value> = match curve.as_deref() {
+            Some(text) => match v8::String::new(scope, text) {
+                Some(text) => text.into(),
+                None => v8::undefined(scope).into(),
+            },
+            None => v8::undefined(scope).into(),
+        };
+        let _ = object.set(scope, name_key.into(), value);
+    }
+    if let Ok(size_key) = key(scope, "size") {
+        let _ = object.set(scope, size_key.into(), v8::Integer::new(scope, size).into());
+    }
+    rv.set(object.into());
+}
+
+/// `crypto_common.cc:226`'s `env->dh_string()`.
+const DH_TYPE: &str = "DH";
+/// `crypto_common.cc:240`'s `env->ecdh_string()`.
+const ECDH_TYPE: &str = "ECDH";
+
+/// `OSSL_PKEY_PARAM_GROUP_NAME` from `core_names.h`, NUL-terminated.
+///
+/// `openssl-sys` does not export the provider parameter names, and the string is
+/// part of OpenSSL's public parameter interface rather than an internal.
+const OSSL_PKEY_PARAM_GROUP_NAME: &[u8] = b"group\0";
+
+/// `TLSWrap::GetALPNNegotiatedProto`.
+///
+/// `SSL_get0_alpn_selected`, returning `false` when none was negotiated — Node
+/// returns `false` rather than `null` here, and `wrap.js:1208` assigns it
+/// straight to `this.alpnProtocol`, so the distinction is observable.
+///
+/// This is on the **critical path of every client handshake**, not an optional
+/// query: `TLSSocket.prototype._finishInit` reads it before it emits `'secure'`,
+/// so a throw here means `secureConnect` never fires even though the handshake
+/// completed. It is the reason a completed handshake looked like a hang.
+fn get_alpn_negotiated_protocol<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let protocol = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return None;
+        }
+        let mut data: *const u8 = std::ptr::null();
+        let mut length: std::os::raw::c_uint = 0;
+        // SAFETY: `ssl` is live, and both out-parameters are live locals.
+        unsafe {
+            openssl_sys::SSL_get0_alpn_selected(ssl, &mut data, &mut length);
+        }
+        if data.is_null() || length == 0 {
+            return None;
+        }
+        // SAFETY: OpenSSL points at `length` bytes owned by the SSL.
+        let bytes = unsafe { std::slice::from_raw_parts(data, length as usize) };
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    });
+    match protocol.flatten() {
+        Some(text) => match v8::String::new(scope, &text) {
+            Some(value) => rv.set(value.into()),
+            None => rv.set(v8::Boolean::new(scope, false).into()),
+        },
+        // Node's `GetALPNNegotiatedProto` sets `false`, not `null`.
+        None => rv.set(v8::Boolean::new(scope, false).into()),
+    }
+}
+
+/// `TLSWrap::SetVerifyMode` (`crypto_tls.cc:1381`).
+///
+/// `lib/internal/tls/wrap.js:967` calls this from `_init` whenever a cert is
+/// requested or the peer is to be rejected, which is *most* sockets — so it is
+/// the first method a `new tls.TLSSocket()` reaches, and the one this crate used
+/// to throw from.
+///
+/// The mode is asymmetric in Node and the asymmetry matters:
+///
+/// * a **server** asks for a peer certificate via `SSL_VERIFY_PEER`, and adds
+///   `FAIL_IF_NO_PEER_CERT` only when it must reject. Without the request flag
+///   there is nothing to reject, so the mode is `VERIFY_NONE`;
+/// * a **client** always uses `VERIFY_NONE` and checks the certificate *after*
+///   the handshake, because a handshake-time failure for an expired certificate
+///   would report `ERR_SSL_*` instead of the `ERR_TLS_CERT_*` code
+///   `lib/_tls_wrap.js` produces.
+///
+/// The verify callback is `None` rather than a native `VerifyCallback`: Node
+/// installs one to stop OpenSSL from aborting, and this crate's post-handshake
+/// check is what decides, so there is nothing for it to do. A `None` here means
+/// OpenSSL accepts the chain and `verifyError()` reports the result — the same
+/// observable behaviour, without a callback that would have to call into V8.
+fn set_verify_mode<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    if args.length() < 2 {
+        throw_type_error(
+            scope,
+            "setVerifyMode expects (requestCert, rejectUnauthorized)",
+        );
+        return;
+    }
+    let request_cert = args.get(0);
+    let reject_unauthorized = args.get(1);
+    if !(request_cert.is_true() || request_cert.is_false())
+        || !(reject_unauthorized.is_true() || reject_unauthorized.is_false())
+    {
+        throw_type_error(scope, "setVerifyMode expects booleans");
+        return;
+    }
+    let request = request_cert.is_true();
+    let reject = reject_unauthorized.is_true();
+
+    let mode = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return None;
+        }
+        let mode = if state.kind == crate::ssl::Kind::Server {
+            if !request {
+                openssl_sys::SSL_VERIFY_NONE
+            } else {
+                let mut mode = openssl_sys::SSL_VERIFY_PEER;
+                if reject {
+                    mode |= openssl_sys::SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+                }
+                mode
+            }
+        } else {
+            // `crypto_tls.cc:1403`: a client checks after the handshake.
+            openssl_sys::SSL_VERIFY_NONE
+        };
+        state.verify_mode = mode;
+        // SAFETY: `ssl` is live, checked above.
+        unsafe { openssl_sys::SSL_set_verify(ssl, mode, None) };
+        Some(mode)
+    });
+    if matches!(mode, Some(None)) {
+        throw_type_error(scope, "setVerifyMode on a destroyed TLSWrap");
+    }
+}
+
+/// `TLSWrap::Start` (`crypto_tls.cc:654`): send the ClientHello.
+///
+/// Node's body is three lines and a comment that reads oddly until the state
+/// machine is in view:
+///
+/// ```c
+/// wrap->ClearOut();   // SSL_read, which triggers the handshake
+/// wrap->EncOut();     // hand the ClientHello to the socket
+/// ```
+///
+/// `ClearOut` is the `SSL_read` phase, and `SSL_read` on a client that has not
+/// handshaked *starts* the handshake and produces the ClientHello into
+/// `enc_out_`. There is no `SSL_do_handshake` call here because reading does the
+/// same thing through the same state machine; the explicit `SSL_do_handshake`
+/// driver is what `OnStreamRead` uses on a later flight, and both go through
+/// [`crate::cycle::run`] so there is one place the phases are ordered.
+///
+/// The `CHECK(!flags_.started)` and `CHECK(wrap->is_client())` are a `TypeError`
+/// here: calling `start()` twice, or on a server, is a caller bug that a real
+/// `node` would abort on.
+fn start<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let object = args.this();
+    let ready = with_state(object, |state| {
+        if state.flags.started {
+            return Err("start() was already called");
+        }
+        if state.kind != crate::ssl::Kind::Client {
+            return Err("start() is client-only");
+        }
+        if state.ssl.is_none() {
+            return Err("start() after destroySSL");
+        }
+        state.flags.started = true;
+        Ok(())
+    });
+    match ready {
+        Some(Ok(())) => {}
+        Some(Err(message)) => {
+            throw_type_error(scope, message);
+            return;
+        }
+        None => {
+            throw_type_error(scope, "Invalid TLSWrap receiver");
+            return;
+        }
+    }
+
+    let Some(cell) = crate::state::state_cell(object) else {
+        return;
+    };
+    // SAFETY: `cell` is this object's live state and the object is the receiver,
+    // so it cannot be collected during the call.
+    unsafe { crate::cycle::run(cell) };
+
+    // The ClientHello is now in `enc_out_` (or `pending_output`); hand it to the
+    // socket. `crypto_tls.cc:660`'s `EncOut()`.
     let stream = with_state(object, |state| state.underlying).flatten();
     if let Some(stream) = stream {
         // SAFETY: `stream` is the wrap's own `underlying`, live while it holds it.

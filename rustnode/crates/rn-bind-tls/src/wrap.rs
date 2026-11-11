@@ -355,10 +355,25 @@ fn wrap(
         return;
     };
     state.kind = kind;
+    let ssl_ptr = ssl.as_ptr();
     state.ssl = Some(ssl);
     state.secure_context = Some(v8::Global::new(scope.as_ref(), context_object));
     state.object = Some(v8::Global::new(scope.as_ref(), object));
+    // The wrap's own `StreamBase` delivers cleartext to `handle.onread`, which
+    // `lib/net.js` assigns on *this* object rather than on the socket beneath it.
+    state.reader.owner_object = Some(v8::Global::new(scope.as_ref(), object));
     state.flags.has_active_write_issued_by_prev_listener = args.get(3).is_true();
+    // `InitSSL`'s callback installation, which needs the state address to exist
+    // first. This is what makes `onhandshakestart`/`onhandshakedone` fire and
+    // what sets `flags.established`.
+    //
+    // The mirrors the info callback reads. Registered before `install` so the
+    // very first handshake message can notify JavaScript.
+    let handles = crate::callback::register(cell, v8::Global::new(scope.as_ref(), object));
+    state.callback = Some(handles);
+    // SAFETY: `cell` is the state allocated for this object, and it outlives the
+    // `SSL` because teardown frees the `SSL` from that same state.
+    unsafe { crate::callback::install(ssl_ptr, cell) };
     drop(state);
 
     // The stream the listener attaches to, if the handle published one. A handle

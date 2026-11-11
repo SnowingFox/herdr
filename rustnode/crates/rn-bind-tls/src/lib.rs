@@ -68,6 +68,7 @@
 //! that module for why throwing beats a stub that returns `undefined`.
 
 pub mod bio;
+pub mod callback;
 pub mod cycle;
 pub mod error;
 pub mod ffi_extra;

@@ -168,6 +168,23 @@ pub struct WrapState {
     /// that cannot be flushed is completed with an error rather than left
     /// pointing at freed memory (R3).
     pub pending_output: Vec<u8>,
+    /// The wrap's **own** `StreamBase` state.
+    ///
+    /// Node's `TLSWrap` is a `StreamBase` in its own right: it has a
+    /// `StreamResource` whose `EmitRead` is how decrypted cleartext reaches
+    /// `handle.onread`. Its `stream` field is null — there is no libuv handle —
+    /// which is exactly the shape `rn_uv::listener` supports for a `JSStream`.
+    ///
+    /// This is what cleartext goes *up* through. Using the underlying socket's
+    /// state instead would push plaintext into the ciphertext path.
+    pub reader: rn_uv::handle::StreamState,
+    /// Decrypted cleartext waiting to be handed to JavaScript.
+    ///
+    /// The opposite direction from [`WrapState::pending_output`]: this is what
+    /// `ClearOut` produced and `lib/net.js` emits as `'data'`, while
+    /// `pending_output` is ciphertext on its way to the socket. Mixing the two
+    /// would put plaintext inside the TLS framing.
+    pub pending_cleartext_output: Vec<u8>,
     /// Cleartext the caller wrote that `SSL_write` could not yet accept.
     ///
     /// `crypto_tls.cc`'s `pending_cleartext_input_`, a kept backing store that
@@ -175,6 +192,20 @@ pub struct WrapState {
     /// backpressure is resumed rather than truncated; dropping it is how a large
     /// payload loses its tail while a small one echoes fine.
     pub pending_cleartext: Vec<u8>,
+    /// The mirrors the SSL callbacks read.
+    ///
+    /// `cycle` holds this state borrowed across `SSL_read`/`SSL_write`, which is
+    /// the stack the info callback runs on — so the callback cannot read the
+    /// `RefCell`. These `Rc<Cell<_>>` are the copy it can read, and `cycle` copies
+    /// their values back here when its borrow ends. See
+    /// [`crate::callback`] for why that split is necessary rather than tidy.
+    pub callback: Option<crate::callback::CallbackHandles>,
+    /// The mode last set by `setVerifyMode`, `TLSWrap`'s `verify_mode_`.
+    ///
+    /// Kept because `setVerifyMode` is idempotent and `lib/internal/tls/wrap.js`
+    /// re-applies it on a handle swap; reading the current mode back from OpenSSL
+    /// is possible but this keeps the two answers in one place.
+    pub verify_mode: i32,
     /// `flags_.eof`: a close-notify or an underlying EOF was seen.
     ///
     /// Once set, `ClearIn` does nothing and `ReadStart` does not re-arm, which is
@@ -188,7 +219,11 @@ impl WrapState {
     /// `ssl` is created by [`crate::wrap`] after the JavaScript object exists,
     /// because `InitSSL` installs callbacks that need to recover that object.
     pub fn new(kind: Kind) -> Self {
+        // A `StreamState` with no libuv handle: `TLSWrap` is a `StreamBase`
+        // without one, which is the same shape `rn-bind-js-stream` uses.
+        let reader = rn_uv::handle::StreamState::new(ptr::null_mut());
         Self {
+            reader,
             object: None,
             secure_context: None,
             ssl: None,
@@ -203,6 +238,9 @@ impl WrapState {
             next_session: None,
             pending_output: Vec::new(),
             pending_cleartext: Vec::new(),
+            pending_cleartext_output: Vec::new(),
+            callback: None,
+            verify_mode: 0,
             error: None,
         }
     }
@@ -295,8 +333,14 @@ impl WrapState {
         // `enc_in_ = enc_out_ = nullptr` in Node. There are no such fields here:
         // `enc_in()`/`enc_out()` read the BIOs back from the SSL, so there is
         // nothing left pointing at a freed BIO.
+        // The callback slot is keyed by this state's address, so it has to go
+        // with the state: a later wrap that reuses the address must not be
+        // matched by a stale entry.
+        crate::callback::unregister(self as *const WrapState as *const RefCell<WrapState>);
+        self.callback = None;
         self.pending_output.clear();
         self.pending_cleartext.clear();
+        self.pending_cleartext_output.clear();
         self.error = None;
         self.flags.eof = false;
         self.secure_context = None;

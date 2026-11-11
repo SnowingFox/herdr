@@ -25,6 +25,11 @@ use std::os::raw::{c_char, c_int, c_long};
 
 use openssl_sys as ffi;
 
+/// `#define SSL_CB_HANDSHAKE_START 0x10` in `ssl.h:1146`.
+pub const SSL_CB_HANDSHAKE_START: c_int = 0x10;
+/// `#define SSL_CB_HANDSHAKE_DONE 0x20` in `ssl.h:1147`.
+pub const SSL_CB_HANDSHAKE_DONE: c_int = 0x20;
+
 /// `#define SSL_CTRL_MODE 33` in `ssl.h:1302`.
 pub const SSL_CTRL_MODE: c_int = 33;
 
@@ -57,6 +62,21 @@ extern "C" {
     /// The in-memory BIO has no descriptor, so the flag is set to zero: a
     /// "shutdown" BIO would try to close a file descriptor it never had.
     pub fn BIO_set_shutdown(bio: *mut ffi::BIO, shut: c_int);
+
+    /// `void SSL_set_info_callback(SSL *ssl, void (*cb)(const SSL*, int, int));`
+    /// — `ssl.h:2201`.
+    ///
+    /// The handshake-progress hook. Node installs `SSLInfoCallback` to learn when
+    /// the handshake started and finished, which is how `flags_.established` is
+    /// set and how `onhandshakedone` reaches `lib/net.js`. Without it a handshake
+    /// can complete at the OpenSSL level and `secureConnect` still never fires.
+    pub fn SSL_set_info_callback(
+        ssl: *mut ffi::SSL,
+        callback: Option<unsafe extern "C" fn(*const ffi::SSL, c_int, c_int)>,
+    );
+
+    /// `SSL_CTX *SSL_get_SSL_CTX(const SSL *ssl);` — `ssl.h:2199`.
+    pub fn SSL_get_SSL_CTX(ssl: *const ffi::SSL) -> *mut ffi::SSL_CTX;
 
     /// `int BIO_test_flags(const BIO *b, int flags);` — `bio.h`.
     ///

@@ -98,6 +98,74 @@ impl WrapListener {
         }
     }
 
+    /// Emits a zero-length or negative read on the wrap's own `StreamBase`.
+    ///
+    /// `nread == UV_EOF` (or another error) is how a TLS stream reports its end:
+    /// `lib/internal/stream_base_commons.js` turns a negative count into `'end'`
+    /// or `'error'` on the socket. Emitting it on the *underlying* stream would
+    /// hand it to the raw socket's `onread`, which `lib/net.js` replaced when the
+    /// `TLSSocket` took over.
+    fn emit_event(&self, nread: isize) {
+        let reader = self.with(|state| &mut state.reader as *mut _);
+        let Some(reader) = reader else {
+            return;
+        };
+        // SAFETY: `reader` is the wrap's own `StreamState`, live for the wrap's
+        // whole life. A non-positive count carries no buffer.
+        unsafe {
+            rn_uv::listener::emit_read(
+                reader,
+                nread,
+                rn_uv::listener::ReadBuffer::Listener(rn_uv::sys::uv_buf_t {
+                    base: std::ptr::null_mut(),
+                    len: 0,
+                }),
+            )
+        };
+    }
+
+    /// Hands decrypted cleartext to JavaScript through the wrap's own
+    /// `StreamBase`.
+    ///
+    /// `TLSWrap::EmitRead` in Node calls the wrap's own `StreamResource`, not the
+    /// underlying socket's: the cleartext belongs to *this* stream, and
+    /// `lib/net.js` has assigned `onread` on the `TLSWrap` object. Sending it
+    /// through the socket would deliver plaintext to the ciphertext path.
+    ///
+    /// # R2
+    ///
+    /// No state borrow is held here: the bytes were taken out by the caller.
+    fn emit_cleartext(&self, bytes: Vec<u8>) {
+        let length = bytes.len();
+        if length == 0 {
+            return;
+        }
+        // The wrap's reader state is reached through the cell because the
+        // listener holds only the cell address, not the state.
+        let reader = self.with(|state| &mut state.reader as *mut _);
+        let Some(reader) = reader else {
+            return;
+        };
+        let Some(mut allocation) = rn_uv::handle::Allocation::new(length) else {
+            tracing::error!(length, "TLSWrap could not allocate a cleartext buffer");
+            return;
+        };
+        // SAFETY: `allocation` has at least `length` bytes and `bytes` has
+        // exactly `length`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), allocation.base(), length);
+        }
+        // SAFETY: `reader` is the wrap's own `StreamState`, live for the wrap's
+        // whole life, and `emit_read` owns the allocation from here.
+        unsafe {
+            rn_uv::listener::emit_read(
+                reader,
+                length as isize,
+                rn_uv::listener::ReadBuffer::Allocated(allocation),
+            )
+        };
+    }
+
     /// Runs `body` with the wrap state, or reports a re-entrant call.
     fn with<R>(&self, body: impl FnOnce(&mut WrapState) -> R) -> Option<R> {
         if self.cell.is_null() {
@@ -143,10 +211,26 @@ impl StreamListener for WrapListener {
     /// runs through [`crate::cycle::run`], which takes its own scoped borrows.
     fn on_stream_read(&mut self, this: &ListenerRef, nread: isize, buffer: ReadBuffer) {
         if nread <= 0 {
-            // `UV_EOF` and errors both arrive here. Node forwards them below so
-            // the socket's own `'end'`/`'error'` fires; a TLS-level error is
-            // reported separately by the state machine once it sees the close.
-            this.pass_read_error_to_previous_listener(nread);
+            // `UV_EOF` and errors arrive on the **underlying** stream, and they
+            // belong to the TLS stream's reader rather than to the socket's:
+            // `lib/net.js` put its `onread` on the `TLSWrap`, so forwarding below
+            // would deliver the close to the raw socket, where nothing is
+            // listening, and the `TLSSocket` would never emit `'end'` or
+            // `'close'`.
+            //
+            // Node's `OnStreamRead` does exactly this (`crypto_tls.cc:1394`):
+            // `EmitRead(nread)`, on the wrap's own `StreamBase`.
+            //
+            // Forwarding below is only correct when the wrap has not taken over
+            // reading yet, which is the `underlying`-is-gone case.
+            let forwarded = self
+                .with(|state| state.underlying.is_none())
+                .unwrap_or(true);
+            if forwarded {
+                this.pass_read_error_to_previous_listener(nread);
+                return;
+            }
+            self.emit_event(nread);
             return;
         }
         let Some(bytes) = buffer.bytes(nread) else {
@@ -172,9 +256,10 @@ impl StreamListener for WrapListener {
                 "TLSWrap could only buffer part of a read"
             );
         }
-        // The state machine. `ClearIn` decrypts whatever the BIO accepted and
+        // The state machine. `ClearOut` decrypts whatever the BIO accepted and
         // `EncOut` produces the ciphertext a retry needs; `flush` then hands
-        // that ciphertext to the underlying stream.
+        // that ciphertext to the underlying stream, and the decrypted cleartext
+        // goes up through the wrap's own `StreamBase`.
         //
         // SAFETY: `cell` is this listener's wrap state, guaranteed live for the
         // listener's whole life by `attach`'s contract.
@@ -184,6 +269,19 @@ impl StreamListener for WrapListener {
             // outer invocation continues the machine when it returns, so the
             // bytes already in `enc_in_` are not lost.
             return;
+        }
+        // Cleartext first: it is what the user is waiting for, and the ciphertext
+        // flush below can complete asynchronously.
+        let cleartext = self
+            .with(|state| {
+                if state.pending_cleartext_output.is_empty() {
+                    return None;
+                }
+                Some(std::mem::take(&mut state.pending_cleartext_output))
+            })
+            .flatten();
+        if let Some(bytes) = cleartext {
+            self.emit_cleartext(bytes);
         }
         let Some(Some(stream)) = self.with(|state| state.underlying) else {
             return;
@@ -201,27 +299,52 @@ impl StreamListener for WrapListener {
         });
     }
 
-    /// `TLSWrap::OnStreamAfterWrite`.
+    /// `TLSWrap::OnStreamAfterWrite` (`crypto_tls.cc:783`).
     ///
     /// The write the underlying stream just finished is the **ciphertext** this
     /// wrap queued, not the cleartext the caller is waiting on. Node's override
-    /// records the status and lets `EncOut` complete the real `WriteWrap` once the
-    /// SSL has produced everything; forwarding it below would complete the
-    /// caller's write when only part of its ciphertext had been sent, which is
-    /// exactly the `writeQueueSize`/`pending` mismatch that leaves a
-    /// `TLSSocket`'s write callback early.
+    /// therefore completes `current_write_` — the caller's `WriteWrap` — rather
+    /// than the request it was handed, which belongs to the internal encryption
+    /// write.
     ///
-    /// Increment 1 has no write path, so this records the completion and does not
-    /// forward.
+    /// Forwarding the request below instead is the failure mode this exists to
+    /// avoid: the caller's write would complete when only part of its ciphertext
+    /// had been sent, and `stream_base_commons`'s `pending` count would reach zero
+    /// early.
+    ///
+    /// Completing it here rather than in a phase is what makes a `tlsSocket.write`
+    /// callback fire at all: without it the caller's `WriteWrap` is never
+    /// `Done`, `lib/net.js`'s `pending` never decrements, and the socket cannot
+    /// close.
     fn on_stream_after_write<'s>(
         &mut self,
         _this: &ListenerRef,
-        _scope: &mut v8::PinScope<'s, '_>,
+        scope: &mut v8::PinScope<'s, '_>,
         _request: v8::Local<'s, v8::Object>,
-        _handle: Option<v8::Local<'s, v8::Object>>,
+        handle: Option<v8::Local<'s, v8::Object>>,
         status: i32,
     ) {
-        tracing::trace!(status, "TLSWrap ciphertext write completed");
+        // The caller's write is taken under the borrow, and completed after it —
+        // `report_completion` calls `oncomplete`, which is JavaScript (R2).
+        let pending = self.with(|state| state.take_queued_write()).flatten();
+        let Some(pending) = pending else {
+            // No caller write outstanding: the ciphertext was a handshake flight
+            // or an alert, and there is nothing to notify.
+            return;
+        };
+        let request = v8::Local::new(scope, pending);
+        let error = if status != 0 {
+            Some("TLS write failed")
+        } else {
+            None
+        };
+        rn_bind_stream_wrap::wrap::report_completion(scope, request, status, handle, error);
+        // A flush that completed means more ciphertext may be ready, or the next
+        // queued cleartext can be encrypted now.
+        //
+        // SAFETY: `cell` is this listener's wrap state, live by `attach`'s
+        // contract.
+        unsafe { crate::cycle::run(self.cell) };
     }
 
     /// `TLSWrap::OnStreamAfterShutdown`.
