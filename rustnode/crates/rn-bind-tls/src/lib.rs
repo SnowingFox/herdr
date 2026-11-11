@@ -74,6 +74,7 @@ pub mod error;
 pub mod ffi_extra;
 pub mod listener;
 pub mod methods;
+pub mod peer_cert;
 pub mod ssl;
 pub mod state;
 pub mod stream;

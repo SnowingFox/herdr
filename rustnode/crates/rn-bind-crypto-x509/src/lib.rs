@@ -57,4 +57,4 @@ pub mod snapshot;
 mod certificate;
 mod install;
 
-pub use install::{install_classes, MEMBERS};
+pub use install::{certificate_from_chain, install_classes, legacy_object, MEMBERS};

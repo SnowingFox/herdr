@@ -77,8 +77,13 @@ pub enum IoOutcome {
     /// `SSL_ERROR_SYSCALL` with `ret == 0`: the peer closed without a
     /// close-notify.
     SyscallEof,
-    /// A real failure. The error queue carries the reason.
-    Failed(String),
+    /// A real failure, with the error queue already captured.
+    ///
+    /// The capture happens here, inside `SSL_get_error`'s shadow, because
+    /// `crypto_tls.cc:921` is explicit that the queue must be read "immediately
+    /// after `SSL_read`, without calling into JS": anything else that touches
+    /// the queue in between changes what the failure looks like.
+    Failed(crate::error::SslError),
 }
 
 impl IoOutcome {
@@ -99,10 +104,13 @@ impl IoOutcome {
             ffi::SSL_ERROR_WANT_WRITE => Self::WantWrite,
             ffi::SSL_ERROR_ZERO_RETURN => Self::ZeroReturn,
             ffi::SSL_ERROR_SYSCALL if ret == 0 => Self::SyscallEof,
-            other => Self::Failed(format!(
-                "SSL error {other}: {}",
-                crate::error::drain_reason()
-            )),
+            other => {
+                let mut captured = crate::error::SslError::capture();
+                if captured.message.is_empty() {
+                    captured.message = format!("SSL error {other}");
+                }
+                Self::Failed(captured)
+            }
         }
     }
 
@@ -195,12 +203,10 @@ pub unsafe fn run(cell: *mut RefCell<WrapState>) -> CycleOutcome {
     // `tlsClientError` and destroy the socket. Recording it without delivering
     // left a failed handshake with nothing happening at all: no JS event, no
     // close, and the accepted socket ref'd forever.
-    let failure = state.error.take().and_then(|message| {
-        state
-            .object
-            .as_ref()
-            .map(|object| (object.clone(), message))
-    });
+    let failure = state
+        .error
+        .take()
+        .and_then(|error| state.object.as_ref().map(|object| (object.clone(), error)));
     if let (Some(stream), Some(object), false) = (
         state.underlying,
         state.object.as_ref(),
@@ -236,10 +242,10 @@ pub unsafe fn run(cell: *mut RefCell<WrapState>) -> CycleOutcome {
     }
     // A failed handshake reports itself after its alert has been flushed, so the
     // peer sees a TLS alert rather than a truncated stream.
-    if let Some((object, message)) = failure {
+    if let Some((object, error)) = failure {
         let _ = rn_uv::callback::with_context(|scope| {
             let object = v8::Local::new(scope, object);
-            crate::listener::deliver_error(scope, object, &message);
+            crate::listener::deliver_error(scope, object, &error);
         });
     }
     CycleOutcome::Cycled
@@ -441,7 +447,10 @@ pub unsafe fn enc_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
 /// As [`clear_in`].
 pub unsafe fn do_handshake(state: &mut WrapState, ssl: *mut ffi::SSL) -> IoOutcome {
     let _ = (state, ssl);
-    IoOutcome::Failed("SSL_do_handshake is not wired yet (tls_wrap increment 3)".to_string())
+    IoOutcome::Failed(crate::error::SslError {
+        message: "SSL_do_handshake is not wired yet (tls_wrap increment 3)".to_string(),
+        ..Default::default()
+    })
 }
 
 /// Whether the wrap is the client side, for the callers that need to know.
@@ -510,7 +519,7 @@ mod tests {
         assert!(!IoOutcome::Wrote(1).should_retry());
         assert!(!IoOutcome::ZeroReturn.should_retry());
         assert!(!IoOutcome::SyscallEof.should_retry());
-        assert!(!IoOutcome::Failed("x".to_string()).should_retry());
+        assert!(!IoOutcome::Failed(crate::error::SslError::default()).should_retry());
     }
 
     /// A phase on a wrap with no pending cleartext moves nothing rather than

@@ -266,10 +266,16 @@ fn fill_key_fields<'s>(
 
 /// The legacy distinguished-name object: `{ CN: 'x', O: ['a', 'b'] }`.
 ///
-/// `GetX509NameObject` builds it with a **null prototype**, and repeats an
-/// attribute name as an array only when it occurs more than once. That
-/// array-on-repetition rule is why `C=US\nO=X\nO=Y` gives `O: ['X', 'Y']` while a
-/// single `O` gives a bare string.
+/// `GetX509NameObject` builds it with a **null prototype**, keys it by the
+/// attribute's *short name* rather than its OID, and repeats a name as an array
+/// only when it occurs more than once. That array-on-repetition rule is why
+/// `C=US\nO=X\nO=Y` gives `O: ['X', 'Y']` while a single `O` gives a bare
+/// string.
+///
+/// The key is `OBJ_nid2sn`'s answer, falling back to the dotted OID for an OID
+/// OpenSSL has no name for. `x509.js`'s `toLegacyObject()` and `getPeerCertificate`
+/// both read these keys by attribute name, so keying by OID silently produces an
+/// object whose `subject.CN` is `undefined`.
 fn legacy_name<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     certificate: &X509,
@@ -290,7 +296,8 @@ fn legacy_name<'s>(
             // writing an empty string, keeping the valid siblings.
             continue;
         };
-        let key = v8::String::new(scope, &attribute.oid)?;
+        let property = attribute.short_name.as_deref().unwrap_or(&attribute.oid);
+        let key = v8::String::new(scope, property)?;
         let value = v8::String::new(scope, value)?;
         let existing = object.get(scope, key.into());
         match existing {

@@ -107,6 +107,40 @@ pub(crate) fn rebuild_from_snapshot<'s>(
     new_certificate(scope, snapshot, index, None)
 }
 
+/// Builds the `X509Certificate` for a chain of DER certificates, leaf first.
+///
+/// This is `X509Certificate::New(env, X509Pointer, issuer_chain, issuers_start)`
+/// as `tls_wrap` reaches it: `getPeerX509Certificate()` hands over the peer's
+/// chain and the object it gets back carries an `issuerCertificate` link for
+/// every entry above the leaf, so a caller can walk it without asking the
+/// binding again. `test-tls-peer-certificate-repeated-reads.js` is the test that
+/// pins the walk: two rounds of `getPeerX509Certificate()` and
+/// `getPeerCertificate(true)` must both see the whole chain, which they do
+/// because the snapshot is immutable and re-parsed per accessor.
+///
+/// `None` when the list is empty or any entry does not parse, which the binding
+/// reports as `undefined` — the same thing Node's `MaybeLocal` becomes.
+pub fn certificate_from_chain<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    chain: Vec<Vec<u8>>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let snapshot = Snapshot::from_der(chain)?;
+    new_certificate(scope, snapshot, 0, None)
+}
+
+/// The legacy object `getPeerCertificate()` returns for one certificate.
+///
+/// `X509Certificate::toObject`, i.e. `X509ToObject`, which is the same object
+/// `toLegacyObject()` hands to `translatePeerCertificate`. Exposed so
+/// `tls_wrap`'s `getPeerCertificate` produces exactly the shape
+/// `X509Certificate#toLegacyObject()` does rather than a second, drifting copy.
+pub fn legacy_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    certificate: &openssl::x509::X509,
+) -> Option<v8::Local<'s, v8::Value>> {
+    crate::legacy::to_legacy(scope, certificate)
+}
+
 /// Installs the X.509 members onto `target`, which is the `crypto` namespace.
 pub fn install_classes<'s>(
     scope: &mut v8::PinScope<'s, '_>,

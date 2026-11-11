@@ -84,8 +84,18 @@ extern "C" {
     /// `BIO_set_flags`/`BIO_clear_flags` but not the reader, and the retry flag is
     /// what the test for an empty `NodeBIO` asserts.
     pub fn BIO_test_flags(bio: *const ffi::BIO, flags: c_int) -> c_int;
-}
 
+    /// `int X509_STORE_CTX_get1_issuer(X509 **issuer, X509_STORE_CTX *ctx, X509 *x);`
+    ///
+    /// Returns 1 with `*issuer` set to a new reference, 0 with nothing set, or -1
+    /// when no issuer was found. `rn-bind-secure-context` declares the same
+    /// symbol for `getIssuer`; both link to the one definition.
+    pub fn X509_STORE_CTX_get1_issuer(
+        issuer: *mut *mut ffi::X509,
+        ctx: *mut ffi::X509_STORE_CTX,
+        x: *mut ffi::X509,
+    ) -> c_int;
+}
 /// `SSL_set_mode(ssl, op)`, expanded from the macro at `ssl.h:641`:
 ///
 /// ```c

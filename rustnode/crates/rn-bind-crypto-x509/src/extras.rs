@@ -109,6 +109,41 @@ extern "C" {
     fn X509_get0_pubkey(certificate: *const ffi::X509) -> *mut ffi::EVP_PKEY;
     fn X509_get_pubkey(certificate: *mut ffi::X509) -> *mut ffi::EVP_PKEY;
     fn X509_check_ca(certificate: *mut ffi::X509) -> std::ffi::c_int;
+    fn OBJ_obj2nid(object: *const ffi::ASN1_OBJECT) -> std::ffi::c_int;
+    fn OBJ_nid2sn(nid: std::ffi::c_int) -> *const std::ffi::c_char;
+}
+
+/// `#define NID_undef 0` in `obj_mac.h`.
+const NID_UNDEF: std::ffi::c_int = 0;
+
+/// The attribute name the legacy object keys by: `OBJ_nid2sn`, or the dotted
+/// text when `OBJ_obj2nid` has no name for it.
+///
+/// This is `ncrypto`'s `X509Name::Iterator::operator*` order exactly, and the
+/// fallback matters: `GetX509NameObject` keys `2.5.4.3` as `CN` for every
+/// certificate OpenSSL knows, but an attribute with a private OID still has to
+/// appear under *some* key rather than being dropped.
+fn nid_short_name(object: *const ffi::ASN1_OBJECT) -> Option<String> {
+    if object.is_null() {
+        return None;
+    }
+    // SAFETY: `object` is borrowed from the live entry for this call only.
+    unsafe {
+        let nid = OBJ_obj2nid(object);
+        if nid == NID_UNDEF {
+            return None;
+        }
+        let pointer = OBJ_nid2sn(nid);
+        if pointer.is_null() {
+            return None;
+        }
+        // SAFETY: OpenSSL returns a static NUL-terminated string.
+        std::ffi::CStr::from_ptr(pointer)
+            .to_str()
+            .ok()
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    }
 }
 
 /// One attribute of a distinguished name.
@@ -117,6 +152,14 @@ pub(crate) struct NameAttribute {
     pub(crate) set: usize,
     /// The attribute's OID in dotted form.
     pub(crate) oid: String,
+    /// The attribute's short name (`CN`, `O`, …), when OpenSSL has one.
+    ///
+    /// `subjectName.rdns[].oid` reports the dotted form and the legacy
+    /// `subject`/`issuer` objects report this one, which is the split
+    /// `ncrypto`'s `X509Name::Iterator` and `InspectName` make: the iterator
+    /// resolves `OBJ_obj2nid` then `OBJ_nid2sn` and falls back to the dotted
+    /// text only when the OID has no name.
+    pub(crate) short_name: Option<String>,
     /// Its value, when it converts to UTF-8.
     ///
     /// `None` for a value whose ASN.1 type is not a string type OpenSSL will
@@ -176,6 +219,7 @@ pub(crate) fn inspect_name(certificate: &X509, subject: bool) -> Option<NameInsp
             previous_set = set;
             attributes.push(NameAttribute {
                 set: set as usize,
+                short_name: nid_short_name(object),
                 oid,
                 value: if can_convert_name_value(value) {
                     convert_name_value(value)

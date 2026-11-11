@@ -210,7 +210,7 @@ pub struct WrapState {
     ///
     /// Once set, `ClearIn` does nothing and `ReadStart` does not re-arm, which is
     /// `crypto_tls.cc:1094`'s `!flags_.eof` guard.
-    pub error: Option<String>,
+    pub error: Option<crate::error::SslError>,
 }
 
 impl WrapState {

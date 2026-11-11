@@ -20,6 +20,17 @@ rn-bind-stream-wrap = { path = "../rn-bind-stream-wrap" }
 # out of it; it never builds a second one. Two `SSL_CTX` lifetimes that disagree
 # about who frees what is the same class of bug as two finalizer registries.
 rn-bind-secure-context = { path = "../rn-bind-secure-context" }
+# `getPeerCertificate` returns exactly what `X509Certificate#toLegacyObject()`
+# returns, and `getPeerX509Certificate` returns a real `X509Certificate`, so both
+# come from the crate that already owns the DER-snapshot design rather than from
+# a second certificate parser here.
+rn-bind-crypto-x509 = { path = "../rn-bind-crypto-x509" }
+# `getCertificate`/`getPeerCertificate` return Buffers, and `getTLSTicket` does
+# too, so the one Buffer constructor the workspace already has is reused.
+rn-bind-crypto-keys = { path = "../rn-bind-crypto-keys" }
+# `verifyError()`'s message depends on `--use-system-ca`, which is a parsed
+# option rather than a runtime flag this crate can read any other way.
+rn-bind-options = { path = "../rn-bind-options" }
 # The same OpenSSL `rn-bind-crypto` builds and links. `openssl-src` is a single
 # artifact in the dependency graph, so this is a new edge onto one library, not a
 # second linkage: cargo resolves `openssl-sys` once and every crate calls into the

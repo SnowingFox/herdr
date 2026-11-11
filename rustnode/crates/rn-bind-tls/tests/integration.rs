@@ -204,10 +204,23 @@ fn the_prototype_carries_every_installed_name() {
 
 /// A `TLSWrap` built from a real `TCP` handle and a real `SecureContext` answers
 /// the state queries this increment implements.
+///
+/// # Why `verifyError()` is not asked here
+///
+/// A wrap that never handshook has no peer certificate, so
+/// `VerifyError`'s `verifyPeerCertificate()` finds neither a peer nor a cipher.
+/// Node dereferences the null cipher there and **segfaults** — measured on
+/// v22.23.4 with `node --expose-internals` — so there is no node behaviour to
+/// match on this receiver. This crate reports
+/// `UNABLE_TO_GET_ISSUER_CERT` instead of crashing (see
+/// [`rn_bind_tls::peer_cert::VerifyError::of`]), and the verified/rejected
+/// answers are pinned by the connection tests below, where node can be asked.
+///
+/// The answer to a *no-certificate* question is `hasPeerCertificate()`, which is
+/// false here and is exactly what `wrap.js:1345` checks.
 #[test]
 fn wrap_builds_a_working_tls_wrap() {
     let script = "\
-        const net = require('net'); \
         const tls = require('tls'); \
         const tcp = process.binding('tcp_wrap'); \
         const h = new tcp.TCP(tcp.constants.SOCKET); \
@@ -216,7 +229,7 @@ fn wrap_builds_a_working_tls_wrap() {
         const res = W.wrap(h, ctx.context, false, false); \
         console.log([ \
           res.isStreamBase === true, \
-          res.verifyError() === 0, \
+          res.hasPeerCertificate() === false, \
           res.getServername() === null, \
           res.isSessionReused() === false, \
           res.writeQueueSize === 0, \
@@ -229,6 +242,39 @@ fn wrap_builds_a_working_tls_wrap() {
         stdout.trim(),
         "true,true,true,true,true,true,true",
         "every answer must match what the state says; stderr: {stderr}"
+    );
+}
+
+/// `verifyError()` on a wrap that never handshook is an `Error`, not a crash and
+/// not a number.
+///
+/// Node segfaults on this receiver (measured), so there is nothing to match; the
+/// requirement this pins is the one every *real* connection depends on — the
+/// return value is `null` or an object with `.code`, never a bare integer, which
+/// is what made `authorizationError` `undefined` before this increment.
+#[test]
+fn verify_error_is_an_object_or_null() {
+    let script = "\
+        const tls = require('tls'); \
+        const tcp = process.binding('tcp_wrap'); \
+        const h = new tcp.TCP(tcp.constants.SOCKET); \
+        const ctx = tls.createSecureContext(); \
+        const W = process.binding('tls_wrap'); \
+        const res = W.wrap(h, ctx.context, false, false); \
+        const value = res.verifyError(); \
+        console.log([ \
+          typeof value, \
+          value === null, \
+          typeof value.code === 'string', \
+          typeof value.message === 'string' && value.message.length > 0, \
+          value instanceof Error, \
+        ].join(','));";
+    let (stdout, stderr, ok) = run(script);
+    assert!(ok, "verifyError must not crash; stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "object,false,true,true,true",
+        "an unverified wrap reports a coded Error; stderr: {stderr}"
     );
 }
 
@@ -629,4 +675,403 @@ fn receive_accepts_injected_ciphertext() {
     let (stdout, stderr, ok) = run(script);
     assert!(ok, "receive must not throw; stderr: {stderr}");
     assert_eq!(stdout.trim(), "accepted");
+}
+
+// ---------------------------------------------------------------------------
+// Increment 4: the peer certificate chain and the verification result
+// ---------------------------------------------------------------------------
+
+/// Node's fixture certificates, which every `test-tls-*` file uses.
+///
+/// Read from a Node checkout when one is available, because the acceptance for
+/// this increment is stated against real `node`'s answers for these exact
+/// certificates. `None` when no checkout is present, in which case the tests
+/// that need them report why they did not run rather than passing vacuously.
+fn node_fixtures() -> Option<std::path::PathBuf> {
+    for candidate in [
+        std::env::var("RUSTNODE_NODE_TEST").ok(),
+        std::env::var("RUSTNODE_TEST_CACHE")
+            .ok()
+            .map(|root| format!("{root}/rustnode-node-test/test")),
+        Some("/tmp/rustnode-node-test/test".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let keys = std::path::Path::new(&candidate).join("fixtures/keys");
+        if keys.join("agent1-cert.pem").is_file() {
+            return Some(keys);
+        }
+    }
+    None
+}
+
+/// Runs a script against the binary, returning `(stdout, stderr, exit_code)`.
+fn run_full(script: &str) -> (String, String, i32) {
+    let output = Command::new("timeout")
+        .arg("20")
+        .arg(binary())
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("the rustnode binary runs");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+/// `getPeerCertificate()` reports the peer's `subject` and `fingerprint256`,
+/// which must equal what `X509Certificate` reports for the same DER.
+///
+/// This is the shape comparison the increment's acceptance asks for: real
+/// `node` reports
+/// `{"C":"US",…,"CN":"agent1","emailAddress":"ry@tinyclouds.org"}` and
+/// `2C:62:59:…:4B:05` for `agent1-cert.pem`, and the legacy object must agree
+/// because it is the same `X509ToObject` path `toLegacyObject()` uses.
+#[test]
+fn get_peer_certificate_reports_node_s_subject_and_fingerprint() {
+    let Some(keys) = node_fixtures() else {
+        eprintln!("skipping: no Node test tree with fixtures was found");
+        return;
+    };
+    let key = keys.join("agent1-key.pem");
+    let cert = keys.join("agent1-cert.pem");
+    let ca = keys.join("ca1-cert.pem");
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        const {{ X509Certificate }} = require('crypto');
+        const key = fs.readFileSync({key:?});
+        const cert = fs.readFileSync({cert:?});
+        const ca = fs.readFileSync({ca:?});
+        const server = tls.createServer(
+          {{ key, cert, ca: [ca], requestCert: true, rejectUnauthorized: false }},
+          (socket) => {{
+            const peer = socket.getPeerCertificate(true);
+            const reference = new X509Certificate(peer.raw);
+            console.log('subject=' + JSON.stringify(peer.subject));
+            console.log('subjectMatchesX509=' +
+              (JSON.stringify(peer.subject) === JSON.stringify(
+                Object.fromEntries((reference.subject || '').split('\n')
+                  .map((line) => {{
+                    const at = line.indexOf('=');
+                    return [line.slice(0, at), line.slice(at + 1)];
+                  }})))));
+            console.log('fingerprint256=' + peer.fingerprint256);
+            console.log('fingerprintMatches=' +
+              (peer.fingerprint256 === reference.fingerprint256));
+            console.log('issuerCertificate=' +
+              (peer.issuerCertificate && peer.issuerCertificate.fingerprint256));
+            console.log('issuerCertificateRepeats=' +
+              (peer.issuerCertificate &&
+               peer.issuerCertificate.issuerCertificate === peer.issuerCertificate));
+            console.log('hasPeer=' + (socket.getPeerX509Certificate() !== undefined));
+            console.log('local=' + JSON.stringify(socket.getCertificate().subject));
+            socket.end();
+            server.close();
+          }});
+        server.on('tlsClientError', (err) => console.log('clientError=' + err.message));
+        server.listen(0, () => {{
+          const client = tls.connect({{
+            port: server.address().port, key, cert, ca: [ca], rejectUnauthorized: false,
+          }}, () => client.end());
+          client.on('error', (err) => {{
+            console.log('clientError=' + err.message);
+            server.close();
+          }});
+        }});
+        "#
+    );
+    let (stdout, stderr, status) = run_full(&script);
+    assert_eq!(status, 0, "the process must exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("subject={\"C\":\"US\",\"ST\":\"CA\",\"L\":\"SF\",\"O\":\"Joyent\","),
+        "the subject must be the attribute map node reports; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("subjectMatchesX509=true"),
+        "getPeerCertificate's subject must agree with X509Certificate#subject; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("fingerprint256=2C:62:59:16:91:89:AB:90:6A:3E:98:88:A6:D3:C5:58:58:6C:AE:FF:9C:33:22:7C:B6:77:D3:34:E7:53:4B:05"),
+        "the fingerprint must be node's for agent1-cert.pem; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("fingerprintMatches=true"),
+        "the fingerprint must match what X509Certificate reports; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("issuerCertificateRepeats=true"),
+        "the last self-signed certificate must point at itself; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("hasPeer=true"),
+        "getPeerX509Certificate must return a certificate; stdout: {stdout}"
+    );
+}
+
+/// A self-signed peer's chain is made circular, which is what
+/// `translatePeerCertificate`'s `c.issuerCertificate !== c` guard exists for.
+///
+/// Without the circular link `getPeerCertificate(true)` reports
+/// `issuerCertificate: undefined` for a self-signed certificate, and a caller
+/// that walks the chain stops early.
+#[test]
+fn a_self_signed_peer_certificate_chains_to_itself() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl is not available to generate a certificate");
+        return;
+    };
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        const key = fs.readFileSync({key:?});
+        const cert = fs.readFileSync({cert:?});
+        const server = tls.createServer(
+          {{ key, cert, requestCert: true, rejectUnauthorized: false }},
+          (socket) => {{
+            const peer = socket.getPeerCertificate(true);
+            console.log('empty=' + (Object.keys(peer).length === 0));
+            console.log('hasPeer=' + (socket.getPeerX509Certificate() !== undefined));
+            console.log('srvLocal=' + JSON.stringify(socket.getCertificate().subject));
+            socket.end();
+            server.close();
+          }});
+        server.on('tlsClientError', (err) => console.log('clientError=' + err.message));
+        server.listen(0, () => {{
+          const client = tls.connect(
+            {{ port: server.address().port, ca: [cert], rejectUnauthorized: false }},
+            () => {{
+              const peer = client.getPeerCertificate(true);
+              console.log('subject=' + JSON.stringify(peer.subject));
+              console.log('circular=' + (peer.issuerCertificate === peer));
+              console.log('local=' + JSON.stringify(client.getCertificate().subject));
+              client.end();
+            }});
+          client.on('error', (err) => {{
+            console.log('clientError=' + err.message);
+            server.close();
+          }});
+        }});
+        "#
+    );
+    let (stdout, stderr, status) = run_full(&script);
+    assert_eq!(status, 0, "the process must exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("subject={\"CN\":\"localhost\"}"),
+        "the client must see the server's subject; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("circular=true"),
+        "a self-signed peer's issuerCertificate must be itself; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("srvLocal={\"CN\":\"localhost\"}"),
+        "the server's getCertificate reports its own certificate; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("local=undefined"),
+        "getCertificate on a client with no certificate reports an empty \
+         object, whose subject is undefined — which is what node reports; \
+         stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("empty=true"),
+        "a server with no client certificate must report an empty object; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("hasPeer=false"),
+        "hasPeerCertificate must be false when no certificate was presented; stdout: {stdout}"
+    );
+}
+
+/// A rejected certificate produces node's exact message and code.
+///
+/// This is defect 1 and the assertion is the one the brief asks for: the
+/// message is `self-signed certificate` / `unable to verify the first
+/// certificate` rather than `undefined`, and `authorizationError` is the
+/// `X509_V_ERR_*` name rather than `undefined`.
+#[test]
+fn a_verification_failure_reports_node_s_message_and_code() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl is not available to generate a certificate");
+        return;
+    };
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        const key = fs.readFileSync({key:?});
+        const cert = fs.readFileSync({cert:?});
+        const server = tls.createServer({{ key, cert }}, (socket) => socket.end());
+        server.on('tlsClientError', () => {{}});
+        server.listen(0, () => {{
+          const client = tls.connect({{
+            port: server.address().port, servername: 'localhost',
+            rejectUnauthorized: true,
+          }});
+          client.on('error', (err) => {{
+            console.log('message=' + JSON.stringify(err.message));
+            console.log('code=' + JSON.stringify(err.code));
+            console.log('authorizationError=' +
+              JSON.stringify(client.authorizationError));
+            console.log('isError=' + (err instanceof Error));
+            server.close();
+          }});
+        }});
+        "#
+    );
+    let (stdout, stderr, status) = run_full(&script);
+    assert_eq!(status, 0, "the process must exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains(
+            "message=\"self-signed certificate; if the root CA is installed locally, \
+             try running Node.js with --use-system-ca\""
+        ),
+        "the message must be OpenSSL's reason plus the hint node adds; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("code=\"DEPTH_ZERO_SELF_SIGNED_CERT\""),
+        "the code must be node's name for X509_V_ERR 18; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("authorizationError=\"DEPTH_ZERO_SELF_SIGNED_CERT\""),
+        "authorizationError comes from verifyError().code; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("isError=true"),
+        "verifyError() must return an Error, not a number; stdout: {stdout}"
+    );
+}
+
+/// A leaf whose issuer is not trusted reports `UNABLE_TO_VERIFY_LEAF_SIGNATURE`
+/// with OpenSSL's text for it.
+///
+/// This is the other half of the code table: the same code path, a different
+/// `X509_V_ERR_*`, and the one every `test-tls-client-auth.js` assertion reads.
+#[test]
+fn an_untrusted_leaf_reports_unable_to_verify_leaf_signature() {
+    let Some(keys) = node_fixtures() else {
+        eprintln!("skipping: no Node test tree with fixtures was found");
+        return;
+    };
+    let key = keys.join("agent1-key.pem");
+    let cert = keys.join("agent1-cert.pem");
+    let other_ca = keys.join("ca2-cert.pem");
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        const key = fs.readFileSync({key:?});
+        const cert = fs.readFileSync({cert:?});
+        const otherCa = fs.readFileSync({other_ca:?});
+        const server = tls.createServer({{ key, cert }}, (socket) => socket.end());
+        server.on('tlsClientError', () => {{}});
+        server.listen(0, () => {{
+          const client = tls.connect({{
+            port: server.address().port, ca: [otherCa], servername: 'agent1',
+            rejectUnauthorized: true,
+          }});
+          client.on('error', (err) => {{
+            console.log('message=' + JSON.stringify(err.message));
+            console.log('code=' + JSON.stringify(err.code));
+            server.close();
+          }});
+        }});
+        "#
+    );
+    let (stdout, stderr, status) = run_full(&script);
+    assert_eq!(status, 0, "the process must exit 0; stderr: {stderr}");
+    assert!(
+        stdout.contains("code=\"UNABLE_TO_VERIFY_LEAF_SIGNATURE\""),
+        "the code must be node's name for X509_V_ERR 21; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("message=\"unable to verify the first certificate"),
+        "the message must be OpenSSL's text for that code; stdout: {stdout}"
+    );
+}
+
+/// A server with `requestCert` and `rejectUnauthorized: false` completes the
+/// handshake with a client certificate whose chain does not verify.
+///
+/// This is defect 2: `SSL_VERIFY_PEER` without Node's always-continue verify
+/// callback makes OpenSSL abort with `SSL alert 48` (`unknown_ca`), and the
+/// server never emits `'secureConnection'` at all. The server must complete the
+/// connection and report the failure through `authorized`/`authorizationError`
+/// instead.
+#[test]
+fn mutual_tls_completes_when_the_chain_is_not_authorized() {
+    let Some(keys) = node_fixtures() else {
+        eprintln!("skipping: no Node test tree with fixtures was found");
+        return;
+    };
+    let server_key = keys.join("agent2-key.pem");
+    let server_cert = keys.join("agent2-cert.pem");
+    let ca1 = keys.join("ca1-cert.pem");
+    // agent3 is signed by ca2, which the server does not trust.
+    let client_key = keys.join("agent3-key.pem");
+    let client_cert = keys.join("agent3-cert.pem");
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        const read = (path) => fs.readFileSync(path);
+        const server = tls.createServer({{
+          key: read({server_key:?}),
+          cert: read({server_cert:?}),
+          ca: [read({ca1:?})],
+          requestCert: true,
+          rejectUnauthorized: false,
+        }}, (socket) => {{
+          console.log('authorized=' + socket.authorized);
+          console.log('authorizationError=' + JSON.stringify(socket.authorizationError));
+          console.log('peerSubject=' + JSON.stringify(socket.getPeerCertificate().subject));
+          socket.end();
+          server.close();
+        }});
+        server.on('tlsClientError', (err) => console.log('clientError=' + err.message));
+        server.listen(0, () => {{
+          const client = tls.connect({{
+            port: server.address().port,
+            key: read({client_key:?}),
+            cert: read({client_cert:?}),
+            ca: [read({ca1:?})],
+            rejectUnauthorized: false,
+          }}, () => client.end());
+          client.on('error', (err) => {{
+            console.log('clientError=' + err.message);
+            server.close();
+          }});
+        }});
+        "#
+    );
+    let (stdout, stderr, status) = run_full(&script);
+    assert_eq!(status, 0, "the process must exit 0; stderr: {stderr}");
+    assert!(
+        !stdout.contains("SSL alert number 48"),
+        "the handshake must not send unknown_ca; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("clientError="),
+        "the server must accept the connection; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("authorized=false"),
+        "the unauthorized chain must report authorized=false; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("authorizationError=\"SELF_SIGNED_CERT_IN_CHAIN\"")
+            || stdout.contains("authorizationError=\"UNABLE_TO_GET_ISSUER_CERT_LOCALLY\"")
+            || stdout.contains("authorizationError=\"UNABLE_TO_VERIFY_LEAF_SIGNATURE\""),
+        "the reason must reach the server as a code rather than aborting; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("peerSubject={\"C\":\"US\",\"ST\":\"CA\",\"L\":\"SF\",\"O\":\"Joyent\","),
+        "the server must still read the client's certificate; stdout: {stdout}"
+    );
 }

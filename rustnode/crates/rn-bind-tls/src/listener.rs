@@ -400,17 +400,23 @@ impl StreamListener for WrapListener {
     }
 }
 
-/// Calls a wrap's `onerror` handler with `message`, as Node's `ClearOut` does.
+/// Calls a wrap's `onerror` handler with `error`, as Node's `ClearOut` does.
 ///
 /// `crypto_tls.cc:1007` is `MakeCallback(env->onerror_string(), 1, &error)`, and
 /// the error object carries `library`/`function`/`reason`/`code` beside its
 /// message. `lib/internal/tls/wrap.js`'s `_tlsError` reads the message and turns it
 /// into the `'error'` emission that destroys the socket, so an unset handler is a
 /// handshake that fails silently.
+///
+/// The `code` matters as much as the message: `test-tls-client-auth.js` asserts
+/// `err.code === 'ERR_SSL_PEER_DID_NOT_RETURN_A_CERTIFICATE'` and
+/// `test-tls-set-sigalgs.js` asserts `ERR_SSL_NO_SHARED_SIGNATURE_ALGORITHMS`,
+/// and a bare `Error` fails both with `undefined` even though the handshake
+/// failed for exactly the right reason.
 pub fn deliver_error(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<v8::Object>,
-    message: &str,
+    error: &crate::error::SslError,
 ) {
     let Some(key) = v8::String::new(scope, "onerror") else {
         return;
@@ -423,12 +429,26 @@ pub fn deliver_error(
         // without one has no socket behind it to notify.
         return;
     };
-    let Some(text) = v8::String::new(scope, message) else {
+    let Some(text) = v8::String::new(scope, &error.message) else {
         return;
     };
-    let error = v8::Exception::error(scope, text);
-    let receiver: v8::Local<v8::Value> = object.into();
-    let _ = handler.call(scope, receiver, &[error]);
+    let exception = v8::Exception::error(scope, text);
+    if let Ok(error_object) = v8::Local::<v8::Object>::try_from(exception) {
+        for (name, text) in [
+            ("library", error.library.as_deref()),
+            ("reason", error.reason.as_deref()),
+            ("code", error.code.as_deref()),
+        ] {
+            let (Some(name_key), Some(text)) = (v8::String::new(scope, name), text) else {
+                continue;
+            };
+            if let Some(text) = v8::String::new(scope, text) {
+                let _ = error_object.set(scope, name_key.into(), text.into());
+            }
+        }
+    }
+    let receiver: v8::Local<'_, v8::Value> = object.into();
+    let _ = handler.call(scope, receiver, &[exception]);
 }
 
 /// Emits whatever cleartext a wrap has produced, through its own `StreamBase`.

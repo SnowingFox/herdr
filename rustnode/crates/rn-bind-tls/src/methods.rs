@@ -184,40 +184,10 @@ pending_method!(
     "it needs a completed handshake to export from"
 );
 pending_method!(
-    pending_get_certificate,
-    "getCertificate",
-    4,
-    "it needs a handshake that selected a certificate"
-);
-pending_method!(
-    pending_get_x509_certificate,
-    "getX509Certificate",
-    4,
-    "it needs a handshake that selected a certificate"
-);
-pending_method!(
     pending_get_finished,
     "getFinished",
     4,
     "it reads the local Finished message, which needs a completed handshake"
-);
-pending_method!(
-    pending_get_peer_certificate,
-    "getPeerCertificate",
-    4,
-    "it needs the peer's chain and the verification result"
-);
-pending_method!(
-    pending_get_peer_x509_certificate,
-    "getPeerX509Certificate",
-    4,
-    "it needs the peer's chain and the verification result"
-);
-pending_method!(
-    pending_has_peer_certificate,
-    "hasPeerCertificate",
-    4,
-    "it needs the peer's chain"
 );
 pending_method!(
     pending_get_peer_finished,
@@ -236,6 +206,12 @@ pending_method!(
     "setPskIdentityHint",
     4,
     "it calls SSL_use_psk_identity_hint for a server handshake"
+);
+pending_method!(
+    pending_get_x509_certificate,
+    "getX509Certificate",
+    4,
+    "it needs a handshake that selected a certificate"
 );
 
 /// Installs one prototype method onto `prototype`.
@@ -264,11 +240,11 @@ pub fn install_into<'s>(
         // Implemented today.
         "destroySSL" => method!(destroy_ssl),
         "getServername" => method!(get_servername),
-        "verifyError" => method!(verify_error),
+        "verifyError" => method!(crate::peer_cert::verify_error),
         "isSessionReused" => method!(is_session_reused),
         "getProtocol" => method!(get_protocol),
-        "getSharedSigalgs" => method!(get_shared_sigalgs),
-        "getTLSTicket" => method!(get_tls_ticket),
+        "getSharedSigalgs" => method!(crate::peer_cert::get_shared_sigalgs),
+        "getTLSTicket" => method!(crate::peer_cert::get_tls_ticket),
         "setMaxSendFragment" => method!(set_max_send_fragment),
         "enableTrace" => method!(enable_trace),
         "writesIssuedByPrevListenerDone" => method!(writes_issued_by_prev_listener_done),
@@ -300,13 +276,13 @@ pub fn install_into<'s>(
         "setSession" => method!(pending_set_session),
         "exportKeyingMaterial" => method!(pending_export_keying_material),
         "getALPNNegotiatedProtocol" => method!(get_alpn_negotiated_protocol),
-        "getCertificate" => method!(pending_get_certificate),
+        "getCertificate" => method!(crate::peer_cert::get_certificate),
         "getX509Certificate" => method!(pending_get_x509_certificate),
         "getEphemeralKeyInfo" => method!(get_ephemeral_key_info),
         "getFinished" => method!(pending_get_finished),
-        "getPeerCertificate" => method!(pending_get_peer_certificate),
-        "getPeerX509Certificate" => method!(pending_get_peer_x509_certificate),
-        "hasPeerCertificate" => method!(pending_has_peer_certificate),
+        "getPeerCertificate" => method!(crate::peer_cert::get_peer_certificate),
+        "getPeerX509Certificate" => method!(crate::peer_cert::get_peer_x509_certificate),
+        "hasPeerCertificate" => method!(crate::peer_cert::has_peer_certificate_method),
         "getPeerFinished" => method!(pending_get_peer_finished),
         "getSession" => method!(get_session),
         "enablePskCallback" => method!(pending_enable_psk_callback),
@@ -784,11 +760,13 @@ fn set_servername<'s>(
 ///   would report `ERR_SSL_*` instead of the `ERR_TLS_CERT_*` code
 ///   `lib/_tls_wrap.js` produces.
 ///
-/// The verify callback is `None` rather than a native `VerifyCallback`: Node
-/// installs one to stop OpenSSL from aborting, and this crate's post-handshake
-/// check is what decides, so there is nothing for it to do. A `None` here means
-/// OpenSSL accepts the chain and `verifyError()` reports the result — the same
-/// observable behaviour, without a callback that would have to call into V8.
+/// The verify callback is Node's `VerifyCallback`, which always returns 1. That
+/// is what makes the mode meaningful without aborting the handshake: OpenSSL
+/// still runs verification and records the result on `SSL_get_verify_result`,
+/// but a failure does not terminate the connection, so `rejectUnauthorized`
+/// stays a JavaScript decision and `verifyError()` reports the reason. Without
+/// it, a server with `requestCert: true, rejectUnauthorized: false` sent `SSL
+/// alert 48` (`unknown_ca`) and never accepted the connection — defect 2.
 fn set_verify_mode<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -833,7 +811,7 @@ fn set_verify_mode<'s>(
         };
         state.verify_mode = mode;
         // SAFETY: `ssl` is live, checked above.
-        unsafe { openssl_sys::SSL_set_verify(ssl, mode, None) };
+        unsafe { openssl_sys::SSL_set_verify(ssl, mode, Some(crate::peer_cert::always_continue)) };
         Some(mode)
     });
     if matches!(mode, Some(None)) {
@@ -992,30 +970,7 @@ fn get_servername<'s>(
     }
 }
 
-/// `TLSWrap::VerifyError`.
-///
-/// `SSL_get_verify_result`, which is `X509_V_OK` (0) when verification succeeded or
-/// was not requested. `lib/internal/tls/wrap.js` reads it and turns a non-zero
-/// value into `ERR_TLS_CERT_ALTNAME_INVALID` or the peer-certificate error, so
-/// returning the raw code is what makes that branch run.
-fn verify_error<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s>,
-) {
-    let code = with_state(args.this(), |state| {
-        let ssl = state.ssl_ptr();
-        if ssl.is_null() {
-            return 0i64;
-        }
-        // SAFETY: `ssl` is live, checked above.
-        unsafe { openssl_sys::SSL_get_verify_result(ssl) as i64 }
-    })
-    .unwrap_or(0);
-    rv.set(v8::Number::new(scope, code as f64).into());
-}
-
-/// `TLSWrap::IsSessionReused`.
+/// `TLSWrap::SetMaxSendFragment`.
 ///
 /// `SSL_session_reused`: false before a handshake, true after a resumed one. It
 /// will start returning true once resumption lands in increment 4.
@@ -1068,89 +1023,7 @@ fn get_protocol<'s>(
     }
 }
 
-/// `TLSWrap::GetSharedSigalgs`.
-///
-/// `SSL_get_shared_sigalgs`, as an array of `[sign, hash]` pairs. Before a
-/// handshake there are none, so an empty array is the correct answer rather than a
-/// deferral.
-fn get_shared_sigalgs<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s>,
-) {
-    let names = with_state(args.this(), |state| {
-        let ssl = state.ssl_ptr();
-        if ssl.is_null() {
-            return Vec::new();
-        }
-        // SAFETY: `ssl` is live, checked above. Index 0 with null out-parameters
-        // asks only for the count, which is what `tls1.h` documents.
-        let count = unsafe {
-            crate::ffi_extra::SSL_get_shared_sigalgs(
-                ssl,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if count <= 0 {
-            return Vec::new();
-        }
-        let mut names = Vec::new();
-        for index in 1..=count {
-            let mut sign: c_int = 0;
-            let mut hash: c_int = 0;
-            let mut sign_hash: c_int = 0;
-            // SAFETY: `index` is within the count OpenSSL reported, and the
-            // out-parameters are live locals; the raw-signature pointers may be
-            // null, which `tls1.h` allows.
-            let ok = unsafe {
-                crate::ffi_extra::SSL_get_shared_sigalgs(
-                    ssl,
-                    index,
-                    &mut sign,
-                    &mut hash,
-                    &mut sign_hash,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok > 0 {
-                names.push((sign, hash));
-            }
-        }
-        names
-    })
-    .unwrap_or_default();
-
-    let array = v8::Array::new(scope, names.len() as i32);
-    for (index, (sign, hash)) in names.iter().enumerate() {
-        let pair = v8::Array::new(scope, 2);
-        let _ = pair.set_index(scope, 0, v8::Integer::new(scope, *sign).into());
-        let _ = pair.set_index(scope, 1, v8::Integer::new(scope, *hash).into());
-        let _ = array.set_index(scope, index as u32, pair.into());
-    }
-    rv.set(array.into());
-}
-
-/// `TLSWrap::GetTLSTicket`.
-///
-/// The session ticket, which only exists after a handshake *and* only with a
-/// resumption callback installed. `null` until increment 4 lands both, which is
-/// what `lib/internal/tls/wrap.js` guards on; reporting an empty buffer would make
-/// `tls.connect` believe a session was available.
-fn get_tls_ticket<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s>,
-) {
-    rv.set(v8::null(scope).into());
-}
-
-/// `TLSWrap::SetMaxSendFragment`.
+/// `TLSWrap::IsSessionReused`.
 ///
 /// `SSL_set_max_send_fragment`, a macro over `SSL_ctrl`, expanded in
 /// [`crate::ffi_extra`]. Answers the return value, which
