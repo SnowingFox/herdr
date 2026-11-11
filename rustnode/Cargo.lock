@@ -1308,6 +1308,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-tls"
+version = "0.1.0"
+dependencies = [
+ "foreign-types",
+ "libc",
+ "openssl",
+ "openssl-sys",
+ "rn-bind-secure-context",
+ "rn-bind-stream-wrap",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "rn-bind-trace-events"
 version = "0.1.0"
 dependencies = [
@@ -1466,6 +1483,7 @@ dependencies = [
  "rn-bind-task-queue",
  "rn-bind-tcp-wrap",
  "rn-bind-timers",
+ "rn-bind-tls",
  "rn-bind-trace-events",
  "rn-bind-tty-wrap",
  "rn-bind-udp-wrap",

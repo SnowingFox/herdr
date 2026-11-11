@@ -249,6 +249,54 @@ fn with_state<R>(this: v8::Local<v8::Object>, body: impl FnOnce(&mut Context) ->
     Some(body(&mut state))
 }
 
+/// The `SSL_CTX` behind a `SecureContext` object, for the `tls_wrap` namespace.
+///
+/// `TLSWrap::Wrap` (`crypto_tls.cc:600`) takes the `SecureContext` as argument 2
+/// and does `Unwrap<SecureContext>(sc)->CreateSSL()`. rustnode's `tls_wrap` is a
+/// separate crate and cannot read this crate's private allocation, so this is the
+/// one accessor it needs.
+///
+/// It returns a **borrowed** pointer, not an owner:
+///
+/// * the `SSL_CTX` is still owned by this `Context`, and `SSL_CTX_free` remains
+///   the only call that releases it — reached from `close()` and from the
+///   object's finalizer, exactly as before;
+/// * the caller gets a reference count on the `SSL_CTX` for free by calling
+///   `SSL_new`, which `TLSWrap` does immediately. `SSL_free` releases that.
+///
+/// So there is one owner and one lifetime for the `SSL_CTX`, which is the
+/// property that was worth not duplicating. A `TLSWrap` that built its own
+/// context would be the second owner.
+///
+/// Returns `None` for a receiver that is not a `SecureContext` and for one whose
+/// `close()` already ran, which is the state `wrap.js:769` creates when it closes
+/// a single-use context while the wrapper is still reachable. Both are reported
+/// by the caller as `ERR_TLS_INVALID_CONTEXT`, which is what a real `node`
+/// returns for a closed context.
+///
+/// # The pointer's lifetime
+///
+/// The `SSL_CTX` stays alive as long as the `SecureContext` object does, and the
+/// object cannot be collected while the caller holds a rooted reference to it.
+/// A `TLSWrap` keeps one (see its `TlsState`), so the pointer it took here stays
+/// valid for the wrap's whole life. A caller that did *not* root the object
+/// could have the context freed under it by a GC between this call and the next
+/// one, which is a real hazard rather than a theoretical one: `wrap.js` drops its
+/// last reference to `context.context` when the `TLSSocket` is gone, and
+/// `destroySSL` can then run in a later microtask.
+pub fn ssl_ctx_of(object: v8::Local<v8::Object>) -> Option<*mut openssl_sys::SSL_CTX> {
+    with_state(object, |context| context.as_ptr()).flatten()
+}
+
+/// The `Context`'s state pointer, for tests that need to observe `close()`.
+///
+/// Not used by any binding: `ssl_ctx_of` is the surface `tls_wrap` needs. This
+/// exists so `rn-bind-tls`'s tests can assert that a closed context reports
+/// `None` without reaching into this crate's allocation.
+pub fn is_closed(object: v8::Local<v8::Object>) -> Option<bool> {
+    with_state(object, |context| context.as_ptr().is_none())
+}
+
 /// `init(secureProtocol, minV, maxV)`.
 ///
 /// `secureProtocol` is `undefined` or a string; the versions are int32. Node

@@ -47,6 +47,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_task_queue::register(registry);
     rn_bind_tcp_wrap::register(registry);
     rn_bind_timers::register(registry);
+    rn_bind_tls::register(registry);
     rn_bind_trace_events::register(registry);
     rn_bind_tty_wrap::register(registry);
     rn_bind_udp_wrap::register(registry);
