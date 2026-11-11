@@ -189,3 +189,8 @@ fi
 printf 'restored build succeeded; %s is back\n' "$harness"
 
 printf '\nRESULT: PASS — recorded skips are skipped, pass/fail unchanged, broken build aborts\n'
+# An explicit success exit, not the status of the `printf` above. With
+# `set -uo pipefail` and no `-e`, falling off the end reports whatever the last
+# command returned, so a failing `printf` would silently turn a pass into a
+# failure and a reader would have no way to tell which verdict was intended.
+exit 0
