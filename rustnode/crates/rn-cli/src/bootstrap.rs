@@ -20,6 +20,8 @@
 use rn_js2c::builtin_by_id;
 use rn_v8_sys::v8;
 
+use crate::versions;
+
 /// The result of running the realm bootstrap.
 pub struct Bootstrapped {
     /// `internalBinding`, as `realm.js` installed it, for the CLI to call.
@@ -1274,28 +1276,28 @@ fn process_object<'s>(
     set(scope, process, "moduleLoadList", load_list.into())?;
 
     let versions = v8::Object::new(scope);
-    let v8_version =
-        v8::String::new(scope, v8::V8::get_version()).ok_or("cannot allocate the V8 version")?;
-    set(scope, versions, "v8", v8_version.into())?;
-    let node_version = v8::String::new(scope, "28.0.0").ok_or("cannot allocate a version")?;
-    set(scope, versions, "node", node_version.into())?;
-    // `lib/internal/util.js` decides at module scope whether crypto exists by
-    // reading `process.versions.openssl`: `const noCrypto =
-    // !process.versions.openssl`. Without it, `require('crypto')` throws
-    // ERR_NO_CRYPTO even though the binding is installed and working, so this
-    // has to be the version the binary actually linked, not a placeholder.
-    let openssl_version = v8::String::new(scope, &rn_bind_crypto::engine::openssl_version())
-        .ok_or("cannot allocate the OpenSSL version")?;
-    set(scope, versions, "openssl", openssl_version.into())?;
-    // The libuv the binary actually links, from `uv_version_string`. Node's test
-    // suite branches on this: `test-blocklist.js` expects an overlong zone
-    // suffix on a mixed-notation IPv6 address to parse only from libuv 1.53, so
-    // a missing value would fail with a `split` of `undefined` rather than a
-    // statement about the runtime.
-    let uv_version = rn_uv::uv_version_string()
-        .and_then(|version| v8::String::new(scope, &version))
-        .ok_or("cannot allocate the libuv version")?;
-    set(scope, versions, "uv", uv_version.into())?;
+    // Node defines each key with `v8::ReadOnly`, and
+    // `test/parallel/test-process-versions.js` asserts exactly that for every
+    // key, so the attribute is part of the contract rather than decoration.
+    for entry in versions::table() {
+        let Some(value) = v8::String::new(scope, &entry.value) else {
+            return Err(format!("cannot allocate process.versions.{}", entry.key));
+        };
+        let Some(key) = v8::String::new(scope, entry.key) else {
+            return Err("cannot allocate a version key".to_string());
+        };
+        if versions
+            .define_own_property(
+                scope,
+                key.into(),
+                value.into(),
+                v8::PropertyAttribute::READ_ONLY,
+            )
+            .is_none()
+        {
+            return Err(format!("cannot define process.versions.{}", entry.key));
+        }
+    }
     set(scope, process, "versions", versions.into())?;
 
     let version = v8::String::new(scope, "v28.0.0").ok_or("cannot allocate a version")?;

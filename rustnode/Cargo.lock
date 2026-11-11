@@ -1451,6 +1451,7 @@ dependencies = [
  "rn-bind-options",
  "rn-bind-task-queue",
  "rn-bind-timers",
+ "rn-bind-zlib",
  "rn-bindings",
  "rn-builtins",
  "rn-core",

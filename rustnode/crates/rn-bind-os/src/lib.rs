@@ -1099,11 +1099,19 @@ fn ipv6_string(bytes: &[u8; 16]) -> String {
     text
 }
 
+/// The `family` string `os.networkInterfaces()` reports for one address.
+///
+/// Node spells these `"IPv4"` / `"IPv6"` / `"<unknown>"`, from the
+/// `ipv4_string`, `ipv6_string` and `unknown_string` constants in
+/// `src/env_properties.h`, and `test/common/index.js`'s `hasIPv6` compares
+/// against `'IPv6'` exactly. A lowercase value is not a cosmetic difference:
+/// it makes `hasIPv6` false on a host that has `::1`, which skips every test
+/// behind that gate.
 fn family_field(family: i32) -> String {
     match family {
-        libc::AF_INET => "ipv4".to_string(),
-        libc::AF_INET6 => "ipv6".to_string(),
-        _ => "unknown".to_string(),
+        libc::AF_INET => "IPv4".to_string(),
+        libc::AF_INET6 => "IPv6".to_string(),
+        _ => "<unknown>".to_string(),
     }
 }
 

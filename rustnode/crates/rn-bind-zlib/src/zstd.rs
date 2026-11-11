@@ -37,6 +37,24 @@ use crate::AfterWrite;
 /// happen explicitly instead of relying on a cast that would sign-extend.
 pub const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 
+/// The zstd version the binary actually linked, as `ZSTD_versionString`
+/// reports it.
+///
+/// This is `1.5.7`, the same release Node bundles at the pin, but it is read
+/// from the linked library rather than asserted, so a dependency bump moves
+/// `process.versions.zstd` with it.
+pub fn linked_version() -> Option<String> {
+    // SAFETY: `ZSTD_versionString` returns a pointer to a static,
+    // NUL-terminated string that lives for the process.
+    let pointer = unsafe { z::ZSTD_versionString() };
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: as above; the pointer is static and NUL-terminated.
+    let text = unsafe { std::ffi::CStr::from_ptr(pointer) }.to_str().ok()?;
+    Some(text.to_string())
+}
+
 /// A zstd error in the `CompressionError` shape
 /// `onerror(message, errno, code)` expects.
 ///

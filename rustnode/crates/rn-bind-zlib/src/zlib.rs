@@ -532,6 +532,26 @@ fn zlib_version_ptr() -> *const std::ffi::c_char {
     z::zlibVersion()
 }
 
+/// The zlib version the binary actually linked, as `zlibVersion()` reports it.
+///
+/// `process.versions.zlib` is this string. It is read from the library rather
+/// than copied from a header because rustnode does not link Node's bundled
+/// zlib: `libz-rs-sys` reports `1.3.0-zlib-rs-0.6.8`, which is its own
+/// compatibility string and not a version any release of zlib carries.
+/// Publishing it is still the honest answer — it names the code the binary
+/// runs — and `test-process-versions.js` accepts the
+/// `\d+(?:\.\d+){1,3}(?:-.*)?` shape this produces.
+pub fn linked_version() -> Option<String> {
+    let pointer = zlib_version_ptr();
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: `zlibVersion` returns a pointer to a static, NUL-terminated
+    // string that lives for the process.
+    let text = unsafe { CStr::from_ptr(pointer) }.to_str().ok()?;
+    Some(text.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

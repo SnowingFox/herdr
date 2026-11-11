@@ -40,6 +40,10 @@ rn-bind-timers = { path = "../rn-bind-timers" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-napi = { path = "../rn-napi" }
+# `process.versions.zlib` and `.zstd` come from the libraries the binary
+# actually links, so the CLI asks those bindings rather than restating a
+# version string in two places.
+rn-bind-zlib = { path = "../rn-bind-zlib" }
 rn-v8-sys = { path = "../rn-v8-sys" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
