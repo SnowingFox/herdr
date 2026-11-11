@@ -1298,7 +1298,6 @@ fn the_explicit_undefined_request_slot_stays_synchronous() {
     let dir = TempDir::new("slot-sync");
     let file = dir.joined("s.txt");
     std::fs::write(&file, b"abc").expect("write");
-    let path = js_path(&file);
 
     let out = run(&format!(
         r#"
