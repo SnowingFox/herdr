@@ -19,6 +19,7 @@ pub mod hook_slot;
 pub mod host_object;
 pub mod native_immediates;
 pub mod per_context;
+pub mod profile;
 pub mod queue;
 pub mod realm;
 pub mod symbol;

@@ -120,7 +120,10 @@ thread_local! {
     /// why [`crate::values::cli_values`] can keep falling back to the table
     /// defaults: a caller that never parses a command line has to see exactly
     /// what it saw before this module existed.
-    static PARSED: RefCell<Option<Store>> = const { RefCell::new(None) };
+    ///
+    /// Shared, not owned: see [`store`] for why a clone here cost 5 ms of
+    /// startup.
+    static PARSED: RefCell<Option<std::sync::Arc<Store>>> = const { RefCell::new(None) };
 }
 
 /// Records the process's parsed option values, for every thread.
@@ -136,22 +139,40 @@ thread_local! {
 /// The thread-local is still read first so a test can install its own store
 /// without changing what the rest of the process sees.
 pub fn install(store: Store) {
-    PROCESS_STORE.get_or_init(|| std::sync::Mutex::new(store.clone()));
+    let shared = std::sync::Arc::new(store);
+    PROCESS_STORE.get_or_init(|| std::sync::Mutex::new(std::sync::Arc::clone(&shared)));
     PARSED.with(|parsed| {
-        *parsed.borrow_mut() = Some(store);
+        *parsed.borrow_mut() = Some(shared);
     });
 }
 
 /// The process's store, visible to every thread.
-static PROCESS_STORE: std::sync::OnceLock<std::sync::Mutex<Store>> = std::sync::OnceLock::new();
+static PROCESS_STORE: std::sync::OnceLock<std::sync::Mutex<std::sync::Arc<Store>>> =
+    std::sync::OnceLock::new();
 
 /// The store for this thread: its own if it installed one, else the process's.
-fn store() -> Option<Store> {
-    let installed = PARSED.with(|parsed| parsed.borrow().clone());
-    if installed.is_some() {
-        return installed;
+///
+/// # Why this hands back a shared handle and not a clone
+///
+/// It used to return `Store` by value, which deep-cloned all 251 entries on
+/// *every* lookup. [`crate::values::cli_values`] looks up one option per table
+/// entry to build its list, so a single `getCLIOptionsValues()` call did 251
+/// clones of 251 entries — and startup calls it twice, once through
+/// `BuiltinModule.allowOptionGatedBuiltins` and once through
+/// `prepareMainThreadExecution`. That was 5.1 ms of the 26 ms startup, added
+/// when the store became process-wide for worker threads (#26).
+///
+/// The handle has to be `Arc` and not `Rc` because the process-wide slot lives
+/// in a `static`, which requires `Send + Sync`.
+fn store() -> Option<std::sync::Arc<Store>> {
+    if let Some(installed) = PARSED.with(|parsed| parsed.borrow().clone()) {
+        return Some(installed);
     }
-    PROCESS_STORE.get()?.lock().ok().map(|store| store.clone())
+    PROCESS_STORE
+        .get()?
+        .lock()
+        .ok()
+        .map(|store| std::sync::Arc::clone(&store))
 }
 
 /// One option's parsed value, if the CLI installed a store.
@@ -163,7 +184,7 @@ pub fn value_of(name: &str) -> Option<ParsedValue> {
 /// Every parsed value, in table order, for a caller that wants them all.
 #[must_use]
 pub fn all_values() -> Option<Vec<(String, ParsedValue)>> {
-    store().map(|store| store.values)
+    store().map(|store| store.values.clone())
 }
 
 /// The parsed values for this process.
@@ -524,6 +545,16 @@ mod tests {
         Store::parse(&argv(items))
     }
 
+    /// Installs `store` on this thread only, leaving the process-wide slot alone.
+    ///
+    /// [`install`] also seeds `PROCESS_STORE`, which is `OnceLock`: the first
+    /// test to call it would decide what every other test in the crate sees.
+    /// These tests are about the lookup path, so they install just the part the
+    /// lookup reads first.
+    fn install_for_this_thread_only(store: Store) {
+        PARSED.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::new(store)));
+    }
+
     #[test]
     fn an_absent_option_keeps_its_default() {
         let store = parsed(&[]);
@@ -751,6 +782,55 @@ mod tests {
         assert!(!namespace_seen(
             &argv(&["--no-warnings"]),
             OptionNamespace::Bench
+        ));
+    }
+
+    /// Installing must share one store rather than hand out copies.
+    ///
+    /// The lookup used to return `Store` by value, which deep-cloned all 251
+    /// entries per call. `cli_values()` looks one option up per table entry, so
+    /// a single `getCLIOptionsValues()` did 251 clones of 251 entries, and
+    /// startup calls it twice — 5.1 ms of a 26 ms startup. A clone is also a
+    /// correctness hazard in its own right: a copy taken before a later
+    /// [`Store::set`] cannot see the correction, so this pins identity and not
+    /// only the cost.
+    ///
+    /// The install here touches only this thread's slot. The rest of this
+    /// module's tests assert what an *uninstalled* process reports, so a test
+    /// that populated the process-wide store would change their answer
+    /// depending on which test ran first.
+    #[test]
+    fn a_lookup_hands_back_a_shared_store_rather_than_a_copy() {
+        install_for_this_thread_only(parsed(&["--experimental-bench"]));
+
+        let first = store().expect("a store was installed");
+        let second = store().expect("the second lookup still finds it");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "two lookups must observe one store, not two deep copies"
+        );
+        assert_eq!(
+            first.value_of("--experimental-bench"),
+            Some(ParsedValue::Bool(true))
+        );
+    }
+
+    /// `all_values` must keep reporting every parsed entry.
+    ///
+    /// Its caller is `getCLIOptionsValues`, whose whole contract is the parsed
+    /// table, so a shared handle that accidentally returned an empty vector
+    /// would pass the identity test above and still be wrong.
+    #[test]
+    fn all_values_still_reports_every_parsed_entry() {
+        let store = parsed(&["--experimental-bench"]);
+        let expected = store.values.len();
+        assert!(expected > 0, "a parsed store is not empty");
+        install_for_this_thread_only(store);
+
+        let values = all_values().expect("a store was installed");
+        assert_eq!(values.len(), expected);
+        assert!(values.iter().any(
+            |(name, value)| name == "--experimental-bench" && *value == ParsedValue::Bool(true)
         ));
     }
 }

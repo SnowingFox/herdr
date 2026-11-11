@@ -635,3 +635,62 @@ fn no_per_context_global_is_enumerable() {
          false\nfalse\nfalse"
     );
 }
+
+#[test]
+fn a_worker_reads_the_option_values_this_process_was_started_with() {
+    // `internal/options.js` memoizes `getCLIOptionsValues()` on first read, and
+    // the store behind it is process-wide because the command line describes the
+    // process rather than one thread. That is not cosmetic: when the store was
+    // per-thread, a worker fell back to the table defaults and took the
+    // TypeScript path because `--strip-types` was back at its recorded `true`,
+    // which threw `ERR_NO_TYPESCRIPT` from a worker's first `eval`.
+    //
+    // The value checked is one the runtime *corrects* rather than parses: `main`
+    // forces `--strip-types` to false because no amaro is vendored. A worker that
+    // read a fresh copy of the table instead of this process's store would report
+    // `true`, so this distinguishes inheritance from an identical default.
+    let dir = std::env::temp_dir().join(format!("rustnode-worker-options-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let worker = dir.join("worker.js");
+    std::fs::write(
+        &worker,
+        "const { getOptionValue } = require('internal/options');\n\
+         const { parentPort } = require('worker_threads');\n\
+         parentPort.postMessage(String(getOptionValue('--strip-types')));\n",
+    )
+    .expect("worker script");
+
+    let main = dir.join("main.js");
+    std::fs::write(
+        &main,
+        format!(
+            "const {{ Worker }} = require('worker_threads');\n\
+             const worker = new Worker({worker:?}, {{ argv: [] }});\n\
+             worker.on('message', (value) => console.log('worker:' + value));\n\
+             worker.on('error', (error) => {{ console.error(error); process.exitCode = 1; }});\n",
+            worker = worker.to_string_lossy(),
+        ),
+    )
+    .expect("main script");
+
+    let out = rustnode(&["--expose-internals", main.to_string_lossy().as_ref()]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Not an exact match on stdout: starting a worker also emits a `tracing`
+    // warning about the inspector namespace, and that warning is not this test's
+    // subject. The line under test is the one the worker posted back.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let reported: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("worker:"))
+        .collect();
+    assert_eq!(
+        reported,
+        vec!["worker:false"],
+        "a worker must inherit this process's corrected option values; stdout: {stdout}"
+    );
+}

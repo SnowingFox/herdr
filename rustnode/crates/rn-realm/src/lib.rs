@@ -1271,6 +1271,7 @@ pub fn bootstrap_realm(
 
     let primordials = v8::Object::new(scope);
     run_per_context(scope, primordials)?;
+    rn_core::profile::mark("primordials");
 
     let process = process_object(scope, script_args, exec_argv)?;
     set_global(scope, global, "process", process.into())?;
@@ -1305,6 +1306,7 @@ pub fn bootstrap_realm(
             .unwrap_or_default();
         return Err(format!("internal/bootstrap/realm threw: {message}"));
     }
+    rn_core::profile::mark("realm.js executed");
 
     // `require` is what user code and the CLI both need, so it becomes a global
     // the same way Node exposes it to a CommonJS module.

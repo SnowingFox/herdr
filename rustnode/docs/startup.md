@@ -136,6 +136,75 @@ After the cache the same profile reads: V8 bring-up 2.4 ms, `Isolate::new`
 0.8 ms, `internal/event_target` 0.8 ms, and 3.7 ms still compiling the handful of
 builtins the plan does not cover.
 
+## Measuring it again
+
+Set `RN_PROFILE_PHASES=1` and every phase reports to stderr at exit, with the
+same boundaries the table above uses plus the ones the realm bootstrap added:
+
+```bash
+RN_PROFILE_PHASES=1 ./target/release/rustnode -e ''
+```
+
+The instrument lives in `rn-core/src/profile.rs`. It is compiled in but reads
+nothing unless the variable is set: when it is unset, a mark is one cached-bool
+test, so it does not perturb the thing it measures. Report one line per mark as
+`cumulative` (from process entry) and `delta` (since the previous mark). The
+sequence is linear, not a tree, so a mark that follows a nested one shows a
+small delta and only its cumulative is meaningful.
+
+This replaced the `RN_PROFILE_PHASES` timers that lived in the CLI and were lost
+when `rn-cli` was refactored into `rn-realm`. Without them a regression could be
+attributed to a commit by bisecting medians but not to a *phase*, which is
+exactly what happened to the 5 ms that `#26` added: two hand-checked mechanisms
+(binary size, the widened `has_external_work` predicate) were both wrong.
+
+## The `#26` startup regression: an O(n²) option lookup
+
+`#26` (worker_threads) moved the parsed option store from a thread-local
+`Store` to a process-wide one so a worker inherits the parent's command line.
+The accessor kept its old signature, `fn store() -> Option<Store>`, and gained a
+`.clone()` to satisfy the `OnceLock`:
+
+```rust
+PROCESS_STORE.get()?.lock().ok().map(|store| store.clone())
+```
+
+A `Store` holds 251 `(String, ParsedValue)` entries, so every lookup deep-cloned
+the entire table. `values::cli_values()` calls `value_of` **once per option** to
+build the list `getCLIOptionsValues()` returns, so one call did 251 clones of
+251 entries. Startup calls it twice — once through
+`BuiltinModule.allowOptionGatedBuiltins`, once through
+`prepareMainThreadExecution` — which measured as 2.6 ms + 2.5 ms.
+
+The phase report named it directly: `allow_option_gated_builtins` went from
+0.33 ms to 2.90 ms and `prepare_execution` from 1.18 ms to 3.85 ms across the
+`#26` boundary, while every other phase was flat.
+
+The fix hands back an `Arc<Store>` instead of a `Store`, so both lookups observe
+one allocation. `Arc` rather than `Rc` because the process-wide slot is a
+`static`. Worker inheritance is unchanged, and
+`a_worker_reads_the_option_values_this_process_was_started_with` in
+`rn-cli/tests/m0_foundation.rs` pins it: it reads `--strip-types`, a value the
+runtime *corrects* rather than parses, so a worker that fell back to a fresh
+copy of the table would report `true`.
+
+Measured on one machine in one session, both binaries interleaved in a single
+batch, 80 runs each, `-e ''`, release build:
+
+| binary | median | min | p25 | vs node |
+| --- | --- | --- | --- | --- |
+| node | 22.10 ms | 18.50 ms | 20.59 ms | — |
+| before `#26` (`05c691b2`) | 28.32 ms | 25.62 ms | 27.41 ms | 0.78x |
+| master `c236ee9c` | 33.11 ms | 30.19 ms | 32.22 ms | 0.67x |
+| master + this fix | 27.43 ms | 24.80 ms | 26.67 ms | 0.81x |
+
+The fix recovers 5.4–5.7 ms depending on the batch, which is the whole
+regression and slightly more (the residual difference against `05c691b2` is
+inside this machine's spread). It does **not** close the remaining ~5.5 ms gap
+to node; that is separate work.
+
+## What is left (continued)
+
 The structural fix beyond this is a V8 startup snapshot: build primordials, the
 realm bootstrap and the builtin table once, then `Context::from_snapshot`. The
 `v8` crate exposes `Isolate::snapshot_creator`, `SnapshotCreator::set_default_context`
