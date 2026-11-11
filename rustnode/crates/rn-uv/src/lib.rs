@@ -43,6 +43,38 @@ pub mod threadpool;
 pub mod uv_loop;
 pub mod wake;
 
+/// Serialises the unit tests whose subject is process-global state.
+///
+/// Several modules here keep counters that are deliberately process-wide —
+/// `ledger`'s created/closed totals and `threadpool`'s in-flight list — and their
+/// tests assert on absolute values after resetting or registering. Cargo runs
+/// unit tests on separate threads by default, so two such tests interleave:
+/// both reset, both record, and one then reads the other's writes and fails with
+/// an assertion that says nothing about the code.
+///
+/// Measured before this existed: 5 failures in 40 runs of `cargo test -p rn-uv
+/// --lib -- --test-threads=8`, and 0 in 10 serial runs. A gate that reddens at
+/// random is worse than one that does not run, because the failure is
+/// indistinguishable from a real one and the habit it teaches is to re-run.
+///
+/// This is one lock for the whole crate rather than one per module: the ledger
+/// and the threadpool are independent, but a single lock cannot be defeated by a
+/// future test that touches both, and the serialised section is microseconds.
+#[cfg(test)]
+pub(crate) static GLOBAL_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`GLOBAL_STATE`] for the duration of a test that measures it.
+///
+/// Recovers from a poisoned lock: a panic inside one such test would otherwise
+/// poison the mutex and turn every later test into a second, unrelated failure
+/// that buries the first.
+#[cfg(test)]
+pub(crate) fn global_state_guard() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub use libuv_sys2 as sys;
 
 /// The libuv version the binary linked, as `uv_version_string` reports it.

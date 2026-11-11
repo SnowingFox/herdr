@@ -142,8 +142,12 @@ pub fn reset() {
 mod tests {
     use super::*;
 
+    /// Both cases below call `reset()` and then assert absolute counts on
+    /// process-wide atomics, so they cannot run concurrently with each other or
+    /// with `threadpool`'s registry tests. See [`crate::GLOBAL_STATE`].
     #[test]
     fn the_ledger_counts_creation_and_close_separately() {
+        let _serialised = crate::global_state_guard();
         reset();
         assert!(snapshot().is_clean(), "an empty ledger is clean");
         let starting = thread_snapshot();
@@ -179,6 +183,7 @@ mod tests {
 
     #[test]
     fn the_process_totals_move_with_the_thread_totals() {
+        let _serialised = crate::global_state_guard();
         reset();
         record_created();
         let process = snapshot();
