@@ -535,6 +535,9 @@ fn schedule<'s, J: FsJob>(
     IN_FLIGHT.with(|slot| {
         slot.borrow_mut().insert(request as usize);
     });
+    // Also visible to the exit path, which cancels it if `process.exit()` runs
+    // while this job is still queued.
+    rn_uv::threadpool::register(request);
 
     // SAFETY: `loop_pointer` is the process loop, which outlives the request;
     // `request` is heap-allocated and stays valid until the after-work callback
@@ -555,6 +558,7 @@ fn schedule<'s, J: FsJob>(
     // freed here and the refusal is reported inline, which keeps `run()`'s
     // contract: either it returns an error or `ondone` is called exactly once.
     IN_FLIGHT.with(|slot| slot.borrow_mut().remove(&(request as usize)));
+    rn_uv::threadpool::unregister(request);
     // SAFETY: neither box was handed on; libuv took no ownership on failure.
     unsafe {
         drop(Box::from_raw(state));
@@ -599,6 +603,7 @@ unsafe extern "C" fn after_work_trampoline<J: FsJob>(
     // here, exactly once, now that no other callback will use them.
     let state = unsafe { Box::from_raw((*request).data as *mut Queued<J>) };
     IN_FLIGHT.with(|slot| slot.borrow_mut().remove(&(request as usize)));
+    rn_uv::threadpool::unregister(request);
     unsafe { drop(Box::from_raw(request)) };
 
     // `UV_ECANCELED` means the loop shut down before the work ran. Node returns

@@ -365,10 +365,22 @@ fn really_exit(
     let _ = std::io::stderr().flush();
 
     if rn_bind_worker::realm_facts().is_main_thread {
+        // `lib/internal/process/per_thread.js::exit` has already emitted 'exit',
+        // and this is the point Node's `Environment::ExitEnv` stops the
+        // threadpool. Doing it before `exit(3)` is what puts the worker join
+        // ahead of the `atexit` handlers and `.fini_array` destructors that free
+        // the process-wide state a running job is still using. See
+        // `rn_uv::threadpool`.
+        //
+        // Only the main thread drains: the threadpool is process-global, so a
+        // worker doing this would shut down the pool its parent is still using.
+        rn_uv::threadpool::drain();
         std::process::exit(code);
     }
     // In a worker: record the code where the parent will read it, mark the realm
     // as exiting so `process.exit()` cannot run twice, and let the loop stop.
+    // The realm's own teardown (`rn-bind-worker`'s `teardown`) closes this
+    // thread's loop; it must not touch the process-wide threadpool.
     rn_bind_worker::record_worker_exit_code(scope, code);
     rn_core::hook_slot::set_flag(scope, rn_core::hook_slot::EXIT_REQUESTED, true);
 }

@@ -15,7 +15,7 @@ fn main() {
 
     if let Err(message) = rn_v8_sys::check_linked_v8() {
         eprintln!("rustnode: {message}");
-        std::process::exit(1);
+        terminate(1);
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -35,7 +35,7 @@ fn main() {
         Ok(options) => options,
         Err(message) => {
             eprintln!("rustnode: {message}");
-            std::process::exit(9);
+            terminate(9);
         }
     };
     // A flag whose feature has not landed must not pass silently, or a test
@@ -65,7 +65,7 @@ fn main() {
                 "rustnode: --allow-env must be '*', a variable name, or a \
                  variable name prefix followed by '*'"
             );
-            std::process::exit(9);
+            terminate(9);
         }
         if options.permission_config.audit {
             let denied = rn_permission::env::record_audited(&allow_env);
@@ -190,14 +190,14 @@ fn main() {
             }
             Err(message) => {
                 eprintln!("rustnode: {message}");
-                std::process::exit(9);
+                terminate(9);
             }
         }
     }
 
     if let Err(message) = bootstrap::install_globals(scope, &args) {
         eprintln!("rustnode: {message}");
-        std::process::exit(1);
+        terminate(1);
     }
 
     // `process.argv` is `[execPath, scriptPath?, ...scriptArgs]`. Node puts the
@@ -363,7 +363,7 @@ fn main() {
         // the emit made `process.on('exit', ...)` fire for every kind of exit
         // except the most common failure a script has.
         let code = rn_realm::runtime::emit_exit_after_failure(scope);
-        std::process::exit(if code == 0 { 1 } else { code });
+        terminate(if code == 0 { 1 } else { code });
     }
 
     if print_result {
@@ -398,7 +398,7 @@ fn main() {
                 let exception = entry.result(scope);
                 eprintln!("Uncaught {}", exception.to_rust_string_lossy(scope));
                 hooks.drain(scope);
-                std::process::exit(1);
+                terminate(1);
             }
         }
         match rn_realm::run_loop(scope, hooks) {
@@ -433,8 +433,27 @@ fn main() {
     // An uncaught exception asks for 1 unless the exit handlers replaced that
     // with a code of their own, which is the order Node applies.
     if exit_requested || rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED) {
-        std::process::exit(if code == 0 { 1 } else { code });
+        terminate(if code == 0 { 1 } else { code });
     }
+    terminate(code);
+}
+
+/// Ends the process, draining libuv's threadpool first.
+///
+/// Every exit in this file goes through here rather than calling
+/// `std::process::exit` directly, because returning from `main` reaches the same
+/// C-runtime exit sequence: `atexit` handlers, then `.fini_array` destructors.
+/// OpenSSL's `OPENSSL_cleanup` is an `atexit` handler that frees process-wide
+/// state, and libuv joins its workers in a destructor, so a pool thread still
+/// inside a crypto job would run against freed memory. [`rn_uv::threadpool::drain`]
+/// cancels what is still queued and joins the workers while that state is intact.
+///
+/// This is the last step, after `exit` has been emitted: it stops the threadpool
+/// and terminates, and nothing observable to JavaScript runs in between. The cost
+/// is bounded by one in-flight job, not by the queue: see that module's notes on
+/// why this is a drain rather than a wait.
+fn terminate(code: i32) -> ! {
+    rn_uv::threadpool::drain();
     std::process::exit(code);
 }
 
@@ -449,7 +468,7 @@ fn evaluate_script<'s>(
 ) -> (Option<v8::Local<'s, v8::Value>>, Option<String>) {
     let Some(name) = v8::String::new(scope, "evalmachine.<anonymous>") else {
         eprintln!("rustnode: cannot allocate script name");
-        std::process::exit(1);
+        terminate(1);
     };
     let origin = v8::ScriptOrigin::new(
         scope,
@@ -466,7 +485,7 @@ fn evaluate_script<'s>(
     );
     let Some(code) = v8::String::new(scope, source) else {
         eprintln!("rustnode: input contains invalid UTF-8");
-        std::process::exit(1);
+        terminate(1);
     };
     let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
     let scope = &mut try_catch.init();

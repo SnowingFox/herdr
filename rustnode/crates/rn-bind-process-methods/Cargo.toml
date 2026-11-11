@@ -18,4 +18,8 @@ rn-v8-sys.workspace = true
 # `process.dlopen` is the addon loader's public entry point, so this namespace
 # owns the call into rn-napi rather than the CLI threading it through.
 rn-napi = { path = "../rn-napi" }
+# `process.reallyExit` is where Node stops the libuv threadpool before the C
+# runtime's exit sequence frees the state a running job is still using, so the
+# drain has to happen here rather than in a destructor.
+rn-uv.workspace = true
 libc.workspace = true
