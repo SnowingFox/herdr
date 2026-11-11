@@ -53,8 +53,47 @@ mod state;
 mod templates;
 
 pub use handle::read_key_from_js;
-pub use install::{install_classes, MEMBERS};
+pub use install::{buffer_from, install_classes, MEMBERS};
 pub use state::{KeyData, KeyType};
+
+/// Builds a `KeyObjectHandle` over a public key, for crates that hand one back.
+///
+/// `X509Certificate#publicKey()` and `parsePKCS12` both return a handle, and both
+/// are outside this crate. Exposing the constructor is deliberate: the alternative
+/// is either a second `KeyObjectHandle` implementation or for X.509 to reach into
+/// this crate's internals, and a duplicate handle class would break
+/// `instanceof KeyObjectHandle` — which `keys.js` checks.
+pub fn create_public_handle<'s>(
+    scope: &mut rn_v8_sys::v8::PinScope<'s, '_>,
+    key: rn_crypto_openssl::PKey,
+) -> Option<rn_v8_sys::v8::Local<'s, rn_v8_sys::v8::Object>> {
+    let data = KeyData::asymmetric(KeyType::Public, key)?;
+    install::create_handle(scope, data)
+}
+
+/// Builds a `KeyObjectHandle` over a private key, for `parsePKCS12`.
+///
+/// The same reasoning as [`create_public_handle`]: the handle class must be this
+/// crate's, because `keys.js` checks `handle instanceof KeyObjectHandle`.
+pub fn create_private_handle<'s>(
+    scope: &mut rn_v8_sys::v8::PinScope<'s, '_>,
+    key: rn_crypto_openssl::PKey,
+) -> Option<rn_v8_sys::v8::Local<'s, rn_v8_sys::v8::Object>> {
+    let data = KeyData::asymmetric(KeyType::Private, key)?;
+    install::create_handle(scope, data)
+}
+
+/// Reads the `KeyData` a `KeyObjectHandle` holds.
+///
+/// `X509Certificate#checkPrivateKey()` and `#verify()` take a handle from
+/// `x509.js`, which obtained it with `getKeyObjectHandle(key)`. This is the one
+/// supported way to read it without exposing the handle's internal fields.
+pub fn key_of_handle(
+    scope: &mut rn_v8_sys::v8::PinScope<'_, '_>,
+    handle: rn_v8_sys::v8::Local<rn_v8_sys::v8::Object>,
+) -> Option<KeyData> {
+    templates::with_key_data(scope, handle, KeyData::clone)
+}
 
 /// The `kKeyType*`, `kCryptoJob*` and curve-encoding values this crate reads.
 ///

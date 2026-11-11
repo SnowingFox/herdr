@@ -103,12 +103,7 @@ pub fn is_safe_alt_name(value: &[u8], option: AltNameOption) -> bool {
 ///   `othername:"XmppAddr:good.example.com\u0000abc123"` with the label inside
 ///   the quotes. That is `PrintGeneralName`'s `GEN_OTHERNAME` branch, which is
 ///   the only caller that hands `PrintAltName` a non-null prefix.
-pub fn push_alt_name(
-    out: &mut String,
-    value: &[u8],
-    option: AltNameOption,
-    prefix: Option<&str>,
-) {
+pub fn push_alt_name(out: &mut String, value: &[u8], option: AltNameOption, prefix: Option<&str>) {
     if is_safe_alt_name(value, option) {
         // Safe names are appended unchanged, for backward compatibility.
         if let Some(prefix) = prefix {
@@ -323,7 +318,12 @@ mod tests {
         // The prefix is written before the value is quoted, so the quotes wrap
         // the value and not the `URI:` label — `URI:"http://…/a\u002cb"`.
         let mut out = String::from("URI:");
-        push_alt_name(&mut out, b"http://example.com/a,b", AltNameOption::None, None);
+        push_alt_name(
+            &mut out,
+            b"http://example.com/a,b",
+            AltNameOption::None,
+            None,
+        );
         assert_eq!(out, "URI:\"http://example.com/a\\u002cb\"");
     }
 
@@ -332,7 +332,12 @@ mod tests {
         // `%2C` is three safe bytes, so it must not be quoted; the test asserts
         // exactly this because it looks like a comma.
         let mut out = String::from("URI:");
-        push_alt_name(&mut out, b"http://example.com/a%2Cb", AltNameOption::None, None);
+        push_alt_name(
+            &mut out,
+            b"http://example.com/a%2Cb",
+            AltNameOption::None,
+            None,
+        );
         assert_eq!(out, "URI:http://example.com/a%2Cb");
     }
 
@@ -351,7 +356,12 @@ mod tests {
         // survive as UTF-8, not be escaped byte by byte. It still needs quoting
         // because of the comma.
         let mut out = String::from("DirName:");
-        push_alt_name(&mut out, "München, evil".as_bytes(), AltNameOption::Utf8, None);
+        push_alt_name(
+            &mut out,
+            "München, evil".as_bytes(),
+            AltNameOption::Utf8,
+            None,
+        );
         assert_eq!(out, "DirName:\"München\\u002c evil\"");
     }
 
