@@ -34,6 +34,19 @@ step "the binding matcher still classifies crates correctly"
 # able to fail this gate rather than being runnable only by hand.
 ./tools/regen-bindings.test.sh
 
+step "every opt-in control still has a verdict to report"
+# The controls that build the CLI or drive a real Node surface stay opt-in,
+# because running them all here would add minutes to every commit. What does not
+# stay opt-in is the property that makes them worth having: that each one
+# distinguishes success from failure by exit status rather than by printing.
+# `cipher-negative-control.sh` shipped documenting exit 2 while exiting 1, and
+# nothing caught it because nothing read the script at all. This reads every
+# control without running it, and self-tests against the defect shapes so the
+# check itself cannot rot into a string of oks.
+#
+# A bare statement, for the same reason as the line above.
+./tools/controls.test.sh
+
 step "regenerating the binding registry"
 ./tools/regen-bindings.sh
 
