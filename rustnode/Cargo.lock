@@ -898,6 +898,7 @@ dependencies = [
  "rn-bind-crypto-keys",
  "rn-bind-crypto-sign",
  "rn-bind-crypto-x509",
+ "rn-bind-secure-context",
  "rn-core",
  "rn-v8-sys",
  "serde_json",

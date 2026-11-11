@@ -28,6 +28,10 @@ rn-bind-crypto-x509 = { path = "../rn-bind-crypto-x509" }
 # DH and keys classes are: Node aggregates a dozen translation units onto one
 # `target`, and the crate split follows the translation unit.
 rn-bind-crypto-sign = { path = "../rn-bind-crypto-sign" }
+# `SecureContext` from `src/crypto/crypto_context.cc`. A separate crate like the
+# others, and installed onto this namespace object for the same reason: Node's
+# `node_crypto.cc` aggregates every `Initialize` onto one `target`.
+rn-bind-secure-context = { path = "../rn-bind-secure-context" }
 # Real OpenSSL, compiled from source. This is deliberate and load-bearing: the
 # whole premise of rustnode is that only the native glue is rewritten, so every
 # digest, MAC, cipher and derivation has to be the same code Node runs. A

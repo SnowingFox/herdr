@@ -127,6 +127,26 @@ fn secure_context_binding_end_to_end() {
                   return a !== b; })()",
         "true",
     );
+    // A call without `new` must be a no-op returning `undefined`, as Node's `New`
+    // is. V8 hands a plain callback the global object as `this`, and that object
+    // has no internal fields, so writing one aborts the process with
+    // `Check failed: Internal field out of bounds` — measured at 100 of 100 runs
+    // before the `new.target` guard. This case would have caught it, and it has
+    // to be a `check!` rather than a direct call so a regression reports a
+    // failure instead of killing the test binary.
+    check!(
+        scope,
+        "call without new returns undefined",
+        "binding.SecureContext()",
+        "undefined",
+    );
+    check!(
+        scope,
+        "call without new leaves the class usable",
+        "(() => { binding.SecureContext(); \
+                  return new binding.SecureContext() instanceof binding.SecureContext; })()",
+        "true",
+    );
 
     // Node installs 27 prototype methods plus the `_external` accessor. A
     // missing one makes `configSecureContext` throw

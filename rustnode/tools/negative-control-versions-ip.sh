@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Negative control for the versions/IP-family change.
 #
-# The guard has to prove three things, in this order:
+# The guard has to prove four things, in this order:
 #
 #   1. The measured binary was built by *this* invocation. Cargo hardlinks a
 #      previously built artifact out of `target/debug/deps` and preserves its
@@ -15,6 +15,33 @@
 #      as `mod versions;` and `bootstrap.rs` calls, so it is genuinely compiled.
 #      A file that nothing references would compile away and the control would
 #      be vacuous.
+#   4. The tree is restored byte-for-byte, and that is *checked*. The snapshot
+#      it compares against outlives the restore, so the check can fail; an
+#      earlier version compared against a file `restore()` had just deleted and
+#      swallowed the result with `|| true`, which could never fail at all.
+#
+# Exit codes: 0 the control behaved as required, 1 the control misbehaved (a
+# check it asserts about the runtime failed), 3 no verdict (the build or the
+# restore could not be completed, so the measurement says nothing about the
+# runtime).
+#
+# These match `tools/cipher-negative-control.sh`, whose header states the same
+# contract.
+# `1` versus `3` is the distinction between "the runtime did the wrong thing"
+# and "this run cannot tell you". A restore that fails after deleting its own
+# backup fits neither of the first two answers, so it exits 3 and says the tree
+# is suspect.
+#
+# The success path ends with an explicit `exit 0`. Letting the script fall off
+# the end makes its status whatever the last command returned, so a later edit
+# could leave it printing PASS while exiting non-zero.
+#
+# The victim is mutated in place, so an interrupted run would otherwise leave a
+# deliberately broken source file behind. Four things prevent that: `restore`
+# is the EXIT trap, `cp` and `cmp` are both checked so it cannot report success
+# after a failed copy, the backups are kept when a restore fails, and a startup
+# guard refuses to run on a tree that already contains the injected line — the
+# SIGKILL case, which no trap can catch.
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,17 +53,62 @@ export RUSTFLAGS="${RUSTFLAGS:-} -L /usr/lib/gcc/x86_64-linux-gnu/13"
 
 binary="target/debug/rustnode"
 victim="crates/rn-cli/src/versions.rs"
-backup="$(mktemp)"
-cp "$victim" "$backup"
-cleanup_ran=0
+
+# A previous run killed with SIGKILL, or the machine going down mid-build, would
+# leave the injected line in the tree with no trap able to help. Refuse to run on
+# that rather than measuring a tree that is already broken for the wrong reason.
+# Checked before the snapshot is taken, so the "original" is never the injected
+# version.
+if grep -q "compile_error!(\"negative control" "$victim"; then
+  printf 'RESULT: NO VERDICT — %s still contains the injected compile_error!\n' "$victim" >&2
+  printf 'from a previous interrupted run; restore it before running this control.\n' >&2
+  exit 3
+fi
+
+snapshot="$(mktemp)"
+if ! cp "$victim" "$snapshot" || ! cmp -s "$victim" "$snapshot"; then
+  rm -f "$snapshot"
+  printf 'RESULT: NO VERDICT — could not snapshot %s, so a restore cannot be verified\n' "$victim" >&2
+  exit 3
+fi
+
+# Modelled on `restore_self_test` in `tools/cipher-negative-control.sh`, which
+# exists in this shape because the naive version lost a source file: the copy
+# was unchecked, the backup was deleted unconditionally, and the script printed
+# success. Three properties, each load-bearing:
+#
+#   * `cp` and `cmp` are checked in one condition, so a short write is caught in
+#     the same expression that made it rather than trusted.
+#   * the comparison happens before any deletion, and the snapshot is only
+#     removed once it is known to match.
+#   * the backups are kept when a restore fails, so a recoverable tree is not
+#     turned into a lost one.
 restore() {
-  if [ "$cleanup_ran" -eq 0 ]; then
-    cp "$backup" "$victim"
-    rm -f "$backup"
-    cleanup_ran=1
+  if ! cp "$snapshot" "$victim" || ! cmp -s "$snapshot" "$victim"; then
+    printf 'RESULT: NO VERDICT — could not restore %s; the original is at %s\n' \
+      "$victim" "$snapshot" >&2
+    printf 'The tree is suspect: %s may not match its pre-run contents.\n' "$victim" >&2
+    return 1
   fi
+  rm -f "$snapshot"
+  return 0
 }
-trap restore EXIT
+
+# The wrapper's status is the trap's status. A bare `trap restore EXIT` would
+# run the function and discard whether it succeeded, which is exactly how a
+# damaged tree gets reported behind a green run.
+#
+# `restore` does not set a "already ran" flag and instead returns immediately
+# unless the snapshot still exists, so re-entry is impossible: the successful
+# path deletes the snapshot and the failed path returns 1 without deleting it,
+# and either way a second call is a no-op. Setting a flag *before* the copy, as
+# the cipher self-test does, is the other way to get this right; this control
+# uses the snapshot's existence so there is only one piece of state.
+restore_once() {
+  [ -e "$snapshot" ] || return 0
+  restore
+}
+trap 'restore_once || exit 3' EXIT
 
 fail() {
   printf 'RESULT: FAIL — %s\n' "$1"
@@ -59,7 +131,8 @@ rm -f "$binary"
 start=$(date +%s)
 
 if ! cargo build -p rn-cli >/tmp/negctl-build.log 2>&1; then
-  fail "the unmodified tree did not build; see /tmp/negctl-build.log"
+  printf 'RESULT: NO VERDICT — the unmodified tree did not build; see /tmp/negctl-build.log\n' >&2
+  exit 3
 fi
 
 [ -x "$binary" ] || fail "the build produced no $binary"
@@ -89,7 +162,6 @@ printf '\ncompile_error!("negative control: this build is supposed to fail");\n'
 rm -f "$binary"
 
 if cargo build -p rn-cli >/tmp/negctl-broken.log 2>&1; then
-  restore
   fail "the deliberately broken build SUCCEEDED, so the control proves nothing"
 fi
 
@@ -100,11 +172,16 @@ fi
 echo "--- broken build aborted (tail) ---"
 grep -E "^error" /tmp/negctl-broken.log | tail -3
 
-# --- 3. restore and prove the tree is byte-identical ------------------------
-restore
-cmp -s "$backup" "$victim" 2>/dev/null || true
+# --- 3. restore, and prove it against a snapshot that still exists ----------
+# Run it here rather than leaving it to the trap so a failure is reported as the
+# restore failure it is, before the rebuild can muddy the output.
+if ! restore; then
+  exit 3
+fi
+
 if ! cargo build -p rn-cli >/tmp/negctl-restore.log 2>&1; then
-  fail "the restored tree did not rebuild"
+  printf 'RESULT: NO VERDICT — the restored tree did not rebuild\n' >&2
+  exit 3
 fi
 after="$(observe)"
 echo "restored build: $after"
