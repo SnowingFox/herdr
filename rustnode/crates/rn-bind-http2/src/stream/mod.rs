@@ -270,9 +270,11 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
     }
     let payload = bytes.to_vec();
     let _ = rn_uv::callback::with_context(|scope| {
-        let Some(object) = object_for(scope, session, stream_id) else {
+        // Without a handle there is nothing to deliver to, and `in_stream_scope`
+        // below would find nothing anyway.
+        if object_for(scope, session, stream_id).is_none() {
             return;
-        };
+        }
         // `streamBaseState[kReadBytesOrError] = nread`, without which `onStreamRead`
         // sees a stale count and pushes the wrong slice.
         rn_uv::stream::with_state(|state| {
@@ -314,9 +316,9 @@ pub fn end_readable(session: &SessionState, stream_id: i32) {
 /// `'error'`.
 pub fn emit_eof(session: &SessionState, stream_id: i32) {
     let _ = rn_uv::callback::with_context(|scope| {
-        let Some(object) = object_for(scope, session, stream_id) else {
+        if object_for(scope, session, stream_id).is_none() {
             return;
-        };
+        }
         rn_uv::stream::with_state(|state| {
             state.set(rn_uv::handle::K_READ_BYTES_OR_ERROR, EOF as u32)
         });
