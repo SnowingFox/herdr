@@ -143,6 +143,13 @@ pub const HOOK_FIELDS: &[(&str, usize)] = &[
 /// `AsyncHooks::kFieldsCount`.
 pub const HOOK_FIELDS_COUNT: usize = 9;
 
+/// `fields_[kCheck] = 1`: async_hooks consistency checks are on by default.
+///
+/// `src/env.cc:2015-2020` sets this because `--no-force-async-hooks-checks`
+/// is what turns it off, not the absence of hooks. The field gates the
+/// stack-corruption comparison in `pop_async_context`.
+pub const CHECK_ENABLED: u32 = 1;
+
 /// `AsyncHooks::UidFields` in `src/env.h`.
 pub const UID_FIELDS: &[(&str, usize)] = &[
     ("kExecutionAsyncId", 0),
@@ -314,12 +321,26 @@ impl BindingModule for AsyncWrap {
         let id_array = id_fields.array(scope);
         let stack_array = ids_stack.array(scope);
 
-        // The ids start invalid and the counter starts at one, which is what
-        // `AsyncHooks` does when it creates the buffers.
-        id_fields.set_float(UID_FIELDS[0].1, INVALID_ASYNC_ID);
-        id_fields.set_float(UID_FIELDS[1].1, INVALID_ASYNC_ID);
+        // `AsyncHooks::AsyncHooks` calls `clear_async_id_stack()` before
+        // anything else, and that is what seeds the buffers:
+        //
+        //     async_id_fields_[kExecutionAsyncId] = 0;
+        //     async_id_fields_[kTriggerAsyncId] = 0;
+        //     fields_[kStackLength] = 0;
+        //
+        // (`src/env.cc:232-237`). The counter starts at one and the default
+        // trigger stays `-1`, which is the "no scope" sentinel that makes
+        // `getDefaultTriggerAsyncId` fall back to the execution id.
+        id_fields.set_float(UID_FIELDS[0].1, 0.0);
+        id_fields.set_float(UID_FIELDS[1].1, 0.0);
         id_fields.set_float(UID_FIELDS[2].1, 1.0);
         id_fields.set_float(UID_FIELDS[3].1, INVALID_ASYNC_ID);
+        // `fields_[kCheck] = 1` (`src/env.cc:2020`): async_hooks checks are
+        // always on unless `--no-force-async-hooks-checks` is passed. The flag
+        // is what enables the stack-corruption comparison in
+        // `pop_async_context`, so leaving it at zero silently disables the
+        // check that catches a mismatched push/pop pair.
+        hook_fields.set(HOOK_FIELDS[6].1, CHECK_ENABLED);
 
         STATE.with(|state| {
             *state.borrow_mut() = Some(State {
@@ -457,8 +478,19 @@ pub fn next_async_id() -> f64 {
         let Some(state) = state.as_ref() else {
             return INVALID_ASYNC_ID;
         };
-        let counter = state.id_fields.get_float(UID_FIELDS[2].1).unwrap_or(1.0);
-        state.id_fields.set_float(UID_FIELDS[2].1, counter + 1.0);
+        // `Environment::new_async_id` is a *pre*-increment:
+        //
+        //     async_id_fields()[kAsyncIdCounter] += 1;
+        //     return async_id_fields()[kAsyncIdCounter];
+        //
+        // (`src/env-inl.h:433-436`), and `newAsyncId` in
+        // `lib/internal/async_hooks.js` is `++async_id_fields[kAsyncIdCounter]`
+        // for the same reason. Returning the counter *before* advancing it
+        // handed out an id that the JavaScript side then reused for its own
+        // resource, which is how two different resources ended up sharing one
+        // id.
+        let counter = state.id_fields.get_float(UID_FIELDS[2].1).unwrap_or(1.0) + 1.0;
+        state.id_fields.set_float(UID_FIELDS[2].1, counter);
         counter
     })
 }
@@ -481,6 +513,67 @@ pub fn default_trigger_async_id() -> f64 {
         return execution_async_id();
     }
     default_trigger
+}
+
+/// Establishes the top-level execution context, Node's `{ 1, 0 }` scope.
+///
+/// Node runs the entry point inside
+///
+/// ```c
+/// // src/node.cc:287-293
+/// InternalCallbackScope callback_scope(
+///     env, Object::New(env->isolate()), { 1, 0 },
+///     InternalCallbackScope::kSkipAsyncHooks);
+/// ```
+///
+/// whose constructor calls `push_async_context(1, 0, object)`
+/// (`src/api/callback.cc:124-126`). `kSkipAsyncHooks` suppresses the `before`
+/// hook, but the push still happens, so the id every top-level resource
+/// inherits as its trigger is **1**, and `executionAsyncId()` answers 1 for the
+/// whole script body.
+///
+/// rustnode never ran that scope, so the buffers kept the values
+/// `clear_async_id_stack` seeds — execution `0` and, before that function was
+/// corrected, `-1`. Every resource created at top level therefore reported
+/// `triggerAsyncId()` as `-1`, which is what
+/// `test-async-hooks-promise.js` and its two siblings assert against.
+///
+/// `kSkipAsyncHooks` is why this does not emit a `before` hook: the scope is
+/// opened before any hook could be registered.
+pub fn push_top_level_context(scope: &mut v8::PinScope<'_, '_>) {
+    // `InternalCallbackScope` is constructed with `Object::New(isolate)` as the
+    // scope's resource and hands it to `push_async_context`, which stores it in
+    // `native_execution_async_resources_[0]`. `executionAsyncResource()` then
+    // answers that object for the whole script body — it is what makes the
+    // top-level call in `test-async-hooks-execution-async-resource.js` truthy.
+    //
+    // The JS `executionAsyncResource()` reads `execution_async_resources[index]`
+    // first and only falls back to the native accessor, so putting the object
+    // in the shared array covers both readers.
+    let resource = v8::Object::new(scope);
+    RESOURCES.with(|slot| {
+        if let Some(resources) = slot.borrow().as_ref() {
+            let resources = v8::Local::new(scope, resources);
+            resources.set_index(scope, 0, resource.into());
+        }
+    });
+    STATE.with(|state| {
+        let state = state.borrow();
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        let offset = state.hook_fields.get(HOOK_FIELDS[7].1).unwrap_or(0) as usize;
+        if offset * 2 >= ASYNC_IDS_STACK_LENGTH {
+            return;
+        }
+        let previous_execution = state.id_fields.get_float(UID_FIELDS[0].1).unwrap_or(0.0);
+        let previous_trigger = state.id_fields.get_float(UID_FIELDS[1].1).unwrap_or(0.0);
+        state.ids_stack.set_float(offset * 2, previous_execution);
+        state.ids_stack.set_float(offset * 2 + 1, previous_trigger);
+        state.hook_fields.set(HOOK_FIELDS[7].1, (offset + 1) as u32);
+        state.id_fields.set_float(UID_FIELDS[0].1, 1.0);
+        state.id_fields.set_float(UID_FIELDS[1].1, 0.0);
+    });
 }
 
 /// `AsyncHooks::provider_string`: the name `init` receives for a provider id.
@@ -733,28 +826,112 @@ fn setup_hooks(
     });
 }
 
+/// `AsyncWrap::PushAsyncContext`, the native half of the stack growth path.
+///
+/// `lib/internal/async_hooks.js` writes the pair inline while the array has
+/// room and only calls this when it does not:
+///
+/// ```js
+/// function pushAsyncContext(asyncId, triggerAsyncId, resource) {
+///   const offset = async_hook_fields[kStackLength];
+///   execution_async_resources[offset] = resource;
+///   if (offset * 2 >= async_wrap.async_ids_stack.length)
+///     return pushAsyncContext_(asyncId, triggerAsyncId);
+///   async_wrap.async_ids_stack[offset * 2] = async_id_fields[kExecutionAsyncId];
+///   async_wrap.async_ids_stack[offset * 2 + 1] = async_id_fields[kTriggerAsyncId];
+///   async_hook_fields[kStackLength]++;
+///   async_id_fields[kExecutionAsyncId] = asyncId;
+///   async_id_fields[kTriggerAsyncId] = triggerAsyncId;
+/// }
+/// ```
+///
+/// So this reads **args 0 and 1** (the new ids), and writes the *saved* pair —
+/// the currently executing ids — into the stack before installing the new ones.
+/// The two details that were wrong here:
+///
+/// * it read args 1 and 2, which are `triggerAsyncId` and `undefined`;
+/// * it stored the incoming pair instead of the previous one, so a pop restored
+///   the ids that had just been pushed rather than the ones they replaced.
 fn push_async_context(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
 ) {
-    let async_id = args.get(1).number_value(scope).unwrap_or(INVALID_ASYNC_ID);
-    let trigger_id = args.get(2).number_value(scope).unwrap_or(INVALID_ASYNC_ID);
+    // `double async_id = args[0]->NumberValue(...)`; Node does not check the
+    // type because the `CHECK_GE` below catches a non-number.
+    let async_id = args.get(0).number_value(scope).unwrap_or(INVALID_ASYNC_ID);
+    let trigger_id = args.get(1).number_value(scope).unwrap_or(INVALID_ASYNC_ID);
+    let grown = STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let state = state.as_mut()?;
+        let offset = state.hook_fields.get(HOOK_FIELDS[7].1).unwrap_or(0) as usize;
+        // `if (offset * 2 >= async_ids_stack_.Length()) grow_async_ids_stack();`
+        // `grow_async_ids_stack` is `reserve(Length() * 3)`, so a nested context
+        // 1000 frames deep costs two growths rather than one per frame.
+        let elements = state.ids_stack.len() / 8;
+        if offset * 2 >= elements {
+            let grown = state.ids_stack.reserve(scope, elements * 3).ok()?;
+            Some(grown)
+        } else {
+            None
+        }
+    });
+    // The JavaScript layer holds its own reference to the array, so a grown
+    // store has to be published or the next inline push writes into the
+    // detached one. `AsyncHooks::grow_async_ids_stack` does the same by
+    // assigning `env->async_ids_stack_string()` on the binding object.
+    if let Some(grown) = grown {
+        publish_ids_stack(scope, grown);
+    }
     STATE.with(|state| {
         let state = state.borrow();
         let Some(state) = state.as_ref() else {
             return;
         };
-        let offset = state.hook_fields.get(7).unwrap_or(0) as usize;
-        // The stack holds pairs, so it is full once twice the depth is reached.
-        if (offset + 1) * 2 > ASYNC_IDS_STACK_LENGTH {
+        let offset = state.hook_fields.get(HOOK_FIELDS[7].1).unwrap_or(0) as usize;
+        let elements = state.ids_stack.len() / 8;
+        if offset * 2 >= elements {
             return;
         }
-        state.ids_stack.set_float(offset * 2, async_id);
-        state.ids_stack.set_float(offset * 2 + 1, trigger_id);
+        // The saved pair is what a pop restores, so it is the *outgoing*
+        // context, not the incoming one.
+        let previous_execution = state
+            .id_fields
+            .get_float(UID_FIELDS[0].1)
+            .unwrap_or(INVALID_ASYNC_ID);
+        let previous_trigger = state
+            .id_fields
+            .get_float(UID_FIELDS[1].1)
+            .unwrap_or(INVALID_ASYNC_ID);
+        state.ids_stack.set_float(offset * 2, previous_execution);
+        state.ids_stack.set_float(offset * 2 + 1, previous_trigger);
         // `async_hook_fields[kStackLength]` is the depth, which JavaScript reads.
-        state.hook_fields.set(7, (offset + 1) as u32);
+        state.hook_fields.set(HOOK_FIELDS[7].1, (offset + 1) as u32);
+        // Installing the new context is what makes `executionAsyncId()` inside
+        // the callback answer the resource the callback runs for.
+        state.id_fields.set_float(UID_FIELDS[0].1, async_id);
+        state.id_fields.set_float(UID_FIELDS[1].1, trigger_id);
     });
+}
+
+/// Replaces `async_ids_stack` on the namespace object with a grown array.
+fn publish_ids_stack(scope: &mut v8::PinScope<'_, '_>, grown: v8::Local<'_, v8::Value>) {
+    let Some(binding) = rn_core::hook_slot::internal_binding(scope) else {
+        return;
+    };
+    let Some(name) = v8::String::new(scope, "async_wrap") else {
+        return;
+    };
+    let Some(namespace) = binding.call(scope, v8::undefined(scope).into(), &[name.into()]) else {
+        return;
+    };
+    let Ok(namespace) = v8::Local::<v8::Object>::try_from(namespace) else {
+        return;
+    };
+    let Some(key) = v8::String::new(scope, "async_ids_stack") else {
+        return;
+    };
+    namespace.set(scope, key.into(), grown);
 }
 
 fn pop_async_context(
@@ -768,19 +945,48 @@ fn pop_async_context(
         let Some(state) = state.as_ref() else {
             return false;
         };
-        let depth = state.hook_fields.get(7).unwrap_or(0) as usize;
+        let depth = state.hook_fields.get(HOOK_FIELDS[7].1).unwrap_or(0) as usize;
         if depth == 0 {
             return false;
         }
-        let top = state
+        // `AsyncHooks::pop_async_context`: the pair lives at `depth - 1`, *two*
+        // slots per entry, so the execution id is at `2 * (depth - 1)` and the
+        // trigger id one past it.
+        //
+        // This used to read `ids_stack[depth - 1]`, the trigger id of the
+        // previous frame, so the corruption check compared against the wrong
+        // number and a legitimate pop was refused.
+        let offset = depth - 1;
+        let saved_execution = state
             .ids_stack
-            .get_float(depth - 1)
+            .get_float(offset * 2)
             .unwrap_or(INVALID_ASYNC_ID);
-        if top != expected {
-            return false;
+        let saved_trigger = state
+            .ids_stack
+            .get_float(offset * 2 + 1)
+            .unwrap_or(INVALID_ASYNC_ID);
+        // `if (kCheck > 0 && async_id_fields[kExecutionAsyncId] != async_id)`
+        // is `FailWithCorruptedAsyncStack` in Node. A mismatch is reported
+        // rather than aborting, and the pop still happens: refusing to pop
+        // would leak the frame and leave `executionAsyncId()` answering an id
+        // whose callback has already returned.
+        let current = state
+            .id_fields
+            .get_float(UID_FIELDS[0].1)
+            .unwrap_or(INVALID_ASYNC_ID);
+        if current != expected {
+            tracing::error!(
+                expected,
+                actual = current,
+                "async_wrap: async hook stack has become corrupted"
+            );
         }
-        state.hook_fields.set(7, (depth - 1) as u32);
-        true
+        state.hook_fields.set(HOOK_FIELDS[7].1, offset as u32);
+        state.id_fields.set_float(UID_FIELDS[0].1, saved_execution);
+        state.id_fields.set_float(UID_FIELDS[1].1, saved_trigger);
+        // The return value is `fields_[kStackLength] > 0` *after* the pop, i.e.
+        // whether a frame remains — not whether the id matched.
+        offset > 0
     });
     rv.set(v8::Boolean::new(scope, matched).into());
 }
@@ -791,9 +997,20 @@ fn clear_async_id_stack(
     _rv: v8::ReturnValue,
 ) {
     let _ = scope;
+    // `AsyncHooks::clear_async_id_stack` resets the ids as well as the depth:
+    //
+    //     async_id_fields_[kExecutionAsyncId] = 0;
+    //     async_id_fields_[kTriggerAsyncId] = 0;
+    //     fields_[kStackLength] = 0;
+    //
+    // (`src/env.cc:232-237`). Only the depth was reset here, so a fatal
+    // exception left the execution id pointing at a resource whose callback had
+    // already unwound.
     STATE.with(|state| {
         if let Some(state) = state.borrow().as_ref() {
-            state.hook_fields.set(7, 0);
+            state.hook_fields.set(HOOK_FIELDS[7].1, 0);
+            state.id_fields.set_float(UID_FIELDS[0].1, 0.0);
+            state.id_fields.set_float(UID_FIELDS[1].1, 0.0);
         }
     });
 }

@@ -1447,6 +1447,7 @@ dependencies = [
 name = "rn-cli"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-async-wrap",
  "rn-bind-crypto",
  "rn-bind-heap-utils",
  "rn-bind-messaging",

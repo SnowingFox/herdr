@@ -160,6 +160,50 @@ impl AliasedUint8Array {
         v8::Local::new(scope, &self.array)
     }
 
+    /// Grows the buffer to `elements` elements, copying what is there.
+    ///
+    /// This is `AliasedBufferBase::reserve` (`src/aliased_buffer-inl.h:205`):
+    /// a new backing store, the old contents copied into it, a new typed array
+    /// over the new store, and the old array replaced. Node grows the async id
+    /// stack this way when a nested context outgrows the initial sixteen.
+    ///
+    /// Returns the new typed array so the caller can republish it, which is
+    /// what `AsyncHooks::grow_async_ids_stack` does by assigning
+    /// `env->async_ids_stack_string()` on the binding object.
+    pub fn reserve<'s>(
+        &mut self,
+        scope: &mut v8::PinScope<'s, '_>,
+        elements: usize,
+    ) -> Result<v8::Local<'s, v8::Value>, String> {
+        if elements <= self.length / self.element.width() {
+            return Ok(v8::Local::new(scope, &self.array));
+        }
+        let length = elements * self.element.width();
+        let backing_store = v8::ArrayBuffer::new_backing_store_from_boxed_slice(
+            vec![0u8; length].into_boxed_slice(),
+        );
+        let backing_store: v8::SharedRef<v8::BackingStore> = backing_store.into();
+        let buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
+        let array = self
+            .element
+            .array(scope, buffer, elements)
+            .ok_or("cannot allocate the grown aliased typed array")?;
+        let data = buffer
+            .data()
+            .map(|data| data.as_ptr().cast::<u8>())
+            .ok_or("the grown backing store has no data pointer")?;
+        // SAFETY: both pointers are inside allocations of at least
+        // `min(old, new)` bytes, and the old store is still alive because the
+        // `Global` has not been replaced yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data.get(), data, self.length.min(length));
+        }
+        self.array = v8::Global::new(scope, array);
+        self.data = Cell::new(data);
+        self.length = length;
+        Ok(v8::Local::new(scope, &self.array))
+    }
+
     /// How many bytes the store holds.
     pub fn len(&self) -> usize {
         self.length
