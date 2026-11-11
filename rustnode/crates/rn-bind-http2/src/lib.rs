@@ -52,11 +52,17 @@
 //! the linked library rather than copied from the pin, so the published version is
 //! always the code the binary actually runs.
 
+pub mod callbacks;
 pub mod constants;
 pub mod errors;
 pub mod ffi;
+pub mod headers;
+pub mod options;
+pub mod session;
+pub mod session_handle;
 pub mod settings;
 pub mod state;
+pub mod stream;
 
 use std::cell::RefCell;
 
@@ -66,6 +72,8 @@ use rn_v8_sys::v8;
 /// Members exposed on the namespace object, matching `contracts/http2.json`
 /// except for the two declared in [`DEFERRED`].
 pub const MEMBERS: &[&str] = &[
+    "Http2Session",
+    "Http2Stream",
     "constants",
     "kBitfield",
     "kSessionFrameErrorListenerCount",
@@ -90,25 +98,35 @@ pub const MEMBERS: &[&str] = &[
     "streamStats",
 ];
 
-/// Members this namespace needs but cannot install yet, each with the reason.
+/// Members this namespace needs but cannot install yet.
 ///
-/// Both are absent rather than stubbed. A `Http2Session` that constructed but
-/// could not open a connection would fail every `test-http2*` file with a
-/// different wrong error than the truth, and the contract check reports a
-/// declared deferral as a known gap — which is the honest state while the
-/// session and stream halves are being written.
-pub const DEFERRED: &[(&str, &str)] = &[
+/// Empty: every member `contracts/http2.json` records is installed. The two
+/// classes this list used to hold are real constructors now, so a declared deferral
+/// here would be a lie of the kind `rn-compat` cannot catch.
+pub const DEFERRED: &[(&str, &str)] = &[];
+
+/// Known gaps that are not contract members, so `rn-compat` cannot express them.
+///
+/// `DEFERRED` is for a *member* that is absent. These are behaviours inside
+/// members that are present, which is why they are recorded separately rather than
+/// smuggled into the member list.
+pub const KNOWN_GAPS: &[(&str, &str)] = &[
     (
-        "Http2Session",
-        "the session half: nghttp2 session construction, the settings exchange, \
-         the read/write path against a real socket and the eleven callbacks \
-         setCallbackFunctions stores; needs StreamBase wiring, so it lands with \
-         the transport rather than as a constructor that cannot connect",
+        "socket teardown on destroy()",
+        "`Http2Session.destroy()` calls `this.ondone` (finishSessionClose) and the \
+         nghttp2 session is freed, but the consumed socket's libuv handle is not \
+         closed, so a process that destroys a session with a live connection does \
+         not drain its loop and the file times out. Closing it needs the \
+         StreamBase ownership model that `Http2Stream` needs for the same reason, \
+         so both land together rather than as a patch here",
     ),
     (
-        "Http2Stream",
-        "the stream half: headers, DATA frames with flow control, trailers and \
-         the stream prototype methods; it cannot exist before Http2Session does",
+        "Http2Stream body delivery",
+        "`respond`/`info`/`trailers` submit real frames and a headers-only round \
+         trip completes, but the Duplex read pump needs a per-stream AsyncWrap \
+         identity (onread receiver, async id, backpressure) that this increment \
+         does not add. This is the 87 timeouts and 13 Uncaught files in the \
+         measurement",
     ),
 ];
 
@@ -239,6 +257,14 @@ impl BindingModule for Http2 {
             set(scope, object, name, value.into())?;
         }
 
+        // The two classes. `Http2Session` is constructed by `core.js`; the
+        // `Http2Stream` constructor is installed because `Initialize` installs it,
+        // and `core.js` receives stream handles rather than making them.
+        let session = session_handle::constructor(scope)?;
+        set(scope, object, "Http2Session", session)?;
+        let stream = stream::constructor(scope)?;
+        set(scope, object, "Http2Stream", stream)?;
+
         // `target->Set(context, env->constants_string(), constants)`, which is a
         // normal (writable) property holding an object whose own properties are
         // read-only.
@@ -247,6 +273,44 @@ impl BindingModule for Http2 {
 
         Ok(object)
     }
+}
+
+/// `STREAM_OPTION_EMPTY_PAYLOAD` from `node_http2.h`.
+pub const STREAM_OPTION_EMPTY_PAYLOAD: i32 = 0x1;
+/// `STREAM_OPTION_GET_TRAILERS`.
+pub const STREAM_OPTION_GET_TRAILERS: i32 = 0x2;
+/// `STREAM_OPTION_AUTO_EMPTY_TRAILERS`.
+pub const STREAM_OPTION_AUTO_EMPTY_TRAILERS: i32 = 0x4;
+
+/// `kSessionMaxInvalidFrames`'s default from `SessionJSFields`.
+///
+/// `core.js` copies this into `kNativeFields` so a caller can raise it per
+/// session; the value here is what an untouched field contains.
+pub const MAX_INVALID_FRAMES: u32 = 1000;
+/// `kSessionMaxRejectedStreams`'s default.
+pub const MAX_REJECTED_STREAMS: u32 = 100;
+
+/// The live nghttp2 session behind a session state.
+pub(crate) fn session_ptr(state: &session::SessionState) -> Option<*mut ffi::nghttp2_session> {
+    session::raw(state)
+}
+
+/// The `Http2Session` JS object a callback reports to, which is `this` in
+/// `core.js`'s handlers.
+pub(crate) fn session_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &session::SessionState,
+) -> Option<v8::Local<'s, v8::Object>> {
+    state
+        .object
+        .borrow()
+        .as_ref()
+        .map(|object| v8::Local::new(scope, object))
+}
+
+/// Reads the eleven installed callbacks.
+pub(crate) fn with_callbacks<R>(body: impl FnOnce(&SessionCallbacks) -> R) -> R {
+    CALLBACKS.with(|callbacks| body(&callbacks.borrow()))
 }
 
 /// Registers the `http2` namespace with the runtime.
@@ -596,14 +660,15 @@ mod tests {
     }
 
     #[test]
-    fn the_deferrals_each_state_a_reason() {
-        // `tools/deferred-reach.py` rejects a `DEFERRED` block it cannot parse, and
-        // a blank reason is indistinguishable from a placeholder.
-        assert_eq!(DEFERRED.len(), 2, "the two classes are the only deferrals");
-        for (name, reason) in DEFERRED {
-            assert!(!reason.trim().is_empty(), "{name} has no reason");
-            assert!(reason.len() > 60, "{name}'s reason is too short to be one");
-        }
+    fn nothing_is_deferred() {
+        // Both classes are real constructors now, so an empty `DEFERRED` is the
+        // honest state. This test exists to make a future deferral a deliberate
+        // edit: `rn-compat` reports a declared deferral as a pass, which is right
+        // for a real gap and wrong for a member somebody simply forgot.
+        assert!(
+            DEFERRED.is_empty(),
+            "a declaration here needs a test update alongside it: {DEFERRED:?}"
+        );
     }
 
     #[test]

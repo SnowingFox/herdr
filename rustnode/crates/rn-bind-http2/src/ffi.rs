@@ -60,6 +60,17 @@ pub const NGHTTP2_FLAG_NONE: u8 = 0;
 pub const NGHTTP2_FLAG_END_STREAM: u8 = 0x01;
 /// `NGHTTP2_FLAG_END_HEADERS`.
 pub const NGHTTP2_FLAG_END_HEADERS: u8 = 0x04;
+/// `NGHTTP2_FLAG_ACK`.
+pub const NGHTTP2_FLAG_ACK: u8 = 0x01;
+
+/// `NGHTTP2_REFUSED_STREAM`, the RST_STREAM code for a refused stream.
+pub const NGHTTP2_REFUSED_STREAM_CODE: u32 = 7;
+/// `NGHTTP2_CANCEL`, the RST_STREAM code `destroy()` uses.
+pub const NGHTTP2_CANCEL_CODE: u32 = 8;
+/// `NGHTTP2_ERR_INVALID_ARGUMENT`.
+pub const NGHTTP2_ERR_INVALID_ARGUMENT: i32 = -501;
+/// `NGHTTP2_ERR_PROTO`, reported for a client-side `pushPromise`.
+pub const NGHTTP2_ERR_PROTO: i32 = -505;
 
 /// `NGHTTP2_HCAT_REQUEST`.
 pub const NGHTTP2_HCAT_REQUEST: c_int = 0;
@@ -191,6 +202,29 @@ pub union nghttp2_frame {
     pub hd: nghttp2_frame_hd,
     pub headers: nghttp2_headers,
     pub data: nghttp2_data,
+    pub ping: nghttp2_ping,
+    pub goaway: nghttp2_goaway,
+}
+
+/// `nghttp2_ping`: a PING frame.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct nghttp2_ping {
+    pub hd: nghttp2_frame_hd,
+    /// The eight opaque bytes a peer must echo back in its ACK.
+    pub opaque_data: [u8; 8],
+}
+
+/// `nghttp2_goaway`: a GOAWAY frame.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct nghttp2_goaway {
+    pub hd: nghttp2_frame_hd,
+    pub last_stream_id: i32,
+    pub error_code: u32,
+    pub opaque_data: *mut u8,
+    pub opaque_data_len: usize,
+    pub ignored: usize,
 }
 
 /// `nghttp2_frame_type.NGHTTP2_HEADERS`.
@@ -205,6 +239,8 @@ pub const NGHTTP2_PING: u8 = 0x06;
 pub const NGHTTP2_GOAWAY: u8 = 0x07;
 /// `nghttp2_frame_type.NGHTTP2_PRIORITY`.
 pub const NGHTTP2_PRIORITY: u8 = 0x02;
+/// `nghttp2_frame_type.NGHTTP2_RST_STREAM`.
+pub const NGHTTP2_RST_STREAM: u8 = 0x03;
 
 /// `nghttp2_session_callbacks_set_on_frame_recv_callback`.
 pub type on_frame_recv_callback = Option<
@@ -620,6 +656,8 @@ extern "C" {
     pub fn nghttp2_stream_get_sum_dependency_weight(stream: *mut nghttp2_stream) -> i32;
     /// `nghttp2_stream_get_state`.
     pub fn nghttp2_stream_get_state(stream: *mut nghttp2_stream) -> c_int;
+    /// `nghttp2_session_set_user_data`.
+    pub fn nghttp2_session_set_user_data(session: *mut nghttp2_session, user_data: *mut c_void);
     /// `nghttp2_session_get_stream`.
     pub fn nghttp2_session_get_stream(
         session: *mut nghttp2_session,
@@ -724,4 +762,151 @@ mod tests {
         assert_eq!(std::mem::size_of::<nghttp2_nv>(), 40);
         assert_eq!(std::mem::align_of::<nghttp2_nv>(), 8);
     }
+}
+
+// Additional declarations the session and stream halves need. Kept as a second
+// `extern` block so the increment-1 surface above stays readable; the two are the
+// same library.
+extern "C" {
+    /// `nghttp2_session_callbacks_set_on_header_callback2`.
+    pub fn nghttp2_session_callbacks_set_on_header_callback2(
+        cbs: *mut nghttp2_session_callbacks,
+        on_header_callback2: on_header_callback2,
+    );
+    /// `nghttp2_session_callbacks_set_on_invalid_frame_recv_callback`.
+    pub fn nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        on_invalid_frame_recv_callback: on_invalid_frame_recv_callback,
+    );
+    /// `nghttp2_session_callbacks_set_on_frame_not_send_callback`.
+    pub fn nghttp2_session_callbacks_set_on_frame_not_send_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        on_frame_not_send_callback: on_frame_not_send_callback,
+    );
+    /// `nghttp2_session_callbacks_set_error_callback2`.
+    pub fn nghttp2_session_callbacks_set_error_callback2(
+        cbs: *mut nghttp2_session_callbacks,
+        error_callback2: error_callback2,
+    );
+    /// `nghttp2_session_callbacks_set_send_data_callback`.
+    pub fn nghttp2_session_callbacks_set_send_data_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        send_data_callback: send_data_callback,
+    );
+
+    /// `nghttp2_submit_response2`.
+    pub fn nghttp2_submit_response2(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+        data_prd: *const nghttp2_data_provider2,
+    ) -> c_int;
+    /// `nghttp2_submit_request2`.
+    pub fn nghttp2_submit_request2(
+        session: *mut nghttp2_session,
+        pri_spec: *const nghttp2_priority_spec,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+        data_prd: *const nghttp2_data_provider2,
+        stream_user_data: *mut c_void,
+    ) -> i32;
+    /// `nghttp2_submit_push_promise`.
+    pub fn nghttp2_submit_push_promise(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+        promised_stream_user_data: *mut c_void,
+    ) -> i32;
+    /// `nghttp2_submit_shutdown_notice`.
+    pub fn nghttp2_submit_shutdown_notice(session: *mut nghttp2_session) -> c_int;
+    /// `nghttp2_submit_priority_update`.
+    pub fn nghttp2_submit_priority_update(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        field_value: *const u8,
+        field_value_len: usize,
+    ) -> c_int;
+    /// `nghttp2_session_get_stream_effective_recv_data_length`.
+    pub fn nghttp2_session_get_stream_effective_recv_data_length(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> i32;
+    /// `nghttp2_rcbuf_get_buf`.
+    pub fn nghttp2_rcbuf_get_buf(rcbuf: *mut nghttp2_rcbuf) -> nghttp2_vec;
+    /// `nghttp2_rcbuf_incref`.
+    pub fn nghttp2_rcbuf_incref(rcbuf: *mut nghttp2_rcbuf);
+    /// `nghttp2_rcbuf_decref`.
+    pub fn nghttp2_rcbuf_decref(rcbuf: *mut nghttp2_rcbuf);
+}
+
+/// `nghttp2_on_header_callback2`: the `rcbuf` form of the header callback.
+pub type on_header_callback2 = Option<
+    unsafe extern "C" fn(
+        session: *mut nghttp2_session,
+        frame: *const nghttp2_frame,
+        name: *mut nghttp2_rcbuf,
+        value: *mut nghttp2_rcbuf,
+        flags: u8,
+        user_data: *mut c_void,
+    ) -> c_int,
+>;
+
+/// `nghttp2_on_invalid_frame_recv_callback`.
+pub type on_invalid_frame_recv_callback = Option<
+    unsafe extern "C" fn(
+        session: *mut nghttp2_session,
+        frame: *const nghttp2_frame,
+        lib_error_code: c_int,
+        user_data: *mut c_void,
+    ) -> c_int,
+>;
+
+/// `nghttp2_on_frame_not_send_callback`.
+pub type on_frame_not_send_callback = Option<
+    unsafe extern "C" fn(
+        session: *mut nghttp2_session,
+        frame: *const nghttp2_frame,
+        lib_error_code: c_int,
+        user_data: *mut c_void,
+    ) -> c_int,
+>;
+
+/// `nghttp2_error_callback2`.
+///
+/// Five parameters, and `lib_error_code` is **second** — not last, and not
+/// absent. Getting this wrong is not a compile error at the boundary: nghttp2
+/// reads the trampoline's declared arity from the call site, so a missing
+/// parameter shifts `user_data` onto a frame field and the deref crashes with a
+/// misaligned pointer. That is exactly how this was found.
+pub type error_callback2 = Option<
+    unsafe extern "C" fn(
+        session: *mut nghttp2_session,
+        lib_error_code: c_int,
+        msg: *const c_char,
+        len: usize,
+        user_data: *mut c_void,
+    ) -> c_int,
+>;
+
+/// `nghttp2_send_data_callback`.
+pub type send_data_callback = Option<
+    unsafe extern "C" fn(
+        session: *mut nghttp2_session,
+        frame: *mut nghttp2_frame,
+        frame_data: *const u8,
+        frame_len: usize,
+        user_data: *mut c_void,
+    ) -> c_int,
+>;
+
+/// `nghttp2_vec`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct nghttp2_vec {
+    pub base: *mut u8,
+    pub len: usize,
 }
