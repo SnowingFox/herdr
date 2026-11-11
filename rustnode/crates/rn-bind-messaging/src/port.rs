@@ -38,6 +38,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 
+use rn_core::host_object::TransferData;
 use rn_v8_sys::v8;
 
 /// One serialized message on its way through a channel.
@@ -46,15 +47,39 @@ use rn_v8_sys::v8;
 /// stores. This keeps the same two pieces: the bytes V8's serializer produced,
 /// and the backing stores the transfer list detached, which the receiver's
 /// deserializer re-attaches in the order the serializer numbered them.
+///
+/// It also carries the clone payloads of the native host objects the payload
+/// references. Node keeps those in `Message::transferables_` and resolves an id
+/// against a `host_objects` vector built from it, so the ids the payload carries
+/// are indices into one vector: transfer-list entries first, then clones.
+/// [`transferred_count`] records where that vector splits, which is Node's
+/// `first_cloned_object_index_`.
 pub struct Message {
     /// The serialized payload, exactly as `ValueSerializer` produced it.
     pub data: Vec<u8>,
     /// Transferred `ArrayBuffer` backing stores, in transfer-id order.
     pub array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
+    /// The transfer-list entries themselves, in id order.
+    ///
+    /// Node's `Message::transferables_` at the sending end: the deserializer
+    /// resolves each port id against this, and rebuilding a port is what moves the
+    /// queue out of the sender's object and into the receiver's.
+    pub ports: Vec<v8::Global<v8::Object>>,
+    /// Native handles and JavaScript clones this message carries, in the order the
+    /// serializer numbered them. Shared with every recipient, the way Node shares
+    /// the `shared_ptr<Message>` itself.
+    pub host_objects: Rc<Vec<Rc<dyn TransferData>>>,
+    /// How many transfer-list entries sit in front of [`host_objects`] in the id
+    /// space the payload references.
+    ///
+    /// A clone's id is its index in the combined vector, so the deserializer
+    /// subtracts this before indexing [`host_objects`]. Zero for every message
+    /// that transfers nothing, which is every `structuredClone`.
+    pub transferred_count: usize,
     /// Whether this entry is the close marker rather than a real message.
     ///
-    /// Node appends an empty `Message` to a queue when a port is disentangled,
-    /// and `ReceiveMessage` turns it into `Close()`. So close is ordered *after*
+    /// Node appends an empty `Message` to a queue when a port is disentangled, and
+    /// `ReceiveMessage` turns it into `Close()`. So close is ordered *after*
     /// everything already queued, which is what makes
     /// `postMessage(1); postMessage(2); close()` deliver `1`, `2`, then `close`.
     pub close: bool,
@@ -62,10 +87,19 @@ pub struct Message {
 
 impl Message {
     /// A real message carrying `data`.
-    pub fn new(data: Vec<u8>, array_buffers: Vec<v8::SharedRef<v8::BackingStore>>) -> Self {
+    pub fn new(
+        data: Vec<u8>,
+        array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
+        ports: Vec<v8::Global<v8::Object>>,
+        host_objects: Vec<Rc<dyn TransferData>>,
+        transferred_count: usize,
+    ) -> Self {
         Self {
             data,
             array_buffers,
+            ports,
+            host_objects: Rc::new(host_objects),
+            transferred_count,
             close: false,
         }
     }
@@ -75,6 +109,9 @@ impl Message {
         Self {
             data: Vec::new(),
             array_buffers: Vec::new(),
+            ports: Vec::new(),
+            host_objects: Rc::new(Vec::new()),
+            transferred_count: 0,
             close: true,
         }
     }
@@ -278,6 +315,12 @@ fn clone_message(message: &Message) -> Message {
     Message {
         data: message.data.clone(),
         array_buffers: message.array_buffers.clone(),
+        // A second recipient needs its own `Global` handles; they point at the same
+        // objects, which is what a transfer-list entry means when one message
+        // reaches more than one port.
+        ports: message.ports.clone(),
+        host_objects: Rc::clone(&message.host_objects),
+        transferred_count: message.transferred_count,
         close: message.close,
     }
 }
@@ -549,7 +592,13 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        assert!(a.dispatch(&Message::new(vec![1], Vec::new())));
+        assert!(a.dispatch(&Message::new(
+            vec![1],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0
+        )));
 
         assert_eq!(a.len(), 0, "the poster must not receive its own message");
         assert_eq!(b.len(), 1);
@@ -564,7 +613,13 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        a.dispatch(&Message::new(vec![7], Vec::new()));
+        a.dispatch(&Message::new(
+            vec![7],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        ));
 
         assert_eq!(b.len(), 1);
         assert_eq!(b.front_is_close(), Some(false));
@@ -576,8 +631,20 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        a.dispatch(&Message::new(vec![1], Vec::new()));
-        a.dispatch(&Message::new(vec![2], Vec::new()));
+        a.dispatch(&Message::new(
+            vec![1],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        ));
+        a.dispatch(&Message::new(
+            vec![2],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        ));
         b.disentangle();
         a.disentangle();
 
@@ -621,7 +688,13 @@ mod tests {
     fn a_group_of_one_dispatches_nothing() {
         let a = MessagePortData::new();
         assert!(
-            !a.dispatch(&Message::new(vec![1], Vec::new())),
+            !a.dispatch(&Message::new(
+                vec![1],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0
+            )),
             "an unentangled port has no peer to warn about"
         );
     }

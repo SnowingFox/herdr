@@ -148,6 +148,27 @@ pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
     let require = v8::Local::new(scope, require);
     let global = scope.get_current_context().global(scope);
 
+    // `internal/bootstrap/node.js` calls `require('internal/worker/js_transferable')
+    // .setup()`, and that file cannot run here. Skipping it left the deserializer
+    // with no create-object hook: `setDeserializerCreateObjectFunction` was never
+    // called, so `JSTransferable::Data::Deserialize` had nothing to invoke and every
+    // cloned host object rebuilt as `undefined`. `test-blocklist-clone.js` is the
+    // test that fails on this.
+    //
+    // `setup()` is JavaScript and runs here, before any user script, which is where
+    // Node runs it too: the hook has to exist before the first `structuredClone`.
+    // It is best-effort like the rest of this function — a failure leaves the hook
+    // unset, and the messaging binding reports that by name rather than crashing.
+    if let Some(transferable) = call_require(scope, require, "internal/worker/js_transferable") {
+        if let Some(setup) = get_property(scope, transferable, "setup") {
+            if let Ok(setup) = v8::Local::<v8::Function>::try_from(setup) {
+                let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+                let scope = &mut try_catch.init();
+                let _ = setup.call(scope, transferable, &[]);
+            }
+        }
+    }
+
     // `structuredClone` comes straight from the messaging binding, which does a
     // real V8 serializer round trip.
     if let Some(value) = call_require(scope, require, "internal/bootstrap/realm")
