@@ -17,6 +17,7 @@ pub mod host_object;
 pub mod native_immediates;
 pub mod per_context;
 pub mod queue;
+pub mod realm;
 pub mod symbol;
 
 pub use abi::{BindingModule, InstallCtx};

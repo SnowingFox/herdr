@@ -32,7 +32,7 @@ mod blocklist;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use rn_core::host_object::TransferData;
 use rn_core::{BindingModule, InstallCtx};
@@ -124,30 +124,30 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
 /// `SocketAddressBlockListWrap::CloneForMessaging`.
 ///
 /// Node's returns `std::make_unique<TransferData>(this)`, whose constructor copies
-/// the `shared_ptr`. [`BlockListClone`] copies the `Rc` for the same reason, so the
+/// the `shared_ptr`. [`BlockListClone`] copies the `Arc` for the same reason, so the
 /// receiving handle wraps the same rules.
 fn block_list_clone<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> Option<Rc<dyn TransferData>> {
+) -> Option<Arc<dyn TransferData>> {
     let list = block_list_handle(scope, object)?;
-    Some(Rc::new(BlockListClone { list }))
+    Some(Arc::new(BlockListClone { list }))
 }
 
 /// `SocketAddressBase::CloneForMessaging`, which copies the address.
 fn socket_address_clone<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> Option<Rc<dyn TransferData>> {
+) -> Option<Arc<dyn TransferData>> {
     let _ = scope;
     let address = with_state::<SocketAddress, _>(object, |address| *address)?;
-    Some(Rc::new(SocketAddressClone { address }))
+    Some(Arc::new(SocketAddressClone { address }))
 }
 
 /// The receiving half of a `BlockList` clone.
 struct BlockListClone {
     /// The rules, shared with the handle this was cloned from.
-    list: Rc<RefCell<BlockList>>,
+    list: Arc<Mutex<BlockList>>,
 }
 
 impl TransferData for BlockListClone {
@@ -158,7 +158,7 @@ impl TransferData for BlockListClone {
         // `BlockList` template, with the constructor deliberately not run so the
         // fresh wrapper does not get a *new* rule set.
         let object = new_block_list_object(scope)?;
-        install_shared_block_list(scope, object, Rc::clone(&self.list));
+        install_shared_block_list(scope, object, Arc::clone(&self.list));
         rn_core::host_object::mark(scope, object, BLOCK_LIST_KIND);
         Some(object)
     }
@@ -327,13 +327,15 @@ fn with_state<T, R>(object: v8::Local<v8::Object>, body: impl FnOnce(&mut T) -> 
 /// a rule to either is visible through both, which is what
 /// `test-blocklist-clone.js` asserts after the clone.
 ///
-/// `Rc<RefCell<_>>` is the Rust equivalent for a single-threaded isolate. It is
-/// per-handle rather than per-object so the sharing is explicit: the two wrappers
-/// reference one `Rc`, and whichever is collected last drops the rules.
+/// `Arc<Mutex<_>>` is the Rust equivalent, and it has to be `Arc`: a clone's
+/// state travels inside a `Message`, whose `TransferData` is `Send + Sync` so a
+/// worker thread can carry it. It is per-handle rather than per-object so the
+/// sharing is explicit: the two wrappers reference one `Arc`, and whichever is
+/// collected last drops the rules.
 fn install_shared_block_list(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
-    list: Rc<RefCell<BlockList>>,
+    list: Arc<Mutex<BlockList>>,
 ) {
     let slot = Box::into_raw(Box::new(BlockListSlot { list }));
     object.set_aligned_pointer_in_internal_field(
@@ -348,7 +350,7 @@ fn install_shared_block_list(
         Box::new(move || {
             // SAFETY: the pointer came from `Box::into_raw` above and no other
             // owner exists; this finalizer runs exactly once. Dropping the slot
-            // drops one `Rc`, so the rules live until the last handle goes.
+            // drops one `Arc`, so the rules live until the last handle goes.
             drop(unsafe { Box::from_raw(address as *mut BlockListSlot) });
         }),
     );
@@ -360,7 +362,7 @@ fn install_shared_block_list(
 /// A separate type from `BlockList` so the other namespaces' `install_state` stays
 /// a plain box: only this one is shared, because only this one is cloneable.
 struct BlockListSlot {
-    list: Rc<RefCell<BlockList>>,
+    list: Arc<Mutex<BlockList>>,
 }
 
 /// Borrows the shared rules behind a `BlockList` handle.
@@ -380,7 +382,18 @@ fn with_block_list<R>(
     // JavaScript while the borrow is held — which is also why the `RefCell` is
     // never already mutably borrowed here.
     let slot = unsafe { &*pointer };
-    let mut list = slot.list.try_borrow_mut().ok()?;
+    // `Mutex` rather than `RefCell` because `TransferData: Send + Sync` puts this
+    // state in a message that a worker thread may carry. A `Mutex` can poison if a
+    // thread panics while holding it, which `RefCell` cannot; recovering with
+    // `into_inner` is deliberate. A poisoned rule set is only reachable if
+    // something already panicked while mutating it, and refusing every later
+    // access would turn that one panic into a permanently unusable block list —
+    // worse than continuing with rules that are structurally intact, because the
+    // mutation in progress was a single `add*`/`remove*` on the rule vector.
+    let mut list = slot
+        .list
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     Some(body(&mut list))
 }
 
@@ -388,7 +401,7 @@ fn with_block_list<R>(
 fn block_list_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> Option<Rc<RefCell<BlockList>>> {
+) -> Option<Arc<Mutex<BlockList>>> {
     if object.internal_field_count() == 0 {
         return None;
     }
@@ -401,7 +414,7 @@ fn block_list_handle<'s>(
     // after the object that owns this slot is collected.
     let slot = unsafe { &*pointer };
     let _ = scope;
-    Some(Rc::clone(&slot.list))
+    Some(Arc::clone(&slot.list))
 }
 
 /// One of the `AF_INET`/`AF_INET6` arguments, read as a family.
@@ -654,7 +667,7 @@ fn block_list_new(
         return;
     }
     let object = args.this();
-    install_shared_block_list(scope, object, Rc::new(RefCell::new(BlockList::new())));
+    install_shared_block_list(scope, object, Arc::new(Mutex::new(BlockList::new())));
     // `Node`'s `BaseObject` constructor records the wrapper, which is what
     // `IsBaseObject` later finds and what makes the handle reachable from
     // `CloneForMessaging`. The mark plays that part here.

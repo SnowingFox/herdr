@@ -48,11 +48,12 @@
 
 mod delivery;
 mod deserialize;
-mod port;
+pub mod port;
 mod serialize;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
@@ -62,7 +63,7 @@ use crate::port::{MessagePortData, PortInner};
 pub use crate::delivery::{
     emit_message_installed, has_delivery_pending, install_emit_message, run as run_message_ports,
 };
-pub use crate::port::set_check_phase_armed;
+pub use crate::port::{live_port_count, schedule_ports_with_mail, set_check_phase_armed};
 
 /// Whether a `MessagePort` is still keeping the loop alive.
 ///
@@ -345,7 +346,7 @@ fn install_message_channel<'s>(
 /// up the `EventTarget` state and the listener-driven `ref`/`start` behaviour.
 pub fn new_port_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    data: Rc<MessagePortData>,
+    data: Arc<MessagePortData>,
 ) -> Result<v8::Local<'s, v8::Object>, String> {
     let instance_template = INSTANCE_TEMPLATE.with(|slot| {
         slot.borrow()
@@ -431,20 +432,6 @@ pub fn port_state_of<'s>(
     // `new_port_object`, and stays valid until the object's finalizer runs —
     // which cannot happen while `object` is a live local.
     Some(unsafe { &*pointer }.inner.clone())
-}
-
-/// Rebuilds a port around an existing queue, for `MessagePort` transfer.
-///
-/// The sender is detached first: a transferred port has to refuse to post or
-/// receive, or the two objects would share one queue.
-fn clone_port_into<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    source: v8::Local<'s, v8::Object>,
-) -> Option<v8::Local<'s, v8::Object>> {
-    let state = port_state_of(scope, source)?;
-    state.detach_for_transfer();
-    let data = Rc::clone(&state.data);
-    new_port_object(scope, data).ok()
 }
 
 /// Throws a `TypeError` carrying `message`.
@@ -584,8 +571,8 @@ fn post_message<'s>(
 
     // Serialization happens even for a closed port, because the transfer list
     // still has to be validated and a clone error still has to be raised.
-    let (message, ports) = match serialize::serialize(scope, args.get(0), args.get(1)) {
-        Ok(pair) => pair,
+    let message = match serialize::serialize(scope, args.get(0), args.get(1)) {
+        Ok(message) => message,
         Err(Some(text)) => {
             throw_type_error(scope, &text);
             return;
@@ -606,17 +593,6 @@ fn post_message<'s>(
         // detached port keeps running.
         rv.set(v8::Boolean::new(scope, false).into());
         return;
-    }
-
-    // A transferred port is detached here and rebuilt on the receiving side by
-    // the deserializer, which moves the queue rather than copying it. The port
-    // travels inside the serialized payload because `write_host_object` wrote its
-    // id there, so nothing extra is queued.
-    for port in ports {
-        let object: v8::Local<v8::Object> = v8::Local::new(scope, &port);
-        if let Some(transferred) = port_state_of(scope, object) {
-            transferred.detach_for_transfer();
-        }
     }
 
     // Wake every port that now has something to read.
@@ -1004,7 +980,7 @@ pub(crate) fn js_transfer_mode(
 pub(crate) fn js_clone_for_messaging<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> Option<std::rc::Rc<dyn rn_core::host_object::TransferData>> {
+) -> Option<std::sync::Arc<dyn rn_core::host_object::TransferData>> {
     let mode = js_transfer_mode(scope, object)?;
     if !mode.is_cloneable() {
         return None;
@@ -1027,7 +1003,7 @@ pub(crate) fn js_clone_for_messaging<'s>(
     // `Utf8Value` in Node stringifies, so a non-string that converts is accepted
     // and one that does not is a clone failure.
     let info = info.to_string(scope)?;
-    Some(std::rc::Rc::new(JsClone {
+    Some(std::sync::Arc::new(JsClone {
         deserialize_info: info.to_rust_string_lossy(scope),
         data: v8::Global::new(scope, data),
     }))
@@ -1122,7 +1098,7 @@ fn structured_clone<'s>(
     // asserts that transferring a `DOMException` throws.
     let transfer_list = transfer_list_from_options(scope, args.get(1));
     let message = match serialize::serialize(scope, value, transfer_list) {
-        Ok((message, _ports)) => message,
+        Ok(message) => message,
         Err(Some(reason)) => {
             throw_data_clone_exception_str(scope, &reason);
             return;

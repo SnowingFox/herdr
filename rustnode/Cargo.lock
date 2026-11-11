@@ -1090,6 +1090,7 @@ version = "0.1.0"
 dependencies = [
  "rn-bind-symbols",
  "rn-core",
+ "rn-uv",
  "rn-v8-sys",
  "serde_json",
  "v8",
@@ -1158,6 +1159,7 @@ name = "rn-bind-process-methods"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rn-bind-worker",
  "rn-core",
  "rn-napi",
  "rn-v8-sys",
@@ -1382,9 +1384,19 @@ dependencies = [
 name = "rn-bind-worker"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-heap-utils",
+ "rn-bind-messaging",
+ "rn-bind-options",
+ "rn-bind-timers",
  "rn-core",
+ "rn-io",
+ "rn-module-wrap",
+ "rn-realm",
+ "rn-uv",
  "rn-v8-sys",
  "serde_json",
+ "tracing",
+ "v8",
 ]
 
 [[package]]
@@ -1497,6 +1509,7 @@ dependencies = [
  "rn-bind-options",
  "rn-bind-task-queue",
  "rn-bind-timers",
+ "rn-bind-worker",
  "rn-bind-zlib",
  "rn-bindings",
  "rn-builtins",
@@ -1508,6 +1521,7 @@ dependencies = [
  "rn-module-wrap",
  "rn-napi",
  "rn-permission",
+ "rn-realm",
  "rn-util",
  "rn-uv",
  "rn-v8-sys",
@@ -1618,6 +1632,30 @@ version = "0.1.0"
 dependencies = [
  "rn-core",
  "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-realm"
+version = "0.1.0"
+dependencies = [
+ "rn-bind-crypto",
+ "rn-bind-heap-utils",
+ "rn-bind-inspector",
+ "rn-bind-messaging",
+ "rn-bind-options",
+ "rn-bind-task-queue",
+ "rn-bind-timers",
+ "rn-bind-zlib",
+ "rn-builtins",
+ "rn-core",
+ "rn-errors",
+ "rn-io",
+ "rn-js2c",
+ "rn-module-wrap",
+ "rn-napi",
+ "rn-uv",
+ "rn-v8-sys",
+ "v8",
 ]
 
 [[package]]

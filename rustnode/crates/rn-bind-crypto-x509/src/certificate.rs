@@ -1102,9 +1102,9 @@ pub(crate) fn register_clone_kind() {
 fn clone_for_messaging<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> Option<std::rc::Rc<dyn rn_core::host_object::TransferData>> {
+) -> Option<std::sync::Arc<dyn rn_core::host_object::TransferData>> {
     let payload = with_state(scope, object, |state| (state.snapshot.clone(), state.index))?;
-    Some(std::rc::Rc::new(CertificateClone {
+    Some(std::sync::Arc::new(CertificateClone {
         snapshot: payload.0,
         index: payload.1,
     }))

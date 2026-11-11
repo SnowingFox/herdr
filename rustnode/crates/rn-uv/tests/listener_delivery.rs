@@ -740,7 +740,7 @@ fn twenty_listener_cycles_leave_no_work_behind() {
     }
 
     assert!(
-        rn_uv::uv_loop::shutdown(),
+        rn_uv::uv_loop::close_loop(),
         "twenty cycles must leave a closeable loop, not a busy one"
     );
 }

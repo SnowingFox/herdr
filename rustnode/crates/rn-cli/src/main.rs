@@ -1,13 +1,9 @@
 mod args;
-mod bootstrap;
-mod event_loop;
-mod versions;
 
 use rn_bindings::install_all;
 use rn_core::Env;
+use rn_realm as bootstrap;
 use rn_v8_sys::v8;
-
-const BOOTSTRAP: &str = include_str!("bootstrap.js");
 
 fn main() {
     tracing_subscriber::fmt()
@@ -86,9 +82,24 @@ fn main() {
     for namespace in registry.namespaces() {
         env.insert(namespace.clone());
     }
-    // `internalBinding` reaches the registry from a V8 callback, which cannot
-    // borrow, so the registry lives for the whole process.
-    let registry: &'static rn_core::BindingRegistry = Box::leak(Box::new(registry));
+    // A worker thread runs a second isolate and needs a registry of its own: the
+    // object each namespace caches is a V8 handle belonging to one isolate, so
+    // sharing this one would hand the worker foreign handles. `rn-bindings` is
+    // the crate that knows how to assemble a registry and it depends on the
+    // worker crate, so the factory is handed over here rather than called from
+    // there.
+    rn_core::realm::set_registry_factory(|| {
+        let mut registry = rn_core::BindingRegistry::new();
+        install_all(&mut registry);
+        registry
+    });
+    // `internalBinding` resolves through whatever registry the *thread* has
+    // installed, so the main thread's has to be installed rather than leaked:
+    // a leaked `&'static` could not be replaced when this thread later ran a
+    // worker's own realm.
+    // Held for the whole of `main`: dropping the guard would uninstall the
+    // registry, and every `internalBinding` call after that would fail.
+    let _realm_registry = rn_core::realm::install(registry);
 
     // `v8.setFlagsFromString()` is a public API — `lib/v8.js` exports it — and
     // V8 refuses to honour it once `PrepareForSnapshotSerialization` has frozen
@@ -140,7 +151,19 @@ fn main() {
     // said. Installing before the realm bootstrap matters: `realm.js` builds
     // the builtin allow-list from `--experimental-bench` during its own load,
     // so a value installed later would arrive after the decision was made.
-    rn_bind_options::parsed::install(options.parsed.clone());
+    // `--strip-types` is recorded with `default: true` because Node 28 ships
+    // amaro, and that is the flag `internal/process/execution.js` keys the
+    // TypeScript path off. This build vendors no amaro, so leaving the default
+    // makes the first `eval` script take a path that throws
+    // `ERR_NO_TYPESCRIPT` — which is how a worker's `console.log` turned into a
+    // process-killing failure. Reporting the capability this binary has is the
+    // same rule `config.hasInspector` follows.
+    let mut parsed = options.parsed.clone();
+    parsed.set(
+        "--strip-types",
+        rn_bind_options::parsed::ParsedValue::Bool(false),
+    );
+    rn_bind_options::parsed::install(parsed);
 
     // The inspector is created before the console is installed, because V8 puts its
     // own `console` on the per-context extras object during `contextCreated`, and
@@ -172,7 +195,7 @@ fn main() {
         }
     }
 
-    if let Err(message) = install_globals(scope, &args) {
+    if let Err(message) = bootstrap::install_globals(scope, &args) {
         eprintln!("rustnode: {message}");
         std::process::exit(1);
     }
@@ -198,7 +221,7 @@ fn main() {
     // the bootstrap itself; the reason is printed so a failure is never silent.
     let mut runtime = None;
     let mut realm_require: Option<v8::Global<v8::Function>> = None;
-    match bootstrap::bootstrap_realm(scope, registry, &argv_rest, &options.exec_argv) {
+    match bootstrap::bootstrap_realm(scope, &argv_rest, &options.exec_argv) {
         Ok(mut loaders) => {
             if options.expose_internals() {
                 bootstrap::expose_internals(scope, &loaders);
@@ -232,8 +255,15 @@ fn main() {
             match loaders.require.as_ref() {
                 Some(require) => {
                     let require = v8::Local::new(scope, require);
-                    match event_loop::RuntimeHooks::install(scope, require) {
-                        Ok(hooks) => runtime = Some(hooks),
+                    match rn_realm::Runtime::install(scope, require) {
+                        Ok(hooks) => {
+                            // Worker exits are reported from the check phase, and
+                            // the hook is additive because the crate that owns
+                            // the handle (`rn-bind-timers`) must not depend on the
+                            // worker crate or vice versa.
+                            rn_bind_worker::install_check_phase();
+                            runtime = Some(hooks);
+                        }
                         Err(message) => eprintln!("rustnode: timers unavailable: {message}"),
                     }
                     // Node's `internal/main/run_main_module` runs pre-execution
@@ -252,7 +282,7 @@ fn main() {
                     // does not, which is why this is gated on the source. Node's
                     // own `eval_string.js` makes the same distinction.
                     if matches!(options.source, args::Source::Eval { .. }) {
-                        if let Err(message) = event_loop::install_eval_builtins(scope, require) {
+                        if let Err(message) = rn_realm::install_eval_builtins(scope, require) {
                             eprintln!("rustnode: builtin globals unavailable: {message}");
                         }
                     }
@@ -365,7 +395,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        match event_loop::run_loop(scope, hooks) {
+        match rn_realm::run_loop(scope, hooks) {
             Ok(rn_io::StopReason::ExitRequested | rn_io::StopReason::TurnLimit) => {
                 exit_requested = true;
             }
@@ -482,100 +512,4 @@ fn forward_v8_flags(args: &[String]) {
             v8::V8::set_flags_from_string(argument);
         }
     }
-}
-
-fn install_globals(scope: &mut v8::PinScope, args: &[String]) -> Result<(), String> {
-    let global = scope.get_current_context().global(scope);
-
-    let argv = v8::Array::new(scope, args.len() as i32);
-    for (index, arg) in args.iter().enumerate() {
-        let value = v8::String::new(scope, arg).ok_or("cannot allocate argv entry")?;
-        argv.set_index(scope, index as u32, value.into());
-    }
-    set_global(scope, global, "__argv", argv.into())?;
-
-    let stdout = make_stream_object(scope, StdStream::Stdout)?;
-    set_global(scope, global, "__stdout", stdout.into())?;
-
-    let stderr = make_stream_object(scope, StdStream::Stderr)?;
-    set_global(scope, global, "__stderr", stderr.into())?;
-
-    let version = v8::String::new(scope, v8::V8::get_version()).ok_or("cannot allocate version")?;
-    set_global(scope, global, "__v8Version", version.into())?;
-
-    let source = v8::String::new(scope, BOOTSTRAP).ok_or("cannot allocate bootstrap source")?;
-    let script = v8::Script::compile(scope, source, None).ok_or("cannot compile bootstrap")?;
-    script.run(scope).ok_or("cannot run bootstrap")?;
-
-    Ok(())
-}
-
-fn set_global(
-    scope: &mut v8::PinScope,
-    global: v8::Local<v8::Object>,
-    name: &str,
-    value: v8::Local<v8::Value>,
-) -> Result<(), String> {
-    let key = v8::String::new(scope, name).ok_or("cannot allocate global name")?;
-    global.set(scope, key.into(), value);
-    Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum StdStream {
-    Stdout,
-    Stderr,
-}
-
-impl StdStream {
-    fn write(self, text: &str) {
-        use std::io::Write;
-        match self {
-            Self::Stdout => {
-                let mut out = std::io::stdout().lock();
-                let _ = out.write_all(text.as_bytes());
-                let _ = out.flush();
-            }
-            Self::Stderr => {
-                let mut err = std::io::stderr().lock();
-                let _ = err.write_all(text.as_bytes());
-                let _ = err.flush();
-            }
-        }
-    }
-}
-
-fn stream_write_callback(
-    scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue,
-) {
-    let Some(text) = args.get(0).to_string(scope) else {
-        return;
-    };
-    let text = text.to_rust_string_lossy(scope);
-    let Some(external) = v8::Local::<v8::External>::try_from(args.data()).ok() else {
-        return;
-    };
-    // SAFETY: the pointer comes from `Box::into_raw` in `make_stream_object` and
-    // lives for the whole process, so the read is valid for the callback's life.
-    let stream = unsafe { *external.value().cast::<StdStream>() };
-    stream.write(&text);
-}
-
-fn make_stream_object<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    stream: StdStream,
-) -> Result<v8::Local<'s, v8::Object>, String> {
-    let external = v8::External::new(scope, Box::into_raw(Box::new(stream)).cast());
-    let template = v8::FunctionTemplate::builder(stream_write_callback)
-        .data(external.into())
-        .build(scope);
-    let function = template
-        .get_function(scope)
-        .ok_or("cannot allocate stream write function")?;
-    let object = v8::Object::new(scope);
-    let key = v8::String::new(scope, "write").ok_or("cannot allocate key")?;
-    object.set(scope, key.into(), function.into());
-    Ok(object)
 }

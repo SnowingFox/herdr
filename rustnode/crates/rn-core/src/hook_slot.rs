@@ -317,3 +317,39 @@ mod tests {
         assert!(!flag(Hook::ExitRequested));
     }
 }
+
+thread_local! {
+    /// The worker's environment message port, as the object
+    /// `internalBinding('worker').getEnvMessagePort()` returns.
+    ///
+    /// Node keeps this on `Environment` (`env->set_message_port`), which is
+    /// per-isolate, and `getEnvMessagePort` reads it back. It is thread-local
+    /// here for the same reason: a worker has one and the main thread has none,
+    /// and a shared slot would let a worker answer with the main thread's port.
+    ///
+    /// `None` on the main thread is not a gap — `createWorkerStdio()` in
+    /// `lib/internal/worker/io.js` is the only caller and it runs only from the
+    /// worker-side bootstrap switch.
+    static ENV_MESSAGE_PORT: RefCell<Option<v8::Global<v8::Object>>> = const { RefCell::new(None) };
+}
+
+/// Records the port `getEnvMessagePort()` should answer with.
+pub fn set_env_message_port(scope: &mut v8::PinScope, port: v8::Local<v8::Object>) {
+    let port = v8::Global::new(scope.as_ref(), port);
+    ENV_MESSAGE_PORT.with(|slot| *slot.borrow_mut() = Some(port));
+}
+
+/// The recorded port, if this thread has one.
+pub fn env_message_port<'s>(scope: &v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    ENV_MESSAGE_PORT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|port| v8::Local::new(scope, port))
+    })
+}
+
+/// Clears the recorded port, so a new realm on this thread does not inherit a
+/// handle from the isolate that ran before it.
+pub fn clear_env_message_port() {
+    ENV_MESSAGE_PORT.with(|slot| *slot.borrow_mut() = None);
+}

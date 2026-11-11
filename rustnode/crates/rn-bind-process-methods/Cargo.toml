@@ -8,6 +8,11 @@ repository.workspace = true
 description = "internalBinding('process_methods') for rustnode"
 
 [dependencies]
+# `process.reallyExit` has to know whether this realm is the main thread: in a
+# worker it may only end the realm, never the process. The worker namespace is
+# where that fact lives, and it is already a dependency of nothing here, so this
+# is a leaf-to-leaf edge with no cycle.
+rn-bind-worker = { path = "../rn-bind-worker" }
 rn-core.workspace = true
 rn-v8-sys.workspace = true
 # `process.dlopen` is the addon loader's public entry point, so this namespace

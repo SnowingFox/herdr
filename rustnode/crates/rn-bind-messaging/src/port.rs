@@ -36,7 +36,8 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, Weak as SharedWeak};
 
 use rn_core::host_object::TransferData;
 use rn_v8_sys::v8;
@@ -54,27 +55,30 @@ use rn_v8_sys::v8;
 /// are indices into one vector: transfer-list entries first, then clones.
 /// [`transferred_count`] records where that vector splits, which is Node's
 /// `first_cloned_object_index_`.
+///
+/// There is exactly *one* vector. A transferred `MessagePort` is a
+/// [`PortTransferData`] entry in it, not a second vector of `Global`s: the
+/// serializer writes one id space, so the deserializer must resolve an id against
+/// one list or the two sides can disagree about which object an id names.
 pub struct Message {
     /// The serialized payload, exactly as `ValueSerializer` produced it.
     pub data: Vec<u8>,
     /// Transferred `ArrayBuffer` backing stores, in transfer-id order.
     pub array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
-    /// The transfer-list entries themselves, in id order.
+    /// Transfer-list entries and clones, in the order the serializer numbered
+    /// them. Shared with every recipient, the way Node shares the
+    /// `shared_ptr<Message>` itself.
     ///
-    /// Node's `Message::transferables_` at the sending end: the deserializer
-    /// resolves each port id against this, and rebuilding a port is what moves the
-    /// queue out of the sender's object and into the receiver's.
-    pub ports: Vec<v8::Global<v8::Object>>,
-    /// Native handles and JavaScript clones this message carries, in the order the
-    /// serializer numbered them. Shared with every recipient, the way Node shares
-    /// the `shared_ptr<Message>` itself.
-    pub host_objects: Rc<Vec<Rc<dyn TransferData>>>,
-    /// How many transfer-list entries sit in front of [`host_objects`] in the id
-    /// space the payload references.
+    /// A transferred port is here as its [`PortTransferData`], which is what lets
+    /// rebuilding it move the queue out of the sender's object and into the
+    /// receiver's.
+    pub host_objects: Arc<Vec<Arc<dyn TransferData>>>,
+    /// How many transfer-list entries sit in front of the clones in
+    /// [`host_objects`].
     ///
-    /// A clone's id is its index in the combined vector, so the deserializer
-    /// subtracts this before indexing [`host_objects`]. Zero for every message
-    /// that transfers nothing, which is every `structuredClone`.
+    /// Node's `first_cloned_object_index_`. The deserializer resolves every id
+    /// against the one vector, so it does not need this; the serializer's `Finish`
+    /// loop does, because that is where the clones begin.
     pub transferred_count: usize,
     /// Whether this entry is the close marker rather than a real message.
     ///
@@ -90,15 +94,13 @@ impl Message {
     pub fn new(
         data: Vec<u8>,
         array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
-        ports: Vec<v8::Global<v8::Object>>,
-        host_objects: Vec<Rc<dyn TransferData>>,
+        host_objects: Vec<Arc<dyn TransferData>>,
         transferred_count: usize,
     ) -> Self {
         Self {
             data,
             array_buffers,
-            ports,
-            host_objects: Rc::new(host_objects),
+            host_objects: Arc::new(host_objects),
             transferred_count,
             close: false,
         }
@@ -109,12 +111,120 @@ impl Message {
         Self {
             data: Vec::new(),
             array_buffers: Vec::new(),
-            ports: Vec::new(),
-            host_objects: Rc::new(Vec::new()),
+            host_objects: Arc::new(Vec::new()),
             transferred_count: 0,
             close: true,
         }
     }
+}
+
+/// Which thread a port belongs to, and which port on it.
+///
+/// A queue that grows on a foreign thread cannot reach the owning `PortInner`:
+/// that is `Rc` and holds a `v8::Weak`, so touching it off-thread is undefined
+/// behaviour rather than a race. So the owner is recorded as a location, and the
+/// owner's own wake callback resolves it. This is Node's `owner_` pointer
+/// expressed so it cannot outlive the thread it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Owner {
+    /// The id the owning thread registered the port under.
+    pub id: u64,
+    /// Which thread that is.
+    pub thread: u64,
+}
+
+thread_local! {
+    /// The ports that exist on this thread, by id.
+    ///
+    /// Weak, because the registry must not keep a port alive; pruned on every
+    /// scan so a thread that creates many short-lived ports does not accumulate
+    /// dead entries.
+    static LOCAL_PORTS: RefCell<Vec<(u64, std::rc::Weak<PortInner>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// This thread's identity, as recorded in [`Owner`].
+fn current_thread() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    thread_local! {
+        static ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    ID.with(|id| {
+        if id.get() == 0 {
+            id.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        id.get()
+    })
+}
+
+/// The next port id to hand out.
+fn next_port_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// This thread's port with id `id`, if it is still alive.
+fn lookup_local(id: u64) -> Option<Rc<PortInner>> {
+    LOCAL_PORTS.with(|ports| {
+        let mut ports = ports.borrow_mut();
+        ports.retain(|(_, port)| port.strong_count() > 0);
+        ports
+            .iter()
+            .find(|(other, _)| *other == id)
+            .and_then(|(_, port)| port.upgrade())
+    })
+}
+
+/// Registers a port on this thread so a foreign wake can find it.
+fn register_local(id: u64, port: &Rc<PortInner>) {
+    LOCAL_PORTS.with(|ports| ports.borrow_mut().push((id, Rc::downgrade(port))));
+}
+
+/// Schedules every port on this thread whose queue another thread grew.
+///
+/// The body of the cross-thread wake callback: a sender can only signal this
+/// thread's `uv_async_t`, so the resolution happens here, where the objects live.
+pub fn schedule_ports_with_mail() {
+    let waiting: Vec<Rc<PortInner>> = LOCAL_PORTS.with(|ports| {
+        let mut ports = ports.borrow_mut();
+        ports.retain(|(_, port)| port.strong_count() > 0);
+        ports
+            .iter()
+            .filter_map(|(_, port)| port.upgrade())
+            .collect()
+    });
+    for port in waiting {
+        if !port.data.is_empty() {
+            port.schedule();
+        }
+    }
+}
+
+/// How many ports this thread still has registered.
+///
+/// Exposed for tests: a create/terminate loop that leaves this climbing has leaked
+/// a port per worker.
+#[must_use]
+pub fn live_port_count() -> usize {
+    LOCAL_PORTS.with(|ports| {
+        let mut ports = ports.borrow_mut();
+        ports.retain(|(_, port)| port.strong_count() > 0);
+        ports.len()
+    })
+}
+
+/// Locks `mutex`, recovering a poisoned guard.
+///
+/// A `Message` may now cross a thread (`TransferData: Send + Sync`), so this state
+/// is behind `Mutex` rather than `RefCell`. Poisoning only happens if a thread
+/// panicked while holding the lock; the data behind it is a queue or a list of
+/// weak references, neither of which can be left structurally broken by a panic in
+/// this module, so recovering is correct and refusing every later access would
+/// turn one panic into a permanently unusable port.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The group of ports that can reach each other, Node's `SiblingGroup`.
@@ -130,34 +240,32 @@ pub struct SiblingGroup {
     ///
     /// Weak, because membership must not keep a port alive: Node's `ports_` holds
     /// raw pointers and a port removes itself on close.
-    ports: RefCell<Vec<Weak<MessagePortData>>>,
+    ports: Mutex<Vec<SharedWeak<MessagePortData>>>,
 }
 
 impl SiblingGroup {
     /// Joins `a` and `b` into one new anonymous group.
-    pub fn entangle(a: &Rc<MessagePortData>, b: &Rc<MessagePortData>) {
-        let group = Rc::new(Self::default());
+    pub fn entangle(a: &Arc<MessagePortData>, b: &Arc<MessagePortData>) {
+        let group = Arc::new(Self::default());
         group.add(a);
         group.add(b);
-        *a.group.borrow_mut() = Some(Rc::clone(&group));
-        *b.group.borrow_mut() = Some(Rc::clone(&group));
+        *lock(&a.group) = Some(Arc::clone(&group));
+        *lock(&b.group) = Some(Arc::clone(&group));
     }
 
-    fn add(&self, port: &Rc<MessagePortData>) {
-        self.ports.borrow_mut().push(Rc::downgrade(port));
+    fn add(&self, port: &Arc<MessagePortData>) {
+        lock(&self.ports).push(Arc::downgrade(port));
     }
 
     /// The live ends, excluding any that were collected.
-    fn members(&self) -> Vec<Rc<MessagePortData>> {
-        self.ports
-            .borrow_mut()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect()
+    fn members(&self) -> Vec<Arc<MessagePortData>> {
+        let mut ports = lock(&self.ports);
+        ports.retain(|member| member.strong_count() > 0);
+        ports.iter().filter_map(SharedWeak::upgrade).collect()
     }
 
     /// The live ends other than `port`.
-    fn peers_of(&self, port: &MessagePortData) -> Vec<Rc<MessagePortData>> {
+    fn peers_of(&self, port: &MessagePortData) -> Vec<Arc<MessagePortData>> {
         self.members()
             .into_iter()
             .filter(|member| !std::ptr::eq(member.as_ref(), port))
@@ -166,7 +274,7 @@ impl SiblingGroup {
 
     /// Removes `port`, and returns how many ends remain in the group.
     fn remove(&self, port: &MessagePortData) -> usize {
-        let mut ports = self.ports.borrow_mut();
+        let mut ports = lock(&self.ports);
         ports.retain(|member| {
             member
                 .upgrade()
@@ -184,51 +292,69 @@ impl SiblingGroup {
 /// *lifetime* rules are the same and they are what this type encodes.
 pub struct MessagePortData {
     /// Messages waiting to be received, oldest first.
-    queue: RefCell<VecDeque<Message>>,
+    queue: Mutex<VecDeque<Message>>,
     /// The group this end belongs to, while it belongs to one.
-    group: RefCell<Option<Rc<SiblingGroup>>>,
+    group: Mutex<Option<Arc<SiblingGroup>>>,
     /// The port object that owns this end, if any.
     ///
     /// Weak, so a queued message does not pin the object, and empty after the
     /// port closed or was transferred — Node's `owner_` pointer, nulled by
     /// `Detach()`. A queue with no owner still exists, so a message posted into
     /// it before the port is claimed is delivered when it is.
-    owner: RefCell<Weak<PortInner>>,
+    owner: Mutex<Option<Owner>>,
 }
 
 impl MessagePortData {
     /// A detached end with no group.
-    pub fn new() -> Rc<Self> {
-        Rc::new(Self {
-            queue: RefCell::new(VecDeque::new()),
-            group: RefCell::new(None),
-            owner: RefCell::new(Weak::new()),
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            queue: Mutex::new(VecDeque::new()),
+            group: Mutex::new(None),
+            owner: Mutex::new(None),
         })
     }
 
     /// Joins two ends into one anonymous group, the way `MessageChannel` does.
-    pub fn entangle(a: &Rc<Self>, b: &Rc<Self>) {
+    pub fn entangle(a: &Arc<Self>, b: &Arc<Self>) {
         SiblingGroup::entangle(a, b);
     }
 
     /// Records the port that owns this end.
     pub fn attach(&self, inner: &Rc<PortInner>) {
-        *self.owner.borrow_mut() = Rc::downgrade(inner);
+        *lock(&self.owner) = Some(Owner {
+            id: inner.id,
+            thread: current_thread(),
+        });
     }
 
     /// Drops the owner link, Node's `Detach()`.
     pub fn detach(&self) {
-        *self.owner.borrow_mut() = Weak::new();
+        *lock(&self.owner) = None;
     }
 
-    /// The owning port, while it is still alive.
+    /// The owning port, while it is still alive on this thread.
+    ///
+    /// `None` from a foreign thread is the honest answer: `PortInner` is `Rc` and
+    /// holds a `v8::Weak`, so it must never be reached from anywhere but the
+    /// thread that built it. Cross-thread delivery goes through the wake token in
+    /// [`Owner`] instead of through this accessor.
     pub fn owner(&self) -> Option<Rc<PortInner>> {
-        self.owner.borrow().upgrade()
+        let owner = *lock(&self.owner);
+        let owner = owner?;
+        if owner.thread != current_thread() {
+            return None;
+        }
+        lookup_local(owner.id)
+    }
+
+    /// The owning port's location, whoever it belongs to.
+    pub fn owner_record(&self) -> Option<Owner> {
+        *lock(&self.owner)
     }
 
     /// Appends a message and wakes the owner if it is receiving.
     pub fn enqueue(&self, message: Message) {
-        self.queue.borrow_mut().push_back(message);
+        lock(&self.queue).push_back(message);
         if let Some(owner) = self.owner() {
             owner.schedule();
         }
@@ -236,32 +362,31 @@ impl MessagePortData {
 
     /// Takes the oldest message, if there is one.
     pub fn dequeue(&self) -> Option<Message> {
-        self.queue.borrow_mut().pop_front()
+        lock(&self.queue).pop_front()
     }
 
     /// The front message's close flag, without removing it.
     ///
-    /// `ReceiveMessage` peeks for exactly this: a port that is not receiving
-    /// still has to honour a close marker, because otherwise a port whose peer
-    /// closed would never notice.
+    /// `ReceiveMessage` peeks for exactly this: a port that is not receiving still
+    /// has to honour a close marker, because otherwise a port whose peer closed
+    /// would never notice.
     pub fn front_is_close(&self) -> Option<bool> {
-        self.queue.borrow().front().map(|message| message.close)
+        lock(&self.queue).front().map(|message| message.close)
     }
 
     /// How many messages are queued.
     pub fn len(&self) -> usize {
-        self.queue.borrow().len()
+        lock(&self.queue).len()
     }
 
     /// Whether the queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.queue.borrow().is_empty()
+        lock(&self.queue).is_empty()
     }
 
     /// The ends this one can reach, excluding itself.
-    pub fn peers(&self) -> Vec<Rc<MessagePortData>> {
-        self.group
-            .borrow()
+    pub fn peers(&self) -> Vec<Arc<MessagePortData>> {
+        lock(&self.group)
             .as_ref()
             .map(|group| group.peers_of(self))
             .unwrap_or_default()
@@ -273,12 +398,12 @@ impl MessagePortData {
     /// "MessagePortData is not entangled" case: `postMessage` warns rather than
     /// throwing, so the caller has to tell the two apart.
     pub fn dispatch(&self, message: &Message) -> bool {
-        let group = self.group.borrow().clone();
+        let group = lock(&self.group).clone();
         let Some(group) = group else {
             return false;
         };
         for peer in group.peers_of(self) {
-            peer.enqueue(clone_message(message));
+            peer.enqueue(message.clone_for_peer());
         }
         true
     }
@@ -290,7 +415,7 @@ impl MessagePortData {
     /// only the ends that are still members. An anonymous two-port group
     /// therefore closes each end exactly once however many times this runs.
     pub fn disentangle(&self) {
-        let group = self.group.borrow_mut().take();
+        let group = lock(&self.group).take();
         let Some(group) = group else {
             // Already out of the group; a second close must stay silent.
             return;
@@ -315,13 +440,56 @@ fn clone_message(message: &Message) -> Message {
     Message {
         data: message.data.clone(),
         array_buffers: message.array_buffers.clone(),
-        // A second recipient needs its own `Global` handles; they point at the same
-        // objects, which is what a transfer-list entry means when one message
-        // reaches more than one port.
-        ports: message.ports.clone(),
-        host_objects: Rc::clone(&message.host_objects),
+        // `Arc`, so a second recipient shares the same payloads. A transferred
+        // port's queue is shared the same way, which is what Node's
+        // `shared_ptr<Message>` means when one message reaches two ports.
+        host_objects: Arc::clone(&message.host_objects),
         transferred_count: message.transferred_count,
         close: message.close,
+    }
+}
+
+impl Message {
+    /// A copy for one more recipient.
+    ///
+    /// The payload bytes and the backing stores are reference-counted either way,
+    /// and `host_objects` is `Arc`, so this clones the small parts and shares the
+    /// large ones — the same thing Node's `shared_ptr<Message>` achieves.
+    fn clone_for_peer(&self) -> Message {
+        clone_message(self)
+    }
+}
+
+/// A transferred `MessagePort`, as it travels in a message.
+///
+/// Node's `MessagePort::TransferData`. It stands in the message's host-object
+/// vector for the port, so the id the payload wrote for it resolves to this
+/// payload on the receiving side and rebuilds the receiving object from the queue
+/// the sender gave up.
+///
+/// Only the queue crosses. [`PortInner`] must not: it is `Rc` and holds a
+/// `v8::Weak`, so sending it to another thread would be undefined behaviour
+/// rather than a transfer. `MessagePortData` is `Arc` + `Mutex`, which is why it
+/// is the part that can move.
+pub struct PortTransferData {
+    /// The queue and group membership the receiving port takes over.
+    data: Arc<MessagePortData>,
+}
+
+impl PortTransferData {
+    /// A payload around the queue `port` is giving up.
+    pub fn for_port(data: Arc<MessagePortData>) -> Arc<dyn TransferData> {
+        Arc::new(Self { data })
+    }
+}
+
+impl TransferData for PortTransferData {
+    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+        // Node's `NewPortObject`: a fresh object around the transferred queue. It
+        // runs `oninit`, which is the hook that wires up the event target — and
+        // the reason this cannot happen from inside `read_host_object`, where
+        // JavaScript is disallowed.
+        crate::new_port_object(scope, Arc::clone(&self.data)).ok()
     }
 }
 
@@ -333,7 +501,12 @@ fn clone_message(message: &Message) -> Message {
 /// object*, not of the channel — closing one end does not stop the other.
 pub struct PortInner {
     /// The queue this end owns.
-    pub data: Rc<MessagePortData>,
+    ///
+    /// `Arc`, because the two ends may live in different isolates and a sender
+    /// appends to the receiver's queue from its own thread.
+    pub data: Arc<MessagePortData>,
+    /// The id this port is registered under on its thread.
+    pub id: u64,
     /// `receiving_messages_`: set by `start()` and by the first listener.
     pub receiving: Cell<bool>,
     /// libuv's ref bit.
@@ -393,9 +566,10 @@ pub fn set_check_phase_armed(armed: fn()) {
 
 impl PortInner {
     /// Builds the port state for a queue.
-    pub fn new(data: Rc<MessagePortData>) -> Rc<Self> {
+    pub fn new(data: Arc<MessagePortData>) -> Rc<Self> {
         let inner = Rc::new(Self {
             data,
+            id: next_port_id(),
             receiving: Cell::new(false),
             refed: Cell::new(true),
             closing: Cell::new(false),
@@ -403,6 +577,7 @@ impl PortInner {
             object: RefCell::new(None),
         });
         inner.data.attach(&inner);
+        register_local(inner.id, &inner);
         inner
     }
 
@@ -580,9 +755,9 @@ pub fn any_keeps_loop_alive() -> bool {
 mod tests {
     use super::*;
 
-    fn port() -> (Rc<MessagePortData>, Rc<PortInner>) {
+    fn port() -> (Arc<MessagePortData>, Rc<PortInner>) {
         let data = MessagePortData::new();
-        let inner = PortInner::new(Rc::clone(&data));
+        let inner = PortInner::new(Arc::clone(&data));
         (data, inner)
     }
 
@@ -592,13 +767,7 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        assert!(a.dispatch(&Message::new(
-            vec![1],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            0
-        )));
+        assert!(a.dispatch(&Message::new(vec![1], Vec::new(), Vec::new(), 0)));
 
         assert_eq!(a.len(), 0, "the poster must not receive its own message");
         assert_eq!(b.len(), 1);
@@ -613,13 +782,7 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        a.dispatch(&Message::new(
-            vec![7],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            0,
-        ));
+        a.dispatch(&Message::new(vec![7], Vec::new(), Vec::new(), 0));
 
         assert_eq!(b.len(), 1);
         assert_eq!(b.front_is_close(), Some(false));
@@ -631,20 +794,8 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        a.dispatch(&Message::new(
-            vec![1],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            0,
-        ));
-        a.dispatch(&Message::new(
-            vec![2],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            0,
-        ));
+        a.dispatch(&Message::new(vec![1], Vec::new(), Vec::new(), 0));
+        a.dispatch(&Message::new(vec![2], Vec::new(), Vec::new(), 0));
         b.disentangle();
         a.disentangle();
 
@@ -688,13 +839,7 @@ mod tests {
     fn a_group_of_one_dispatches_nothing() {
         let a = MessagePortData::new();
         assert!(
-            !a.dispatch(&Message::new(
-                vec![1],
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                0
-            )),
+            !a.dispatch(&Message::new(vec![1], Vec::new(), Vec::new(), 0)),
             "an unentangled port has no peer to warn about"
         );
     }
@@ -754,7 +899,7 @@ mod tests {
         let a = MessagePortData::new();
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
-        let inner = PortInner::new(Rc::clone(&a));
+        let inner = PortInner::new(Arc::clone(&a));
         inner.start();
 
         inner.detach_for_transfer();

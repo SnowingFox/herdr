@@ -104,6 +104,14 @@ parseable `("member", "reason")` pairs.
 `src/**` and `lib/**` there; never push to or modify it, its origin is
 `nodejs/node`.
 
+## `tools/regen-bindings.sh` matches the substring `pub fn register`
+
+It decides what is a binding crate by grepping for `pub fn register`, not by
+checking the signature. A helper called `register_current_thread` in `rn-uv`
+therefore made `rn-uv` look like a namespace provider and broke the workspace
+build with `cannot find function 'register' in crate 'rn_uv'`. Naming anything
+in a non-binding crate `register...` will do the same.
+
 ## Cargo's `tools/*` workspace glob
 
 `tools/` is a workspace member glob, so any directory in it needs a

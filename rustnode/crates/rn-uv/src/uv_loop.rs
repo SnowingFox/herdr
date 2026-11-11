@@ -72,6 +72,23 @@ thread_local! {
     static IN_LOOP: RefCell<bool> = const { RefCell::new(false) };
 }
 
+thread_local! {
+    /// Whether [`shutdown`] is running on this thread.
+    ///
+    /// Guards against the re-entrancy described there: close callbacks run
+    /// JavaScript, and that JavaScript can ask for the same teardown.
+    static SHUTTING_DOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears [`SHUTTING_DOWN`] when the shutdown it guards ends, however it ends.
+struct ShutdownGuard;
+
+impl Drop for ShutdownGuard {
+    fn drop(&mut self) {
+        SHUTTING_DOWN.with(|flag| flag.set(false));
+    }
+}
+
 /// The loop pointer plus everything that has to be dropped with it.
 struct LoopHandle {
     pointer: *mut uv::uv_loop_t,
@@ -103,7 +120,31 @@ impl LoopHandle {
         let pointer = boxed.as_mut() as *mut uv::uv_loop_t;
         std::mem::forget(boxed);
         let keepalive = create_keepalive(pointer)?;
+        crate::ledger::record_created();
         Some(Self { pointer, keepalive })
+    }
+}
+
+/// Releases the loop and its storage.
+///
+/// The struct is only ever stored in the thread-local `LOOP`, so this runs when
+/// that thread is torn down — which for a worker is one per `new Worker()`. Before
+/// this existed every worker leaked its whole `uv_loop_t` plus the keepalive
+/// handle, which is a leak a create/terminate loop shows as steadily growing RSS.
+///
+/// The handles themselves are closed by [`close_loop`] before this runs; a handle
+/// still open here means `close_loop` reported failure, and the loop is dropped
+/// anyway because the thread is ending. That case is logged rather than hidden.
+impl Drop for LoopHandle {
+    fn drop(&mut self) {
+        // SAFETY: `pointer` came from the `Box` `create` leaked, and nothing else
+        // owns it. The keepalive handle was allocated the same way.
+        unsafe {
+            if !self.keepalive.is_null() {
+                drop(Box::from_raw(self.keepalive));
+            }
+            drop(Box::from_raw(self.pointer));
+        }
     }
 }
 
@@ -293,32 +334,67 @@ pub fn stop() {
     unsafe { uv::uv_stop(pointer) };
 }
 
-/// Closes every handle on the loop and releases it.
+/// Closes every handle on the loop, drains, and releases the loop.
 ///
-/// Called when a process is shutting down deliberately. Any handle still open
-/// is closed first, because `uv_loop_close` refuses to release a loop that
-/// still owns handles. This is terminal: the scheduler's handles are closed with
-/// everything else, so nothing may arm a timer afterwards.
-pub fn shutdown() -> bool {
+/// This is the teardown a *realm* performs, and the order matters in a way that
+/// has already cost this project twice:
+///
+/// 1. every handle is closed with `uv_close`, which only *requests* the close —
+///    libuv frees it when it runs the callback, from inside `uv_run`;
+/// 2. `uv_run` is driven until it returns "not alive", which is the point where
+///    every close callback has fired and nothing is left to schedule;
+/// 3. `uv_loop_close` is called and its result is returned, because a non-zero
+///    result means a handle is *still* open — and freeing the loop anyway is
+///    what leaves a dangling watcher in libuv's process-global signal tree.
+///
+/// `uv_stop` is deliberately not used. It makes the current `uv_run` return
+/// early without closing anything, so the next `uv_run` resumes the same handles:
+/// a terminate that used it would appear to work once and then hang on the second
+/// cycle, which is exactly what a create/terminate loop exercises.
+///
+/// Returns `true` when the loop closed cleanly. `false` means something is still
+/// open and the caller must not treat the loop as released.
+pub fn close_loop() -> bool {
     let Some(pointer) = loop_ptr() else {
         return true;
     };
 
-    // Walking `closing_handles` directly would race with libuv's own state; the
-    // documented way to drain is to let libuv run until nothing is left, then
-    // close. Handles that are still open keep the loop alive, so stop them via
-    // `uv_walk` and close each one.
-    // SAFETY: `pointer` is the process' live loop, and `close_walked_handle`
-    // only calls `uv_close` on handles libuv handed to it.
+    // `uv_run` below executes close callbacks, and a close callback can run
+    // JavaScript that ends up here again. A nested sweep would call `uv_close`
+    // on handles libuv has already been told to close, which aborts inside libuv
+    // rather than returning an error. The outer run drains everything, so the
+    // inner call reports what it can know.
+    if SHUTTING_DOWN.with(|flag| flag.replace(true)) {
+        return false;
+    }
+    let _guard = ShutdownGuard;
+
+    // SAFETY: `pointer` is this thread's live loop; `close_walked_handle` only
+    // calls `uv_close` on handles libuv handed to it, and skips ones already
+    // closing.
+    unsafe {
+        uv::uv_walk(pointer, Some(close_walked_handle), ptr::null_mut());
+        // `UV_RUN_DEFAULT` blocks until there is no referenced work. Close
+        // callbacks are what make the remaining handles disappear, and the
+        // keepalive handle is unref'd, so this returns once they have all run.
+        uv::uv_run(pointer, uv::uv_run_mode_UV_RUN_DEFAULT);
+        if uv::uv_loop_close(pointer) == 0 {
+            return true;
+        }
+    }
+
+    // Still open. One more sweep catches a handle a close callback created or a
+    // binding armed from its own teardown; the second `uv_loop_close` is the
+    // honest answer either way.
+    // SAFETY: as above.
     unsafe {
         uv::uv_walk(pointer, Some(close_walked_handle), ptr::null_mut());
         uv::uv_run(pointer, uv::uv_run_mode_UV_RUN_DEFAULT);
-        let status = uv::uv_loop_close(pointer);
-        status == 0
+        uv::uv_loop_close(pointer) == 0
     }
 }
 
-/// `uv_walk` callback used by [`shutdown`].
+/// `uv_walk` callback used by [`close_loop`].
 ///
 /// # Safety
 ///
@@ -330,9 +406,22 @@ unsafe extern "C" fn close_walked_handle(handle: *mut uv::uv_handle_t, _arg: *mu
     // SAFETY: libuv passes a live handle. A handle that is already closing must
     // not be closed twice, which is what `uv_is_closing` checks.
     if unsafe { uv::uv_is_closing(handle) } == 0 {
-        // SAFETY: as above; a null `close_cb` asks libuv to just release it.
-        unsafe { uv::uv_close(handle, None) };
+        // SAFETY: as above. The callback is the ledger's close hook rather than
+        // `None`, because a handle that libuv releases without a callback would
+        // never be counted, and the whole point of the ledger is that
+        // `closed == created` is checkable.
+        unsafe { uv::uv_close(handle, Some(walked_handle_closed)) };
     }
+}
+
+/// The close callback [`close_loop`] gives every handle it sweeps.
+///
+/// # Safety
+///
+/// Called by libuv once a swept handle is closed. It touches no handle state, so
+/// it is valid for every handle type.
+unsafe extern "C" fn walked_handle_closed(_handle: *mut uv::uv_handle_t) {
+    crate::ledger::record_closed();
 }
 
 /// Reads `handle->data`, the pointer libuv carries back to its owner.
