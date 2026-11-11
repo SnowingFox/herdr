@@ -182,7 +182,7 @@ attributed to a commit by bisecting medians but not to a *phase*, which is
 exactly what happened to the 5 ms that `#26` added: two hand-checked mechanisms
 (binary size, the widened `has_external_work` predicate) were both wrong.
 
-## The `#26` startup regression: an O(n²) option lookup
+## The `#26` startup regression: a quadratic option-list build
 
 `#26` (worker_threads) moved the parsed option store from a thread-local
 `Store` to a process-wide one so a worker inherits the parent's command line.
@@ -207,6 +207,15 @@ So one `getCLIOptionsValues()` call did **251 lookups, each deep-cloning a
 quoted, so `a_parsed_store_holds_only_the_options_that_have_a_default` in
 `rn-bind-options` pins the 217 *derived from the table* rather than as a
 literal: adding an option keeps the test honest.
+
+To be precise about the complexity, since the phrase "O(n²) lookup" is wrong for
+this code: `Store::value_of` was already a linear scan (`self.values.iter()
+.find(..)`), so one lookup was O(entries) before #26 and one lookup is
+O(entries) after. A *build* is O(lookups × entries) either way. The clone did
+not change the asymptotic class — it raised the constant and added ~54,500
+allocations, because each of the 251 lookups newly allocated and filled a
+217-entry vector before doing the same scan it always had. That allocation and
+copying is the ~5 ms.
 
 ### Two builds, from one cause — and a duplicate call that was not one
 
@@ -285,16 +294,30 @@ Worker inheritance is unchanged, and
 runtime *corrects* rather than parses, so a worker that fell back to a fresh
 copy of the table would report `true`.
 
-The phase report located the cost without ambiguity: on unfixed master the two
-marks that each contain one build were `allow_option_gated_builtins` **2.80 ms**
-and `prepare_execution` **3.76 ms**, while the marks carrying no build —
-`primordials`, `install_early_globals` — were unchanged. After the fix the same
-two marks are **0.33 ms** and **1.24 ms**, because one build went from
-**2.60 ms to 0.087 ms** (measured in-process, 200 calls after warm-up, on the
-unfixed and fixed binaries respectively). Two builds at those per-call costs is
-5.2 ms → 0.17 ms, about 5.0 ms recovered, which is what the batch measurements
-below show. `install_cjs_loader` sits at ~2.9 ms on both, which is the loader
-itself rather than an option read and is why it is not evidence of anything here.
+The phase report located the cost without ambiguity, on the tree that still had
+the duplicate call (unfixed master, `c236ee9c`): there, both marks that contain a
+build moved — `allow_option_gated_builtins` **2.80 ms** and `prepare_execution`
+**3.76 ms** — while the marks carrying no build (`primordials`,
+`install_early_globals`) were unchanged.
+
+`c236ee9c` is the only tree where both of those marks exist, because the
+duplicate call is what supplied the first one. A head with it removed has no
+`allow_option_gated_builtins` mark at all; only `prepare_execution` remains, and
+on the current head it is **1.24 ms**. Do not compare the two across trees:
+`0.33 ms` for that mark belongs to `a99cf945`, the intermediate commit that still
+applied the allow-list twice, and quoting it beside a duplicate-free head mixes
+two different programs.
+
+The measurement that is unambiguous is per build, and it is the strongest
+evidence here. Taken in-process over 200 calls after warm-up, one
+`getCLIOptionsValues()` costs **2.60 ms unfixed and 0.087 ms fixed**. There are
+**two builds on every tree** — pre-`#26`, unfixed master, and this head — so
+`#26` did not add a build; it made each build cost that much. Two builds at
+2.60 ms is 5.2 ms, two at 0.087 ms is 0.17 ms, and the ~5.0 ms between them is
+what the batch measurements below show.
+
+`install_cjs_loader` sits at ~2.9 ms on both trees, which is the loader itself
+rather than an option read and is why it is not evidence of anything here.
 
 Measured on one machine in one session, all binaries interleaved in a single
 batch, 100 runs each, `-e ''`, release build. Absolute milliseconds drift

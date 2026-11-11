@@ -170,9 +170,15 @@ static PROCESS_STORE: std::sync::OnceLock<std::sync::Mutex<std::sync::Arc<Store>
 /// undefined`, so the next read (`addReadOnlyProcessAlias` from
 /// `patchProcessObject`) rebuilds. Both go through the one memoized
 /// `getCLIOptionsFromBinding`, so this is one module instance with a
-/// deliberately cleared cache, not two instances. #26 made each of those two
-/// builds cost O(lookups x entries) instead of O(lookups), which is the ~5 ms
-/// it added to startup.
+/// deliberately cleared cache, not two instances.
+///
+/// What #26 changed is the cost of a lookup, not its shape: `value_of` was
+/// already a linear scan of the store (`self.values.iter().find(..)`), so a
+/// build was O(lookups x entries) before it and is O(lookups x entries) after.
+/// The clone did not change the asymptotic class — it raised the constant and
+/// added ~54,500 allocations, because each of the 251 lookups newly allocated
+/// and filled a 217-entry vector before doing the same scan it always did. That
+/// extra allocation and copying is the ~5 ms #26 added.
 ///
 /// The handle has to be `Arc` and not `Rc` because the process-wide slot lives
 /// in a `static`, which requires `Send + Sync`.
