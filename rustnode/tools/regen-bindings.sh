@@ -15,7 +15,133 @@ cd "$root"
 
 crates=()
 skipped=()
-# Any crate that exports `register` joins the registry, whatever it is called,
+
+# Prints the declaration that marks a crate as a namespace provider, or nothing.
+#
+# The match is a *declaration*, not a substring. `grep -rqs "pub fn register"`
+# was wrong in both directions:
+#
+#   * it matched prose. A doc comment explaining not to name a helper this way,
+#     or a note that says "export a `register` function", registered the crate
+#     that contained only the words, and the generated `install_all` then called
+#     a symbol nothing exported. That happened twice, so the failure is real.
+#   * it matched unrelated methods. `crates/rn-core/src/binding.rs` has
+#     `pub fn register(&mut self, namespace: Namespace)` and
+#     `pub fn register_module<M: ...>`, so `rn-core` is a live false positive
+#     under the substring rule. It is harmless only because the exclusion list
+#     above names it; that exclusion is load-bearing for correctness, not
+#     tidiness. Do not "clean it up" while the matcher could still match
+#     `rn-core` -- remove it only together with a rule that demonstrably cannot.
+#
+# Anchoring to the start of a line is not sufficient on its own: a crate can
+# legitimately write the signature at column 0 inside a comment. Requiring the
+# argument to be a `BindingRegistry` is what makes the match mean "this is the
+# discovery entry point" rather than "these bytes appear at the start of a line".
+#
+# Which direction this errs in, deliberately: a false positive breaks the build
+# for every crate with a call to a function that does not exist, while a false
+# negative only shows up as "skipped" and then as a missing namespace at
+# runtime. Neither is good, but the false negative is worse to diagnose, so this
+# scanner errs toward *matching*: when it cannot tell code from prose it treats
+# the bytes as code.
+#
+# `#[cfg(test)]` modules are deliberately NOT excluded. A `register` in a test
+# module would be registered by mistake, but excluding it needs brace tracking
+# that is easy to get wrong, and getting it wrong skips a crate that really
+# does export the function. Widening the matcher is the safer trade, so a crate
+# that only defines `register` under `#[cfg(test)]` is a crate whose tests do
+# not link; that is caught by the build, not here.
+read -r -d '' scanner <<'AWK' || true
+# Tracks block comments, string literals, raw strings and char literals across
+# lines, so that text inside any of them cannot satisfy the declaration match
+# below. It is not a parser: `/*` appears inside string literals in this tree
+# (`"**/*.js"`, `b"/*"`), so a character-level comment stripper would treat the
+# rest of such a file as a comment and lose a real declaration in it.
+BEGIN { sq = "\047" }
+FNR == 1 { emit(); mode = ""; code = ""; file = FILENAME; depth = 0 }
+{
+  line = $0
+  n = length(line)
+  out = ""
+  i = 1
+  while (i <= n) {
+    c = substr(line, i, 1)
+    two = substr(line, i, 2)
+
+    if (mode == "block") {
+      # Rust block comments nest, so a `/*` inside one opens another level and
+      # only its matching close ends the comment. Stopping at the first close
+      # would resume scanning comment prose as code.
+      if (two == "/*") { depth++; i += 2; continue }
+      if (two == "*/") {
+        depth--
+        i += 2
+        if (depth <= 0) { mode = ""; depth = 0 }
+        continue
+      }
+      i++
+      continue
+    }
+    if (mode == "str") {
+      if (c == "\\") { i += 2; continue }
+      if (c == "\"") { mode = "" }
+      i++
+      continue
+    }
+    if (mode == "raw") {
+      if (substr(line, i, rawlen) == rawclose) { mode = ""; i += rawlen } else { i++ }
+      continue
+    }
+
+    if (two == "//") { break }
+    if (two == "/*") { mode = "block"; depth = 1; i += 2; continue }
+
+    # A char literal is quoted and short; a lifetime such as 'a is not, and is
+    # left as code so that a signature mentioning &'a cannot swallow the file.
+    if (c == sq) {
+      if (substr(line, i, 2) == "\\" sq) { i += 4; continue }
+      if (substr(line, i + 2, 1) == sq) { i += 3; continue }
+      out = out c
+      i++
+      continue
+    }
+
+    # r"..." / r#"..."# / br#"..."#, only where the r starts a token. At column
+    # 1 there is no preceding character to inspect.
+    if ((c == "r" || c == "b") && (i == 1 || substr(line, i - 1, 1) !~ /[A-Za-z0-9_]/)) {
+      j = i
+      if (c == "b") { j++ }
+      if (substr(line, j, 1) == "r") {
+        hashes = ""
+        k = j + 1
+        while (substr(line, k, 1) == "#") { hashes = hashes "#"; k++ }
+        if (substr(line, k, 1) == "\"") {
+          rawclose = "\"" hashes
+          rawlen = length(rawclose)
+          mode = "raw"
+          i = k + 1
+          continue
+        }
+      }
+    }
+
+    if (c == "\"") { mode = "str"; i++; continue }
+    out = out c
+    i++
+  }
+  code = code out "\n"
+}
+END { emit() }
+
+function emit() {
+  if (code ~ /(^|\n)[[:space:]]*pub[[:space:]]+fn[[:space:]]+register[[:space:]]*\([[:space:]]*registry[[:space:]]*:[[:space:]]*&[[:space:]]*mut[[:space:]]*(rn_core[[:space:]]*::[[:space:]]*)?BindingRegistry/) {
+    print file
+  }
+  code = ""
+}
+AWK
+
+# Any crate that declares `register` joins the registry, whatever it is called,
 # so a workstream is not forced to name its crate a particular way.
 for dir in crates/*; do
   [ -d "$dir" ] || continue
@@ -24,10 +150,15 @@ for dir in crates/*; do
   esac
   name="$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)"
   [ -n "$name" ] || continue
-  # A crate joins the registry by exporting `pub fn register`. Without it the
-  # crate is mid-landing: report it and leave it out, so an unfinished crate
+  # A crate joins the registry by declaring the discovery function. Without it
+  # the crate is mid-landing: report it and leave it out, so an unfinished crate
   # cannot break the build for everyone else.
-  if grep -rqs "pub fn register" "$dir/src"; then
+  found=0
+  while IFS= read -r hit; do
+    [ -n "$hit" ] && found=1
+  done < <(find "$dir/src" -name '*.rs' -type f -print0 2>/dev/null |
+    xargs -0r awk "$scanner")
+  if [ "$found" -eq 1 ]; then
     crates+=("$name")
   else
     skipped+=("$name")
