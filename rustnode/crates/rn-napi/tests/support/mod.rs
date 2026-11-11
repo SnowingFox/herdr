@@ -81,6 +81,7 @@ pub fn build_addon() -> Result<Build, String> {
         // objects go into the one `.node` and share `report_failure`.
         .arg(source.join("addon.c"))
         .arg(source.join("addon_async.c"))
+        .arg(source.join("addon_wrap.c"))
         // `addon_async.c` starts a real producer thread with `pthread_create`, which
         // is the point: the thread-safe function has to be called from a thread
         // that is not the isolate's. Linking pthread is what makes that a real

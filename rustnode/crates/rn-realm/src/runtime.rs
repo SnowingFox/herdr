@@ -348,6 +348,24 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
         // messages before running the queues.
         rn_bind_inspector::drain_attached(self.scope);
 
+        // Node-API finalizers deferred from a V8 GC thread run here. This is the
+        // one place every iteration passes through with a live scope, so a
+        // finalizer cannot be starved by the loop deciding it has no work.
+        //
+        // The drain runs before the tick queue for the same reason Node runs
+        // `RunAndClearNativeImmediates` before `processImmediate`: a finalizer that
+        // deletes a reference queues more work, and that work belongs to the same
+        // phase rather than one iteration later.
+        if rn_core::finalizer::has_pending() {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(self.scope));
+            let scope = &mut try_catch.init();
+            rn_core::finalizer::run_pending();
+            if scope.has_caught() {
+                if let Some(exception) = scope.exception() {
+                    rn_errors::report_uncaught_exception(scope, exception);
+                }
+            }
+        }
         let run_next_ticks = self.hooks.run_next_ticks(self.scope);
         self.call_catching(run_next_ticks);
     }
@@ -367,6 +385,17 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
         // finishes, which is what lets a client evaluate in a process that has already
         // run its entry point. Node's `Agent::IsActive` does the same.
         if rn_bind_inspector::is_attached() || rn_bind_inspector::has_pending_messages() {
+            return true;
+        }
+        // A Node-API finalizer deferred from a V8 GC thread keeps the process alive
+        // for one more iteration, which is what lets it run: the loop must not exit
+        // with `pending_finalizers` non-empty. This is the only place that can answer
+        // "still has work" without touching libuv from the thread the finalizer was
+        // queued on.
+        //
+        // Checked before the worker/timer answer below, which is a call rather than a
+        // predicate: this one is cheap and true exactly when a finalizer is waiting.
+        if rn_core::finalizer::has_pending() {
             return true;
         }
         // A running `Worker` has its own loop on another thread, so nothing on

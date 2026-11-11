@@ -57,6 +57,31 @@ fn run_ok(script: &str) -> String {
     stdout
 }
 
+/// Runs a script with `--expose-gc`, so `global.gc()` is available.
+///
+/// The finalizer tests need to force collection: the whole point is that a wrap
+/// which frees its payload too early (or twice) looks correct until a collection
+/// the test did not ask for happens. Forcing it makes the failure deterministic
+/// instead of dependent on whether the child happened to collect.
+fn run_with_gc(script: &str) -> String {
+    let binary = rustnode();
+    assert!(
+        binary.is_file(),
+        "{} does not exist; the CLI must be built before these tests",
+        binary.display()
+    );
+    let output = Command::new(&binary)
+        .arg("--expose-gc")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("the rustnode binary must be runnable");
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    assert!(output.status.success(), "script failed: {stderr}");
+    stdout
+}
+
 /// JSON-escapes a path so it can be embedded in a script literal.
 fn literal(path: &std::path::Path) -> String {
     format!("{:?}", path.to_string_lossy())
@@ -508,4 +533,120 @@ fn a_throw_from_a_threadsafe_callback_reaches_the_listener_before_pending_microt
         literal(&build.path)
     ));
     assert_eq!(stdout, "callback,listener,microtask");
+}
+
+#[test]
+fn a_wrap_survives_gc_while_referenced_and_its_finalizer_runs_once_after() {
+    // The case a get/set round trip cannot prove. `napi_unwrap` must keep working
+    // across forced collections, and after the object is dropped the finalizer must
+    // free the payload exactly once — not zero times (a leak) and not twice (a
+    // double free that only shows up under GC timing).
+    let build = support::build_addon_or_abort();
+    let stdout = run_with_gc(&format!(
+        "const addon = require({});\n\
+         const before = addon.counters().wrapFinalized;\n\
+         let object = addon.wrapWithFinalizer(99);\n\
+         // Collect with the object alive: the wrap must survive.\n\
+         for (let round = 0; round < 3; round += 1) {{ global.gc(); }}\n\
+         const read = addon.readWrapped(object);\n\
+         object = null;\n\
+         // Collect until the finalizer runs, then look at the counter.\n\
+         let settled = 0;\n\
+         const timer = setInterval(() => {{\n\
+           const junk = [];\n\
+           for (let i = 0; i < 20000; i += 1) junk.push({{ i }});\n\
+           global.gc();\n\
+           const counters = addon.counters();\n\
+           if (counters.wrapFinalized > before || ++settled > 20) {{\n\
+             clearInterval(timer);\n\
+             console.log(read,\n\
+                         counters.wrapFinalized - before,\n\
+                         counters.doubleFree);\n\
+           }}\n\
+         }}, 5);",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "99 1 0");
+}
+
+#[test]
+fn an_external_value_and_a_wrap_over_one_allocation_free_it_exactly_once() {
+    // The specific hazard: an external's finalizer and a wrap's finalizer both
+    // pointing at one allocation. Only the external owns it, so exactly one free
+    // happens. Two would be a double free visible only under GC timing, and the
+    // fixture counts frees rather than crashing so this can assert it.
+    let build = support::build_addon_or_abort();
+    let stdout = run_with_gc(&format!(
+        "const addon = require({});\n\
+         const before = addon.counters();\n\
+         let object = addon.externalWithWrap();\n\
+         // Read the payload through the wrap while the external still owns it.\n\
+         const value = addon.readExternalViaWrap(object);\n\
+         object = null;\n\
+         let settled = 0;\n\
+         const timer = setInterval(() => {{\n\
+           const junk = [];\n\
+           for (let i = 0; i < 20000; i += 1) junk.push({{ i }});\n\
+           global.gc();\n\
+           const counters = addon.counters();\n\
+           const freed = counters.externalFreed - before.externalFreed;\n\
+           const wrapRan = counters.wrapFinalized - before.wrapFinalized;\n\
+           if (freed > 0 || ++settled > 20) {{\n\
+             clearInterval(timer);\n\
+             console.log(value, freed, wrapRan, counters.doubleFree);\n\
+           }}\n\
+         }}, 5);",
+        literal(&build.path)
+    ));
+    // One free, no wrap finalizer (the wrap does not own the pointer), no double
+    // free.
+    assert_eq!(stdout, "4242 1 0 0");
+}
+
+#[test]
+fn unwrap_rejects_an_object_that_was_never_wrapped() {
+    // Node reports `napi_invalid_arg` here, and an addon distinguishes "not mine"
+    // from "mine" by exactly that status.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         console.log(addon.unwrappedRejects({{}}), addon.unwrappedRejects([]));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "true true");
+}
+
+#[test]
+fn removing_a_wrap_detaches_it_so_a_second_unwrap_fails() {
+    // `napi_remove_wrap` hands the pointer to the addon and detaches it. A second
+    // unwrap must fail rather than return a pointer the addon may already have
+    // freed.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const object = addon.wrapWithFinalizer(7);\n\
+         const taken = addon.removeWrapped(object);\n\
+         let second;\n\
+         try {{ addon.readWrapped(object); second = 'no-throw'; }}\n\
+         catch (error) {{ second = error.code || error.name; }}\n\
+         console.log(taken, second, addon.unwrappedRejects(object));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "7 ERR_ADDON_UNWRAP true");
+}
+
+#[test]
+fn a_buffer_surface_round_trip_carries_the_bytes() {
+    // The owned-buffer path: an `ArrayBuffer` created natively, viewed as a
+    // `Uint8Array`, written through `napi_get_buffer_info`'s pointer and read back
+    // by JavaScript. A shim that returned a different allocation would fail here.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const described = addon.bufferInfo();\n\
+         console.log(described.isBuffer, described.length, described.first,\n\
+                     described.hasData, described.arrayBufferIsBuffer);",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "true 8 7 true false");
 }

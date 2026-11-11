@@ -141,7 +141,59 @@ impl WorkerThread {
 
         let code = self.boot_and_run(scope);
 
-        // ---- 6. teardown ----------------------------------------------------
+        // ---- 6. drain deferred Node-API finalizers -------------------------
+        // A buffer created by an addon and owned by this worker is released when
+        // the worker exits, which is what `test_worker_buffer_callback`'s
+        // `getFreeCallCount()` asserts. The scheduler's drain runs between
+        // iterations, so it cannot cover an exit that happened before the last
+        // finalizer was queued; this is the environment teardown Node reports
+        // through `node_napi_env__::DrainFinalizerQueue`.
+        //
+        // Before `teardown()`, because that closes the loop and the isolate — a
+        // finalizer needs a scope, and after teardown there is none.
+        //
+        // The collection is forced first. An addon's buffer is owned by its backing
+        // store, and V8 only calls that store's deleter when the isolate is torn
+        // down or the buffer is collected. Without this, a buffer the addon created
+        // at module-init would have its deleter run *during* isolate drop — after
+        // this drain, with no scope left — so the addon's free callback would never
+        // run. `test_worker_buffer_callback`'s `getFreeCallCount()` is exactly that
+        // assertion.
+        //
+        // Two passes: the first collects the objects, the second collects the
+        // buffers those objects referenced, which is the usual shape for weak
+        // finalization in V8.
+        for _ in 0..2 {
+            // `low_memory_notification` rather than
+            // `request_garbage_collection_for_testing`: the latter aborts unless the
+            // process was started with `--expose-gc`, which a user's script may not
+            // have been.
+            scope.low_memory_notification();
+            while rn_core::finalizer::has_pending() {
+                let try_catch = std::pin::pin!(v8::TryCatch::new(&mut **scope));
+                let drained = &mut try_catch.init();
+                rn_core::finalizer::run_pending();
+                if drained.has_caught() {
+                    // A finalizer that throws during teardown has nobody to catch
+                    // it; the exception is dropped rather than printed, which is
+                    // what Node does when the isolate is going away.
+                    let _ = drained.exception();
+                }
+            }
+        }
+        while rn_core::finalizer::has_pending() {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(&mut **scope));
+            let drained = &mut try_catch.init();
+            rn_core::finalizer::run_pending();
+            if drained.has_caught() {
+                // A finalizer that throws during teardown has nobody to catch it;
+                // the exception is dropped rather than printed, which is what Node
+                // does when the isolate is going away.
+                let _ = drained.exception();
+            }
+        }
+
+        // ---- 7. teardown ----------------------------------------------------
         teardown();
         code
     }

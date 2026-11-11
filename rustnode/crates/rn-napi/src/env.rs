@@ -25,8 +25,8 @@ use std::os::raw::c_char;
 use rn_v8_sys::v8;
 
 use crate::abi::{
-    NapiEnv, NapiExtendedErrorInfo, NapiFinalize, NapiNodeVersion, NapiRef, NapiStatus,
-    NODE_MAJOR_VERSION, NODE_MINOR_VERSION, NODE_PATCH_VERSION,
+    NapiCleanupHook, NapiEnv, NapiExtendedErrorInfo, NapiFinalize, NapiNodeVersion, NapiRef,
+    NapiStatus, NODE_MAJOR_VERSION, NODE_MINOR_VERSION, NODE_PATCH_VERSION,
 };
 
 /// The released-module information `napi_get_node_version` reports.
@@ -161,6 +161,20 @@ pub struct Env {
     #[allow(dead_code)]
     refs: RefCell<Vec<Option<RefEntry>>>,
     exceptions: RefCell<ExceptionState>,
+    /// `napi_add_env_cleanup_hook` entries, in registration order.
+    ///
+    /// Order matters: Node runs cleanup hooks in reverse registration order, the
+    /// same way a stack unwinds, so a hook registered last can still use what an
+    /// earlier one set up.
+    cleanup_hooks: RefCell<Vec<(NapiCleanupHook, *mut std::ffi::c_void)>>,
+    /// The thread whose isolate this environment belongs to.
+    ///
+    /// With `worker_threads` there is one isolate per worker thread, and a
+    /// deferred finalizer must run against the isolate that owns the addon's
+    /// pointers, not whichever realm's drain happens to reach it first. A
+    /// finalizer that finds itself on the wrong thread reports it instead of
+    /// calling into an isolate it does not own.
+    owner_thread: std::thread::ThreadId,
 }
 
 impl Env {
@@ -174,7 +188,93 @@ impl Env {
             instance_data: Cell::new(None),
             refs: RefCell::new(Vec::new()),
             exceptions: RefCell::new(ExceptionState::default()),
+            cleanup_hooks: RefCell::new(Vec::new()),
+            owner_thread: std::thread::current().id(),
         }
+    }
+
+    /// Whether the caller is on the thread that owns this environment's isolate.
+    ///
+    /// A deferred Node-API finalizer checks this before touching V8: the queue is
+    /// process-wide, so a worker's finalizer could otherwise be drained by the main
+    /// realm. Running it there would enter the wrong isolate.
+    pub(crate) fn is_on_owner_thread(&self) -> bool {
+        std::thread::current().id() == self.owner_thread
+    }
+
+    /// The thread whose isolate this environment belongs to.
+    ///
+    /// A deferred finalizer is filed under this id so only the owning realm drains
+    /// it.
+    pub(crate) fn owner_thread(&self) -> std::thread::ThreadId {
+        self.owner_thread
+    }
+
+    /// Registers a cleanup hook, as `napi_add_env_cleanup_hook` does.
+    ///
+    /// Registering the same `(fun, arg)` pair twice is a no-op in Node, because the
+    /// pair is the hook's identity and `napi_remove_env_cleanup_hook` removes by it.
+    pub(crate) fn add_cleanup_hook(&self, fun: NapiCleanupHook, arg: *mut std::ffi::c_void) {
+        if let Ok(mut hooks) = self.cleanup_hooks.try_borrow_mut() {
+            if !hooks
+                .iter()
+                .any(|existing| hook_matches(existing, fun, arg))
+            {
+                hooks.push((fun, arg));
+            }
+        }
+    }
+
+    /// Removes a cleanup hook, reporting whether it was registered.
+    pub(crate) fn remove_cleanup_hook(
+        &self,
+        fun: NapiCleanupHook,
+        arg: *mut std::ffi::c_void,
+    ) -> bool {
+        let Ok(mut hooks) = self.cleanup_hooks.try_borrow_mut() else {
+            return false;
+        };
+        let Some(index) = hooks
+            .iter()
+            .rposition(|existing| hook_matches(existing, fun, arg))
+        else {
+            return false;
+        };
+        hooks.remove(index);
+        true
+    }
+
+    /// Runs every cleanup hook in reverse registration order.
+    ///
+    /// Node calls these when the environment is torn down, which is also when a
+    /// thread-safe function's finalizer may fire. Nothing here calls into
+    /// JavaScript: a hook runs after the environment has stopped allowing it.
+    ///
+    /// **This runtime has no environment teardown path**, so nothing calls this
+    /// yet: `napi_add_env_cleanup_hook` registers and
+    /// `napi_remove_env_cleanup_hook` unregisters, and the hooks run when a
+    /// teardown path is added. Registering is still the correct behaviour for an
+    /// addon that only wants its cleanup to happen at exit, and it is what makes
+    /// `test_cleanup_hook` fail on the missing teardown rather than on the missing
+    /// symbol. Reported rather than stubbed into a lie.
+    #[allow(dead_code)]
+    pub(crate) fn run_cleanup_hooks(&self) {
+        let hooks = match self.cleanup_hooks.try_borrow_mut() {
+            Ok(mut hooks) => std::mem::take(&mut *hooks),
+            Err(_) => return,
+        };
+        for (fun, arg) in hooks.into_iter().rev() {
+            if let Some(fun) = fun {
+                // SAFETY: the addon's own hook, with the argument it registered.
+                unsafe { fun(arg) };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn cleanup_hook_count(&self) -> usize {
+        self.cleanup_hooks.borrow().len()
     }
 
     pub fn module_api_version(&self) -> i32 {
@@ -310,6 +410,32 @@ impl Env {
             state.mark_pending();
         }
     }
+}
+
+/// Whether a registered hook is the one a `(fun, arg)` pair names.
+///
+/// Both halves have to match, and the argument is compared as an address because
+/// that is what the addon passed. The function pointer is compared too, but see
+/// the note below: identical functions can share an address, so the pair is the
+/// identity rather than either half alone.
+fn hook_matches(
+    (existing_fun, existing_arg): &(NapiCleanupHook, *mut std::ffi::c_void),
+    fun: NapiCleanupHook,
+    arg: *mut std::ffi::c_void,
+) -> bool {
+    // `std::ptr::fn_addr_eq` is the documented comparison for function pointers;
+    // a plain `==` is not, because the compiler may merge identical bodies and
+    // may also duplicate one function, so equal addresses do not prove equal
+    // pointers. Comparing the argument as well means a false positive needs two
+    // hooks with both the same body address and the same argument, which is the
+    // same program either way.
+    let same_function = match (*existing_fun, fun) {
+        (Some(left), Some(right)) => std::ptr::fn_addr_eq(left, right),
+        // Both missing is not a hook the shim ever registers (`napi_add_...`
+        // rejects a null callback), so it cannot match.
+        _ => false,
+    };
+    same_function && *existing_arg == arg
 }
 
 /// Rewrites a slot's status and message in place.

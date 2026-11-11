@@ -63,8 +63,10 @@
     }                                                                \
   } while (0)
 
-/* `addon_async.c` registers its own methods; this is the declaration it needs. */
+/* `addon_async.c` and `addon_wrap.c` register their own methods; these are the
+ * declarations they need. */
 napi_status register_async_methods(napi_env env, napi_value exports);
+napi_status register_wrap_methods(napi_env env, napi_value exports);
 
 /* Throws a `TypeError` naming the failure, so a broken asynchronous path reports
  * through the same channel as the synchronous ones instead of aborting. */
@@ -360,6 +362,20 @@ NAPI_MODULE_EXPORT napi_value NAPI_MODULE_INITIALIZER(napi_env env,
         "tableMarker", NULL, NULL, NULL, NULL, methods[1],
         napi_default_jsproperty, NULL};
     NODE_API_CALL(env, napi_define_properties(env, exports, 2, descriptors));
+  }
+
+  /* Wrap and external-value fixtures, registered from `addon_wrap.c`. */
+  {
+    napi_status status = register_wrap_methods(env, exports);
+    if (status != napi_ok) {
+      const napi_extended_error_info* info = NULL;
+      napi_get_last_error_info(env, &info);
+      napi_throw_error(env, "ERR_ADDON_WRAP",
+                       info != NULL && info->error_message != NULL
+                           ? info->error_message
+                           : "registering the wrap methods failed");
+      return NULL;
+    }
   }
 
   /* The asynchronous surface: libuv thread-pool work and thread-safe functions,

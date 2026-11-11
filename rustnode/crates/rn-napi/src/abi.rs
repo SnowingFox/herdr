@@ -65,6 +65,27 @@ pub struct NapiEscapableHandleScope {
     _private: [u8; 0],
 }
 
+/// `napi_typedarray_type`, in declaration order.
+///
+/// The integers are ABI: an addon passes the literal, so a reordering silently
+/// changes which element size it gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum NapiTypedarrayType {
+    Int8 = 0,
+    Uint8 = 1,
+    Uint8Clamped = 2,
+    Int16 = 3,
+    Uint16 = 4,
+    Int32 = 5,
+    Uint32 = 6,
+    Float32 = 7,
+    Float64 = 8,
+    BigInt64 = 9,
+    BigUint64 = 10,
+    Float16 = 11,
+}
+
 /// `typedef struct napi_async_work__* napi_async_work;`
 #[repr(C)]
 pub struct NapiAsyncWork {
@@ -99,6 +120,12 @@ pub enum NapiThreadsafeFunctionCallMode {
 /// `typedef napi_value (NAPI_CDECL* napi_callback)(napi_env, napi_callback_info)`
 pub type NapiCallback =
     Option<unsafe extern "C" fn(env: *mut NapiEnv, info: *mut NapiCallbackInfo) -> *mut NapiValue>;
+
+/// `typedef void (NAPI_CDECL* napi_cleanup_hook)(void* arg)`
+///
+/// Unlike a finalizer this takes no environment: it runs when the environment is
+/// already being torn down, so there is nothing left to call into.
+pub type NapiCleanupHook = Option<unsafe extern "C" fn(arg: *mut c_void)>;
 
 /// `typedef void (NAPI_CDECL* napi_async_execute_callback)(napi_env, void*)`
 ///
