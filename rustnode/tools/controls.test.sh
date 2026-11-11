@@ -585,15 +585,25 @@ record() {
 
 # Which scripts this check owns.
 #
-# There is no hand-maintained list, because forgetting to add a new control is the
-# failure being fixed. A script is included when its name says it is a control
-# (`*control*.sh`) or when `check.sh` does not invoke it, which is what "opt-in"
-# means here: a script that runs in the gate cannot rot unnoticed, so it is out of
-# scope.
+# There is no hand-maintained list of *controls*, because forgetting to add a new
+# control is the failure being fixed. A script is included when its name says it is
+# a control (`*control*.sh`) or when `check.sh` does not invoke it, which is what
+# "opt-in" means here: a script that runs in the gate cannot rot unnoticed, so it is
+# out of scope.
 #
-# `run-node-tests.sh` is excluded by name. It is the harness driver rather than a
-# control: it runs a selection of Node's suite and prints a table, and has no
-# pass/fail verdict of its own to check.
+# Harnesses are excluded by name, and that list is deliberately explicit rather than
+# inferred. A harness drives work and reports what it observed in a table; it makes
+# no pass/fail claim, so it has no verdict contract to hold it to. Requiring one
+# would either force a verdict onto a measurement tool or push its author to invent
+# an exit code that means nothing. Adding a name here is a claim that the script
+# reports *observations*, not a verdict -- the opposite of the whitelist this check
+# refuses for controls.
+#
+#   run-node-tests.sh           runs a selection of Node's suite, prints a table
+#   fs-readfile-jobs-measure.sh runs 58 fs test files, prints `PASS=n FAIL=n`
+#
+# Both were checked to have no verdict exit of their own: a failing row is counted
+# into the printed total, not into the script's status.
 select_controls() {
   local path base
   for path in "$here"/*.sh; do
@@ -603,7 +613,8 @@ select_controls() {
       # check.sh is the gate itself. It necessarily mentions its own name in its
       # usage header, so the "not referenced by check.sh" rule would otherwise
       # include it by luck rather than by intent.
-      check.sh | run-node-tests.sh | *.test.sh) continue ;;
+      check.sh | *.test.sh) continue ;;
+      run-node-tests.sh | fs-readfile-jobs-measure.sh) continue ;;
       *control*) printf '%s\n' "$path"; continue ;;
     esac
     if [ -f "$check_sh" ] && ! grep -qF "$base" "$check_sh"; then
