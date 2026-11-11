@@ -1,6 +1,7 @@
 mod args;
 mod bootstrap;
 mod event_loop;
+mod versions;
 
 use rn_bindings::install_all;
 use rn_core::Env;
