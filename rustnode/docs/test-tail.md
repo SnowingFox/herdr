@@ -43,12 +43,12 @@ A previous version of this document, and the work plan built on it, assumed the
 long tail of `AssertionError: … strictly equal` failures was mostly async
 propagation. **It is not, and the count is now zero.**
 
-Reading the strict-equal failures one by one, on the current master run:
+Reading the strict-equal failures one by one, on the latest full run:
 
 | tree | strict-equal files | worker-gated | async-shaped | other |
 | --- | --- | --- | --- | --- |
 | `52f79555` (#51) | 151 | 1 | **0** | 150 |
-| `368e32ac` (current master) | 196 | 0 | **0** | 196 |
+| `368e32ac` | 196 | 0 | **0** | 196 |
 
 The four files that did belong to async propagation
 (`test-async-hooks-promise-triggerid.js`, `test-async-hooks-promise.js`,
@@ -80,15 +80,29 @@ by both scope and rule, and the differences do not add up.
 | 3097/5159 (60.0%) | `52f79555` (#51) | `test/parallel` only | exit-code only | **superseded** — post-#51, still counts skips |
 | 2855/5714 (50.0%) | `7af7b306` (pre-#51) | 8 suites, 5714 files | four-marker | **measured here** |
 | 2572/5714 (45.0%) | `52f79555` (#51) | 8 suites, 5714 files | four-marker | **measured here** |
-| **2732/5714 (47.8%)** | **`368e32ac` (current master)** | **8 suites, 5714 files** | **four-marker** | **current — quote this one** |
+| **2732/5714 (47.8%)** | **`368e32ac`** | **8 suites, 5714 files** | **four-marker** | **headline — quote this one** |
 | 2645/5159 (51.3%) | `7af7b306` (pre-#51) | `test/parallel` only | four-marker | **measured here** |
 | 2393/5159 (46.4%) | `52f79555` (#51) | `test/parallel` only | four-marker | **measured here** — the honest `test/parallel` rate for that tree |
+| 2550/5159 (49.4%) | `368e32ac` | `test/parallel` only | four-marker | **measured here** — the `test/parallel` rate `docs/project-context.md` quotes |
+| 2549/5159 (49.4%) | `f0649774` | `test/parallel` only | four-marker | **measured here** — matches the eight-suite row below it |
 
-The eight-suite and `test/parallel` rows are different measurements. The current
-master figure is the eight-suite one because that is the scope with a complete
-run; the 46.4% row is the matching `test/parallel` number for the #51 tree and is
-**not** a predecessor of 47.8% in a time series — the trees differ by the merges
-between `52f79555` and `368e32ac` as well as by scope.
+The eight-suite and `test/parallel` rows are different measurements, and **neither
+is a time series**: the trees differ by merges as well as by scope. Read them as
+independent measurements of different trees, not as movement.
+
+The two `49.4%` rows are the ones to compare against the `test/parallel` exit-code
+rates above them, because those share a scope. The `47.8%` eight-suite row is the
+headline because that is the scope with a complete run over every suite the harness
+selects. **47.8% versus 49.4% is a scope difference, not movement.**
+
+**Do not subtract across scopes, which is what produces a spurious residual.** The
+`test/parallel` and eight-suite skip populations are different numbers — 761 vs 808
+on the `52f79555` tree, 471 vs 485 on the later two — and mixing one into the other
+leaves a handful of files that look like rounding but are not. (The `test/parallel`
+figure counts the exit-0 skips the decomposition subtracts; one further file,
+`parallel/test-worker-process-cwd.js`, carries a skip marker and exits non-zero, so
+it is already outside the exit-0 count.) See the decomposition below, which closes
+exactly when both sides come from the same run.
 
 ### Why 52.6% is superseded
 
@@ -137,9 +151,9 @@ On the same run of the same tree, the decomposition is exact:
 | tree | exit-0 | − skip markers | − `✖`/`Uncaught` | = four-marker pass | residual |
 | --- | --- | --- | --- | --- | --- |
 | `52f79555` (#51) | 3218 | −761 | −64 | **2393** | **0** |
-| `368e32ac` (current master) | 3082 | −471 | −61 | **2550** | **0** |
+| `368e32ac` | 3082 | −471 | −61 | **2550** | **0** |
 
-(Both rows are `test/parallel` scope. The eight-suite current-master total is
+(Both rows are `test/parallel` scope. The eight-suite total is
 2732/5714, which is a different scope and is not comparable row-for-row with these.)
 
 A four-file residual appears if the numbers are combined across scopes: 3197 − 808 =
@@ -159,7 +173,7 @@ direction. It affects only what a human sees when reading a failure reason.
 ### Why a sample of this suite misleads, and the general rule
 
 Skips are **clustered by family**, not spread through the suite. On the
-current-master run, 485 of 5714 files skip (8.5%), and they are not evenly
+latest full run, 485 of 5714 files skip (8.5%), and they are not evenly
 distributed:
 
 | skip reason | files | share |
@@ -202,7 +216,7 @@ whole-suite count or name the family and count it exhaustively.**
 All three used the same pinned Node tree, the same tool, a binary frozen before the
 run, and the same command. The first two differ only by #51.
 
-| | pre-#51 | #51 branch | current master |
+| | pre-#51 | #51 branch | latest full run |
 | --- | --- | --- | --- |
 | commit | `7af7b306` | `52f79555` (`origin/cursor/exit-and-test-status`) | `368e32ac` |
 | contains | #33, #46; **not** #51 | #33, #46, #51 | #51 merged via `2fc0b17f`, plus later merges |
@@ -216,7 +230,7 @@ run, and the same command. The first two differ only by #51.
 | skipped | 808 | 808 | 485 |
 | failing | 2051 | 2334 | 2497 |
 
-The current-master run is the one to quote. It is not an extrapolation from the
+The latest full run is the one to quote. It is not an extrapolation from the
 other two: it was measured on that commit with a binary built from it.
 
 Binary freshness: `rm target/debug/rustnode` does **not** force a rebuild, because
@@ -253,18 +267,50 @@ said nothing that looks like failure". It does not mean the assertions ran.
 
 On a **#51-or-later** binary the exit code carries the verdict, so the rule has much
 less room to be wrong — but it is still a rule about output, not a proof. 2141 of the
-2732 current-master passes (78%) print nothing at all, which is normal for a passing
-test and also indistinguishable from a test that silently did nothing. Cross-checking
-silent passes against a reference runtime would settle it, and **that check cannot be
-completed on this machine**: the pinned tree is Node 28 and the only `node` available
-is v22.23.4, which disagrees with the pin on its own (a 25-file sample of silent
-passes re-run under v22 failed 4 files for reasons that are v22's, such as rejecting a
-`Buffer` path argument that Node 28 accepts). Treat the pass figures as an upper
-bound until a Node 28 binary is available to validate against.
+2732 passes (78%) print nothing at all, which is normal for a passing test and also
+indistinguishable from a test that silently did nothing.
+
+**That specific risk is measured, and it is small.** `tools/mustcall-sample.py`
+instruments every `common.mustCall*` registration and every invocation of the
+function it wraps, so it answers the question directly — no reference runtime
+needed. Sampled from the passing set:
+
+| sample | files with a registration | contaminated | Wilson 95% |
+| --- | --- | --- | --- |
+| seed 7, 20 files | 17 | **0** | 0.0% – 18.4% |
+| seed 11, 60 files | 51 | **0** | 0.0% – 7.0% |
+| seed 11, 200 files | 165 | **0** (3 runs) | 0.0% – 2.3% |
+
+Reproduce the widest one:
+
+```
+python3 tools/mustcall-sample.py --results <dir with run-*.json> \
+    --tests /tmp/node-pin/test --node-binary <binary> --limit 200 --seed 11
+```
+
+"Contaminated" means a file that passes while an assertion it registered never ran.
+Zero in 165 files bounds that class below ~2.3% of `mustCall`-carrying passes.
+
+**Treat this as a rate, not a per-file verdict.** One intermediate run of the same
+200-file sample reported **1** contaminated file (7 unsatisfied assertions in
+`parallel/test-cluster-concurrent-disconnect.js`), and three subsequent runs of the
+identical command reported 0. A test whose async work sometimes finishes after the
+`exit` handler will flip. Quote the bound, not the list.
+
+This does **not** make the rule sound for every file — a file with no `mustCall`
+registration and no output is still unaccounted for — so the pass figures remain an
+upper bound. But the largest specific mechanism by which they could be inflated is
+bounded at a few per cent, which is stronger than the earlier "cannot be checked on
+this machine": that was true only before the tool existed.
+
+(The cross-check against a reference runtime is still worth nothing here: the pin is
+Node 28 and the only `node` on this machine is v22.23.4, which fails several pinned
+files for v22's own reasons. That is why the tool reports the two answers separately
+and only `unsatisfied` counts.)
 
 ## Sizing, with provenance per row
 
-All rows below are from the **current-master run** (binary `3c50d5e7e04da6ab`,
+All rows below are from the **latest full run** (binary `3c50d5e7e04da6ab`,
 commit `368e32ac`, 5714 files, 2497 failing) unless the row says otherwise. A row
 marked *counted* was sized by matching a failure signature in the recorded output
 of that run; a row marked *run* was re-run on the binary it names. Sizes are
@@ -278,7 +324,7 @@ distinct files and overlap, so they are not additive.
 | 28 | `fsBinding.cpSyncCopyDir is not a function` | counted |
 | 17 | `internalBinding('locks')` has no implementation | counted |
 | 11 | `unsupported option '--snapshot-blob'` | counted |
-| ~~123~~ 0 | `WorkerImpl is not a constructor` | counted — **closed** between #51 and current master |
+| ~~123~~ 0 | `WorkerImpl is not a constructor` | counted — **closed** between #51 and `368e32ac` |
 | ~~19~~ 0 | `fs.cp` `then()` on a `BigInt64Array` stat result | counted — **closed** |
 | ~~0~~ 0 | `ReadFileJob` / `WriteFileJob` | **run** — closed by #46, still 0 |
 
@@ -313,7 +359,7 @@ current honest "no implementation yet".
 ### The strict-equal tail — 196 files, and it is not an async cluster
 
 `Expected values to be strictly equal` is a substring, not a cause. Classified by
-reading each failure body on the current-master run:
+reading each failure body on the latest full run:
 
 | split | files |
 | --- | --- |
@@ -470,16 +516,16 @@ recorded here so they are not reintroduced from memory.
 | "a strict-equal `AbortSignal` file" | None. `test-abortsignal-cloneable.js` prints three `✖` subtests and then hangs to the 30 s timeout; it is a hang, not a `strictEqual`. |
 | "a strict-equal `AsyncLocalStorage` file" | None. The four ALS failures are 2 timeouts (`http-agent`, `http-multiclients`), `_queryObjects is not a function`, and `assert.ok(storeGCed)` — no `strictEqual` among them. |
 | "a `structuredClone` transfer-list failure" | No file fails on `structuredClone` with a transfer list as its recorded reason. The two files that print `Found invalid value in transferList` are `test-webstreams-clone-unref.js` and `test-whatwg-webstreams-transfer.js`, which exercise the Web Streams transfer path, not `structuredClone`. `test-structuredClone-global.js` fails with `Missing expected exception` and `test-structuredClone-domexception.js` passes. |
-| "638 files — `tls_wrap`" | 646 on the current-master run. The old number was counted against a superseded baseline, so it is replaced rather than carried. |
-| "148 files — strict equal" | 196 on the current-master run (151 on the #51 tree). The bucket grows as real failures stop being hidden. |
-| "116 files — `WorkerImpl`" | 123 on the #51 tree, **0 on current master** — `worker_threads` works; see the closed-family rows above. |
-| "85 / 94 files — timeouts" | 187 on the current-master run. The old figures were load-, binary- and rule-dependent. |
+| "638 files — `tls_wrap`" | 646 on the latest full run. The old number was counted against a superseded baseline, so it is replaced rather than carried. |
+| "148 files — strict equal" | 196 on the latest full run (151 on the #51 tree). The bucket grows as real failures stop being hidden. |
+| "116 files — `WorkerImpl`" | 123 on the #51 tree, **0 on `368e32ac`** — `worker_threads` works; see the closed-family rows above. |
+| "85 / 94 files — timeouts" | 187 on the latest full run. The old figures were load-, binary- and rule-dependent. |
 | "17 + 12 files — `ReadFileJob` / `getWasmCompileCacheEntry`" | `ReadFileJob` is 0 after #46; the wasm-cache count is unmeasured, for the reason above. |
 | "~110 files — deferred asymmetric crypto" | Unmeasured; see above. |
-| "27 files — `--snapshot-blob`" | 11 on the current-master run. The old "27" counted files *mentioning* the flag, but only 11 fail because the option was refused. |
-| "12 files — `locks`" | 17 on the current-master run, and the consumer is the Web Locks API, not `--experimental-locks`. |
+| "27 files — `--snapshot-blob`" | 11 on the latest full run. The old "27" counted files *mentioning* the flag, but only 11 fail because the option was refused. |
+| "12 files — `locks`" | 17 on the latest full run, and the consumer is the Web Locks API, not `--experimental-locks`. |
 | "20 files — `zstd is not implemented`" | 0: closed by #21. See the zstd section. |
-| "fs.cp `then()` on a `BigInt64Array` — 19 files" | 0 on current master: `fs/promises.cp` works. Verified by running it. |
+| "fs.cp `then()` on a `BigInt64Array` — 19 files" | 0 on `368e32ac`: `fs/promises.cp` works. Verified by running it. |
 | "`--experimental-stream-iter` / `--allow-natives-syntax` were removed from the unimplemented list" | Verified: neither warns. `--experimental-vm-modules`, `--experimental-quic`, `--permission` and `--experimental-locks` still do. |
 | "`deps_files` moved 1 → 3" | Verified by `./tools/verify-libjs.sh`: `435 lib files, 3 deps files`. |
 | "everything is committed on `node-test-tail` and fast-forwarded to `origin/rustnode/main`" | No such branch exists, and `origin/rustnode/main` is at `8b7c43b7`, not at the text's tree. Removed rather than restated. |
