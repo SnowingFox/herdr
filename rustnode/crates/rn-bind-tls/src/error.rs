@@ -274,6 +274,93 @@ pub fn print() -> String {
         .join("\n")
 }
 
+// `const char *ERR_lib_error_string(unsigned long e);`, which `openssl-sys` does
+// not declare.
+//
+// `Entry` already carries `library`, but that is the *numeric* id; node reports
+// the display name (`SSL routines`) in the error's `library` property.
+extern "C" {
+    fn ERR_lib_error_string(code: c_ulong) -> *const c_char;
+}
+
+/// One queued error, as `crypto_tls.cc:957-989` builds an `Error` from it.
+///
+/// Node's `ClearOut` failure path is four steps and all four are observable:
+///
+/// ```c
+/// unsigned long ssl_err = ERR_peek_error();        // head, before draining
+/// const std::string error_str = GetBIOError();     // the whole queue, drained
+/// ls = ERR_lib_error_string(ssl_err);              // library display name
+/// rs = ERR_reason_error_string(ssl_err);           // reason text
+/// code = "ERR_SSL_" + upper(rs with spaces → _);   // e.g. ERR_SSL_THIS_ERROR
+/// ```
+///
+/// The `code` is derived from the **reason text**, not from a table: Node's
+/// comment says so — "SSL has no API to recover the error name from the number,
+/// so we transform reason strings like `this error` to `ERR_SSL_THIS_ERROR`,
+/// which ends up being close to the original error macro name."
+///
+/// Without it, `test-tls-client-auth.js` and `test-tls-set-sigalgs.js` fail on
+/// `assert.strictEqual(err.code, 'ERR_SSL_PEER_DID_NOT_RETURN_A_CERTIFICATE')`
+/// with `undefined`, even though the handshake failure itself is reported
+/// correctly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SslError {
+    /// `GetBIOError()`: every queued entry, newline separated.
+    pub message: String,
+    /// `ERR_lib_error_string`'s display name, when it has one.
+    pub library: Option<String>,
+    /// `ERR_reason_error_string`'s text for the head entry.
+    pub reason: Option<String>,
+    /// `ERR_SSL_<REASON>`, derived from [`Self::reason`] the way node does.
+    pub code: Option<String>,
+}
+
+impl SslError {
+    /// Peeks the head entry's library and reason, then drains the queue for the
+    /// message — node's order, which is why the peek has to come first.
+    pub fn capture() -> Self {
+        // SAFETY: reads the calling thread's queue head without removing it.
+        let head = unsafe { ERR_peek_error() };
+        let library = string_of(unsafe { ERR_lib_error_string(head) });
+        let reason = reason_name(head);
+        let code = reason.as_deref().map(|reason| {
+            let body: String = reason
+                .chars()
+                .map(|c| {
+                    if c == ' ' {
+                        '_'
+                    } else {
+                        c.to_ascii_uppercase()
+                    }
+                })
+                .collect();
+            format!("ERR_SSL_{body}")
+        });
+        Self {
+            message: print(),
+            library,
+            reason,
+            code,
+        }
+    }
+
+    /// Whether the capture holds nothing.
+    pub fn is_empty(&self) -> bool {
+        self.message.is_empty() && self.code.is_none()
+    }
+}
+
+/// One static string OpenSSL handed back, or `None` for a null pointer.
+fn string_of(pointer: *const c_char) -> Option<String> {
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: OpenSSL returns a static NUL-terminated string for these lookups.
+    let text = unsafe { CStr::from_ptr(pointer) }.to_string_lossy();
+    (!text.is_empty()).then(|| text.into_owned())
+}
+
 /// `ERR_error_string_n`'s output for one code, in the numeric form.
 pub fn format_code(code: u64) -> String {
     let mut buffer = [0 as c_char; 256];
@@ -362,5 +449,79 @@ mod tests {
             reason_string: Some("named".to_string()),
         };
         assert_eq!(entry.message(), "named:1:2:3");
+    }
+
+    /// A captured failure carries the whole queue as its message and derives the
+    /// `code` from the reason text the way `crypto_tls.cc:983-989` does.
+    ///
+    /// The injected error's reason has no name, so this asserts the derivation
+    /// rule itself rather than a specific `ERR_SSL_*` string: spaces become
+    /// underscores and the rest is upper-cased. A real SSL failure's reason is a
+    /// phrase like `peer did not return a certificate`, which is exactly what
+    /// makes this transformation produce
+    /// `ERR_SSL_PEER_DID_NOT_RETURN_A_CERTIFICATE`.
+    #[test]
+    fn a_capture_derives_the_code_from_the_reason() {
+        clear();
+        inject();
+        let captured = SslError::capture();
+        assert!(!captured.is_empty(), "an injected error must be captured");
+        assert!(
+            !captured.message.is_empty(),
+            "the message is GetBIOError's newline-joined queue"
+        );
+        if let Some(code) = captured.code.as_deref() {
+            assert!(
+                code.starts_with("ERR_SSL_"),
+                "a code is ERR_SSL_ plus the reason: {code}"
+            );
+            assert!(
+                code.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "the reason is upper-cased with spaces as underscores: {code}"
+            );
+        }
+        assert!(!has_error(), "capturing drains the queue");
+    }
+
+    /// The derivation itself, over the two phrases the TLS tests assert on.
+    ///
+    /// This is the property `test-tls-client-auth.js` and
+    /// `test-tls-set-sigalgs.js` read through `err.code`, so it is pinned
+    /// directly rather than only through a live handshake.
+    #[test]
+    fn the_code_is_err_ssl_plus_the_upper_cased_reason() {
+        let derive = |reason: &str| {
+            let body: String = reason
+                .chars()
+                .map(|c| {
+                    if c == ' ' {
+                        '_'
+                    } else {
+                        c.to_ascii_uppercase()
+                    }
+                })
+                .collect();
+            format!("ERR_SSL_{body}")
+        };
+        assert_eq!(
+            derive("peer did not return a certificate"),
+            "ERR_SSL_PEER_DID_NOT_RETURN_A_CERTIFICATE"
+        );
+        assert_eq!(
+            derive("no suitable signature algorithm"),
+            "ERR_SSL_NO_SUITABLE_SIGNATURE_ALGORITHM"
+        );
+    }
+
+    /// Capturing an empty queue reports nothing, which is the path a failure
+    /// OpenSSL did not record takes.
+    #[test]
+    fn capturing_an_empty_queue_captures_nothing() {
+        clear();
+        let captured = SslError::capture();
+        assert!(captured.is_empty());
+        assert!(captured.code.is_none());
+        assert!(captured.message.is_empty());
     }
 }

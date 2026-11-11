@@ -243,7 +243,7 @@ pub fn install_into<'s>(
         "verifyError" => method!(crate::peer_cert::verify_error),
         "isSessionReused" => method!(is_session_reused),
         "getProtocol" => method!(get_protocol),
-        "getSharedSigalgs" => method!(get_shared_sigalgs),
+        "getSharedSigalgs" => method!(crate::peer_cert::get_shared_sigalgs),
         "getTLSTicket" => method!(crate::peer_cert::get_tls_ticket),
         "setMaxSendFragment" => method!(set_max_send_fragment),
         "enableTrace" => method!(enable_trace),
@@ -1021,74 +1021,6 @@ fn get_protocol<'s>(
         },
         None => rv.set(v8::null(scope).into()),
     }
-}
-
-/// `TLSWrap::GetSharedSigalgs`.
-///
-/// `SSL_get_shared_sigalgs`, as an array of `[sign, hash]` pairs. Before a
-/// handshake there are none, so an empty array is the correct answer rather than a
-/// deferral.
-fn get_shared_sigalgs<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s>,
-) {
-    let names = with_state(args.this(), |state| {
-        let ssl = state.ssl_ptr();
-        if ssl.is_null() {
-            return Vec::new();
-        }
-        // SAFETY: `ssl` is live, checked above. Index 0 with null out-parameters
-        // asks only for the count, which is what `tls1.h` documents.
-        let count = unsafe {
-            crate::ffi_extra::SSL_get_shared_sigalgs(
-                ssl,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if count <= 0 {
-            return Vec::new();
-        }
-        let mut names = Vec::new();
-        for index in 1..=count {
-            let mut sign: c_int = 0;
-            let mut hash: c_int = 0;
-            let mut sign_hash: c_int = 0;
-            // SAFETY: `index` is within the count OpenSSL reported, and the
-            // out-parameters are live locals; the raw-signature pointers may be
-            // null, which `tls1.h` allows.
-            let ok = unsafe {
-                crate::ffi_extra::SSL_get_shared_sigalgs(
-                    ssl,
-                    index,
-                    &mut sign,
-                    &mut hash,
-                    &mut sign_hash,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok > 0 {
-                names.push((sign, hash));
-            }
-        }
-        names
-    })
-    .unwrap_or_default();
-
-    let array = v8::Array::new(scope, names.len() as i32);
-    for (index, (sign, hash)) in names.iter().enumerate() {
-        let pair = v8::Array::new(scope, 2);
-        let _ = pair.set_index(scope, 0, v8::Integer::new(scope, *sign).into());
-        let _ = pair.set_index(scope, 1, v8::Integer::new(scope, *hash).into());
-        let _ = array.set_index(scope, index as u32, pair.into());
-    }
-    rv.set(array.into());
 }
 
 /// `TLSWrap::IsSessionReused`.

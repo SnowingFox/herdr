@@ -113,6 +113,13 @@ const X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE: c_int = 21;
 /// Returns an empty list when there is no peer certificate at all, which the
 /// binding reports as `undefined` rather than an empty object — a caller that
 /// only wanted "is there one" gets [`has_peer_certificate`] instead.
+#[allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "the only callers are the TLSWrap prototype methods, which pass \
+              WrapState::ssl_ptr() for the wrap that is the call's receiver; that \
+              Ssl is owned by the same WrapState and freed only by its destroy \
+              path, so it is live for the whole call"
+)]
 pub fn peer_chain(ssl: *mut ffi::SSL, is_server: bool, include_issuers: bool) -> Vec<Vec<u8>> {
     if ssl.is_null() {
         return Vec::new();
@@ -213,6 +220,12 @@ unsafe fn der_of(certificate: *mut ffi::X509) -> Option<Vec<u8>> {
 /// certificate at all, so it has to be the certificate's presence and not the
 /// verify result: a TLS 1.3 resumed handshake reports `X509_V_OK` with no
 /// certificate, which is exactly the case the check exists for.
+#[allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "reachable only from the TLSWrap prototype methods and \
+              peer_verify_result, both of which hand over WrapState::ssl_ptr() for \
+              a wrap whose Ssl is alive for the call"
+)]
 pub fn has_peer_certificate(ssl: *mut ffi::SSL) -> bool {
     if ssl.is_null() {
         return false;
@@ -233,6 +246,12 @@ pub fn has_peer_certificate(ssl: *mut ffi::SSL) -> bool {
 /// `GetCertificate` is `SSL_get_certificate`, which is a **borrowed** pointer to
 /// the certificate the `SSL` is currently configured with — not the context's.
 /// That distinction is what makes `setKeyCert`'s SNI swap visible here.
+#[allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "called only by GetCertificate's binding, with WrapState::ssl_ptr() \
+              from the wrap that is the receiver; the certificate it returns is \
+              owned by that SSL and only read"
+)]
 pub fn local_certificate(ssl: *mut ffi::SSL) -> Option<Vec<u8>> {
     if ssl.is_null() {
         return None;
@@ -322,15 +341,16 @@ pub extern "C" fn always_continue(_preverify_ok: c_int, _ctx: *mut ffi::X509_STO
     1
 }
 
-/// `SSL_get_verify_result`, or `None` when there is no `SSL`.
-pub fn verify_result(ssl: *mut ffi::SSL) -> Option<c_long> {
-    if ssl.is_null() {
-        return None;
-    }
-    // SAFETY: `ssl` is live, checked above.
-    Some(unsafe { ffi::SSL_get_verify_result(ssl) })
-}
-
+/// `SSL_get_verify_result` for a live `SSL`.
+///
+/// The four `SSL_get_*` queries this and its neighbours make are one family and
+/// share one argument contract, which [`peer_verify_result`] states.
+#[allow(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "called only by VerifyError::of, which is reached from the \
+              verifyError() prototype method with WrapState::ssl_ptr() for that \
+              method's own receiver; the SSL is alive for the call"
+)]
 /// `SSLPointer::verifyPeerCertificate` (`ncrypto.cc:5175`), as `VerifyError`
 /// consumes it.
 ///
@@ -681,6 +701,129 @@ fn set_issuer<'s>(
     object.set(scope, key.into(), issuer).is_some()
 }
 
+/// `TLSWrap::GetSharedSigalgs` (`crypto_tls.cc:2084`).
+///
+/// `SSL_get_shared_sigalgs` as an array of `"RSA-PSS+SHA384"` strings — *not*
+/// `[sign, hash]` numeric pairs, which is what this returned before and is why
+/// `test-tls-set-sigalgs.js` failed its `deepStrictEqual` against node's answer.
+///
+/// Two details of the loop are load-bearing and both were wrong:
+///
+/// * **Index 0 is a real entry, not a count probe.** `SSL_get_shared_sigalgs`
+///   (`t1_lib.c:3693`) validates `idx < shared_sigalgslen` and returns the
+///   *length*; index 0 with null out-parameters returns the length only because
+///   the caller asked for an in-range index, so iterating `1..=count` both skips
+///   the first entry and reads one past the end.
+/// * **The count is what the call returns, not a separate probe.** Node calls it
+///   once with index 0 to size the array, then once per index.
+///
+/// The name is built from the sign NID and the hash NID through
+/// `OBJ_nid2sn`, with node's five special-cased family prefixes, because
+/// `OBJ_nid2sn(NID_rsassaPss)` is `RSASSA-PSS` where the API reports `RSA-PSS`.
+pub fn get_shared_sigalgs<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let names = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: `ssl` is live, checked above, and index 0 is in range whenever
+        // the list is non-empty.
+        let count = unsafe {
+            crate::ffi_extra::SSL_get_shared_sigalgs(
+                ssl,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let mut names = Vec::with_capacity(count.max(0) as usize);
+        for index in 0..count {
+            let mut sign: c_int = 0;
+            let mut hash: c_int = 0;
+            // SAFETY: `index` is inside the count just read, and the
+            // out-parameters are live locals; the raw-signature pointers are null,
+            // which `t1_lib.c:3715` allows.
+            let ok = unsafe {
+                crate::ffi_extra::SSL_get_shared_sigalgs(
+                    ssl,
+                    index,
+                    &mut sign,
+                    &mut hash,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok <= 0 {
+                break;
+            }
+            names.push(crate::peer_cert::sigalg_name(sign, hash));
+        }
+        names
+    })
+    .unwrap_or_default();
+
+    let array = v8::Array::new(scope, names.len() as i32);
+    for (index, name) in names.iter().enumerate() {
+        if let Some(text) = v8::String::new(scope, name) {
+            let _ = array.set_index(scope, index as u32, text.into());
+        }
+    }
+    rv.set(array.into());
+}
+
+/// `GetSharedSigalgs`'s per-entry name: `"RSA-PSS+SHA384"`.
+///
+/// `crypto_tls.cc:2102-2156`. The sign NID's *family* decides the prefix, with
+/// five special cases where `OBJ_nid2sn` does not produce the name the API
+/// reports (`RSASSA-PSS` rather than `RSA-PSS`, for instance), and the hash NID
+/// goes through `OBJ_nid2sn` unchanged. An unknown NID on either side becomes
+/// `UNDEF`, which is node's own fallback rather than an error.
+pub fn sigalg_name(sign_nid: c_int, hash_nid: c_int) -> String {
+    const NID_RSA_ENCRYPTION: c_int = 6;
+    const NID_DSA: c_int = 116;
+    const NID_RSASSA_PSS: c_int = 912;
+    const NID_X9_62_ID_ECPUBLICKEY: c_int = 408;
+    const NID_ED25519: c_int = 1087;
+    const NID_ED448: c_int = 1088;
+
+    let prefix = match sign_nid {
+        NID_RSA_ENCRYPTION => "RSA".to_string(),
+        NID_RSASSA_PSS => "RSA-PSS".to_string(),
+        NID_DSA => "DSA".to_string(),
+        NID_X9_62_ID_ECPUBLICKEY => "ECDSA".to_string(),
+        NID_ED25519 => "Ed25519".to_string(),
+        NID_ED448 => "Ed448".to_string(),
+        other => nid_short_name(other).unwrap_or_else(|| "UNDEF".to_string()),
+    };
+    let hash = nid_short_name(hash_nid).unwrap_or_else(|| "UNDEF".to_string());
+    format!("{prefix}+{hash}")
+}
+
+/// `OBJ_nid2sn`, as an owned `String`.
+fn nid_short_name(nid: c_int) -> Option<String> {
+    extern "C" {
+        fn OBJ_nid2sn(nid: c_int) -> *const std::os::raw::c_char;
+    }
+    // SAFETY: returns a static NUL-terminated string or null.
+    let pointer = unsafe { OBJ_nid2sn(nid) };
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: static string owned by OpenSSL.
+    let text = unsafe { std::ffi::CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned();
+    (!text.is_empty()).then_some(text)
+}
+
 /// `TLSWrap::GetPeerX509Certificate` (`crypto_tls.cc:1881`).
 ///
 /// A real `X509Certificate`, built from the peer's chain so its
@@ -937,7 +1080,6 @@ mod tests {
         assert!(peer_chain(std::ptr::null_mut(), true, true).is_empty());
         assert!(!has_peer_certificate(std::ptr::null_mut()));
         assert!(local_certificate(std::ptr::null_mut()).is_none());
-        assert!(verify_result(std::ptr::null_mut()).is_none());
         assert!(peer_verify_result(std::ptr::null_mut()).is_none());
     }
 
