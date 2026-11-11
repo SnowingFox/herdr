@@ -27,9 +27,17 @@
 # Exit codes: 0 the control behaved as required, 1 the control did not, 2 usage
 # error, 3 the run is void (build or setup failure) with no verdict.
 #
+# `after` needs the class on the `crypto` namespace, and the one line that puts
+# it there lives in `crates/rn-bind-crypto/src/install.rs`, which this branch
+# deliberately does not touch because that file is single-owner. So `after` is a
+# *wired* run: it appends the `install_classes` call and the crate dependency,
+# builds, measures, and restores both files. Without that the after column would
+# be a measurement of a tree that has the crate but never installs it, which
+# proves nothing about the crate.
+#
 # Usage:
 #   tools/secure-context-probe.sh before   # against origin/master
-#   tools/secure-context-probe.sh after    # against this tree
+#   tools/secure-context-probe.sh after    # this tree, wired for the run
 #   tools/secure-context-probe.sh --self-test  # prove the exit-3 contract
 
 set -uo pipefail
@@ -87,6 +95,57 @@ run_probe() {
   ( cd "$tree/rustnode" && "$binary" --expose-internals tools/secure-context-probe.js 2>&1 )
 }
 
+# Applies the two edits that put the class on the namespace, and installs a trap
+# that puts both files back. The restore is checked, not assumed: a control that
+# leaves the tree modified is worse than one that does not run.
+wired_install() {
+  install_rs="crates/rn-bind-crypto/src/install.rs"
+  cargo_toml="crates/rn-bind-crypto/Cargo.toml"
+  backup_install="$(mktemp)"
+  backup_toml="$(mktemp)"
+
+  cp "$install_rs" "$backup_install" || return 1
+  cp "$cargo_toml" "$backup_toml" || return 1
+
+  # The function that carries the edits, so the trap has one place to undo them.
+  apply_wiring() {
+    python3 - "$install_rs" "$cargo_toml" <<'PYEOF'
+import sys
+install_rs, cargo_toml = sys.argv[1], sys.argv[2]
+s = open(install_rs).read()
+needle = '        rn_bind_crypto_keys::install_classes(scope, object)?;'
+if needle not in s:
+    sys.exit("the install_classes call site is not where this script expects")
+s = s.replace(needle, needle + '\n        rn_bind_secure_context::install_classes(scope, object)?;', 1)
+open(install_rs, "w").write(s)
+s = open(cargo_toml).read()
+if "rn-bind-secure-context" not in s:
+    s = s.replace("[dependencies]", "[dependencies]\nrn-bind-secure-context = { path = \"../rn-bind-secure-context\" }", 1)
+    open(cargo_toml, "w").write(s)
+PYEOF
+  }
+
+  restore_wiring() {
+    local failed=0
+    if ! cp "$backup_install" "$install_rs" || ! cmp -s "$backup_install" "$install_rs"; then
+      echo "FAIL: could not restore $install_rs; original at $backup_install" >&2
+      failed=1
+    fi
+    if ! cp "$backup_toml" "$cargo_toml" || ! cmp -s "$backup_toml" "$cargo_toml"; then
+      echo "FAIL: could not restore $cargo_toml; original at $backup_toml" >&2
+      failed=1
+    fi
+    if [ "$failed" -eq 0 ]; then
+      rm -f "$backup_install" "$backup_toml"
+    fi
+    return "$failed"
+  }
+
+  trap 'restore_wiring || exit 1' EXIT
+  apply_wiring || { echo "could not apply the wiring" >&2; return 1; }
+  return 0
+}
+
 status=0
 
 if [ "$mode" = "before" ]; then
@@ -136,7 +195,12 @@ if [ "$mode" = "before" ]; then
     status=1
   fi
 else
-  if ! build "$root" "this tree" ""; then
+  if ! wired_install; then
+    echo "RESULT: NO VERDICT - could not apply the namespace wiring." >&2
+    exit 3
+  fi
+
+  if ! build "$root" "this tree (wired)" ""; then
     echo "RESULT: NO VERDICT - this tree could not be built." >&2
     exit 3
   fi
@@ -147,18 +211,6 @@ else
   echo "-- exit $rc --"
 
   if [ "$rc" -ne 0 ]; then
-    # The most likely cause is the one thing this branch deliberately does not
-    # commit: the `install.rs` line that calls `install_classes` onto the crypto
-    # namespace. That file is single-owner, so the wiring is the coordinator's
-    # edit at merge time. Reporting "unexpected" with no explanation would send
-    # the next reader looking for a defect in the crate, so the hint is printed.
-    if echo "$output" | grep -q "class|MISSING"; then
-      echo "RESULT: NO VERDICT - the class is not on the namespace in this tree." >&2
-      echo "  This is expected until rn-bind-crypto/src/install.rs calls" >&2
-      echo "  rn_bind_secure_context::install_classes, which this branch does not" >&2
-      echo "  commit because that file is single-owner. See the PR description." >&2
-      exit 3
-    fi
     echo "RESULT: UNEXPECTED - the after probe exited $rc, expected 0" >&2
     status=1
   elif ! echo "$output" | grep -q "config.setCipherSuites+setCiphers|OK"; then
