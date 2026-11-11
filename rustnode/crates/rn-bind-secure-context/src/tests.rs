@@ -186,6 +186,33 @@ fn secure_context_binding_end_to_end() {
         "(() => { try { void binding.SecureContext.prototype._external; return 'no-throw'; }           catch (e) { return e.name; } })()",
         "TypeError",
     );
+    // Every method invoked on the prototype itself must throw rather than read
+    // an internal field the prototype does not have. Reading `_external` there
+    // aborted the process with "misaligned pointer dereference" before
+    // `with_state` counted the object's internal fields, which is why this case
+    // exists and why it runs before the instance cases.
+    //
+    // `close` is deliberately not in the list: it is called from a
+    // `once('close')` handler in wrap.js where throwing would turn a teardown
+    // into a second failure, so a bad receiver is ignored on purpose.
+    check!(
+        scope,
+        "every method on the prototype throws instead of crashing",
+        "(() => { const names = [ 'init','setKey','setCert','addCACert', \
+           'setAllowPartialTrustChain','addCRL','addRootCerts','setCipherSuites', \
+           'setCiphers','setSigalgs','setECDHCurve','setDHParam','setMaxProto', \
+           'setMinProto','getMaxProto','getMinProto','setOptions', \
+           'setSessionIdContext','setSessionTimeout','getTicketKeys', \
+           'getCertificate','getIssuer' ]; \
+           let nonThrow = []; \
+           for (const name of names) { \
+             try { binding.SecureContext.prototype[name](); } \
+             catch (e) { continue; } \
+             nonThrow.push(name); \
+           } \
+           return nonThrow.length === 0 ? 'all threw' : nonThrow.join(','); })()",
+        "all threw",
+    );
     check!(
         scope,
         "_external on an instance is an opaque object, as in Node",

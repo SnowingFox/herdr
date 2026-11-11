@@ -199,9 +199,32 @@ fn constructor(
 /// `ASSIGN_OR_RETURN_UNWRAP` produces, rather than a panic. A re-entrant borrow
 /// cannot happen because nothing in this crate calls back into V8 while holding
 /// it.
+///
+/// # Why the internal-field count is checked
+///
+/// `get_aligned_pointer_from_internal_field` reads raw storage at a fixed offset
+/// into the object's embedder fields. Called on an object that has *no* internal
+/// fields it does not return null — it reads whatever bytes are at that offset,
+/// which for a prototype object happened to be a misaligned address and aborted
+/// the process:
+///
+/// ```text
+/// misaligned pointer dereference: address must be a multiple of 0x8 but is 0x1a6ad3219149
+/// ```
+///
+/// That is reached by reading `SecureContext.prototype._external`, which a real
+/// `node` answers with a `TypeError` from the accessor's `Signature` guard. The
+/// count check is this crate's equivalent guard, and it is load-bearing: without
+/// it a legal JavaScript expression crashes the process instead of throwing.
 fn with_state<R>(this: v8::Local<v8::Object>, body: impl FnOnce(&mut Context) -> R) -> Option<R> {
-    // SAFETY: the pointer was written by `constructor` into this object's field
-    // 0, and nothing but its finalizer clears or replaces it.
+    // The prototype, and anything else not created by `constructor`, has no
+    // embedder fields, so field 0 is not a pointer and must not be read.
+    if this.internal_field_count() < INTERNAL_FIELD_COUNT {
+        return None;
+    }
+    // SAFETY: the object has at least one internal field, and the only writer of
+    // field 0 is `constructor`, which stores a `*mut RefCell<Context>` there.
+    // Nothing but the object's finalizer clears or replaces it.
     let pointer = unsafe { this.get_aligned_pointer_from_internal_field(CONTEXT_STATE_FIELD, 0) }
         as *mut RefCell<Context>;
     if pointer.is_null() {
