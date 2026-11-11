@@ -118,10 +118,10 @@ having the member exist and fail keeps the JS layer on its documented path.
 
 ## The three calling conventions
 
-Every member picks its behaviour from its trailing argument, exactly as
+Every member picks its behaviour from its request argument, exactly as
 `GetReqWrap()` does in `src/node_file.cc`:
 
-| trailing argument | mode | binding returns |
+| request argument | mode | binding returns |
 | --- | --- | --- |
 | absent | synchronous | the value, or throws |
 | an object (`FSReqCallback` instance) | callback | `undefined`, then calls `req.oncomplete(err, value)` |
@@ -130,6 +130,36 @@ Every member picks its behaviour from its trailing argument, exactly as
 `kUsePromises` is matched by identity against a symbol created at install time.
 A user-created symbol with the same description therefore does not select promise
 mode, which matters because the symbol is published on the namespace object.
+
+### The request slot is a position, not always the tail
+
+For every member but two the request is the last argument, and `conclude!`
+classifies the tail. `stat` and `fstat` put a real operand *after* it:
+
+```text
+stat(path, useBigint, req, throwIfNoEntry)
+fstat(fd,   useBigint, req, shouldNotThrow)
+```
+
+Reading their tail was not a cosmetic slip. `fs.promises.stat` passes
+`options.throwIfNoEntry`, which defaults to `true`, so the binding answered
+*synchronous* and returned the raw stat slot array where the promise layer
+expected a promise. `internal/fs/promises.js` then threw
+
+```text
+TypeError: Method Promise.prototype.then called on incompatible receiver
+[object BigInt64Array]
+```
+
+which reads like a thenable being duck-typed and is not: the stats object was the
+return value because the call never entered promise mode. The callback form had
+the same defect and no error at all — `fs.stat(path, cb)` never called back.
+
+Both use `conclude!(slot 2; ...)`, backed by `request::classify_slot`.
+`lstat` is three arguments long, so its request *is* the tail, which is why the
+bug looked `stat`-specific. Any new member whose request is followed by another
+operand must use the `slot` form; the sync form's explicit `undefined` in that
+slot still answers synchronous.
 
 ### Why the callback is deferred, and not threaded
 

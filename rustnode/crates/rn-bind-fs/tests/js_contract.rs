@@ -1089,3 +1089,230 @@ d.run(() => {{
         "both job classes must deliver inside the caller's async frame"
     );
 }
+
+/// Runs `source` inline (`-e`) through the real `rustnode` binary.
+///
+/// Separate from `run_in_binary` above, which writes a script file: `require` of
+/// an `internal/**` module resolves only under `-e` in this runtime (real `node`
+/// rejects it from a file too), so a test that reaches a binding directly has to
+/// evaluate its source inline. `flags` carries `--expose-internals` for those.
+fn run_inline_with(label: &str, source: &str, flags: &[&str]) -> String {
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.pop();
+    path.pop();
+    path.push("target");
+    path.push(if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    });
+    path.push("rustnode");
+    let output = std::process::Command::new(&path)
+        .args(flags)
+        .arg("-e")
+        .arg(source)
+        .output()
+        .unwrap_or_else(|error| panic!("the rustnode binary must be built first: {error}"));
+    assert!(
+        output.status.success(),
+        "{label}: script failed with {:?}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// The request slot is a position, not the tail
+// ---------------------------------------------------------------------------
+
+/// `stat` and `fstat` are the two members whose request argument is followed by
+/// a real operand, so the shared `conclude!` tail classification answered
+/// "synchronous" for them. The visible symptom was
+/// `TypeError: Method Promise.prototype.then called on incompatible receiver
+/// [object BigInt64Array]` from `fs.promises.stat`, because the binding handed
+/// back the raw stat slot array where the promise layer expected a promise.
+///
+/// These tests drive the CLI because the promise path needs the real
+/// `lib/internal/fs/promises.js`.
+#[test]
+fn promises_stat_and_fstat_resolve_through_promise_mode() {
+    let dir = TempDir::new("slot-promise");
+    let file = dir.joined("s.txt");
+    std::fs::write(&file, b"x").expect("write");
+    let path = js_path(&file);
+
+    let out = run_in_binary(
+        "slot-promise",
+        &format!(
+            r#"
+const fs = require('fs');
+(async () => {{
+  const plain = await fs.promises.stat('{path}');
+  const big = await fs.promises.stat('{path}', {{ bigint: true }});
+  const viaLstat = await fs.promises.lstat('{path}');
+  console.log(JSON.stringify({{
+    stat: plain.constructor.name,
+    statIsBigInt: typeof plain.size === 'bigint',
+    bigint: big.constructor.name,
+    bigintIsBigInt: typeof big.size === 'bigint',
+    lstat: viaLstat.constructor.name,
+  }}));
+}})();
+"#
+        ),
+    );
+    assert_eq!(
+        out,
+        r#"{"stat":"Stats","statIsBigInt":false,"bigint":"BigIntStats","bigintIsBigInt":true,"lstat":"Stats"}"#
+    );
+}
+
+/// `fstat` takes the fd instead of a path but has the same four-slot shape, so
+/// it needs the positional read for the same reason.
+///
+/// The assertion is `instanceof Promise`, not a `then` error: raw `await` on a
+/// typed array silently returns the array, so only the `PromisePrototypeThen`
+/// that `internal/fs/promises.js` uses actually throws. Checking the returned
+/// kind is the contract the JS layer depends on either way.
+#[test]
+fn promise_mode_fstat_resolves_through_its_own_request_slot() {
+    let dir = TempDir::new("slot-fstat");
+    let file = dir.joined("f.bin");
+    std::fs::write(&file, b"123456").expect("write");
+
+    let out = run_inline_with(
+        "slot-fstat",
+        &format!(
+            r#"
+const fs = require('fs');
+const realm = require('internal/bootstrap/realm');
+const binding = realm.internalBinding('fs');
+(async () => {{
+  const fd = fs.openSync('{path}', 'r');
+  // Four arguments, because that is the shape that distinguishes the two
+  // readings: with three, the request *is* the tail and both agree. `fs.js:520`
+  // and `fs.js:2119` both pass a fourth argument.
+  const plainCall = binding.fstat(fd, false, binding.kUsePromises, true);
+  const bigCall = binding.fstat(fd, true, binding.kUsePromises, false);
+  const plainIsPromise = plainCall instanceof Promise;
+  const bigIsPromise = bigCall instanceof Promise;
+  const plain = await plainCall;
+  const big = await bigCall;
+  fs.closeSync(fd);
+  console.log(JSON.stringify({{
+    plainIsPromise,
+    bigIsPromise,
+    plain: plain.constructor.name,
+    plainSize: plain[8],
+    big: big.constructor.name,
+    bigSize: String(big[8]),
+  }}));
+}})();
+"#,
+            path = js_path(&file)
+        ),
+        &["--expose-internals"],
+    );
+    assert_eq!(
+        out,
+        r#"{"plainIsPromise":true,"bigIsPromise":true,"plain":"Float64Array","plainSize":6,"big":"BigInt64Array","bigSize":"6"}"#
+    );
+}
+
+#[test]
+fn the_stat_callback_form_calls_back_instead_of_returning_the_array() {
+    // The same bug in the callback convention: `fs.stat(path, cb)` passes
+    // `undefined` for `options.throwIfNoEntry`'s slot in one shape and `true` in
+    // another, and a tail read made both look synchronous, so `oncomplete` was
+    // never delivered and the callback silently never ran.
+    let dir = TempDir::new("slot-callback");
+    let file = dir.joined("c.txt");
+    std::fs::write(&file, b"xy").expect("write");
+    let path = js_path(&file);
+
+    let out = run_in_binary(
+        "slot-callback",
+        &format!(
+            r#"
+const fs = require('fs');
+let calls = 0;
+fs.stat('{path}', (err, stats) => {{
+  calls++;
+  console.log(JSON.stringify({{
+    err: err === null ? 'null' : String(err),
+    isStats: stats && stats.constructor.name === 'Stats',
+    size: stats && stats.size,
+    calls,
+  }}));
+}});
+fs.lstat('{path}', (err, stats) => {{
+  console.log(JSON.stringify({{ lstatSize: stats && stats.size }}));
+}});
+"#
+        ),
+    );
+    assert_eq!(
+        out,
+        "{\"err\":\"null\",\"isStats\":true,\"size\":2,\"calls\":1}\n{\"lstatSize\":2}"
+    );
+}
+
+#[test]
+fn a_missing_path_in_promise_mode_rejects_with_the_stat_error() {
+    // `fs.promises.stat` defaults `throwIfNoEntry` to `true`, which is the value
+    // that used to land in the request slot. The rejection has to come from the
+    // async path, with `syscall: 'stat'`.
+    let out = run_in_binary(
+        "slot-enoent",
+        r#"
+const fs = require('fs');
+(async () => {
+  const seen = [];
+  try { await fs.promises.stat('/definitely/not/here/slot'); }
+  catch (e) { seen.push([e.code, e.syscall, e.errno].join(' ')); }
+  // `throwIfNoEntry: false` resolves `undefined` rather than rejecting.
+  const none = await fs.promises.stat('/definitely/not/here/slot', { throwIfNoEntry: false });
+  // The callback form still reports it as `err`.
+  await new Promise((resolve) => {
+    fs.stat('/definitely/not/here/slot', (err) => {
+      seen.push([err.code, err.syscall].join(' '));
+      resolve();
+    });
+  });
+  console.log(JSON.stringify({ seen, none: none === undefined }));
+})();
+"#,
+    );
+    assert_eq!(
+        out,
+        r#"{"seen":["ENOENT stat -2","ENOENT stat"],"none":true}"#
+    );
+}
+
+#[test]
+fn the_explicit_undefined_request_slot_stays_synchronous() {
+    // `binding.stat(path, bigint, undefined, throwIfNoEntry)` is the sync form,
+    // and it has an operand *after* the empty request slot. A positional read
+    // must still answer "synchronous" for it, not "no request then error".
+    let dir = TempDir::new("slot-sync");
+    let file = dir.joined("s.txt");
+    std::fs::write(&file, b"abc").expect("write");
+
+    let out = run(&format!(
+        r#"
+        const missing = fsBinding.stat('/definitely/not/here/slot', false, undefined, false);
+        const present = fsBinding.stat('{file}', false, undefined, true);
+        globalThis.__out = JSON.stringify({{
+          missingIsUndefined: missing === undefined,
+          type: present.constructor.name,
+          size: present[8],
+        }});
+        "#,
+        file = js_path(&file)
+    ));
+    assert_eq!(
+        out,
+        r#"{"missingIsUndefined":true,"type":"Float64Array","size":3}"#
+    );
+}
