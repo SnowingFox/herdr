@@ -84,6 +84,11 @@ pub struct Flags {
     /// previous listener was still in flight when this wrap took over, which is
     /// `wrapHasActiveWriteFromPrevOwner` at `wrap.js:836`.
     pub has_active_write_issued_by_prev_listener: bool,
+    /// `flags_.eof` — a close-notify or an underlying EOF was seen.
+    ///
+    /// `ClearIn` does nothing once set, and `ReadStart` does not re-arm, which is
+    /// `crypto_tls.cc:1094`'s `!flags_.eof` guard.
+    pub eof: bool,
     /// `flags_.in_destroy` — re-entrant `Destroy` is a no-op.
     ///
     /// Node has no such flag because `if (!ssl_) return;` covers it; it is here
@@ -156,12 +161,25 @@ pub struct WrapState {
     pub next_session: Option<*mut openssl_sys::SSL_SESSION>,
     /// The bytes `EncOut` has produced but not yet handed to the socket.
     ///
-    /// Node keeps these in the `NodeBIO` and drains them immediately; a queue
+    /// Node writes them straight to the underlying stream from `EncOut`; a queue
     /// here is what lets `DoWrite` report a partial write without losing the
-    /// remainder. Cleared by [`TlsState::destroy`], which is R3's other half: a
-    /// write that cannot be flushed is completed with an error rather than left
-    /// pointing at freed memory.
+    /// remainder, and what lets `flush` retry after `WANT_WRITE`. Drained by
+    /// [`crate::stream::flush`], and cleared by [`WrapState::destroy`] — a write
+    /// that cannot be flushed is completed with an error rather than left
+    /// pointing at freed memory (R3).
     pub pending_output: Vec<u8>,
+    /// Cleartext the caller wrote that `SSL_write` could not yet accept.
+    ///
+    /// `crypto_tls.cc`'s `pending_cleartext_input_`, a kept backing store that
+    /// `ClearOut` retries. Node parks it on `WANT_WRITE` so a write under
+    /// backpressure is resumed rather than truncated; dropping it is how a large
+    /// payload loses its tail while a small one echoes fine.
+    pub pending_cleartext: Vec<u8>,
+    /// `flags_.eof`: a close-notify or an underlying EOF was seen.
+    ///
+    /// Once set, `ClearIn` does nothing and `ReadStart` does not re-arm, which is
+    /// `crypto_tls.cc:1094`'s `!flags_.eof` guard.
+    pub error: Option<String>,
 }
 
 impl WrapState {
@@ -184,6 +202,8 @@ impl WrapState {
             cert_cb_pending: false,
             next_session: None,
             pending_output: Vec::new(),
+            pending_cleartext: Vec::new(),
+            error: None,
         }
     }
 
@@ -276,6 +296,9 @@ impl WrapState {
         // `enc_in()`/`enc_out()` read the BIOs back from the SSL, so there is
         // nothing left pointing at a freed BIO.
         self.pending_output.clear();
+        self.pending_cleartext.clear();
+        self.error = None;
+        self.flags.eof = false;
         self.secure_context = None;
         self.flags.established = false;
         self.flags.started = false;

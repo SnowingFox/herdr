@@ -82,6 +82,22 @@ impl WrapListener {
         Self { cell }
     }
 
+    /// The JavaScript `TLSWrap` object this listener belongs to.
+    ///
+    /// Needed by `flush`, which reports a write completion through V8 and
+    /// therefore needs the object rather than the state. `None` when the wrap was
+    /// built without one, which a direct `new TLSWrap()` leaves behind.
+    fn object<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object> {
+        let global = self.with(|state| state.object.clone());
+        match global.flatten() {
+            Some(global) => v8::Local::new(scope, global),
+            // An empty object rather than a panic: `flush` only uses the object
+            // to reach the state and to pass as a write's owner, and a wrap with
+            // no object has nothing to flush.
+            None => v8::Object::new(scope),
+        }
+    }
+
     /// Runs `body` with the wrap state, or reports a re-entrant call.
     fn with<R>(&self, body: impl FnOnce(&mut WrapState) -> R) -> Option<R> {
         if self.cell.is_null() {
@@ -156,11 +172,33 @@ impl StreamListener for WrapListener {
                 "TLSWrap could only buffer part of a read"
             );
         }
-        // The state machine. Increment 1 has no handshake, so this reports the
-        // increment that adds it rather than dropping the bytes silently.
+        // The state machine. `ClearIn` decrypts whatever the BIO accepted and
+        // `EncOut` produces the ciphertext a retry needs; `flush` then hands
+        // that ciphertext to the underlying stream.
+        //
         // SAFETY: `cell` is this listener's wrap state, guaranteed live for the
         // listener's whole life by `attach`'s contract.
-        unsafe { crate::cycle::run(self.cell) };
+        let outcome = unsafe { crate::cycle::run(self.cell) };
+        if outcome == crate::cycle::CycleOutcome::Reentrant {
+            // A callback inside the state machine re-entered the listener. The
+            // outer invocation continues the machine when it returns, so the
+            // bytes already in `enc_in_` are not lost.
+            return;
+        }
+        let Some(Some(stream)) = self.with(|state| state.underlying) else {
+            return;
+        };
+        // `flush` needs a scope to report a completion through. This is the same
+        // `callback::with_context` that `rn_uv::handle::deliver_read` uses for the
+        // JavaScript `onread` call, for the same reason: a libuv read callback
+        // already runs inside a handle scope, and this borrows it rather than
+        // creating a second one.
+        let _ = rn_uv::callback::with_context(|scope| {
+            let object = self.object(scope);
+            // SAFETY: `stream` came from the wrap's own `underlying` field
+            // while the wrap holds it, per `attach`'s contract.
+            unsafe { crate::stream::flush(scope, object, stream, None) }
+        });
     }
 
     /// `TLSWrap::OnStreamAfterWrite`.

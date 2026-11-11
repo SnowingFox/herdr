@@ -8,10 +8,16 @@
 //! | `enc_in_` | read from | the socket's ciphertext is *written* into it, and `SSL_read` consumes it |
 //! | `enc_out_` | write to | `SSL_write` produces ciphertext into it, and `EncOut` drains it to the socket |
 //!
-//! They are not symmetric: `enc_in_` is only ever written by Node and read by
-//! OpenSSL, `enc_out_` the reverse. `NodeBIO` refuses to do both on one instance
-//! (`crypto_bio.cc` `CHECK`s the direction on every entry point), which is why
-//! there are two rather than one.
+//! They are not symmetric in use — `enc_in_` is only ever written by Node and read
+//! by OpenSSL, `enc_out_` the reverse — which is why there are two rather than
+//! one. But `crypto_bio.cc` does **not** enforce that: a `NodeBIO` is a plain
+//! buffer with no direction flag, and `receive()` writes into `enc_in_` after
+//! OpenSSL may already have read from it.
+//!
+//! An earlier version of this module did enforce a direction, on the theory that
+//! mixing them would corrupt a handshake. That was wrong and it broke
+//! `receive()`: the input BIO is `SSL_get_rbio`'s, and a flag set at creation said
+//! "output". The check is gone; Node's shape is the authority.
 //!
 //! # R1: the `SSL` owns both BIOs, and this type owns neither
 //!
@@ -114,22 +120,14 @@ struct Buffer {
     eof_return: c_int,
     /// `initial_`: the capacity to reserve for a write, `crypto_bio.h:180`.
     initial: usize,
-    /// Which direction this BIO was created for, for the direction `CHECK`.
-    ///
-    /// `crypto_bio.cc` asserts a BIO is used one way, because a BIO that both
-    /// accepts writes from Node and is written by OpenSSL would mix ciphertext
-    /// and plaintext. Keeping the flag makes that a reported error here rather
-    /// than a corrupted handshake.
-    write_only: bool,
 }
 
 impl Buffer {
-    fn new(write_only: bool) -> Self {
+    fn new() -> Self {
         Self {
             data: VecDeque::new(),
             eof_return: DEFAULT_EOF_RETURN,
             initial: INITIAL_BUFFER_LENGTH,
-            write_only,
         }
     }
 }
@@ -183,7 +181,7 @@ fn method() -> Option<*const ffi::BIO_METHOD> {
 }
 
 /// `NodeBIO::New`: a BIO that retries when empty.
-fn new(write_only: bool) -> Option<*mut ffi::BIO> {
+fn new() -> Option<*mut ffi::BIO> {
     let method = method()?;
     // SAFETY: `method` is the live process-wide method, and `BIO_new` allocates
     // a `BIO` that points at it. `bio_create` installs the `Buffer` before this
@@ -193,7 +191,7 @@ fn new(write_only: bool) -> Option<*mut ffi::BIO> {
         if bio.is_null() {
             return None;
         }
-        let buffer = Box::into_raw(Box::new(RefCell::new(Buffer::new(write_only))));
+        let buffer = Box::into_raw(Box::new(RefCell::new(Buffer::new())));
         ffi::BIO_set_data(bio, buffer.cast::<c_void>());
         ffi::BIO_set_init(bio, 1);
         crate::ffi_extra::BIO_set_shutdown(bio, 0);
@@ -238,10 +236,6 @@ unsafe extern "C" fn bio_write(bio: *mut ffi::BIO, data: *const c_char, length: 
         tracing::error!("NodeBIO write re-entered itself");
         return -1;
     };
-    if buffer.write_only {
-        tracing::error!("NodeBIO write on a BIO created for output");
-        return -1;
-    }
     if length > 0 {
         // SAFETY: `data` points at `length` readable bytes, which OpenSSL
         // guarantees for the duration of the call.
@@ -264,10 +258,6 @@ unsafe extern "C" fn bio_read(bio: *mut ffi::BIO, out: *mut c_char, length: c_in
         tracing::error!("NodeBIO read re-entered itself");
         return -1;
     };
-    if buffer.write_only {
-        tracing::error!("NodeBIO read on a BIO created for output");
-        return -1;
-    }
     let available = buffer.data.len().min(length as usize);
     for index in 0..available {
         // `pop_front` on a non-empty deque cannot be `None`.
@@ -388,7 +378,7 @@ unsafe extern "C" fn bio_create(bio: *mut ffi::BIO) -> c_int {
     // a BIO whose create reported success, so this is the only place the buffer
     // is allocated.
     if unsafe { ffi::BIO_get_data(bio) }.is_null() {
-        let buffer = Box::into_raw(Box::new(RefCell::new(Buffer::new(false))));
+        let buffer = Box::into_raw(Box::new(RefCell::new(Buffer::new())));
         // SAFETY: `bio` is the new BIO; nothing else owns this field yet.
         unsafe { ffi::BIO_set_data(bio, buffer.cast::<c_void>()) };
     }
@@ -443,8 +433,8 @@ pub struct Pair {
 impl Pair {
     /// `NodeBIO::New` twice, as `InitSSL` does at `crypto_tls.cc:549`.
     pub fn new() -> Option<Self> {
-        let input = new(false)?;
-        let output = new(true)?;
+        let input = new()?;
+        let output = new()?;
         Some(Self {
             input,
             output,
@@ -682,7 +672,7 @@ mod tests {
     /// greppable.
     #[test]
     fn bytes_round_trip_through_a_bio() {
-        let bio = new(false).expect("a BIO is created");
+        let bio = new().expect("a BIO is created");
         let data = b"hello tls";
         // SAFETY: `bio` is live.
         let written =
@@ -721,7 +711,7 @@ mod tests {
     /// `SSL_ERROR_ZERO_RETURN`.
     #[test]
     fn an_empty_read_asks_for_a_retry() {
-        let bio = new(false).expect("a BIO is created");
+        let bio = new().expect("a BIO is created");
         let mut out = [0 as c_char; 8];
         // SAFETY: `bio` is live and `out` has room.
         let read = unsafe { bio_read(bio, out.as_mut_ptr(), out.len() as c_int) };
@@ -741,22 +731,37 @@ mod tests {
     /// A BIO created for output refuses a read and one created for input refuses
     /// a write, which is the direction check that stops ciphertext and plaintext
     /// being mixed in one buffer.
+    /// A BIO is a plain buffer with no direction: writing after reading works,
+    /// which is what `receive()` depends on — it writes into the read BIO after
+    /// OpenSSL may already have consumed part of it.
+    ///
+    /// Node's `NodeBIO` has no direction flag (`crypto_bio.cc`'s `Read`/`Write`
+    /// are both unconditional), and an earlier version of this module wrongly
+    /// enforced one.
     #[test]
-    fn a_bio_refuses_the_wrong_direction() {
-        let out_bio = new(true).expect("an output BIO is created");
-        let mut buffer = [0 as c_char; 4];
-        // SAFETY: `out_bio` is live and `buffer` has room.
-        let read = unsafe { bio_read(out_bio, buffer.as_mut_ptr(), buffer.len() as c_int) };
-        assert_eq!(read, -1, "an output BIO must refuse a read");
-        // SAFETY: `out_bio` is live and this is its only release.
-        unsafe { release_for_test(out_bio) };
+    fn a_bio_accepts_both_directions() {
+        let bio = new().expect("a BIO is created");
+        let data = b"abc";
+        // SAFETY: `bio` is live.
+        let written = unsafe { bio_write(bio, data.as_ptr().cast::<c_char>(), 3) };
+        assert_eq!(written, 3);
+        let mut out = [0 as c_char; 8];
+        // SAFETY: `bio` is live and `out` has room.
+        let read = unsafe { bio_read(bio, out.as_mut_ptr(), 3) };
+        assert_eq!(read, 3, "a written BIO must be readable");
+        // Writing again after a read is legal.
+        // SAFETY: `bio` is live.
+        let again = unsafe { bio_write(bio, data.as_ptr().cast::<c_char>(), 3) };
+        assert_eq!(again, 3, "a BIO may be written after being read");
+        // SAFETY: `bio` is live and this is its only release.
+        unsafe { release_for_test(bio) };
     }
 
     /// `BIO_C_SET_BUF_MEM_EOF_RETURN` turns the retry into a real EOF, which is
     /// what `NewFixed` does for a fixed buffer.
     #[test]
     fn the_eof_return_can_be_changed_to_a_real_eof() {
-        let bio = new(false).expect("a BIO is created");
+        let bio = new().expect("a BIO is created");
         // SAFETY: `bio` is live.
         unsafe { bio_ctrl(bio, BIO_C_SET_BUF_MEM_EOF_RETURN, 0, ptr::null_mut()) };
         let mut out = [0 as c_char; 4];

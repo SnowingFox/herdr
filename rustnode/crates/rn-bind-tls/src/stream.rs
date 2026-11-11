@@ -28,9 +28,8 @@
 
 use rn_v8_sys::v8;
 
-use crate::methods::NOT_IMPLEMENTED;
 use crate::state::with_state;
-use crate::wrap::throw_coded;
+use crate::wrap::throw_type_error;
 
 /// Installs one `StreamBase` accessor onto `prototype`.
 ///
@@ -197,55 +196,244 @@ fn get_bytes_written<'s>(
     rv.set(v8::Number::new(scope, count as f64).into());
 }
 
-/// `StreamBase::ReadStartJS` → `TLSWrap::ReadStart`, which is
-/// `underlying_stream()->ReadStart()`.
+/// `StreamBase::ReadStartJS` → `TLSWrap::ReadStart` (`crypto_tls.cc:1092`).
 ///
-/// Increment 2, because starting reads before the state machine exists would
-/// deliver ciphertext into `enc_in_` and never decrypt it — a hang rather than an
-/// error.
+/// Starts reads on the **underlying** stream, not on a libuv handle of its own —
+/// `TLSWrap` has none. The bytes then arrive through
+/// [`crate::listener::WrapListener::on_stream_read`], which is where they enter
+/// `enc_in_`.
+///
+/// `crypto_tls.cc:1094` guards on `!flags_.eof` so a read is not re-armed after a
+/// close-notify has been seen; the same guard is here, and `0` is the answer in
+/// that case because there is nothing to start.
 fn read_start<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    throw_coded(
-        scope,
-        "readStart is not implemented yet: it starts reads on the wrapped stream (tls_wrap increment 2)",
-        NOT_IMPLEMENTED,
-    );
-    rv.set(v8::Integer::new(scope, -1).into());
+    let object = args.this();
+    // What to do is decided under the borrow; the call into rn-uv happens after
+    // it ends, which is R2 — `read_start` can synchronously deliver a read.
+    let target = with_state(object, |state| {
+        if state.flags.eof {
+            return None;
+        }
+        state.flags.reading = true;
+        state.underlying
+    });
+    let Some(Some(stream)) = target else {
+        rv.set(v8::Integer::new(scope, 0).into());
+        return;
+    };
+    // SAFETY: the underlying stream is live while the wrap holds it, and it was
+    // resolved from the handle `wrap()` was given.
+    let status = unsafe {
+        let state = &mut *stream;
+        if state.stream.is_null() {
+            0
+        } else {
+            rn_uv::stream::read_start(state.stream, stream)
+        }
+    };
+    rv.set(v8::Integer::new(scope, status).into());
 }
 
-/// `StreamBase::ReadStopJS`.
+/// `StreamBase::ReadStopJS` → `TLSWrap::ReadStop` (`crypto_tls.cc:1099`).
 fn read_stop<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    throw_coded(
-        scope,
-        "readStop is not implemented yet: it stops reads on the wrapped stream (tls_wrap increment 2)",
-        NOT_IMPLEMENTED,
-    );
-    rv.set(v8::Integer::new(scope, -1).into());
+    let object = args.this();
+    let target = with_state(object, |state| {
+        state.flags.reading = false;
+        state.underlying
+    });
+    let Some(Some(stream)) = target else {
+        rv.set(v8::Integer::new(scope, 0).into());
+        return;
+    };
+    // SAFETY: as `read_start`.
+    let status = unsafe {
+        let state = &mut *stream;
+        if state.stream.is_null() {
+            0
+        } else {
+            rn_uv::stream::read_stop(state.stream)
+        }
+    };
+    rv.set(v8::Integer::new(scope, status).into());
 }
 
-/// `StreamBase::Shutdown` → `TLSWrap::DoShutdown`.
+/// `StreamBase::Shutdown` → `TLSWrap::DoShutdown` (`crypto_tls.cc:1328`).
 ///
-/// Node's version queues the `ShutdownWrap` and issues the SSL close-notify, then
-/// completes the request once the ciphertext has flushed. Increment 2 has the
-/// queueing half; increment 3 the flush.
+/// Issues `SSL_shutdown` (twice, because the first call only sends the
+/// close-notify and the second waits for the peer's) and parks the `ShutdownWrap`
+/// until the ciphertext has drained. The parking is what R3 is about: a request
+/// held here must be completed on teardown, or `lib/net.js` waits forever.
+///
+/// The deferred path — a shutdown issued from inside the SSL library's stack —
+/// is `crypto_tls.cc:1333`, and it is reachable today because `ClearIn` runs the
+/// machine. It parks the request and reports `0`, and the next cycle completes
+/// it.
 fn shutdown<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    throw_coded(
-        scope,
-        "shutdown is not implemented yet: it queues a ShutdownWrap until the SSL flushes (tls_wrap increment 2)",
-        NOT_IMPLEMENTED,
-    );
-    rv.set(v8::Integer::new(scope, -1).into());
+    let Some(request) = request_argument(args.get(0)) else {
+        throw_type_error(scope, "shutdown expects a ShutdownWrap");
+        return;
+    };
+    let object = args.this();
+
+    // Decide under the borrow, act after it.
+    let plan = with_state(object, |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            // `DoShutdown` after `destroySSL`: Node reports `UV_EPROTO` for a
+            // write it cannot encrypt, and a shutdown has the same problem.
+            return Err(-71);
+        }
+        if state.in_library_call() {
+            // `crypto_tls.cc:1333`: `SSL_shutdown` must not run on the library's
+            // own stack. Park it; the next cycle completes it.
+            state.pending_shutdown = Some(v8::Global::new(scope.as_ref(), request));
+            state.flags.shutdown = true;
+            return Ok(0);
+        }
+        // SAFETY: `ssl` is live, checked above.
+        unsafe {
+            if openssl_sys::SSL_shutdown(ssl) == 0 {
+                openssl_sys::SSL_shutdown(ssl);
+            }
+        }
+        state.flags.shutdown = true;
+        // The close-notify is in `enc_out_`; `flush` hands it to the socket.
+        Ok(0)
+    });
+
+    match plan {
+        Some(Ok(0)) => {
+            // Drain the close-notify out. `flush` completes the request itself
+            // when there is nothing left to send, which is the common case for a
+            // socket that is already idle.
+            if let Some(Some(status)) = with_state(object, |state| Some(state.underlying)) {
+                if let Some(stream) = status {
+                    // SAFETY: `stream` is the wrap's own `underlying`, live.
+                    unsafe { flush(scope, object, stream, Some(request)) };
+                } else {
+                    // Nothing to write to, so the request is complete.
+                    rn_bind_stream_wrap::wrap::report_completion(scope, request, 0, None, None);
+                }
+            }
+            rv.set(v8::Integer::new(scope, 0).into());
+        }
+        Some(Ok(_)) => rv.set(v8::Integer::new(scope, 0).into()),
+        Some(Err(status)) => rv.set(v8::Integer::new(scope, status).into()),
+        None => {
+            throw_type_error(scope, "Invalid TLSWrap receiver");
+        }
+    }
+}
+
+/// Reads a request object out of a method argument.
+///
+/// `lib/internal/stream_base_commons.js` always passes one for `shutdown`; a
+/// non-object is a caller bug, so it is reported rather than ignored.
+fn request_argument<'s>(value: v8::Local<'s, v8::Value>) -> Option<v8::Local<'s, v8::Object>> {
+    v8::Local::<v8::Object>::try_from(value).ok()
+}
+
+/// Hands whatever `EncOut` produced to the underlying stream.
+///
+/// This is the write half of `TLSWrap::EncOut` (`crypto_tls.cc:1000`): the bytes
+/// are ciphertext, and they go out through the wrapped stream's own write path
+/// rather than through a libuv handle of this wrap's.
+///
+/// `request`, when given, is the `WriteWrap` or `ShutdownWrap` whose completion
+/// follows the flush. When there is nothing to write the request completes
+/// immediately, which is the "no pending encrypted output" case at
+/// `crypto_tls.cc:1183`.
+///
+/// Returns the status the caller should report, or `None` when a completion is
+/// queued and will report itself.
+/// # Safety
+///
+/// `stream` must be a live `StreamState` — the wrapped stream's, retrieved from
+/// the wrap's own `underlying` field while the wrap still holds it.
+pub unsafe fn flush<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    stream: *mut rn_uv::handle::StreamState,
+    request: Option<v8::Local<'s, v8::Object>>,
+) -> Option<i32> {
+    // The bytes are taken under the borrow and the borrow ends before anything
+    // calls into V8 (R2).
+    let taken = with_state(object, |state| {
+        if state.pending_output.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut state.pending_output))
+    });
+    let Some(Some(bytes)) = taken else {
+        // Nothing to send. A request waiting on the flush is complete now: this
+        // is `EncOut`'s "no pending encrypted output" branch, and completing it
+        // here rather than leaving it parked is R3's contract.
+        if let Some(request) = request {
+            rn_bind_stream_wrap::wrap::report_completion(scope, request, 0, None, None);
+        }
+        return Some(0);
+    };
+
+    // SAFETY: the stream is live while the wrap holds it, and `bytes` is a Vec
+    // whose allocation outlives the call — `owned` below keeps it alive until the
+    // completion.
+    let request = match request {
+        Some(request) => request,
+        None => empty_request(scope, object),
+    };
+    let raw_stream = {
+        // SAFETY: the stream is live while the wrap holds it.
+        let state = unsafe { &*stream };
+        state.stream
+    };
+    if raw_stream.is_null() {
+        return Some(-71);
+    }
+    let length = bytes.len();
+    let buffer = rn_uv::sys::uv_buf_t {
+        base: bytes.as_ptr() as *mut std::os::raw::c_char,
+        len: length,
+    };
+    // SAFETY: `raw_stream` is live, and `bytes` is moved into `owned` so its
+    // allocation outlives the libuv completion.
+    let status = unsafe {
+        rn_uv::stream::queue_write(
+            scope,
+            raw_stream,
+            vec![buffer],
+            length,
+            request,
+            object,
+            vec![bytes.into_boxed_slice()],
+        )
+    };
+    Some(status)
+}
+
+/// A stand-in request object for a flush with no caller-supplied wrap.
+///
+/// `queue_write` needs a request to attach its completion to. `EncOut` has no
+/// `WriteWrap` of its own — the ciphertext it sends is not a caller's write — so
+/// a bare object is used and its completion calls nothing. That is what Node's
+/// `StreamWriteResult` does for the same case: the write is part of the SSL's
+/// machinery, not a request the JavaScript side made.
+fn empty_request<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _object: v8::Local<'s, v8::Object>,
+) -> v8::Local<'s, v8::Object> {
+    v8::Object::new(scope)
 }
 
 /// `StreamBase::UseUserBuffer`, which `TLSWrap` does not support.
@@ -267,86 +455,292 @@ fn use_user_buffer<'s>(
 /// `StreamBase::Writev`, which is `StreamBase::Write` over an array of buffers.
 fn writev<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
 ) {
-    throw_coded(
-        scope,
-        "writev is not implemented yet: it encrypts and writes ciphertext (tls_wrap increment 2)",
-        NOT_IMPLEMENTED,
-    );
-    rv.set(v8::Integer::new(scope, -1).into());
+    let mut chunks = Vec::new();
+    // `writev(req, chunks, allBuffers)`: the middle argument is the array.
+    if let Ok(array) = v8::Local::<v8::Array>::try_from(args.get(1)) {
+        let length = array.length();
+        for index in 0..length {
+            let Some(value) = array.get_index(scope, index) else {
+                continue;
+            };
+            // SAFETY: `stream_base_commons` keeps each view alive on `req.chunks`.
+            if let Some(buffer) = unsafe { rn_uv::stream_base::view_buffer(value) } {
+                chunks.push(buffer);
+            }
+        }
+    }
+    write_chunks(scope, args, chunks, rv);
 }
 
 /// `StreamBase::WriteBuffer`, the single-buffer write.
 fn write_buffer<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    throw_coded(
-        scope,
-        "writeBuffer is not implemented yet: it encrypts and writes ciphertext (tls_wrap increment 2)",
-        NOT_IMPLEMENTED,
-    );
-    rv.set(v8::Integer::new(scope, -1).into());
+    // SAFETY: `stream_base_commons` keeps the view alive on `req.buffer`.
+    let Some(buffer) = (unsafe { rn_uv::stream_base::view_buffer(args.get(1)) }) else {
+        rv.set(v8::Integer::new(scope, EINVAL).into());
+        return;
+    };
+    write_chunks(scope, args, vec![buffer], rv);
 }
 
 /// `StreamBase::WriteString<ASCII>`.
 fn write_ascii<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
 ) {
-    throw_coded(
-        scope,
-        "writeAsciiString is not implemented yet (tls_wrap increment 2)",
-        NOT_IMPLEMENTED,
-    );
-    rv.set(v8::Integer::new(scope, -1).into());
+    write_string(scope, args, rv, StringEncoding::Latin1);
 }
 
 /// `StreamBase::WriteString<UTF8>`.
 fn write_utf8<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
 ) {
-    throw_coded(
-        scope,
-        "writeUtf8String is not implemented yet (tls_wrap increment 2)",
-        NOT_IMPLEMENTED,
-    );
-    rv.set(v8::Integer::new(scope, -1).into());
+    write_string(scope, args, rv, StringEncoding::Utf8);
 }
 
 /// `StreamBase::WriteString<UCS2>`.
 fn write_ucs2<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
 ) {
-    throw_coded(
-        scope,
-        "writeUcs2String is not implemented yet (tls_wrap increment 2)",
-        NOT_IMPLEMENTED,
-    );
-    rv.set(v8::Integer::new(scope, -1).into());
+    write_string(scope, args, rv, StringEncoding::Utf16Le);
 }
 
 /// `StreamBase::WriteString<LATIN1>`.
 fn write_latin1<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    _args: v8::FunctionCallbackArguments<'s>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
+) {
+    write_string(scope, args, rv, StringEncoding::Latin1);
+}
+
+/// Which encoding a `write*String` form flattens with.
+#[derive(Clone, Copy)]
+enum StringEncoding {
+    Utf8,
+    Latin1,
+    Utf16Le,
+}
+
+/// The shared body of the four `write*String` forms.
+///
+/// Flattens the string, then goes through the same path a `Buffer` write takes.
+/// The bytes are copied into an owned `Vec` because a V8 string's representation
+/// is not stable across a call into V8, which the completion path does.
+fn write_string<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+    encoding: StringEncoding,
+) {
+    let value = args.get(1);
+    let Ok(text) = v8::Local::<v8::String>::try_from(value) else {
+        rv.set(v8::Integer::new(scope, EINVAL).into());
+        return;
+    };
+    let bytes = match encoding {
+        // `to_rust_string_lossy` is UTF-8 by construction, which is the `<UTF8>`
+        // form's contract.
+        StringEncoding::Utf8 => text.to_rust_string_lossy(scope).into_bytes(),
+        StringEncoding::Latin1 | StringEncoding::Utf16Le => {
+            // `to_rust_string_lossy` decodes through UTF-8, so the Latin-1 form
+            // is a lossy downcast and the UCS-2 form is a re-encode of the same
+            // code units. Both are exact for the bytes `lib/net.js` actually
+            // sends through these forms — ASCII and Latin-1 text — and the
+            // lossy path is only reachable for a code point above U+00FF, which
+            // the `<LATIN1>` form cannot represent in Node either.
+            let text = text.to_rust_string_lossy(scope);
+            match encoding {
+                StringEncoding::Utf16Le => text
+                    .encode_utf16()
+                    .flat_map(|unit| unit.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                _ => text.chars().map(|ch| ch as u32 as u8).collect::<Vec<u8>>(),
+            }
+        }
+    };
+    // SAFETY: `view_buffer` is not used here; the bytes are owned by this frame
+    // and handed to `queue_write` as its `owned` storage below.
+    let chunk = rn_uv::sys::uv_buf_t {
+        base: bytes.as_ptr() as *mut std::os::raw::c_char,
+        len: bytes.len(),
+    };
+    let object = args.this();
+    let Some(request) = write_request(scope, args) else {
+        rv.set(v8::Integer::new(scope, EINVAL).into());
+        return;
+    };
+    let status = dispatch_chunks(scope, object, request, vec![chunk], vec![bytes]);
+    rv.set(v8::Integer::new(scope, status.max(0)).into());
+}
+
+/// The shared body of `writeBuffer` and `writev`.
+fn write_chunks<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    chunks: Vec<rn_uv::sys::uv_buf_t>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    throw_coded(
-        scope,
-        "writeLatin1String is not implemented yet (tls_wrap increment 2)",
-        NOT_IMPLEMENTED,
-    );
-    rv.set(v8::Integer::new(scope, -1).into());
+    let object = args.this();
+    let Some(request) = write_request(scope, args) else {
+        rv.set(v8::Integer::new(scope, EINVAL).into());
+        return;
+    };
+    let status = dispatch_chunks(scope, object, request, chunks, Vec::new());
+    rv.set(v8::Integer::new(scope, status.max(0)).into());
 }
+
+/// The `WriteWrap` a write method was given, or a fresh one.
+///
+/// `lib/internal/stream_base_commons.js` passes `null` as argument 0 and then
+/// attaches `oncomplete` to the returned object, which is why a missing request
+/// means "make one" rather than "this is a bug".
+fn write_request<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    if let Ok(request) = v8::Local::<v8::Object>::try_from(args.get(0)) {
+        return Some(request);
+    }
+    let constructor = rn_bind_stream_wrap::wrap::constructor::<rn_bind_stream_wrap::WriteWrap>(
+        scope,
+        rn_bind_stream_wrap::wrap::write_constructor,
+    )
+    .ok()?;
+    let function = v8::Local::<v8::Function>::try_from(constructor).ok()?;
+    function.new_instance(scope, &[])
+}
+
+/// Encrypts `chunks` with `SSL_write` and queues the ciphertext.
+///
+/// This is `TLSWrap::DoWrite` (`crypto_tls.cc:1114`), reduced to its synchronous
+/// path. The shape:
+///
+/// 1. concatenate the cleartext,
+/// 2. `SSL_write` under the library-call scope, which is what produces ciphertext
+///    into `enc_out_`,
+/// 3. on `WANT_WRITE`/`WANT_READ`, park the bytes in `pending_cleartext` so the
+///    next `ClearOut` retries them rather than truncating the write,
+/// 4. flush the ciphertext.
+///
+/// Returns the status the caller reports: `0` when a completion is queued, a
+/// negative error otherwise.
+fn dispatch_chunks<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    request: v8::Local<'s, v8::Object>,
+    chunks: Vec<rn_uv::sys::uv_buf_t>,
+    owned: Vec<Vec<u8>>,
+) -> i32 {
+    let mut cleartext = Vec::new();
+    for chunk in &chunks {
+        if chunk.len == 0 {
+            continue;
+        }
+        if chunk.base.is_null() {
+            return EINVAL;
+        }
+        // SAFETY: `chunk.base` points at `chunk.len` readable bytes. A view's
+        // bytes are held by `req.buffer`, and a string's by `owned`.
+        let bytes = unsafe { std::slice::from_raw_parts(chunk.base.cast::<u8>(), chunk.len) };
+        cleartext.extend_from_slice(bytes);
+    }
+    let _ = owned;
+    if cleartext.is_empty() {
+        // `crypto_tls.cc:1170`'s empty-write case: there is nothing to encrypt,
+        // but the ciphertext from an earlier handshake may still need to go out.
+        return match with_state(object, |state| state.underlying) {
+            Some(Some(stream)) => {
+                // SAFETY: `stream` is the wrap's own `underlying`, live.
+                unsafe { flush(scope, object, stream, Some(request)) }.unwrap_or(0)
+            }
+            _ => {
+                rn_bind_stream_wrap::wrap::report_completion(scope, request, 0, None, None);
+                0
+            }
+        };
+    }
+
+    let plan = with_state(object, |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            // `crypto_tls.cc:1121`: "Write after DestroySSL" is `UV_EPROTO`.
+            return Err(EPROTO);
+        }
+        if state.in_library_call() {
+            // `crypto_tls.cc:1141`: a write issued from inside the SSL library's
+            // stack is parked. Dropping it would lose the caller's bytes; writing
+            // it here would re-enter the state machine.
+            state.pending_cleartext.extend_from_slice(&cleartext);
+            state.current_write = Some(v8::Global::new(scope.as_ref(), request));
+            state.flags.write_callback_scheduled = true;
+            return Ok(None);
+        }
+        state.flags.write_callback_scheduled = true;
+        state.current_write = Some(v8::Global::new(scope.as_ref(), request));
+        state.library_call_depth = state.library_call_depth.saturating_add(1);
+        // SAFETY: `ssl` is live, checked above.
+        let written = unsafe {
+            openssl_sys::SSL_write(
+                ssl,
+                cleartext.as_ptr().cast(),
+                cleartext.len() as std::os::raw::c_int,
+            )
+        };
+        // SAFETY: `written` is this call's own return value.
+        let outcome = unsafe { crate::cycle::IoOutcome::of(ssl, written, written.max(0) as usize) };
+        state.library_call_depth = state.library_call_depth.saturating_sub(1);
+        match outcome {
+            crate::cycle::IoOutcome::Wrote(_) => {}
+            crate::cycle::IoOutcome::WantRead | crate::cycle::IoOutcome::WantWrite => {
+                state.pending_cleartext.extend_from_slice(&cleartext);
+            }
+            crate::cycle::IoOutcome::ZeroReturn | crate::cycle::IoOutcome::SyscallEof => {
+                state.flags.eof = true;
+            }
+            crate::cycle::IoOutcome::Failed(reason) => {
+                state.error = Some(reason);
+                state.flags.write_callback_scheduled = false;
+                let _ = state.current_write.take();
+                return Err(EPROTO);
+            }
+        }
+        Ok(state.underlying)
+    });
+
+    match plan {
+        // The write was parked for the next cycle, which will complete it.
+        Some(Ok(None)) => 0,
+        // SAFETY: `stream` is the wrap's own `underlying`, live.
+        Some(Ok(Some(stream))) => {
+            unsafe { flush(scope, object, stream, Some(request)) }.unwrap_or(0)
+        }
+        Some(Err(status)) => {
+            rn_bind_stream_wrap::wrap::report_completion(scope, request, status, None, None);
+            status
+        }
+        None => {
+            rn_bind_stream_wrap::wrap::report_completion(scope, request, EINVAL, None, None);
+            EINVAL
+        }
+    }
+}
+
+/// `UV_EINVAL`, for a write this crate cannot represent.
+const EINVAL: i32 = 22;
+/// `UV_EPROTO`, `DoWrite`'s answer after the SSL is gone.
+const EPROTO: i32 = 71;
 
 /// `onread`'s getter, `StreamBase::AddMethods`'s last accessor.
 ///

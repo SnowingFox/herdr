@@ -90,14 +90,6 @@ macro_rules! pending_method {
     };
 }
 
-// Increment 2: the read and write paths.
-pending_method!(
-    pending_receive,
-    "receive",
-    2,
-    "it feeds injected ciphertext through the state machine"
-);
-
 // Increment 3: the handshake state machine and the SSL_get_error retry loop.
 pending_method!(
     pending_start,
@@ -325,7 +317,7 @@ pub fn install_into<'s>(
         "writesIssuedByPrevListenerDone" => method!(writes_issued_by_prev_listener_done),
 
         // Increment 2: the read and write paths.
-        "receive" => method!(pending_receive),
+        "receive" => method!(receive),
 
         // Increment 3: the handshake state machine and the SSL_get_error retry loop.
         "start" => method!(pending_start),
@@ -371,6 +363,70 @@ pub fn install_into<'s>(
 // ---------------------------------------------------------------------------
 // The methods this increment implements
 // ---------------------------------------------------------------------------
+
+/// `TLSWrap::Receive` (`crypto_tls.cc:636`): ciphertext injected from JavaScript.
+///
+/// `wrap.js:617` calls this from `initRead` for bytes that arrived on the socket
+/// before the `TLSWrap` existed — the socket is created, data is buffered, and
+/// only then is the handle wrapped. Those bytes are already ciphertext, so they
+/// skip the listener and go straight into `enc_in_`.
+///
+/// The loop copies as much as the BIO accepts and stops when the wrap closes,
+/// which is Node's `while (len > 0 && wrap->IsAlive() && !wrap->IsClosing())`.
+/// Anything the BIO refuses is dropped rather than re-queued: the BIO accepts
+/// everything it is offered, so a refusal means the wrap is going away.
+fn receive<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let value = args.get(0);
+    let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) else {
+        throw_type_error(scope, "receive expects an ArrayBufferView");
+        return;
+    };
+    let length = view.byte_length();
+    let base = view.data().cast::<u8>();
+    if length == 0 {
+        return;
+    }
+    if base.is_null() {
+        throw_type_error(scope, "receive was given a view with no data");
+        return;
+    }
+    // SAFETY: `base` points at `length` bytes of the caller's view, valid for the
+    // duration of the call.
+    let bytes = unsafe { std::slice::from_raw_parts(base, length) };
+
+    let object = args.this();
+    let accepted = with_state(object, |state| {
+        // `crypto_tls.cc:1391`'s guard: after `DestroySSL` there is no BIO to
+        // write into, and Node's loop exits on `IsAlive()` being false.
+        let Some(enc_in) = state.enc_in() else {
+            return 0;
+        };
+        enc_in.write(bytes)
+    });
+    if accepted == Some(0) {
+        return;
+    }
+    // The state machine runs, which is what decrypts the injected bytes. This is
+    // `wrap->OnStreamRead(copy, buf)` at `crypto_tls.cc:650`.
+    let Some(cell) = crate::state::state_cell(object) else {
+        return;
+    };
+    // SAFETY: `cell` is this object's live state, and the object is the receiver
+    // of the call, so it cannot be collected during it.
+    let outcome = unsafe { crate::cycle::run(cell) };
+    let _ = outcome;
+    // Whatever `ClearIn`/`EncOut` produced now goes to the socket. The borrow is
+    // taken and released before `flush`, which is R2.
+    let stream = with_state(object, |state| state.underlying).flatten();
+    if let Some(stream) = stream {
+        // SAFETY: `stream` is the wrap's own `underlying`, live while it holds it.
+        unsafe { crate::stream::flush(scope, object, stream, None) };
+    }
+}
 
 /// `TLSWrap::DestroySSL`, and the one teardown path (R1, R3, R4).
 ///

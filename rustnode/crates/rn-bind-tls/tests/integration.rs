@@ -245,3 +245,97 @@ fn the_error_queue_hooks_work() {
         "an injected error must be observable; stderr: {stderr}"
     );
 }
+
+/// `readStart` and `readStop` reach the underlying stream (increment 2).
+///
+/// On an unconnected socket libuv reports `UV_ENOTCONN` (-107), which is the same
+/// code a real `node` returns for `readStart` before `connect`. On a connected one
+/// it is 0. Both are checked, because the difference between "the method works"
+/// and "the method returns a plausible number" is which code comes back where.
+#[test]
+fn read_start_and_stop_reach_the_underlying_stream() {
+    let script = "\
+        const tls = require('tls'); \
+        const tcp = process.binding('tcp_wrap'); \
+        const h = new tcp.TCP(tcp.constants.SOCKET); \
+        const ctx = tls.createSecureContext(); \
+        const W = process.binding('tls_wrap'); \
+        const res = W.wrap(h, ctx.context, false, false); \
+        console.log(res.readStart() + ',' + res.readStop()); \
+        res.destroySSL();";
+    let (stdout, stderr, ok) = run(script);
+    assert!(ok, "readStart must not throw; stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "-107,0",
+        "an unconnected socket reports UV_ENOTCONN from readStart and 0 from \
+         readStop; stderr: {stderr}"
+    );
+}
+
+/// A wrapped **connected** socket reports `0` from `readStart`, and the process
+/// exits cleanly afterwards.
+///
+/// The clean exit is the R4 assertion: a `TLSWrap` with nothing pending must not
+/// hold a ref, or the loop never drains and the process hangs — which is the
+/// failure `spawn_sync` already paid for.
+#[test]
+fn a_connected_socket_reads_and_tears_down_cleanly() {
+    let script = "\
+        const net = require('net'); \
+        const tls = require('tls'); \
+        const server = net.createServer((sock) => sock.end()); \
+        server.listen(0, '127.0.0.1', () => { \
+          const port = server.address().port; \
+          const s = net.connect(port, '127.0.0.1', () => { \
+            const ctx = tls.createSecureContext(); \
+            const W = process.binding('tls_wrap'); \
+            const res = W.wrap(s._handle, ctx.context, false, false); \
+            console.log('start=' + res.readStart()); \
+            console.log('queue=' + res.writeQueueSize); \
+            res.destroySSL(); \
+            s.destroy(); \
+            server.close(); \
+            console.log('clean'); \
+          }); \
+        });";
+    let (stdout, stderr, ok) = run(script);
+    assert!(
+        ok,
+        "the connected-socket path must succeed; stderr: {stderr}"
+    );
+    let out = stdout.trim();
+    assert!(
+        out.contains("start=0"),
+        "readStart on a connected socket must be 0; got {out}"
+    );
+    assert!(out.contains("queue=0"), "nothing is queued; got {out}");
+    assert!(
+        out.contains("clean"),
+        "the process must reach its own last line, which proves the loop \
+         drained; got {out}"
+    );
+}
+
+/// `receive()` injects ciphertext into the wrap without a listener.
+///
+/// `wrap.js`'s `initRead` uses it for bytes the socket buffered before the wrap
+/// existed. On a fresh wrap with no handshake there is nothing to decrypt, so the
+/// assertion is that the call is accepted and the state survives it — a throw
+/// here would break `initRead` for every socket that arrives with data buffered.
+#[test]
+fn receive_accepts_injected_ciphertext() {
+    let script = "\
+        const tls = require('tls'); \
+        const tcp = process.binding('tcp_wrap'); \
+        const h = new tcp.TCP(tcp.constants.SOCKET); \
+        const ctx = tls.createSecureContext(); \
+        const W = process.binding('tls_wrap'); \
+        const res = W.wrap(h, ctx.context, false, false); \
+        res.receive(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x05])); \
+        console.log('accepted'); \
+        res.destroySSL();";
+    let (stdout, stderr, ok) = run(script);
+    assert!(ok, "receive must not throw; stderr: {stderr}");
+    assert_eq!(stdout.trim(), "accepted");
+}
