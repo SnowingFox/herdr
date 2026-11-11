@@ -196,7 +196,7 @@ The old text also said to expect the number to stay at 0 until `rn-module` and
 would unblock thousands of files. That is what happened; the full-suite figure below
 is the curve.
 
-**Full suite — 2732 of 5714 files pass (47.8%), measured on `368e32ac`.**
+**Full suite — 2731 of 5714 files pass (47.8%), measured on `f0649774`.**
 
 That is the current number, and it is measured with the four-marker rule on a binary
 built from that commit. An earlier version of this section said the figure was
@@ -217,13 +217,20 @@ For scale, the same tool at the same scope on an earlier tree:
 | --- | --- | --- | --- | --- |
 | 8 suites, 5714 files | `7af7b306` (pre-#51) | `c4ff9845…` | four-marker | 2855 passed (50.0%) |
 | 8 suites, 5714 files | `52f79555` (#51) | `d8c0d9cd…` | four-marker | 2572 passed (45.0%) |
-| 8 suites, 5714 files | `368e32ac` (current) | `3c50d5e7…` | four-marker | **2732 passed (47.8%)** |
+| 8 suites, 5714 files | `f0649774` | `dc9355c7…` | four-marker | **2731 passed (47.8%)** |
+| `test/parallel` only (5159 files) | `368e32ac` | `3c50d5e7…` | four-marker | 2550 passed (49.4%) |
+| `test/parallel` only (5159 files) | `f0649774` | `dc9355c7…` | four-marker | 2549 passed (49.4%) |
 
-The rate moved 45.0% → 47.8% because merges between those two trees closed whole
-families — `worker_threads`, `fs/promises.cp`, the inspector namespace (329 skips to
-zero) — not because the measurement changed. All three rows used the pinned tree
-`f344e7f552e3656bd37517151c5dc87d22b33771` and the commands in `docs/test-tail.md`,
-which also explains why the rule is a floor rather than a proof.
+**47.8% and 49.4% are not a trend — they are different scopes.** The eight-suite
+rate is lower because the extra suites carry failures `test/parallel` does not. Both
+are measured; `docs/test-tail.md` holds the full provenance table and explains why
+neither may be converted into the other by arithmetic.
+
+The eight-suite rate moved 45.0% → 47.8% because merges between those two trees
+closed whole families — `worker_threads`, `fs/promises.cp`, the inspector namespace
+(329 skips to zero) — not because the measurement changed. All five rows used the
+pinned tree `f344e7f552e3656bd37517151c5dc87d22b33771` and the commands in
+`docs/test-tail.md`, which also explains why the rule is a floor rather than a proof.
 
 The old text reported 1 of 5,666 files passing and named
 `parallel/test-regression-object-prototype.js` as the only pass. That was true of the
