@@ -1,5 +1,15 @@
 // Evidence for the per-context global audit.
 //
+// Run it with the built binary, not with system `node`:
+//
+//   cargo build -p rn-cli && ./target/debug/rustnode tools/per-context-audit.js
+//
+// It runs in `tools/check.sh`, immediately after the build step, because every
+// assertion below reads the rustnode realm: `primordials`, `DOMException` and the
+// per-context symbol tables exist only there, so system `node` fails on the first
+// `primordials` access. It is placed after the build rather than before it for
+// that reason alone, and it costs about 150ms.
+//
 // Three things are checked, because the bug this documents had three layers:
 //
 // 1. every identifier the per-context scripts read, and its runtime type;
@@ -7,6 +17,11 @@
 //    destructurable value is defined;
 // 3. which of those names are *globals* at all. Node passes all of them as
 //    arguments, so none should be enumerable on `globalThis`.
+//
+// Every check must be able to fail. The first block used to compare
+// `typeof value` against `typeof value`, which passed for all 14 globals
+// regardless of the realm; each expectation is now a declared type read back
+// from `globalThis`, so a missing or wrong-typed global fails and names itself.
 'use strict';
 
 const results = [];
@@ -22,15 +37,37 @@ console.log('--- free identifiers in internal/per_context/*.js, and their types 
 // prints the list): primordials.js reads language builtins plus `primordials`;
 // domexception.js reads `exports`, `primordials`, `privateSymbols`,
 // `perIsolateSymbols`; messageport.js reads `exports` and `primordials`.
-const globals = {
-  // primordials.js: configurable value properties and intrinsics come from
-  // globalThis, which is the object those free identifiers resolve through.
-  Array, Function, Reflect, String, Symbol, Uint8Array,
-  decodeURI, decodeURIComponent, encodeURI, encodeURIComponent,
-  escape, eval, unescape, globalThis,
+// The expected `typeof` for each name, written out rather than derived from the
+// value being checked. Deriving it (`expected = typeof value`) makes the check
+// compare a value to itself: it passes whether the global is present, absent, or
+// the wrong type, so it can never fail. These 14 names are the ones
+// `primordials.js` resolves through the global object; the table is the claim
+// under test, not a reading of the realm.
+//
+// `Reflect` is `object`, not `function` — ECMAScript defines it as an ordinary
+// non-callable object and Node reports `object` too. A table that said
+// `function` would fail against a correct realm.
+const expectedGlobals = {
+  Array: 'function',
+  Function: 'function',
+  Reflect: 'object',
+  String: 'function',
+  Symbol: 'function',
+  Uint8Array: 'function',
+  decodeURI: 'function',
+  decodeURIComponent: 'function',
+  encodeURI: 'function',
+  encodeURIComponent: 'function',
+  escape: 'function',
+  eval: 'function',
+  unescape: 'function',
+  globalThis: 'object',
 };
-for (const [name, value] of Object.entries(globals)) {
-  record(`global ${name}`, typeof value, name === 'globalThis' ? 'object' : typeof value);
+for (const [name, want] of Object.entries(expectedGlobals)) {
+  // Read the realm, not a destructured local: a local only shows the binding
+  // resolved while this file was parsed, whereas a missing global has to fail
+  // here. `globalThis[name]` is `undefined` when absent, which never matches.
+  record(`global ${name}`, typeof globalThis[name], want);
 }
 // `primordials` is the one per-context name that has to be a global here,
 // because `realm.js` reads it as a bare identifier inside its wrapper.

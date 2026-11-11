@@ -319,14 +319,33 @@ re-pin that adds an entry fails rather than silently omitting it, and
 `per_isolate_symbol_description` refuses a name outside the table instead of
 handing out a fresh identity.
 
-A second bug surfaced only once the file ran: `internalBinding('symbols')` was
-keyed by the C++ member name, but `node_symbols.cc` keys it by the symbol's
-*description*. `lib/internal/worker/io.js` destructures `handle_onclose`, so it
-was getting `undefined` and passing it to `ObjectDefineProperty` as a property
-key, which throws at module scope — `require('internal/worker/io')` failed and
-took 226 test files with it. The table in `rn_core` now carries the member name
-and the description as separate fields and the namespace installs the
-description.
+**The symbol table was re-keyed, not repaired.** This is worth stating precisely,
+because the obvious reading — "master had a symbol-keying bug" — is wrong and
+would send the next person looking for a regression that never shipped.
+`internalBinding('symbols')` was correct before this change: the table in
+`rn-bind-symbols/src/lib.rs` held 27 `(exposed name, description)` pairs in which
+the two fields were *identical* for every entry (`("handle_onclose",
+"handle_onclose")`, …, see `cab39a39` and `118a95df`, unchanged at
+`45015ce3^` = `18b3a28f`), and `install` keyed the namespace by the first field —
+`v8::String::new(scope, name)`. Since that field already was the description,
+`internalBinding('symbols').handle_onclose` resolved and `require('internal/worker/io')`
+loaded.
+
+What the change did was single-source the table: it moved to
+`rn_core::PER_ISOLATE_SYMBOLS` (commit `8e862d2c`) as `(C++ member name,
+description)` — Node's `PER_ISOLATE_SYMBOL_PROPERTIES` shape — and `install` now
+keys by the *description*, because `node_symbols.cc` does
+(`env->PropertyName()->Description(isolate)`). Three entries differ between the
+columns (`handle_onclose_symbol`/`handle_onclose`, `oninit_symbol`/`oninit`,
+`onpskexchange_symbol`/`onpskexchange`); that split is new information the
+one-column table could not express, not a defect it was hiding.
+
+The risk was introduced *by* the refactor and caught before it merged: once the
+member name is a separate column, keying the namespace by it would leave
+`io.js`'s `handle_onclose` destructuring `undefined` and pass that to
+`ObjectDefineProperty` as a property key, which throws at module scope. That is a
+transient state of this refactor, not a bug on `master`, and the code now keys by
+the description so it cannot recur.
 
 Measured: `test-domexception-cause.js`, `test-domexception-subclass.js`,
 `test-global-domexception.js`, `test-quotaexceedederror.js`,
