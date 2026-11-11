@@ -3,7 +3,6 @@
 //
 // Regenerate the contracts with:
 //
-//   cd rustnode
 //   ./tools/contract-gen/generate.sh
 //
 // or, equivalently, by hand:

@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # `rust-toolchain.toml` is the single source of truth for the toolchain, and
+  # cargo only honours it when no RUSTUP_TOOLCHAIN override is set.
+  #
+  # `vendor/merve` and `vendor/llhttp` are C/C++ compiled by cc-rs; pinning g++
+  # matches `tools/check.sh` and avoids clang++ builds missing GCC C++ headers.
+  CXX: g++
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Verify vendored sources are unmodified
+        run: |
+          ./tools/verify-libjs.sh
+          ./tools/verify-llhttp.sh
+          ./tools/verify-merve.sh
+
+      - name: Read the pinned toolchain
+        id: toolchain
+        run: |
+          version=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$version" || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Point the linker at libstdc++
+        run: |
+          libdir=$(dirname "$(g++ -print-file-name=libstdc++.so)")
+          test -e "$libdir/libstdc++.so" || { echo "no libstdc++.so in $libdir" >&2; exit 1; }
+          echo "RUSTFLAGS=-L $libdir" >> "$GITHUB_ENV"
+          echo "linking against $libdir/libstdc++.so"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Swatinem/rust-cache prunes `target/<profile>/` down to `build/`,
+      # `.fingerprint/` and `deps/` for outside crates, deleting the 198 MB
+      # `target/<profile>/gn_out/obj/librusty_v8.a` while preserving `v8`'s
+      # build-script fingerprints. Drop stale v8 fingerprints whenever the
+      # archive is absent so the build script re-fetches it cleanly.
+      - name: Repair a half-restored v8 build from cache
+        run: |
+          for profile in debug release; do
+            archive="target/$profile/gn_out/obj/librusty_v8.a"
+            if [ -e "$archive" ]; then
+              echo "$profile: archive present, $(stat -c%s "$archive") bytes"
+              continue
+            fi
+            shopt -s nullglob
+            fingerprints=(target/"$profile"/.fingerprint/v8-*)
+            shopt -u nullglob
+            if [ ${#fingerprints[@]} -eq 0 ]; then
+              echo "$profile: no cached v8 state, the build script will fetch the archive"
+              continue
+            fi
+            echo "$profile: v8 fingerprints without $archive, rebuilding v8"
+            rm -rf "${fingerprints[@]}"
+            rm -rf target/"$profile"/build/v8-*
+          done
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build CLI binary
+        run: cargo build -p rn-cli
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Binding shape contracts and reachability
+        run: |
+          cargo run --release -p rn-compat -- contracts --baseline contracts/complete-namespaces.txt
+          ./tools/deferred-reach.py
+          python3 tools/smoke.py --self-test

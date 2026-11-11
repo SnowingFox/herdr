@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Regenerates rustnode/contracts/*.json from the vendored Node builtin JS.
+# Regenerates contracts/*.json from the vendored Node builtin JS.
 #
-#     cd rustnode && ./tools/contract-gen/generate.sh
+#     ./tools/contract-gen/generate.sh
 #
 # Options:
 #   --node <path>   Node binary to record with (default: `node` on PATH)
@@ -58,7 +58,7 @@ trap 'rm -rf "$workdir"' EXIT
 
 if [[ "$mode" == "check" ]]; then
   cargo run --quiet -p contract-gen -- "$workdir/recorded.json" --out "$workdir/contracts"
-  if diff -ru contracts "$workdir/contracts"; then
+  if diff -ru --exclude='complete-namespaces.txt' contracts "$workdir/contracts"; then
     echo "contracts are up to date"
     exit 0
   fi

@@ -2,12 +2,11 @@
 
 Records the exact shape of every `internalBinding()` namespace the vendored
 Node builtin JavaScript expects, and writes one JSON contract per namespace to
-`rustnode/contracts/`.
+`contracts/`.
 
 ## Regenerate
 
 ```bash
-cd rustnode
 ./tools/contract-gen/generate.sh
 ```
 

@@ -4,7 +4,7 @@
 //! Regenerate every contract with:
 //!
 //! ```bash
-//! cd rustnode && ./tools/contract-gen/generate.sh
+//! ./tools/contract-gen/generate.sh
 //! ```
 //!
 //! which runs the recorder, then this emitter, then the `rn-compat` shape check.

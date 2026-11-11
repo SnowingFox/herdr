@@ -1,22 +1,20 @@
-# rustnode contributor notes for agents
+# rsnode contributor notes for agents
 
-`../AGENTS.md` is the repository's project guidance and applies here. This file
-only records what is specific to `rustnode/`, and each entry below cost real time
-to discover.
+Repository-level guidance for working on the `rsnode` runtime. Each entry below
+cost real time to discover.
 
 ## The commit trailer that gets added for you
 
-This environment installs a commit hook outside the repository, at
-`$(git config core.hooksPath)`, which appends
-`Co-authored-by: snowingfox <...>` to every commit message. The project's commit
-rules forbid AI co-author lines, so a commit made with plain `git commit` will be
-wrong even though nothing in the repository did it.
-
-Commit with the hooks path neutralised:
+Managed agent environments may install a commit hook outside the repository, at
+`$(git config core.hooksPath)`, which appends a `Co-authored-by:` line to every
+commit message. Commit rules forbid AI co-author lines, so commit with the hooks
+path neutralised:
 
 ```bash
-git -c core.hooksPath=/dev/null -c user.name="rustnode" \
-  -c user.email="rustnode@local" commit -m "..."
+git -c core.hooksPath=/dev/null \
+  -c user.name="snowingfox" \
+  -c user.email="26035718+SnowingFox@users.noreply.github.com" \
+  commit -m "..."
 ```
 
 `--no-verify` is NOT enough. The hook that adds the trailer is

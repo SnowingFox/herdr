@@ -1,5 +1,5 @@
 //! Checks Rust binding namespaces against the generated contracts in
-//! `rustnode/contracts/`.
+//! `contracts/`.
 //!
 //! ```bash
 //! cargo run -p rn-compat -- contracts            # fail on real mismatches

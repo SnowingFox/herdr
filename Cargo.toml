@@ -21,7 +21,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
-repository = "https://github.com/SnowingFox/herdr"
+repository = "https://github.com/SnowingFox/rsnode"
 
 [workspace.dependencies]
 v8 = "152.2.0"

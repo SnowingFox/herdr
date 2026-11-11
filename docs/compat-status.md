@@ -14,12 +14,12 @@ own, and each answers a different question.
 | binding contracts | does a Rust `internalBinding()` namespace expose what the JavaScript reads? | a recorded member is missing |
 | Node test suite | how much of Node actually behaves the same? | a test file exits non-zero |
 
-Run all four from `rustnode/`:
+Run all four from the repository root:
 
 ```bash
 ./tools/verify-libjs.sh
 ./tools/verify-llhttp.sh
-cargo run -p rn-compat
+cargo run -p rn-compat -- contracts
 ./tools/run-node-tests.sh
 ```
 
@@ -139,7 +139,7 @@ cargo run -p rn-harness -- report
 cargo run -p rn-harness -- report --json
 ```
 
-Result files land in `rustnode/tools/harness/results/`, which is gitignored. Each
+Result files land in `tools/harness/results/`, which is gitignored. Each
 run writes one `run-<timestamp>[-label].json`. `report` reads all of them and
 keeps the newest outcome per test file, so fixed tests turn green without
 re-running everything and repeated runs never inflate the total.
