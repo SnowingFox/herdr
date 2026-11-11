@@ -51,6 +51,7 @@ rn-bind-serdes = { path = "../rn-bind-serdes" }
 rn-bind-signal-wrap = { path = "../rn-bind-signal-wrap" }
 rn-bind-spawn-sync = { path = "../rn-bind-spawn-sync" }
 rn-bind-sqlite = { path = "../rn-bind-sqlite" }
+rn-bind-stream-pipe = { path = "../rn-bind-stream-pipe" }
 rn-bind-stream-wrap = { path = "../rn-bind-stream-wrap" }
 rn-bind-string-decoder = { path = "../rn-bind-string-decoder" }
 rn-bind-symbols = { path = "../rn-bind-symbols" }
