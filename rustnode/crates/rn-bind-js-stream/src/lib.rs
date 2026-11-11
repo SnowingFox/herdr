@@ -34,9 +34,16 @@
 //! prototype carries the whole stream surface — `readStart`, `writeBuffer`,
 //! `writeUtf8String`, `fd`, `bytesRead`, `onread` and the rest. rustnode's
 //! `tcp_wrap`/`pipe_wrap` install theirs from [`rn_uv::stream_base`], which is
-//! written against a libuv handle. A `JSStream` has none, so the same surface is
-//! built here over a plain counter pair instead. The methods a caller can reach
-//! are the same; only what they do differs, exactly as in Node.
+//! written against a libuv handle. A `JSStream` has none: its slot holds an
+//! [`rn_uv::handle::StreamState`] whose `stream` is null, and the method surface
+//! is built here over that state. The methods a caller can reach are the same;
+//! only what they do differs, exactly as in Node.
+//!
+//! The read and write paths go through [`rn_uv::listener`], so a listener pushed
+//! onto a `JSStream` sees the bytes — `readBuffer` is `EmitAlloc` → memcpy →
+//! `EmitRead` (`src/js_stream.cc:176-197`), and `finishWrite`/`finishShutdown`
+//! are `EmitAfterWrite`/`EmitAfterShutdown`. That is what lets a `TLSWrap` wrap a
+//! `JSStreamSocket` and still observe its own ciphertext completions.
 //!
 //! # Deferred
 //!

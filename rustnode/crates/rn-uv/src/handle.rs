@@ -110,6 +110,18 @@ pub struct StreamState {
     /// runs with no such mapping available, so the object is rooted here instead
     /// and released when the wrapper is finalised.
     pub owner_object: Option<v8::Global<v8::Object>>,
+    /// `StreamResource::listener_`, innermost first.
+    ///
+    /// Empty means "deliver to JavaScript", which is where Node keeps a
+    /// `default_listener_` at the bottom of every chain. See [`crate::listener`]
+    /// for the contract and [`crate::listener::push_stream_listener`] for the
+    /// only writer.
+    ///
+    /// A binding may read the length to know whether something is still
+    /// listening, but the chain must only be mutated through
+    /// `crate::listener`, because that module maintains the
+    /// `previous_listener_` links the forwarding paths walk.
+    pub listeners: Vec<crate::listener::ListenerRef>,
 }
 
 impl StreamState {
@@ -123,6 +135,7 @@ impl StreamState {
             bytes_written: 0,
             async_wrap: rn_core::AsyncWrapState::uninitialised(rn_core::async_wrap::PROVIDER_NONE),
             owner_object: None,
+            listeners: Vec::new(),
         }
     }
 
@@ -138,6 +151,41 @@ impl StreamState {
         }
         // SAFETY: `stream` is a live libuv handle while this state exists.
         unsafe { uv::uv_is_closing(as_handle(self.stream)) != 0 }
+    }
+
+    /// Notifies and detaches every attached listener, innermost last.
+    ///
+    /// This is the body of `StreamResource::~StreamResource` and is what
+    /// `Drop` calls. It is a method rather than a free function so `Drop` can
+    /// hand `&mut self` rather than manufacturing a second `&mut` from a raw
+    /// pointer to the value being dropped.
+    ///
+    /// Each listener's `on_stream_destroy` must not call into JavaScript: the
+    /// state is being freed, so anything it reaches back into may already be
+    /// gone. [`crate::listener`] documents the same constraint on the trait.
+    pub fn destroy_listeners(&mut self) {
+        let listeners = std::mem::take(&mut self.listeners);
+        for listener in &listeners {
+            listener.detach_from_stream();
+        }
+        for listener in &listeners {
+            listener.notify_destroyed();
+        }
+    }
+}
+
+/// `StreamResource::~StreamResource` (`src/stream_base.cc:898`).
+///
+/// A stream's teardown notifies and detaches everything listening to it. Without
+/// this, a `TLSWrap` attached to a socket that closed first would keep a
+/// dangling `stream_` into freed memory — and its own `Destroy()` would call
+/// `RemoveStreamListener` on that memory.
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        if self.listeners.is_empty() {
+            return;
+        }
+        self.destroy_listeners();
     }
 }
 
@@ -163,6 +211,11 @@ impl Allocation {
 
     /// The address libuv's `uv_buf_t.base` wants.
     pub fn base(&mut self) -> *mut u8 {
+        self.pointer
+    }
+
+    /// The address without a mutable borrow, for a caller that only reads.
+    pub fn base_const(&self) -> *const u8 {
         self.pointer
     }
 
@@ -225,10 +278,23 @@ impl Drop for Allocation {
 /// Delivers one read to `handle.onread` in the shape
 /// `internal/stream_base_commons.js` expects.
 ///
+/// This is the bottom of the listener chain: `StreamResource::EmitRead` when no
+/// listener is attached, which in Node is `default_listener_`
+/// (`EmitToJSStreamListener::OnStreamRead`, `stream_base.cc:731`).
+///
 /// `status` is libuv's `nread`: positive for bytes, `UV_EOF` at end of stream,
 /// any other negative value for an error. The two values JS reads are published
 /// to the shared `streamBaseState` first, because `onStreamRead` reads them
 /// before it looks at its argument.
+///
+/// # Why this takes a raw pointer
+///
+/// `lib/net.js` can `destroy()` the socket from inside `onread`, and that runs
+/// `close()` → `StreamState::state = Closing` on the same state. A `&mut` held
+/// across the call would make that re-borrow undefined. So the two facts this
+/// needs — the byte count and the rooted owner — are taken under a scoped
+/// borrow that ends before `callback::with_context`, and the state is not
+/// touched again afterwards.
 ///
 /// # Why `onread` is read from the object, not stored on the state
 ///
@@ -239,18 +305,23 @@ impl Drop for Allocation {
 /// value. A copy taken at construction time would go stale the first time a
 /// socket was paused, and a copy taken at `readStart` would miss a later
 /// assignment.
-pub fn deliver_read(
-    state: &mut StreamState,
-    stream_base_state: &rn_core::AliasedUint8Array,
-    status: isize,
-    allocation: Option<Allocation>,
-) {
-    if status > 0 {
-        // `StreamResource::EmitRead` counts before the listener sees the bytes, so
-        // `handle.bytesRead` is already up to date inside `onread`.
-        state.bytes_read += status as u64;
+///
+/// # Safety
+///
+/// `state` must be live, and the caller must hold no reference to it across this
+/// call. The byte count is **not** incremented here: `StreamResource::EmitRead`
+/// owns that (`stream_base-inl.h:75`), and [`crate::listener::emit_read`] is the
+/// only caller of this function.
+pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: Option<Allocation>) {
+    if state.is_null() {
+        return;
     }
-    let Some(owner) = state.owner_object.clone() else {
+    let Some(owner) = ({
+        // SAFETY: the caller guarantees `state` is live. The borrow ends with
+        // this block, before anything below can re-enter and mutate the state.
+        let state = unsafe { &*state };
+        state.owner_object.clone()
+    }) else {
         return;
     };
 
@@ -258,9 +329,7 @@ pub fn deliver_read(
         let Some(allocation) = allocation else {
             return;
         };
-        stream_base_state.set(K_READ_BYTES_OR_ERROR, status as u32);
-        stream_base_state.set(K_ARRAY_BUFFER_OFFSET, 0);
-
+        publish_read_count(status);
         callback::with_context(|scope| {
             let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
             let Some(handler) = onread_of(scope, object) else {
@@ -280,8 +349,7 @@ pub fn deliver_read(
         return;
     }
 
-    stream_base_state.set(K_READ_BYTES_OR_ERROR, status as u32);
-    stream_base_state.set(K_ARRAY_BUFFER_OFFSET, 0);
+    publish_read_count(status);
     callback::with_context(|scope| {
         let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
         let Some(handler) = onread_of(scope, object) else {
@@ -289,6 +357,18 @@ pub fn deliver_read(
         };
         let receiver: v8::Local<v8::Value> = object.into();
         let _ = handler.call(&*scope, receiver, &[]);
+    });
+}
+
+/// Publishes `(nread, offset)` into the shared `streamBaseState`.
+///
+/// `onStreamRead` reads both before it looks at its argument, so this has to
+/// happen before the call and not during it. Doing nothing when `stream_wrap`
+/// has not been installed yet is correct: nothing can be reading then.
+fn publish_read_count(status: isize) {
+    crate::stream::with_state(|state| {
+        state.set(K_READ_BYTES_OR_ERROR, status as u32);
+        state.set(K_ARRAY_BUFFER_OFFSET, 0);
     });
 }
 

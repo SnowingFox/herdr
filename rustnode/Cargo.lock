@@ -1014,6 +1014,7 @@ dependencies = [
 name = "rn-bind-js-stream"
 version = "0.1.0"
 dependencies = [
+ "libuv-sys2",
  "rn-core",
  "rn-uv",
  "rn-v8-sys",

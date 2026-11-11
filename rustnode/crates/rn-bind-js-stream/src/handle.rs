@@ -28,8 +28,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
+use std::ptr;
 
 use rn_v8_sys::v8;
+
+use rn_uv::handle::StreamState;
 
 use crate::methods;
 
@@ -42,10 +45,22 @@ pub(crate) const SLOT_FIELD: i32 = 0;
 /// read a counter from a borrowed slot, and several `StreamBase` methods update
 /// one without needing to own the whole slot.
 pub struct StreamSlot {
-    /// `StreamBase::bytes_read_`.
-    pub bytes_read: Cell<u64>,
-    /// `StreamBase::bytes_written_`.
-    pub bytes_written: Cell<u64>,
+    /// The `StreamResource` half: the byte counters and the listener chain.
+    ///
+    /// Node's `JSStream` is an `AsyncWrap + StreamBase`, so it is a
+    /// `StreamResource` with no libuv handle — and its `stream` field is null
+    /// because there is nothing underneath it. That is exactly the shape
+    /// [`rn_uv::listener`] supports, and it is why `readBuffer` can go through
+    /// `EmitRead` rather than calling `onread` itself: a listener pushed onto a
+    /// `JSStream` sees the bytes, as `js_stream.cc:176-197` does.
+    ///
+    /// `UnsafeCell` is not needed and `Option` is not used: the state is
+    /// constructed once with the slot and dropped with it, and every method that
+    /// touches it takes `&mut` from [`with_state`], which is scoped to one
+    /// callback — the same borrow discipline [`rn_uv::listener::emit_read`]
+    /// requires.
+    pub state: RefCell<StreamState>,
+
     /// Whether `readStart` has been called and `readStop` has not, which is
     /// `StreamBase`'s `reading_` notion and what `readStart` twice must not
     /// double-count.
@@ -54,11 +69,45 @@ pub struct StreamSlot {
     ///
     /// `lib/internal/js_stream_socket.js` never assigns it; `lib/net.js` does,
     /// through `Socket.prototype._handle.onread = onStreamRead`, and that is what
-    /// `readBuffer` and `emitEOF` call. A `RefCell` because the accessor pair
-    /// replaces it while `readBuffer` reads it.
+    /// `readBuffer` and `emitEOF` reach through the default listener. A
+    /// `RefCell` because the accessor pair replaces it while a read is being
+    /// delivered.
     pub onread: RefCell<Option<v8::Global<v8::Function>>>,
     /// Parks the finalizer registration so dropping it cannot cancel it.
     pub weak: RefCell<Option<v8::Weak<v8::Object>>>,
+}
+
+impl StreamSlot {
+    /// A slot for a fresh `JSStream`.
+    pub fn new() -> Self {
+        let mut state = StreamState::new(ptr::null_mut());
+        // `StreamBase`'s constructor pushes `default_listener_`; here absence is
+        // the default, so the owner object is what `deliver_read` reaches. It is
+        // installed by `new` below once the object exists.
+        state.owner_object = None;
+        Self {
+            state: RefCell::new(state),
+            reading: Cell::new(false),
+            onread: RefCell::new(None),
+            weak: RefCell::new(None),
+        }
+    }
+
+    /// `StreamBase::bytesRead`.
+    pub fn bytes_read(&self) -> u64 {
+        self.state.borrow().bytes_read
+    }
+
+    /// `StreamBase::bytesWritten`.
+    pub fn bytes_written(&self) -> u64 {
+        self.state.borrow().bytes_written
+    }
+}
+
+impl Default for StreamSlot {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Runs `body` with the slot behind a `JSStream` object.
@@ -74,6 +123,39 @@ pub(crate) fn with_slot<R>(
     }
     // SAFETY: as above — the address is the live slot this object owns.
     Some(body(unsafe { &*(address as *const StreamSlot) }))
+}
+
+/// Runs `body` with a scoped `&mut StreamState` for the slot's stream.
+///
+/// This is the same shape [`rn_uv::listener::emit_read`] documents: the borrow
+/// ends before the callback, so a listener that re-enters — removing itself,
+/// writing, or reading a counter — cannot alias it.
+pub(crate) fn with_state<R>(
+    object: v8::Local<v8::Object>,
+    body: impl FnOnce(&mut StreamState) -> R,
+) -> Option<R> {
+    with_slot(object, |slot| body(&mut slot.state.borrow_mut()))
+}
+
+/// The listener chain for a `JSStream`, as the address the listener layer takes.
+///
+/// Returns `None` for a receiver that is not a `JSStream`.
+///
+/// The state is a `RefCell` because the accessors take `&self`, but the listener
+/// layer takes a raw pointer precisely so no borrow is held across a callback —
+/// see [`rn_uv::listener`]. `RefCell::as_ptr` gives that address without creating
+/// a reference, which is why it is used here rather than `borrow_mut`.
+pub(crate) fn state_pointer(object: v8::Local<v8::Object>) -> Option<*mut StreamState> {
+    // SAFETY: the field only ever holds a pointer installed by `new`, and the
+    // object is a live local.
+    let address = unsafe { object.get_aligned_pointer_from_internal_field(SLOT_FIELD, 0) } as usize;
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: as above — the slot is live for as long as the object is, which is
+    // at least as long as the callback using this pointer.
+    let slot = unsafe { &*(address as *const StreamSlot) };
+    Some(slot.state.as_ptr())
 }
 
 /// Builds the `JSStream` constructor and its prototype.
@@ -210,14 +292,16 @@ fn new(
         return;
     }
     let object = args.this();
-    let slot = Box::into_raw(Box::new(StreamSlot {
-        bytes_read: Cell::new(0),
-        bytes_written: Cell::new(0),
-        reading: Cell::new(false),
-        onread: RefCell::new(None),
-        weak: RefCell::new(None),
-    }));
+    let slot = Box::into_raw(Box::new(StreamSlot::new()));
     object.set_aligned_pointer_in_internal_field(SLOT_FIELD, slot.cast::<c_void>(), 0);
+
+    // The default listener reaches JavaScript through `owner_object`, so the
+    // object a `JSStream` delivers to is its own wrapper — Node's
+    // `StreamBase::GetObject()`.
+    // SAFETY: `slot` was just created and is not aliased yet.
+    unsafe {
+        (*slot).state.borrow_mut().owner_object = Some(v8::Global::new(scope.as_ref(), object))
+    };
 
     let address = slot as usize;
     let weak = v8::Weak::with_guaranteed_finalizer(

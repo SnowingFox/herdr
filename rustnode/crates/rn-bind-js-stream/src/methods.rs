@@ -34,7 +34,11 @@
 //! `CallJSOnreadMethod` does. Sharing the array rather than keeping a second one
 //! is the point of it being aliased.
 
+use libuv_sys2 as uv;
 use rn_v8_sys::v8;
+
+use rn_uv::handle::Allocation;
+use rn_uv::listener;
 
 use crate::handle::{self, with_slot, StreamSlot};
 
@@ -310,9 +314,8 @@ pub(crate) fn do_write<'s>(
     // `bytes_written_ += total_bytes` happens in `StreamBase::Write` before
     // `DoWrite`, so `handle.bytesWritten` is already up to date inside
     // `onwrite`.
-    with_slot(object, |slot| {
-        slot.bytes_written
-            .set(slot.bytes_written.get() + total as u64);
+    crate::handle::with_state(object, |state| {
+        state.bytes_written += total as u64;
     });
 
     let buffers = v8::Array::new_with_elements(scope, &copies);
@@ -383,12 +386,18 @@ pub(crate) fn use_user_buffer(
     rv.set(v8::Integer::new(_scope, 0).into());
 }
 
-/// `JSStream::ReadBuffer`: hand `chunk` to `onread`.
+/// `JSStream::ReadBuffer`: `EmitAlloc` → memcpy → `EmitRead`.
 ///
-/// `EmitAlloc`/`EmitRead` in Node loop over the chunk so a listener that accepts
-/// less than offered is respected. `EmitToJSStreamListener` always offers the
-/// whole slab, so the loop collapses into one delivery here; splitting would only
-/// change how many `data` events one `readBuffer` produced.
+/// `src/js_stream.cc:163-190` is explicit about the loop, and it is not optional
+/// once a listener is in the chain: a listener may accept less than the whole
+/// chunk, so the remainder goes to a fresh `EmitAlloc` and a second `EmitRead`.
+/// `EmitToJSStreamListener` always offers the whole slab, so with no listener the
+/// loop runs once — which is what it did here before the listener mechanism
+/// existed.
+///
+/// The bytes are copied into a buffer the *reader* owns, because the JavaScript
+/// caller may reuse `chunk` the moment this returns and `onread` keeps the
+/// `ArrayBuffer` it is given.
 pub(crate) fn read_buffer<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -407,60 +416,89 @@ pub(crate) fn read_buffer<'s>(
         return;
     }
     let object = args.this();
-
-    // `EmitRead` counts the bytes before the listener sees them.
-    with_slot(object, |slot| {
-        slot.bytes_read.set(slot.bytes_read.get() + length as u64);
-    });
-
-    // `CallJSOnreadMethod` publishes the count and offset first, because
-    // `onStreamRead` reads them before it looks at its argument.
+    let Some(state) = crate::handle::state_pointer(object) else {
+        return;
+    };
+    // The `streamBaseState` buffer is created by whichever namespace got there
+    // first; touching it here keeps this crate independent of install order.
     let _ = rn_uv::stream::state_array(scope);
-    rn_uv::stream::with_state(|state| {
-        state.set(rn_uv::handle::K_READ_BYTES_OR_ERROR, length as u32);
-        state.set(rn_uv::handle::K_ARRAY_BUFFER_OFFSET, 0);
-    });
-
-    // The bytes are copied into a fresh backing store: the caller owns `chunk`
-    // and may reuse it, and `onread` keeps the `ArrayBuffer` it is given.
     // SAFETY: `base` points at `length` bytes of the caller's live view.
     let bytes = unsafe { std::slice::from_raw_parts(base, length) };
-    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
-    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+    let mut offset = 0usize;
 
-    if let Some(onread) = onread_of(scope, object) {
-        let argument: v8::Local<'_, v8::Value> = array_buffer.into();
-        let receiver: v8::Local<'_, v8::Value> = object.into();
-        let _ = onread.call(scope, receiver, &[argument]);
+    // `while (len != 0)`, exactly as `js_stream.cc:175` writes it.
+    while offset < bytes.len() {
+        let remaining = bytes.len() - offset;
+        // `EmitAlloc` first: the listener decides where the bytes land and may
+        // hand back less than asked for, which is why the loop exists.
+        let listener_buffer = unsafe { listener::emit_alloc(state, remaining) };
+        let capacity = match listener_buffer {
+            Some(buffer) => buffer.len.min(remaining),
+            None => remaining,
+        };
+        if capacity == 0 {
+            // A listener that offers nothing cannot make progress, and looping
+            // again would spin.
+            return;
+        }
+        let source = &bytes[offset..offset + capacity];
+        let buffer = match listener_buffer {
+            Some(mut buffer) => {
+                // SAFETY: `buffer.base` points at `capacity` writable bytes the
+                // listener owns.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.as_ptr(),
+                        buffer.base.cast::<u8>(),
+                        capacity,
+                    )
+                };
+                buffer.len = capacity;
+                listener::ReadBuffer::Listener(buffer)
+            }
+            None => {
+                let mut allocation = match Allocation::new(capacity) {
+                    Some(allocation) => allocation,
+                    None => return,
+                };
+                // SAFETY: `allocation` holds `capacity` writable bytes.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(source.as_ptr(), allocation.base(), capacity)
+                };
+                listener::ReadBuffer::Allocated(allocation)
+            }
+        };
+        offset += capacity;
+        // SAFETY: `state` is live and `emit_read` holds no reference to it across
+        // the listener call — which is what lets the listener re-enter.
+        unsafe { listener::emit_read(state, capacity as isize, buffer) };
     }
 }
 
-/// `JSStream::EmitEOF`: `EmitRead(UV_EOF)`, which calls `onread` with no argument.
+/// `JSStream::EmitEOF`: `EmitRead(UV_EOF)` (`src/js_stream.cc:193`).
 pub(crate) fn emit_eof<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_>,
 ) {
     let object = args.this();
+    let Some(state) = crate::handle::state_pointer(object) else {
+        return;
+    };
+    // `streamBaseState` is created lazily by whichever namespace got there first;
+    // touching it here keeps this crate independent of install order.
     let _ = rn_uv::stream::state_array(scope);
-    rn_uv::stream::with_state(|state| {
-        state.set(rn_uv::handle::K_READ_BYTES_OR_ERROR, EOF as u32);
-        state.set(rn_uv::handle::K_ARRAY_BUFFER_OFFSET, 0);
-    });
-    if let Some(onread) = onread_of(scope, object) {
-        let receiver: v8::Local<'_, v8::Value> = object.into();
-        let _ = onread.call(scope, receiver, &[]);
-    }
+    // SAFETY: `state` is live and `emit_read` holds no reference across it. A
+    // negative `nread` is the end-of-stream signal `onStreamRead` reads.
+    unsafe { listener::emit_read(state, EOF as isize, listener::ReadBuffer::Listener(empty())) };
 }
 
-/// Reads the `onread` function off a `JSStream` object.
-pub(crate) fn onread_of<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'s, v8::Object>,
-) -> Option<v8::Local<'s, v8::Function>> {
-    let key = v8::String::new(scope, "onread")?;
-    let value = object.get(scope, key.into())?;
-    v8::Local::<v8::Function>::try_from(value).ok()
+/// A zero-length buffer, for a read that carries no bytes.
+pub(crate) fn empty() -> uv::uv_buf_t {
+    uv::uv_buf_t {
+        base: std::ptr::null_mut(),
+        len: 0,
+    }
 }
 
 /// The `onread` accessor's getter.
@@ -534,7 +572,7 @@ pub(crate) fn get_bytes_read(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let bytes = with_slot(args.this(), |slot| slot.bytes_read.get()).unwrap_or(0);
+    let bytes = crate::handle::with_slot(args.this(), |slot| slot.bytes_read()).unwrap_or(0);
     rv.set(v8::Number::new(scope, bytes as f64).into());
 }
 
@@ -544,7 +582,7 @@ pub(crate) fn get_bytes_written(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let bytes = with_slot(args.this(), |slot| slot.bytes_written.get()).unwrap_or(0);
+    let bytes = with_slot(args.this(), |slot| slot.bytes_written()).unwrap_or(0);
     rv.set(v8::Number::new(scope, bytes as f64).into());
 }
 
@@ -558,7 +596,7 @@ pub(crate) fn finish_write<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'s>,
 ) {
-    finish(scope, &args, "finishWrite");
+    finish(scope, &args, "finishWrite", false);
 }
 
 /// `JSStream::Finish<ShutdownWrap>`: the same completion for a shutdown.
@@ -567,14 +605,21 @@ pub(crate) fn finish_shutdown<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'s>,
 ) {
-    finish(scope, &args, "finishShutdown");
+    finish(scope, &args, "finishShutdown", true);
 }
 
 /// Delivers a request's completion, in the shape `report_completion` expects.
+///
+/// `StreamReq::Done` is `stream()->EmitAfterWrite(this, status)` (or
+/// `EmitAfterShutdown`), so the completion goes through the listener chain
+/// rather than straight to JavaScript: a `TLSWrap` over a `JSStream` — which is
+/// what `lib/internal/js_stream_socket.js` exists for — has to see its own
+/// ciphertext writes finish.
 pub(crate) fn finish<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
     name: &str,
+    shutdown: bool,
 ) {
     let Ok(request) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
         handle::throw_type_error(scope, &format!("{name} requires a request object"));
@@ -585,10 +630,29 @@ pub(crate) fn finish<'s>(
         return;
     };
     // `w->Done(status)` runs the listener, which reads `oncomplete` off the
-    // request. `report_completion` parks the status in `writeStatus` when the
+    // request. The default listener parks the status in `writeStatus` when the
     // callback is not there yet, which is what `afterWriteDispatched` replays.
     let handle_object = request_handle(scope, request);
-    rn_uv::stream::report_completion(scope, request, status, handle_object, None);
+    let Some(state) = args
+        .this()
+        .is_object()
+        .then(|| crate::handle::state_pointer(args.this()))
+        .flatten()
+    else {
+        // A receiver with no slot: nothing can have queued this request, so this
+        // is the honest fallback rather than a silently dropped completion.
+        rn_uv::stream::report_completion(scope, request, status, handle_object, None);
+        return;
+    };
+    // SAFETY: `state` is live, and `emit_after_*` holds no reference to it across
+    // the listener call.
+    unsafe {
+        if shutdown {
+            listener::emit_after_shutdown(state, scope, request, handle_object, status);
+        } else {
+            listener::emit_after_write(state, scope, request, handle_object, status);
+        }
+    }
 }
 
 /// Reads `request.handle`, the stream object a completion reports.
