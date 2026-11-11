@@ -152,62 +152,77 @@ pub fn throw(scope: &mut v8::PinScope<'_, '_>, error: &KeyError) {
     if let Some(code) = error.code() {
         set_string(scope, object, "code", code);
     }
-    match error {
-        KeyError::OpenSsl { packed, message } if *packed != 0 => {
-            attach_openssl_detail(scope, object, *packed, message);
+    if let KeyError::OpenSsl { packed, message } = error {
+        if *packed != 0 && !attach_openssl_detail(scope, object, *packed, message) {
+            // One of the field assignments threw (a prototype setter). That
+            // exception is the one the caller must see, so ours is dropped.
+            return;
         }
-        _ => {}
     }
     scope.throw_exception(exception);
 }
 
 /// Attaches the `library`, `reason` and `code` fields `ThrowCryptoError` builds
 /// from a packed OpenSSL error.
+///
+/// Returns `false` when assigning one of those fields threw — which happens when
+/// a test installs a throwing setter for `library` on `Object.prototype`, the
+/// exact case `test-crypto-sign-verify.js` covers ("bye, bye, library"). The
+/// pending exception must then be left alone: calling `ThrowException` with our
+/// own error would replace it, and the test would see the OpenSSL message
+/// instead of the setter's.
 fn attach_openssl_detail(
     scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<v8::Object>,
+    object: v8::Local<'_, v8::Object>,
     packed: u64,
     fallback: &'static str,
-) {
+) -> bool {
     // The wrapper crate owns the unpacking, so the shapes agree between every
     // crate that reports an OpenSSL failure.
     let Some(detail) = rn_crypto_openssl::openssl_error_for(packed) else {
         // No string for the packed value: Node reports the caller's message with
         // `ERR_CRYPTO_OPERATION_FAILED`, which is already set.
         let _ = fallback;
-        return;
+        return true;
     };
-    set_string(scope, object, "code", &detail.code());
-    set_string(
-        scope,
-        object,
-        "library",
-        &format!("{} routines", detail.library),
-    );
-    set_string(scope, object, "reason", &detail.reason);
+    // `library` is the *display* name, which already carries " routines" and is
+    // present even for a library Node's code table omits (DECODER, PROVIDER).
+    // `code` is the other one and has no segment for those.
+    if !set_string(scope, object, "code", &detail.code())
+        || !set_string(scope, object, "library", &detail.library_display)
+        || !set_string(scope, object, "reason", &detail.reason)
+    {
+        return false;
+    }
     if let Some(text) = v8::String::new(scope, &detail.message) {
         // `ThrowCryptoError` sets the message to `ERR_error_string_n`'s output,
         // replacing whatever the caller passed. Doing it here keeps the shape in
         // one place instead of at every call site.
-        let _ = object.set(
-            scope,
-            v8::String::new(scope, "message").unwrap().into(),
-            text.into(),
-        );
+        let Some(key) = v8::String::new(scope, "message") else {
+            return false;
+        };
+        if object.set(scope, key.into(), text.into()).is_none() {
+            return false;
+        }
     }
+    true
 }
 
+/// Sets a string property, reporting whether the assignment completed.
+///
+/// `Object::set` returns `None` when a setter on the prototype chain threw, so
+/// this is the signal the caller needs to stop and let that exception stand.
 fn set_string(
     scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<v8::Object>,
+    object: v8::Local<'_, v8::Object>,
     name: &str,
     value: &str,
-) {
+) -> bool {
     let (Some(key), Some(text)) = (v8::String::new(scope, name), v8::String::new(scope, value))
     else {
-        return;
+        return true;
     };
-    object.set(scope, key.into(), text.into());
+    object.set(scope, key.into(), text.into()).is_some()
 }
 
 #[cfg(test)]

@@ -19,6 +19,11 @@ rn-bind-crypto-cipher = { path = "../rn-bind-crypto-cipher" }
 # `crypto_spkac.cc`. A separate crate for the same reason, and the classes land
 # on this namespace object.
 rn-bind-crypto-keys = { path = "../rn-bind-crypto-keys" }
+# `Sign`/`Verify`/`SignJob`/`RSACipherJob` from `src/crypto/crypto_sig.cc` and
+# `crypto_rsa.cc`. Installed onto this namespace object for the same reason the
+# DH and keys classes are: Node aggregates a dozen translation units onto one
+# `target`, and the crate split follows the translation unit.
+rn-bind-crypto-sign = { path = "../rn-bind-crypto-sign" }
 # Real OpenSSL, compiled from source. This is deliberate and load-bearing: the
 # whole premise of rustnode is that only the native glue is rewritten, so every
 # digest, MAC, cipher and derivation has to be the same code Node runs. A

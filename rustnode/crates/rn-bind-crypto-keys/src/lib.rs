@@ -52,6 +52,7 @@ mod jobs;
 mod state;
 mod templates;
 
+pub use handle::read_key_from_js;
 pub use install::{install_classes, MEMBERS};
 pub use state::{KeyData, KeyType};
 

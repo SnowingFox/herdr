@@ -18,8 +18,16 @@
 pub struct OpenSslError {
     /// The packed `unsigned long` OpenSSL returned.
     pub packed: u64,
-    /// The library's short id, e.g. `"EVP"`.
+    /// The library's short id, e.g. `"EVP"`. Empty when Node's `OSSL_ERROR_CODES_MAP`
+    /// has no entry for the numeric id, which is the case for `ERR_LIB_PROVIDER`
+    /// and `ERR_LIB_DECODER`.
     pub library: String,
+    /// The library's *display* name, e.g. `"EVP routines"` or `"DECODER routines"`.
+    ///
+    /// This is what Node puts in the error's `library` property: it comes from
+    /// `ERR_lib_error_string`, not from the code table, so a library with no code
+    /// entry still reports its name.
+    pub library_display: String,
     /// The reason string, e.g. `"bad decrypt"`.
     pub reason: String,
     /// `error:1C800064:Provider routines::bad decrypt`, which is what
@@ -31,9 +39,13 @@ impl OpenSslError {
     /// The `code` property: `ERR_OSSL_<LIBRARY>_<REASON>` with the reason's
     /// spaces and punctuation turned into underscores.
     ///
-    /// This is `node::error::Decorate`, which builds the code from the short
-    /// library id. Uppercasing the *display* name instead produces
-    /// `ERR_OSSL_EVP_ROUTINES_BAD_DECRYPT`, a string no Node test accepts.
+    /// This is `node::error::Decorate`. Two details come straight from it:
+    ///
+    /// * the library segment is empty for a library outside Node's table, which
+    ///   is why a provider error is `ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE`
+    ///   and not `ERR_OSSL_PROVIDER_...`; and
+    /// * `SSL` drops the `OSSL_` prefix, because `ERR_OSSL_SSL_...` is a code
+    ///   Node deliberately does not produce.
     pub fn code(&self) -> String {
         let library = self.library.to_ascii_uppercase();
         let reason: String = self
@@ -42,6 +54,12 @@ impl OpenSslError {
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
             .collect();
+        if library.is_empty() {
+            return format!("ERR_OSSL_{reason}");
+        }
+        if library == "SSL" {
+            return format!("ERR_{library}_{reason}");
+        }
         format!("ERR_OSSL_{library}_{reason}")
     }
 }
@@ -62,14 +80,15 @@ pub fn openssl_error() -> Option<OpenSslError> {
         if packed == 0 {
             return None;
         }
-        let library = c_string(openssl_sys::ERR_lib_error_string(packed));
+        let display = c_string(openssl_sys::ERR_lib_error_string(packed));
         let reason = c_string(openssl_sys::ERR_reason_error_string(packed));
         let message = error_string(packed);
         Some(OpenSslError {
             packed,
-            library,
+            library: short_library_name(&display, openssl_sys::ERR_GET_LIB(packed)),
             reason,
             message,
+            library_display: display,
         })
     }
 }
@@ -86,14 +105,20 @@ pub fn openssl_error_for(packed: u64) -> Option<OpenSslError> {
     // SAFETY: the two lookups only read a packed value, and the strings they
     // return are static and NUL-terminated.
     unsafe {
+        let display = c_string(openssl_sys::ERR_lib_error_string(packed));
+        let display = if display.is_empty() {
+            // The error table has no name for this library; the message already
+            // carries whatever it could produce.
+            String::new()
+        } else {
+            display
+        };
         Some(OpenSslError {
             packed,
-            library: short_library_name(
-                &c_string(openssl_sys::ERR_lib_error_string(packed)),
-                openssl_sys::ERR_GET_LIB(packed),
-            ),
+            library: short_library_name(&display, openssl_sys::ERR_GET_LIB(packed)),
             reason: c_string(openssl_sys::ERR_reason_error_string(packed)),
             message: error_string(packed),
+            library_display: display,
         })
     }
 }
@@ -265,6 +290,7 @@ fn from_stack_entry(entry: &openssl::error::Error, library: std::ffi::c_int) -> 
         library: short_library_name(display, library),
         reason: reason_text.to_string(),
         message: error_string(packed),
+        library_display: display.to_string(),
     }
 }
 
@@ -274,17 +300,83 @@ fn from_stack_entry(entry: &openssl::error::Error, library: std::ffi::c_int) -> 
 /// `Provider routines` and `Diffie-Hellman routines`; the code Node builds uses
 /// the short id (`EVP`, `PEM`, `Provider`, `DH`). The first word of the display
 /// name is the short id for all but a handful, and the handful are listed.
-fn short_library_name(display: &str, library: std::ffi::c_int) -> String {
-    let first = display.split_whitespace().next().unwrap_or(display);
-    match (library, first) {
-        // `Diffie-Hellman routines` reports the display name while the code uses
-        // `DH`. The rest are the names whose first word already is the id.
-        (28, _) => "DH".to_string(),
-        _ => first.to_string(),
+fn short_library_name(_display: &str, library: std::ffi::c_int) -> String {
+    // Node maps the *numeric* library id through a fixed table
+    // (`OSSL_ERROR_CODES_MAP` in `crypto_util.cc`) and leaves the segment empty
+    // for anything outside it. That is why a provider error's code is
+    // `ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE` with no `PROVIDER_` in it:
+    // OpenSSL 3 introduced `ERR_LIB_PROVIDER`, which Node's table predates.
+    //
+    // The numbers are OpenSSL 3's `ERR_LIB_*` from `openssl/err.h`. They are not
+    // guessable — `RSA` is 4, not 3, and `BIO` is 32, not 21 — and getting one
+    // wrong produces a plausible code for the wrong library, so each is copied
+    // from the header rather than inferred.
+    match library {
+        // `OSSL_ERROR_CODES_MAP`.
+        2 => "SYS",
+        3 => "BN",
+        4 => "RSA",
+        5 => "DH",
+        6 => "EVP",
+        7 => "BUF",
+        8 => "OBJ",
+        9 => "PEM",
+        10 => "DSA",
+        11 => "X509",
+        13 => "ASN1",
+        14 => "CONF",
+        15 => "CRYPTO",
+        16 => "EC",
+        20 => "SSL",
+        32 => "BIO",
+        33 => "PKCS7",
+        34 => "X509V3",
+        36 => "RAND",
+        38 => "ENGINE",
+        39 => "OCSP",
+        40 => "UI",
+        41 => "COMP",
+        42 => "ECDSA",
+        43 => "ECDH",
+        46 => "CMS",
+        48 => "HMAC",
+        128 => "USER",
+        // `OSSL_ERROR_CODES_MAP_OPENSSL_ONLY`.
+        35 => "PKCS12",
+        37 => "DSO",
+        44 => "OSSL_STORE",
+        45 => "FIPS",
+        47 => "TS",
+        50 => "CT",
+        51 => "ASYNC",
+        52 => "KDF",
+        53 => "SM2",
+        // Outside the table: no library segment at all.
+        _ => "",
     }
+    .to_string()
 }
 
-/// Drains the OpenSSL error queue into a [`ParseFailure`].
+/// The `ERR_OSSL_*` code for a packed error, without needing its display parts.
+///
+/// This is the form the bindings should use when they hold the packed value: it
+/// reads the library id out of the value itself, so it cannot disagree with
+/// OpenSSL about which library the error came from. Reverse-mapping a display
+/// name is the alternative, and it is fragile — `"digital envelope routines"` is
+/// `EVP`, `"Diffie-Hellman routines"` is `DH`, and a name not in the table
+/// silently loses its segment.
+pub fn ossl_code_for(packed: u64, reason: &str) -> String {
+    let library = short_library_name("", openssl_sys::ERR_GET_LIB(packed));
+    OpenSslError {
+        packed,
+        library,
+        library_display: String::new(),
+        reason: reason.to_string(),
+        message: String::new(),
+    }
+    .code()
+}
+
 ///
 /// Used by paths that called OpenSSL directly rather than through the `openssl`
 /// crate, so nothing has consumed the queue yet.

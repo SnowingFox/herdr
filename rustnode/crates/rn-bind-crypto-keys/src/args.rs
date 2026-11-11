@@ -94,12 +94,20 @@ pub fn read_format_and_type(
 
     let type_value = values.at(*offset + 1);
     if format.is_raw() {
-        // Raw formats use the type slot for a point conversion form or null.
-        // A raw key has no DER type of its own, so there is nothing else it
-        // could mean.
+        // Raw formats use the type slot for the key type name or a point
+        // conversion form.
+        //
+        // The two halves are not symmetric, which is easy to miss:
+        // `raw-public`/`raw-private` on an *export* carry a
+        // `point_conversion_form_t` integer, but on *import* `keys.js` sends
+        // `asymmetricKeyType`, a string like `"ed25519"`, because the raw bytes
+        // alone do not say which curve or family they belong to. Rejecting the
+        // string makes `crypto.sign(null, data, {key, format: 'raw-private',
+        // asymmetricKeyType: 'ed25519'})` fail with a message about encodings,
+        // which names nothing that is actually wrong.
         if let Some(form) = type_value.int32() {
             read.ec_point_form = form;
-        } else if !type_value.is_null_or_undefined() {
+        } else if type_value.string().is_none() && !type_value.is_null_or_undefined() {
             return Err(EncodingError::Unsupported);
         }
     } else if let Some(value) = type_value.int32() {
