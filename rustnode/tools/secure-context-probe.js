@@ -142,9 +142,23 @@ const missing = PROTOTYPE_METHODS.filter(
 report('prototype.methods', missing.length === 0 ?
   `all ${PROTOTYPE_METHODS.length} present` :
   `MISSING ${missing.join(',')}`);
-report(
-  'prototype._external',
-  typeof NativeSecureContext.prototype._external);
+// `_external` is an accessor with a getter, not a prototype method, and reading
+// it on the prototype throws from the `Signature` guard. Both were checked
+// against a real `node` 22 before being asserted here.
+report('prototype._external descriptor', (() => {
+  const d = Object.getOwnPropertyDescriptor(
+    NativeSecureContext.prototype, '_external');
+  if (d === undefined) return 'MISSING';
+  return `get=${typeof d.get} enumerable=${d.enumerable} configurable=${d.configurable}`;
+})());
+report('prototype._external read', (() => {
+  try {
+    void NativeSecureContext.prototype._external;
+    return 'no-throw (Node throws TypeError)';
+  } catch (error) {
+    return `${error.name} (as in Node)`;
+  }
+})());
 
 // ---------------------------------------------------------------------------
 // (2) `init`, exactly as `common.js:88` calls it.

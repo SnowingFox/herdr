@@ -654,13 +654,27 @@ fn close(
 }
 
 /// `_external` reads the `SSL_CTX` address.
+///
+/// Node returns a `v8::External` wrapping the raw pointer, and a real `node`
+/// makes that observable: the value is an object whose `constructor` is
+/// `undefined` and which cannot be converted to a primitive. Returning the
+/// address as a `BigInt` would be a different type with different observable
+/// behaviour, so it returns a real `External` here. Nothing in `lib/**` reads it;
+/// `tls_wrap` gets the context through the internal field, not through this
+/// property, so its only job is to be the same shape Node's is.
 fn external(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
     match with_state(args.this(), |context| context.external_pointer()) {
-        Some(address) => rv.set(v8::BigInt::new_from_u64(scope, address as u64).into()),
+        Some(address) => {
+            // `External::new` takes a `*mut c_void`; `0` for a closed context is
+            // a null `External`, which is what an `SSL_CTX` that has been freed
+            // has become. It is not dereferenced here or anywhere in this crate.
+            let value = v8::External::new(scope, address as *mut std::os::raw::c_void);
+            rv.set(value.into());
+        }
         None => throw_type_error(scope, "Invalid SecureContext receiver"),
     }
 }
@@ -765,15 +779,27 @@ fn build_class<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
         "getIssuer" => get_issuer,
     );
 
-    // The `_external` accessor. Node installs it as a read-only accessor on the
-    // prototype with a `Signature` check so it is only reachable from an
-    // instance; the receiver check in `external` is the equivalent guard here.
+    // The `_external` accessor. Node installs it with `SetAccessorProperty`, so
+    // reading `ctx._external` runs the getter; a real `node` reports an object
+    // whose `constructor` is undefined, which is what `External` gives. It is
+    // installed as a *getter*, not as a prototype method, because
+    // `typeof prototype._external` must be `undefined` — the property lives on
+    // the prototype as an accessor, not as a function value.
     {
         let getter = v8::FunctionTemplate::builder(external).build(scope);
         let Some(key) = v8::String::new(scope, "_external") else {
             return Err("cannot allocate the _external property name".to_string());
         };
-        prototype.set(key.into(), getter.into());
+        // `DONT_DELETE` without `READ_ONLY`: Node's descriptor is
+        // `{ get, enumerable: true, configurable: false }`, which is
+        // `DONT_DELETE` alone. A real `node` reports exactly that, verified with
+        // `Object.getOwnPropertyDescriptor` on a live context.
+        prototype.set_accessor_property(
+            key.into(),
+            Some(getter),
+            None,
+            v8::PropertyAttribute::DONT_DELETE,
+        );
     }
 
     // The class name has to be set *before* `get_function`, because V8 refuses

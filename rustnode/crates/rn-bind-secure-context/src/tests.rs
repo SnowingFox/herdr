@@ -169,11 +169,28 @@ fn secure_context_binding_end_to_end() {
             "function",
         );
     }
+    // `_external` is an accessor, not a prototype method: a real `node` reports
+    // `{ get, enumerable: true, configurable: false }` and reading it on the
+    // prototype itself throws `TypeError` from the `Signature` check. Asserting
+    // `typeof ... === 'function'` here would have been asserting a shape Node
+    // does not have, which is what the first version of this test did.
     check!(
         scope,
-        "_external accessor",
-        "typeof binding.SecureContext.prototype._external",
-        "function",
+        "_external is an accessor with a getter",
+        "(() => { const d = Object.getOwnPropertyDescriptor(            binding.SecureContext.prototype, '_external');            return (typeof d.get) + '|' + d.enumerable + '|' + d.configurable; })()",
+        "function|true|false",
+    );
+    check!(
+        scope,
+        "_external on the prototype throws (Signature guard)",
+        "(() => { try { void binding.SecureContext.prototype._external; return 'no-throw'; }           catch (e) { return e.name; } })()",
+        "TypeError",
+    );
+    check!(
+        scope,
+        "_external on an instance is an opaque object, as in Node",
+        "(() => { const c = new binding.SecureContext(); c.init(undefined, 0, 0);           const ext = c._external;           return (typeof ext) + '|' + String(ext.constructor); })()",
+        "object|undefined",
     );
 
     // The five ticket-key index constants.
