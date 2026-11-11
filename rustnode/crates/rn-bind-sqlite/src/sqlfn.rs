@@ -183,7 +183,7 @@ unsafe extern "C" fn scalar_call(
                     Some(result) => {
                         // SAFETY: `context` is the live invocation context
                         // SQLite passed to this callback.
-                        unsafe { value::result_from_js(scope, context, result) };
+                        value::result_from_js(scope, context, result);
                     }
                     None => propagate(scope, database),
                 }
@@ -213,9 +213,7 @@ fn function_arity(
     function: v8::Local<'_, v8::Function>,
 ) -> Option<i32> {
     let key = v8::String::new(scope, "length")?;
-    let Some(value) = function.get(scope, key.into()) else {
-        return None;
-    };
+    let value = function.get(scope, key.into())?;
     match value.number_value(scope) {
         Some(length) if length.fract() == 0.0 && length >= 0.0 && length <= i32::MAX as f64 => {
             Some(length as i32)
@@ -593,7 +591,7 @@ fn aggregate_result(context: *mut ffi::sqlite3_context, is_final: bool) {
                         },
                         None => v8::undefined(&*scope).into(),
                     };
-                    unsafe { value::result_from_js(scope, context, initial) };
+                    value::result_from_js(scope, context, initial);
                     return;
                 }
                 if !is_final {
@@ -614,7 +612,7 @@ fn aggregate_result(context: *mut ffi::sqlite3_context, is_final: bool) {
                     None => Some(current),
                 };
                 match result {
-                    Some(result) => unsafe { value::result_from_js(scope, context, result) },
+                    Some(result) => value::result_from_js(scope, context, result),
                     None => propagate(scope, database),
                 }
                 if is_final {
@@ -824,12 +822,8 @@ fn option_function<'s>(
     name: &str,
     required: bool,
 ) -> Option<Option<v8::Local<'s, v8::Function>>> {
-    let Some(key) = v8::String::new(scope, name) else {
-        return None;
-    };
-    let Some(value) = options.get(scope, key.into()) else {
-        return None;
-    };
+    let key = v8::String::new(scope, name)?;
+    let value = options.get(scope, key.into())?;
     if value.is_undefined() {
         if !required {
             return Some(None);
