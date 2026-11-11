@@ -12,3 +12,8 @@ rn-core.workspace = true
 rn-permission = { path = "../rn-permission" }
 rn-v8-sys.workspace = true
 libc.workspace = true
+# `ReadFileJob` and `WriteFileJob` are real threadpool jobs: they queue a
+# `uv_work_t` on the process loop and deliver `ondone` from it, which needs the
+# loop and the re-enter-V8-from-`uv_run` primitive. Both are that crate's.
+rn-uv.workspace = true
+libuv-sys2.workspace = true
