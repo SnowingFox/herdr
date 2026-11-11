@@ -117,7 +117,27 @@ pub const MEMBERS: &[&str] = &[
     "startLoadingCertificatesOffThread",
     "createNativeKeyObjectClass",
     "createCryptoKeyClass",
+    // The X.509 surface, installed by `rn-bind-crypto-x509`, which owns
+    // `src/crypto/crypto_x509.cc` and `crypto_pkcs12.cc`. `x509.js` runs
+    // `createX509CertificateClass` at module scope and destructures the rest, so
+    // these are load-bearing for `require('crypto')`.
     "createX509CertificateClass",
+    "isX509Certificate",
+    "parseX509",
+    "parseX509Snapshot",
+    "getX509CertificateSnapshot",
+    "parsePKCS12",
+    // The SPKI blocklist's test hooks and the root-store accessors. They live in
+    // `crypto_context.cc` rather than `crypto_x509.cc`, but the list is X.509
+    // policy and `lib/tls.js` reads the root store before any `SecureContext`
+    // exists, so they land with this slice.
+    "addBlockedSPKIForTesting",
+    "clearBlockedSPKIsForTesting",
+    "getBundledRootCertificates",
+    "getExtraCACertificates",
+    "getSystemCACertificates",
+    "getUserRootCertificates",
+    "resetRootCertStore",
     // Comparison and feature queries.
     "timingSafeEqual",
     "getFipsCrypto",
@@ -199,10 +219,22 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "The async `crypto.diffieHellman()` form is a CryptoJob; the sync `run()` path \
          and the shared `CryptoJob` machinery land with the rest of the job family.",
     ),
-    ("DhKeyPairGenJob","Key generation and DH share the asymmetric key surface, deferred with KeyObject."),
-    ("DsaKeyPairGenJob","Key generation is part of the asymmetric key surface, deferred with KeyObject."),
-    ("ECDH","ECDH is part of the asymmetric key surface, deferred with KeyObject."),
-    ("ECDHConvertKey","ECDH key conversion needs the EC key surface, deferred with KeyObject."),
+    (
+        "DhKeyPairGenJob",
+        "Key generation and DH share the asymmetric key surface, deferred with KeyObject.",
+    ),
+    (
+        "DsaKeyPairGenJob",
+        "Key generation is part of the asymmetric key surface, deferred with KeyObject.",
+    ),
+    (
+        "ECDH",
+        "ECDH is part of the asymmetric key surface, deferred with KeyObject.",
+    ),
+    (
+        "ECDHConvertKey",
+        "ECDH key conversion needs the EC key surface, deferred with KeyObject.",
+    ),
     (
         "KEMDecapsulateJob",
         "ML-KEM decapsulation needs the KeyObject surface and OpenSSL's KEM provider.",
@@ -215,8 +247,11 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "KangarooTwelveJob",
         "KT128/KT256 are not in the OpenSSL build `openssl-src` produces.",
     ),
-    ("KmacJob","KMAC needs the KeyObject surface for its key and is not in this OpenSSL build."),
-    ("Mac","createMac needs the KeyObject surface for its key."),
+    (
+        "KmacJob",
+        "KMAC needs the KeyObject surface for its key and is not in this OpenSSL build.",
+    ),
+    ("Mac", "createMac needs the KeyObject surface for its key."),
     (
         "RandomBytesJob",
         "The async `randomBytes` path needs the event loop; `randomBytes` works because \
@@ -235,10 +270,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "TurboSHAKE is not in the OpenSSL build `openssl-src` produces.",
     ),
     (
-        "addBlockedSPKIForTesting",
-        "Test-only hook for the certificate blocklist, deferred with X.509.",
-    ),
-    (
         "certExportChallenge",
         "SPKAC challenge extraction needs the certificate surface, which is deferred with X.509.",
     ),
@@ -251,14 +282,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "SPKAC verification needs the certificate surface, deferred with X.509.",
     ),
     (
-        "clearBlockedSPKIsForTesting",
-        "Test-only hook for the certificate blocklist, deferred with X.509.",
-    ),
-    (
-        "getBundledRootCertificates",
-        "The root store needs the bundled certificate blob, deferred with X.509 and TLS.",
-    ),
-    (
         "getCachedMacAliases",
         "`getMacs()` needs the MAC surface; the hash alias cache is installed.",
     ),
@@ -267,32 +290,12 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "Exposes WebCrypto key slots, deferred with CryptoKey.",
     ),
     (
-        "getExtraCACertificates",
-        "The root certificate store is part of the TLS/X.509 surface, deferred with SecureContext.",
-    ),
-    (
-        "getSystemCACertificates",
-        "The root certificate store is part of the TLS/X.509 surface, deferred with SecureContext.",
-    ),
-    (
-        "getUserRootCertificates",
-        "The root certificate store is part of the TLS/X.509 surface, deferred with SecureContext.",
-    ),
-    (
-        "getX509CertificateSnapshot",
-        "Static snapshot accessor for X.509, deferred.",
-    ),
-    (
         "isCryptoKey",
         "The CryptoKey type test needs the WebCrypto CryptoKey class, which is deferred.",
     ),
     (
         "isKeyAlgorithmAvailable",
         "Asks whether a named key algorithm is usable; deferred with the key surface.",
-    ),
-    (
-        "isX509Certificate",
-        "The X509Certificate type test needs the X.509 class, which is deferred.",
     ),
     (
         "kKEMDecapsulate",
@@ -375,18 +378,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "Argon2 is not built into the OpenSSL this crate links.",
     ),
     (
-        "parsePKCS12",
-        "PKCS#12 parsing produces KeyObjects and needs the DER reader, deferred with X.509 and keys.",
-    ),
-    (
-        "parseX509",
-        "Parsing a certificate into the X509Certificate shape needs that class, deferred with X.509.",
-    ),
-    (
-        "parseX509Snapshot",
-        "Snapshot restoring needs the X.509 class it rebuilds, deferred with X.509.",
-    ),
-    (
         "privateDecrypt",
         "RSA decryption needs the KeyObject surface.",
     ),
@@ -394,11 +385,13 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "privateEncrypt",
         "RSA encryption needs the KeyObject surface.",
     ),
-    ("publicDecrypt", "RSA decryption needs the KeyObject surface."),
-    ("publicEncrypt", "RSA encryption needs the KeyObject surface."),
     (
-        "resetRootCertStore",
-        "The root certificate store is part of the TLS/X.509 surface, deferred with SecureContext.",
+        "publicDecrypt",
+        "RSA decryption needs the KeyObject surface.",
+    ),
+    (
+        "publicEncrypt",
+        "RSA encryption needs the KeyObject surface.",
     ),
     (
         "setFipsCrypto",
@@ -409,7 +402,10 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "setupFipsIndicatorChannel",
         "FIPS indicator events, deferred with setFipsCrypto.",
     ),
-    ("testFipsCrypto", "FIPS indicator testing, deferred with FIPS."),
+    (
+        "testFipsCrypto",
+        "FIPS indicator testing, deferred with FIPS.",
+    ),
 ];
 
 /// The numeric constants `lib/internal/crypto/**` passes back into the binding.
@@ -614,12 +610,6 @@ impl BindingModule for Crypto {
                     .get_function(scope),
             ),
             (
-                "createX509CertificateClass",
-                v8::FunctionTemplate::builder(crate::classes::create_x509_certificate_class)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
                 "timingSafeEqual",
                 v8::FunctionTemplate::builder(timing_safe_equal)
                     .build(scope)
@@ -683,6 +673,12 @@ impl BindingModule for Crypto {
         // onto one `target`. This also defines `RSA_PKCS1_PSS_PADDING`, so the
         // constant block below must not define it again.
         rn_bind_crypto_sign::install_classes(scope, object)?;
+        // `X509Certificate` and the X.509 helpers. `src/crypto/crypto_x509.cc`
+        // and `crypto_pkcs12.cc` are separate translation units that
+        // `src/node_crypto.cc` aggregates onto this one `target`. This replaces
+        // the base-class stand-in `crate::classes::create_x509_certificate_class`
+        // installed above, so that binding must not run as well.
+        rn_bind_crypto_x509::install_classes(scope, object)?;
         // The job handles, whose instances expose `run()`.
         install_job_class(scope, object, "HashJob", hash_job)?;
         install_job_class(scope, object, "HmacJob", hmac_job)?;

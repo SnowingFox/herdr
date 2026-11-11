@@ -1,0 +1,26 @@
+[package]
+name = "rn-bind-crypto-x509"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "`X509Certificate`, the SPKI blocklist and the root store for internalBinding('crypto')"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# The shared `EVP_PKEY` ownership and error layer. `publicKey()`,
+# `checkPrivateKey()` and `verify()` all hand an `EVP_PKEY` to the `KeyObject`
+# family, so the ownership rules have to be that crate's and not a second copy.
+rn-crypto-openssl = { path = "../rn-crypto-openssl" }
+# `X509Certificate#publicKey()` returns a `KeyObject`, and `parsePKCS12` returns
+# the key it found as a `KeyObjectHandle`. Both are this crate's classes, so the
+# constructors have to come from it rather than being rebuilt here.
+rn-bind-crypto-keys = { path = "../rn-bind-crypto-keys" }
+openssl = { version = "=0.10.82", features = ["vendored"] }
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
+foreign-types = "0.3"
+
+[dev-dependencies]
+serde_json.workspace = true

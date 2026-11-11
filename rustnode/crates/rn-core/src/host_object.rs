@@ -165,14 +165,58 @@ pub fn mark(
 
 /// The transfer mode of a registered handle, or `None` when `object` is not one.
 ///
-/// Every registered kind is `Cloneable`, because a kind exists to say "this type
-/// knows how to be copied"; a future native type that could only move would carry
-/// its mode in the marking instead.
+/// A registered kind is `Cloneable`, because a kind exists to say "this type knows
+/// how to be copied"; a future native type that could only move would carry its
+/// mode in the marking instead.
+///
+/// # Why the JavaScript stamp is consulted first
+///
+/// `markAsUncloneable(obj)` sets the `transfer_mode_private_symbol` to
+/// `kDisallowCloneAndTransfer`, and Node's `GetTransferMode` is a virtual the
+/// *subclass* can override — `BaseObject`'s answer is the default, not the final
+/// one. rustnode has no subclass to override with, so the stamp is that override,
+/// and consulting the registered kind first makes the stamp unreachable: a
+/// registered handle would answer `Cloneable` no matter what JavaScript marked it
+/// on. `test-crypto-x509-clone-transfer.js` asserts a stamped certificate throws
+/// `DataCloneError`, so the ordering is observable.
+///
+/// `None` from the stamp means "not marked", which is the only case where the
+/// registered kind decides.
 pub fn transfer_mode(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
 ) -> Option<TransferMode> {
-    kind_of(scope, object).map(|_| TransferMode::Cloneable)
+    kind_of(scope, object)?;
+    match stamped_mode(scope, object) {
+        Some(mode) => Some(mode),
+        None => Some(TransferMode::Cloneable),
+    }
+}
+
+/// The mode `markTransferMode` wrote, or `None` when this object carries no stamp.
+///
+/// Reads the same `node:transfer_mode` symbol `markTransferMode` writes, through
+/// `crate::symbol` so the identity is shared. A non-numeric stamp is
+/// `DisallowCloneAndTransfer`, which is Node's answer for a value that is not a
+/// `Uint32`.
+fn stamped_mode(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+) -> Option<TransferMode> {
+    let key = crate::symbol(scope, "node:transfer_mode");
+    // Presence first: `get` on a missing property yields `undefined`, which is
+    // not a `Uint32` and would otherwise read as "stamped uncloneable" for every
+    // handle in the process.
+    if !object.has(scope, key.into()).unwrap_or(false) {
+        return None;
+    }
+    let Some(value) = object.get(scope, key.into()) else {
+        return Some(TransferMode::DisallowCloneAndTransfer);
+    };
+    if !value.is_uint32() {
+        return Some(TransferMode::DisallowCloneAndTransfer);
+    }
+    Some(TransferMode::from_bits(value.uint32_value(scope)?))
 }
 
 /// The clone payload for `object`, when it is a handle of a registered kind.
