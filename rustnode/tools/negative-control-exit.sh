@@ -47,11 +47,21 @@ build_arm() {
   local label="$1"
   printf '\n== building %s ==\n' "$label"
   rm -f "$binary"
+  # A deleted binary is not enough to prove a relink: `cargo build` restores a
+  # cached hardlink for an unchanged tree, mtime and all. Touching the CLI's
+  # entry point forces the compile, and the log is checked for it below, so a
+  # cached binary cannot reach the assertions in either arm. This repository has
+  # reported a pass from a binary that was never rebuilt.
+  touch crates/rn-cli/src/main.rs
   local started
   started="$(date +%s)"
   if ! cargo build -p rn-cli >"$work/build.log" 2>&1; then
     printf 'BUILD FAILED; refusing to test a stale binary\n' >&2
     tail -20 "$work/build.log" >&2
+    return 1
+  fi
+  if ! grep -q 'Compiling rn-cli' "$work/build.log"; then
+    printf 'NO RELINK: the build never recompiled rn-cli; refusing to test the binary\n' >&2
     return 1
   fi
   if [ ! -x "$binary" ]; then
