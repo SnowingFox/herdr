@@ -34,9 +34,28 @@ pub enum Payload<'s> {
     Pair(Local<'s, v8::Value>, Local<'s, v8::Value>),
 }
 
+/// Why an operation produced no value.
+///
+/// Two kinds because the permission model's denial is not a syscall error: it
+/// carries its own code and its own two fields, and `ERR_ACCESS_DENIED` is a
+/// plain `Error` rather than a `UVException`. Delivering it through the
+/// `FsError` path would give it an `errno` and a `syscall` Node never sets.
+pub enum Failure {
+    /// A syscall failed; delivered as the `UVException` shape.
+    Syscall(FsError),
+    /// The permission model refused the operation before any syscall ran.
+    Denied(rn_permission::AccessDeniedError),
+}
+
+impl From<FsError> for Failure {
+    fn from(error: FsError) -> Self {
+        Self::Syscall(error)
+    }
+}
+
 /// A completion ready to be delivered.
 pub struct Completion<'s> {
-    pub payload: Result<Payload<'s>, FsError>,
+    pub payload: Result<Payload<'s>, Failure>,
 }
 
 impl<'s> Completion<'s> {
@@ -60,7 +79,15 @@ impl<'s> Completion<'s> {
 
     pub fn failed(error: FsError) -> Self {
         Self {
-            payload: Err(error),
+            payload: Err(Failure::Syscall(error)),
+        }
+    }
+
+    /// A completion that delivers `error` to whichever calling convention the
+    /// request selected.
+    pub fn denied(error: rn_permission::AccessDeniedError) -> Self {
+        Self {
+            payload: Err(Failure::Denied(error)),
         }
     }
 
@@ -87,7 +114,9 @@ enum Rooted {
 /// Owns everything the microtask needs across the native/JS boundary.
 struct CallbackDelivery {
     request: v8::Global<v8::Object>,
-    payload: Result<Rooted, FsError>,
+    /// A [`Failure`] holds no V8 handles, so it survives the scope that
+    /// produced it as-is; only the success payload has to be rooted.
+    payload: Result<Rooted, Failure>,
 }
 
 /// Converts a completion into rooted handles.
@@ -96,7 +125,7 @@ struct CallbackDelivery {
 fn root<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     completion: Completion<'s>,
-) -> Result<Rooted, FsError> {
+) -> Result<Rooted, Failure> {
     match completion.payload {
         Ok(Payload::Unit) => Ok(Rooted::Unit),
         Ok(Payload::Value(value)) => {
@@ -108,7 +137,7 @@ fn root<'s>(
             let second = v8::Global::new(scope.as_ref(), second);
             Ok(Rooted::Pair(first, second))
         }
-        Err(error) => Err(error),
+        Err(failure) => Err(failure),
     }
 }
 
@@ -170,10 +199,11 @@ fn callback_trampoline(
     };
 
     let arguments: Vec<Local<v8::Value>> = match delivery.payload {
-        Err(error) => match error_object(scope, &error) {
+        Err(Failure::Syscall(error)) => match error_object(scope, &error) {
             Some(object) => vec![object],
             None => return,
         },
+        Err(Failure::Denied(error)) => vec![error.to_value(scope)],
         Ok(Rooted::Unit) => vec![v8::null(scope).into()],
         Ok(Rooted::Value(value)) => {
             let value = Local::new(scope, &value);
@@ -206,10 +236,14 @@ pub fn deliver_to_promise<'s>(
     let promise = resolver.get_promise(scope);
 
     match completion.payload {
-        Err(error) => {
+        Err(Failure::Syscall(error)) => {
             if let Some(object) = error_object(scope, &error) {
                 resolver.reject(scope, object);
             }
+        }
+        Err(Failure::Denied(error)) => {
+            let value = error.to_value(scope);
+            resolver.reject(scope, value);
         }
         Ok(Payload::Unit) => {
             resolver.resolve(scope, v8::undefined(scope).into());

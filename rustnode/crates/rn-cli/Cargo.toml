@@ -24,6 +24,10 @@ rn-core = { path = "../rn-core" }
 # for the argv rather than two that can disagree.
 rn-bind-options = { path = "../rn-bind-options" }
 rn-bindings = { path = "../rn-bindings" }
+# `process.permission` and the native checks share one model, which the CLI
+# builds from `--permission` and the `--allow-*` flags and installs before the
+# registry is created.
+rn-permission = { path = "../rn-permission" }
 # `process.versions.openssl` has to report the version this binary actually
 # linked, so the CLI reads it from the crypto binding rather than hardcoding.
 rn-bind-crypto = { path = "../rn-bind-crypto" }

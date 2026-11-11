@@ -10,7 +10,9 @@
 //! * [`PermissionBinding`] is `internalBinding('permission')`, which
 //!   `lib/internal/process/permission.js` wraps into `process.permission`;
 //! * [`AccessDenied`] is the `ERR_ACCESS_DENIED` payload, with the `permission`
-//!   and `resource` fields the JavaScript error constructor takes.
+//!   and `resource` fields the JavaScript error constructor takes;
+//! * [`runtime`] is where the CLI installs the one model the native checks read,
+//!   so a crate enforcing a scope does not have to be handed the model.
 //!
 //! # Gated resources
 //!
@@ -43,8 +45,10 @@
 
 pub mod binding;
 pub mod enforcement;
+pub mod env;
 pub mod model;
 pub mod path;
+pub mod runtime;
 
 pub use binding::{PermissionBinding, MEMBERS};
 pub use enforcement::{AccessDeniedError, PermissionGate};
@@ -55,8 +59,48 @@ pub use path::{resolve_path, wildcard_if_dir, RadixTree};
 
 /// Registers the `permission` namespace with the runtime.
 ///
-/// The binding is installed with a permissive model by default; the CLI is what
-/// turns enforcement on from `--permission` and the `--allow-*` flags.
+/// The binding is installed around the model the CLI put in [`runtime`], so
+/// `process.permission.has()` and the native checks answer from one set of
+/// grants: a `process.permission.drop()` revokes access for `fs` too. Without
+/// an installed model the binding still exists and grants everything, which is
+/// what a process started without `--permission` must do.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
-    registry.register_module(PermissionBinding::from_model(PermissionModel::disabled()));
+    let model =
+        runtime::shared().unwrap_or_else(|| std::sync::Arc::new(PermissionModel::disabled()));
+    registry.register_module(PermissionBinding::new(model));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_installs_the_model_the_cli_supplied() {
+        // A CLI that built an enforcing model must see that model behind
+        // `internalBinding('permission')`; installing a fresh disabled one here
+        // is what made every check a no-op.
+        let model = runtime::install(PermissionModel::with_cwd(
+            "/work",
+            PermissionConfig {
+                allow_fs_read: vec!["*".to_string()],
+                ..PermissionConfig::enforce()
+            },
+        ));
+        let mut registry = rn_core::BindingRegistry::new();
+        register(&mut registry);
+        assert!(registry.can_install("permission"));
+        assert!(runtime::shared().is_some_and(|shared| std::sync::Arc::ptr_eq(&shared, &model)));
+        assert!(model.check_fs_read("/etc/passwd").is_ok());
+        assert!(model.check_fs_write("/etc/passwd").is_err());
+        runtime::clear();
+    }
+
+    #[test]
+    fn register_without_an_installed_model_still_grants_everything() {
+        runtime::clear();
+        let mut registry = rn_core::BindingRegistry::new();
+        register(&mut registry);
+        assert!(registry.can_install("permission"));
+        assert!(!runtime::is_enabled());
+    }
 }

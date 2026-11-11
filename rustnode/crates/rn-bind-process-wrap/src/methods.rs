@@ -546,6 +546,18 @@ pub fn spawn(
         return;
     }
 
+    // `THROW_IF_INSUFFICIENT_PERMISSIONS(…kChildProcess, file…)` runs as soon as
+    // the file argument has been read, before any of the spawn options are
+    // interpreted, so a denial wins over a malformed stdio table. The resource
+    // is the executable as written: `lib/child_process.js` looks the program up
+    // and passes the resolved path, and Node reports exactly that string.
+    if let Some(file) = crate::arg_string(scope, &args, 0) {
+        if let Some(denied) = rn_permission::runtime::deny_child_process(&file) {
+            denied.throw(scope);
+            return;
+        }
+    }
+
     let mut options = match Options::build(scope, &args) {
         Ok(options) => options,
         Err(SpawnFailure::Status(status)) => {

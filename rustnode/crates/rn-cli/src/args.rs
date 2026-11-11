@@ -36,6 +36,18 @@ pub struct Options {
     /// this, `lib/internal/bootstrap/realm.js` sees `false` and leaves
     /// `node:bench` unrequireable no matter what the command line said.
     pub parsed: rn_bind_options::Store,
+    /// The permission model the flags asked for.
+    ///
+    /// Built by [`finish`] from the same `exec_argv` the parser recorded, and
+    /// installed by the CLI before the binding registry exists so
+    /// `internalBinding('permission')` and the native checks share one model.
+    pub permission: rn_permission::PermissionShared,
+    /// The flags that model was built from.
+    ///
+    /// Kept as well as the model because the environment scrub needs the
+    /// `--allow-env` patterns before the model is installed, and re-parsing the
+    /// argv to recover them would be a second interpretation of the same flags.
+    pub permission_config: rn_permission::PermissionConfig,
 }
 
 impl Options {
@@ -67,15 +79,15 @@ pub enum Source {
 /// Flags that take no separate value and that rustnode deliberately ignores.
 ///
 /// These change Node's behaviour in ways that do not affect whether a script
-/// runs: warning categories, source maps, gc exposure, permission grants. A
-/// script that only needs them accepted should run.
+/// runs: warning categories, source maps, gc exposure. A script that only needs
+/// them accepted should run.
+///
+/// The `--allow-*` permission grants are deliberately *not* here. They carry
+/// values, they change what the runtime permits, and accepting them without
+/// acting on them was the bug this list used to hide.
 const IGNORED_WITHOUT_VALUE: &[&str] = &[
     "--abort-on-uncaught-exception",
-    "--allow-child-process",
-    "--allow-fs-read",
-    "--allow-fs-write",
     "--allow-natives-syntax",
-    "--allow-worker",
     "--disable-proto",
     "--enable-source-maps",
     "--expose-gc",
@@ -101,11 +113,23 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
 const VALUE_SEPARATE: &[&str] = &["--conditions", "--import", "--loader", "--require", "-r"];
 
 /// Flags that are `--flag=value` and may also appear bare.
+///
+/// The `--allow-*` permission grants are listed here for their `=` form;
+/// [`parse`] treats the three that take a path or list (`--allow-env`,
+/// `--allow-fs-read`, `--allow-fs-write`) as also accepting a separate argument,
+/// because that is a spelling Node's own tests use.
 const VALUE_INLINE_PREFIXES: &[&str] = &[
+    "--allow-addons=",
     "--allow-child-process=",
     "--allow-env=",
+    "--allow-ffi=",
     "--allow-fs-read=",
+    "--allow-fs-vfs=",
     "--allow-fs-write=",
+    "--allow-inspector=",
+    "--allow-net=",
+    "--allow-openssl-store=",
+    "--allow-wasi=",
     "--allow-worker=",
     "--conditions=",
     "--disable-warning=",
@@ -122,6 +146,45 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
     "--unhandled-rejections=",
 ];
 
+/// Permission flags that take a value, in either the `=` or the separate form.
+///
+/// They are the only entries in [`VALUE_INLINE_PREFIXES`] that consume a
+/// following argument: `--allow-fs-read /tmp` is how Node's tests spell it, and
+/// `--allow-env=A,B` is one occurrence whose value the model splits on commas.
+const PERMISSION_VALUE_FLAGS: &[&str] = &["--allow-env", "--allow-fs-read", "--allow-fs-write"];
+
+/// Whether `flag` is one of the permission flags, in any spelling.
+///
+/// Used to decide whether a flag belongs in the permission model rather than in
+/// [`UNIMPLEMENTED`], where it used to be listed. Every one of these is now acted
+/// on, so reporting any of them as missing would be a warning that is no longer
+/// true.
+fn is_permission_flag(flag: &str) -> bool {
+    let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+    PERMISSION_BOOLEAN_GRANTS.contains(&name)
+        || PERMISSION_VALUE_FLAGS.contains(&name)
+        || matches!(name, "--permission" | "--permission-audit")
+}
+
+/// Permission flags that take no value and turn a scope on.
+///
+/// Every entry is covered by [`is_permission_flag`]; this list exists so the set
+/// of bare grants is stated once, next to the flags that take values. They are
+/// not in [`IGNORED_WITHOUT_VALUE`] because they are not ignored:
+/// [`Options::permission`] grants the scope when one of these is present, and the
+/// enforcement points then allow what they gate.
+const PERMISSION_BOOLEAN_GRANTS: &[&str] = &[
+    "--allow-addons",
+    "--allow-child-process",
+    "--allow-ffi",
+    "--allow-fs-vfs",
+    "--allow-inspector",
+    "--allow-net",
+    "--allow-openssl-store",
+    "--allow-wasi",
+    "--allow-worker",
+];
+
 /// Flags that enable an experimental surface rustnode has not built yet.
 ///
 /// Accepting them silently would make a test look like it exercised the feature
@@ -136,6 +199,17 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
 ///   implementation, and the `test-quic-stream-iteration*` files pass.
 /// * `--allow-natives-syntax` — forwarded to V8, so `%DebugPrint` and the other
 ///   natives intrinsics parse instead of throwing `SyntaxError`.
+///
+/// `--permission` was the fourth. It is still here, and the reason is worth
+/// stating precisely, because most of the model now works: `fs.read`,
+/// `fs.write`, `child` and `env` are enforced, but `net` is not — `tcp_wrap`,
+/// `udp_wrap` and `pipe_wrap` have no `kNet` check yet, so
+/// `server.listen()` succeeds under `--permission`. A process that believes it
+/// has denied the network but has not is the exact failure this list exists to
+/// prevent, so the flag keeps its warning until that lands. `worker`, `addon`,
+/// `wasi`, `inspector`, `ffi` and `openssl.store` are unenforced too, but for a
+/// different reason: this build has no `Worker` constructor, addon loader, WASI
+/// implementation, inspector or FFI surface to gate at all.
 const UNIMPLEMENTED: &[&str] = &[
     "--experimental-network-inspection",
     "--experimental-shadow-realm",
@@ -216,6 +290,30 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             continue;
         }
 
+        // A permission grant whose value is a separate argument. Node accepts
+        // both spellings and its own tests use both, so the value is taken here
+        // and recorded in the joined form `exec_argv` uses everywhere else.
+        // This is checked before the generic permission branch below, because
+        // `--allow-fs-read` alone would otherwise be accepted as a bare boolean
+        // and its value treated as the script path.
+        if PERMISSION_VALUE_FLAGS.contains(&argument.as_str()) {
+            let Some(value) = args.get(index + 1) else {
+                return Err(format!("{argument} requires an argument"));
+            };
+            options.exec_argv.push(format!("{argument}={value}"));
+            index += 2;
+            continue;
+        }
+
+        // Any permission flag: `--permission`, `--permission-audit`, a boolean
+        // `--allow-*`, or an `--allow-*=value`. Accepted, recorded for
+        // `execArgv`, and acted on — `finish` turns them into the model.
+        if is_permission_flag(argument) {
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
         if VALUE_SEPARATE.contains(&argument.as_str()) {
             let Some(value) = args.get(index + 1) else {
                 return Err(format!("{argument} requires an argument"));
@@ -248,7 +346,6 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             if UNIMPLEMENTED
                 .iter()
                 .any(|flag| argument.starts_with(&format!("{flag}=")))
-                || argument.starts_with("--permission=")
             {
                 unimplemented.insert(argument.clone());
             }
@@ -273,7 +370,49 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
     // both. The flags only — never the script path or its arguments, which
     // Node's parser stops at too.
     options.parsed = rn_bind_options::Store::parse(&options.exec_argv);
+    // The permission model is the one thing this parser builds rather than
+    // describes: `PermissionConfig::from_args` already reads these flags in both
+    // spellings and owns the 68 tests that pin its grammar, so routing through
+    // it keeps one interpretation of `--allow-fs-read=*` rather than two.
+    let mut config = rn_permission::PermissionConfig::from_args(&options.exec_argv);
+    // `Environment::InitializePermission` grants the entry point read access
+    // implicitly, so `node --permission app.js` can load the script it was told
+    // to run without also needing `--allow-fs-read=app.js`. It does *not* do that
+    // for `-e` or a REPL, where there is no file to allow, and it skips `-`
+    // (stdin) and the `inspect` subcommand. The path is the one from the command
+    // line: the model resolves it against the working directory, which is what
+    // `PathResolve` does with it too.
+    if let Source::File(path) = &options.source {
+        if path != "-" && path != "inspect" {
+            config.allow_fs_read.push(path.clone());
+        }
+    }
+    // `--require` preloads are granted the same way, because Node cannot load
+    // them before `lib/**` runs either.
+    for entry in &options.exec_argv {
+        if let Some(preload) = entry.strip_prefix("--require=") {
+            config.allow_fs_read.push(preload.to_string());
+        }
+    }
+    options.permission_config = config.clone();
+    options.permission = std::sync::Arc::new(rn_permission::PermissionModel::with_cwd(
+        current_dir(),
+        config,
+    ));
     options
+}
+
+/// The working directory the permission model resolves relative grants against.
+///
+/// Node's `PathResolve` starts from the process working directory, and a grant
+/// written as `--allow-fs-read=data` has to mean the same directory the script
+/// sees. A directory that cannot be read is impossible in practice and is not
+/// worth failing the run over, so the empty string makes relative grants resolve
+/// against `/` rather than panicking.
+fn current_dir() -> String {
+    std::env::current_dir()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -317,6 +456,118 @@ mod tests {
     fn an_unimplemented_experimental_flag_is_reported_not_hidden() {
         let options = parse_of(&["--experimental-vm-modules", "-e", "1"]).expect("parses");
         assert_eq!(options.unimplemented, ["--experimental-vm-modules"]);
+    }
+
+    /// The bug this whole change exists for: `--permission` used to be accepted
+    /// and recorded, while the binding it reaches was built from
+    /// `PermissionModel::disabled()` and nothing consulted a gate.
+    #[test]
+    fn permission_flags_build_an_enforcing_model() {
+        let options =
+            parse_of(&["--permission", "--allow-fs-read=/tmp", "-e", "1"]).expect("parses");
+        assert!(options.permission.is_enabled());
+        assert!(!options.permission.is_audit());
+    }
+
+    #[test]
+    fn no_permission_flag_still_builds_a_disabled_model() {
+        // The negative direction of the same test: a runtime without the flag
+        // must not deny anything, so this is what keeps the check honest rather
+        // than denying everything.
+        let options = parse_of(&["--allow-fs-read=/tmp", "-e", "1"]).expect("parses");
+        assert!(!options.permission.is_enabled());
+    }
+
+    #[test]
+    fn every_permission_flag_spelling_reaches_the_model() {
+        // Both value forms, because Node's own tests use both.
+        let joined =
+            parse_of(&["--permission", "--allow-fs-read=/tmp/x", "-e", "1"]).expect("parses");
+        assert!(joined
+            .exec_argv
+            .iter()
+            .any(|flag| flag == "--allow-fs-read=/tmp/x"));
+        assert!(
+            joined.permission.check_fs_read("/tmp/x").is_ok(),
+            "the joined form must grant the path"
+        );
+
+        let separate =
+            parse_of(&["--permission", "--allow-fs-read", "/tmp/x", "-e", "1"]).expect("parses");
+        // The separate form is recorded joined, so `execArgv` has one shape and
+        // the model sees a value rather than treating the path as the script.
+        assert!(separate
+            .exec_argv
+            .iter()
+            .any(|flag| flag == "--allow-fs-read=/tmp/x"));
+        assert!(
+            separate.permission.check_fs_read("/tmp/x").is_ok(),
+            "the separate form must grant the path"
+        );
+        assert!(matches!(separate.source, Source::Eval { .. }));
+    }
+
+    #[test]
+    fn a_grant_does_not_grant_the_other_scope() {
+        // A model built from only a read grant must deny writes, and vice versa:
+        // a `--permission` that allowed everything would pass the tests above
+        // without enforcing anything.
+        let options =
+            parse_of(&["--permission", "--allow-fs-read=/tmp/x", "-e", "1"]).expect("parses");
+        assert!(options.permission.check_fs_read("/tmp/x").is_ok());
+        assert!(options.permission.check_fs_write("/tmp/x").is_err());
+        assert!(options.permission.check_child_process().is_err());
+    }
+
+    #[test]
+    fn permission_audit_is_enabled_but_does_not_deny() {
+        let options = parse_of(&["--permission-audit", "-e", "1"]).expect("parses");
+        assert!(options.permission.is_enabled());
+        assert!(options.permission.is_audit());
+    }
+
+    #[test]
+    fn the_entry_point_is_granted_read_implicitly() {
+        // `Environment::InitializePermission` adds the script path to
+        // `allow_fs_read`, so `node --permission app.js` can load what it was
+        // told to run.
+        let options = parse_of(&["--permission", "/definitely/not/here.js"]).expect("parses");
+        assert!(options
+            .permission
+            .check_fs_read("/definitely/not/here.js")
+            .is_ok());
+        assert!(options.permission.check_fs_read("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn eval_gets_no_implicit_read_grant() {
+        // `-e` has no file, so there is nothing to allow; granting the working
+        // directory instead would make `--permission -e` silently readable.
+        let options = parse_of(&["--permission", "-e", "1"]).expect("parses");
+        assert!(options.permission.check_fs_read("probe.js").is_err());
+    }
+
+    #[test]
+    fn permission_grants_are_not_reported_unimplemented() {
+        // `net` is the one scope this build cannot enforce yet, so
+        // `--permission` itself keeps its warning; the grants must not add any.
+        let options = parse_of(&[
+            "--permission",
+            "--allow-fs-read=/tmp",
+            "--allow-fs-write=/tmp",
+            "--allow-child-process",
+            "--allow-env=A",
+            "-e",
+            "1",
+        ])
+        .expect("parses");
+        assert_eq!(options.unimplemented, ["--permission"]);
+    }
+
+    #[test]
+    fn a_missing_permission_value_is_an_error_not_a_script() {
+        let error = parse_of(&["--permission", "--allow-fs-read"]).expect_err("rejects");
+        assert!(error.contains("--allow-fs-read"), "{error}");
     }
 
     #[test]
