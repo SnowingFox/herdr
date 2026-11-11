@@ -55,13 +55,51 @@ fn the_shared_arrays_have_node_types_and_lengths() {
 }
 
 #[test]
-fn the_id_counter_starts_at_one_and_ids_start_invalid() {
+fn the_top_level_context_matches_node() {
+    // Node runs the entry point inside `InternalCallbackScope(env, obj,
+    // { 1, 0 }, kSkipAsyncHooks)` (`src/node.cc:287-293`), which pushes async
+    // id 1 and trigger 0. Measured against `node --expose-internals`:
+    //
+    //     exec 1 trig 0 ctr 2 depth 1 check 1
+    //
+    // The four values that are invariant are the ids, the depth and the check
+    // flag. The counter is *not*: it counts the resources the bootstrap
+    // created, so it differs between `node -e`, a script file, and a build with
+    // a different startup path. Asserting an exact counter would pin this test
+    // to one bootstrap shape rather than to the contract.
     let output = run(&format!(
         "{PRELUDE}
         console.log(aw.async_id_fields[constants.kExecutionAsyncId],
-                    aw.async_id_fields[constants.kAsyncIdCounter]);"
+                    aw.async_id_fields[constants.kTriggerAsyncId],
+                    aw.async_hook_fields[constants.kStackLength],
+                    aw.async_hook_fields[constants.kCheck]);"
     ));
-    assert_eq!(output, "-1 1");
+    assert_eq!(output, "1 0 1 1");
+}
+
+#[test]
+fn the_public_execution_ids_are_one_and_zero_at_top_level() {
+    // What the three failing Node tests actually read. Before this was fixed
+    // `-1 !== 1` was the recorded assertion in
+    // `test-async-hooks-promise.js`, `-triggerid.js` and
+    // `-top-level-clearimmediate.js`.
+    let output = run("const ah = require('async_hooks');\
+         const seen = [];\
+         ah.createHook({ init(id, type, tid) { seen.push([id, type, tid]); } }).enable();\
+         Promise.resolve(1);\
+         console.log(ah.executionAsyncId(), ah.triggerAsyncId(), JSON.stringify(seen));");
+    // `node -e` on the same script prints `1 0 [[2,"PROMISE",1]]`.
+    assert_eq!(output, r#"1 0 [[2,"PROMISE",1]]"#);
+}
+
+#[test]
+fn execution_async_resource_is_truthy_at_top_level() {
+    // `test-async-hooks-execution-async-resource.js:11` asserts exactly this.
+    // The scope's resource object is what `executionAsyncResource()` answers
+    // for the whole script body.
+    let output = run("const { executionAsyncResource } = require('async_hooks');\
+         console.log(Boolean(executionAsyncResource()));");
+    assert_eq!(output, "true");
 }
 
 #[test]
@@ -80,39 +118,87 @@ fn pushing_and_popping_moves_the_stack_length() {
         "{PRELUDE}
         const depth = () => aw.async_hook_fields[constants.kStackLength];
         const before = depth();
-        aw.pushAsyncContext(null, 7, 3);
+        aw.pushAsyncContext(7, 3);
         const during = depth();
+        const exec = aw.async_id_fields[constants.kExecutionAsyncId];
+        const trig = aw.async_id_fields[constants.kTriggerAsyncId];
         const popped = aw.popAsyncContext(7);
         const after = depth();
-        const wrong = aw.popAsyncContext(999);
-        console.log(before, during, popped, after, wrong);"
+        console.log(before, during, exec, trig, popped, after);"
     ));
-    // A pop with the wrong id must not change the depth: that check is what
-    // stops a mismatched pair from corrupting the context.
-    assert_eq!(output, "0 1 true 0 false");
+    // `PushAsyncContext` reads args 0 and 1 (`src/async_wrap.cc:277-285`), and
+    // installing the pair is the point of the call: it used to read args 1/2
+    // and never wrote the ids at all, so `executionAsyncId()` inside the pushed
+    // context answered the caller's id rather than the callee's.
+    assert_eq!(output, "1 2 7 3 true 1");
 }
 
 #[test]
-fn the_stack_stores_the_id_pair_it_was_given() {
+fn popping_restores_the_context_the_push_replaced() {
+    // This is the bug the `19 !== 18` assertion came from: the stack must hold
+    // the *outgoing* pair, because that is what a pop restores.
     let output = run(&format!(
         "{PRELUDE}
-        aw.pushAsyncContext(null, 11, 5);
-        console.log(aw.async_ids_stack[0], aw.async_ids_stack[1]);"
+        const exec = () => aw.async_id_fields[constants.kExecutionAsyncId];
+        const trig = () => aw.async_id_fields[constants.kTriggerAsyncId];
+        const outer = [exec(), trig()];
+        aw.pushAsyncContext(11, 5);
+        const inner = [exec(), trig()];
+        aw.popAsyncContext(11);
+        const back = [exec(), trig()];
+        console.log(outer.join(','), inner.join(','), back.join(','));"
     ));
-    assert_eq!(output, "11 5");
+    assert_eq!(output, "1,0 11,5 1,0");
 }
 
 #[test]
-fn clearing_the_stack_resets_the_depth() {
+fn the_stack_stores_the_outgoing_id_pair() {
     let output = run(&format!(
         "{PRELUDE}
-        aw.pushAsyncContext(null, 1, 2);
-        aw.pushAsyncContext(null, 3, 4);
+        aw.pushAsyncContext(11, 5);
+        console.log(aw.async_ids_stack[0], aw.async_ids_stack[1],
+                    aw.async_ids_stack[2], aw.async_ids_stack[3]);"
+    ));
+    // The top-level scope already occupies entry 0, so this push lands at entry
+    // 1 — slots 2 and 3 — and stores the pair that was executing before it.
+    // The old code stored the *incoming* pair there, so a pop restored the ids
+    // that had just been pushed instead of the ones they replaced.
+    assert_eq!(output, "0 0 1 0");
+}
+
+#[test]
+fn a_deep_stack_grows_instead_of_dropping_frames() {
+    // `test-async-hooks-recursive-stack-runInAsyncScope.js` recurses 1000 deep
+    // and asserts `executionAsyncId()` all the way back out. The array starts
+    // at 16 entries and `grow_async_ids_stack` triples it, so the depth has to
+    // survive past the initial extent.
+    let output = run(&format!(
+        "{PRELUDE}
+        for (let i = 0; i < 200; i++) aw.pushAsyncContext(i + 100, 1);
+        const depth = aw.async_hook_fields[constants.kStackLength];
+        const top = aw.async_id_fields[constants.kExecutionAsyncId];
+        const extent = aw.async_ids_stack.length;
+        console.log(depth, top, extent > 32);"
+    ));
+    assert_eq!(output, "201 299 true");
+}
+
+#[test]
+fn clearing_the_stack_resets_the_depth_and_the_ids() {
+    let output = run(&format!(
+        "{PRELUDE}
+        aw.pushAsyncContext(1, 2);
+        aw.pushAsyncContext(3, 4);
         const before = aw.async_hook_fields[constants.kStackLength];
         aw.clearAsyncIdStack();
-        console.log(before, aw.async_hook_fields[constants.kStackLength]);"
+        console.log(before, aw.async_hook_fields[constants.kStackLength],
+                    aw.async_id_fields[constants.kExecutionAsyncId],
+                    aw.async_id_fields[constants.kTriggerAsyncId]);"
     ));
-    assert_eq!(output, "2 0");
+    // `AsyncHooks::clear_async_id_stack` resets the ids to 0 as well as the
+    // depth (`src/env.cc:232-237`). Resetting only the depth left the execution
+    // id pointing at a resource whose callback had already unwound.
+    assert_eq!(output, "3 0 0 0");
 }
 
 #[test]

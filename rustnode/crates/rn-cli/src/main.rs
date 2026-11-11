@@ -236,6 +236,13 @@ fn main() {
         Err(message) => eprintln!("rustnode: realm bootstrap failed: {message}"),
     }
 
+    // `src/node.cc::StartExecution` opens an `InternalCallbackScope` with
+    // `{ 1, 0 }` and `kSkipAsyncHooks` around everything it runs, so the async
+    // id every top-level resource inherits as its trigger is 1. Without it the
+    // buffers keep the `clear_async_id_stack` seed and every resource reports
+    // `triggerAsyncId() === -1`. See `push_top_level_context`.
+    rn_bind_async_wrap::push_top_level_context(scope);
+
     // A file is loaded through Node's own entry-point path
     // (`internal/modules/run_main.js::executeUserEntryPoint`), which picks the
     // CommonJS or ESM loader from the file's format — `.mjs`, `.wasm`, or a

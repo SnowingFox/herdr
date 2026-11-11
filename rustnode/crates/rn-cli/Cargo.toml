@@ -38,6 +38,10 @@ rn-io = { path = "../rn-io" }
 rn-uv = { path = "../rn-uv" }
 rn-bind-timers = { path = "../rn-bind-timers" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
+# The entry point runs inside an `InternalCallbackScope` whose async context is
+# `{ 1, 0 }` (`src/node.cc:287`), and that scope lives with `async_wrap`'s
+# state. Opening it here is what makes top-level `triggerAsyncId()` answer 1.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-napi = { path = "../rn-napi" }
 # `process.versions.zlib` and `.zstd` come from the libraries the binary
