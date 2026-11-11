@@ -65,6 +65,14 @@ pub struct Message {
     pub data: Vec<u8>,
     /// Transferred `ArrayBuffer` backing stores, in transfer-id order.
     pub array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
+    /// Shared buffer backing stores the payload referenced, in id order.
+    ///
+    /// Node's `Message::shared_array_buffers_`. These are *not* transfers: a
+    /// shared buffer stays usable on the sending side, and the receiver attaches
+    /// the same allocation rather than a copy. Without this list a message
+    /// containing a `Uint32Array` over a `SharedArrayBuffer` could not be read
+    /// back at all, which is what stopped `new Worker()` from constructing.
+    pub shared_array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
     /// Transfer-list entries and clones, in the order the serializer numbered
     /// them. Shared with every recipient, the way Node shares the
     /// `shared_ptr<Message>` itself.
@@ -94,12 +102,14 @@ impl Message {
     pub fn new(
         data: Vec<u8>,
         array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
+        shared_array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
         host_objects: Vec<Arc<dyn TransferData>>,
         transferred_count: usize,
     ) -> Self {
         Self {
             data,
             array_buffers,
+            shared_array_buffers,
             host_objects: Arc::new(host_objects),
             transferred_count,
             close: false,
@@ -111,6 +121,7 @@ impl Message {
         Self {
             data: Vec::new(),
             array_buffers: Vec::new(),
+            shared_array_buffers: Vec::new(),
             host_objects: Arc::new(Vec::new()),
             transferred_count: 0,
             close: true,
@@ -440,6 +451,9 @@ fn clone_message(message: &Message) -> Message {
     Message {
         data: message.data.clone(),
         array_buffers: message.array_buffers.clone(),
+        // A `SharedRef` clone points at the same allocation, which is exactly what
+        // a shared buffer is: every recipient, and the sender, must see one buffer.
+        shared_array_buffers: message.shared_array_buffers.clone(),
         // `Arc`, so a second recipient shares the same payloads. A transferred
         // port's queue is shared the same way, which is what Node's
         // `shared_ptr<Message>` means when one message reaches two ports.
@@ -767,7 +781,13 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        assert!(a.dispatch(&Message::new(vec![1], Vec::new(), Vec::new(), 0)));
+        assert!(a.dispatch(&Message::new(
+            vec![1],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0
+        )));
 
         assert_eq!(a.len(), 0, "the poster must not receive its own message");
         assert_eq!(b.len(), 1);
@@ -782,7 +802,13 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        a.dispatch(&Message::new(vec![7], Vec::new(), Vec::new(), 0));
+        a.dispatch(&Message::new(
+            vec![7],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        ));
 
         assert_eq!(b.len(), 1);
         assert_eq!(b.front_is_close(), Some(false));
@@ -794,8 +820,20 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        a.dispatch(&Message::new(vec![1], Vec::new(), Vec::new(), 0));
-        a.dispatch(&Message::new(vec![2], Vec::new(), Vec::new(), 0));
+        a.dispatch(&Message::new(
+            vec![1],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        ));
+        a.dispatch(&Message::new(
+            vec![2],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        ));
         b.disentangle();
         a.disentangle();
 
@@ -839,7 +877,13 @@ mod tests {
     fn a_group_of_one_dispatches_nothing() {
         let a = MessagePortData::new();
         assert!(
-            !a.dispatch(&Message::new(vec![1], Vec::new(), Vec::new(), 0)),
+            !a.dispatch(&Message::new(
+                vec![1],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0
+            )),
             "an unentangled port has no peer to warn about"
         );
     }
