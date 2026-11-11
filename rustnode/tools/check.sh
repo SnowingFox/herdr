@@ -43,6 +43,18 @@ step "building the workspace and the CLI binary"
 cargo build --workspace
 cargo build -p rn-cli
 
+step "the cipher control still reports a void run as a void run"
+# The control's exit contract — 3 for "the build failed, so there is no
+# verdict", distinct from 1 for "the control misbehaved" — is what stops a
+# build failure being reported as a failed control. That was a real defect: a
+# `compile_error!` used to exit 1 and print `RESULT: UNEXPECTED`. The contract
+# is only worth having if something exercises it, so the self-test runs here
+# rather than being a diagnostic nobody invokes. It injects a real
+# `compile_error!`, so it sits after the build (warm cache makes it ~1s) and
+# before the tests and lints, which would fail loudly if the restore ever left
+# the source tree modified.
+./tools/cipher-negative-control.sh --self-test
+
 if [ "$quick" -eq 0 ]; then
   step "running the workspace tests"
   cargo test --workspace

@@ -191,7 +191,7 @@ function hex(buffer) {
 // `test/parallel/test-crypto-cipheriv-decipheriv.js`. That is what
 // `CipherBase::CommonInit` throws; the v22 on this machine predates that check and
 // accepts the option silently. (`test/parallel/test-crypto-cipheriv-xts.js` is not
-// one of them: it checks real XTS ciphertext vectors and the repeated-update state
+// one of them: it round-trips XTS ciphers and checks the repeated-update state
 // errors, and contains no such assertion.) The pin is authoritative, so these
 // print the pin's answer and the diff against v22 is expected. See
 // `docs/compat-status.md`'s "Version skew against the local `node` binary".

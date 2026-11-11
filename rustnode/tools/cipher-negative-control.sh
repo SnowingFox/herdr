@@ -133,21 +133,50 @@ self_test() {
   local source_backup binary_backup had_binary=0
   source_backup="$(mktemp)"
   binary_backup="$(mktemp)"
-  cp "$target" "$source_backup"
+
+  # An unchecked backup is worse than no backup: `cp` into a full filesystem
+  # leaves an empty file, and the restore would then copy that over the source
+  # and delete the only evidence. Nothing has been mutated yet at this point,
+  # so a failed backup can stop cleanly.
+  if ! cp "$target" "$source_backup"; then
+    echo "SELF-TEST ABORTED: could not back up $target; nothing was modified." >&2
+    rm -f "$source_backup" "$binary_backup"
+    return 1
+  fi
   if [ -f "$binary" ]; then
-    cp "$binary" "$binary_backup"
+    if ! cp "$binary" "$binary_backup"; then
+      echo "SELF-TEST ABORTED: could not back up $binary; nothing was modified." >&2
+      rm -f "$source_backup" "$binary_backup"
+      return 1
+    fi
     had_binary=1
   fi
 
+  # Returns nonzero if anything could not be put back, and keeps the backups in
+  # that case: a restore that fails after deleting its own copy turns a
+  # recoverable tree into a lost one. The comparison after each copy is what
+  # catches a short write rather than trusting `cp`'s exit status alone.
   restore_self_test() {
-    cp "$source_backup" "$target"
-    rm -f "$source_backup"
-    if [ "$had_binary" -eq 1 ]; then
-      cp "$binary_backup" "$binary"
+    local failed=0
+    if ! cp "$source_backup" "$target" || ! cmp -s "$source_backup" "$target"; then
+      echo "FAIL: could not restore $target; the original is at $source_backup" >&2
+      failed=1
     fi
-    rm -f "$binary_backup"
+    if [ "$had_binary" -eq 1 ]; then
+      if ! cp "$binary_backup" "$binary" || ! cmp -s "$binary_backup" "$binary"; then
+        echo "FAIL: could not restore $binary; the original is at $binary_backup" >&2
+        failed=1
+      fi
+    fi
+    if [ "$failed" -eq 0 ]; then
+      rm -f "$source_backup" "$binary_backup"
+    fi
+    return "$failed"
   }
-  trap restore_self_test EXIT
+  # `exit 1` is deliberate: a failed restore inside the trap would otherwise be
+  # reported while the script still exited 0, which is the one outcome that
+  # would hide a damaged tree behind a green self-test.
+  trap 'restore_self_test || exit 1' EXIT
 
   printf '\ncompile_error!("injected by cipher-negative-control.sh --self-test");\n' >>"$target"
 
@@ -173,7 +202,9 @@ self_test() {
     failures=$((failures + 1))
   fi
 
-  restore_self_test
+  if ! restore_self_test; then
+    failures=$((failures + 1))
+  fi
   trap - EXIT
 
   if [ "$failures" -ne 0 ]; then
