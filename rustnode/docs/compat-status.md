@@ -258,6 +258,12 @@ round-trips through node and vice versa — so this affects compression ratio,
 not correctness. Closing it means linking the same zlib Node vendors, which is
 a build change of its own.
 
+The zstd half of `zlib` does not share this: it links `zstd-sys`, which vendors
+the same C sources Node bundles at the same version (`+zstd.1.5.7`), so
+`zstdCompressSync` is byte-identical to Node's for the payloads in
+`crates/rn-bind-zlib/tests/zstd_parity.rs`. The divergence above is specific to
+`libz-rs-sys` and to `deflate`/`gzip`, and this change does not touch it.
+
 ### Web Streams globals are not installed
 
 `ReadableStream`, `WritableStream`, `TransformStream` and their friends are

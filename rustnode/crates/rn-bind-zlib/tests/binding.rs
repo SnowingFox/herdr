@@ -515,17 +515,19 @@ fn handle_lifetime_is_safe() {
         r#"{"message":"zlib binding closed","errno":-2,"code":"Z_STREAM_ERROR"}"#
     );
 
-    // The zstd constructors exist for namespace shape, but report clearly that
-    // they are unimplemented rather than surfacing a `TypeError` from
-    // `new undefined()`.
+    // The zstd constructors have to build a real handle. The sync driver below
+    // is `processChunkSync`'s loop, so this proves the handles speak the same
+    // `writeSync`/`writeState` protocol the other three families use rather than
+    // merely existing for namespace shape.
     let zstd = eval_sequence(&[r#"
         (() => {
           const binding = globalThis.__zlibBinding;
           const outcomes = {};
           for (const name of ['ZstdCompress', 'ZstdDecompress']) {
             try {
-              new binding[name]();
-              outcomes[name] = 'constructed';
+              const handle = new binding[name]();
+              outcomes[name] = typeof handle.writeSync;
+              handle.close();
             } catch (error) {
               outcomes[name] = error.message;
             }
@@ -535,7 +537,114 @@ fn handle_lifetime_is_safe() {
         "#]);
     assert_eq!(
         zstd,
-        r#"{"ZstdCompress":"zstd is not implemented by rn-bind-zlib","ZstdDecompress":"zstd is not implemented by rn-bind-zlib"}"#
+        r#"{"ZstdCompress":"function","ZstdDecompress":"function"}"#
+    );
+
+    // A full compress/decompress round trip through the native handles, driven
+    // exactly as `lib/zlib.js` drives them: `init` with a `Uint32Array(2)`
+    // write state, then `writeSync` until the output buffer is no longer full.
+    let zstd_round_trip = eval_sequence(&[r#"
+        (() => {
+          const binding = globalThis.__zlibBinding;
+
+          function compress(input) {
+            const params = new Uint32Array(403).fill(-1);
+            const state = new Uint32Array(2);
+            const handle = new binding.ZstdCompress();
+            const callback = () => {};
+            handle.init(params, undefined, state, callback, undefined, false);
+
+            const chunkSize = 64;
+            const out = [];
+            let availInBefore = input.length;
+            let inOff = 0;
+            while (true) {
+              const buffer = new Uint8Array(chunkSize);
+              handle.writeSync(2, input, inOff, availInBefore, buffer, 0, chunkSize);
+              const availOutAfter = state[0];
+              const availInAfter = state[1];
+              const inDelta = availInBefore - availInAfter;
+              const have = chunkSize - availOutAfter;
+              if (have > 0) out.push(buffer.slice(0, have));
+              if (availOutAfter === 0) {
+                inOff += inDelta;
+                availInBefore = availInAfter;
+              } else {
+                break;
+              }
+            }
+            handle.close();
+            let total = 0;
+            for (const part of out) total += part.length;
+            const joined = new Uint8Array(total);
+            let offset = 0;
+            for (const part of out) { joined.set(part, offset); offset += part.length; }
+            return joined;
+          }
+
+          function decompress(input) {
+            const params = new Uint32Array(101).fill(-1);
+            const state = new Uint32Array(2);
+            const handle = new binding.ZstdDecompress();
+            const callback = () => {};
+            handle.init(params, undefined, state, callback, undefined, false);
+
+            const chunkSize = 256;
+            const out = [];
+            let availInBefore = input.length;
+            let inOff = 0;
+            while (true) {
+              const buffer = new Uint8Array(chunkSize);
+              handle.writeSync(2, input, inOff, availInBefore, buffer, 0, chunkSize);
+              const availOutAfter = state[0];
+              const availInAfter = state[1];
+              const inDelta = availInBefore - availInAfter;
+              const have = chunkSize - availOutAfter;
+              if (have > 0) out.push(buffer.slice(0, have));
+              if (availOutAfter === 0) {
+                inOff += inDelta;
+                availInBefore = availInAfter;
+              } else {
+                break;
+              }
+            }
+            handle.close();
+            let total = 0;
+            for (const part of out) total += part.length;
+            const joined = new Uint8Array(total);
+            let offset = 0;
+            for (const part of out) { joined.set(part, offset); offset += part.length; }
+            return joined;
+          }
+
+          // A short, non-repetitive string does not compress (zstd's frame
+          // header costs more than the literals save), so the round trip is
+          // checked on both a short input and a repetitive one that must shrink.
+          const input = asciiBytes('hello zstd, this is a round trip through the native handle');
+          const frame = compress(input);
+          const magic = [...frame.slice(0, 4)];
+          const back = decompress(frame);
+
+          const repetitive = new Uint8Array(800);
+          for (let i = 0; i < repetitive.length; i++) {
+            repetitive[i] = 0x61 + (i % 8);
+          }
+          const repetitiveFrame = compress(repetitive);
+          const repetitiveBack = decompress(repetitiveFrame);
+
+          return JSON.stringify({
+            magic,
+            roundTrip: [...back].length === input.length &&
+              [...back].every((byte, index) => byte === input[index]),
+            repetitiveRoundTrip: [...repetitiveBack].length === repetitive.length &&
+              [...repetitiveBack].every((byte, index) => byte === repetitive[index]),
+            repetitiveFrameIsSmaller: repetitiveFrame.length < repetitive.length,
+          });
+        })();
+        "#]);
+    assert_eq!(
+        zstd_round_trip,
+        r#"{"magic":[40,181,47,253],"roundTrip":true,"repetitiveRoundTrip":true,"repetitiveFrameIsSmaller":true}"#
     );
 
     // Re-initializing a closed handle must work, which is what the JS does when
