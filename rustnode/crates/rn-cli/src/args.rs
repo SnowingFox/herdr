@@ -251,13 +251,27 @@ const PERMISSION_BOOLEAN_GRANTS: &[&str] = &[
 /// * `--allow-natives-syntax` — forwarded to V8, so `%DebugPrint` and the other
 ///   natives intrinsics parse instead of throwing `SyntaxError`.
 ///
-/// `--permission` was the fourth. It has now left the list too: `fs.read`,
-/// `fs.write`, `child`, `env`, `net` and `addon` are all enforced, which is the
-/// set this build has a surface for. `worker` is still unenforced but gated on
-/// the unmerged worker_threads branch, `inspector` has its own change open, and
-/// `wasi`, `ffi` and `openssl.store` have no implementation to gate at all —
-/// `new WASI()` already fails on the missing `wasi` binding rather than on a
-/// permission, so a permission warning over it would name the wrong cause.
+/// `--permission` was the fourth, and it has now left the list too. Every scope
+/// that is enforced is listed in `crates/rn-permission`'s module documentation;
+/// the ones that are not, and the reason each cannot be, are:
+///
+/// * `wasi` — rustnode has no `internalBinding('wasi')`, so `new WASI()` already
+///   throws "the namespace has no Rust implementation yet". A permission check
+///   in front of that would report the wrong cause.
+/// * `ffi` — no `node:ffi` surface either; `require('node:ffi')` fails on the
+///   missing binding for the same reason.
+/// * `openssl.store` — the crypto layer has no STORE-loader path to gate.
+///
+/// The three above are all "no surface exists", so the warning would name a
+/// permission gap where the real gap is a missing feature.
+///
+/// `worker`, `inspector`, `net`, `addon`, `fs` and `child` *are* enforced, so
+/// none of them belongs here. `worker` became enforceable with the
+/// worker_threads landing; `inspector.open()` checks `inspector`.
+///
+/// `--permission` itself is deliberately absent: the warning is what told a user
+/// the model was not enforced, and for the scopes above the honest signal is the
+/// missing-feature error, not a permission one.
 const UNIMPLEMENTED: &[&str] = &[
     "--experimental-network-inspection",
     "--experimental-shadow-realm",

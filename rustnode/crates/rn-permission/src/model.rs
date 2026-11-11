@@ -909,6 +909,15 @@ impl PermissionModel {
         self.check_boolean(PermissionScope::Inspector, "")
     }
 
+    /// [`Self::check_inspector`] with the resource Node names.
+    ///
+    /// `inspector_agent.cc` passes its own entry-point name (`"StartIoThread"`,
+    /// `"WaitForConnect"`) rather than a user-supplied string, so the denial's
+    /// `resource` identifies where the inspector was reached from.
+    pub fn check_inspector_named(&self, resource: &str) -> Result<(), AccessDenied> {
+        self.check_boolean(PermissionScope::Inspector, resource)
+    }
+
     /// Checks opening a network server or socket.
     pub fn check_net(&self, resource: &str) -> Result<(), AccessDenied> {
         self.check_boolean(PermissionScope::Net, resource)

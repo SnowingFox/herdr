@@ -26,13 +26,24 @@
 //! | `fs` | `fs.symlink` only, which needs both halves | `lib/fs.js`, `lib/internal/fs/promises.js` |
 //! | `child` | `spawn`, `spawnSync`, `exec`, `execFile`, `fork` | `process_wrap.cc`, `spawn_sync.cc` |
 //! | `worker` | `new Worker()` | `node_worker.cc` |
-//! | `addon` | `process.dlopen`, `internalBinding` of a linked binding | `node_binding.cc` |
-//! | `wasi` | `new WASI()` | `node_wasi.cc` |
-//! | `inspector` | opening the inspector, `console` previews | `lib/internal/util/inspector.js` |
-//! | `net` | TCP/UDP/Pipe servers and sockets | `tcp_wrap.cc`, `udp_wrap.cc`, `pipe_wrap.cc` |
+//! | `addon` | `process.dlopen`, `process._linkedBinding` | `node_binding.cc` |
+//! | `inspector` | `inspector.open()` | `inspector_agent.cc::StartIoThread` |
+//! | `net` | TCP/UDP/Pipe servers and sockets, DNS lookups | `tcp_wrap.cc`, `udp_wrap.cc`, `pipe_wrap.cc`, `cares_wrap.cc` |
 //! | `env` | every environment variable except the ones Node keeps | env scrub at startup |
-//! | `ffi` | `node:ffi` calls | `lib/ffi.js` |
-//! | `openssl.store` | OpenSSL STORE loaders | crypto layer |
+//!
+//! Three scopes have a model and no call site, because the surface they would
+//! gate does not exist in this build. They are not enforced and no check can
+//! fire:
+//!
+//! | Scope | Why it cannot be enforced yet |
+//! | --- | --- |
+//! | `wasi` | no `internalBinding('wasi')`; `new WASI()` fails on that first |
+//! | `ffi` | no `node:ffi`; `require('node:ffi')` fails on the binding first |
+//! | `openssl.store` | the crypto layer has no OpenSSL STORE loader path |
+//!
+//! `PermissionScope` still carries all of them, because `has('wasi')` and
+//! `--allow-wasi` have to answer the way Node's do even when nothing acts on the
+//! answer.
 //!
 //! # Cost
 //!

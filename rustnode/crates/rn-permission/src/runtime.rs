@@ -258,6 +258,17 @@ pub fn deny_worker() -> Option<AccessDeniedError> {
     evaluate(PermissionModel::check_worker)
 }
 
+/// [`deny_worker`] for a call site with a V8 scope, publishing the denial to
+/// `node:permission-model:worker` first.
+pub fn check_worker<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<AccessDeniedError> {
+    let denied = observe(PermissionModel::check_worker)?;
+    publish(scope, &denied);
+    if is_audit() {
+        return None;
+    }
+    Some(denied)
+}
+
 /// Checks loading the named native addon.
 pub fn deny_addon(resource: &str) -> Option<AccessDeniedError> {
     evaluate(|model| model.check_addon_named(resource))
@@ -359,6 +370,23 @@ pub fn enforces_addon_without_grant() -> bool {
 /// Checks enabling the inspector.
 pub fn deny_inspector() -> Option<AccessDeniedError> {
     evaluate(PermissionModel::check_inspector)
+}
+
+/// [`deny_inspector`] for a call site with a V8 scope, publishing the denial to
+/// `node:permission-model:inspector` first.
+///
+/// `resource` is Node's name for the internal entry point — `"StartIoThread"`,
+/// `"WaitForConnect"` and so on — rather than anything the caller supplied.
+pub fn check_inspector<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    resource: &str,
+) -> Option<AccessDeniedError> {
+    let denied = observe(|model| model.check_inspector_named(resource))?;
+    publish(scope, &denied);
+    if is_audit() {
+        return None;
+    }
+    Some(denied)
 }
 
 /// Checks a `--allow-env` grant for `name`.
