@@ -1,0 +1,34 @@
+[package]
+name = "rn-bind-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('tls_wrap') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-uv.workspace = true
+rn-v8-sys.workspace = true
+# `WriteWrap::Done` / `ShutdownWrap::Done`, which is how R3's "complete the
+# pending write" is actually delivered: the request objects are this crate's, so
+# completing one means calling into it rather than reimplementing `oncomplete`.
+rn-bind-stream-wrap = { path = "../rn-bind-stream-wrap" }
+# `SecureContext` owns the `SSL_CTX` this crate's `SSL` is created from.
+# `TLSWrap` holds a reference to the JavaScript object and reads the `SSL_CTX`
+# out of it; it never builds a second one. Two `SSL_CTX` lifetimes that disagree
+# about who frees what is the same class of bug as two finalizer registries.
+rn-bind-secure-context = { path = "../rn-bind-secure-context" }
+# The same OpenSSL `rn-bind-crypto` builds and links. `openssl-src` is a single
+# artifact in the dependency graph, so this is a new edge onto one library, not a
+# second linkage: cargo resolves `openssl-sys` once and every crate calls into the
+# symbols of that one build.
+openssl = { version = "=0.10.82", features = ["vendored"] }
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
+foreign-types = "0.3"
+libc = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

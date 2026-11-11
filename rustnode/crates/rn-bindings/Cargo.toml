@@ -55,6 +55,7 @@ rn-bind-symbols = { path = "../rn-bind-symbols" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 rn-bind-tcp-wrap = { path = "../rn-bind-tcp-wrap" }
 rn-bind-timers = { path = "../rn-bind-timers" }
+rn-bind-tls = { path = "../rn-bind-tls" }
 rn-bind-trace-events = { path = "../rn-bind-trace-events" }
 rn-bind-tty-wrap = { path = "../rn-bind-tty-wrap" }
 rn-bind-udp-wrap = { path = "../rn-bind-udp-wrap" }
