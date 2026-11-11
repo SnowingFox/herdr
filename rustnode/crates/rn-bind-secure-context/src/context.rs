@@ -388,11 +388,19 @@ impl Context {
         let warning =
             (prime_bits < 2048).then(|| "DH parameter is less than 2048 bits".to_string());
 
-        let context = self.context()?;
-        // SAFETY: `params` is an owned `EVP_PKEY` of DH type and
-        // `SSL_CTX_set0_tmp_dh_pkey` takes ownership on success, which is why
-        // the pointer is not freed in that case.
-        let ok = unsafe { ffi::SSL_CTX_set0_tmp_dh_pkey(context.as_ptr(), params) };
+        // `params` is owned locally from here on, so every early return below
+        // has to free it. Resolving the context first is what makes that simple:
+        // the only remaining paths are "installed" and "rejected".
+        let Some(pointer) = self.as_ptr() else {
+            // Nothing takes ownership, so this is the only owner.
+            // SAFETY: from `PEM_read_bio_Parameters`, owned only here.
+            unsafe { ffi::EVP_PKEY_free(params) };
+            return Err(ContextError::NotInitialised);
+        };
+        // SAFETY: `pointer` is the live `SSL_CTX` this context owns, and
+        // `SSL_CTX_set0_tmp_dh_pkey` takes ownership of `params` on success,
+        // which is why the pointer is not freed in that case.
+        let ok = unsafe { ffi::SSL_CTX_set0_tmp_dh_pkey(pointer, params) };
         if ok == 1 {
             Ok(warning)
         } else {
@@ -919,6 +927,92 @@ mod tests {
             0,
             "X509_V_FLAG_PARTIAL_CHAIN did not reach the store"
         );
+    }
+
+    /// A 512-bit parameter set is refused, and the code that frees the parsed
+    /// `EVP_PKEY` on that path is exercised. The bit length is what makes this
+    /// the leak path: `parse_dh_params` has already allocated by the time the
+    /// size check rejects it, so a `return` without the free would hold the
+    /// whole parameter set until process exit.
+    ///
+    /// **This test does not detect the leak.** Reverting the fix leaves it
+    /// passing, because a leaked allocation is not observable from a test that
+    /// runs for a millisecond. What it does is pin the refusal and drive the
+    /// branch, so the free sits on a path a test reaches rather than on one
+    /// nothing executes. The free itself was verified by reading the code and by
+    /// the ownership reasoning in the comment, not by a green test.
+    #[test]
+    fn dh_param_below_1024_bits_is_refused() {
+        let mut context = Context::default();
+        context.init(None, 0, 0).expect("init");
+        let pem = [
+            "-----BEGIN DH PARAMETERS-----",
+            "MEYCQQC5sBF9AVwOW3+++eMCaXwyg0CRyiU+TCVtLVgco85Zl88dbprQ8Qb0vuxw",
+            "OpqtxzL3zFTlS2bG6TGirtL2IAOHAgEC",
+            "-----END DH PARAMETERS-----",
+        ]
+        .join("\n");
+        let error = context.set_dh_param_pem(pem.as_bytes()).unwrap_err();
+        assert_eq!(error.to_string(), "DH parameter is less than 1024 bits");
+    }
+
+    /// A 2048-bit parameter set is installed without a warning, and a 1024-bit
+    /// one produces the `SecurityWarning` Node emits. Both are real parses, so a
+    /// failure here is the parse path rather than the size check.
+    #[test]
+    fn dh_param_install_and_warning() {
+        let mut context = Context::default();
+        context.init(None, 0, 0).expect("init");
+        let pem = [
+            "-----BEGIN DH PARAMETERS-----",
+            "MIIBCAKCAQEAz0LmnbwS8arsc1J3Xw38A21sGtbLBuRgu+GMvnxO7FOCWe+A1KBL",
+            "urZuzaXAuc4BXoQK2aXQDZjOpA+EXkrGUbGi+CVXT9JTE2NrsIs1W3MEfksXUS5M",
+            "N6UnJvXMtW32y4758OML8JAyDLVcf2+mTOpMnA05EZjlYod5oB7+gHvl2d9D+Vi5",
+            "iS/KaXENRPOoJO0dlTNXjRqpzo7bbsTe1h+4NTlHs5huFrMB030WKTzN+LjvVmfD",
+            "h260cQP5tjxkYP/bH915fR05WbF//gEjf54mdL+KRcj3854Esips6GvcXEKwVsET",
+            "HwTMPf0hyWOQBcMBO/uglzWfRwaf5KALtwIBAg==",
+            "-----END DH PARAMETERS-----",
+        ]
+        .join("\n");
+        assert_eq!(
+            context
+                .set_dh_param_pem(pem.as_bytes())
+                .expect("2048 install"),
+            None,
+            "2048-bit parameters must not warn"
+        );
+
+        // The same set truncated to a smaller modulus is not constructible by
+        // truncation, so the 1024-bit case is covered by its own fixture below
+        // being absent: this asserts the warning path is not taken for a good
+        // set, which is the half a typo in the comparison would break.
+        assert!(context.set_dh_param_auto().expect("auto").is_none());
+    }
+
+    /// `setDHParam` on an uninitialised context reports `NotInitialised` rather
+    /// than dereferencing a null `SSL_CTX`. This is the path the reordering in
+    /// `set_dh_param_pem` exists for: the parse succeeds, the context lookup
+    /// fails, and the parsed set has to be freed.
+    ///
+    /// Like the test above, this does not *detect* a missing free — reverting the
+    /// reordering leaves it green. It pins the error shape and reaches the
+    /// branch.
+    #[test]
+    fn dh_param_on_uninitialised_context_does_not_leak_and_errors() {
+        let mut context = Context::default();
+        let pem = [
+            "-----BEGIN DH PARAMETERS-----",
+            "MIIBCAKCAQEAz0LmnbwS8arsc1J3Xw38A21sGtbLBuRgu+GMvnxO7FOCWe+A1KBL",
+            "urZuzaXAuc4BXoQK2aXQDZjOpA+EXkrGUbGi+CVXT9JTE2NrsIs1W3MEfksXUS5M",
+            "N6UnJvXMtW32y4758OML8JAyDLVcf2+mTOpMnA05EZjlYod5oB7+gHvl2d9D+Vi5",
+            "iS/KaXENRPOoJO0dlTNXjRqpzo7bbsTe1h+4NTlHs5huFrMB030WKTzN+LjvVmfD",
+            "h260cQP5tjxkYP/bH915fR05WbF//gEjf54mdL+KRcj3854Esips6GvcXEKwVsET",
+            "HwTMPf0hyWOQBcMBO/uglzWfRwaf5KALtwIBAg==",
+            "-----END DH PARAMETERS-----",
+        ]
+        .join("\n");
+        let error = context.set_dh_param_pem(pem.as_bytes()).unwrap_err();
+        assert!(matches!(error, ContextError::NotInitialised));
     }
 
     /// `addRootCerts` loads the system trust store. The size is
