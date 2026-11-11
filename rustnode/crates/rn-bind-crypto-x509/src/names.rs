@@ -63,6 +63,14 @@ pub enum AltNameOption {
     Utf8,
 }
 
+/// What `PrintGeneralName` writes for an `othername` it cannot format.
+///
+/// A known extension OID with an unexpected value type, or one of the five
+/// supported OIDs with the wrong string type, prints this marker inside the
+/// `othername:` label rather than failing. `test-x509-escaping.js` asserts the
+/// marker for the BoringSSL branch and for a `SRVName` that is not an IA5String.
+pub const UNSUPPORTED_OTHERNAME: &str = "othername:<unsupported>";
+
 /// `IsSafeAltName`: whether a value can be written without quoting.
 pub fn is_safe_alt_name(value: &[u8], option: AltNameOption) -> bool {
     for &byte in value {
@@ -85,16 +93,28 @@ pub fn is_safe_alt_name(value: &[u8], option: AltNameOption) -> bool {
 
 /// `PrintAltName`: append a value, quoted and escaped when it is not safe.
 ///
-/// The `DNS:`/`URI:`-style prefix is *not* a parameter. In `PrintGeneralName`
-/// the prefix is written to the buffer before this is called, so a quoted value
-/// comes out as `URI:"http://…/a\u002cb"` with the quotes around the value
-/// alone. Folding the prefix in here would produce `"URI:http://…"`, which is a
-/// different string and the assertion `test-x509-escaping.js` makes about
-/// `infoAccess`.
-pub fn push_alt_name(out: &mut String, value: &[u8], option: AltNameOption) {
+/// `prefix` is the `safe_prefix` parameter, and whether a caller passes it is
+/// the difference between two outputs `test-x509-escaping.js` pins:
+///
+/// * `DNS:`, `URI:`, `email:` and `IP Address:` are written to the buffer
+///   *before* this is called, so a quoted value reads `URI:"http://…/a\u002cb"`
+///   with the quotes around the value alone.
+/// * An `othername` passes its label *through* here, so a quoted value reads
+///   `othername:"XmppAddr:good.example.com\u0000abc123"` with the label inside
+///   the quotes. That is `PrintGeneralName`'s `GEN_OTHERNAME` branch, which is
+///   the only caller that hands `PrintAltName` a non-null prefix.
+pub fn push_alt_name(
+    out: &mut String,
+    value: &[u8],
+    option: AltNameOption,
+    prefix: Option<&str>,
+) {
     if is_safe_alt_name(value, option) {
         // Safe names are appended unchanged, for backward compatibility.
-        //
+        if let Some(prefix) = prefix {
+            out.push_str(prefix);
+            out.push(':');
+        }
         // `String::from_utf8_lossy` rather than a strict decode: a safe name is
         // ASCII by construction in the `None` case, and in the `Utf8` case the
         // bytes came from OpenSSL's own UTF-8 printer.
@@ -103,6 +123,10 @@ pub fn push_alt_name(out: &mut String, value: &[u8], option: AltNameOption) {
     }
 
     out.push('"');
+    if let Some(prefix) = prefix {
+        out.push_str(prefix);
+        out.push(':');
+    }
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut index = 0;
     while index < value.len() {
@@ -275,7 +299,7 @@ mod tests {
     fn the_escaping_rules_match_the_node_test_table() {
         for (input, expected) in CASES {
             let mut out = String::new();
-            push_alt_name(&mut out, input.as_bytes(), AltNameOption::None);
+            push_alt_name(&mut out, input.as_bytes(), AltNameOption::None, None);
             assert_eq!(&out, expected, "escaping {input:?}");
         }
     }
@@ -289,6 +313,7 @@ mod tests {
             &mut out,
             b"http://example.com/?a=b&c=d",
             AltNameOption::None,
+            None,
         );
         assert_eq!(out, "URI:http://example.com/?a=b&c=d");
     }
@@ -298,7 +323,7 @@ mod tests {
         // The prefix is written before the value is quoted, so the quotes wrap
         // the value and not the `URI:` label — `URI:"http://…/a\u002cb"`.
         let mut out = String::from("URI:");
-        push_alt_name(&mut out, b"http://example.com/a,b", AltNameOption::None);
+        push_alt_name(&mut out, b"http://example.com/a,b", AltNameOption::None, None);
         assert_eq!(out, "URI:\"http://example.com/a\\u002cb\"");
     }
 
@@ -307,7 +332,7 @@ mod tests {
         // `%2C` is three safe bytes, so it must not be quoted; the test asserts
         // exactly this because it looks like a comma.
         let mut out = String::from("URI:");
-        push_alt_name(&mut out, b"http://example.com/a%2Cb", AltNameOption::None);
+        push_alt_name(&mut out, b"http://example.com/a%2Cb", AltNameOption::None, None);
         assert_eq!(out, "URI:http://example.com/a%2Cb");
     }
 
@@ -316,7 +341,7 @@ mod tests {
         // `DNS:"ex\u00e4mple.com"`: in a DNS name `0xe4` is Latin-1, so it is
         // escaped rather than read as a UTF-8 lead byte.
         let mut out = String::from("DNS:");
-        push_alt_name(&mut out, b"ex\xe4mple.com", AltNameOption::None);
+        push_alt_name(&mut out, b"ex\xe4mple.com", AltNameOption::None, None);
         assert_eq!(out, "DNS:\"ex\\u00e4mple.com\"");
     }
 
@@ -326,8 +351,32 @@ mod tests {
         // survive as UTF-8, not be escaped byte by byte. It still needs quoting
         // because of the comma.
         let mut out = String::from("DirName:");
-        push_alt_name(&mut out, "München, evil".as_bytes(), AltNameOption::Utf8);
+        push_alt_name(&mut out, "München, evil".as_bytes(), AltNameOption::Utf8, None);
         assert_eq!(out, "DirName:\"München\\u002c evil\"");
+    }
+
+    #[test]
+    fn an_othername_label_goes_inside_the_quotes() {
+        // `PrintGeneralName`'s `GEN_OTHERNAME` branch is the only caller that
+        // passes a prefix through `PrintAltName`, so the label ends up inside the
+        // quotes. The test asserts exactly this string for
+        // `OCSP - othername:"XmppAddr:good.example.com\u0000abc123"`.
+        let mut out = String::from("othername:");
+        push_alt_name(
+            &mut out,
+            b"good.example.com\0abc123",
+            AltNameOption::Utf8,
+            Some("XmppAddr"),
+        );
+        assert_eq!(out, "othername:\"XmppAddr:good.example.com\\u0000abc123\"");
+    }
+
+    #[test]
+    fn an_unsupported_othername_is_a_marker_not_an_error() {
+        // `PrintGeneralName` writes `othername:<unsupported>` when the OID is not
+        // one of the five known types or the value type does not match. That is a
+        // successful print, so it must not be confused with a formatting failure.
+        assert_eq!(UNSUPPORTED_OTHERNAME, "othername:<unsupported>");
     }
 
     #[test]
