@@ -556,6 +556,7 @@ fn new(
     // reads `handle.getAsyncId()` would otherwise reach an uninstalled handle.
     crate::handle::with_handle(object, |handle| {
         rn_bind_async_wrap::async_reset(scope, &mut handle.state.async_wrap, object, object, None);
+        handle.state.context_frame = rn_bind_async_wrap::current_context_frame(scope);
     });
 
     // The defaults `src/tcp_wrap.cc` pre-creates. Setting them here as well as on

@@ -73,7 +73,8 @@ pub unsafe extern "C" fn after_close(handle_pointer: *mut uv::uv_handle_t) {
         else {
             return;
         };
-        stream_base::call_onclose(scope, object);
+        // SAFETY: `state` is the live state of this handle's wrapper.
+        stream_base::call_onclose(scope, state.async_wrap.into(), state.context_frame.clone(), object);
     });
 }
 
@@ -230,6 +231,12 @@ pub fn async_reset(
             object,
             execution_async_id,
         );
+        // `set_context_frame(async_context_frame::current())`
+        // (`src/async_wrap.cc:635`). A socket reused from an `http.Agent` pool is
+        // reset per request, so this captures the *asking request's* frame; that
+        // is what makes `AsyncLocalStorage` reach the response callback of the
+        // second request on a reused socket.
+        handle.state.context_frame = rn_bind_async_wrap::current_context_frame(scope);
     });
 }
 

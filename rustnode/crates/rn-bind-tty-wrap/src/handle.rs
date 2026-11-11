@@ -326,6 +326,7 @@ fn new(
                     object,
                     None,
                 );
+                handle.state.context_frame = rn_bind_async_wrap::current_context_frame(scope);
             });
         }
         None => {

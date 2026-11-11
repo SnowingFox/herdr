@@ -179,7 +179,12 @@ pub unsafe extern "C" fn after_close(handle_pointer: *mut uv::uv_handle_t) {
         let Some(object) = owner.as_ref().map(|object| v8::Local::new(scope, object)) else {
             return;
         };
-        stream_base::call_onclose(scope, object);
+        stream_base::call_onclose(
+            scope,
+            state.async_wrap.into(),
+            state.context_frame.clone(),
+            object,
+        );
     });
 
     // `HandleWrap::OnClose` drops the wrap's reference once `onclose` has run, so

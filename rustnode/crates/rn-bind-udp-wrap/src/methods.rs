@@ -76,7 +76,16 @@ pub unsafe extern "C" fn after_close(handle_pointer: *mut uv::uv_handle_t) {
         else {
             return;
         };
-        rn_uv::stream_base::call_onclose(scope, object);
+        // SAFETY: `handle` is the live state of this wrapper.
+        rn_uv::stream_base::call_onclose(
+            scope,
+            rn_core::callback_scope::AsyncContext {
+                async_id: handle.async_id,
+                trigger_async_id: -1.0,
+            },
+            None,
+            object,
+        );
     });
 
     // `HandleWrap::OnClose` drops the wrap's reference to the object once

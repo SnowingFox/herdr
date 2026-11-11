@@ -74,7 +74,8 @@ pub unsafe extern "C" fn after_close(handle_pointer: *mut uv::uv_handle_t) {
         else {
             return;
         };
-        stream_base::call_onclose(scope, object);
+        // SAFETY: `state` is the live state of this handle's wrapper.
+        stream_base::call_onclose(scope, state.async_wrap.into(), state.context_frame.clone(), object);
     });
 }
 

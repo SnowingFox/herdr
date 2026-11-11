@@ -509,8 +509,44 @@ pub unsafe fn view_buffer(value: v8::Local<v8::Value>) -> Option<uv::uv_buf_t> {
 
 /// Calls `handle.onclose()`, the callback `HandleWrap::OnClose` invokes.
 ///
-/// Shared because both bindings' close callbacks need it.
-pub fn call_onclose(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<v8::Object>) {
+/// Shared because both bindings' close callbacks need it. `HandleWrap::OnClose`
+/// (`src/handle_wrap.cc:155`) ends in `wrap->MakeCallback(onclose, 0, nullptr)`,
+/// so this runs inside the handle's `InternalCallbackScope` like a read does:
+/// `executionAsyncId()` inside `'close'` is the socket's id, and
+/// `AsyncLocalStorage` sees the frame the handle captured.
+pub fn call_onclose(
+    scope: &mut v8::PinScope<'_, '_>,
+    context: rn_core::callback_scope::AsyncContext,
+    frame: Option<v8::Global<v8::Value>>,
+    object: v8::Local<v8::Object>,
+) {
+    let Some(key) = v8::String::new(scope, "onclose") else {
+        return;
+    };
+    let Some(value) = object.get(scope, key.into()) else {
+        return;
+    };
+    if let Ok(function) = v8::Local::<v8::Function>::try_from(value) {
+        let args = rn_core::callback_scope::ScopeArgs {
+            context,
+            resource: Some(v8::Global::new(scope.as_ref(), object)),
+            frame,
+        };
+        let _ = rn_core::callback_scope::with_scope(scope, args, |scope| {
+            let receiver: v8::Local<v8::Value> = object.into();
+            let _ = function.call(&*scope, receiver, &[]);
+        });
+    }
+}
+
+/// Calls `handle.onclose()` for a wrapper that carries no async state.
+///
+/// `ProcessWrap` is an `AsyncWrap` in Node, but this runtime's process handle
+/// has no async id or frame, so there is nothing to push and nothing to install.
+/// Calling the callback unscoped is what this did before [`call_onclose`] grew a
+/// scope, and it is honest: giving it one would first require giving the handle
+/// an async id.
+pub fn call_onclose_unscoped(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<v8::Object>) {
     let Some(key) = v8::String::new(scope, "onclose") else {
         return;
     };

@@ -177,9 +177,16 @@ fn async_local_storage_survives_a_socket_read_callback() {
 
 #[test]
 fn async_local_storage_survives_two_requests_on_one_keep_alive_socket() {
-    // The pooled-socket case the failing tests use: the second read arrives
-    // from libuv after the first response has completed, so it is a separate
-    // `onread` and a separate frame exchange.
+    // The pooled-socket case the failing tests use. The socket is created inside
+    // `cls.run('first')`, so the handle captures that frame; the second read
+    // arrives after the first response completed and must still see it, because
+    // the frame belongs to the socket rather than to whichever callback ran last.
+    //
+    // This is why the expectation is `first` twice rather than `first`/`second`:
+    // creating the connection inside one `run()` and then writing from another
+    // does not change the frame the *handle* captured. Asserting otherwise would
+    // encode a behaviour Node does not have — the first version of this test did,
+    // and `node` itself caught it.
     same_output_as_node(
         "const net = require('net');\n\
          const { AsyncLocalStorage } = require('async_hooks');\n\
@@ -193,21 +200,134 @@ fn async_local_storage_survives_two_requests_on_one_keep_alive_socket() {
            });\n\
          });\n\
          server.listen(0, () => {\n\
-           const client = net.connect(server.address().port);\n\
-           client.on('connect', () => {\n\
-             cls.run('first', () => client.write('one'));\n\
+           cls.run('first', () => {\n\
+             const client = net.connect(server.address().port);\n\
+             client.on('connect', () => client.write('one'));\n\
+             client.on('data', (chunk) => {\n\
+               console.log('read ' + chunk + ' store ' + cls.getStore());\n\
+               if (String(chunk) === 'response-1') {\n\
+                 client.write('two');\n\
+               } else {\n\
+                 client.end();\n\
+               }\n\
+             });\n\
+             client.on('close', () => server.close());\n\
            });\n\
-           client.on('data', (chunk) => {\n\
-             console.log('read ' + chunk + ' store ' + cls.getStore());\n\
-             if (String(chunk) === 'response-1') {\n\
-               cls.run('second', () => client.write('two'));\n\
-             } else {\n\
-               client.end();\n\
-             }\n\
-           });\n\
-           client.on('close', () => server.close());\n\
          });",
-        "read response-1 store first\nread response-2 store second",
+        "read response-1 store first\nread response-2 store first",
+    );
+}
+
+#[test]
+fn a_store_written_inside_a_callback_does_not_leak_to_the_next_one() {
+    // The other direction of the frame exchange. `AsyncContextFrame.exchange`
+    // installs the resource's frame on entry; the pair to it is the restore on
+    // exit, and without the restore everything that runs afterwards inherits the
+    // last callback's frame.
+    //
+    // The observable consequence is that two interleaved requests each keep their
+    // own store. A one-directional fix passes the test above and fails this one.
+    same_output_as_node(
+        "const net = require('net');\n\
+         const { AsyncLocalStorage } = require('async_hooks');\n\
+         const cls = new AsyncLocalStorage();\n\
+         const server = net.createServer((socket) => socket.end('bye'));\n\
+         server.listen(0, () => {\n\
+           cls.run('outer', () => {\n\
+             const client = net.connect(server.address().port);\n\
+             client.on('connect', () => client.write('hi'));\n\
+             client.on('data', () => {\n\
+               cls.enterWith('mutated-in-callback');\n\
+               client.end();\n\
+             });\n\
+             client.on('close', () => server.close());\n\
+           });\n\
+           setTimeout(() => {\n\
+             console.log('unrelated timer store ' + cls.getStore());\n\
+           }, 40);\n\
+         });",
+        "unrelated timer store undefined",
+    );
+}
+
+#[test]
+fn the_frame_is_in_place_before_the_before_hook_fires() {
+    // `InternalCallbackScope`'s constructor exchanges the frame at
+    // `src/api/callback.cc:117`, pushes the context at `:124` and emits `before`
+    // at `:127` — in that order. So a `before` hook is the one observer that runs
+    // inside the scope before any user code, and it must already see the
+    // callback's frame.
+    //
+    // An implementation that pushed the context and emitted `before` first and
+    // only then installed the frame would report `before:undefined` followed by
+    // `after:outer` for the same callback, which is what this pins against.
+    //
+    // The trailing unmatched `before` is Node's own: `onclose` runs inside the
+    // scope, and the scope's `after` is skipped when the handle is already
+    // closing. Both runtimes agree on it, which is why the expectation is this
+    // shape rather than a tidy sequence of balanced pairs.
+    same_output_as_node(
+        "const net = require('net');\n\
+         const async_hooks = require('async_hooks');\n\
+         const { AsyncLocalStorage } = require('async_hooks');\n\
+         const cls = new AsyncLocalStorage();\n\
+         const socketId = { value: -1 };\n\
+         const seen = [];\n\
+         async_hooks.createHook({\n\
+           before: (id) => {\n\
+             if (id === socketId.value) seen.push('before:' + String(cls.getStore()));\n\
+           },\n\
+           after: (id) => {\n\
+             if (id === socketId.value) seen.push('after:' + String(cls.getStore()));\n\
+           },\n\
+         }).enable();\n\
+         const server = net.createServer((sock) => sock.end('bye'));\n\
+         server.listen(0, () => {\n\
+           cls.run('outer', () => {\n\
+             const client = net.connect(server.address().port);\n\
+             socketId.value = client._handle.getAsyncId();\n\
+             client.on('connect', () => client.write('hi'));\n\
+             client.on('data', () => client.end());\n\
+             client.on('close', () => {\n\
+               console.log(seen.join(','));\n\
+               server.close();\n\
+             });\n\
+           });\n\
+         });",
+        "before:outer,after:outer,before:outer,after:outer,before:outer",
+    );
+}
+
+#[test]
+fn a_throwing_callback_reports_before_its_microtasks_run() {
+    // The ordering, and it is not the intuitive one.
+    // `InternalMakeCallback` sets `MarkAsFailed()` when the callback throws, so
+    // `InternalCallbackScope::Close` returns at `if (failed_) return;` and its
+    // `PerformCheckpoint` never runs. The uncaught trigger therefore precedes a
+    // microtask the throwing callback queued.
+    //
+    // `crates/rn-napi/tests/addon_e2e.rs` pins the same `callback,listener,microtask`
+    // order for thread-safe functions. A fix that drained microtasks around the
+    // callback would produce `callback,microtask,listener` and pass any casual
+    // smoke test.
+    same_output_as_node(
+        "const net = require('net');\n\
+         const order = [];\n\
+         process.on('uncaughtException', () => order.push('listener'));\n\
+         const server = net.createServer((socket) => { socket.end('bye'); });\n\
+         server.listen(0, () => {\n\
+           const client = net.connect(server.address().port);\n\
+           client.on('data', () => {\n\
+             order.push('callback');\n\
+             queueMicrotask(() => order.push('microtask'));\n\
+             throw new Error('boom');\n\
+           });\n\
+           setTimeout(() => {\n\
+             console.log(order.join(','));\n\
+             server.close();\n\
+           }, 60);\n\
+         });",
+        "callback,listener,microtask",
     );
 }
 
