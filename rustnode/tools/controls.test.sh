@@ -378,6 +378,52 @@ documented_codes() {
   ' "$1"
 }
 
+# Prints "<line>\t<path>" for every repository path a control names that does not
+# exist, relative to the repository root.
+#
+# Why this exists: every other assertion in this file reads the control as shell.
+# A control can satisfy all of them while naming a file that was moved or deleted --
+# that was the #26 defect, where `negative-control-exit.sh` hard-coded
+# `crates/rn-cli/src/event_loop.rs`. The `cp` failed, nothing was broken, the build
+# succeeded, and the arm reported PASS on a stale-binary check that meant nothing.
+# No execution-free assertion about exit codes or quoting could see it, because the
+# string was perfectly well-formed; only the filesystem knows it is wrong.
+#
+# Comments are skipped. A comment explaining what a file *used* to be called is
+# documentation, not a dependency, and flagging it would force authors to stop
+# recording history -- the exact reasoning that left this class unguarded.
+#
+# Paths containing a shell expansion (`$file`, `${dir}`) are skipped: they are
+# constructed at run time and cannot be resolved statically. `negative-control-zstd.sh`
+# builds `crates/rn-bind-zlib/$file` in a loop, and demanding that literal exist
+# would be a false positive.
+#
+# A line carrying a negated file test (`! -f`, `! -e`, `! test`) is skipped too. A
+# control is entitled to assert that something is *absent*, and the path in that
+# assertion is required not to exist. No control here does it with a literal path,
+# but the rule is one token long and the false positive would be confusing enough to
+# be worth preventing rather than discovering.
+#
+# Only `crates/` is covered. That is where this defect occurred, it is the tree every
+# control reaches into to break something deliberately, and the pattern is exact
+# enough to have no exemptions. Widening it to any repository path would need to
+# distinguish a path from prose, which is not decidable from a line of shell.
+nonexistent_crate_paths() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    /![[:space:]]*(-[fde]|test)([[:space:]]|$)/ { next }
+    {
+      line = $0
+      while (match(line, /crates\/[A-Za-z0-9_.\/-]+\.(rs|toml)/)) {
+        p = substr(line, RSTART, RLENGTH)
+        line = substr(line, RSTART + RLENGTH)
+        if (p ~ /\$/) continue
+        if (system("test -e \"" p "\"") != 0) print FNR "\t" p
+      }
+    }
+  ' "$1"
+}
+
 # Prints "<line>\t<code>\t<polarity>" for every literal `exit`, where polarity is
 # what the message on that path says the exit means.
 #
@@ -570,6 +616,22 @@ assert_control() {
     else
       ok "$name documents only codes it can produce: $documented"
     fi
+  fi
+
+  # A path the control names but the repository does not have. This is the only
+  # assertion here that consults the filesystem, because a stale path is invisible
+  # to every reading of the script as text: the string is well-formed, the quoting
+  # is right, and the exit codes are consistent. See the header on
+  # `nonexistent_crate_paths` for the defect this catches.
+  local d_line d_path dangling=""
+  while IFS=$'\t' read -r d_line d_path; do
+    [ -n "${d_line:-}" ] || continue
+    dangling="$dangling $d_path (line $d_line)"
+  done < <(nonexistent_crate_paths "$path")
+  if [ -n "$dangling" ]; then
+    no "$name names a path that does not exist:$dangling"
+  else
+    ok "$name names only paths that exist"
   fi
 
   [ "$afail" -eq 0 ]
@@ -780,6 +842,48 @@ echo "PASS: the control behaved"
 exit 0
 SH
 
+  # The #26 shape, reduced: a control that names a source file which has been
+  # moved. Everything else about this fixture is correct -- it has both exit codes,
+  # no swallowed exit, and consistent messages -- so the path assertion is the only
+  # one that can reject it. That isolation is the point: a fixture that failed three
+  # assertions at once would not prove this check works, which is the same
+  # cannot-fail shape the check exists to catch.
+  cat >"$dir/stale-path-control.sh" <<'SH'
+#!/usr/bin/env bash
+# Exit codes: 0 pass, 1 fail
+set -euo pipefail
+target="crates/rn-cli/src/event_loop.rs"
+if [ ! -f "$target" ]; then
+  echo "FAIL: the source to break is missing"
+  exit 1
+fi
+echo "PASS: the guard broke the build"
+exit 0
+SH
+
+  # The pass case for the same assertion: a path that does exist, one constructed
+  # at run time, one named only in a comment, and one asserted to be *absent*. None
+  # may be flagged, or the assertion would force controls to drop their history,
+  # forbid loops that build a path from a variable, and forbid asserting that a
+  # legacy file is gone.
+  cat >"$dir/live-path-control.sh" <<'SH'
+#!/usr/bin/env bash
+# Exit codes: 0 pass, 1 fail
+# This one used to break crates/rn-cli/src/event_loop.rs before it moved.
+set -euo pipefail
+target="crates/rn-cli/src/main.rs"
+[ -f "$target" ] || { echo "FAIL: no source file" >&2; exit 1; }
+for file in lib.rs; do
+  [ -f "crates/rn-realm/src/$file" ] || { echo "FAIL: no $file" >&2; exit 1; }
+done
+if [ ! -e crates/rn-cli/src/legacy_removed.rs ]; then
+  echo "PASS: the guard broke the build"
+  exit 0
+fi
+echo "FAIL: a file that should be gone is back" >&2
+exit 1
+SH
+
   chmod +x "$dir"/*.sh
   # A control that is not executable cannot be run at all.
   cp "$dir/ok-control.sh" "$dir/not-executable-control.sh"
@@ -787,9 +891,10 @@ SH
 
   local case expected
   for case in ok:pass or-guard:pass heredoc-in-substitution:pass \
+              live-path:pass \
               cmdsub:fail pipeline:fail subshell:fail print-only:fail \
               always-zero:fail doc-mismatch:fail failure-exits-zero:fail \
-              not-executable:fail; do
+              stale-path:fail not-executable:fail; do
     expected="${case#*:}"
     case="${case%%:*}"
     path="$dir/$case-control.sh"
@@ -818,6 +923,25 @@ SH
       fi
     fi
     record
+
+    # A rejected fixture only proves this check works if it was rejected by the
+    # assertion the fixture is about. `stale-path` is built to fail nothing but the
+    # path assertion, so requiring that exact line to be the only failure keeps the
+    # self-test from passing because some unrelated assertion happened to fire --
+    # which is a weaker claim than it looks and the same shape as the defect.
+    if [ "$case" = "stale-path" ]; then
+      local path_fails
+      path_fails="$(grep -c '^FAIL .*names a path that does not exist' "$dir/$case.log" || true)"
+      local all_fails
+      all_fails="$(grep -c '^FAIL ' "$dir/$case.log" || true)"
+      if [ "$path_fails" -eq 1 ] && [ "$all_fails" -eq 1 ]; then
+        ok "self-test: the stale path is the only reason that fixture fails"
+      else
+        no "self-test: the stale-path fixture failed for $all_fails reason(s), only one of which was the path"
+        sed 's/^/     /' "$dir/$case.log"
+      fi
+      record
+    fi
   done
 }
 

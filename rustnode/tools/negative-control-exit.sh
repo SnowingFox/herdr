@@ -31,14 +31,20 @@ esac
 
 binary="$root/target/debug/rustnode"
 work="$(mktemp -d)"
-# The file the `guard` arm breaks. It has moved once already (`rn-cli/src/event_loop.rs`
-# became `rn-realm/src/runtime.rs`), so it is resolved rather than hard-coded: a stale
-# path made the guard's `cp` fail, the build then succeeded because nothing had been
-# broken, and the arm still printed PASS — for the wrong reason. A guard that can pass
-# by failing to find its target is not a guard.
+# The file the `guard` arm breaks, located by what it defines rather than by name.
+#
+# It was hard-coded once (`crates/rn-cli/src/event_loop.rs`), and #26 moved that file
+# to `rn-realm/src/runtime.rs`. The `cp` then failed, nothing was broken, the build
+# succeeded, `build_arm` refused the stale binary on its mtime check, and the arm
+# printed PASS — for the wrong reason. A guard that can pass by failing to find its
+# target is not a guard.
+#
+# Searching for the definition means the path cannot go stale, and it leaves no
+# non-existent path literal for the static path assertion in `controls.test.sh` to
+# flag, which a hard-coded fallback list would have needed an exemption for.
 guarded=""
-for candidate in crates/rn-realm/src/runtime.rs crates/rn-cli/src/event_loop.rs; do
-  if [ -f "$candidate" ]; then
+for candidate in crates/*/src/*.rs; do
+  if grep -q '^pub fn emit_before_exit' "$candidate" 2>/dev/null; then
     guarded="$candidate"
     break
   fi
@@ -47,6 +53,15 @@ done
 restore() {
   if [ -n "$guarded" ] && [ -f "$work/guarded.rs" ]; then
     cp "$work/guarded.rs" "$guarded"
+  fi
+  # The binary is removed before every build, so a build that fails must put back
+  # what it found. Without this the `guard` arm leaves the tree with no
+  # `target/debug/rustnode` at all, and the next step to exec it -- `check.sh`
+  # runs `rustnode tools/per-context-audit.js` -- fails with `Permission denied`
+  # or `No such file`, which reads as a broken gate rather than a broken control.
+  if [ ! -x "$binary" ] && [ -f "$work/binary.bak" ]; then
+    cp "$work/binary.bak" "$binary"
+    chmod +x "$binary" 2>/dev/null || true
   fi
   rm -rf "$work"
 }
@@ -57,6 +72,11 @@ trap restore EXIT
 build_arm() {
   local label="$1"
   printf '\n== building %s ==\n' "$label"
+  # Keep a copy of whatever is there before deleting it, so `restore` can put a
+  # runnable binary back when the build fails.
+  if [ -x "$binary" ] && [ ! -f "$work/binary.bak" ]; then
+    cp "$binary" "$work/binary.bak" 2>/dev/null || true
+  fi
   rm -f "$binary"
   # A deleted binary is not enough to prove a relink: `cargo build` restores a
   # cached hardlink for an unchanged tree, mtime and all. Touching the CLI's
