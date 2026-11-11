@@ -62,6 +62,13 @@ pub const MEMBERS: &[&str] = &[
     // the namespace Node aggregates them onto.
     "DiffieHellman",
     "DiffieHellmanGroup",
+    // The cipher surface. Installed by `rn-bind-crypto-cipher`, which owns
+    // `src/crypto/crypto_cipher.cc` and `crypto_aes.cc`. `getCipherInfo` is in
+    // that translation unit too, not in the enumeration module, so it comes with
+    // them rather than with `getCiphers`.
+    "CipherBase",
+    "AESCipherJob",
+    "getCipherInfo",
     // Random.
     "randomFillSync",
     "secureBuffer",
@@ -142,11 +149,6 @@ pub const MEMBERS: &[&str] = &[
 /// that and is part of the gate.
 pub const DEFERRED: &[(&str, &str)] = &[
     (
-        "AESCipherJob",
-        "WebCrypto AES jobs run on the libuv threadpool, which this landing does not have; \
-         `crypto.subtle` is unblocked by the KeyObject work, not by this crate.",
-    ),
-    (
         "Argon2Job",
         "Argon2 needs OpenSSL's Argon2 provider, which `openssl-src` does not build; \
          `crypto.argon2` must report ERR_CRYPTO_ARGON2_NOT_SUPPORTED, as Node does when the \
@@ -160,11 +162,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "CheckPrimeJob",
         "Prime checking is a threadpool job built on BN primitives; the sync half is deferred \
          with the rest of the key surface.",
-    ),
-    (
-        "CipherBase",
-        "createCipheriv/createDecipheriv need a streaming EVP_CIPHER_CTX handle with an async \
-         completion path. The engine supports the primitives but the handle is deferred.",
     ),
     (
         "DHBitsJob",
@@ -256,12 +253,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     (
         "getCachedMacAliases",
         "`getMacs()` needs the MAC surface; the hash alias cache is installed.",
-    ),
-    (
-        "getCipherInfo",
-        "getCipherInfo returns key/iv/mode details for a cipher. It is deferred because \
-         `lib/internal/crypto/cipher.js` only reaches it through createCipheriv, which is \
-         itself deferred; the enumeration it would draw on is implemented.",
     ),
     (
         "getCryptoKeySlots",
@@ -681,6 +672,7 @@ impl BindingModule for Crypto {
         // they are members of *this* namespace object, which is how
         // `src/node_crypto.cc` aggregates them too.
         rn_bind_crypto_dh::install_classes(scope, object)?;
+        rn_bind_crypto_cipher::install_classes(scope, object)?;
         // The job handles, whose instances expose `run()`.
         install_job_class(scope, object, "HashJob", hash_job)?;
         install_job_class(scope, object, "HmacJob", hmac_job)?;

@@ -893,10 +893,22 @@ dependencies = [
  "libc",
  "openssl",
  "openssl-sys",
+ "rn-bind-crypto-cipher",
  "rn-bind-crypto-dh",
  "rn-core",
  "rn-v8-sys",
  "serde_json",
+]
+
+[[package]]
+name = "rn-bind-crypto-cipher"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "openssl",
+ "openssl-sys",
+ "rn-core",
+ "rn-v8-sys",
 ]
 
 [[package]]
