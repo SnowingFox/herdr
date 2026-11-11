@@ -357,7 +357,13 @@ fn main() {
 
     if let Some(message) = caught {
         eprintln!("{message}");
-        std::process::exit(1);
+        // The status is 1 and `exit` still has to run: Node reports an uncaught
+        // throw through `process._fatalException`, which overwrites
+        // `process.exitCode` with `kGenericUserError` and emits `exit`. Skipping
+        // the emit made `process.on('exit', ...)` fire for every kind of exit
+        // except the most common failure a script has.
+        let code = rn_realm::runtime::emit_exit_after_failure(scope);
+        std::process::exit(if code == 0 { 1 } else { code });
     }
 
     if print_result {
@@ -407,16 +413,29 @@ fn main() {
         hooks.drain(scope);
     }
 
-    // A script that reports failure through `process.exitCode` rather than a
-    // throw is how every one of Node's own tests fails, so the status has to
-    // travel out of the interpreter. An explicit `process.exit()` already
-    // terminated the process before reaching here.
-    if let Some(code) = bootstrap::read_exit_code(scope) {
-        std::process::exit(code);
-    }
+    // The loop has settled, so the process is at the point Node calls
+    // `EmitProcessExitInternal` from. `beforeExit` has already been offered the
+    // final idle by the loop itself, so what is left is `exit` and termination.
+    //
+    // Nothing ran this before, which is why a natural exit printed nothing from
+    // a `process.on('exit', ...)` handler while an explicit `process.exit()`
+    // did: that path reaches `per_thread.js`'s wrapper, and this one went
+    // straight to `std::process::exit`.
+    //
+    // A process that is already exiting — an explicit `process.exit()` that
+    // returned because user code replaced `reallyExit`, or a fatal path that
+    // emitted `exit` itself — is left alone and keeps the status it settled on.
+    let code = match runtime.as_ref() {
+        Some(_) => rn_realm::runtime::emit_exit(scope, 0),
+        None => bootstrap::read_exit_code(scope).unwrap_or(0),
+    };
+
+    // An uncaught exception asks for 1 unless the exit handlers replaced that
+    // with a code of their own, which is the order Node applies.
     if exit_requested || rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED) {
-        std::process::exit(1);
+        std::process::exit(if code == 0 { 1 } else { code });
     }
+    std::process::exit(code);
 }
 
 /// Compiles and runs `source` as a bare script and reports the result.
