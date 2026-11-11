@@ -500,3 +500,132 @@ fn a_cloneable_host_object_survives_post_message() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true 7");
 }
+
+#[test]
+fn domexception_is_nodes_per_context_class() {
+    // `DOMException` used to be a hand-built plain object in `rn-bind-messaging`:
+    // it constructed, carried `name`/`message`/`code` as data properties, and was
+    // not an `Error`. Every one of those is observable, and
+    // `test/parallel/test-global-domexception.js` asserts the whole set.
+    //
+    // The class is now Node's own `internal/per_context/domexception.js`, which is
+    // only reachable when the per-context scripts run with the symbol tables they
+    // expect — so this fails if `run_per_context` ever goes back to passing empty
+    // objects.
+    let out = rustnode(&[
+        "-e",
+        "const e = new DOMException('x', 'SyntaxError');\n\
+         console.log(e.toString());\n\
+         console.log(e instanceof Error, e instanceof DOMException);\n\
+         console.log(Object.prototype.toString.call(e));\n\
+         console.log(e.name, e.message, e.code);\n\
+         console.log(Object.getPrototypeOf(DOMException.prototype) === Error.prototype);\n\
+         console.log(DOMException.INDEX_SIZE_ERR, new DOMException('u', 'NotFoundError').code);",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "SyntaxError: x\ntrue true\n[object DOMException]\nSyntaxError x 12\ntrue\n1 8"
+    );
+}
+
+#[test]
+fn the_per_context_exports_are_the_globals() {
+    // `internalBinding('messaging')` must hand back the *same* `DOMException` the
+    // global is: `internal/util.js` and `internal/abort_controller.js` construct
+    // that one, so a second class would make `instanceof DOMException` false for
+    // every error the platform raises. Node stores the per-context `exports` on the
+    // context, and this is the check that the binding reads the same object.
+    //
+    // `QuotaExceededError` is the subclass in the same file and exercises the
+    // private `#quota`/`#requested` fields and the code table together.
+    let out = rustnode(&[
+        "--expose-internals",
+        "-e",
+        "const { internalBinding } = require('internal/test/binding');\n\
+         const messaging = internalBinding('messaging');\n\
+         const q = new QuotaExceededError('q', { quota: 4, requested: 8 });\n\
+         console.log(globalThis.DOMException === messaging.DOMException);\n\
+         console.log(globalThis.QuotaExceededError === messaging.QuotaExceededError);\n\
+         console.log(q instanceof DOMException, q instanceof Error, q.name, q.code);\n\
+         console.log(q.quota, q.requested, String(q));",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "true\ntrue\ntrue true QuotaExceededError 22\n4 8 QuotaExceededError: q"
+    );
+}
+
+#[test]
+fn a_domexception_clones_with_its_name_and_code() {
+    // `internal/per_context/domexception.js` defines two methods on one prototype:
+    // `[messaging_clone_symbol]` and `[messaging_deserialize_symbol]`. With the
+    // `perIsolateSymbols` table empty both land on the string key `"undefined"`
+    // and the second replaces the first, so the class constructs and silently
+    // clones nothing — `structuredClone` then returns the `DOMException`'s
+    // *properties* rather than a `DOMException`. That is the failure this pins.
+    //
+    // The transfer case is the other half: a `DOMException` is not transferable,
+    // and Node raises a `DataCloneError` `DOMException` for it.
+    let out = rustnode(&[
+        "-e",
+        "const e = new DOMException('t', 'DataCloneError');\n\
+         const c = structuredClone(e);\n\
+         console.log(c instanceof DOMException, c instanceof Error, c.name, c.code, String(c));\n\
+         console.log(c.stack === e.stack);\n\
+         try { structuredClone(e, { transfer: [e] }); }\n\
+         catch (error) { console.log(error.name, error.code, error instanceof DOMException); }",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "true true DataCloneError 25 DataCloneError: t\ntrue\nDataCloneError 25 true"
+    );
+}
+
+#[test]
+fn no_per_context_global_is_enumerable() {
+    // Node passes `primordials`, `privateSymbols` and `perIsolateSymbols` as
+    // *arguments*, so none of them is a global. `primordials` has to be one here
+    // because `realm.js` reads it as a bare identifier, but it must not be
+    // enumerable: `test/common/index.js` walks `globalThis` at exit and fails the
+    // test for any name it does not recognise, which cost 388 files once.
+    //
+    // The count is the ratchet. It was 9 before this change and must not grow:
+    // a new enumerable global would show up here rather than as hundreds of
+    // unrelated failures.
+    let out = rustnode(&[
+        "-e",
+        "const names = Object.keys(globalThis).sort();\n\
+         console.log(names.length);\n\
+         console.log(names.join(','));\n\
+         console.log(Object.keys(globalThis).includes('DOMException'));\n\
+         console.log(Object.keys(globalThis).includes('primordials'));\n\
+         console.log(Object.keys(globalThis).includes('QuotaExceededError'));",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "9\n\
+         clearImmediate,clearInterval,clearTimeout,crypto,navigator,queueMicrotask,\
+         setImmediate,setInterval,setTimeout\n\
+         false\nfalse\nfalse"
+    );
+}

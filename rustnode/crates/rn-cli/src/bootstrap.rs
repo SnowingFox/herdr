@@ -380,15 +380,25 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
     // `internal/bootstrap/web/exposed-wildcard.js` publishes through
     // `internalBinding('messaging').exposeLazyDOMExceptionProperty(globalThis)`.
     // That module cannot run here — it aborts on the missing `inspector`
-    // binding — so the same binding call is made directly. `internal/blob.js`
-    // and `internal/util.js` construct it, and Node's own
-    // `test/parallel/test-util-inspect.js` inspects its prototype.
+    // binding — so the same binding call is made directly, followed by the
+    // `exposeLazyInterfaces(globalThis, 'internal/worker/clone_dom_exception', [
+    // 'QuotaExceededError'])` the same file performs two lines later.
+    // `internal/blob.js` and `internal/util.js` construct `DOMException`, and
+    // Node's own `test/parallel/test-util-inspect.js` inspects its prototype.
+    //
+    // Both are installed as non-enumerable data properties: Node's
+    // `exposeLazyInterfaces` passes `enumerable = false`, and
+    // `test/common/index.js` fails a test for any *enumerable* global name it
+    // does not recognise.
     if let Some(namespace) = v8::String::new(scope, "messaging") {
         if let Some(messaging) = internal_binding.call(scope, global.into(), &[namespace.into()]) {
             if let Some(expose) = get_property(scope, messaging, "exposeLazyDOMExceptionProperty") {
                 if let Ok(expose) = v8::Local::<v8::Function>::try_from(expose) {
                     let _ = expose.call(scope, messaging, &[global.into()]);
                 }
+            }
+            if let Some(quota) = get_property(scope, messaging, "QuotaExceededError") {
+                let _ = set_global(scope, global, "QuotaExceededError", quota);
             }
         }
     }
@@ -1168,29 +1178,83 @@ pub fn bootstrap_realm(
     })
 }
 
-/// Runs `internal/per_context/primordials` with the parameters its kind declares.
+/// The `internal/per_context/**` files Node runs, in order.
+///
+/// `InitializePrimordials` in `src/api/environment.cc` iterates exactly this
+/// array. It is a list, not a set: `domexception.js` reads
+/// `symbols.messaging_clone_symbol`, and `messageport.js` needs the primordials
+/// the first entry built.
+const PER_CONTEXT_FILES: &[&str] = &[
+    "internal/per_context/primordials",
+    "internal/per_context/domexception",
+    "internal/per_context/messageport",
+];
+
+/// Runs every `internal/per_context/**` script the way `InitializePrimordials` does.
+///
+/// # What Node passes, and why the arguments are built here
+///
+/// A `kPerContextScript` compiles with the wrapper parameters
+/// `(exports, primordials, privateSymbols, perIsolateSymbols)`. The two symbol
+/// objects are not decoration: `domexception.js` destructures
+/// `transfer_mode_private_symbol` from the first and
+/// `messaging_clone_symbol` / `messaging_deserialize_symbol` from the second, and
+/// defines those two as methods on one prototype. With the symbols missing — the
+/// previous behaviour, where `run_per_context` handed over empty objects — both
+/// methods land on the string key `"undefined"` and the second replaces the
+/// first, so `DOMException` still constructed and silently could not clone.
+///
+/// `perIsolateSymbols` was not even passed to the other two files: only
+/// `primordials.js` ran, so `DOMException` came from the hand-built binding in
+/// `rn-bind-messaging` instead. That is why it was never an `Error` subclass —
+/// the binding built a plain object with data properties, while Node's file
+/// creates an `Error` and swaps its prototype.
+///
+/// # The exports object
+///
+/// Node keeps one `exports` object for the whole set and stores it on the
+/// context under `node:per_context_binding_exports`, which is how
+/// `GetPerContextExports` — and therefore `node_messaging.cc`'s
+/// `GetDOMException` — finds it again. The same object is stored here, so
+/// `internalBinding('messaging')` can return the *identical* constructor the
+/// global `DOMException` is, rather than a second class that would fail
+/// `instanceof`.
 fn run_per_context(
     scope: &mut v8::PinScope,
     primordials: v8::Local<v8::Object>,
 ) -> Result<(), String> {
-    let builtin = builtin_by_id("internal/per_context/primordials")
-        .ok_or("primordials is missing from the builtin table")?;
-    let function = rn_builtins::compile(scope, builtin.id(), builtin.source(), builtin.kind())
-        .ok_or("failed to compile primordials")?;
-
     let exports = v8::Object::new(scope);
-    let private_symbols = v8::Object::new(scope);
-    let per_isolate_symbols = v8::Object::new(scope);
-    let arguments = [
-        exports.into(),
-        primordials.into(),
-        private_symbols.into(),
-        per_isolate_symbols.into(),
-    ];
-    function
-        .call(scope, exports.into(), &arguments)
-        .ok_or("primordials threw")?;
-    Ok(())
+    let private_symbols = rn_core::private_symbols_object(scope)?;
+    let per_isolate_symbols = rn_core::per_isolate_symbols_object(scope)?;
+
+    for id in PER_CONTEXT_FILES {
+        let builtin =
+            builtin_by_id(id).ok_or_else(|| format!("{id} is missing from the builtin table"))?;
+        let function = rn_builtins::compile(scope, builtin.id(), builtin.source(), builtin.kind())
+            .ok_or_else(|| format!("failed to compile {id}"))?;
+
+        let arguments = [
+            exports.into(),
+            primordials.into(),
+            private_symbols.into(),
+            per_isolate_symbols.into(),
+        ];
+        // Node calls with the exports object as the receiver, which is what the
+        // wrapper's `exports` parameter shadows anyway; matching it keeps a
+        // script that reads `this` from behaving differently from Node.
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let scope = &mut try_catch.init();
+        let _ = function.call(scope, exports.into(), &arguments);
+        if scope.has_caught() {
+            let message = scope
+                .exception()
+                .map(|exception| exception.to_rust_string_lossy(scope))
+                .unwrap_or_default();
+            return Err(format!("{id} threw: {message}"));
+        }
+    }
+
+    rn_core::set_per_context_exports(scope, exports)
 }
 
 /// Builds the `process` object the bootstrap expects.
