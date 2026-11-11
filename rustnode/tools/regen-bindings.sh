@@ -28,10 +28,15 @@ skipped=()
 #   * it matched unrelated methods. `crates/rn-core/src/binding.rs` has
 #     `pub fn register(&mut self, namespace: Namespace)` and
 #     `pub fn register_module<M: ...>`, so `rn-core` is a live false positive
-#     under the substring rule. It is harmless only because the exclusion list
-#     above names it; that exclusion is load-bearing for correctness, not
-#     tidiness. Do not "clean it up" while the matcher could still match
-#     `rn-core` -- remove it only together with a rule that demonstrably cannot.
+#     under the substring rule.
+#
+#     The exclusion below still names `rn-core`, but only as a safeguard: the
+#     matcher now requires a `BindingRegistry` argument in the declaration, and
+#     `rn-core` has no function of that signature, so it is already classified as
+#     skipped without the exclusion. Removing it was measured to produce the same
+#     output. It is kept so that a future widening of the matcher cannot silently
+#     register `rn-core`, which would generate a call to a `register` that takes
+#     `&mut self` and break the build for every crate.
 #
 # Anchoring to the start of a line is not sufficient on its own: a crate can
 # legitimately write the signature at column 0 inside a comment. Requiring the

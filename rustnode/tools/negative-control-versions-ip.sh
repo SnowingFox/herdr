@@ -111,3 +111,9 @@ echo "restored build: $after"
 [ "$after" = "$good" ] || fail "the restored build reports something different: $after != $good"
 
 printf 'RESULT: PASS — fresh good build observed, broken build aborted, tree restored\n'
+# The PASS is a message, not a verdict. Without this the script ends on the
+# `printf`, so it reports printf's status -- 0 even when the tree is not what it
+# claims. `set -uo pipefail` has no `-e` here on purpose (the control has to
+# evaluate failing arms instead of aborting on them), which is exactly why the
+# success path has to name its code.
+exit 0
