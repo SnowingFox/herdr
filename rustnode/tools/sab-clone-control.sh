@@ -44,7 +44,15 @@ case "$arm" in
     ;;
 esac
 
-base_ref="${RUSTNODE_SAB_BASE:-origin/master}"
+# The pre-fix commit, pinned rather than following a branch.
+#
+# `origin/master` used to be correct here and is now wrong: #58 merged the fix, so
+# a moving ref makes the `before` arm build the fixed tree and pass, which is the
+# same silent-meaning loss this project keeps finding. `bdfcb18b` is the merge
+# before #58 and has no `get_shared_array_buffer_id`, so the arm fails for the
+# right reason. Moving this default is a decision, not an automatic follow of
+# master.
+base_ref="${RUSTNODE_SAB_BASE:-bdfcb18b}"
 
 work="$(mktemp -d)"
 restore_sources() {
