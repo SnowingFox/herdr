@@ -160,11 +160,40 @@ pub fn parse_public_key_pem(bytes: &[u8]) -> ParseResult<PKey> {
             // A PEM block of some other kind — a certificate, a CSR, arbitrary
             // text — is "not a public key" rather than an OpenSSL failure.
             // Node draws the same line: `TryParsePublicKeyPEM` reports
-            // NOT_RECOGNIZED when no `PUBLIC KEY` header is present.
+            // NOT_RECOGNIZED when no recognised header is present.
             if !has_pem_header(bytes, b"PUBLIC KEY") && !has_pem_header(bytes, b"RSA PUBLIC KEY") {
+                // The third step of `TryParsePublicKeyPEM`: an X.509 certificate
+                // is accepted as a source of a public key. `crypto.createVerify`
+                // is routinely called with a certificate instead of a key — every
+                // TLS test does it — and `X509_get_pubkey` is what Node uses.
+                if has_pem_header(bytes, b"CERTIFICATE") {
+                    return parse_public_key_from_certificate_pem(bytes);
+                }
                 return Err(failure(true));
             }
             Err(crate::error::from_error_stack(&error, false))
+        }
+    }
+}
+
+/// `d2i_X509` then `X509_get_pubkey`: a certificate's public key.
+///
+/// A certificate that does not parse is `NotRecognized` rather than `Failed`,
+/// which keeps `GetPublicOrPrivateKeyFromJs`'s fallback to the private-key parser
+/// working: a caller can pass either kind and the wrong one is not fatal.
+fn parse_public_key_from_certificate_pem(bytes: &[u8]) -> ParseResult<PKey> {
+    let certificate = match openssl::x509::X509::from_pem(bytes) {
+        Ok(certificate) => certificate,
+        Err(_) => {
+            crate::error::clear_error();
+            return Err(failure(true));
+        }
+    };
+    match certificate.public_key() {
+        Ok(key) => PKey::from_public(key).ok_or_else(|| failure(false)),
+        Err(_) => {
+            crate::error::clear_error();
+            Err(failure(false))
         }
     }
 }

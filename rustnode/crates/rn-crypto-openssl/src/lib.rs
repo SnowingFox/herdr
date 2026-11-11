@@ -27,6 +27,7 @@ mod error;
 mod parse;
 mod pkey;
 mod raw;
+mod sign;
 
 pub use algorithm::{
     KeyAlgorithm, KeyAlgorithmName, DH, DSA, EC, ED25519, ED448, ML_DSA_44, ML_DSA_65, ML_DSA_87,
@@ -35,7 +36,7 @@ pub use algorithm::{
 pub use encode::{KeyEncoding, KeyFormat, PrivateKeyEncoding, PublicKeyEncoding};
 pub use error::{
     clear_error, failure, failure_from, failure_with_passphrase, from_error_stack, openssl_error,
-    openssl_error_for, OpenSslError, ParseError, ParseFailure, ParseResult,
+    openssl_error_for, ossl_code_for, OpenSslError, ParseError, ParseFailure, ParseResult,
 };
 pub use parse::{
     parse_private_key, parse_private_key_der, parse_private_key_pem, parse_public_key,
@@ -47,4 +48,10 @@ pub use pkey::{
 pub use raw::{
     as_parse_failure, import_raw, import_raw_private_key, import_raw_public_key, import_raw_seed,
     nid_of_curve, KeyFormatError,
+};
+pub use sign::{
+    apply_rsa_options, bytes_of_rs, clear_openssl_error, default_sign_padding, digest_by_name,
+    padding_from_raw, set_rsa_padding, sign_digest, sign_final, signature_from_p1363,
+    signature_to_p1363, verify_digest, verify_final, SignContext, SignError, PADDINGS,
+    RSA_PKCS1_PSS_PADDING,
 };

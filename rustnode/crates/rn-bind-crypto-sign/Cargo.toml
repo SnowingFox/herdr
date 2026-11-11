@@ -1,0 +1,25 @@
+[package]
+name = "rn-bind-crypto-sign"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sign and Verify for internalBinding('crypto')"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# The signature operations themselves: `EVP_PKEY_sign`/`verify` over a finalised
+# digest, the RSA padding and PSS salt-length helpers, and the DER/P1363
+# conversion. Kept in the shared layer so the `cipher` and `keys` crates agree
+# with this one about padding and error shapes.
+rn-crypto-openssl = { path = "../rn-crypto-openssl" }
+# `GetPrivateKeyFromJs` / `GetPublicOrPrivateKeyFromJs`, which are exported from
+# the crate that owns `crypto_keys.cc`. `Sign.sign` and `Verify.verify` take raw
+# key bytes and a format rather than a `KeyObjectHandle`, so the decode lives
+# there and this crate calls it.
+rn-bind-crypto-keys = { path = "../rn-bind-crypto-keys" }
+openssl = { version = "=0.10.82", features = ["vendored"] }
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
+foreign-types = "0.3"

@@ -301,7 +301,9 @@ fn init_asymmetric(
         .and_then(KeyFormat::from_raw)
     {
         if format.is_raw() {
-            let Some(data) = import_raw_key(scope, values, format, key_type) else {
+            // `KeyObjectHandle.import(keyType, data, format, type, passphrase,
+            // namedCurve)`: the key type occupies slot 0, so the data slot is 1.
+            let Some(data) = import_raw_key(scope, values, 1, format, key_type) else {
                 return;
             };
             set_key_data(scope, this, data);
@@ -352,6 +354,110 @@ fn init_asymmetric(
     set_key_data(scope, this, data);
 }
 
+/// `GetPublicOrPrivateKeyFromJs`, for another binding crate that takes a key.
+///
+/// `crypto_sig.cc` does not construct a `KeyObjectHandle`: its `sign` and
+/// `verify` methods call these two static decoders on their own argument list and
+/// use the `EVP_PKEY` directly. Exposing them here rather than repeating the
+/// walk in another crate is the point of this crate owning `crypto_keys.cc` —
+/// the PEM/DER/JWK/raw/KeyObject dispatch, its offset arithmetic and its error
+/// shapes are subtle enough that two copies would diverge.
+///
+/// `args` is the *whole* callback argument list and `offset` is where the key
+/// starts. On return `offset` points at the first argument *after* the key, so
+/// the caller can read its own trailing arguments. Returns `None` after
+/// throwing, which is what the Node original signals with an empty
+/// `KeyObjectData`.
+///
+/// # Why the offset is forced forward
+///
+/// `GetPrivateKeyFromJs` consumes five slots on every path — data, format, type,
+/// passphrase, namedCurve — and the private reader here does the same. The public
+/// reader returns from its parse branch without advancing the last slots, because
+/// `createPublicKey` has no arguments after the key and never needs the number.
+/// `crypto_sig.cc`'s callers *do* have arguments after the key, so the trailing
+/// slots are consumed here for both kinds: without it `Sign.verify` reads the
+/// signature from the middle of the key's own argument list.
+pub fn read_key_from_js(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    offset: &mut usize,
+    key_type: KeyType,
+) -> Option<KeyData> {
+    let values = values_of(scope, args);
+    let start = *offset;
+    let key = match key_type {
+        // `GetPublicOrPrivateKeyFromJs` in Node accepts either kind: verifying
+        // with the private half is normal, and the raw-private format only
+        // exists for private keys.
+        KeyType::Public => read_public_or_private_from_js(scope, args, &values, offset),
+        KeyType::Private => read_private_key(scope, args, &values, offset),
+        KeyType::Secret => {
+            throw(scope, &KeyError::InvalidKeyType);
+            None
+        }
+    }?;
+    // The key occupies `start..start + 5`. A reader that returned early leaves
+    // `offset` inside that range, so this raises it to the end rather than
+    // trusting each branch to have advanced identically.
+    *offset = (*offset).max(start + KEY_ARGUMENT_SLOTS);
+    let Some(data) = KeyData::asymmetric(key_type, key) else {
+        throw(scope, &KeyError::InvalidKeyType);
+        return None;
+    };
+    Some(data)
+}
+
+/// The number of argument slots a key occupies: data, format, type, passphrase
+/// and namedCurve.
+const KEY_ARGUMENT_SLOTS: usize = 5;
+
+/// `GetPublicOrPrivateKeyFromJs`: a key that may be either kind.
+///
+/// `Verify.verify` and `verifyOneShot` take a public *or* private key — using the
+/// private half to verify is normal, and `test-crypto-sign-verify.js` does it in
+/// its raw-key block. The private reader is tried first because it accepts every
+/// shape the public one does plus the raw-private and seed formats; a public PEM
+/// parses through it too, since `PEM_read_bio_PrivateKey` is not what runs — the
+/// dispatch below is `parse_public_or_private_key`, which tries both.
+fn read_public_or_private_from_js(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    values: &Values,
+    offset: &mut usize,
+) -> Option<PKey> {
+    let data = values.get(*offset).clone();
+    let format = values
+        .opt(*offset + 1)
+        .and_then(|value| value.int32())
+        .and_then(KeyFormat::from_raw);
+
+    // A raw key must go through the raw importer: the PEM parser would be handed
+    // 32 bytes of key material and report "failed to read asymmetric key", which
+    // names nothing that is actually wrong. `raw-public` imports with the public
+    // target and the other two with the private one, because a seed and a private
+    // scalar are both private material.
+    if let Some(format @ (KeyFormat::RawPublic | KeyFormat::RawPrivate | KeyFormat::RawSeed)) =
+        format
+    {
+        let target = if format == KeyFormat::RawPublic {
+            KeyType::Public
+        } else {
+            KeyType::Private
+        };
+        return import_raw_key(scope, values, *offset, format, target)?
+            .asymmetric_key()
+            .cloned();
+    }
+    if matches!(data, Value::String(_) | Value::Bytes(_)) {
+        // Everything else is decoded by whichever parser recognises it.
+        return read_public_or_private_key(scope, args, values, offset);
+    }
+    // A descriptor object: JWK, raw, or an existing handle. The private reader
+    // covers all three, and the *reported* key type is decided by the caller.
+    read_private_key(scope, args, values, offset)
+}
+
 /// `GetPrivateKeyFromJs`: decodes a private key from the argument list.
 fn read_private_key(
     scope: &mut v8::PinScope<'_, '_>,
@@ -360,7 +466,6 @@ fn read_private_key(
     offset: &mut usize,
 ) -> Option<PKey> {
     let data = values.get(*offset).clone();
-
     if data.is_object() {
         // An object with no integer format in the next slot is another
         // `KeyObjectHandle`: `createPrivateKey(privateKey)` and
@@ -399,7 +504,7 @@ fn read_private_key(
                 return None;
             }
             format if format.is_raw() => {
-                let data = import_raw_key(scope, values, format, KeyType::Private)?;
+                let data = import_raw_key(scope, values, *offset, format, KeyType::Private)?;
                 *offset += 5;
                 return Some(data.asymmetric_key()?.clone());
             }
@@ -408,6 +513,28 @@ fn read_private_key(
                 throw(scope, &KeyError::InvalidKeyType);
                 return None;
             }
+        }
+    }
+
+    // A raw key arrives as a `Buffer`, not as an object descriptor, so the
+    // object branch above never sees it. `keys.js` sends
+    // `{format: 'raw-private', asymmetricKeyType: 'ed25519', key: <Buffer>}` as
+    // four positional slots exactly like a PEM key, and the *format* slot is what
+    // distinguishes them. Checking it here rather than requiring an object is
+    // what makes `crypto.sign(null, data, {format: 'raw-private', ...})` work:
+    // without it the bytes are handed to the PEM parser and the caller sees
+    // "Failed to read private key" for a key that reads fine through
+    // `createPrivateKey`, because that path starts at slot 0 and this one does
+    // not.
+    if let Some(format) = values
+        .opt(*offset + 1)
+        .and_then(|value| value.int32())
+        .and_then(KeyFormat::from_raw)
+    {
+        if format.is_raw() || format == KeyFormat::RawSeed {
+            let data = import_raw_key(scope, values, *offset, format, KeyType::Private)?;
+            *offset += KEY_ARGUMENT_SLOTS;
+            return Some(data.asymmetric_key()?.clone());
         }
     }
 
@@ -463,7 +590,7 @@ fn read_public_or_private_key(
                     return None;
                 }
                 format if format.is_raw() => {
-                    let data = import_raw_key(scope, values, format, KeyType::Public)?;
+                    let data = import_raw_key(scope, values, *offset, format, KeyType::Public)?;
                     *offset += 5;
                     return Some(data.asymmetric_key()?.clone());
                 }
@@ -615,11 +742,20 @@ fn report_parse_failure(
 fn import_raw_key(
     scope: &mut v8::PinScope<'_, '_>,
     values: &Values,
+    base: usize,
     format: KeyFormat,
     target: KeyType,
 ) -> Option<KeyData> {
-    let bytes = values.opt(1).and_then(value_bytes)?;
-    let Some(type_name) = values.opt(3).and_then(|value| match value {
+    // The slots are relative to `base`, which is 0 for a `KeyObjectHandle.import`
+    // call and the key's own index when `Sign.sign`'s argument list is walked.
+    // Absolute indices here silently read the wrong slot for the second shape,
+    // which surfaces as "Failed to read private key" with no clue why.
+    // `base` is the *data* slot. The key's five slots are data, format, type,
+    // passphrase, namedCurve, so the type name and the curve name sit two and
+    // four slots along — not three and five, which is the same arithmetic shifted
+    // by the format slot that `read_format_and_type` has already consumed.
+    let bytes = values.opt(base).and_then(value_bytes)?;
+    let Some(type_name) = values.opt(base + 2).and_then(|value| match value {
         Value::String(text) => Some(text.clone()),
         _ => None,
     }) else {
@@ -636,7 +772,7 @@ fn import_raw_key(
         );
         return None;
     };
-    let named_curve = values.opt(5).and_then(|value| match value {
+    let named_curve = values.opt(base + 4).and_then(|value| match value {
         Value::String(text) => Some(text.clone()),
         _ => None,
     });

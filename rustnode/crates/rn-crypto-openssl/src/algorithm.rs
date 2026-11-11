@@ -131,6 +131,26 @@ impl KeyAlgorithm {
         matches!(self.family, Family::EdDsa | Family::Xdh)
     }
 
+    /// `KeyAlgorithm::isOneShot`: the algorithms a *streaming* signature handle
+    /// cannot drive.
+    ///
+    /// EdDSA and the post-quantum signature families sign a whole message rather
+    /// than a digest, so `crypto.createSign`/`createVerify` reject them with
+    /// `ERR_CRYPTO_UNSUPPORTED_OPERATION`. `crypto.sign`/`crypto.verify` (the
+    /// one-shot job) still work, because they pass the message through.
+    pub fn is_one_shot(self) -> bool {
+        // Named individually rather than by family: `Family::EdDsa` also holds
+        // X25519 and X448, which are key-agreement algorithms with no signature
+        // operation at all, and rejecting them here would change the error a
+        // `createSign` on a key-agreement key reports.
+        matches!(self.name, "Ed25519" | "Ed448")
+            // The post-quantum signature families are named per parameter set
+            // (`ML-DSA-44`, `SLH-DSA-SHA2-128f`), so a prefix is the only stable
+            // match. ML-KEM is excluded: it is key encapsulation, not a signature.
+            || self.name.starts_with("ML-DSA-")
+            || self.name.starts_with("SLH-DSA-")
+    }
+
     /// Whether a raw public key can be imported or exported.
     pub fn supports_raw_public(self) -> bool {
         self.is_okp() || self.is_pqc()

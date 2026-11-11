@@ -85,6 +85,15 @@ pub const MEMBERS: &[&str] = &[
     "RsaKeyPairGenJob",
     "EcKeyPairGenJob",
     "NamedKeyPairGenJob",
+    // The signature surface, installed by `rn-bind-crypto-sign` from
+    // `src/crypto/crypto_sig.cc` and `crypto_rsa.cc`. `Sign`/`Verify` are the
+    // streaming classes `lib/internal/crypto/sig.js` drives; `SignJob` is the
+    // one-shot `crypto.sign`/`crypto.verify` form and `RSACipherJob` the RSA
+    // encrypt/decrypt job `rsa.js` builds for RSA-OAEP.
+    "Sign",
+    "Verify",
+    "SignJob",
+    "RSACipherJob",
     // The `RSAKeyVariant` values `keygen.js` puts in `RsaKeyPairGenJob`'s second
     // slot. Without them the argument is `undefined`, the variant defaults to
     // PKCS#1, and every `rsa-pss` generation silently produces a plain RSA key.
@@ -209,10 +218,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     ("KmacJob","KMAC needs the KeyObject surface for its key and is not in this OpenSSL build."),
     ("Mac","createMac needs the KeyObject surface for its key."),
     (
-        "RSACipherJob",
-        "RSA public/private encrypt and decrypt need the KeyObject surface.",
-    ),
-    (
         "RandomBytesJob",
         "The async `randomBytes` path needs the event loop; `randomBytes` works because \
          `lib/internal/crypto/random.js` implements it over the sync fill.",
@@ -226,18 +231,8 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "A TLS secure context needs the tls binding; this crate does not own it.",
     ),
     (
-        "Sign",
-        "createSign/createVerify need the KeyObject surface and an incremental signature \
-         context. The HMAC verify path in the engine is tested but not exposed as a class.",
-    ),
-    ("SignJob","Signing jobs need the KeyObject surface and an incremental signature context."),
-    (
         "TurboShakeJob",
         "TurboSHAKE is not in the OpenSSL build `openssl-src` produces.",
-    ),
-    (
-        "Verify",
-        "createVerify needs the KeyObject surface; see `Sign`.",
     ),
     (
         "addBlockedSPKIForTesting",
@@ -682,6 +677,12 @@ impl BindingModule for Crypto {
         // stand-in that used to be installed above, so the `crate::classes`
         // binding for `createNativeKeyObjectClass` must not be installed as well.
         rn_bind_crypto_keys::install_classes(scope, object)?;
+        // `Sign`/`Verify` and the two signature jobs. Same one-translation-unit
+        // split: `src/crypto/crypto_sig.cc` and `crypto_rsa.cc` install onto this
+        // object because `src/node_crypto.cc` aggregates their `Initialize` calls
+        // onto one `target`. This also defines `RSA_PKCS1_PSS_PADDING`, so the
+        // constant block below must not define it again.
+        rn_bind_crypto_sign::install_classes(scope, object)?;
         // The job handles, whose instances expose `run()`.
         install_job_class(scope, object, "HashJob", hash_job)?;
         install_job_class(scope, object, "HmacJob", hmac_job)?;
@@ -1961,6 +1962,24 @@ mod tests {
             assert!(
                 reason.len() > 20,
                 "{member} has no real reason for being deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn the_signature_surface_is_installed_and_not_deferred() {
+        // Slice S7 added exactly these four, from `crypto_sig.cc` and
+        // `crypto_rsa.cc`. A member present in both lists, or in neither, makes
+        // `rn-compat` report a mismatch that reads as an unrelated contract
+        // failure — so the four are named here rather than left to the totals.
+        for member in ["Sign", "Verify", "SignJob", "RSACipherJob"] {
+            assert!(
+                MEMBERS.contains(&member),
+                "{member} must be installed by rn-bind-crypto-sign"
+            );
+            assert!(
+                !DEFERRED.iter().any(|(name, _)| *name == member),
+                "{member} is both installed and deferred"
             );
         }
     }

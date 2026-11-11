@@ -896,6 +896,7 @@ dependencies = [
  "rn-bind-crypto-cipher",
  "rn-bind-crypto-dh",
  "rn-bind-crypto-keys",
+ "rn-bind-crypto-sign",
  "rn-core",
  "rn-v8-sys",
  "serde_json",
@@ -936,6 +937,19 @@ dependencies = [
  "rn-uv",
  "rn-v8-sys",
  "serde_json",
+]
+
+[[package]]
+name = "rn-bind-crypto-sign"
+version = "0.1.0"
+dependencies = [
+ "foreign-types",
+ "openssl",
+ "openssl-sys",
+ "rn-bind-crypto-keys",
+ "rn-core",
+ "rn-crypto-openssl",
+ "rn-v8-sys",
 ]
 
 [[package]]
