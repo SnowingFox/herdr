@@ -136,14 +136,12 @@ pub fn user() -> Vec<String> {
 /// std::make_unique<X509Set>()` in `ResetRootCertStore`. Every entry must parse,
 /// which is why this reports the failure rather than storing a partial list: a
 /// half-populated store would verify some chains and not others.
-pub fn reset(pem_strings: &[Vec<u8>]) -> Result<usize, ()> {
+pub fn reset(pem_strings: &[Vec<u8>]) -> Option<usize> {
     let mut parsed = Vec::with_capacity(pem_strings.len());
     for entry in pem_strings {
         // Store PEM, because that is the shape all five getters return; parsing
         // and re-encoding here is what proves the entry is a certificate.
-        let Some(certificates) = pem_certificates(entry) else {
-            return Err(());
-        };
+        let certificates = pem_certificates(entry)?;
         parsed.extend(certificates);
     }
     let count = parsed.len();
@@ -151,7 +149,7 @@ pub fn reset(pem_strings: &[Vec<u8>]) -> Result<usize, ()> {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     *roots = parsed;
-    Ok(count)
+    Some(count)
 }
 
 /// Every certificate in a PEM blob, re-encoded as PEM.
@@ -167,16 +165,14 @@ fn pem_certificates(bytes: &[u8]) -> Option<Vec<String>> {
     if certificates.is_empty() {
         return None;
     }
-    Some(
-        certificates
-            .into_iter()
-            .map(|der| {
-                let certificate = X509::from_der(&der).ok()?;
-                let pem = certificate.to_pem().ok()?;
-                String::from_utf8(pem).ok()
-            })
-            .collect::<Option<Vec<String>>>()?,
-    )
+    certificates
+        .into_iter()
+        .map(|der| {
+            let certificate = X509::from_der(&der).ok()?;
+            let pem = certificate.to_pem().ok()?;
+            String::from_utf8(pem).ok()
+        })
+        .collect::<Option<Vec<String>>>()
 }
 
 /// Every certificate in a PEM blob, as DER.
@@ -236,12 +232,12 @@ mod tests {
     fn resetting_the_user_store_replaces_it() {
         let first = self_signed("first");
         let second = self_signed("second");
-        assert_eq!(reset(&[first]).expect("parses"), 1);
+        assert_eq!(reset(&[first]), Some(1));
         assert_eq!(user().len(), 1);
-        assert_eq!(reset(&[second.clone(), second]).expect("parses"), 2);
+        assert_eq!(reset(&[second.clone(), second]), Some(2));
         assert_eq!(user().len(), 2);
         // An empty array clears it, which `ResetRootCertStore` special-cases.
-        assert_eq!(reset(&[]).expect("parses"), 0);
+        assert_eq!(reset(&[]), Some(0));
         assert!(user().is_empty());
     }
 
@@ -249,7 +245,7 @@ mod tests {
     fn an_unparseable_entry_rejects_the_whole_reset() {
         // A half-applied store would verify some chains and not others, so the
         // failure is all-or-nothing.
-        assert!(reset(&[b"not a certificate".to_vec()]).is_err());
+        assert!(reset(&[b"not a certificate".to_vec()]).is_none());
         assert!(user().is_empty());
     }
 

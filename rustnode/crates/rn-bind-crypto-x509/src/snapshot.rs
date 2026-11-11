@@ -261,7 +261,8 @@ mod tests {
         let leaf = self_signed();
         let issuer = self_signed();
         let snapshot =
-            Snapshot::from_leaf_der_and_issuers(leaf.clone(), &[issuer.clone()]).expect("snapshot");
+            Snapshot::from_leaf_der_and_issuers(leaf.clone(), std::slice::from_ref(&issuer))
+                .expect("snapshot");
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot.der_at(0), Some(leaf.as_slice()));
         assert_eq!(snapshot.der_at(1), Some(issuer.as_slice()));

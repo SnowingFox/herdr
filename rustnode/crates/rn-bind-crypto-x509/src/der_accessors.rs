@@ -94,7 +94,7 @@ pub fn serial_number(certificate: &X509) -> Option<String> {
     // SAFETY: the certificate is live for the call, and `toUpper` needs no
     // mutable access beyond the cast Node makes for the same reason.
     unsafe {
-        let serial = X509_get_serialNumber(certificate.as_ptr() as *mut ffi::X509);
+        let serial = X509_get_serialNumber(certificate.as_ptr());
         if serial.is_null() {
             return None;
         }
@@ -160,7 +160,7 @@ pub fn key_usage(certificate: &X509) -> Option<Vec<String>> {
     // released below, and reads only the certificate.
     unsafe {
         let stack = X509_get_ext_d2i(
-            certificate.as_ptr() as *mut ffi::X509,
+            certificate.as_ptr(),
             ffi::NID_ext_key_usage,
             std::ptr::null_mut(),
             std::ptr::null_mut(),

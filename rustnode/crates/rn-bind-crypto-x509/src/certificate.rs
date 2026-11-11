@@ -277,9 +277,7 @@ macro_rules! install_methods {
         $(
             {
                 let template = v8::FunctionTemplate::builder($callback).build($scope);
-                let Some(key) = v8::String::new($scope, $name) else {
-                    return None;
-                };
+                let key = v8::String::new($scope, $name)?;
                 $prototype.set(key.into(), template.into());
             }
         )*
@@ -356,7 +354,7 @@ pub(crate) fn constructor(
             let copied = with_state(scope, source, |state| {
                 (state.snapshot.clone(), state.index, state.issuer.clone())
             });
-            let copied = copied.map(|(snapshot, index, issuer)| (snapshot, index, issuer));
+            let copied = copied;
             if let Some((snapshot, index, issuer)) = copied {
                 set_state(
                     scope,

@@ -186,9 +186,7 @@ pub fn transfer_mode(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
 ) -> Option<TransferMode> {
-    if kind_of(scope, object).is_none() {
-        return None;
-    }
+    kind_of(scope, object)?;
     match stamped_mode(scope, object) {
         Some(mode) => Some(mode),
         None => Some(TransferMode::Cloneable),

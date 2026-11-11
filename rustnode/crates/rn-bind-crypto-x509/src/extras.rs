@@ -413,7 +413,7 @@ pub(crate) fn is_ca(certificate: &X509) -> bool {
     // SAFETY: `X509_check_ca` takes a non-const `X509 *` but only reads it (it
     // fills a cache inside the extension structure, which is why Node casts
     // too).
-    unsafe { X509_check_ca(certificate.as_ptr() as *mut ffi::X509) != 0 }
+    unsafe { X509_check_ca(certificate.as_ptr()) != 0 }
 }
 
 /// `X509View::checkHost`.
@@ -431,7 +431,7 @@ pub(crate) fn check_host(
     // receives an allocated string that is freed below.
     let result = unsafe {
         X509_check_host(
-            certificate.as_ptr() as *mut ffi::X509,
+            certificate.as_ptr(),
             name.as_ptr().cast::<std::ffi::c_char>(),
             name.len(),
             flags,
@@ -464,7 +464,7 @@ pub(crate) fn check_email(
     // SAFETY: `email` is a live slice whose length is passed with it.
     crate::certificate::CheckMatch::from_raw(unsafe {
         X509_check_email(
-            certificate.as_ptr() as *mut ffi::X509,
+            certificate.as_ptr(),
             email.as_ptr().cast::<std::ffi::c_char>(),
             email.len(),
             flags,
@@ -492,12 +492,7 @@ pub(crate) fn check_ip(
     // SAFETY: `address` is a fixed array and `length` is 4 or 16, both of which
     // are the only sizes `X509_check_ip` accepts.
     crate::certificate::CheckMatch::from_raw(unsafe {
-        X509_check_ip(
-            certificate.as_ptr() as *mut ffi::X509,
-            address.as_ptr(),
-            length,
-            flags,
-        )
+        X509_check_ip(certificate.as_ptr(), address.as_ptr(), length, flags)
     })
 }
 
@@ -519,12 +514,7 @@ fn parse_ip_literal(subject: &str) -> Option<([u8; 16], usize)> {
 pub(crate) fn is_issued_by(certificate: &X509, issuer: &X509) -> bool {
     // SAFETY: both certificates are live; `X509_check_issued` casts `issuer` to
     // non-const and only reads it.
-    unsafe {
-        X509_check_issued(
-            issuer.as_ptr() as *mut ffi::X509,
-            certificate.as_ptr() as *mut ffi::X509,
-        ) == ffi::X509_V_OK
-    }
+    unsafe { X509_check_issued(issuer.as_ptr(), certificate.as_ptr()) == ffi::X509_V_OK }
 }
 
 /// `X509View::checkPrivateKey`.
@@ -534,7 +524,7 @@ pub(crate) fn is_issued_by(certificate: &X509, issuer: &X509) -> bool {
 /// `rn-crypto-openssl::sign`: this is a key comparison, not a verification.
 pub(crate) fn check_private_key(certificate: &X509, key: &PKeyRef<impl HasPublic>) -> bool {
     // SAFETY: both handles are live and the call only reads them.
-    unsafe { X509_check_private_key(certificate.as_ptr() as *mut ffi::X509, key.as_ptr()) == 1 }
+    unsafe { X509_check_private_key(certificate.as_ptr(), key.as_ptr()) == 1 }
 }
 
 /// `X509View::checkPublicKey`, installed as `verify`.
@@ -551,12 +541,7 @@ pub(crate) fn check_private_key(certificate: &X509, key: &PKeyRef<impl HasPublic
 /// provides, and neither is a substitute for the other.
 pub(crate) fn check_public_key(certificate: &X509, key: &PKeyRef<impl HasPublic>) -> bool {
     // SAFETY: both handles are live and the call only reads them.
-    unsafe {
-        X509_verify(
-            certificate.as_ptr() as *mut ffi::X509,
-            key.as_ptr() as *mut ffi::EVP_PKEY,
-        ) == 1
-    }
+    unsafe { X509_verify(certificate.as_ptr(), key.as_ptr()) == 1 }
 }
 
 /// The certificate's public key, with a reference this crate owns.
@@ -565,7 +550,7 @@ pub(crate) fn check_public_key(certificate: &X509, key: &PKeyRef<impl HasPublic>
 /// is what `publicKey()` hands to a `KeyObjectHandle`.
 pub fn owned_public_key(certificate: &X509) -> Option<*mut ffi::EVP_PKEY> {
     // SAFETY: returns one new reference owned by the caller.
-    let key = unsafe { X509_get_pubkey(certificate.as_ptr() as *mut ffi::X509) };
+    let key = unsafe { X509_get_pubkey(certificate.as_ptr()) };
     (!key.is_null()).then_some(key)
 }
 
@@ -612,48 +597,6 @@ pub(crate) unsafe fn private_pkey_from_raw(
     }
     // SAFETY: the caller guarantees ownership of exactly one reference.
     Some(unsafe { <openssl::pkey::PKey<openssl::pkey::Private> as ForeignType>::from_ptr(key) })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_check_match_mapping_is_the_one_openssl_documents() {
-        use crate::certificate::CheckMatch;
-        assert_eq!(CheckMatch::from_raw(1), CheckMatch::Match);
-        assert_eq!(CheckMatch::from_raw(0), CheckMatch::NoMatch);
-        assert_eq!(CheckMatch::from_raw(-2), CheckMatch::InvalidName);
-        // Everything else is a failure, not a silent "no match": conflating them
-        // would make a broken certificate look like a name mismatch.
-        assert_eq!(CheckMatch::from_raw(-1), CheckMatch::Failed);
-        assert_eq!(CheckMatch::from_raw(-3), CheckMatch::Failed);
-    }
-
-    #[test]
-    fn an_ipv4_literal_parses_to_four_bytes() {
-        let (address, length) = parse_ip_literal("8.8.8.8").expect("parses");
-        assert_eq!(length, 4);
-        assert_eq!(&address[..4], &[8, 8, 8, 8]);
-    }
-
-    #[test]
-    fn an_ipv6_literal_parses_to_sixteen_bytes() {
-        let (address, length) = parse_ip_literal("2001:db8::1").expect("parses");
-        assert_eq!(length, 16);
-        assert_eq!(address[0], 0x20);
-        assert_eq!(address[1], 0x01);
-        assert_eq!(address[15], 0x01);
-    }
-
-    #[test]
-    fn a_non_literal_is_not_an_ip() {
-        // This is `INVALID_NAME` in `CheckIP`, which becomes
-        // `ERR_INVALID_ARG_VALUE("Invalid name")` rather than `undefined`.
-        assert!(parse_ip_literal("example.com").is_none());
-        assert!(parse_ip_literal("8.8.8").is_none());
-        assert!(parse_ip_literal("").is_none());
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -777,4 +720,46 @@ pub(crate) fn signature<'s>(
     let encoded = rn_bind_crypto_keys::buffer_from(scope, &value)?;
     object.set(scope, value_key.into(), encoded);
     Some(object.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_check_match_mapping_is_the_one_openssl_documents() {
+        use crate::certificate::CheckMatch;
+        assert_eq!(CheckMatch::from_raw(1), CheckMatch::Match);
+        assert_eq!(CheckMatch::from_raw(0), CheckMatch::NoMatch);
+        assert_eq!(CheckMatch::from_raw(-2), CheckMatch::InvalidName);
+        // Everything else is a failure, not a silent "no match": conflating them
+        // would make a broken certificate look like a name mismatch.
+        assert_eq!(CheckMatch::from_raw(-1), CheckMatch::Failed);
+        assert_eq!(CheckMatch::from_raw(-3), CheckMatch::Failed);
+    }
+
+    #[test]
+    fn an_ipv4_literal_parses_to_four_bytes() {
+        let (address, length) = parse_ip_literal("8.8.8.8").expect("parses");
+        assert_eq!(length, 4);
+        assert_eq!(&address[..4], &[8, 8, 8, 8]);
+    }
+
+    #[test]
+    fn an_ipv6_literal_parses_to_sixteen_bytes() {
+        let (address, length) = parse_ip_literal("2001:db8::1").expect("parses");
+        assert_eq!(length, 16);
+        assert_eq!(address[0], 0x20);
+        assert_eq!(address[1], 0x01);
+        assert_eq!(address[15], 0x01);
+    }
+
+    #[test]
+    fn a_non_literal_is_not_an_ip() {
+        // This is `INVALID_NAME` in `CheckIP`, which becomes
+        // `ERR_INVALID_ARG_VALUE("Invalid name")` rather than `undefined`.
+        assert!(parse_ip_literal("example.com").is_none());
+        assert!(parse_ip_literal("8.8.8").is_none());
+        assert!(parse_ip_literal("").is_none());
+    }
 }

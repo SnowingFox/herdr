@@ -186,9 +186,7 @@ fn base_template<'s>(
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELD_COUNT);
-    let Some(name) = v8::String::new(scope, "X509Certificate") else {
-        return None;
-    };
+    let name = v8::String::new(scope, "X509Certificate")?;
     template.set_class_name(name);
     let prototype = template.prototype_template(scope);
     // The 30 prototype methods, in the order `crypto_x509.cc`'s
@@ -641,7 +639,7 @@ fn reset_root_cert_store<'s>(
             }
         }
     }
-    if crate::root_store::reset(&entries).is_err() {
+    if crate::root_store::reset(&entries).is_none() {
         throw_crypto_error_with(scope, 0, "Failed to parse certificate");
     }
 }
