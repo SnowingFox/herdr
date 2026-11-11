@@ -183,6 +183,59 @@ pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
 
     install_process_methods(scope, require, global);
     install_web_globals(scope);
+    install_async_hooks_native_hooks(scope, require);
+}
+
+/// Hands `async_wrap` the callbacks `AsyncWrap` calls for its own resources.
+///
+/// `internal/bootstrap/node.js` does exactly this, immediately after `process`
+/// exists and before any user code:
+///
+/// ```js
+/// const { nativeHooks } = require('internal/async_hooks');
+/// internalBinding('async_wrap').setupHooks(nativeHooks);
+/// ```
+///
+/// Without it, `async_hook_fields[kInit]` counts the hooks a script enabled but
+/// `setupHooks` has no functions to call, so a native `init` or `destroy` —
+/// `TCPWrap`'s on construction and on `asyncReset`, and every deferred
+/// `emitDestroy` — is emitted into nothing. The JavaScript layer still reports
+/// ids, which is why the gap was invisible: `getAsyncId()` answered correctly and
+/// only the hooks were missing.
+///
+/// It runs after `install_early_globals` rather than before because
+/// `internal/async_hooks` reads `internalBinding('errors')` at module scope, and
+/// that namespace is only reliably installed once the realm bootstrap has
+/// finished.
+fn install_async_hooks_native_hooks<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+) {
+    let Some(internal) = call_require(scope, require, "internal/async_hooks") else {
+        return;
+    };
+    let Some(native_hooks) = get_property(scope, internal, "nativeHooks") else {
+        return;
+    };
+    let Some(binding) = rn_core::hook_slot::internal_binding(scope) else {
+        return;
+    };
+    let Some(name) = v8::String::new(scope, "async_wrap") else {
+        return;
+    };
+    let Some(binding) = binding.call(scope, v8::undefined(scope).into(), &[name.into()]) else {
+        return;
+    };
+    let Ok(binding) = v8::Local::<v8::Object>::try_from(binding) else {
+        return;
+    };
+    let Some(setup) = get_property(scope, binding.into(), "setupHooks") else {
+        return;
+    };
+    let Ok(setup) = v8::Local::<v8::Function>::try_from(setup) else {
+        return;
+    };
+    let _ = setup.call(scope, binding.into(), &[native_hooks]);
 }
 
 /// Installs the web globals `test/common/index.js` needs before its first test.

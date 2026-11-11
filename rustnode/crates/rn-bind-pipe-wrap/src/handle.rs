@@ -62,6 +62,18 @@ impl PipeHandle {
     pub fn stream(&self) -> *mut uv::uv_stream_t {
         self.state.stream
     }
+
+    /// The provider `src/pipe_wrap.cc` selects from the socket type.
+    ///
+    /// The `IPC` case is `PROVIDER_PIPEWRAP`: an IPC channel is a connected pipe
+    /// that carries descriptors, not a distinct async provider.
+    pub fn provider(kind: i32) -> u32 {
+        if kind == crate::SERVER {
+            rn_core::async_wrap::PROVIDER_PIPESERVERWRAP
+        } else {
+            rn_core::async_wrap::PROVIDER_PIPEWRAP
+        }
+    }
 }
 
 thread_local! {
@@ -371,9 +383,18 @@ fn new(
         return;
     };
     handle.kind = kind;
+    // `src/pipe_wrap.cc` picks the provider from the socket type before the
+    // constructor body runs, and the `AsyncWrap(env, object, provider)` base then
+    // resets, which allocates the first async id and emits the first `init`.
+    handle.state.async_wrap = rn_core::AsyncWrapState::uninitialised(PipeHandle::provider(kind));
 
     let object = args.this();
     install(scope, object, handle);
+    // After `install`, so a hook that reads `getAsyncId()` reaches installed
+    // state, which is the same ordering the TCP constructor uses.
+    crate::handle::with_handle(object, |handle| {
+        rn_bind_async_wrap::async_reset(scope, &mut handle.state.async_wrap, object, object, None);
+    });
     rv.set(object.into());
 }
 

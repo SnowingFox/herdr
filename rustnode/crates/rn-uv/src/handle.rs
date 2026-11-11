@@ -58,19 +58,6 @@ pub const K_LAST_WRITE_ERR: usize = 4;
 /// tests write from JavaScript and read back from Rust.
 pub const STREAM_BASE_STATE_FIELDS: usize = 5;
 
-/// The process-wide async id counter.
-///
-/// `AsyncWrap` in Node allocates from one monotonically increasing space, so a
-/// `TCP` handle and a `Timeout` never share an id and `async_hooks` can key on
-/// it. This is a process-global counter for the same reason: ids must be unique
-/// across handle kinds, not per binding.
-static NEXT_ASYNC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Allocates the next async id, matching `AsyncWrap::get_async_id()`'s source.
-pub fn next_async_id() -> u64 {
-    NEXT_ASYNC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Where the handle is in its lifecycle, mirroring `HandleWrap::State`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandleState {
@@ -103,17 +90,19 @@ pub struct StreamState {
     pub bytes_read: u64,
     /// Bytes handed to writes so far, `StreamResource::bytes_written_`.
     pub bytes_written: u64,
-    /// `AsyncWrap::get_async_id()`.
+    /// `AsyncWrap`'s id, trigger id and provider kind.
     ///
     /// Every wrapped handle in Node is an `AsyncWrap` with an id of its own, and
     /// `lib/net.js` reads it as `this._handle.getAsyncId()` to key the socket's
-    /// `async_id_symbol`. `newAsyncId()` exists as a fallback for a handle that
-    /// is not wrapped, and `net.js` line 224 uses it when the method is absent —
-    /// but `net.js` line 724 and the server paths call the method directly, so a
-    /// handle without it throws `getAsyncId is not a function` from inside
-    /// `Socket.connect`. Hence a real id, from the same allocator
-    /// `internalBinding('async_wrap')` hands out.
-    pub async_id: u64,
+    /// `async_id_symbol`. `AsyncReset` re-issues the id when a pooled socket is
+    /// reused, which is what `lib/internal/http/agent.js::asyncResetHandle` asks
+    /// for; keeping the three fields together is what makes that one state
+    /// transition rather than three that can disagree.
+    ///
+    /// The state is plain data because this crate must not depend on a binding;
+    /// the `AsyncReset` behaviour that advances it lives in `rn-bind-async-wrap`
+    /// and `rn-bind-tcp-wrap` calls it.
+    pub async_wrap: rn_core::AsyncWrapState,
     /// The object this state belongs to, rooted.
     ///
     /// Node keeps the reverse mapping (`handle[owner_symbol]`), which works
@@ -132,7 +121,7 @@ impl StreamState {
             on_read: None,
             bytes_read: 0,
             bytes_written: 0,
-            async_id: next_async_id(),
+            async_wrap: rn_core::AsyncWrapState::uninitialised(rn_core::async_wrap::PROVIDER_NONE),
             owner_object: None,
         }
     }
