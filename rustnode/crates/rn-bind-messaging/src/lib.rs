@@ -172,6 +172,13 @@ impl BindingModule for Messaging {
         let message_channel = install_message_channel(scope)?;
 
         let values: [(&str, v8::Local<v8::Value>); 10] = [
+            // `DOMException` and `QuotaExceededError` are Node's per-context
+            // scripts' exports, not classes built here. Node's own
+            // `CreatePerContextProperties` reads both off
+            // `GetPerContextExports`, so `internalBinding('messaging').DOMException`
+            // is the *same* constructor as the `DOMException` global — which is
+            // what makes `instanceof DOMException` hold across the two, and what
+            // makes `[kClone]` reachable when a DOMException is posted.
             ("DOMException", dom_exception_constructor(scope)),
             ("MessageChannel", message_channel),
             ("MessagePort", message_port),
@@ -447,6 +454,45 @@ pub fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     };
     let exception = v8::Exception::type_error(scope, text);
     scope.throw_exception(exception);
+}
+
+/// Throws `new DOMException(message, 'DataCloneError')`, Node's
+/// `ThrowDataCloneException`.
+///
+/// `node_messaging.cc` builds the exception from
+/// `GetDOMException(context)->NewInstance(context, {message, "DataCloneError"})`,
+/// which is the per-context class: `name` is `DataCloneError`, `code` is 25, and
+/// the object is an `Error`. `test-structuredClone-domexception.js` asserts on
+/// `name`, so the approximation this replaces (a `TypeError` with the same text)
+/// could not pass it.
+///
+/// When the per-context class is unavailable the message still has to surface, so
+/// the fallback is an ordinary `Error` carrying the same text rather than silence.
+#[doc(hidden)]
+pub fn throw_data_clone_exception(
+    scope: &mut v8::PinScope<'_, '_>,
+    message: v8::Local<'_, v8::Value>,
+) {
+    let Some(constructor) = per_context_export(scope, "DOMException") else {
+        let text = message
+            .to_string(scope)
+            .unwrap_or_else(|| v8::String::empty(scope));
+        let exception = v8::Exception::error(scope, text);
+        scope.throw_exception(exception);
+        return;
+    };
+    let Ok(constructor) = v8::Local::<v8::Function>::try_from(constructor) else {
+        return;
+    };
+    let Some(name) = v8::String::new(scope, "DataCloneError") else {
+        return;
+    };
+    // `NewInstance(context, 2, argv)`: the constructor takes
+    // `(message, options)` and a string second argument is the *name*.
+    let Some(exception) = constructor.new_instance(scope, &[message, name.into()]) else {
+        return;
+    };
+    scope.throw_exception(exception.into());
 }
 
 /// Sets `no_message_symbol` as the return value.
@@ -728,92 +774,63 @@ fn port_argument(
 // The rest of the namespace
 // ---------------------------------------------------------------------------
 
-/// A `DOMException` built the way the platform expects.
+/// `DOMException` from the per-context scripts, or a throwing placeholder.
 ///
-/// `lib/internal/util.js` uses this for `AbortSignal` and the web streams, so it
-/// needs `name`, `message` and `code` to behave.
+/// `lib/internal/util.js` and `lib/internal/abort_controller.js` both construct
+/// `internalBinding('messaging').DOMException`, and `internal/worker/clone_dom_exception.js`
+/// re-exports it. Node reads it off `GetPerContextExports`; this does the same
+/// through [`rn_core::per_context_exports`], so the binding hands back the very
+/// constructor the global is.
+///
+/// The placeholder is only reachable before the per-context scripts have run,
+/// which the bootstrap does not do: a namespace installed earlier would otherwise
+/// have to return `undefined` and every caller would fail somewhere unrelated.
+/// Throwing names the cause instead.
 fn dom_exception_constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
-    let template = v8::FunctionTemplate::builder(new_dom_exception).build(scope);
-    if let Some(name) = v8::String::new(scope, "DOMException") {
-        template.set_class_name(name);
-    }
-    match template.get_function(scope) {
-        Some(function) => function.into(),
-        None => v8::undefined(scope).into(),
-    }
-}
-
-fn new_dom_exception(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue,
-) {
-    let message = args
-        .get(0)
-        .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope))
-        .unwrap_or_default();
-    let name = args
-        .get(1)
-        .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope))
-        .unwrap_or_else(|| "Error".to_string());
-
-    let object = args.this();
-    let values: [(&str, String); 2] = [("message", message.clone()), ("name", name.clone())];
-    for (key, value) in values {
-        if let (Some(key), Some(text)) =
-            (v8::String::new(scope, key), v8::String::new(scope, &value))
-        {
-            object.set(scope, key.into(), text.into());
-        }
-    }
-    if let Some(key) = v8::String::new(scope, "code") {
-        object.set(scope, key.into(), v8::Integer::new(scope, 0).into());
-    }
-    rv.set(object.into());
+    per_context_export(scope, "DOMException").unwrap_or_else(|| placeholder_constructor(scope))
 }
 
 fn quota_exceeded_error<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
-    let template = v8::FunctionTemplate::builder(new_quota_exceeded_error).build(scope);
-    if let Some(name) = v8::String::new(scope, "QuotaExceededError") {
-        template.set_class_name(name);
-    }
-    match template.get_function(scope) {
-        Some(function) => function.into(),
-        None => v8::undefined(scope).into(),
+    per_context_export(scope, "QuotaExceededError")
+        .unwrap_or_else(|| placeholder_constructor(scope))
+}
+
+/// One export of the per-context scripts' `exports` object.
+fn per_context_export<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let exports = rn_core::per_context_exports(scope)?;
+    let key = v8::String::new(scope, name)?;
+    let value = exports.get(scope, key.into())?;
+    if value.is_function() {
+        Some(value)
+    } else {
+        None
     }
 }
 
-fn new_quota_exceeded_error(
+/// A constructor that throws, standing in for a per-context export that has not
+/// been produced yet.
+///
+/// Deliberately not a plausible `DOMException`: a plausible one is what made this
+/// bug invisible for so long, because it constructed fine and was simply not an
+/// `Error`.
+fn placeholder_constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
+    function(scope, "missingPerContextExport", missing_per_context_export)
+        .unwrap_or_else(|_| v8::undefined(scope).into())
+}
+
+fn missing_per_context_export(
     scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue,
 ) {
-    // A `QuotaExceededError` is a `DOMException` with a fixed name and code.
-    let message = args
-        .get(0)
-        .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope))
-        .unwrap_or_default();
-    let object = args.this();
-    if let (Some(key), Some(text)) = (
-        v8::String::new(scope, "message"),
-        v8::String::new(scope, &message),
-    ) {
-        object.set(scope, key.into(), text.into());
-    }
-    if let (Some(key), Some(text)) = (
-        v8::String::new(scope, "name"),
-        v8::String::new(scope, "QuotaExceededError"),
-    ) {
-        object.set(scope, key.into(), text.into());
-    }
-    if let Some(key) = v8::String::new(scope, "code") {
-        // QUOTA_EXCEEDED_ERR is 22 in the DOM spec.
-        object.set(scope, key.into(), v8::Integer::new(scope, 22).into());
-    }
-    rv.set(object.into());
+    throw_type_error(
+        scope,
+        "this class is an export of the internal/per_context scripts, \
+         which have not run in this context",
+    );
 }
 
 fn expose_lazy_dom_exception_property(
@@ -826,10 +843,10 @@ fn expose_lazy_dom_exception_property(
     // calls this during pre-execution, and `internal/blob.js` throws
     // `lazyDOMException(...)` from `arrayBuffer()` and the stream error path.
     //
-    // The constructor is installed eagerly rather than lazily because it is a
-    // single function template that `MessagePort` already needs: there is nothing
-    // to defer, and an accessor that only forwards to the constructor would add a
-    // getter to the startup path for no saving.
+    // The constructor is installed eagerly rather than lazily because it is the
+    // per-context scripts' `DOMException`, which the messaging namespace already
+    // has to resolve; there is nothing to defer, and an accessor that only
+    // forwards to it would add a getter to the startup path for no saving.
     let target = match v8::Local::<v8::Object>::try_from(args.get(0)) {
         Ok(target) => target,
         Err(_) => scope.get_current_context().global(scope),
@@ -842,7 +859,15 @@ fn expose_lazy_dom_exception_property(
     // non-enumerably, and `test/common/index.js` fails a test for any global
     // name it does not recognise when it walks `globalThis`. A `set` here made
     // `DOMException` visible to that walk.
-    let descriptor = v8::PropertyDescriptor::new_from_value_writable(constructor, true);
+    //
+    // The flags are Node's, read from the `globalThis` of a real binary:
+    // `{ writable: true, enumerable: false, configurable: true }`.
+    // `SetLazyDataProperty(..., DontEnum)` produces them, so configuring only
+    // the enumerable bit would leave `configurable: false` and break any
+    // test that replaces the global.
+    let mut descriptor = v8::PropertyDescriptor::new_from_value_writable(constructor, true);
+    descriptor.set_enumerable(false);
+    descriptor.set_configurable(true);
     if target
         .define_property(scope, key.into(), &descriptor)
         .is_none()
@@ -1084,157 +1109,60 @@ impl rn_core::host_object::TransferData for JsClone {
     }
 }
 
-/// The delegate `structuredClone` uses to serialize.
-///
-/// Node's `StructuredClone` goes through `Message::Serialize` with an empty
-/// transfer list, which means it uses the *same* `SerializerDelegate` as
-/// `postMessage` — host objects included. This mirrors that rather than using the
-/// "no host objects" delegate it used before, because that delegate is why a
-/// `BlockList` clone lost its handle: with `is_host_object` answering `Some(false)`
-/// for everything, V8 copied the enumerable properties of the wrapper and never
-/// asked for the clone payload.
-struct PlainSerializer<'a> {
-    host_objects: &'a RefCell<Vec<v8::Global<v8::Object>>>,
-}
-
-impl v8::ValueSerializerImpl for PlainSerializer<'_> {
-    fn has_custom_host_object(&self, _isolate: &v8::Isolate) -> bool {
-        // Same reason as the `postMessage` delegate: the decision belongs to the
-        // transfer-mode marking, not to V8 counting embedder fields.
-        true
-    }
-
-    fn throw_data_clone_error<'s>(
-        &self,
-        scope: &mut v8::PinScope<'s, '_>,
-        message: v8::Local<'s, v8::String>,
-    ) {
-        // V8 gives the message; the exception type is the platform's.
-        let exception = v8::Exception::error(scope, message);
-        scope.throw_exception(exception);
-    }
-
-    fn is_host_object<'s>(
-        &self,
-        scope: &mut v8::PinScope<'s, '_>,
-        object: v8::Local<'s, v8::Object>,
-    ) -> Option<bool> {
-        Some(
-            crate::port_state_of(scope, object).is_some()
-                || rn_core::host_object::is_registered(scope, object)
-                || js_marked(scope, object),
-        )
-    }
-
-    fn write_host_object<'s>(
-        &self,
-        scope: &mut v8::PinScope<'s, '_>,
-        object: v8::Local<'s, v8::Object>,
-        serializer: &dyn v8::ValueSerializerHelper,
-    ) -> Option<bool> {
-        // `structuredClone` has no transfer list, so a transferable-only object
-        // cannot be cloned — Node throws here too, with this text.
-        if crate::port_state_of(scope, object).is_some() {
-            throw_type_error(
-                scope,
-                "Object that needs transfer was found in message but not listed in transferList",
-            );
-            return None;
-        }
-        let mode = rn_core::host_object::transfer_mode(scope, object)
-            .or_else(|| js_transfer_mode(scope, object));
-        let Some(mode) = mode else {
-            throw_type_error(scope, "Cannot clone object of unsupported type.");
-            return None;
-        };
-        if !mode.is_cloneable() {
-            throw_type_error(
-                scope,
-                "Object that needs transfer was found in message but not listed in transferList",
-            );
-            return None;
-        }
-        let id = {
-            let mut host_objects = self.host_objects.borrow_mut();
-            host_objects.push(v8::Global::new(scope, object));
-            host_objects.len() as u32 - 1
-        };
-        serializer.write_uint32(id);
-        Some(true)
-    }
-}
-
-fn structured_clone(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+fn structured_clone<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
     let value = args.get(0);
-    let host_objects = RefCell::new(Vec::new());
-    let serializer = v8::ValueSerializer::new(
-        scope,
-        Box::new(PlainSerializer {
-            host_objects: &host_objects,
-        }),
-    );
-    // `WriteHeader` before the value, matching `Message::Serialize`. It is not
-    // cosmetic: `ReadValue` picks V8's legacy whole-buffer reader when the
-    // wire-format version is 0, and that reader refuses the clone data appended
-    // after the payload, so a clone carrying any `data` would fail to read back.
-    v8::ValueSerializerHelper::write_header(&serializer);
-    let Some(true) = serializer.write_value(scope.get_current_context(), value) else {
-        // V8 has already thrown, which is what `structuredClone` should do for
-        // an uncloneable value (a function, a WeakMap, a symbol).
-        return;
+    // `structuredClone(value, options)` goes through `Message::Serialize` and
+    // `Message::Deserialize` in Node, with `options.transfer` as the transfer
+    // list — the same machinery `postMessage` uses. Doing it any other way makes
+    // a transfer silently a copy, and `test-structuredClone-domexception.js`
+    // asserts that transferring a `DOMException` throws.
+    let transfer_list = transfer_list_from_options(scope, args.get(1));
+    let message = match serialize::serialize(scope, value, transfer_list) {
+        Ok((message, _ports)) => message,
+        Err(Some(reason)) => {
+            throw_data_clone_exception_str(scope, &reason);
+            return;
+        }
+        // V8 already scheduled the exception.
+        Err(None) => return,
     };
-
-    // `SerializerDelegate::Finish`, which interleaves the clone hook with the
-    // write of its data, exactly as `serialize::serialize` does. Both halves have
-    // to be in one loop because writing a `[kClone]` payload can reach *more* host
-    // objects — a `BlockList` wrapper's payload is `{ handle }`, and that handle is
-    // a cloneable native object of its own — so the vector grows while it is
-    // walked.
-    let mut clones: Vec<Rc<dyn rn_core::host_object::TransferData>> = Vec::new();
-    let mut index = 0;
-    loop {
-        let count = host_objects.borrow().len();
-        if index >= count {
-            break;
-        }
-        let object = {
-            let slots = host_objects.borrow();
-            match slots.get(index) {
-                Some(object) => v8::Local::new(scope, object),
-                None => continue,
-            }
-        };
-        let clone = rn_core::host_object::clone_for_messaging(scope, object)
-            .or_else(|| js_clone_for_messaging(scope, object));
-        let Some(clone) = clone else {
-            return;
-        };
-        if !clone.write_data(scope, &serializer) {
-            return;
-        }
-        clones.push(clone);
-        index += 1;
-    }
-
-    let data = serializer.release();
-    drop(serializer);
-
-    let message = crate::port::Message::new(data, Vec::new(), Vec::new(), clones, 0);
     match deserialize::deserialize(scope, &message) {
         Ok(deserialized) => rv.set(deserialized.value),
         Err(()) => {
-            // A read failure means the bytes were malformed, which cannot
-            // happen from a clone we just wrote; throwing keeps it visible.
             throw_type_error(
                 scope,
                 "structuredClone: the serialized value could not be read back",
             );
         }
     }
+}
+
+/// `options.transfer`, or `undefined` when there is no options object.
+fn transfer_list_from_options<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    options: v8::Local<'s, v8::Value>,
+) -> v8::Local<'s, v8::Value> {
+    let Ok(options) = v8::Local::<v8::Object>::try_from(options) else {
+        return v8::undefined(scope).into();
+    };
+    let Some(key) = v8::String::new(scope, "transfer") else {
+        return v8::undefined(scope).into();
+    };
+    options
+        .get(scope, key.into())
+        .unwrap_or_else(|| v8::undefined(scope).into())
+}
+
+/// [`throw_data_clone_exception`] for a Rust-side message.
+pub(crate) fn throw_data_clone_exception_str(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    throw_data_clone_exception(scope, text.into());
 }
 
 // ---------------------------------------------------------------------------

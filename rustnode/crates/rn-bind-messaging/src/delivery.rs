@@ -50,18 +50,36 @@ pub fn install_emit_message<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     load: impl FnOnce(&mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>>,
 ) -> Result<(), String> {
+    // Node's `GetEmitMessageFunction` reads `emitMessage` off
+    // `GetPerContextExports`: `internal/per_context/messageport` already ran
+    // during the realm bootstrap and put it there. Taking the same path means one
+    // compile per realm and one `exports` object, so the function a port delivers
+    // through is the one the bootstrap produced.
+    if let Some(exports) = rn_core::per_context_exports(scope) {
+        if let Some(emit) = function_named(scope, exports, "emitMessage") {
+            EMIT_MESSAGE.with(|slot| *slot.borrow_mut() = Some(v8::Global::new(scope, emit)));
+            return Ok(());
+        }
+    }
+
     let function = load(scope).ok_or("internal/per_context/messageport could not be compiled")?;
 
     // The kind is `kPerContextScript`, whose parameters are
     // `(exports, primordials, privateSymbols, perIsolateSymbols)`.
+    //
+    // `messageport.js` reads only `SymbolFor` from `primordials` at module scope,
+    // but the two symbol objects are supplied from the same builders the
+    // bootstrap uses anyway: passing an empty object is how the per-context
+    // scripts came to be run against missing globals in the first place, and a
+    // script that starts reading one of them would fail here rather than
+    // silently see `undefined`.
     let exports = v8::Object::new(scope);
-    // `messageport.js` reads `SymbolFor` from `primordials` at module scope, and
-    // nothing else from the two symbol tables there, so empty objects are the
-    // correct argument for the latter pair.
     let primordials = primordials_from_global(scope)
         .ok_or("the primordials global is missing; the realm bootstrap has not run")?;
-    let private_symbols = v8::Object::new(scope);
-    let per_isolate_symbols = v8::Object::new(scope);
+    let private_symbols = rn_core::private_symbols_object(scope)
+        .map_err(|reason| format!("cannot build privateSymbols: {reason}"))?;
+    let per_isolate_symbols = rn_core::per_isolate_symbols_object(scope)
+        .map_err(|reason| format!("cannot build perIsolateSymbols: {reason}"))?;
 
     let arguments = [
         exports.into(),
@@ -80,16 +98,21 @@ pub fn install_emit_message<'s>(
         return Err(format!("internal/per_context/messageport threw: {message}"));
     }
 
-    let Some(key) = v8::String::new(scope, "emitMessage") else {
-        return Err("cannot allocate the emitMessage key".to_string());
-    };
-    let Some(value) = exports.get(scope, key.into()) else {
-        return Err("internal/per_context/messageport has no emitMessage".to_string());
-    };
-    let emit = v8::Local::<v8::Function>::try_from(value)
-        .map_err(|_| "emitMessage is not a function".to_string())?;
+    let emit = function_named(scope, exports, "emitMessage")
+        .ok_or("internal/per_context/messageport has no emitMessage")?;
     EMIT_MESSAGE.with(|slot| *slot.borrow_mut() = Some(v8::Global::new(scope, emit)));
     Ok(())
+}
+
+/// `object[name]` when it is a function.
+fn function_named<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let key = v8::String::new(scope, name)?;
+    let value = object.get(scope, key.into())?;
+    v8::Local::<v8::Function>::try_from(value).ok()
 }
 
 /// Reads the `primordials` global the realm bootstrap installs.

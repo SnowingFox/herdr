@@ -272,24 +272,65 @@ globals are simply not wired, because `internal/bootstrap/node.js` never runs
 in this build. `util.inspect`'s own test needs `ReadableStream`, and is the one
 remaining failure in the Node test smoke set.
 
-### `DOMException` is not a real `Error` subclass
+### `DOMException` is now Node's per-context class (fixed 2026-11-11)
 
-`new DOMException('m','N')` reports `[object Object]` and `instanceof Error`
-is `false`; Node gives `[object DOMException]` and `true`. The properties are
-data properties on the instance rather than prototype accessors, so
-`util.inspect` renders `{}` where Node renders `[object DOMException] { ... }`.
+Recorded here because it was a divergence for a long time and the *shape* of the
+bug is the reusable lesson, not the fix.
 
-Node's own implementation is `lib/internal/per_context/domexception.js`, which
-is vendored and correct. It cannot be `require`d, because it reads `primordials`
-and `privateSymbols` as bare globals — it has to be *called* with those injected,
-the way `run_per_context` already calls `primordials.js`.
+`new DOMException('m','N')` reported `[object Object]`, `instanceof Error` was
+`false`, and `code` was always `0`; Node gives `[object DOMException]`, `true`,
+and the code table's value. The properties were data properties on the instance
+rather than prototype accessors, so `util.inspect` rendered `{}`. `util.inspect`
+and the WebCrypto and `QuotaExceededError` tests were failing on this alone.
 
-The missing piece is small and specific: `run_per_context` in
-`crates/rn-cli/src/bootstrap.rs` builds a `private_symbols` object and passes it
-as an argument, but never exposes it as a global, so `domexception.js` has
-nothing to read. Exposing it, then running that file through the same path,
-should let the vendored implementation replace the hand-built one.
+**The cause was not `DOMException`.** `run_per_context` in
+`crates/rn-cli/src/bootstrap.rs` ran only `internal/per_context/primordials` and
+handed it empty objects in place of Node's `privateSymbols` and
+`perIsolateSymbols`. `internal/per_context/domexception.js` is vendored and
+correct, but it destructures `transfer_mode_private_symbol` from the first table
+and `messaging_clone_symbol` + `messaging_deserialize_symbol` from the second, and
+defines those last two as methods on one prototype. With the tables empty both
+methods landed on the string key `"undefined"` and the second replaced the
+first — so the class would have constructed and silently failed to clone. It
+never got that far, because the file was not run at all: `DOMException` came from
+a hand-built V8 function template in `rn-bind-messaging`.
 
-Two workers independently hit this and both reverted their attempts rather than
-leave half-working surgery, which is why it is recorded here rather than guessed
-at in the code.
+**The fix.** `run_per_context` now runs all three files in Node's order, with the
+arguments `InitializePrimordials` passes, and stores the shared `exports` object
+on the context under the private key `node:per_context_binding_exports` the way
+`GetPerContextExports` does. `rn_core::private_symbols_object` and
+`rn_core::per_isolate_symbols_object` build the two tables from the single
+`PER_ISOLATE_*` tables in `rn_core`, and `internalBinding('messaging')` reads
+`DOMException` and `QuotaExceededError` back out of the stored exports instead of
+building its own — so the binding and the global are the same constructor, which
+`instanceof` across them requires.
+
+**The general lesson, which is why this is written down.** A per-realm global that
+is silently absent does not fail at its own site. It fails wherever an
+`undefined` is used as a key or a value, which is far from the missing binding.
+This project has now hit that twice: `util.privateSymbols` installed 4 of Node's
+22 entries and every missing one collapsed onto the string key `"undefined"`
+(which made a child `Module` read its parent's object as its own source), and
+this case, where two prototype methods collapsed onto one key.
+
+The audit that prevents a third: `rn_core::PER_ISOLATE_SYMBOLS` and
+`PRIVATE_SYMBOLS` are each pinned against their contract file by a test, so a
+re-pin that adds an entry fails rather than silently omitting it, and
+`per_isolate_symbol_description` refuses a name outside the table instead of
+handing out a fresh identity.
+
+A second bug surfaced only once the file ran: `internalBinding('symbols')` was
+keyed by the C++ member name, but `node_symbols.cc` keys it by the symbol's
+*description*. `lib/internal/worker/io.js` destructures `handle_onclose`, so it
+was getting `undefined` and passing it to `ObjectDefineProperty` as a property
+key, which throws at module scope — `require('internal/worker/io')` failed and
+took 226 test files with it. The table in `rn_core` now carries the member name
+and the description as separate fields and the namespace installs the
+description.
+
+Measured: `test-domexception-cause.js`, `test-domexception-subclass.js`,
+`test-global-domexception.js`, `test-quotaexceedederror.js`,
+`test-structuredClone-domexception.js`, `test-util-inspect.js` and
+`test-webcrypto-random.js` all went from fail to pass, with no file regressing.
+`tools/per-context-control.sh` is the negative control: 7 of its 8 checks fail
+against the pre-fix binary and all 8 pass against this one.

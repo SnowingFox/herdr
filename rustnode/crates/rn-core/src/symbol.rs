@@ -160,6 +160,124 @@ pub const PRIVATE_SYMBOLS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Every `PER_ISOLATE_SYMBOL_PROPERTIES` entry, as
+/// `(the C++ member name, the description `internalBinding('symbols')` exposes)`.
+///
+/// Copied from `src/env_properties.h` at the pinned revision. Three descriptions
+/// differ from the member name — `handle_onclose_symbol` is described
+/// `handle_onclose` — because `node_symbols.cc` keys the namespace by the
+/// *description*, so `internalBinding('symbols').handle_onclose` is the exposed
+/// spelling while `env->handle_onclose_symbol()` is the C++ member.
+///
+/// These are identities, not names. `lib/internal/worker/js_transferable.js`
+/// writes an object mark under `messaging_clone_symbol` and `node_messaging.cc`
+/// reads it back, and `internal/per_context/domexception.js` defines one method
+/// per symbol on a single prototype, so a table that handed out a fresh symbol
+/// per call — or that omitted an entry — would make the write invisible to the
+/// read. Both consumers resolve through [`symbol`], which is what keeps them
+/// agreeing.
+pub const PER_ISOLATE_SYMBOLS: &[(&str, &str)] = &[
+    ("fs_use_promises_symbol", "fs_use_promises_symbol"),
+    ("async_id_symbol", "async_id_symbol"),
+    ("ffi_sb_shared_buffer_symbol", "ffi_sb_shared_buffer_symbol"),
+    ("ffi_sb_invoke_slow_symbol", "ffi_sb_invoke_slow_symbol"),
+    ("ffi_sb_arguments_symbol", "ffi_sb_arguments_symbol"),
+    ("ffi_sb_return_symbol", "ffi_sb_return_symbol"),
+    ("constructor_key_symbol", "constructor_key_symbol"),
+    ("handle_onclose_symbol", "handle_onclose"),
+    ("no_message_symbol", "no_message_symbol"),
+    (
+        "messaging_deserialize_symbol",
+        "messaging_deserialize_symbol",
+    ),
+    ("imported_cjs_symbol", "imported_cjs_symbol"),
+    ("messaging_transfer_symbol", "messaging_transfer_symbol"),
+    ("messaging_clone_symbol", "messaging_clone_symbol"),
+    (
+        "messaging_transfer_list_symbol",
+        "messaging_transfer_list_symbol",
+    ),
+    ("oninit_symbol", "oninit"),
+    ("owner_symbol", "owner_symbol"),
+    ("onpskexchange_symbol", "onpskexchange"),
+    ("resource_symbol", "resource_symbol"),
+    ("trigger_async_id_symbol", "trigger_async_id_symbol"),
+    (
+        "builtin_source_text_module_hdo",
+        "builtin_source_text_module_hdo",
+    ),
+    ("embedder_module_hdo", "embedder_module_hdo"),
+    (
+        "source_text_module_default_hdo",
+        "source_text_module_default_hdo",
+    ),
+    ("vm_context_no_contextify", "vm_context_no_contextify"),
+    (
+        "vm_dynamic_import_default_internal",
+        "vm_dynamic_import_default_internal",
+    ),
+    (
+        "vm_dynamic_import_main_context_default",
+        "vm_dynamic_import_main_context_default",
+    ),
+    (
+        "vm_dynamic_import_missing_flag",
+        "vm_dynamic_import_missing_flag",
+    ),
+    (
+        "vm_dynamic_import_no_callback",
+        "vm_dynamic_import_no_callback",
+    ),
+];
+
+/// Returns the per-isolate symbol described as `description`, creating it once.
+///
+/// The description is the identity, because that is what
+/// `PER_ISOLATE_SYMBOL_PROPERTIES` passes to `v8::Symbol` in Node and what the
+/// table above records for both symbol properties. Two names may share a
+/// description in Node's table — they never do — so this is safe, and a caller
+/// that has only the exposed name (rather than the description) should look it up
+/// through [`per_isolate_symbol`].
+pub fn symbol_by_description<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    description: &'static str,
+) -> v8::Local<'s, v8::Symbol> {
+    symbol(scope, description)
+}
+
+/// The description `internalBinding('symbols')` exposes as `name`, if any.
+///
+/// Node's `node_symbols.cc` sets each property of that namespace under
+/// `env->PropertyName()->Description(...)`, **not** under the C++ member name, so
+/// the exposed spelling is whatever `PER_ISOLATE_SYMBOL_PROPERTIES` passes as the
+/// second tuple element. Three members rename themselves that way —
+/// `handle_onclose_symbol` is exposed as `handle_onclose` — and `io.js`
+/// destructures `handle_onclose`, so a table keyed by the member name installs
+/// `handle_onclose_symbol` and leaves the destructured binding `undefined`.
+///
+/// That `undefined` then became the property key in
+/// `ObjectDefineProperty(MessagePort.prototype, handleOnCloseSymbol, ...)`, which
+/// is a `TypeError` at module scope: `undefined` has no descriptor to redefine.
+pub fn per_isolate_symbol_description(name: &str) -> Option<&'static str> {
+    PER_ISOLATE_SYMBOLS
+        .iter()
+        .find(|(_, description)| *description == name)
+        .map(|(_, description)| *description)
+}
+
+/// The per-isolate symbol `internalBinding('symbols')` exposes as `name`.
+///
+/// Returns `None` for a name outside [`PER_ISOLATE_SYMBOLS`]: that is a
+/// programming mistake rather than a runtime condition, and answering with a
+/// fresh symbol would be the silent-identity bug the table exists to prevent.
+pub fn per_isolate_symbol<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Symbol>> {
+    let description = per_isolate_symbol_description(name)?;
+    Some(symbol(scope, description))
+}
+
 /// Defines `key` on `object` so the mark stays out of enumeration.
 ///
 /// Non-enumerable, non-writable and non-configurable: `for..in`, `Object.keys` and
@@ -256,6 +374,111 @@ mod tests {
             before,
             descriptions.len(),
             "two private symbols share a description, so they would resolve to one identity"
+        );
+    }
+
+    #[test]
+    fn every_contract_per_isolate_symbol_is_in_the_table() {
+        // `contracts/symbols.json` is the recorded shape of
+        // `internalBinding('symbols')`. The same argument as the private table
+        // applies, one step worse: `internal/per_context/domexception.js`
+        // defines `[messaging_clone_symbol]` and `[messaging_deserialize_symbol]`
+        // on one prototype, so two missing entries collapse onto the string key
+        // `"undefined"` and the second method silently replaces the first.
+        let contract = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../contracts/symbols.json"),
+        )
+        .expect("contracts/symbols.json is readable");
+        let contract: serde_json::Value =
+            serde_json::from_str(&contract).expect("contracts/symbols.json is valid JSON");
+        let recorded = contract["members"]
+            .as_object()
+            .expect("the symbols contract has a members object");
+
+        // The namespace is keyed by *description*, so that is the spelling the
+        // contract records and the one to compare against.
+        let installed: Vec<&str> = PER_ISOLATE_SYMBOLS
+            .iter()
+            .map(|(_, description)| *description)
+            .collect();
+        let mut missing: Vec<&str> = Vec::new();
+        for name in recorded.keys() {
+            if !installed.contains(&name.as_str()) {
+                missing.push(name.as_str());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "per-isolate symbols recorded in the contract but not installed: {missing:?}"
+        );
+        assert_eq!(
+            installed.len(),
+            recorded.len(),
+            "the table must not install names the contract does not record"
+        );
+    }
+
+    #[test]
+    fn the_per_isolate_table_has_no_collapsing_identities() {
+        // Two entries with the same description would be one `v8::Symbol`, so a
+        // write through `messaging_clone_symbol` would be readable as
+        // `messaging_deserialize_symbol`. Node's table has no such pair.
+        let mut descriptions: Vec<&str> = PER_ISOLATE_SYMBOLS
+            .iter()
+            .map(|(_, description)| *description)
+            .collect();
+        let total = descriptions.len();
+        descriptions.sort_unstable();
+        descriptions.dedup();
+        assert_eq!(
+            total,
+            descriptions.len(),
+            "two per-isolate symbols share a description, so they are one identity"
+        );
+        // And the descriptions are what Node passes to `v8::Symbol`, so they must
+        // all be non-empty or two of them would collapse anyway.
+        assert!(
+            PER_ISOLATE_SYMBOLS
+                .iter()
+                .all(|(_, description)| !description.is_empty()),
+            "an empty description makes every such symbol the same identity"
+        );
+    }
+
+    #[test]
+    fn the_per_isolate_lookup_reaches_every_recorded_name() {
+        // `per_isolate_symbol` is what `internalBinding('symbols')` uses, and
+        // `internal/per_context/domexception.js` destructures two of these names
+        // from `perIsolateSymbols`. A description in the table that the lookup
+        // cannot resolve would be a member the namespace claims and never
+        // installs — or installs under a name `lib/**` never destructures.
+        for (member, description) in PER_ISOLATE_SYMBOLS {
+            assert_eq!(
+                per_isolate_symbol_description(description),
+                Some(*description),
+                "the lookup does not reach the exposed name {description} \
+                 (member {member})"
+            );
+        }
+        assert_eq!(per_isolate_symbol_description("not_a_symbol"), None);
+        // The three whose member name and exposed name differ, pinned so a copy
+        // error cannot silently rename `internalBinding('symbols')`'s
+        // `handle_onclose` into `handle_onclose_symbol`.
+        assert_eq!(
+            per_isolate_symbol_description("handle_onclose"),
+            Some("handle_onclose")
+        );
+        assert_eq!(per_isolate_symbol_description("oninit"), Some("oninit"));
+        assert_eq!(
+            per_isolate_symbol_description("onpskexchange"),
+            Some("onpskexchange")
+        );
+        // And the C++ spellings are genuinely not exposed: `io.js` destructures
+        // `handle_onclose`, so resolving the member name would install a property
+        // nothing asks for.
+        assert_eq!(
+            per_isolate_symbol_description("handle_onclose_symbol"),
+            None
         );
     }
 }

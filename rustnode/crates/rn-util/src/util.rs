@@ -275,17 +275,18 @@ fn install_predicates(scope: &mut v8::PinScope, object: v8::Local<v8::Object>) {
 /// and `internal/errors` stores an arrow message the same way. Both come from
 /// the shared table in `rn_core`, so the crate that writes a mark and the one
 /// that reads it agree on the key.
+///
+/// The object itself is built by [`rn_core::private_symbols_object`], the same
+/// function `run_per_context` gives `internal/per_context/domexception` as its
+/// `privateSymbols` argument. Two builders would be two chances to drop an
+/// entry, and the copy under `util` is the one `lib/**` destructures. It has a
+/// null prototype, as Node's `ObjectTemplate::NewInstance` + `SetPrototype(Null)`
+/// produces, so a missing name reads `undefined` rather than something inherited.
 fn install_symbols<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<v8::Object>,
 ) -> Result<(), String> {
-    let private = v8::Object::new(scope);
-    for (name, description) in rn_core::PRIVATE_SYMBOLS {
-        let symbol = rn_core::symbol(scope, description);
-        let key = v8::String::new(scope, name)
-            .ok_or_else(|| format!("cannot allocate the private symbol key {name}"))?;
-        private.set(scope, key.into(), symbol.into());
-    }
+    let private = rn_core::private_symbols_object(scope)?;
     let key =
         v8::String::new(scope, "privateSymbols").ok_or("cannot allocate the privateSymbols key")?;
     object.set(scope, key.into(), private.into());
