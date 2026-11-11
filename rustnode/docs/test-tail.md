@@ -7,8 +7,28 @@ files out of 5666, from a full baseline run of 2803 passing (49.5%).
 Treat the sizes as relative priority, not as a promise that fixing one closes
 exactly that many files: many carry more than one failure.
 
+## Read this before quoting a number
 
-## Headline numbers
+**The 2803/5666 (49.5%) baseline in this file is stale.** Re-measured on
+`origin/master` at `27d67077` with a frozen baseline binary, the suite is
+**3733 of 5666 files passing (65.9%)**, 930 files higher. The per-cluster sizes
+below were counted against the old snapshot, so they overstate what is left in
+the clusters that have since moved and remain useful only as relative priority.
+
+The current rates that matter for remaining work are `crypto` 15.9%, `tls` 7.3%
+and `https` 2.7%, against `http` at 90.0% for contrast. Those three are the
+lowest-rate clusters of any size, and they are the subject of the TLS and
+asymmetric crypto workstream.
+
+Two procedure details when re-measuring. Freeze the binary first and use a
+separate result directory: `rn-harness report` keeps the newest outcome per file
+per directory, so a rebuilt binary in the same directory silently mixes before
+and after. And the Node test tree must be the pin: `f344e7f552e` is a full
+40-character SHA, so `git fetch --depth 1 origin <full-sha>` into an empty repo
+plus `sparse-checkout set test` is what works; without `--tests` the wrapper
+clones Node's default branch and the numbers are not comparable.
+
+## Headline numbers from the original snapshot
 
 | measure | before | after |
 | --- | --- | --- |
