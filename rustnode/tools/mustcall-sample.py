@@ -124,10 +124,20 @@ def parse_log(path: Path) -> tuple[int, int, int, list[str]]:
                 continue
             kind = record.get("k")
             if kind == "expect":
-                expected[record["id"]] = (
-                    record.get("kind", ""),
-                    record.get("expected", 1),
-                )
+                # `expected` is whatever the instrument wrote, which is the count
+                # `mustCall`/`mustCallAtLeast` received. It is a number for every
+                # call `test/common/index.js` accepts — that function throws on a
+                # non-numeric criteria — but the instrument copies the argument
+                # verbatim, so a caller reaching it by another route can log an
+                # object. Comparing one against a count raised `TypeError:
+                # '<' not supported between instances of 'int' and 'dict'` on the
+                # `minimum` path, which aborted the whole sample rather than
+                # skipping one row. Keep the numeric rows and drop the rest: a
+                # row this tool cannot interpret is not evidence either way.
+                want = record.get("expected", 1)
+                if not isinstance(want, int) or isinstance(want, bool):
+                    continue
+                expected[record["id"]] = (record.get("kind", ""), want)
             elif kind == "hit":
                 hits[record["id"]] = hits.get(record["id"], 0) + 1
     unsatisfied = 0
