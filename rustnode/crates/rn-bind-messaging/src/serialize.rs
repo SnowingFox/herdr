@@ -555,6 +555,7 @@ mod tests {
         let message = Message::new(
             Vec::new(),
             Vec::new(),
+            Vec::new(),
             vec![port_a.clone(), port_b.clone(), clone_a.clone()],
             2,
         );
