@@ -664,6 +664,12 @@ fn read_stop(
 }
 
 /// `StreamBase::Shutdown`: end this stream's writable side.
+///
+/// Marking the record `ended` is what lets the *existing* provider report
+/// `NGHTTP2_DATA_FLAG_EOF` on its next read, which is how END_STREAM reaches the
+/// wire. Submitting a second provider here instead was the bug: nghttp2 answers
+/// `NGHTTP2_ERR_DATA_EXIST` and the first provider never learns the body is
+/// complete.
 fn shutdown(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -681,20 +687,21 @@ fn shutdown(
     if let Some(record) = state.streams.borrow_mut().get_mut(&id) {
         record.ended = true;
     }
-    let provider = provider::Provider::end_stream();
-    // SAFETY: `raw` is live and the provider outlives the call.
-    let status = unsafe {
-        ffi::nghttp2_submit_data2(raw, ffi::NGHTTP2_FLAG_END_STREAM, id, provider.as_ptr())
-    };
+    // SAFETY: `raw` is live and `id` is a stream this session owns.
+    let status = unsafe { ffi::nghttp2_session_resume_data(raw, id) };
     crate::session::schedule_write(state);
     if let Ok(request) = v8::Local::<v8::Object>::try_from(args.get(0)) {
-        rn_bind_stream_wrap::wrap::report_completion(scope, request, status, None, None);
+        rn_bind_stream_wrap::wrap::report_completion(scope, request, 0, None, None);
     }
-    rv.set(v8::Integer::new(scope, status).into());
+    // `shutdownWritable` reads `1` as "finished synchronously" and only then runs
+    // `afterShutdown`, which is what emits `'finish'` on the writable side.
+    // nghttp2's `0` means "queued", and the completion above has already run, so
+    // there is nothing left to wait for.
+    let finished = if status >= 0 { 1 } else { status };
+    rv.set(v8::Integer::new(scope, finished).into());
 }
 
-/// `StreamBase::Writev`, which `stream_base_commons.js` reaches when the chunk
-/// is a buffer list.
+/// `StreamBase::Writev`, which `stream_base_commons.js` reaches for a chunk list.
 fn writev(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -705,8 +712,6 @@ fn writev(
     };
     let mut bytes = Vec::new();
     if let Ok(array) = v8::Local::<v8::Array>::try_from(args.get(1)) {
-        // `allBuffers` is the third argument; `core.js` passes `true` from
-        // `writeGeneric`, so every entry is a buffer and the array is flat.
         let all_buffers = args.get(2).boolean_value(scope);
         let stride = if all_buffers { 1 } else { 2 };
         let count = (array.length() as usize) / stride;
@@ -728,10 +733,9 @@ fn writev(
 
 /// The four `write*String` forms, which differ only in encoding.
 ///
-/// `writeGeneric` in `lib/internal/stream_base_commons.js` reaches these for a
-/// string chunk, and which one it picks depends on the encoding the caller asked
-/// for — so all four have to exist or a plain `stream.end('text')` fails with
-/// "is not a function".
+/// `writeGeneric` in `lib/internal/stream_base_commons.js` picks one by the
+/// encoding the caller asked for, so all four have to exist or a plain
+/// `stream.end('text')` fails with "is not a function".
 fn write_string(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -742,7 +746,6 @@ fn write_string(
         return;
     };
     let Ok(text) = v8::Local::<v8::String>::try_from(args.get(1)) else {
-        let _ = scope;
         return;
     };
     let length = text.length();
@@ -812,7 +815,14 @@ fn write_buffer(
     queue_write(scope, args.this(), id, bytes, args.get(0), &mut rv);
 }
 
-/// Submits `bytes` as a DATA frame on `id`.
+/// Appends `bytes` to the stream's body queue and asks nghttp2 to read again.
+///
+/// Deliberately does **not** submit a provider. `respond()` and `request()` each
+/// submit exactly one, and nghttp2 rejects a second with `NGHTTP2_ERR_DATA_EXIST`
+/// (`-529`) — which is what a `shutdown()` after a write was hitting, so the body
+/// went out with END_STREAM unset and the peer waited for a terminator that never
+/// came. `nghttp2_session_resume_data` is how more bytes are offered to the
+/// existing provider after it reported `NGHTTP2_ERR_DEFERRED`.
 fn queue_write(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
@@ -827,18 +837,20 @@ fn queue_write(
     let Some(raw) = crate::session_ptr(state) else {
         return;
     };
+    let length = bytes.len();
     if let Some(record) = state.streams.borrow_mut().get_mut(&id) {
         record.pending.extend_from_slice(&bytes);
+        record.sent_bytes += length as u64;
     }
-    let provider = provider::Provider::new(state, id, 0);
-    // SAFETY: `raw` is live and the provider outlives the call.
-    let status =
-        unsafe { ffi::nghttp2_submit_data2(raw, ffi::NGHTTP2_FLAG_NONE, id, provider.as_ptr()) };
+    // Wakes the provider that is already installed, which is what makes the
+    // deferred read happen rather than waiting for the next frame to arrive.
+    // SAFETY: `raw` is live and `id` is a stream this session owns.
+    let status = unsafe { ffi::nghttp2_session_resume_data(raw, id) };
     crate::session::schedule_write(state);
     if let Ok(request) = v8::Local::<v8::Object>::try_from(request) {
-        rn_bind_stream_wrap::wrap::report_completion(scope, request, status, None, None);
+        rn_bind_stream_wrap::wrap::report_completion(scope, request, 0, None, None);
     }
-    rv.set(v8::Integer::new(scope, status).into());
+    rv.set(v8::Integer::new(scope, status.max(0)).into());
 }
 
 /// `StreamBase::UseUserBuffer`, which an HTTP/2 stream does not support.

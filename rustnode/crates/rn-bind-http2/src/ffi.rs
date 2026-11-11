@@ -656,6 +656,8 @@ extern "C" {
     pub fn nghttp2_stream_get_sum_dependency_weight(stream: *mut nghttp2_stream) -> i32;
     /// `nghttp2_stream_get_state`.
     pub fn nghttp2_stream_get_state(stream: *mut nghttp2_stream) -> c_int;
+    /// `nghttp2_session_resume_data`.
+    pub fn nghttp2_session_resume_data(session: *mut nghttp2_session, stream_id: i32) -> c_int;
     /// `nghttp2_session_set_user_data`.
     pub fn nghttp2_session_set_user_data(session: *mut nghttp2_session, user_data: *mut c_void);
     /// `nghttp2_session_get_stream`.

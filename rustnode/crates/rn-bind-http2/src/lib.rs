@@ -112,25 +112,20 @@ pub const DEFERRED: &[(&str, &str)] = &[];
 /// smuggled into the member list.
 pub const KNOWN_GAPS: &[(&str, &str)] = &[
     (
-        "the readable side never emits 'end'",
-        "`on_stream_close` is the only thing that can end a stream's readable \
-         side, and nghttp2 does not deliver it while the outbound side still has \
-         an open DATA provider — so on a client stream the response body arrives \
-         and `'end'` never does. `core.js` gates every cleanup path on \
-         `_readableState.ended`, so the session is never destroyed, its socket \
-         stays ref'd and the process cannot exit. This is the 90 timeouts and it \
-         is *one* bug, not a family: it needs the provider to report EOF through \
-         `StreamBase` rather than from the pending queue, which is where the \
-         pull/pause protocol has to come from",
-    ),
-    (
         "socket teardown on destroy()",
         "`Http2Session.destroy()` calls `this.ondone` (finishSessionClose) and the \
          nghttp2 session is freed, but the consumed socket's libuv handle is not \
-         closed, so a process that destroys a session with a live connection does \
-         not drain its loop. Closing another binding's handle from here would \
-         free state its owner still holds, so this waits for the same provider \
-         work as the entry above",
+         closed by this crate, so a session destroyed while its connection is still \
+         open can leave the handle ref'd. A graceful close after a completed \
+         request does unwind (tools/http2-lifecycle-probe.sh asserts it), so this \
+         is the `destroy()`-mid-connection case rather than the ordinary one",
+    ),
+    (
+        "per-stream stats and async context",
+        "`stream.stats` reads `refreshState`'s counters and `async_hooks` needs a \
+         stream's provider/trigger pair to line up with the JavaScript resource. \
+         The id is real now, but `test-http2-async-local-storage.js` still reaches \
+         a `undefined.id` on the stream object",
     ),
 ];
 
