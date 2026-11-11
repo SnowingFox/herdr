@@ -52,8 +52,22 @@ A binding crate needs three things and nothing else:
    `registry.register(Namespace::from_module(&X))` form is gone and compiles only
    if you also add a hand-written match in the CLI, which is what the registry
    exists to avoid.
-3. `./tools/regen-bindings.sh`, which discovers crates by looking for
-   `pub fn register`.
+3. `./tools/regen-bindings.sh`, which discovers crates by looking for the
+   `pub fn register` declaration itself, not the string.
+
+`tools/regen-bindings.sh` matches a *declaration* of
+`pub fn register(registry: &mut [rn_core::]BindingRegistry)`, skipping comments,
+strings and `register` methods that take `&mut self`. Two failures came from
+matching the bare string: a doc comment explaining not to use that name
+registered the crate it was warning about, and `rn-core`'s
+`pub fn register(&mut self, namespace: Namespace)` matches it. `rn-core` is in
+the script's exclusion list for that reason, so removing `rn-core` from that
+list without checking the matcher would break the build.
+`tools/regen-bindings.test.sh` pins all of this, including a byte-for-byte
+comparison against the committed `install_all.rs`. It runs in `tools/check.sh`
+immediately before the regeneration, as a bare statement so its exit status is
+the gate's: a matcher regression turns the gate red instead of only being
+findable by running the tests by hand.
 
 ## Aliased buffers
 
