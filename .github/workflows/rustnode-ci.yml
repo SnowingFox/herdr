@@ -3,31 +3,116 @@ name: CI
 on:
   push:
     branches: ["rustnode/**"]
-    paths: ["rustnode/**"]
+    paths:
+      - "rustnode/**"
+      # A change to this workflow must run this workflow, or a CI fix can be
+      # merged without ever having been exercised.
+      - ".github/workflows/rustnode-ci.yml"
   pull_request:
-    paths: ["rustnode/**"]
+    paths:
+      - "rustnode/**"
+      - ".github/workflows/rustnode-ci.yml"
   workflow_dispatch:
 
 defaults:
   run:
     working-directory: rustnode
 
+env:
+  # `rustnode/rust-toolchain.toml` is the single source of truth for the
+  # toolchain, and cargo only honours it when no RUSTUP_TOOLCHAIN override is
+  # set. Nothing here may export RUSTUP_TOOLCHAIN, or CI silently drifts from
+  # the pin again.
+  #
+  # `vendor/merve` and `vendor/llhttp` are C/C++ compiled by cc-rs, and cc-rs
+  # defaults to `c++`, which resolves to clang++ on this image without the GCC
+  # C++ include paths and fails on <cstddef>. `tools/check.sh` pins g++ for the
+  # same reason. The libstdc++ `-L` that link then needs is derived below
+  # instead of hardcoding a GCC version directory.
+  CXX: g++
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Verify vendored Node builtins are unmodified
         run: ./tools/verify-libjs.sh
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Install the exact toolchain from `rustnode/rust-toolchain.toml` rather
+      # than whatever stable is. Cargo reads the pin file on its own, but
+      # rustup only resolves and downloads that toolchain if it is installed;
+      # `@stable` guaranteed the opposite of the pin and ran two toolchains in
+      # one job.
+      - name: Read the pinned toolchain
+        id: toolchain
+        run: |
+          version=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' rust-toolchain.toml)
+          test -n "$version" || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Linking a g++-compiled object needs libstdc++, whose `.so` symlink lives
+      # only in the GCC version directory rather than on the default linker
+      # search path. Ask the compiler where that is instead of guessing the
+      # version, so a runner image with a different GCC still links.
+      - name: Point the linker at libstdc++
+        run: |
+          libdir=$(dirname "$(g++ -print-file-name=libstdc++.so)")
+          test -e "$libdir/libstdc++.so" || { echo "no libstdc++.so in $libdir" >&2; exit 1; }
+          echo "RUSTFLAGS=-L $libdir" >> "$GITHUB_ENV"
+          echo "linking against $libdir/libstdc++.so"
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
         with:
+          toolchain: ${{ steps.toolchain.outputs.version }}
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rustnode
+
+      # Swatinem/rust-cache restores `target/` with every profile pruned down to
+      # `build/`, `.fingerprint/` and `deps/`, for crates outside the workspace
+      # only. The `v8` crate's build script therefore survives with its
+      # fingerprints intact and does not run again, while the 198 MB
+      # `librusty_v8.a` it downloaded into `target/<profile>/gn_out/obj/` is
+      # deleted by that same prune and never restored. Cargo is then left
+      # pointing `-L` at a directory that does not exist and linking
+      # `-l static=rusty_v8`, so any unit that has to build or relink fails with
+      # "could not find native static library `rusty_v8`" while the build script
+      # is reported as fresh. Nothing about the source or the lints is wrong.
+      #
+      # Rebuild v8 whenever its fingerprints exist without the archive they
+      # describe: dropping the stale fingerprints makes the build script run
+      # again and re-fetch the archive. This is a no-op on a cold or complete
+      # cache, so it costs nothing in the ordinary case and needs no second
+      # cache to invalidate.
+      #
+      # `cargo clean -p v8` only covers the default profile, and the contracts
+      # step at the end builds `--release`, which keeps its own
+      # `target/release/gn_out/`. So the fingerprints are removed per profile
+      # instead of with `cargo clean`, which also leaves `target/release` alone
+      # in the profile that did not need repairing.
+      - name: Repair a half-restored v8 build from cache
+        run: |
+          for profile in debug release; do
+            archive="target/$profile/gn_out/obj/librusty_v8.a"
+            if [ -e "$archive" ]; then
+              echo "$profile: archive present, $(stat -c%s "$archive") bytes"
+              continue
+            fi
+            shopt -s nullglob
+            fingerprints=(target/"$profile"/.fingerprint/v8-*)
+            shopt -u nullglob
+            if [ ${#fingerprints[@]} -eq 0 ]; then
+              echo "$profile: no cached v8 state, the build script will fetch the archive"
+              continue
+            fi
+            echo "$profile: v8 fingerprints without $archive, rebuilding v8"
+            rm -rf "${fingerprints[@]}"
+            rm -rf target/"$profile"/build/v8-*
+          done
 
       - name: Format
         run: cargo fmt --all --check
