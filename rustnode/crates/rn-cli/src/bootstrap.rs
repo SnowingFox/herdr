@@ -1314,8 +1314,11 @@ fn process_object<'s>(
     feature(scope, "ipv6", true);
     // Builtins are compiled into the binary by `rn-js2c`.
     feature(scope, "cached_builtins", true);
-    // There is no inspector and no debug build.
-    feature(scope, "inspector", false);
+    // The inspector exists: `--inspect` starts a WebSocket endpoint and
+    // `internalBinding('inspector')` opens real sessions against V8's inspector, so
+    // `process.features.inspector` reporting `false` would be wrong in a way
+    // `lib/internal/util/inspector.js` acts on — it skips the console wrapper.
+    feature(scope, "inspector", true);
     feature(scope, "debug", cfg!(debug_assertions));
     // Modules are requireable, and TypeScript stripping is not implemented.
     feature(scope, "require_module", true);

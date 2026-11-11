@@ -999,6 +999,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-inspector"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libuv-sys2",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "tracing",
+ "v8",
+]
+
+[[package]]
 name = "rn-bind-js-stream"
 version = "0.1.0"
 dependencies = [
@@ -1336,6 +1350,7 @@ dependencies = [
  "rn-bind-heap-utils",
  "rn-bind-http-parser",
  "rn-bind-icu",
+ "rn-bind-inspector",
  "rn-bind-js-stream",
  "rn-bind-messaging",
  "rn-bind-mksnapshot",
@@ -1403,6 +1418,7 @@ version = "0.1.0"
 dependencies = [
  "rn-bind-crypto",
  "rn-bind-heap-utils",
+ "rn-bind-inspector",
  "rn-bind-messaging",
  "rn-bind-options",
  "rn-bind-task-queue",

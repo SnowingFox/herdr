@@ -21,6 +21,7 @@ glob
 heap_utils
 http_parser
 icu
+inspector
 internal_only_v8
 ipc_serdes
 js_stream
@@ -35,6 +36,7 @@ permission
 pipe_wrap
 process_methods
 process_wrap
+profiler
 report
 serdes
 signal_wrap

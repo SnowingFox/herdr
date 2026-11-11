@@ -1,0 +1,26 @@
+[package]
+name = "rn-bind-inspector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('inspector') and internalBinding('profiler') for rustnode"
+
+[dependencies]
+# The inspector *is* V8's: `v8::inspector` binds `v8-inspector.h`, which is
+# compiled into the prebuilt archive (41 defined `v8_inspector__*` symbols). There
+# is no cargo feature to enable and nothing to vendor.
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+v8.workspace = true
+# The socket server is a libuv TCP listener on its own thread, and the wakeup that
+# carries a protocol message from that thread to the isolate is a `uv_async_t` on
+# the process loop — the same arrangement `rn-uv`'s keepalive handle uses.
+libuv-sys2.workspace = true
+rn-uv.workspace = true
+libc.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]

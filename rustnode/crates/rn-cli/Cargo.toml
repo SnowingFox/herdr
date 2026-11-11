@@ -37,6 +37,9 @@ rn-io = { path = "../rn-io" }
 # reads from `uv_version_string` rather than from a manifest.
 rn-uv = { path = "../rn-uv" }
 rn-bind-timers = { path = "../rn-bind-timers" }
+# `--inspect` starts the inspector's WebSocket endpoint, and the loop drains the
+# messages its reader threads queue.
+rn-bind-inspector = { path = "../rn-bind-inspector" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-napi = { path = "../rn-napi" }

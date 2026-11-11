@@ -233,21 +233,19 @@ fn config_values_match_a_default_linux_release_build() {
     );
     assert_eq!(Config::get("hasTracing"), Some(Value::Bool(true)));
     assert_eq!(Config::get("hasNodeOptions"), Some(Value::Bool(true)));
-    // The one value here that deliberately differs from a stock Node build.
-    // `config.hasInspector` means "this binary was compiled with the
-    // inspector", and this one was not: `internalBinding('inspector')` has no
-    // implementation. Three call sites make that unavoidable —
-    // `internal/process/pre_execution.js` reaches the binding at module scope
-    // through `setupInspectorHooks`, `lib/v8.js` reads the flag at module scope
-    // to decide whether to load `internalBinding('profiler')`, and
-    // `lib/inspector.js` throws when it is false. Reporting a stock build's
-    // `true` breaks startup and `require('v8')` alike. The recorded Node value
-    // is true; see the note on `config_values_match_a_live_node_recording` for
-    // why it is expected to disagree until the inspector lands.
+    // `config.hasInspector` means "this binary was compiled with the inspector", and
+    // this one was: `rn-bind-inspector` implements the namespace over V8's own
+    // inspector. It is worth stating why the flag can be true without lying, because
+    // it was false for a reason that no longer holds:
+    // `internal/process/pre_execution.js` reaches `registerAsyncHook` at module scope,
+    // `lib/v8.js` loads `internalBinding('profiler')` at module scope, and
+    // `lib/inspector.js` throws when the flag is false. All three are satisfied now,
+    // and `--inspect` plus `session.post('Runtime.evaluate')` are exercised by
+    // `crates/rn-bind-inspector/tests/protocol.rs` and `tools/inspector-smoke.py`.
     assert_eq!(
         Config::get("hasInspector"),
-        Some(Value::Bool(false)),
-        "this build has no inspector, and the flag must say so"
+        Some(Value::Bool(true)),
+        "this build has an inspector binding, so the flag must report it"
     );
     assert_eq!(
         Config::get("noBrowserGlobals"),
@@ -300,12 +298,11 @@ fn config_values_match_a_live_node_recording() {
         ("hasSmallICU", Value::Bool(false)),
         ("hasTracing", Value::Bool(true)),
         ("hasNodeOptions", Value::Bool(true)),
-        // Recorded from a stock Node, which has the inspector. This is the only
-        // value that is allowed to disagree, and only for this reason: the
-        // build genuinely lacks `internalBinding('inspector')`, so reporting
-        // `true` would be a claim the binary cannot honour. Drop the exception
-        // (and the corresponding assertion above) when the inspector lands.
-        ("hasInspector", Value::Bool(false)),
+        // Recorded from a stock Node, which has the inspector, and this build now
+        // agrees: `internalBinding('inspector')` and `internalBinding('profiler')`
+        // are both implemented, so the value is no longer an exception to the
+        // recording. See the note on `config_values_match_their_documented_values`.
+        ("hasInspector", Value::Bool(true)),
         ("noBrowserGlobals", Value::Bool(false)),
         ("bits", Value::int(64)),
     ] {
@@ -315,13 +312,6 @@ fn config_values_match_a_live_node_recording() {
             "{name} disagrees with Node"
         );
     }
-
-    // Checked separately because its expected value legitimately differs.
-    assert_eq!(
-        Config::get("hasInspector"),
-        Some(Value::Bool(false)),
-        "the recording says true, but this build has no inspector binding"
-    );
 }
 
 #[test]

@@ -55,20 +55,17 @@ pub const VALUES: &[Member] = &[
     // `#if !defined(NODE_WITHOUT_NODE_OPTIONS)`, inside the small-ICU guard.
     // `NODE_WITHOUT_NODE_OPTIONS` is only set by Android and embedder builds.
     ("hasNodeOptions", Value::Bool(true)),
-    // `#if HAVE_INSPECTOR`. The inspector is built unless --without-inspector.
-    // `lib/inspector.js` throws ERR_INSPECTOR_NOT_AVAILABLE when this is false,
-    // so it must only become false together with the `inspector` binding.
+    // `#if HAVE_INSPECTOR`. The inspector is built unless --without-inspector, and
+    // this build has one: `rn-bind-inspector` implements `internalBinding('inspector')`
+    // over V8's own inspector, and `internalBinding('profiler')` beside it.
     //
-    // It is false now, and three call sites make that unavoidable:
-    // `internalBinding('inspector')` has no implementation;
-    // `internal/process/pre_execution.js` reaches it at module scope through
-    // `setupInspectorHooks` when this is true, which turned every startup into a
-    // throw; and `lib/v8.js` reads the flag at module scope to decide whether to
-    // load `internalBinding('profiler')`, so `require('v8')` failed on a
-    // namespace the build does not have. Reporting true is the same lie as
-    // reporting `process.features.inspector` true. Flip all of them when the
-    // inspector lands.
-    ("hasInspector", Value::Bool(false)),
+    // The three call sites that forced this to `false` are all satisfied now, which is
+    // what makes the flag a report rather than a claim:
+    // `lib/inspector.js` requires the binding and gets a real `Session`;
+    // `internal/process/pre_execution.js`'s `setupInspectorHooks` calls
+    // `registerAsyncHook` at module scope, which the binding installs;
+    // and `lib/v8.js` loads `internalBinding('profiler')` at module scope, which exists.
+    ("hasInspector", Value::Bool(true)),
     // `#ifdef NODE_NO_BROWSER_GLOBALS`, set by --no-browser-globals. Default
     // builds keep the browser globals, so this is false.
     ("noBrowserGlobals", Value::Bool(false)),

@@ -326,6 +326,17 @@ impl<'a, 's, 'i> V8Scheduler<'a, 's, 'i> {
 
 impl Scheduler for V8Scheduler<'_, '_, '_> {
     fn drain(&mut self) {
+        // The inspector's reader threads queue CDP messages and ask for a check phase
+        // through `native_immediates`, but the immediate only runs if the loop reaches
+        // the check phase — which it will not when a debugger is the only thing
+        // keeping the process alive. Draining here means a message is dispatched on the
+        // first turn after it arrives either way.
+        //
+        // Before the ticks, because `Runtime.runIfWaitingForDebugger` may queue work
+        // that a tick callback would otherwise run first, and Node dispatches protocol
+        // messages before running the queues.
+        rn_bind_inspector::drain_attached(self.scope);
+
         let run_next_ticks = self.hooks.run_next_ticks(self.scope);
         self.call_catching(run_next_ticks);
     }
@@ -338,7 +349,13 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
         // A ref'd receiving `MessagePort` pins the process open in Node even
         // though it owns no libuv handle, so libuv's own liveness answer is
         // incomplete without it.
-        rn_bind_messaging::has_message_port_work()
+        if rn_bind_messaging::has_message_port_work() {
+            return true;
+        }
+        // A debugger being attached keeps `node --inspect` alive after the script
+        // finishes, which is what lets a client evaluate in a process that has already
+        // run its entry point. Node's `Agent::IsActive` does the same.
+        rn_bind_inspector::is_attached() || rn_bind_inspector::has_pending_messages()
     }
 }
 

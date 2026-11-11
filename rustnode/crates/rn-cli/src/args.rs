@@ -36,6 +36,13 @@ pub struct Options {
     /// this, `lib/internal/bootstrap/realm.js` sees `false` and leaves
     /// `node:bench` unrequireable no matter what the command line said.
     pub parsed: rn_bind_options::Store,
+    /// The inspector endpoint `--inspect` asked for, if any.
+    ///
+    /// `Some` starts the server before user code runs, which is what makes
+    /// `node --inspect` print its `ws://` URL and accept a client. `None` leaves the
+    /// inspector off, which is the default for the same reason it is in Node: a
+    /// listening debug port is an attack surface.
+    pub inspect: Option<InspectRequest>,
     /// The permission model the flags asked for.
     ///
     /// Built by [`finish`] from the same `exec_argv` the parser recorded, and
@@ -57,6 +64,50 @@ impl Options {
         self.exec_argv
             .iter()
             .any(|flag| flag == "--expose-internals")
+    }
+}
+
+/// What `--inspect` and its variants asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectRequest {
+    /// The port to bind. `0` asks the OS for a free one.
+    pub port: u16,
+    /// The host to bind.
+    pub host: String,
+    /// Whether to wait for a client before running user code (`--inspect-brk`).
+    pub wait: bool,
+}
+
+impl InspectRequest {
+    /// Parses the value of `--inspect`, `--inspect-brk` or `--inspect-port`.
+    ///
+    /// Node accepts `[host:]port` in every spelling, and a bare flag with no value
+    /// (which the parser turns into `None` here). A host containing a colon is
+    /// bracketed, so `--inspect=[::1]:9229` splits on the *last* colon rather than the
+    /// first.
+    ///
+    /// Returns `Err` for a port that is not a number or does not fit in 16 bits,
+    /// because Node rejects those at startup rather than silently using 9229.
+    pub fn parse(value: Option<&str>, wait: bool) -> Result<Self, String> {
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            return Ok(Self {
+                port: 9229,
+                host: "127.0.0.1".to_string(),
+                wait,
+            });
+        };
+        let (host, port) = match value.rsplit_once(':') {
+            Some((host, port)) => (host.trim_start_matches('[').trim_end_matches(']'), port),
+            None => ("127.0.0.1", value),
+        };
+        let port: u16 = port
+            .parse()
+            .map_err(|_| format!("--inspect: '{value}' is not a valid port"))?;
+        Ok(Self {
+            port,
+            host: if host.is_empty() { "127.0.0.1" } else { host }.to_string(),
+            wait,
+        })
     }
 }
 
@@ -339,6 +390,22 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
             continue;
         }
 
+        // `--inspect`, `--inspect-brk`, `--inspect-port` and their `=value` forms.
+        // These are parsed here rather than left in the generic prefix branch because
+        // the value decides whether the process opens a socket, and a flag recorded
+        // but not acted on would look implemented.
+        if let Some(request) = parse_inspect_flag(argument) {
+            match request {
+                Ok(request) => {
+                    options.inspect = Some(request);
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
+                Err(message) => return Err(message),
+            }
+        }
+
         if VALUE_INLINE_PREFIXES
             .iter()
             .any(|prefix| argument.starts_with(prefix))
@@ -359,6 +426,24 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
     }
 
     Ok(finish(options, unimplemented))
+}
+
+/// Parses one `--inspect*` argument, or `None` when it is not one.
+///
+/// `--inspect-port` sets the port without starting the server in Node, and is
+/// accepted here for the same reason: `lib/internal/bench_runner/cli.js` checks
+/// `process.debugPort` and passes it on to a child, so a runner that rejects the flag
+/// cannot spawn anything.
+fn parse_inspect_flag(argument: &str) -> Option<Result<InspectRequest, String>> {
+    let (name, value) = match argument.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (argument, None),
+    };
+    match name {
+        "--inspect" | "--inspect-port" => Some(InspectRequest::parse(value, false)),
+        "--inspect-brk" => Some(InspectRequest::parse(value, true)),
+        _ => None,
+    }
 }
 
 fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {

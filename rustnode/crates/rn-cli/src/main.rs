@@ -118,6 +118,10 @@ fn main() {
     // and a binding callback cannot obtain a `&mut Isolate` soundly. Recording
     // the isolate here is the same arrangement the ESM handlers use.
     rn_bind_heap_utils::set_snapshot_isolate(&mut isolate);
+    // `V8Inspector::create` and V8's client callbacks need `&mut Isolate`, which a
+    // binding cannot obtain soundly, so the inspector records the isolate here the
+    // same way `heap_utils` does for heap snapshots.
+    rn_bind_inspector::set_isolate(&mut isolate);
     // Node runs V8 with an explicit microtask policy: the embedder decides when
     // the queue drains, through `runMicrotasks()` in
     // `lib/internal/process/task_queues.js` and the loop's own checkpoints.
@@ -136,6 +140,36 @@ fn main() {
     // the builtin allow-list from `--experimental-bench` during its own load,
     // so a value installed later would arrive after the decision was made.
     rn_bind_options::parsed::install(options.parsed.clone());
+
+    // The inspector is created before the console is installed, because V8 puts its
+    // own `console` on the per-context extras object during `contextCreated`, and
+    // `internal/util/inspector.js`'s `wrapConsole` reads it from the binding at that
+    // point. Creating it later leaves the global console unwrapped and a debugger
+    // never sees a `console.log`.
+    //
+    // `process.features.inspector` and `config.hasInspector` are true, so `lib/**`
+    // loads `internal/inspector_async_hook` and `internalBinding('profiler')`; both
+    // exist, which is what makes those flags honest.
+    rn_bind_inspector::ensure_inspector(scope);
+
+    // `--inspect` opens the endpoint before anything else runs, and prints the URL the
+    // way Node does. `--inspect-brk` additionally blocks until a client attaches, which
+    // is what makes the first line of user code the first line a debugger sees.
+    if let Some(request) = options.inspect.as_ref() {
+        match rn_bind_inspector::start_server(request.host.as_str(), request.port) {
+            Ok(url) => {
+                eprintln!("Debugger listening on {url}");
+                eprintln!("For help, see: https://nodejs.org/learn/getting-started/debugging");
+                if request.wait && !rn_bind_inspector::wait_for_client() {
+                    eprintln!("rustnode: --inspect-brk found no client; running without waiting");
+                }
+            }
+            Err(message) => {
+                eprintln!("rustnode: {message}");
+                std::process::exit(9);
+            }
+        }
+    }
 
     if let Err(message) = install_globals(scope, &args) {
         eprintln!("rustnode: {message}");
