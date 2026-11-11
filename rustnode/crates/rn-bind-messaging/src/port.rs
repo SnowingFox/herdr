@@ -142,6 +142,15 @@ pub struct Owner {
     pub id: u64,
     /// Which thread that is.
     pub thread: u64,
+    /// The owning thread's wake handle, if it had one when this was recorded.
+    ///
+    /// This is the piece that makes a cross-thread post arrive *at post time*.
+    /// Without it, `enqueue` found no local `PortInner` on a foreign thread and
+    /// did nothing, so the receiving loop only noticed the message on its next
+    /// turn — 347ms for a worker that posted and then busy-looped for 300ms,
+    /// against node's 26ms. Node's `TriggerAsync` is the same idea: the sender
+    /// signals the owner's `uv_async_t` instead of touching the owner.
+    pub token: Option<rn_uv::wake::ThreadToken>,
 }
 
 thread_local! {
@@ -335,6 +344,10 @@ impl MessagePortData {
         *lock(&self.owner) = Some(Owner {
             id: inner.id,
             thread: current_thread(),
+            // Captured here, on the owning thread, because the `uv_async_t` it
+            // names belongs to this thread's loop. A sender on another thread
+            // can only signal it, never reach the port itself.
+            token: rn_uv::wake::current_thread_token(),
         });
     }
 
@@ -363,11 +376,32 @@ impl MessagePortData {
         *lock(&self.owner)
     }
 
-    /// Appends a message and wakes the owner if it is receiving.
+    /// Appends a message and wakes whoever must read it.
+    ///
+    /// Two cases, and the second is the one that took a bug to notice:
+    ///
+    /// * the owner is on this thread, so it can be scheduled directly;
+    /// * the owner is on another thread, in which case [`Self::owner`] returns
+    ///   `None` by design and nothing would happen. That was the whole of
+    ///   CLA-137: a worker posted and then busy-looped, and the parent only saw
+    ///   the message when the worker's loop came back around. Node signals the
+    ///   owner's `uv_async_t` at post time; `Owner::token` is how the same
+    ///   signal is sent here.
     pub fn enqueue(&self, message: Message) {
         lock(&self.queue).push_back(message);
         if let Some(owner) = self.owner() {
             owner.schedule();
+            return;
+        }
+        // Foreign owner: signal its loop. A token whose thread has exited is
+        // inert and returns false, which is the ordinary race — the message
+        // stays queued rather than being lost.
+        if let Some(owner) = self.owner_record() {
+            if let Some(token) = owner.token {
+                // `false` means the thread's handle is gone; the message stays
+                // queued, so this is a lost wake rather than a lost message.
+                let _ = token.notify();
+            }
         }
     }
 
