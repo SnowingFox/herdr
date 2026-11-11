@@ -415,6 +415,17 @@ fn submit_rst(state: &SessionState, stream_id: i32, code: u32) {
     let Some(raw) = crate::session_ptr(state) else {
         return;
     };
+    // Drain what is already queued *before* the reset. `core.js` submits an RST
+    // from `finishCloseStream` as soon as the writable side finishes, while the
+    // response's DATA is still sitting behind a deferred flush — so the RST would
+    // overtake the body and the peer would see a reset stream instead of a
+    // response. `stream.end(); stream.close()` hit exactly that: the server
+    // received no data at all.
+    //
+    // Flushing is only legal when `receiving` is false; `send_pending_data`
+    // enforces that itself and leaves the write scheduled when it declines,
+    // which is the same shape Node's `SendPendingData` has.
+    crate::session::flush_pending(state);
     // SAFETY: `raw` is a live nghttp2 session.
     unsafe {
         ffi::nghttp2_submit_rst_stream(raw, ffi::NGHTTP2_FLAG_NONE, stream_id, code);

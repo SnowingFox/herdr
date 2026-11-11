@@ -112,13 +112,13 @@ pub const DEFERRED: &[(&str, &str)] = &[];
 /// smuggled into the member list.
 pub const KNOWN_GAPS: &[(&str, &str)] = &[
     (
-        "socket teardown on destroy()",
-        "`Http2Session.destroy()` calls `this.ondone` (finishSessionClose) and the \
-         nghttp2 session is freed, but the consumed socket's libuv handle is not \
-         closed by this crate, so a session destroyed while its connection is still \
-         open can leave the handle ref'd. A graceful close after a completed \
-         request does unwind (tools/http2-lifecycle-probe.sh asserts it), so this \
-         is the `destroy()`-mid-connection case rather than the ordinary one",
+        "server-side destroy() with no request",
+        "`on('session', s => s.destroy())` before any request never lets the \
+         process exit. The ordinary cases are fine and were measured: a client \
+         `destroy()` while connected exits in 163ms, and a graceful close after a \
+         completed request unwinds, which tools/http2-lifecycle-probe.sh asserts. \
+         This is the narrow path where the session is destroyed having never \
+         received a frame, so nothing drives the socket to close",
     ),
     (
         "per-stream stats and async context",

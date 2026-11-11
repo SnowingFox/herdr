@@ -12,7 +12,9 @@
 #   * increment 3: a second DATA provider was rejected with
 #     NGHTTP2_ERR_DATA_EXIST, so the body's END_STREAM was never sent, the peer
 #     never saw `'end'`, and `core.js`'s cleanup — which is gated on
-#     `_readableState.ended` — never ran.
+#     `_readableState.ended` — never ran;
+#   * increment 5: `stream.end(); stream.close()` submitted an RST_STREAM that
+#     overtook the still-deferred body, so the server received nothing at all.
 #
 # So the probe sets no timer of its own. A timer would let the process exit
 # whether or not the loop drained, which is the measurement this tool exists to
@@ -44,9 +46,24 @@ const http2 = require('http2');
 const server = http2.createServer();
 let bodies = 0;
 let ends = 0;
+// The `end(); close()` case: the body must still arrive even though the close is
+// requested in the same tick as the end.
+let racingBody = 0;
+let raceClosed = 0;
 
 server.on('session', (session) => session.on('error', () => {}));
-server.on('stream', (stream) => {
+server.on('stream', (stream, headers) => {
+  if (headers[':path'] === '/race') {
+    stream.on('data', (chunk) => {
+      racingBody += chunk.length;
+    });
+    stream.on('end', () => {
+      raceClosed++;
+      stream.respond({ ':status': 200 });
+      stream.end();
+    });
+    return;
+  }
   stream.respond({ ':status': 200 });
   stream.end('ok');
 });
@@ -61,10 +78,21 @@ server.listen(0, () => {
   });
   request.on('end', () => {
     ends++;
-    // Both sides close, and nothing else is scheduled: whether the process exits
-    // now is entirely up to whether every handle was released.
-    client.close();
-    server.close();
+
+    // One tick later: `end()` immediately followed by `close()`, which used to
+    // drop the body because the reset overtook the queued DATA.
+    const raced = client.request({ ':method': 'POST', ':path': '/race' });
+    raced.on('data', () => {});
+    raced.on('error', () => {});
+    raced.write(Buffer.alloc(30));
+    raced.end();
+    raced.close();
+    raced.on('close', () => {
+      // Both sides close, and nothing else is scheduled: whether the process exits
+      // now is entirely up to whether every handle was released.
+      client.close();
+      server.close();
+    });
   });
 });
 
@@ -74,8 +102,11 @@ process.on('exit', (code) => {
   }
   // Exiting without completing the exchange would pass a bare exit-code check
   // while proving nothing.
-  if (bodies !== 2 || ends !== 1) {
-    console.error(`lifecycle probe: incomplete exchange bodies=${bodies} ends=${ends}`);
+  if (bodies !== 2 || ends !== 1 || racingBody !== 30 || raceClosed !== 1) {
+    console.error(
+      'lifecycle probe: incomplete exchange ' +
+      `bodies=${bodies} ends=${ends} raceBody=${racingBody} raceEnds=${raceClosed}`,
+    );
     process.exitCode = 1;
   }
 });

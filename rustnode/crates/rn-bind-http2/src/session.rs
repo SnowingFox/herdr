@@ -579,6 +579,40 @@ impl rn_uv::listener::StreamListener for SessionListener {
     }
 }
 
+/// Sends whatever nghttp2 has queued, if it is legal to send right now.
+///
+/// This is `SendPendingData` without the "is a flush scheduled" gate, because the
+/// caller has a frame of its own to queue afterwards and needs the earlier ones on
+/// the wire first. It refuses while `receiving` (nghttp2 is walking its own receive
+/// buffer) and while a send is already in progress, which are the two conditions
+/// `SendPendingData` itself refuses on.
+pub fn flush_pending(state: &SessionState) {
+    if state.receiving.get() || state.sending.get() || state.destroyed.get() {
+        return;
+    }
+    let Some(raw) = raw(state) else {
+        return;
+    };
+    let stream_state = state.stream.get();
+    if stream_state.is_null() {
+        return;
+    }
+    // Nothing queued means nothing to do, and calling `mem_send` for no reason
+    // would clear a schedule the check phase is relying on.
+    // SAFETY: `raw` is live and `want_write` only reads.
+    if unsafe { ffi::nghttp2_session_want_write(raw) } == 0 {
+        return;
+    }
+    // Mark the deferred flush as already handled, then run one.
+    state.write_scheduled.set(true);
+    send_pending_data_ungated(state);
+}
+
+/// The body of [`send_pending_data`] without the "is a flush scheduled" check.
+fn send_pending_data_ungated(state: &SessionState) {
+    let _ = rn_uv::callback::with_context(|scope| send_pending_data(scope, state));
+}
+
 /// `ConsumeHTTP2Data`: feed `bytes` to nghttp2 and send what it queued.
 pub fn receive(session: &SessionState, bytes: &[u8], scope: &mut v8::PinScope<'_, '_>) {
     receive_scope(scope, session, bytes);
