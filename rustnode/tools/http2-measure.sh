@@ -52,6 +52,10 @@ tests_dir=""
 runs=3
 only=""
 limit=0
+# Files are independent processes, and one that times out costs a full 60s. Running
+# a few at once is what makes a 3x pass over the family finish in a sitting rather
+# than overnight; it does not change any per-file verdict.
+jobs="${HERDR_HTTP2_JOBS:-4}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --tests)
@@ -68,6 +72,10 @@ while [ $# -gt 0 ]; do
       ;;
     --limit)
       limit="${2:?--limit needs a count}"
+      shift 2
+      ;;
+    --jobs)
+      jobs="${2:?--jobs needs a count}"
       shift 2
       ;;
     -h | --help)
@@ -139,26 +147,32 @@ run_one() {
   local flags
   flags="$(flags_of "$file")"
   local started ended status
+  # Scratch files are per-process: with `--jobs` above 1 several `run_one` bodies
+  # run at once, and a shared output file would interleave two tests' output and
+  # read as a false `Uncaught`.
+  local scratch
+  scratch="$(mktemp -d "$work/run.XXXXXX")"
   started=$(date +%s%N)
   # shellcheck disable=SC2086 # the flags line is a space-separated list on purpose
   set +e
-  timeout 60 "$binary" $flags "$file" >"$work/out" 2>"$work/err"
+  timeout 60 "$binary" $flags "$file" >"$scratch/out" 2>"$scratch/err"
   status=$?
   set -e
   ended=$(date +%s%N)
   local markers=""
-  if grep -q '✖' "$work/out" "$work/err" 2>/dev/null; then
+  if grep -q '✖' "$scratch/out" "$scratch/err" 2>/dev/null; then
     markers="${markers}X"
   fi
-  if grep -q 'Uncaught' "$work/out" "$work/err" 2>/dev/null; then
+  if grep -q 'Uncaught' "$scratch/out" "$scratch/err" 2>/dev/null; then
     markers="${markers}U"
   fi
-  if grep -q '^1\.\.0 # Skipped' "$work/out" "$work/err" 2>/dev/null; then
+  if grep -q '^1\.\.0 # Skipped' "$scratch/out" "$scratch/err" 2>/dev/null; then
     markers="${markers}S0"
   fi
-  if grep -q ': # SKIP' "$work/out" "$work/err" 2>/dev/null; then
+  if grep -q ': # SKIP' "$scratch/out" "$scratch/err" 2>/dev/null; then
     markers="${markers}SK"
   fi
+  rm -rf "$scratch"
   local verdict="PASS"
   if [ "$status" -ne 0 ] || [ -n "$markers" ]; then
     verdict="FAIL"
@@ -189,12 +203,21 @@ printf 'files %d runs %d\n' "$total" "$runs"
 
 outcome_file="$results/http2-files.txt"
 : >"$outcome_file"
-for file in "${files[@]}"; do
-  name="${file#"$tests_dir"/}"
-  outcomes=()
-  markers_seen=""
-  slowest=0
-  passes=0
+# One line per file, written by a worker into its own file, then concatenated in
+# the original order. Ordering matters because the output is diffed between runs of
+# two branches and a reordered list would drown the real difference.
+per_file_dir="$work/per-file"
+mkdir -p "$per_file_dir"
+
+measure_file() {
+  local index="$1"
+  local file="$2"
+  local name="${file#"$tests_dir"/}"
+  local outcomes=()
+  local markers_seen=""
+  local slowest=0
+  local passes=0
+  local run record status markers verdict millis
   for ((run = 1; run <= runs; run++)); do
     record="$(run_one "$file")"
     IFS='|' read -r status markers verdict millis <<<"$record"
@@ -212,6 +235,7 @@ for file in "${files[@]}"; do
       slowest="$millis"
     fi
   done
+  local stability
   if [ "$passes" -eq "$runs" ]; then
     stability="stable-pass"
   elif [ "$passes" -eq 0 ]; then
@@ -220,8 +244,21 @@ for file in "${files[@]}"; do
     stability="unstable"
   fi
   printf '%s | %s | %s | %s | %sms\n' \
-    "$name" "${outcomes[*]}" "$stability" "${markers_seen:-none}" "$slowest" >>"$outcome_file"
-done
+    "$name" "${outcomes[*]}" "$stability" "${markers_seen:-none}" "$slowest" \
+    >"$per_file_dir/$index"
+}
+export -f measure_file run_one flags_of
+export binary tests_dir runs work per_file_dir
+
+# `xargs -P` gives each file its own process, and `run_one` already uses unique
+# output paths per invocation through `$work`, so the workers cannot collide.
+for index in "${!files[@]}"; do
+  printf '%s\0%s\0' "$index" "${files[$index]}"
+done | xargs -0 -n 2 -P "$jobs" bash -c 'measure_file "$0" "$1"'
+
+for index in "${!files[@]}"; do
+  cat "$per_file_dir/$index"
+done >>"$outcome_file"
 
 cat "$outcome_file"
 
