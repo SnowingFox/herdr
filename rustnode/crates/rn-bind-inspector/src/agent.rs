@@ -123,7 +123,7 @@ pub fn with_isolate<R>(body: impl FnOnce(&mut v8::Isolate) -> R) -> Option<R> {
 
 /// The inspector client V8 calls back into.
 ///
-/// One method is load-bearing and the rest are not:
+/// Two methods are load-bearing:
 ///
 /// * `ensure_default_context_in_group` must return the inspected context. Without it
 ///   every `Runtime.evaluate` answers `Cannot find default execution context`, because
@@ -131,12 +131,36 @@ pub fn with_isolate<R>(body: impl FnOnce(&mut v8::Isolate) -> R) -> Option<R> {
 ///   exactly the case for `Runtime.evaluate`, `Runtime.getProperties` and every
 ///   `Profiler.*` call. The default trait implementation returns `None`, so leaving it
 ///   out produces a namespace that looks complete and evaluates nothing.
-/// * `run_message_loop_on_pause` is what makes a breakpoint *stop* JavaScript. It is
-///   empty here — see the module comment — so a `Debugger.pause` is acknowledged and
-///   execution continues.
+/// * `run_message_loop_on_pause` is what makes a breakpoint *stop* JavaScript. V8 calls
+///   it from inside `Debugger.pause` and from a breakpoint hit, and it must not return
+///   until the frontend says resume; returning immediately is the shape that made this
+///   crate's first slice acknowledge a pause and keep running. See `pause` for what it
+///   blocks on and why it is a condition variable rather than a nested event loop.
 struct Client;
 
 impl v8::inspector::V8InspectorClientImpl for Client {
+    fn run_message_loop_on_pause(&self, _context_group_id: i32) {
+        // `waiting_for_resume_ = true; runMessageLoop();` in Node's
+        // `runMessageLoopOnPause` (`inspector_agent.cc:538`). The loop dispatches
+        // frontend messages — including the `Debugger.resume` that ends it — and the
+        // isolate sits still until then.
+        crate::pause::set_resumed(false);
+        // `NodeRuntime.waitingForDebugger` is what `test-inspector-debug-brk-flag.js`
+        // and `test-inspector.js` wait for after sending `NodeRuntime.enable`. It is
+        // emitted here, at the moment the pause really starts, because that is the
+        // event's meaning: the runtime is stopped and the frontend may now drive it.
+        if let Some(message) = crate::domains::waiting_for_debugger_notification() {
+            crate::deliver_to_frontends(&message);
+        }
+        crate::pause::run_pause_loop();
+    }
+
+    fn quit_message_loop_on_pause(&self) {
+        // Node: `waiting_for_resume_ = false` (`:590`). V8 calls this from inside
+        // `Debugger.resume`, on the paused thread, so it only has to flip the flag the
+        // wait condition reads.
+        crate::pause::resume();
+    }
     fn ensure_default_context_in_group(
         &self,
         context_group_id: i32,

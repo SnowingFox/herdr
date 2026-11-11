@@ -65,6 +65,65 @@ pub(crate) fn origin<'s>(
     )
 }
 
+/// Converts an absolute path to the `file://` URL a debugger expects.
+///
+/// Node reports compiled scripts under `file:///abs/path`, and every inspector test
+/// builds breakpoint URLs with `pathToFileURL(...)` against that convention. rustnode
+/// was reporting the bare path for CommonJS files — the ESM path already produced a
+/// URL, because the vendored `defaultResolve` builds one — which made
+/// `Debugger.setBreakpointByUrl` resolve to zero locations for exactly the files a
+/// debugger cares about. `test-inspector-break-when-eval.js` and its neighbours write
+/// `file://${path}`, so a bare path is invisible to them.
+///
+/// Verified against a real Node 22 on the same input: `node /tmp/x.js` reports
+/// `file:///tmp/x.js`, and so does a `require`d module. Anything that is not an
+/// absolute path is returned unchanged, which keeps `vm.Script`'s synthetic names
+/// (`'evalmachine.<anonymous>'`, `'test.js'`) as they are — Node does the same, and a
+/// URL-ified synthetic name would break stack traces.
+pub fn path_to_file_url(path: &str) -> String {
+    if !path.starts_with('/') {
+        return path.to_string();
+    }
+    // A path is percent-encoded per the URL spec; the characters that actually appear in
+    // a source path and are illegal in a URL are the space and the percent itself.
+    // Anything else (a `#` in a filename, for instance) would also need it, so the
+    // escaping covers the reserved set rather than just those two.
+    let mut encoded = String::with_capacity(path.len() + 8);
+    encoded.push_str("file://");
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'/'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b':'
+            | b'@'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b'['
+            | b']' => encoded.push(char::from(byte)),
+            other => {
+                use std::fmt::Write;
+                let _ = write!(encoded, "%{other:02X}");
+            }
+        }
+    }
+    encoded
+}
+
 /// Builds a `ScriptOrigin` for an ES module compile.
 ///
 /// `is_module` must be true or V8 aborts in debug builds, so this exists rather
@@ -295,6 +354,16 @@ fn build_source<'s>(
     cached: Option<&mut CachedBytes>,
 ) -> v8::script_compiler::Source {
     let host_defined = host_defined_options(scope, symbol);
+    // A CommonJS file's filename is an absolute path; a debugger needs the `file://`
+    // form, and so does `Debugger.setBreakpointByUrl` in every Node test that names a
+    // source. `path_to_file_url` leaves a synthetic name alone.
+    let filename = {
+        let text = filename.to_rust_string_lossy(scope);
+        match v8::String::new(scope, &path_to_file_url(&text)) {
+            Some(url) => url,
+            None => filename,
+        }
+    };
     let origin = origin(
         scope,
         filename,

@@ -42,7 +42,9 @@
 //!   rather than the `[{webSocketDebuggerUrl}]` document a browser expects. The
 //!   WebSocket endpoint itself is complete.
 
-mod agent;
+pub mod agent;
+pub mod domains;
+mod pause;
 mod profiler;
 mod server;
 mod session;
@@ -328,6 +330,63 @@ pub fn wait_for_client() -> bool {
             .as_ref()
             .is_some_and(|server| server.wait_for_client())
     })
+}
+
+/// Marks a frontend as attached, which is what makes a pause wait.
+pub fn set_frontend_attached(attached: bool) {
+    pause::set_attached(attached);
+}
+
+/// Whether a frontend is attached.
+pub fn frontend_attached() -> bool {
+    pause::is_attached()
+}
+
+/// Ends a pause, as `Debugger.resume` does.
+pub fn resume() {
+    pause::resume();
+}
+
+/// Records that the next statement should stop, before any session exists.
+///
+/// This is the agent-side flag `callAndPauseOnStart` and `--inspect-brk` set; the
+/// per-session `schedule_pause_on_next_statement` is what V8 actually honours.
+pub fn request_pause_before_next_statement() {
+    pause::request_pause();
+}
+
+/// Arms a pause, clearing any resume left over from an earlier one.
+pub fn arm_pause_for_test() {
+    pause::arm();
+}
+
+/// Runs the pause loop, for a test that needs to observe it blocking.
+///
+/// Returns whether it waited. Production code reaches this through V8's
+/// `runMessageLoopOnPause`, which is the only caller that should exist outside tests.
+pub fn run_pause_loop_for_test() -> bool {
+    pause::run_pause_loop()
+}
+
+/// Sends one notification to every attached frontend.
+///
+/// Used for events the frontend asked for that no V8 session produces —
+/// `NodeRuntime.waitingForDebugger` is the one that matters. A no-op when nothing is
+/// attached, which is the honest state for a `--inspect` run with no client.
+pub fn deliver_to_frontends(message: &str) {
+    SERVER.with(|slot| {
+        if let Some(server) = slot.borrow().as_ref() {
+            server::broadcast(server.shared(), message);
+        }
+    });
+    session::broadcast(message);
+}
+
+/// Asks the loop for one check phase so queued frontend messages are dispatched.
+///
+/// A no-op before the loop exists, which is the honest state during bootstrap.
+pub fn drain_pending() {
+    server::request_drain();
 }
 
 /// Releases the inspector at process exit.
