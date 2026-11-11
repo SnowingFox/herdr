@@ -70,12 +70,13 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --quick) do_build=0; shift ;;
     --self-test) mode="self-test"; shift ;;
+    --mechanism) mode="mechanism"; shift ;;
     --tests) tests_dir="${2:?--tests needs a directory}"; shift 2 ;;
     -h | --help)
       sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
-    *) echo "usage: $0 [--quick] [--self-test] [--tests <dir>]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--quick] [--self-test] [--mechanism] [--tests <dir>]" >&2; exit 2 ;;
   esac
 done
 
@@ -121,12 +122,24 @@ locate_tests() {
 
 # Runs one probe and prints its exit code on stdout. The probe's own output is
 # captured separately: it is evidence, not the verdict.
+#
+# `common_dir` may be empty for the one case that does not load `test/common`,
+# which is how the gate runs it without a Node checkout.
 run_probe() {
   local node_bin="$1"
   local name="$2"
   local common_dir="$3"
-  RUSTNODE_MUSTCALL_COMMON="${common_dir}/common/index.js" \
-    "$node_bin" "$probe" "$name" >/tmp/mustcall-probe.out 2>&1
+  local common_file="${common_dir}/common/index.js"
+  # `env` rather than a bare assignment so an empty path is a genuinely unset
+  # variable: the probe decides whether it needs one, and handing it
+  # "/common/index.js" would be a lie about what it was given.
+  if [ -n "$common_dir" ]; then
+    RUSTNODE_MUSTCALL_COMMON="$common_file" \
+      "$node_bin" "$probe" "$name" >/tmp/mustcall-probe.out 2>&1
+  else
+    env -u RUSTNODE_MUSTCALL_COMMON \
+      "$node_bin" "$probe" "$name" >/tmp/mustcall-probe.out 2>&1
+  fi
   echo $?
 }
 
@@ -178,7 +191,15 @@ control() {
   echo "tests:  $tests_dir"
   echo
 
-  # Exit-handler-only. These are the verdict.
+  # The mechanism itself, with no test tree and no `test/common`. These two are
+  # what `tools/check.sh` runs: `runCallChecks` fails a file by calling
+  # `process.exit(1)` from inside an exit listener, so a re-entrant exit whose
+  # code reaches `reallyExit` is the property the whole family rests on.
+  check handler-exits-one 1 "MECHANISM: exit(1) from an exit handler sets 1"
+  check handler-exits-zero 0 "MECHANISM: a non-throwing handler keeps 0"
+
+  # Exit-handler-only. These are the verdict, and they need Node's own
+  # `test/common`; `--mechanism` stops before here.
   check never-called 1 "EXIT-HANDLER-ONLY: uncalled mustCall must fail"
   check at-least-never-called 1 "EXIT-HANDLER-ONLY: mustCallAtLeast minimum"
   check must-succeed-never-called 1 "EXIT-HANDLER-ONLY: mustSucceed delegates"
@@ -229,8 +250,35 @@ self_test() {
   return 0
 }
 
+# `--mechanism` runs only the two tree-free cases. It exists so the gate can
+# guard the property `mustCall` rests on without cloning Node's test tree: a
+# file is failed by an `exit` listener calling `process.exit(1)`, and a
+# re-entrant exit whose code never reaches `reallyExit` would silently turn
+# every `mustCall` in the suite back into a no-op.
+mechanism() {
+  echo "== mustCall enforcement, mechanism only =="
+  echo "binary: $binary"
+  echo
+  check handler-exits-one 1 "exit(1) from an exit handler sets the status"
+  check handler-exits-zero 0 "a non-throwing handler keeps the status"
+  echo
+  if [ "$failures" -ne 0 ]; then
+    echo "RESULT: mechanism FAILED ($failures case(s))" >&2
+    return 1
+  fi
+  echo "RESULT: mechanism holds (a re-entrant exit from a handler sets the status)"
+  return 0
+}
+
 if [ "$mode" = "self-test" ]; then
   if ! self_test; then
+    exit 1
+  fi
+  exit 0
+fi
+
+if [ "$mode" = "mechanism" ]; then
+  if ! mechanism; then
     exit 1
   fi
   exit 0

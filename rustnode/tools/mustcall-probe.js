@@ -14,16 +14,25 @@
 // `RUSTNODE_MUSTCALL_COMMON` names the `test/common/index.js` of a Node test
 // tree. The check is only meaningful against Node's own implementation: a
 // local reimplementation would test this file rather than the runtime.
+//
+// One case — `handler-exits-one` — deliberately does not need it. It is the
+// mechanism `runCallChecks` relies on, reduced to the two lines that matter, so
+// the gate can guard it without a 103 MB test tree. See the note on that case.
 'use strict';
 
+const probe = process.argv[2];
+// The cases that exercise the exit mechanism directly, with `test/common`
+// removed. They are the only ones the gate can run without a Node checkout.
+const TREE_FREE = new Set(['handler-exits-one', 'handler-exits-zero']);
+const needsCommon = !TREE_FREE.has(probe);
+
 const commonPath = process.env.RUSTNODE_MUSTCALL_COMMON;
-if (!commonPath) {
+if (needsCommon && !commonPath) {
   console.error('RUSTNODE_MUSTCALL_COMMON is not set');
   process.exit(2);
 }
-const common = require(commonPath);
+const common = needsCommon ? require(commonPath) : null;
 
-const probe = process.argv[2];
 switch (probe) {
   // The acceptance probe. `f` is created and deliberately never invoked, so
   // the process has one unsatisfied mustCall when the event loop empties.
@@ -73,6 +82,36 @@ switch (probe) {
   case 'called-from-a-timer': {
     const f = common.mustCall(() => {}, 1);
     setTimeout(f, 1);
+    break;
+  }
+
+  // The mechanism `runCallChecks` depends on, with `test/common` removed: a
+  // listener that calls `process.exit(1)` from inside the exit handler.
+  //
+  // This case earns its own entry because nothing in the Rust suite can express
+  // it. `crates/rn-cli/tests/event_loop.rs` has nine exit tests, but its
+  // `same_as_node` helper asserts `status.success()` on *both* runtimes, so a
+  // script that is supposed to exit 1 cannot go through it; and the one test
+  // that does call `process.exit()` inside a handler passes no code, so it
+  // asserts termination, not the status. A regression where the emit runs but a
+  // re-entrant exit's code is dropped would leave every one of those tests
+  // green while `mustCall` silently stopped failing files.
+  //
+  // No Node test tree is needed, which is what lets `tools/check.sh` run it.
+  case 'handler-exits-one': {
+    process.on('exit', () => {
+      process.exit(1);
+    });
+    break;
+  }
+
+  // The tree-free must-pass counterpart. Without it `handler-exits-one` would
+  // accept a runtime that fails every program, which is the same defect the
+  // tree-dependent cases guard against one level up.
+  case 'handler-exits-zero': {
+    process.on('exit', () => {
+      console.log('handler ran');
+    });
     break;
   }
 

@@ -103,35 +103,29 @@ step "the cipher control still reports a void run as a void run"
 # the source tree modified.
 ./tools/cipher-negative-control.sh --self-test
 
-step "the mustCall control still has a verdict to report"
-# `common.mustCall` compares its call count in a `process.on('exit')` handler,
-# so on a runtime whose `exit` event never fires on a natural loop exit a file
-# that never ran its callback still exits 0. That is what let ~2850 files under
-# `test/parallel` report a pass without checking anything, and it is why the
-# suite's headline number was overstated.
+step "the exit handler can still fail a process"
+# `common.mustCall` fails a file by calling `process.exit(1)` from inside a
+# `process.on('exit')` listener. Before #60 wired the emit, that listener never
+# ran on a natural loop exit, so ~2850 files under `test/parallel` reported a
+# pass without checking anything and the suite's headline number was overstated.
 #
-# Two tiers, because the full verdict needs Node's own `test/common/index.js`,
-# which is never vendored (103 MB, tied to a revision):
+# The Rust suite guards the emit itself (`a_natural_exit_runs_the_exit_handlers`
+# and eight neighbours), but not this composition: `same_as_node` asserts
+# `status.success()` on *both* runtimes, so no test there can express "exits 1",
+# and the one test that calls `process.exit()` inside a handler passes no code.
+# A regression where the emit runs but a re-entrant exit's code is dropped would
+# leave every one of those green while `mustCall` silently became a no-op again.
 #
-#   * the self-test is tree-independent and runs here. It proves the control
-#     still fails against `/bin/true`, which is the property that makes a green
-#     control mean something. A control whose verdict path cannot report a
-#     failure is worse than no control, and this is the cheap half of the
-#     contract.
-#   * the full verdict runs only where the tree exists. It is NOT run here by
-#     default because it measures the runtime's exit behaviour, not the control:
-#     against current `master` it correctly reports three failures, and wiring
-#     that in would turn every unrelated PR red until the exit fix lands. The
-#     exit fix's own PR is what flips it.
-./tools/mustcall-negative-control.sh --self-test
+# `--mechanism` asserts exactly that pair and needs no Node test tree, so it can
+# run on every machine. The full six-case matrix still needs Node's own
+# `test/common` and stays opt-in; it passes on current master.
+./tools/mustcall-negative-control.sh --mechanism
 
 mustcall_tests="${RUSTNODE_TEST_CACHE:-${TMPDIR:-/tmp}}/rustnode-node-test/test"
 if [ -f "$mustcall_tests/common/index.js" ]; then
   echo "mustcall control: a Node test tree is present at $mustcall_tests;"
-  echo "mustcall control: run ./tools/mustcall-negative-control.sh --quick --tests $mustcall_tests"
-  echo "mustcall control: for the full verdict (it fails until the exit fix lands)"
-else
-  echo "mustcall control: no Node test tree; the full verdict was not measured"
+  echo "mustcall control: ./tools/mustcall-negative-control.sh --quick --tests $mustcall_tests"
+  echo "mustcall control: runs the full six-case matrix as well"
 fi
 
 if [ "$quick" -eq 0 ]; then
