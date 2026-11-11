@@ -1,0 +1,23 @@
+[package]
+name = "rn-bind-secure-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "`SecureContext` for internalBinding('crypto')"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# The same OpenSSL `rn-bind-crypto` builds and links. `openssl-src` is a single
+# artifact in the dependency graph, so this is a new edge onto one library, not
+# a second linkage: cargo resolves `openssl-sys` once and every crate calls into
+# the symbols of that one build.
+openssl = { version = "=0.10.82", features = ["vendored"] }
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
+# `ForeignType`, for `X509::from_ptr` on the reference-counted issuer pointer
+# that `X509_STORE_CTX_get1_issuer` hands back. Not a new dependency in the
+# graph: `openssl` already depends on exactly this version and does not
+# re-export it.
+foreign-types = "0.3"
