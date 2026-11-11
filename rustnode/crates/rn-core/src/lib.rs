@@ -15,6 +15,7 @@ pub mod handle;
 pub mod hook_slot;
 pub mod host_object;
 pub mod native_immediates;
+pub mod per_context;
 pub mod queue;
 pub mod symbol;
 
@@ -25,5 +26,12 @@ pub use binding::{BindingRegistry, Installer, Namespace};
 pub use codec::Encoding;
 pub use env::Env;
 pub use error::KernelError;
+pub use per_context::{
+    per_context_exports, per_isolate_symbols_object, private_symbols_object,
+    set_per_context_exports, PER_CONTEXT_EXPORTS,
+};
 pub use queue::TaskQueue;
-pub use symbol::{define_mark, symbol, CONTEXTIFY_CONTEXT, HOST_DEFINED_OPTION, PRIVATE_SYMBOLS};
+pub use symbol::{
+    define_mark, per_isolate_symbol, per_isolate_symbol_description, symbol, CONTEXTIFY_CONTEXT,
+    HOST_DEFINED_OPTION, PER_ISOLATE_SYMBOLS, PRIVATE_SYMBOLS,
+};

@@ -89,13 +89,14 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
         scope: &mut v8::PinScope<'s, '_>,
         message: v8::Local<'s, v8::String>,
     ) {
-        // V8 supplies the text (`"function ... could not be cloned"`). Node raises
-        // a `DataCloneError` `DOMException`; this build's `DOMException` is the
-        // plain object installed by the parent module, so a `TypeError` carrying
-        // the same message is the closest behaviour that keeps both the type name
-        // and the text intact.
-        let exception = v8::Exception::type_error(scope, message);
-        scope.throw_exception(exception);
+        // V8 supplies the text (`"function ... could not be cloned"`). Node's
+        // `SerializerDelegate::ThrowDataCloneError` raises
+        // `ThrowDataCloneException`, which constructs
+        // `internal/per_context/domexception`'s `DOMException` with the name
+        // `DataCloneError` — so `error.name` is that string, `error.code` is 25,
+        // and `error instanceof Error` holds. That class now exists, so this goes
+        // through it instead of approximating with a `TypeError`.
+        crate::throw_data_clone_exception(scope, message.into());
     }
 
     fn is_host_object<'s>(
@@ -133,7 +134,7 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
                 None => {
                     // `postMessage(port)` without listing it. Node's
                     // `clone_transfer_needed_str()`: a port cannot be copied.
-                    crate::throw_type_error(
+                    crate::throw_data_clone_exception_str(
                         scope,
                         "Object that needs transfer was found in message but not listed in \
                          transferList",
@@ -150,14 +151,17 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
             .or_else(|| crate::js_transfer_mode(scope, object));
         let Some(mode) = mode else {
             // Node's `clone_unsupported_type_str()`.
-            crate::throw_type_error(scope, "Cannot clone object of unsupported type.");
+            crate::throw_data_clone_exception_str(
+                scope,
+                "Cannot clone object of unsupported type.",
+            );
             return None;
         };
         if !mode.is_cloneable() {
             // A host object that can only move has to be in the transfer list. No
             // type in this build is in that state, but the answer must not quietly
             // become "copy it".
-            crate::throw_type_error(
+            crate::throw_data_clone_exception_str(
                 scope,
                 "Object that needs transfer was found in message but not listed in transferList",
             );
@@ -346,7 +350,9 @@ fn collect_transfers<'s>(
             return Err(None);
         };
         let Ok(object) = v8::Local::<v8::Object>::try_from(entry) else {
-            return Err(Some("Transfer list contents must be objects".to_string()));
+            // `Message::Serialize`'s `!entry_val->IsObject()` branch, whose text
+            // is `env->clone_untransferable_str()`.
+            return Err(Some("Found invalid value in transferList.".to_string()));
         };
 
         if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(entry) {
@@ -389,9 +395,7 @@ fn collect_transfers<'s>(
             continue;
         }
 
-        return Err(Some(
-            "Transfer list contents must be ArrayBuffers or MessagePorts".to_string(),
-        ));
+        return Err(Some("Found invalid value in transferList.".to_string()));
     }
 
     Ok(transfers)
