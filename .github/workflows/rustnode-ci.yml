@@ -2,7 +2,15 @@ name: CI
 
 on:
   push:
-    branches: ["rustnode/**"]
+    # `master` is where rustnode work actually lands, so it has to be listed or
+    # a merge produces no run at all. `rustnode/**` is kept because the work
+    # used to land there and a branch following that pattern should still be
+    # verified; it costs nothing while no such branch is pushed.
+    #
+    # `master` alone was missing until now, which meant the only coverage was
+    # the `pull_request` run below — and changes that reach master without a PR
+    # were never verified by this workflow at all.
+    branches: ["rustnode/**", "master"]
     paths:
       - "rustnode/**"
       # A change to this workflow must run this workflow, or a CI fix can be
@@ -133,5 +141,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # `--baseline` is the coverage ratchet, and this step is the only place CI
+      # can enforce it. Without it the check tolerates every unregistered
+      # namespace, so a namespace that used to cover its contract could drop to
+      # a placeholder and still exit 0 here — the exact regression the ratchet
+      # exists to catch. `tools/check.sh` has always passed it; this step did
+      # not, so CI was weaker than the gate it is supposed to mirror.
       - name: Binding shape contracts
-        run: cargo run --release -p rn-compat -- contracts
+        run: cargo run --release -p rn-compat -- contracts --baseline contracts/complete-namespaces.txt
