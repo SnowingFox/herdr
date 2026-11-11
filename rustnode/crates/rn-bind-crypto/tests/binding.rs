@@ -524,16 +524,21 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "createNativeKeyObjectClass returns the callback's classes",
-            // `keys.js` destructures the result into four classes at module scope;
-            // a factory that returned undefined would fail there.
+            // `keys.js` destructures the result into four classes at module scope
+            // and constructs each with a real `KeyObjectHandle`. The base class
+            // checks its argument the way Node's `NativeKeyObject::New` does
+            // (`CHECK(KeyObjectHandle::HasInstance(...))`), so a real handle is
+            // part of the contract and a string is not accepted.
             source: r#"
+                const handle = new binding.KeyObjectHandle();
+                handle.init(binding.kKeyTypeSecret, Buffer.alloc(16));
                 const result = binding.createNativeKeyObjectClass((Base) => {
                   class KeyObject extends Base {
-                    constructor(handle) { super(handle); this.tag = 'keyobject'; }
+                    constructor(h) { super(h); this.tag = 'keyobject'; }
                   }
                   return [KeyObject];
                 });
-                const instance = new result[0]('a-handle');
+                const instance = new result[0](handle);
                 return result.length + ':' + (instance instanceof result[0]) + ':'
                   + instance.tag;
             "#,

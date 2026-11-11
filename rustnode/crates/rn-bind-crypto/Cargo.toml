@@ -15,6 +15,10 @@ rn-v8-sys.workspace = true
 # classes land on this crate's namespace object.
 rn-bind-crypto-dh = { path = "../rn-bind-crypto-dh" }
 rn-bind-crypto-cipher = { path = "../rn-bind-crypto-cipher" }
+# The `KeyObject` family: `src/crypto/crypto_keys.cc`, `crypto_keygen.cc` and
+# `crypto_spkac.cc`. A separate crate for the same reason, and the classes land
+# on this namespace object.
+rn-bind-crypto-keys = { path = "../rn-bind-crypto-keys" }
 # Real OpenSSL, compiled from source. This is deliberate and load-bearing: the
 # whole premise of rustnode is that only the native glue is rewritten, so every
 # digest, MAC, cipher and derivation has to be the same code Node runs. A

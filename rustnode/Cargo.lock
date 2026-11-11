@@ -895,6 +895,7 @@ dependencies = [
  "openssl-sys",
  "rn-bind-crypto-cipher",
  "rn-bind-crypto-dh",
+ "rn-bind-crypto-keys",
  "rn-core",
  "rn-v8-sys",
  "serde_json",
@@ -920,6 +921,21 @@ dependencies = [
  "openssl-sys",
  "rn-core",
  "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-bind-crypto-keys"
+version = "0.1.0"
+dependencies = [
+ "foreign-types",
+ "libuv-sys2",
+ "openssl",
+ "openssl-sys",
+ "rn-core",
+ "rn-crypto-openssl",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
 ]
 
 [[package]]
@@ -1459,6 +1475,15 @@ dependencies = [
  "thiserror",
  "tracing",
  "v8",
+]
+
+[[package]]
+name = "rn-crypto-openssl"
+version = "0.1.0"
+dependencies = [
+ "foreign-types",
+ "openssl",
+ "openssl-sys",
 ]
 
 [[package]]

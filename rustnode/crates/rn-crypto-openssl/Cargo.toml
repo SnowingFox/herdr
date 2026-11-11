@@ -1,0 +1,22 @@
+[package]
+name = "rn-crypto-openssl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The shared EVP_PKEY/BIGNUM/EC_KEY wrapper layer over OpenSSL"
+
+[dependencies]
+# The same OpenSSL `rn-bind-crypto` builds and links. `openssl-src` is a single
+# artifact in the dependency graph, so this is a new edge onto one library, not
+# a second linkage: cargo resolves `openssl-sys` once and every crate calls into
+# the same build. Two `openssl-src` builds would double build time and could
+# put two `OPENSSL_init` states in one process.
+openssl = { version = "=0.10.82", features = ["vendored"] }
+# The raw `EVP_PKEY_get_bn_param`/`OSSL_PARAM`/`ERR_*` calls the safe crate does
+# not expose, which the key-detail and error-shape paths need.
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
+# `BigNum`/`PKey` to raw pointers. Not a new dependency in the graph: `openssl`
+# already depends on exactly this version, and it is not re-exported.
+foreign-types = "0.3"
