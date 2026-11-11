@@ -174,11 +174,14 @@ fn require_internal<'s>(
 /// would expose a builtin whose option is off, which is the divergence this
 /// replaces.
 ///
-/// This fixes the *allow-list*, not reachability. The CJS resolver currently
-/// bypasses the allow-list for `node:`-scheme ids, so a builtin this call
-/// correctly withholds can still be required — a pre-existing defect on master,
-/// tracked separately. The call is still correct and worth having, because the
-/// resolver fix will consume exactly this state.
+/// This is the *allow-list* itself, and the reachability that enforces it is a
+/// separate place: every `node:` id a user types goes through the vendored CJS
+/// loader's `BuiltinModule.normalizeRequirableId`, which reports
+/// `ERR_UNKNOWN_BUILTIN_MODULE` for an id this call did not expose. Which
+/// wrapper owns that delegation is described on
+/// [`wrap_cjs_require_with_builtin_fallback`]; before it existed rustnode
+/// handed the scheme branch to the realm's internal loader, which has no
+/// allow-list, and a withheld builtin stayed reachable through `node:`.
 pub fn allow_option_gated_builtins(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
     let Some(require) = loaders.require.as_ref() else {
         return;
@@ -1096,12 +1099,24 @@ pub fn install_cjs_loader<'s>(
 
 /// Wraps the CommonJS `require` so a builtin id still resolves.
 ///
-/// The CommonJS loader handles `node:` ids itself through
-/// `BuiltinModule.normalizeRequirableId`, but a bare `internal/...` id is only
-/// a builtin when `--expose-internals` put it in the user-facing list, and even
-/// then the loader resolves it through `BuiltinModule` rather than the
-/// filesystem. This tries the file loader first and falls back to the realm
-/// loader, which is the loader that knows every builtin id.
+/// A bare `internal/...` id is only a builtin when `--expose-internals` put it
+/// in the user-facing list, and the CommonJS loader resolves it through
+/// `BuiltinModule` rather than the filesystem, so the fallback to the realm
+/// loader is what keeps `require('internal/bootstrap/realm')` working: that id is
+/// deliberately excluded from the id list the loader consults, so only the realm
+/// loader — which returns its own `loaderExports` for it — can serve it.
+///
+/// A `node:` id is *not* routed here. The realm loader is Node's **internal**
+/// loader: `requireBuiltin` looks the id up in `BuiltinModule.map`, which holds
+/// every vendored builtin, so it has no allow-list and cannot have one — Node's
+/// own internals require gated modules at their own scope. Handing a user's
+/// `require('node:...')` to it therefore skipped
+/// `BuiltinModule.normalizeRequirableId`, the only check on the `node:` branch,
+/// and `require('node:quic')` loaded a module `canBeRequiredByUsers` reports
+/// false for. The file loader already implements that check
+/// (`defaultResolveImplForCJSLoading`: normalize, then
+/// `ERR_UNKNOWN_BUILTIN_MODULE`), so the scheme branch is delegated to it
+/// exactly like the schemeless branch, and one policy governs both.
 fn wrap_cjs_require_with_builtin_fallback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     file_require: v8::Local<'s, v8::Function>,
@@ -1110,13 +1125,9 @@ fn wrap_cjs_require_with_builtin_fallback<'s>(
     // A V8 callback cannot capture the two loaders, so the wrapper is built in
     // JavaScript the same way the `node:` wrapper is.
     let source = "(function (fileRequire, realmRequire) {\n\
-                  \x20 function isBuiltinId(id) {\n\
-                  \x20   return typeof id === 'string' &&\n\
-                  \x20     (id.startsWith('internal/') || id.startsWith('node:'));\n\
-                  \x20 }\n\
                   \x20 return function require(id) {\n\
-                  \x20   if (isBuiltinId(id)) {\n\
-                  \x20     try { return realmRequire(id.replace(/^node:/, '')); }\n\
+                  \x20   if (typeof id === 'string' && id.startsWith('internal/')) {\n\
+                  \x20     try { return realmRequire(id); }\n\
                   \x20     catch (error) {\n\
                   \x20       if (!/Missing internal module/.test(String(error && error.message))) throw error;\n\
                   \x20     }\n\
