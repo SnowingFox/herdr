@@ -1,469 +1,403 @@
 # What remains in Node's test suite
 
-A measured map of the failures left in `test/parallel`, written after the
-clusters that a single fix could close were all closed. Sizes are distinct
-files out of 5666, from a full baseline run of 2803 passing (49.5%).
+A sized map of the failures left in Node's own test suite, used to decide what to
+build next. Every number in it was produced by a command named next to it. Where a
+number could not be measured, this file says so instead of estimating.
 
-Treat the sizes as relative priority, not as a promise that fixing one closes
-exactly that many files: many carry more than one failure.
+**What this map is for.** It ranks the remaining work by how many test files a fix
+would unblock, so a worker can pick the largest honest target. It is not a release
+gate, not a compatibility claim, and not a promise that fixing one family closes
+exactly that many files: a file often carries more than one failure, and the
+families below overlap.
 
-## Read this before quoting a number
+**How the numbers were obtained.** `tools/test-tail-map.py` runs each test file in
+its own process against a named binary and keeps the whole stdout and stderr. A
+file counts as **passing only when it exits 0 *and* has none of four markers**:
 
-**The 2803/5666 (49.5%) baseline in this file is stale.** Re-measured on
-`origin/master` at `8b7c43b7` with a frozen binary and a fresh result directory,
-the suite is **3799 of 5666 files recorded as passing (67.0%)**.
-
-**But 817 of those 3799 "passes" never ran a test.** `common.skip()` prints
-`1..0 # Skipped: <reason>` and calls `process.exit(0)`, and
-`tools/harness/src/runner.rs` records `passed = !timed_out && exit_code == 0`,
-so a skip is counted as a pass. Measured by scanning each row's retained
-`stdout_head` for the marker:
-
-| figure | value |
+| marker | what it means |
 | --- | --- |
-| files recorded as passing | **3799 / 5666 (67.0%)** |
-| of which skipped | **817 (21.5% of recorded passes)** |
-| files that actually ran and passed | **2982 / 5666 (52.6%)** |
+| `✖` on stdout | `node:test` printed a failing subtest |
+| `Uncaught` on stdout or stderr | a plain-assert failure, often mid-line behind a `file:line:` prefix |
+| `1..0 # Skipped` at column zero | `common.skip()` ran and exited 0 having tested nothing |
+| `: # SKIP` | `node:test` skipped the test |
 
-**Quote 52.6% if the question is "how much of Node's suite actually works", and
-67.0% only if the question is "how many files does the harness record as
-passing".** The honest number is the 52.6%. The 817-skips figure is not a
-measurement artifact of this machine: 789 of them (96.6%) are rustnode gaps that
-real `node` would run — inspector, QUIC and DTLS are simply absent. Only 22 are
-platform-inherent gates a Linux `node` would skip too.
+Everything that did not exit 0 is a failure; a timeout is a failure too, because a
+killed process never stated a verdict. Files that skip are counted separately and
+excluded from the ratio, since they measure nothing either way.
 
-The same scan on the previous baseline at `27d67077` reads 3735 recorded / 814
-skipped / 2921 honest (65.9% / 51.6%), so the skip population is stable and the
-recorded and honest series move together.
+**What this map deliberately does not claim.** It does not claim the four-marker
+rule is sound. It is a floor: a file that asserts nothing observable, or that
+prints no output at all, cannot be told apart from a pass by reading output (see
+"The rule is a floor, not a ceiling" below). It does not claim any figure below is
+current beyond the binary it names, and it does not reconcile figures taken at
+different scopes — a `test/parallel` rate and a seven-suite rate are different
+measurements and are never combined.
 
-This re-measurement replaced the old 3733/5666 (65.9%). The delta is +64 files,
-all attributed in the commit-by-commit notes below; the two apparent regressions
-were temp-directory collisions in the harness, not code.
+## Pass-rate provenance
 
-The current rates that matter for remaining work are `crypto` 21.7%, `tls` 7.3%
-and `https` 2.7%, against `http` at 90.0% for contrast. Those three are the
-lowest-rate clusters of any size, and they are the subject of the TLS and
-asymmetric crypto workstream.
+Every full-suite figure this project has published, with what it actually measured.
+Read the **scoring rule** column before comparing any two rows; several pairs differ
+by both scope and rule, and the differences do not add up.
 
-Two procedure details when re-measuring. Freeze the binary first and use a
-separate result directory: `rn-harness report` keeps the newest outcome per file
-per directory, so a rebuilt binary in the same directory silently mixes before
-and after. And the Node test tree must be the pin: `f344e7f552e` is a full
-40-character SHA, so `git fetch --depth 1 origin <full-sha>` into an empty repo
-plus `sparse-checkout set test` is what works; without `--tests` the wrapper
-clones Node's default branch and the numbers are not comparable.
-
-## Measured at `8b7c43b7` — cluster deltas and attribution
-
-Two full runs, both at the pinned tree
-(`f344e7f552e3656bd37517151c5dc87d22b33771`), each with its own frozen binary and
-its own never-reused result directory:
-
-| run | binary | recorded | skipped | honest |
+| figure | commit | suite scope | scoring rule | verdict |
 | --- | --- | --- | --- | --- |
-| `27d67077` (old baseline) | `ad4832bf…` | 3735/5666 (65.9%) | 814 | 2921 (51.6%) |
-| `8b7c43b7` (current) | `08186134…` | **3799/5666 (67.0%)** | 817 | **2982 (52.6%)** |
+| 2803/5666 (49.5%) | pre-`8b7c43b7` baseline | 7 suites, 5666 files | exit-code only | **superseded** — optimistic by both defect classes below |
+| 3733/5666 (65.9%) | `27d67077` | 7 suites, 5666 files | exit-code only | **superseded** |
+| 3735/5666 (65.9%) | `27d67077` re-run | 7 suites, 5666 files | exit-code only | **superseded** — the two-recorded-file delta from the row above is run noise |
+| 3799/5666 (67.0%) | `8b7c43b7` | 7 suites, 5666 files | exit-code only | **superseded** |
+| 2982/5666 (52.6%) | `8b7c43b7` | 7 suites, 5666 files | skip-aware | **superseded** — correct for skip counting, still scored on exit codes, so it still contains the #51 false passes |
+| 3491/5159 (67.7%) | `7af7b306` | `test/parallel` only | exit-code only | **not reproducible here** — see the discrepancy note below; this work reads 3591 at the same commit |
+| 3097/5159 (60.0%) | `52f79555` (#51) | `test/parallel` only | exit-code only | **not reproducible here** — this work reads 3218; still inflated by skips |
+| 2855/5714 (50.0%) | `7af7b306` (pre-#51) | 8 suites, 5714 files | four-marker | **measured here** |
+| 2572/5714 (45.0%) | `52f79555` (#51) | 8 suites, 5714 files | four-marker | **last measured eight-suite figure** |
+| 2645/5159 (51.3%) | `7af7b306` (pre-#51) | `test/parallel` only | four-marker | **measured here** |
+| 2393/5159 (46.4%) | `52f79555` (#51) | `test/parallel` only | four-marker | **measured here** |
 
-The old run reproduces the previously recorded 65.9% (3733 vs 3735 — two files of
-run-to-run noise), which is what makes the new number comparable to it.
+### Why 52.6% is superseded, and why 45.0% is not a headline
 
-### Clusters the brief tracks, recomputed
+Two defects made the harness grade failures as passes, and they are independent:
 
-| cluster | docs said | `27d67077` | `8b7c43b7` | delta | honest (ran & passed) | skipped |
-| --- | --- | --- | --- | --- | --- | --- |
-| `http` | 395/439 | 395/439 | 395/439 | +0 | 394/439 | 1 |
-| `crypto` | 30/189 | 30/189 | **41/189** | **+11** | 33/189 | 8 |
-| `tls` | 18/245 | 18/245 | 18/245 | +0 | 5/245 | 13 |
-| `https` | 2/74 | 2/74 | 2/74 | +0 | 0/74 | 2 |
-| `zlib` | 73/97 | 74/100 | **90/100** | **+16** | 90/100 | 0 |
+1. **Skips counted as passes.** `common.skip()` prints `1..0 # Skipped:` and calls
+   `process.exit(0)`, and `rn-harness` records `passed = !timed_out && exit_code == 0`.
+   Measured on the pre-#51 run below: 824 of its 3870 exit-0 files skipped, and 825
+   files carry a skip marker in total (the extra one is a `known_issues` skip that
+   exits 1).
+2. **`node:test` failures counted as passes.** Until #51, `beforeExit` was never
+   emitted, so `internal/test_runner/harness.js` never finalised the root test, so
+   `test:summary` never ran and the process never set `process.exitCode`. A file
+   whose subtests failed printed the failures and exited **0**. Reproduce on a
+   pre-#51 binary:
 
-`zlib` needs a note on the denominator: the harness "cluster" is every file whose
-basename starts `test-zlib`, which is **100** across all seven suites. The docs'
-**97** is `parallel/test-zlib*` only, where the current figure is **89/97**. Both
-are correct for their definitions; the +16 is the same files either way.
+   ```
+   $ ./target/debug/rustnode -e "const {test}=require('node:test');test('f',()=>{throw new Error('x')})"
+   ...  # prints the failure, no "tests N" summary
+   $ echo $?
+   0
+   ```
 
-**No cluster went down.** `tls`, `https` and `http` are unchanged.
+   On #51's binary the same command exits 1, and 340 files in the suite import
+   `node:test`.
 
-### Every file that changed outcome, and what caused it
+**The honest current figure is unmeasured**, because #51 is still open and no tree
+containing it is on `master`. Do not quote 45.0% as "the" pass rate: it is the
+`52f79555` tree, which contains #51 but not anything merged after `7af7b306`, and it
+is the last figure anyone measured rather than the current one. When #51 lands,
+re-run `tools/test-tail-map.py` on the merge commit and replace this paragraph.
 
-66 files went fail → pass and 2 went pass → fail, for a net +64.
+### A discrepancy this document does not resolve
 
-**`#21` zstd — 18 files.** 7 `test-zlib-zstd-*` plus `test-zlib.js`,
-`test-zlib-truncated.js`, `test-zlib-zero-byte.js`, `test-zlib-decode-strings.js`,
-`test-zlib-random-byte-pipes.js`, `test-zlib-write-after-flush.js`,
-`test-zlib-brotli-flush-invalid-kind.js`,
-`test-zlib-convenience-async-round-trip.js`,
-`test-zlib-convenience-methods.js`, `test-stream-iter-transform-sync.js`,
-`test-vfs-zip-provider-handle.js`. Every one failed with `Uncaught Error: zstd is
-not implemented by rn-bind-zlib`, which is the throw this merge removed. The
-non-zstd files are there because they construct a zstd handle at module scope.
+PR #51 publishes 3491 passed before its fix and 3097 after, on `test/parallel`,
+measured with `rn-harness`. Re-measuring the same two commits with
+`tools/test-tail-map.py` gives **3591** and **3218** — 100 and 121 files higher.
 
-**`#19` DiffieHellman — 13 files.** `test-crypto-dh-{errors,generate-keys,
-group-setters,known-groups,modp2-views,modp2,odd-key,padding,shared}.js`,
-`pummel/test-crypto-dh-hash.js`, `pummel/test-crypto-dh-keys.js`,
-`pummel/test-dh-regr.js`. Old failures are `_DiffieHellmanGroup is not a
-constructor` (10) and `_DiffieHellman is not a constructor` (1). This is the
-`crypto` +11.
+The cause is not established, and this document does not pick a side. What is
+ruled out or measured:
 
-**`#16` permission — 22 files.** `test-permission-*` (20) and
-`test-cli-permission-*` (2). Old failures were `warning: --permission is accepted
-but not implemented` (11) and `unsupported option '--allow-{net,addons,
-inspector,wasi}'` (7), plus two assertion failures. This is the `permission`
-cluster moving 23 → 43 recorded.
+* **Not the temp-directory change.** Re-running the pre-fix commit with
+  `--serial-id 0` (which reproduces `rn-harness`'s shared `test/.tmp.0/`, the way
+  both of #51's runs were taken) gives 3581, only 10 below the 3591 measured with a
+  per-file id. Collisions are real but they are not a 100-file effect.
+* **Not the timeout.** #51 used 60 s; 30 s gives 3591 and 60 s gives 3581 at the
+  same commit, so a longer limit moves the number *down* by reclassifying
+  timeouts, not up.
+* **Not a different suite set.** Both are `test/parallel` over the same pinned
+  tree, and both select 5159 files.
 
-**`#17` TCP asyncReset / getProviderType — 3 files.** `test-cluster-concurrent-disconnect.js`
-(failed with `TypeError [ERR_INVALID_ARG_TYPE]: The "err" argument must be of
-type number. Received an instance of WriteWrap` from `getSystemErrorName` — the
-handle was being passed where an int was expected), `test-async-wrap-destroyid.js`
-and `test-socketaddress.js`.
+The two directions of the fix agree in this work (+100 pre, +121 post), which is
+consistent with a constant difference in how a pass was counted rather than with
+either binary behaving differently. Anyone reusing #51's 3491/3097 pair should
+re-measure first. The rows this document sizes come from its own runs, so the
+discrepancy does not enter any family count.
 
-**`#18` kClone host-object hook — 2 files.** `test-blocklist-clone.js` posts a
-`BlockList` through a `MessageChannel` and asserts the deserialised copy is a
-working `BlockList`; the old failure was `TypeError: data.check is not a
-function`, exactly the missing-hook symptom. `test-messaging-marktransfermode.js`
-is the other.
+### Provenance of the two runs measured for this document
 
-**Harness temp-directory collisions — 4 gains, 2 losses.** These are *not* code
-changes and should not be read as regressions. `test-fastutf8stream-retry.js`,
-`test-fs-readfilesync-pipe-large.js`, `test-fs-symlink-longpath.js` and
-`test-fs-utils-get-dirents.js` moved fail → pass, and
-`test-fs-existssync-memleak-longpath.js` and
-`test-fs-realpath-stale-stat-values.js` moved pass → fail, all with `ENOENT` /
-`EEXIST` under the shared `test/.tmp.<n>/` directory. Running the two "lost"
-files alone against the same `8b7c43b7` binary gives **2/2 passing**, which
-proves it is contention between concurrent files and not the tree.
+Both runs used the same pinned Node tree, the same tool, a binary frozen before the
+run, and the same command. They differ only by #51.
 
-**1 remaining file:** `test-perf-hooks-usertiming.js`, old failure
-`TypeError: structuredClone: the serialized value could not be read back`, which
-is consistent with `#18` but is the least directly evidenced attribution here.
-
-## The skip population, grouped by gate
-
-817 of the 3799 recorded passes are `1..0 # Skipped:` exits. Grouped by reason at
-`8b7c43b7`:
-
-| files | gate | real `node` would run it? |
+| | pre-#51 | post-#51 |
 | --- | --- | --- |
-| 328 | `V8 inspector is disabled` (`process.features.inspector = false`) | **yes** — `--inspect` is an unsupported option here |
-| 272 | `QUIC is not enabled` | **yes** — the flag warns as unimplemented |
-| 54 | `DTLS is not enabled` | **yes** |
-| 32 | `missing ESLint` (`tools/eslint` not checked out) | yes, but this is a fixture gap, not a runtime one |
-| 31 | `missing SQLite` (`process.versions.sqlite`) | **yes** |
-| 18 | `no IPv6 support` | **yes, and this one is a bug** — see below |
-| 24 | OpenSSL build/feature gate (FIPS, PKCS#11, `openssl-cli`, BoringSSL) | mixed — some are genuine build differences |
-| 18 | Windows-only test | no, inherent on Linux |
-| 11 | `Requires Amaro` (TypeScript) | **yes** |
-| 3 | Temporal, macOS-only, AIX-only, addon, Intl/ICU, trace events | mostly no |
-| 12 | environment (`strace`, `wrk`, `ab`, `nop` binary, non-TTY, inotify) | no, inherent |
+| commit | `7af7b306` | `52f79555` (`origin/cursor/exit-and-test-status`, #51) |
+| contains | #33, #46; **not** #51 | #33, #46, #51 |
+| binary | `/tmp/frozen-pre51/rustnode` | `/tmp/frozen-pr51/rustnode` |
+| sha256 (16) | `c4ff9845a0b34faf` | `d8c0d9cd691cfd07` |
+| binary mtime (UTC) | 2026-11-11T10:10:26 | 2026-11-11T10:08:43 |
+| Node tree | `f344e7f552e3656bd37517151c5dc87d22b33771` | same |
+| command | `tools/test-tail-map.py run --node <binary> --tests /tmp/node-pin/test --jobs 8 --timeout 30` | same |
+| exit-0 files | 3898 (68.2%) | 3454 (60.4%) |
+| four-marker passes | **2855 (50.0%)** | **2572 (45.0%)** |
+| skipped | 808 | 808 |
+| failing | 2051 | 2334 |
 
-**789 of 817 (96.6%) are rustnode gaps rather than platform gates.** The single
-largest fix available is the inspector: 328 files, spread over `repl` (101),
-`debugger` (83), `inspector` (76) and `heap`/`cpu` (22). Second is QUIC at 272.
+Binary freshness: `rm target/debug/rustnode` does **not** force a rebuild, because
+Cargo restores a cached hardlink whose mtime predates the build. `touch
+crates/rn-cli/src/main.rs` and confirm `Compiling rn-cli` appears. Build env:
+`RUSTUP_TOOLCHAIN=1.96.1 CXX=g++ RUSTFLAGS="-L /usr/lib/gcc/x86_64-linux-gnu/13"`.
 
-This is why the honest figure is 52.6% and not 67.0%. The clusters that look
-strongest are the most affected: `repl` is recorded 102/102 but every one of
-those is a skip, and `debugger` is 83/83 all skipped. `sqlite` is 26/26 all
-skipped — the same pattern the sqlite worker hit, at 100%.
+## The rule is a floor, not a ceiling
 
-### The IPv6 skips are a real bug, not a gate
+The four-marker rule catches most of the #51 class but not all of it. On
+`test/parallel`, the exit-code rule says 375 files flipped pass → fail when #51
+landed. Of those 375:
 
-`common.hasIPv6` returns `Object.keys(os.networkInterfaces()).some(...)` looking
-for `family === 'IPv6'`. rustnode's `os.networkInterfaces()` returns **lowercase**
-`"ipv4"` / `"ipv6"` where Node returns `"IPv4"` / `"IPv6"`:
+| | files |
+| --- | --- |
+| the four-marker rule already called them not-passes on the pre-#51 binary | **118** |
+| it still passed them, because the output carried **no marker at all** | **257** |
 
-```
-$ rustnode -e "console.log(JSON.stringify([...new Set(Object.values(require('os').networkInterfaces()).flat().map(x=>x.family))]))"
-["ipv4","ipv6"]
-$ node      -e "…same…"
-["IPv4","IPv6"]
-```
-
-So `hasIPv6` is false even though `process.features.ipv6` is `true` and `::1` is
-present in the interface list, and **18 files skip with "no IPv6 support" that
-should run**. It also sets `internal: false` for loopback where Node sets `true`,
-and leaves `mac` empty. This is a one-line casing fix in the `os` binding and it
-unblocks 18 files; it is worth doing before any of the larger skip families.
-
-### `process.versions` and the capability flags
-
-`process.versions` is **not** the main skip family, contrary to expectation: it
-accounts for 31 SQLite skips, 11 Amaro and 2 ICU. But it is a real and cheap gap,
-and it blocks capability detection generally.
-
-Node at the pin exposes **31** keys (`src/node_metadata.h`,
-`NODE_VERSIONS_KEYS`). rustnode reports **4**:
+242 of the 257 are uncalled `common.mustCall`, and **193 of the 257 printed
+completely empty output** pre-#51. `common.mustCall` reports
+`Mismatched <anonymous> function calls. Expected exactly 1, actual 0.` from a code
+path that only runs when the summary runs, so pre-#51 the file printed **nothing**
+and exited 0. Example, `parallel/test-bench-context-control.js`:
 
 ```
-node, openssl, uv, v8
+$ /tmp/frozen-pre51/rustnode test/parallel/test-bench-context-control.js ; echo $?
+0                      # empty output
+$ /tmp/frozen-pr51/rustnode  test/parallel/test-bench-context-control.js ; echo $?
+1                      # "Mismatched noop function calls. Expected exactly 1, actual 0."
 ```
 
-Missing, in the order `NODE_VERSIONS_KEYS_BASE` lists them:
+So a `tools/test-tail-map.py` pass on a pre-#51 binary means only "exited 0 and
+said nothing that looks like failure". It does not mean the assertions ran. On a
+#51 binary the exit code carries the verdict and the rule is sound.
 
-`zlib`, `brotli`, `zstd`, `ares`, `modules`, `nghttp2`, `napi`, `llhttp`,
-`uvwasi`, `acorn`, `simdjson`, `simdutf`, `ada`, `nbytes`, `ngtcp2`, `nghttp3`,
-`amaro`, `undici`, `merve` — plus the conditional groups `ncrypto` (with
-`openssl`), `cldr`, `icu`, `tz`, `unicode`, `sqlite`, `libffi`, `lief`.
+## Sizing, with provenance per row
 
-That is **27 missing keys**. `common` gates on several of them directly
-(`hasSQLite`, `hasCrypto`, `hasFFI`) and on `process.config.variables` for others
-(`hasIntl` reads `v8_enable_i18n_support`, `hasTemporal` reads
-`v8_enable_temporal_support`) — and `process.config.variables` *is* populated
-here, which is why Intl gates behave. Adding the version keys would let those
-gates answer correctly without changing any other behaviour.
+All rows below are from the **post-#51 run** (binary `d8c0d9cd691cfd07`, commit
+`52f79555`, 5714 files, 2334 failing) unless the row says otherwise. A row marked
+*counted* was sized by matching a failure signature in the recorded output of that
+run; a row marked *run* was re-run on the binary it names. Sizes are distinct files
+and overlap, so they are not additive.
 
-## Headline numbers from the original snapshot
-
-| measure | before | after |
+| files | family | provenance |
 | --- | --- | --- |
-| fixed 120-test sample of `test/parallel` | **58/120 (48.3%)** | **74/120 (61.7%)** |
-| full `test/parallel` (5666 files, measured) | 2803 (49.5%) | 3799 (67.0%) recorded / 2982 (52.6%) honest, at `8b7c43b7` |
-| `python3 tools/smoke.py` | 18/18 | 18/18 |
-| `tools/parity.py` | 2755 bytes identical | 2755 bytes identical |
-| `./tools/check.sh` gates | green | green |
+| 640 | `internalBinding('tls_wrap')` has no implementation | counted |
+| 151 | `AssertionError: … strictly equal`, no single cause | counted (132 in `test/parallel`) |
+| 123 | `WorkerImpl is not a constructor` | counted |
+| 114 | timeouts | counted |
+| 28 | `fsBinding.cpSyncCopyDir is not a function` | counted |
+| 19 | `fs.cp` calls `then()` on a `BigInt64Array` stat result | counted |
+| 13 | `internalBinding('locks')` has no implementation | counted |
+| 10 | `unsupported option '--snapshot-blob'` | counted |
+| 0 | `ReadFileJob` / `WriteFileJob` | **run**, see below |
 
-The 2803/49.5% figure is a full measured baseline I ran before changing
-anything. The "after" full run was still in flight when this was written (each
-full pass is roughly two hours because ~85 files time out at 30s), so the
-**sample is the only like-for-like before/after number**. It is the metric the
-task brief specified, and it moved 14 files.
+### `tls_wrap` — 640 files, and it is not tail work
 
-Why 14 sample files and far more at scale: the 120-file sample is the
-alphabetically-first 120 of `test/parallel`, so it is heavy on `a*` and `bench*`
-and contains no `child_process`, no `tls`, no `fs.cp`, no `crypto` webcrypto and
-no `worker` tests. Every one of those clusters moved at full-suite scale without
-appearing in the sample at all. Concretely, the fixes below carry a signal in
-**987 distinct baseline failure files**; only ~14 of them sit inside the sample.
+The contract lists three members (`TLSWrap`, `wrap`, `HAVE_SSL_TRACE`), which makes
+it look tractable. It is not. `TLSWrap` is a `StreamBase` whose `DoWrite`/`DoRead`
+are `SSL_write`/`SSL_read` against an `SSL_CTX` from a `SecureContext`, plus
+`SSL_do_handshake`, the `SSL_get_error` retry machine, session resumption, SNI
+callbacks, ALPN, OCSP and the session-ticket keys. `lib/internal/tls/wrap.js`
+proxies **16** handle methods (`ref`, `unref`, `hasRef`, `open`, `bind`, `listen`,
+`connect`, `bind6`, `connect6`, `getsockname`, `getpeername`, `setNoDelay`,
+`setKeepAlive`, `setSimultaneousAccepts`, `setBlocking`, `setPendingInstances`) into
+a live SSL object.
 
-## Clusters closed
+This is a TLS stack over OpenSSL and belongs to the crypto workstream. Starting it
+elsewhere would produce a partial handle that fails deeper and less legibly than the
+current honest "no implementation yet".
 
-Counts are distinct files in the measured 5666-file baseline whose failure text
-carried that signature. They overlap, so the counts are not additive; the union
-is the 987 stated above.
+### The strict-equal tail — 151 files, and it is not an async cluster
 
-| files | cluster | fix |
-| --- | --- | --- |
-| 413 | `Unexpected global(s) found: __argv, __stdout, __stderr, __v8Version, …` | `bootstrap.js` deletes its Rust hand-off globals; `set_global` defines globals non-enumerably; `exposeLazyDOMExceptionProperty` defines instead of assigns |
-| 152 | `internalBinding('ipc_serdes')` has no implementation | new `ipc_serdes` namespace in `rn-bind-serdes`: V8 serialization with the `[4-byte BE length][payload]` framing and `ArrayBufferView` host-object tagging |
-| 105 | `Missing internal module 'internal/deps/acorn/acorn/dist/acorn'` | vendored `deps/acorn/acorn/dist/acorn.js` + `acorn-walk/dist/walk.js` from the pinned revision; `deps_files` 1 → 3 |
-| 106 | `--experimental-stream-iter is accepted but not implemented` | stopped warning: `stream/iter` resolves and the `test-quic-stream-iteration*` files pass |
-| 82 | `Cannot destructure property 'subtle' of 'globalThis.crypto'` | installed WebCrypto in **file** mode (`crypto`, `Crypto`, `CryptoKey`, `SubtleCrypto`); `-e` mode had masked the gap |
-| 37 | `fsBinding.cpSyncCheckPaths is not a function` | implemented `cpSyncCheckPaths`: the four `fs.cp` path-identity checks, with `ERR_FS_CP_*` shapes recorded from the real `node` binary |
-| 32 | `setUncaughtExceptionCaptureCallback is not a function` | installed the four `internal/process/execution` hooks; routed timer/immediate throws through `process._fatalException`; added the `shouldAbortOnUncaughtToggle` aliased buffer |
-| 22 | `No such built-in module: node:bench` | parse the CLI into `internalBinding('options')` values (`Store` mirrors `OptionsParser<Options>::Parse`), which is what gates `node:bench` |
-| 22 | `--allow-natives-syntax is accepted but not implemented` | forwarded to V8 before `V8::Initialize`, both spellings |
-| 14 | `process.getuid/geteuid/getgid/getegid/getgroups is not a function` | copied the credential getters onto `process`; fixed the `credentials` setters to resolve names instead of coercing, and to throw `UVException`'s exact shape |
-| 8 | `internalBinding('signal_wrap')` has no implementation | new `rn-bind-signal-wrap`: `Signal` as a `HandleWrap` over `uv_signal_t` |
+`Expected values to be strictly equal` is a substring, not a cause. Classified by
+reading each failure body on the post-#51 run:
 
-Two smaller commits support the above: `rn-bind-options` now has a `parsed`
-module with 44 unit tests, and `rn-bind-os`'s `credentials` setters were
-corrected (they coerced every non-numeric string to uid 0, so
-`process.setuid('nobody')` tried to become root rather than reporting an unknown
-credential).
+| split | files |
+| --- | --- |
+| worker-gated | 1 |
+| async-shaped (file name or failure text mentions async hooks / ALS) | **0** |
+| something else | 150 |
 
-Every fix above was verified against the `node` binary on PATH, and the
-recorded-vs-actual comparison is in the commit body for each. The strongest
-examples: `process.getgroups()` is byte-identical to `node`'s answer on this
-machine; the four `fs.cpSync` error shapes match byte-for-byte including the
-trailing separator `src` keeps in the subdirectory case; and
-`setUncaughtExceptionCaptureCallback` followed by a throwing `setImmediate`
-prints the same two lines and exits 0 under both runtimes.
+The async-shaped count is zero because the four files that used to be here
+(`test-async-hooks-promise-triggerid.js`, `test-async-hooks-promise.js`,
+`test-async-hooks-top-level-clearimmediate.js`,
+`test-async-hooks-recursive-stack-runInAsyncScope.js`) **pass** on this tree: #33
+established the top-level async context. A previous version of this document argued
+the long tail was mostly async propagation; that claim was measured false when the
+bucket was read file by file, and the last four genuine members have since been
+fixed. The tail is ordinary native-surface gaps that happen to end in a
+`strictEqual`.
 
-## Deliberately not attempted, with sizes
+### `WorkerImpl` — 123 files
 
-These are the whole remaining tail as measured, largest first. A next worker can
-pick from this list directly.
+`worker_threads`. `rn-bind-worker` declares `Worker` deferred, and the reason holds:
+it needs a second isolate, a cross-thread `MessagePort` transport, and the
+worker-side bootstrap in `internal/main/worker_thread.js`. It is a subsystem, not a
+namespace.
 
-### 638 files — `tls_wrap`: **not tail work, do not start it**
+### timeouts — 114 files
 
-The contract lists only three members (`TLSWrap`, `wrap`, `HAVE_SSL_TRACE`), which
-makes it look like a weekend job. It is not. `TLSWrap` is a `StreamBase` whose
-`DoWrite`/`DoRead` are `SSL_write`/`SSL_read` against an `SSL_CTX` created from a
-`SecureContext`, plus `SSL_do_handshake`, the `SSL_get_error` retry machine,
-session resumption, SNI callbacks, ALPN, OCSP and the TLS session-ticket keys.
-`lib/internal/tls/wrap.js` drives it through fifteen proxied `HandleWrap`/
-`TCPWrap` methods that all have to forward into a live SSL object.
+A timeout is a failure: the process was killed and never stated a verdict. The
+count is load-sensitive, so treat a file that changed outcome *and* timed out on
+either side as noise until re-run alone. `--timeout` raises the per-file limit.
 
-This is a real TLS stack over OpenSSL, of the same order as the deferred
-asymmetric crypto surface (`RsaKeyPairGenJob`, `KeyObjectHandle`,
-`EcKeyPairGenJob`, `_DiffieHellmanGroup`, `isNativeKeyObject` — another ~110
-files in this same list). **Recommendation: leave all of it to the crypto
-workstream.** Starting `tls_wrap` here would have produced a partial handle that
-fails deeper and less legibly than the current honest "no implementation yet".
+### `fs.cp` — 28 + 19 files, two separate bugs
 
-### 148 files — `AssertionError: Expected values to be strictly equal`, no single cause
+| files | failure |
+| --- | --- |
+| 28 | `cpSyncCopyDir is not a function` — `-r` recursion is still declared deferred |
+| 19 | `Method Promise.prototype.then called on incompatible receiver [object BigInt64Array]` in `fs/promises` |
 
-This is the true long tail: after removing every named signature, 148 files fail
-on a bare value comparison. They are not one bug. Spot-checking put them in
-`async_hooks` id sequencing, `AbortSignal` clone/reason semantics, `AsyncLocalStorage`
-propagation through the HTTP agent, and `structuredClone` transfer lists. Closing
-this needs per-family investigation, not a cluster fix.
+The second is the best ratio in the tail: it needs no async knowledge, only that the
+promise path stop receiving bigint stat arrays.
 
-### 116 files — `WorkerImpl is not a constructor`
+### `locks` — 13 files
 
-`worker_threads`. `rn-bind-worker` declares `Worker` deferred with a reason that
-is correct and still applies: it needs a second isolate, a cross-thread
-`MessagePort` transport, and the worker-side bootstrap in
-`internal/main/worker_thread.js`. This is a subsystem, not a namespace. It also
-blocks a large share of the 148 above, because many of those tests spawn a worker
-to check propagation.
+`internalBinding('locks')` is unimplemented. Its consumer is the Web Locks API
+(`navigator.locks`, reached through `internal/locks.js`), not
+`--experimental-locks`; `--experimental-locks` warns separately and the four
+`test-web-locks*` files fail on the binding.
 
-### timeouts — now 94, was ~85
+### `--snapshot-blob` — 10 files
 
-Measured **94** at `8b7c43b7` (and 97 at `27d67077` on the same machine), against
-the ~85 this file previously recorded. The count is close between the two runs on
-this machine, so most of the gap to ~85 is environment, not one merge. Distribution
-now: `cluster` 21, `http` 14,
-`child` 11, `dns` 11, `dgram` 6, `gc` 5, `async` 3, `fastutf8stream` 3, `worker`
-3, then ones and twos. The count moving is a comparability caveat, not a
-regression: a changed timeout population means the environment differs, so a file
-that flipped outcome *and* timed out on either side should be re-run alone before
-being called a fix or a regression.
+Startup snapshots. The flag is not in `rn-cli`'s accepted list, and accepting it
+would need `rn-bind-mksnapshot`'s snapshot build path to work, so it is not a parser
+tweak.
 
-All HTTP-related in the baseline (`test-async-hooks-http-agent*`,
-`test-async-local-storage-http-*`, `test-http-server-keep-alive-*`). Root cause I
-identified but did not fix: `HTTPParser#consume` throws because rustnode has no
-`StreamBase` handle handoff, so `lib/internal/http/server.js` aborts the
-connection path; the keep-alive socket then keeps the loop alive forever. A
-related symptom is worth its own look: the process does not always exit after
-`server.close()`, and orphaned `child-process-stay-alive-forever` children
-accumulated during my first full run and had to be killed by hand.
+### `ReadFileJob` / `WriteFileJob` — 0 files, closed by #46
 
-### `--permission` — model enforced for four scopes, flag still on the warning list
+**Correction.** This document previously listed "17 + 12 files — `ReadFileJob` /
+`getWasmCompileCacheEntry`" and said both were deferrals with reasons that still
+held. Both halves were wrong.
 
-**Correction, not a measurement from the full run below.** The old text said the
-permission model was "genuinely absent" and that `--allow-fs-read` /
-`--allow-child-process` did not gate anything. That is no longer true. #16
-threaded the model from the CLI into every check, so `fs` read, `fs` write,
-`child` and `env` are genuinely enforced: `/etc/passwd` returns
-`ERR_ACCESS_DENIED` under `--permission`, is readable without it, and
-`--allow-fs-read=/etc/passwd` re-enables it.
+`ReadFileJob` and `WriteFileJob` are now installed by #46 (`97c56e36`), so they are
+no longer in `crates/rn-bind-fs/src/install.rs`'s `DEFERRED` list at all. Measured
+on `8cf029b2f3dba530` (current `master`, post-#46): of the 57 files in
+`test/parallel` that call `fs.readFile(`/`fs.writeFile(` in callback form, **0**
+still fail with `ReadFileJob is not a constructor` or
+`WriteFileJob is not a constructor`, down from 34 across the whole suite before it.
 
-`test-permission-*` moved **23/88 → 44/88** on that merge. (My full-suite
-measurement below puts the cluster's *honest* pass count lower, at 33/88 with 10
-of the 43 recorded passes being skips — see the skip section; the 44/88 is the
-pre-skip recorded figure on the change's own base.)
+The old *reason* was false even before the fix. It said reads "go through
+read/readv until batching is measured as needed", but `vendor/libnode-js/lib/fs.js`
+is byte-identical to Node's (`sha256 ee9167e6…` in `vendor/libnode-js/LIBJS.sha256`)
+and constructs `new ReadFileJob(path, flagsNumber, kReadFileBufferLength, true)`
+unconditionally in the `buffer === undefined` branch. There was never a fallback
+path, so callback `fs.readFile` threw
+`TypeError: ReadFileJob is not a constructor` — it did not read through `readv`.
+Reproduce against a pre-#46 binary:
 
-The flag legitimately **stays on the `UNIMPLEMENTED` warning list**, but for a
-different reason than the old text gave. It is not that the model is absent — it
-is that six scopes remain unenforced: **`net`, `worker`, `addon`, `wasi`,
-`inspector`, `ffi`**. Tests that exercise those still see a warning, and the
-warning is honest for them. Implementing the model for the remaining six is the
-work that would let the flag come off the list; passing the flag only to tests
-that do not need enforcement would be weakening a check, so do not do that.
+```
+$ ./rustnode -e "require('fs').readFile('/etc/hostname',()=>{})"
+Uncaught TypeError: ReadFileJob is not a constructor
+```
 
-### 27 files — `unsupported option '--snapshot-blob'`
+`getWasmCompileCacheEntry` is still deferred, with a reason that is checkable rather
+than aspirational: both it and `saveWasmCompileCacheEntry` need V8 APIs the linked
+`v8` crate does not expose (`v8::WasmModuleCompilation` with a module-caching
+callback, and `v8::WasmModuleObject::CompiledModule::Serialize()`). Its file count is
+**not** measured here; the "12" the old text carried came from the superseded
+baseline and is not reproduced.
 
-Startup snapshots. The flag is not in `rn-cli`'s accepted list. Accepting it
-would need `rn-bind-mksnapshot`'s snapshot build path to actually work, so this
-is not a parser tweak.
+### `zstd` — closed, and the level 4-6 divergence is recorded the other way round
+
+Both throws that lived in `rn-bind-zlib/src/handle.rs` are gone; `zstdCompressSync`
+and `createZstdCompress` are functions. Why the output can be byte-identical:
+`cargo tree` shows `zstd-sys 2.0.17+zstd.1.5.7`, and Node's `deps/zstd/lib/zstd.h`
+at the pin defines `ZSTD_VERSION_RELEASE 7` with major/minor 1.5 — the same
+compressor at the same version.
+
+**Correction to the previous text**, which said `deflate` at levels 4-6 gives
+rustnode a ratio of 79 where Node reaches 60. Measured on the 4000-byte
+alphabet-cycle payload, it is the reverse: rustnode produces **79 bytes** where Node
+produces **60** (`deflateSync`, levels 4 and 6). `docs/compat-status.md` carries the
+same inverted table and needs the same correction; it is out of scope here.
+
+### `--permission` — model enforced for four scopes, flag still warns
+
+The permission *model* is no longer absent: `fs` read, `fs` write, `child` and `env`
+are enforced.
+
+```
+$ ./rustnode --permission -e "try{require('fs').readFileSync('/etc/passwd')}catch(e){console.log(e.code)}"
+ERR_ACCESS_DENIED
+$ ./rustnode --permission --allow-fs-read=/etc/passwd -e "console.log(require('fs').readFileSync('/etc/passwd','utf8').length)"
+1069
+```
+
+The flag still appears on the `UNIMPLEMENTED` warning list, and that warning is
+honest, because six scopes remain unenforced: `net`, `worker`, `addon`, `wasi`,
+`inspector`, `ffi`. Passing the flag only to tests that do not need enforcement
+would weaken a check, so do not do that. A per-scope file count is not measured
+here.
 
 ### `block_list` — closed
 
-Four members (`BlockList`, `SocketAddress`, `AF_INET`, `AF_INET6`), but
-`BlockList` was a native rule engine: `addAddress`, `addRange`, `addSubnet`,
-`check`, with IPv4/IPv6 CIDR prefix matching. It is implemented now
-(`crates/rn-bind-block-list`), so this cluster is no longer a gap.
+`BlockList`, `SocketAddress`, `AF_INET` and `AF_INET6` are implemented in
+`crates/rn-bind-block-list`, and the contract check reports the namespace `ok`. The
+remaining `test-*blocklist*` failures point elsewhere: `test-blocklist-fast-api.js`
+needs `internalBinding('debug')`, `test-tls-spki-blocklist.js` needs `tls_wrap`, and
+`test-blocklist-clone.js` needs the `kClone`/`kDeserialize` host-object round trip.
 
-Of the sample files that exercise it, `test-blocklist.js`,
-`test-net-blocklist.js`, `test-dgram-blocklist.js`, `test-net-server-blocklist.js`
-and `test-net-server-blocklist-fail-closed.js` pass. Three still fail for reasons
-outside this namespace: `test-blocklist-fast-api.js` needs `internalBinding('debug')`,
-`test-tls-spki-blocklist.js` needs `tls_wrap`, and `test-blocklist-clone.js` needs
-the messaging layer to round-trip a host object through `kClone`/`kDeserialize`
-(the hook is stored by `setDeserializerCreateObjectFunction` but never invoked, so
-the deserialised value arrives as a plain object).
+### Deferred asymmetric crypto
 
-### ~110 files — deferred asymmetric crypto
+`isNativeKeyObject`, `RsaKeyPairGenJob`, `KeyObjectHandle`, `EcKeyPairGenJob`,
+`_DiffieHellmanGroup` and `NamedKeyPairGenJob` all read `undefined` from `require('crypto')`
+today, so this surface is still absent. It belongs with `tls_wrap` in the crypto
+workstream. **The "~110 files" the previous text gave is not reproduced**: that
+figure came from the superseded baseline and counting it properly needs a per-member
+signature match this document has not run.
 
-`isNativeKeyObject` (22), `RsaKeyPairGenJob` (19), `KeyObjectHandle` (18),
-`EcKeyPairGenJob` (12), `_DiffieHellmanGroup` (11), `NamedKeyPairGenJob` (7),
-plus `RandomBytesJob` and `KeyObjectHandle` variants. Belongs with `tls_wrap` in
-the crypto workstream.
+## Claims removed from this document
 
-### `zstd` — closed (was "20 files — `zstd is not implemented`")
+Each of these appeared in an earlier version and did not survive checking. They are
+recorded here so they are not reintroduced from memory.
 
-**Correction, not a measurement from the full run below.** Both throws that lived
-in `rn-bind-zlib/src/handle.rs` are gone as of `8b7c43b7`: `ZstdCompress` and
-`ZstdDecompress` build real handles, and the whole public surface is implemented
-(`createZstdCompress`/`createZstdDecompress`, the four sync/async convenience
-methods, every `ZSTD_C_*`/`ZSTD_D_*` parameter, and dictionaries).
+| removed claim | why |
+| --- | --- |
+| "the strict-equal tail is mostly async propagation" | 144 files read individually: 4 async, 1 worker-gated, 139 other. Now 0 async, because #33 fixed the last four. |
+| "`ReadFileJob`/`WriteFileJob` deferral reasons still hold" | They are not deferred any more (#46), and the stated reason was never true: `lib/fs.js` calls them unconditionally. |
+| "a strict-equal `AbortSignal` file" | None. `test-abortsignal-cloneable.js` prints three `✖` subtests and then hangs to the 30 s timeout; it is a hang, not a `strictEqual`. |
+| "a strict-equal `AsyncLocalStorage` file" | None. The four ALS failures are 2 timeouts (`http-agent`, `http-multiclients`), `_queryObjects is not a function`, and `assert.ok(storeGCed)` — no `strictEqual` among them. |
+| "a `structuredClone` transfer-list failure" | No file fails on `structuredClone` with a transfer list as its recorded reason. The two files that print `Found invalid value in transferList` are `test-webstreams-clone-unref.js` and `test-whatwg-webstreams-transfer.js`, which exercise the Web Streams transfer path, not `structuredClone`. `test-structuredClone-global.js` fails with `Missing expected exception` and `test-structuredClone-domexception.js` passes. |
+| "638 files — `tls_wrap`" | 640 on the post-#51 run. The old number is not wrong by much, but it was counted against a superseded baseline, so it is replaced rather than carried. |
+| "148 files — strict equal" | 151 on the post-#51 run at eight-suite scope, 132 of them in `test/parallel`. |
+| "116 files — `WorkerImpl`" | 123 on the post-#51 run. |
+| "85 / 94 files — timeouts" | 114 on the post-#51 run. The old figures were load- and binary-dependent. |
+| "17 + 12 files — `ReadFileJob` / `getWasmCompileCacheEntry`" | `ReadFileJob` is 0 after #46; the wasm-cache count is unmeasured, for the reason above. |
+| "~110 files — deferred asymmetric crypto" | Unmeasured; see above. |
+| "27 files — `--snapshot-blob`" | 10 on the post-#51 run. The old "27" counted files *mentioning* the flag (33 files across `test/**` mention `snapshot-blob`, and 29 are `test-snapshot-*`), but only 10 fail because the option was refused. |
+| "12 files — `locks`" | 13 on the post-#51 run, and the consumer is the Web Locks API, not `--experimental-locks`. |
+| "`--experimental-stream-iter` / `--allow-natives-syntax` were removed from the unimplemented list" | Verified: neither warns. `--experimental-vm-modules`, `--experimental-quic`, `--permission` and `--experimental-locks` still do. |
+| "`deps_files` moved 1 → 3" | Verified by `./tools/verify-libjs.sh`: `435 lib files, 3 deps files`. |
+| "everything is committed on `node-test-tail` and fast-forwarded to `origin/rustnode/main`" | No such branch exists, and `origin/rustnode/main` is at `8b7c43b7`, not at the text's tree. Removed rather than restated. |
 
-Measured on that merge:
+## Other numbers this document does not quote
 
-| measure | before | after |
-| --- | --- | --- |
-| `test-zlib-zstd` | 3/10 | **10/10** |
-| `test-zlib` cluster | 73/97 | **89/97** |
+* **A per-cluster pass rate.** `rn-harness report` groups by the first name segment
+  (`test-fs-open.js` → `fs`), which mixes suites and hides skips. Every rate quoted
+  here is either whole-suite or a named family counted from the recorded run.
+* **A "fixed" count for a merge.** The old text attributed 66 fail → pass to five
+  PRs by matching failure text. That kind of attribution needs the same binary for
+  both sides; none is reproduced here.
+* **A before/after for the 120-file sample.** That sample was the alphabetically
+  first 120 files of `test/parallel` (83 `test-a*`, 30 `test-bench*`, no
+  `child_process`, no `fs-cp`), so it was never representative and its 58 → 74
+  movement was measured under the exit-code-only rule.
 
-Why compression output is **byte-identical** to Node's rather than merely
-mutually decodable: Node vendors zstd **1.5.7** at `deps/zstd`, and this crate
-links `zstd-sys` **2.0.17**, which vendors the same C sources at the same
-version (`+zstd.1.5.7`). Both sides run the same compressor, so
-`zstdCompressSync` produces the same bytes — a property `tests/zstd_parity.rs`
-reports on several payloads rather than asserting, since only mutual decodability
-is required.
+## Reproducing any row
 
-**The `libz-rs-sys` level 4-6 divergence is untouched and is a different
-thing.** `deflate`/`gzip` at levels 4-6 still compress to a ratio of 60 where
-Node reaches 79, because those paths go through `libz-rs-sys` rather than Node's
-zlib. Decompression is byte-identical either way, so it affects ratio, not
-correctness. This change does not touch that path and does not fix it; see
-`docs/compat-status.md` for the table.
+```bash
+cd rustnode
+export RUSTUP_TOOLCHAIN=1.96.1 CXX=g++ RUSTFLAGS="-L /usr/lib/gcc/x86_64-linux-gnu/13"
 
-### 17 + 12 files — `ReadFileJob` / `getWasmCompileCacheEntry`
+# the pinned Node tree, as a full 40-character SHA (not a branch)
+git init /tmp/node-pin && cd /tmp/node-pin
+git remote add origin https://github.com/nodejs/node
+git fetch --depth 1 origin f344e7f552e3656bd37517151c5dc87d22b33771
+git checkout FETCH_HEAD && git sparse-checkout set test && cd -
 
-Batched read job and the wasm compile-cache entry lookup. Both are declared
-deferrals in `rn-bind-fs` with reasons that still hold.
+# a binary frozen before the run, so a later build cannot contaminate it
+touch crates/rn-cli/src/main.rs
+cargo build -p rn-cli
+cp target/debug/rustnode /tmp/frozen/rustnode && chmod 755 /tmp/frozen/rustnode
+sha256sum /tmp/frozen/rustnode && stat -c '%y' /tmp/frozen/rustnode
 
-### 12 files — `locks` namespace missing
+# measure, then size the families
+python3 tools/test-tail-map.py run --node /tmp/frozen/rustnode \
+    --tests /tmp/node-pin/test --out /tmp/full.json --jobs 8 --timeout 30
+python3 tools/test-tail-map.py score /tmp/full.json
+python3 tools/test-tail-map.py score /tmp/full.json --family tls_wrap --list
+```
 
-`locks` is small but its consumer is `--experimental-locks`, which is itself not
-implemented; implementing the namespace alone would move the failure rather than
-close it.
-
-## Honest caveats
-
-* **The full-suite number has since been re-measured** — see "Measured at
-  `8b7c43b7`" above. The original 49.5% baseline and the 65.9% figure that
-  replaced it are both superseded by 67.0% recorded / 52.6% honest. The 120-file
-  sample remains useful only as the like-for-like before/after for the original
-  cluster-closing work; quote the full-pass number, not the sample.
-* **Timeouts moved from ~85 to 94**, which matters if you compare this pass to
-  the `27d67077` one: the timeout population is 94 here (`cluster` 21, `http` 14,
-  `child` 11, `dns` 11), so a handful of files can flip for load reasons alone.
-  Treat a file that changed outcome *and* timed out on either side as noise until
-  re-run in isolation — that is exactly how the two apparent regressions in this
-  pass were cleared.
-* **A "pass" is not necessarily a test.** 817 of the 3799 recorded passes are
-  `common.skip()` exits. Until `tools/harness` learns to detect the marker, any
-  per-cluster rate in this file should be read as an upper bound.
-* **The 987-file union is a signature match, not a per-file re-run.** A file that
-  carried `__argv` in its stderr may also have failed for a second reason, so
-  some of those 987 still fail. The sample going 58 → 74 is the evidence that the
-  fixes are real; the 987 is the evidence that the sample understates them.
-* **`--experimental-stream-iter` and `--allow-natives-syntax` were removed from
-  the "unimplemented" warning list** because their behaviour now exists. That is
-  the opposite of weakening a check: the warning had become a lie that tests read
-  back. `--permission`, `--experimental-quic`, `--experimental-vm-modules` and
-  the rest still warn.
-* **The `deps_files` count moved 1 → 3.** That is a count change, which the
-  project rules treat as a stop signal. It is legitimate here and was done the
-  way `vendor/libnode-js/README.md` prescribes: two real files from Node's
-  `node.gyp` `deps_files` list were vendored byte-identical, the count was
-  updated in all three places that check it (`node-pin.toml`, `scheme.rs`,
-  `verify-libjs.sh`) plus `TABLE_DIGEST`, and the README's "not vendored yet"
-  paragraph was replaced with what is now vendored and what still is not
-  (`deps/v8/tools/**.mjs`, eleven files, only reachable from `--prof-process`).
-  No test expectation was relaxed.
-
-## Files
-
-Everything is committed on `node-test-tail` and fast-forwarded to
-`origin/rustnode/main`.
-
-New crates: `rustnode/crates/rn-bind-signal-wrap/` (`lib.rs`, `handle.rs`).
-New modules: `rustnode/crates/rn-bind-options/src/parsed.rs`,
-`rustnode/crates/rn-bind-serdes/src/ipc.rs`,
-`rustnode/crates/rn-bind-fs/src/cp.rs`.
-Vendored: `rustnode/vendor/libnode-js/deps/acorn/acorn/dist/acorn.js`,
-`rustnode/vendor/libnode-js/deps/acorn/acorn-walk/dist/walk.js`.
+`./tools/check.sh --quick` is the gate; `--quick` skips only the workspace test
+sweep. There is no `GATE` variable in this repository.

@@ -125,8 +125,15 @@ def read_flags(path):
     return []
 
 
-def serial_id(relative):
-    """A stable per-file id, so concurrent files do not share a temp dir."""
+def serial_id(relative, pinned=None):
+    """A stable per-file id, so concurrent files do not share a temp dir.
+
+    `pinned` restores `rn-harness`'s behaviour of giving every file the same
+    id, which is what makes its numbers directly comparable to a run recorded
+    before this tool existed.
+    """
+    if pinned is not None:
+        return str(pinned)
     return str(zlib.crc32(relative.encode()) % 100000)
 
 
@@ -135,11 +142,11 @@ def serial_id(relative):
 # --------------------------------------------------------------------------
 
 
-def run_one(node, checkout_root, tests_root, relative, timeout):
+def run_one(node, checkout_root, tests_root, relative, timeout, pinned_serial=None):
     argv = [node] + read_flags(os.path.join(tests_root, relative)) + [f"test/{relative}"]
     env = dict(os.environ)
     env.update(
-        TEST_SERIAL_ID=serial_id(relative),
+        TEST_SERIAL_ID=serial_id(relative, pinned_serial),
         TEST_THREAD_ID="0",
         TEST_PARALLEL="0",
         NODE_TEST_DIR=tests_root,
@@ -247,12 +254,15 @@ def command_run(args):
 
     with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         for result in pool.map(
-            lambda f: run_one(node, checkout_root, tests_root, f, args.timeout), parallel
+            lambda f: run_one(
+                node, checkout_root, tests_root, f, args.timeout, args.serial_id
+            ),
+            parallel,
         ):
             note(result["file"])
             results.append(result)
     for relative in serial:
-        result = run_one(node, checkout_root, tests_root, relative, args.timeout)
+        result = run_one(node, checkout_root, tests_root, relative, args.timeout, args.serial_id)
         note(relative)
         results.append(result)
 
@@ -406,6 +416,13 @@ def main():
     run.add_argument("--jobs", type=int, default=8)
     run.add_argument("--timeout", type=int, default=30)
     run.add_argument("--limit", type=int, default=0)
+    run.add_argument(
+        "--serial-id",
+        type=int,
+        default=None,
+        help="pin TEST_SERIAL_ID for every file, as rn-harness does; "
+        "makes a run comparable to results recorded before this tool existed",
+    )
 
     score = sub.add_parser("score", help="apply the pass rule and size the families")
     score.add_argument("run")
