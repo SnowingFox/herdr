@@ -71,10 +71,15 @@ unsafe extern "C" fn drop_external_buffer(
         let hint = buffer.finalize_hint as usize;
         // The closure is `Send` because it captures only addresses, and it runs
         // on the loop's thread where a scope exists.
-        let queued = rn_core::finalizer::enqueue(move || {
-            // Re-enter through `with_context`: it opens a handle scope and publishes
-            // it, which is what makes a `napi_*` call from this finalizer legal.
-            crate::scope::with_context(|scope| {
+        // Filed under the environment's owning thread: with worker_threads there is
+        // one isolate per thread, and a worker's finalizer must not be drained by
+        // the main realm.
+        let owner = unsafe { crate::env::env_from(buffer.env) }.map(|e| e.owner_thread());
+        let queued = rn_core::finalizer::enqueue_for(owner, move || {
+            // Re-enter through `with_owner_context`: it opens a handle scope,
+            // publishes it, and refuses to run on a thread that does not own the
+            // environment's isolate.
+            crate::scope::with_owner_context(env as *mut NapiEnv, |scope| {
                 let guard = crate::scope::ScopeGuard::enter(scope);
                 // SAFETY: the addon's own callback with the pointers it supplied.
                 // The addon owns `data` and is being told to release it now.

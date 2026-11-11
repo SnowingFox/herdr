@@ -113,6 +113,35 @@ pub(crate) fn with_context<R>(
     rn_uv::callback::with_context(body)
 }
 
+/// Runs `body` in `env`'s isolate, but only on the thread that owns it.
+///
+/// The finalizer queue is process-wide (`rn_core::finalizer`), so with
+/// `worker_threads` a worker's finalizer could be picked up by whichever realm's
+/// scheduler drains first. `with_context` resolves the *ambient* thread's isolate,
+/// so running a worker's finalizer on the main thread would enter the wrong one.
+///
+/// This refuses instead: the addon's callback does not run, and the reason is
+/// logged. That is a leak in an already-degenerate case rather than undefined
+/// behaviour, and it is the conservative direction — the alternative is calling
+/// addon code against an isolate that does not own its pointers.
+///
+/// Returns `None` when the environment is gone or the thread is wrong.
+pub(crate) fn with_owner_context<R>(
+    env: *mut crate::abi::NapiEnv,
+    body: impl FnOnce(&mut v8::PinScope<'_, '_, v8::Context>) -> R,
+) -> Option<R> {
+    // SAFETY: `env` is null or one of this crate's environments.
+    let environment = unsafe { crate::env::env_from(env) }?;
+    if !environment.is_on_owner_thread() {
+        tracing::error!(
+            "a Node-API finalizer was drained by a thread that does not own its \
+             environment; it was skipped rather than run against the wrong isolate"
+        );
+        return None;
+    }
+    with_context(body)
+}
+
 /// Records the isolate and context so a callback with no Node-API scope can
 /// re-enter V8.
 ///

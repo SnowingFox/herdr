@@ -167,6 +167,14 @@ pub struct Env {
     /// same way a stack unwinds, so a hook registered last can still use what an
     /// earlier one set up.
     cleanup_hooks: RefCell<Vec<(NapiCleanupHook, *mut std::ffi::c_void)>>,
+    /// The thread whose isolate this environment belongs to.
+    ///
+    /// With `worker_threads` there is one isolate per worker thread, and a
+    /// deferred finalizer must run against the isolate that owns the addon's
+    /// pointers, not whichever realm's drain happens to reach it first. A
+    /// finalizer that finds itself on the wrong thread reports it instead of
+    /// calling into an isolate it does not own.
+    owner_thread: std::thread::ThreadId,
 }
 
 impl Env {
@@ -181,7 +189,25 @@ impl Env {
             refs: RefCell::new(Vec::new()),
             exceptions: RefCell::new(ExceptionState::default()),
             cleanup_hooks: RefCell::new(Vec::new()),
+            owner_thread: std::thread::current().id(),
         }
+    }
+
+    /// Whether the caller is on the thread that owns this environment's isolate.
+    ///
+    /// A deferred Node-API finalizer checks this before touching V8: the queue is
+    /// process-wide, so a worker's finalizer could otherwise be drained by the main
+    /// realm. Running it there would enter the wrong isolate.
+    pub(crate) fn is_on_owner_thread(&self) -> bool {
+        std::thread::current().id() == self.owner_thread
+    }
+
+    /// The thread whose isolate this environment belongs to.
+    ///
+    /// A deferred finalizer is filed under this id so only the owning realm drains
+    /// it.
+    pub(crate) fn owner_thread(&self) -> std::thread::ThreadId {
+        self.owner_thread
     }
 
     /// Registers a cleanup hook, as `napi_add_env_cleanup_hook` does.

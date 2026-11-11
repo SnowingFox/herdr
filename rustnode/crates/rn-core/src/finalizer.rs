@@ -35,7 +35,9 @@
 //! second wake mechanism for no benefit, since the loop already has to be woken
 //! and that is `native_immediates::set_wakeup`'s job.
 
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::thread::ThreadId;
 
 /// How to make the loop run a check phase.
 ///
@@ -110,9 +112,29 @@ pub type FinalizerBody = dyn FnOnce() + Send;
 /// path that already allocated that object.
 type Pending = Box<FinalizerBody>;
 
-fn queue() -> &'static Mutex<Vec<Pending>> {
-    static QUEUE: OnceLock<Mutex<Vec<Pending>>> = OnceLock::new();
-    QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+/// The queue, keyed by the thread that must run each entry.
+///
+/// Per-thread rather than one flat list because there is one isolate per worker
+/// thread: a worker's finalizer calls into the worker's isolate, and running it on
+/// the main thread would enter the wrong one. Keying by the *owning* thread means
+/// each realm drains exactly its own finalizers and the question never arises,
+/// which is better than guarding at the call site.
+///
+/// The key is captured at [`enqueue`] time and read at drain time, so a worker that
+/// exits without collecting leaves its entries behind rather than handing them to
+/// another realm.
+fn queue() -> &'static Mutex<HashMap<ThreadId, Vec<Pending>>> {
+    static QUEUE: OnceLock<Mutex<HashMap<ThreadId, Vec<Pending>>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The thread that owns the finalizers being enqueued.
+///
+/// A GC callback runs on whichever thread triggered the collection, which is *not*
+/// the isolate's thread in this runtime (measured: they differ). The owner is
+/// therefore an explicit parameter rather than `thread::current()`.
+fn owner_of(owner: Option<ThreadId>) -> ThreadId {
+    owner.unwrap_or_else(|| std::thread::current().id())
 }
 
 /// Defers `body` to the loop's thread.
@@ -124,18 +146,32 @@ fn queue() -> &'static Mutex<Vec<Pending>> {
 /// while holding it. The caller should treat that as "the finalizer will not run"
 /// rather than retrying, because the queue's contents are then unknown.
 pub fn enqueue(body: impl FnOnce() + Send + 'static) -> bool {
+    enqueue_for(None, body)
+}
+
+/// Defers `body` to `owner`'s thread.
+///
+/// `owner` is the thread whose isolate the finalizer must run against; `None`
+/// means the current thread. A V8 GC callback passes `Some` because it runs on a
+/// collection thread, not the isolate's.
+pub fn enqueue_for(owner: Option<ThreadId>, body: impl FnOnce() + Send + 'static) -> bool {
+    let key = owner_of(owner);
     match queue().lock() {
         Ok(mut pending) => {
-            pending.push(Box::new(body));
+            pending.entry(key).or_default().push(Box::new(body));
             drop(pending);
             // The loop has to run an iteration, or nothing drains the queue.
             wake();
             true
         }
         Err(poisoned) => {
-            // The list itself is still structurally sound — a `Vec` cannot be
-            // half-pushed — so recovering is better than dropping the finalizer.
-            poisoned.into_inner().push(Box::new(body));
+            // The map itself is still structurally sound — a `HashMap` cannot be
+            // half-inserted — so recovering is better than dropping the finalizer.
+            poisoned
+                .into_inner()
+                .entry(key)
+                .or_default()
+                .push(Box::new(body));
             wake();
             true
         }
@@ -145,9 +181,18 @@ pub fn enqueue(body: impl FnOnce() + Send + 'static) -> bool {
 /// Whether any finalizer is waiting, so the check phase knows it has work.
 #[must_use]
 pub fn has_pending() -> bool {
+    has_pending_for(std::thread::current().id())
+}
+
+/// Whether a finalizer is waiting for `owner`'s thread.
+#[must_use]
+pub fn has_pending_for(owner: ThreadId) -> bool {
     match queue().lock() {
-        Ok(pending) => !pending.is_empty(),
-        Err(poisoned) => !poisoned.into_inner().is_empty(),
+        Ok(pending) => pending.get(&owner).is_some_and(|list| !list.is_empty()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .get(&owner)
+            .is_some_and(|list| !list.is_empty()),
     }
 }
 
@@ -159,10 +204,11 @@ pub fn has_pending() -> bool {
 /// inside a finalizer must not push the next finalizer into an iteration that may
 /// never come.
 pub fn run_pending() {
+    let owner = std::thread::current().id();
     loop {
         let batch = match queue().lock() {
-            Ok(mut pending) => std::mem::take(&mut *pending),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+            Ok(mut pending) => pending.remove(&owner).unwrap_or_default(),
+            Err(poisoned) => poisoned.into_inner().remove(&owner).unwrap_or_default(),
         };
         if batch.is_empty() {
             return;
@@ -191,19 +237,64 @@ mod tests {
 
     #[test]
     fn enqueueing_from_another_thread_is_safe() {
-        // The whole point: V8 calls the weak callback on a GC thread. This proves
-        // the queue itself accepts that without touching V8.
-        let handle = std::thread::spawn(|| {
+        // The whole point: V8 calls the weak callback on a GC thread, not the
+        // isolate's. This proves the queue accepts that without touching V8, and
+        // that the entry is filed under the *owner* rather than the thread that
+        // happened to enqueue it.
+        let owner = std::thread::current().id();
+        let handle = std::thread::spawn(move || {
             let marker = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let inner = marker.clone();
-            assert!(enqueue(move || {
+            assert!(enqueue_for(Some(owner), move || {
                 inner.store(true, std::sync::atomic::Ordering::SeqCst);
             }));
             marker
         });
         let marker = handle.join().expect("the thread must not panic");
-        assert!(has_pending(), "the other thread's entry must be queued");
+        assert!(
+            has_pending_for(owner),
+            "the entry must be filed under the owner thread, not the enqueuer"
+        );
         // The marker is not set yet: nothing has drained.
         assert!(!marker.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn an_entry_for_another_thread_is_not_drained_here() {
+        // The worker_threads hazard: a worker's finalizer must not be picked up by
+        // the main realm's drain, because `with_context` would enter the main
+        // isolate while the addon's pointers belong to the worker's.
+        // A thread that runs a drain of its own, so the entry is genuinely
+        // processed there rather than merely filed and ignored.
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        let other = std::thread::spawn(move || {
+            let id = std::thread::current().id();
+            assert!(enqueue_for(Some(id), move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+            (id, has_pending_for(id))
+        })
+        .join()
+        .expect("the other thread must not panic");
+        let (other, filed_on_owner) = other;
+        assert!(filed_on_owner, "filed under its owner's id");
+        assert!(has_pending_for(other), "filed under its owner");
+        assert!(
+            !has_pending_for(std::thread::current().id()),
+            "the current thread must not see another thread's work"
+        );
+        // Drain here: it must leave the other thread's entry alone. The `|| true`
+        // this replaces made the check vacuous, which is the failure mode this
+        // whole slice keeps running into.
+        run_pending();
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "this thread's drain must not run another thread's finalizer"
+        );
+        assert!(
+            has_pending_for(other),
+            "the other thread's entry must still be waiting for that thread"
+        );
     }
 }

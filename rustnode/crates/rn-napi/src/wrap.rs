@@ -186,8 +186,10 @@ unsafe fn finish_finalizer(pointer: *mut Wrap, defer: bool) {
             if defer {
                 // V8 may call the weak callback from a GC thread, so the addon's
                 // finalizer is deferred to the loop's thread where a scope exists.
-                let _ = rn_core::finalizer::enqueue(move || {
-                    crate::scope::with_context(|scope| {
+                let owner = unsafe { crate::env::env_from(env as *mut NapiEnv) }
+                    .map(|environment| environment.owner_thread());
+                let _ = rn_core::finalizer::enqueue_for(owner, move || {
+                    crate::scope::with_owner_context(env as *mut NapiEnv, |scope| {
                         let guard = crate::scope::ScopeGuard::enter(scope);
                         // SAFETY: the addon's own callback with the pointers it
                         // supplied; it is being told to release `data` now.

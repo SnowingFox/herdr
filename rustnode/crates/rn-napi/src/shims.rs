@@ -2922,21 +2922,26 @@ pub unsafe extern "C" fn napi_create_external(
                         // V8 may run this on a GC thread, so the addon's callback is
                         // deferred to the loop's thread — the same reason a buffer's
                         // deleter defers.
-                        let _ = rn_core::finalizer::enqueue(move || {
-                            crate::scope::with_context(|scope| {
-                                let guard = crate::scope::ScopeGuard::enter(scope);
-                                // SAFETY: the addon's own callback with the
-                                // pointers it supplied; it is being told to
-                                // release `data` now.
-                                unsafe {
-                                    finalize(
-                                        env_address as *mut NapiEnv,
-                                        address as *mut c_void,
-                                        hint as *mut c_void,
-                                    )
-                                };
-                                drop(guard);
-                            });
+                        let owner = unsafe { env_from(env_address as *mut NapiEnv) }
+                            .map(|environment| environment.owner_thread());
+                        let _ = rn_core::finalizer::enqueue_for(owner, move || {
+                            crate::scope::with_owner_context(
+                                env_address as *mut NapiEnv,
+                                |scope| {
+                                    let guard = crate::scope::ScopeGuard::enter(scope);
+                                    // SAFETY: the addon's own callback with the
+                                    // pointers it supplied; it is being told to
+                                    // release `data` now.
+                                    unsafe {
+                                        finalize(
+                                            env_address as *mut NapiEnv,
+                                            address as *mut c_void,
+                                            hint as *mut c_void,
+                                        )
+                                    };
+                                    drop(guard);
+                                },
+                            );
                         });
                     }),
                 );
