@@ -123,6 +123,11 @@ thread_local! {
     /// A raw-pointer key because that is the identity libuv hands back. Removing
     /// the entry in the after-work callback is what frees it, including when the
     /// loop is shutting down.
+    ///
+    /// The same addresses are registered with [`rn_uv::threadpool`], which is
+    /// what the process exit path cancels: a keygen still queued when
+    /// `process.exit()` runs would otherwise keep touching OpenSSL after
+    /// `OPENSSL_cleanup` freed it.
     static IN_FLIGHT: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
 }
 
@@ -236,6 +241,9 @@ fn queue_async<'s, J: Runnable + 'static>(
     IN_FLIGHT.with(|slot| {
         slot.borrow_mut().insert(request as usize, request as usize);
     });
+    // Also visible to the exit path, which cancels it if `process.exit()` runs
+    // while this job is still queued.
+    rn_uv::threadpool::register(request);
 
     // SAFETY: `loop_pointer` is the process loop, which outlives the request;
     // `request` is heap-allocated and stays valid until the after-work callback
@@ -252,6 +260,7 @@ fn queue_async<'s, J: Runnable + 'static>(
         // The loop refused the work and no callback will arrive, so the request
         // and its state are freed here and the failure is reported inline.
         IN_FLIGHT.with(|slot| slot.borrow_mut().remove(&(request as usize)));
+        rn_uv::threadpool::unregister(request);
         // SAFETY: both boxes were created just above and no callback owns them.
         let state = unsafe { Box::from_raw(state) };
         unsafe { drop(Box::from_raw(request)) };
@@ -310,6 +319,7 @@ unsafe extern "C" fn after_work_trampoline<J: Runnable + 'static>(
     // here, exactly once, now that no other callback will use them.
     let state = unsafe { Box::from_raw((*request).data as *mut QueuedJob<J>) };
     IN_FLIGHT.with(|slot| slot.borrow_mut().remove(&(request as usize)));
+    rn_uv::threadpool::unregister(request);
     unsafe { drop(Box::from_raw(request)) };
 
     let output = state

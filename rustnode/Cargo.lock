@@ -1163,6 +1163,7 @@ dependencies = [
  "rn-bind-worker",
  "rn-core",
  "rn-napi",
+ "rn-uv",
  "rn-v8-sys",
 ]
 

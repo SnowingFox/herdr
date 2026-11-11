@@ -131,6 +131,10 @@ impl AsyncWork {
             self.queued = false;
             return Err(status);
         }
+        // Visible to the exit path: a `napi_async_work` still queued when
+        // `process.exit()` runs is cancelled rather than left to race process
+        // teardown on a pool thread.
+        rn_uv::threadpool::register(request);
         Ok(())
     }
 
@@ -205,6 +209,9 @@ unsafe extern "C" fn on_complete(request: *mut uv::uv_work_t, status: i32) {
     // `napi_delete_async_work` from inside `complete`, and `test_async` does.
     // Nothing below may touch `work` after the addon has been called.
     work.queued = false;
+    // libuv has handed the request back, so the exit path must stop cancelling
+    // it. Also covers the `UV_ECANCELED` delivery a cancel at exit produces.
+    rn_uv::threadpool::unregister(request);
     let Some(complete) = work.complete else {
         return;
     };

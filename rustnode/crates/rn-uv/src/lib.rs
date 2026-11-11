@@ -39,6 +39,7 @@ pub mod listener;
 pub mod stream;
 pub mod stream_base;
 pub mod streams;
+pub mod threadpool;
 pub mod uv_loop;
 pub mod wake;
 
