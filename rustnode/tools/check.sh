@@ -43,6 +43,19 @@ step "building the workspace and the CLI binary"
 cargo build --workspace
 cargo build -p rn-cli
 
+step "the per-context globals still behave as Node's do"
+# The control for the per-context work: DOMException is a real `Error`, the
+# messaging binding hands back the same class, and `structuredClone` survives the
+# per-isolate symbols. It ships as a plain statement for the same reason as the
+# matcher tests above -- a bare command's status is the gate's status under
+# `set -e`, while `| tee` or `$( )` would let a failing control fall through to a
+# green gate. That is not hypothetical here: this control reported a stale PASS
+# once already, which is why it re-checks the build it used.
+#
+# It belongs after the build because every assertion runs against the rustnode
+# realm, and warm it costs ~0.4s, so there is no reason to leave it opt-in.
+./tools/per-context-control.sh
+
 step "the cipher control still reports a void run as a void run"
 # The control's exit contract — 3 for "the build failed, so there is no
 # verdict", distinct from 1 for "the control misbehaved" — is what stops a
