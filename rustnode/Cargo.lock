@@ -1575,6 +1575,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-quic-vendor-probe"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "openssl-src",
+]
+
+[[package]]
 name = "rn-util"
 version = "0.1.0"
 dependencies = [
