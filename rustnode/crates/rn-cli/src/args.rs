@@ -283,12 +283,16 @@ const UNIMPLEMENTED: &[&str] = &[
 /// Experimental flags whose behaviour *is* implemented.
 ///
 /// They still travel through the generic `--experimental-` branch, but must not
-/// be reported as unimplemented, because `lib/**` now acts on them: each is read
-/// back through `internalBinding('options')` by the vendored JavaScript.
+/// be reported as unimplemented, because the feature exists: reporting
+/// `--experimental-sqlite` as unimplemented while `require('node:sqlite')`
+/// works is a lie the flag prints on every run.
 ///
-/// `--experimental-sqlite` belongs here now that `internalBinding('sqlite')`
-/// exists: claiming it is unimplemented while `require('node:sqlite')` works is
-/// a lie the flag itself prints on every run.
+/// Being listed here says only that the flag's feature is present. It does not
+/// mean the flag is *consumed*: `--no-experimental-sqlite` is recorded into the
+/// parsed option store and read by `realm.js`'s policy table, but the CJS
+/// resolver currently bypasses the allow-list for `node:`-scheme ids, so passing
+/// it does not actually gate the module. That is a pre-existing resolver defect,
+/// separate from this list.
 const IMPLEMENTED_EXPERIMENTAL: &[&str] = &[
     "--experimental-bench",
     "--experimental-stream-iter",

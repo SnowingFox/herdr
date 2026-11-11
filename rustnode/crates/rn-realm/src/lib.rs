@@ -173,6 +173,12 @@ fn require_internal<'s>(
 /// The alternative — calling `allowRequireByUsers` for a fixed list of ids —
 /// would expose a builtin whose option is off, which is the divergence this
 /// replaces.
+///
+/// This fixes the *allow-list*, not reachability. The CJS resolver currently
+/// bypasses the allow-list for `node:`-scheme ids, so a builtin this call
+/// correctly withholds can still be required — a pre-existing defect on master,
+/// tracked separately. The call is still correct and worth having, because the
+/// resolver fix will consume exactly this state.
 pub fn allow_option_gated_builtins(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
     let Some(require) = loaders.require.as_ref() else {
         return;

@@ -298,8 +298,8 @@ pub static OPTIONS: &[OptionInfo] = &[
         // `node_options.h` defaults this to `HAVE_SQLITE`, and `build.rs`
         // compiles the vendored amalgamation into this binary, so the field is
         // true unless `--no-experimental-sqlite` is passed. Reporting `false`
-        // left the builtin gated on the main thread while a worker realm — which
-        // asks the same accessor — reached a different answer.
+        // would leave the builtin out of the allow-list that `realm.js` builds
+        // from this value.
         default_is_true: true,
         namespace: OptionNamespace::None,
         default: DefaultValue::Bool(true),
