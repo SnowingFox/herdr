@@ -115,6 +115,13 @@ shuffled together with node's runs in one batch.
 
 **Startup 43.4 → 23.0 ms, 1.89x faster.** Against node that is 0.44x → 0.84x.
 
+> **Historical figure.** Both the 23.0 ms and the 0.84x above measure *this cache
+> change at this tree*. `#26` (worker_threads) later added ~5 ms to startup, and
+> current `master` is ~0.76x against node, not 0.84x. See the regression section
+> further down ("The `#26` startup regression") for the mechanism and the
+> current measurement. The table and the comparison above are left as measured;
+> they are a real record of the cache work, not a statement about today.
+
 `tools/bench.py --samples 40`, one such run:
 
 ```text
@@ -135,6 +142,23 @@ After the cache the same profile reads: V8 bring-up 2.4 ms, `Isolate::new`
 `internal/encoding` 2.7 ms, `internal/modules/cjs/loader` 1.4 ms, `internal/url`
 0.8 ms, `internal/event_target` 0.8 ms, and 3.7 ms still compiling the handful of
 builtins the plan does not cover.
+
+The structural fix beyond this is a V8 startup snapshot: build primordials, the
+realm bootstrap and the builtin table once, then `Context::from_snapshot`. The
+`v8` crate exposes `Isolate::snapshot_creator`, `SnapshotCreator::set_default_context`
+and `Context::from_snapshot` for this. It is the same shape as the code cache —
+one artefact produced at build time, consumed per process — but it covers module
+*execution* as well as compilation, which is the remaining 15 ms. It is a larger
+change than the cache because the snapshot has to reproduce the exact isolate
+state `main` builds by hand (platform, flags, isolate callbacks, microtask
+policy), and because the builtin table and `hook_slot`'s thread-locals would have
+to survive serialisation. The code cache landed first because it removes the
+larger, better-isolated share of the cost with no change to bootstrap order.
+
+Note that the figures in this section are from the cache work at its own tree.
+The regression section below describes a ~5 ms cost added afterwards, so the
+"remaining 15 ms" here is not the current split; re-run the phase report for
+that.
 
 ## Measuring it again
 
@@ -184,32 +208,21 @@ quoted, so `a_parsed_store_holds_only_the_options_that_have_a_default` in
 `rn-bind-options` pins the 217 *derived from the table* rather than as a
 literal: adding an option keeps the test honest.
 
-### It was called twice, and only one of those calls was Node's
+### Two builds, from one cause — and a duplicate call that was not one
 
-Startup built the list twice, measured as 2.6 ms + 2.5 ms. Two separate causes,
-both worth stating plainly because the original code and an earlier draft of
-this document presented the pair as if it were Node's own arrangement:
+Every tree from `05c691b2` to this head builds the list exactly **twice**. Two
+things were going on, and an earlier draft of this section — and the comment on
+`store()` — wrongly presented them as two causes of the same two builds. They are
+independent:
 
-1. **`main.rs` applied the allow-list a second time.** It called
-   `allow_option_gated_builtins` before pre-execution, with the comment
-   "rustnode does not run `pre_execution.js`". That is false: `prepare_execution`
-   invokes `prepareMainThreadExecution`, whose `prepareExecution` calls
-   `setupOptionGatedBuiltins()` at `internal/process/pre_execution.js:121` —
-   which *is* `BuiltinModule.allowOptionGatedBuiltins(getOptionValue)`. Node
-   applies it once, from inside pre-execution; rustnode applied it twice.
-   Nothing between the two calls needs a gated builtin: `install_early_globals`
-   reaches only `buffer`, `encoding`, `worker/js_transferable`, `async_hooks` and
-   `util`, and `install_cjs_loader` only `modules/cjs/loader`; workers likewise
-   call `install_early_globals` and never the allow-list. The duplicate call is
-   **removed**, along with the now-dead `rn_realm::allow_option_gated_builtins`,
-   so rustnode now does it the way Node does.
-2. **`prepareExecution` deliberately clears the memo.** `getCLIOptionsValues()`
-   is memoized in `internal/options.js:33` (`optionsDict ??=`), but the first
-   read happens earlier, from the CJS loader's `initializeCJS` →
-   `initializeCjsConditions` → `getOptionValue('--conditions')`. Then
-   `prepareExecution` calls `refreshRuntimeOptions()` →
-   `refreshOptions()`, which sets `optionsDict = undefined`, so the next read
-   rebuilds. Captured stacks, in order:
+1. **One cause of the two builds: `prepareExecution` deliberately clears the
+   memo.** `getCLIOptionsValues()` is memoized in `internal/options.js:33`
+   (`optionsDict ??=`), but `prepareExecution` calls `refreshRuntimeOptions()` →
+   `refreshOptions()`, which sets `optionsDict = undefined`, so the build before
+   that point is discarded and the build after it starts over. The two readers
+   are the CJS loader's `initializeCJS` → `initializeCjsConditions` →
+   `getOptionValue('--conditions')`, and `patchProcessObject`'s
+   `addReadOnlyProcessAlias`. Captured stacks, in order, on this head:
 
    ```text
    #1  getCLIOptionsFromBinding  node:internal/options:34
@@ -235,6 +248,33 @@ this document presented the pair as if it were Node's own arrangement:
    real value. That ordering is a genuine divergence from Node and is left
    alone here: after the `Arc` fix it costs 0.08 ms.
 
+2. **A duplicate call that was *not* a third build, but was still wrong.**
+   `main.rs` called `allow_option_gated_builtins` before pre-execution, with the
+   comment "rustnode does not run `pre_execution.js`". That premise is false:
+   `prepare_execution` invokes `prepareMainThreadExecution`, whose
+   `prepareExecution` calls `setupOptionGatedBuiltins()` at
+   `internal/process/pre_execution.js:121` — which *is*
+   `BuiltinModule.allowOptionGatedBuiltins(getOptionValue)`. Node applies it
+   once, from inside pre-execution; rustnode applied it twice.
+
+   Counting calls to `getCLIOptionsValues` shows **two on every tree**, including
+   unfixed master: because the duplicate call reads through the same memo, it
+   displaced `initializeCJS` as the *first* reader rather than adding a build.
+   On unfixed master the first stack is
+   `BuiltinModule.allowOptionGatedBuiltins (realm:293)` and the second is
+   `patchProcessObject`; on this head the first is `initializeCJS` and the second
+   is unchanged. So removing it is worth ~0.2 ms, and it is gone because it was
+   Node's call made twice and its comment stated a false premise — not because
+   it duplicated an expensive build.
+
+   Nothing between the two calls needs a gated builtin either:
+   `install_early_globals` reaches only `buffer`, `encoding`,
+   `worker/js_transferable`, `async_hooks` and `util`, `install_cjs_loader` only
+   `modules/cjs/loader`, and a worker calls `install_early_globals` but never the
+   allow-list. It is removed along with the now-dead
+   `rn_realm::allow_option_gated_builtins`, so rustnode now does it the way Node
+   does.
+
 ### The fix
 
 Hand back an `Arc<Store>` instead of a `Store`, so every lookup observes one
@@ -245,9 +285,16 @@ Worker inheritance is unchanged, and
 runtime *corrects* rather than parses, so a worker that fell back to a fresh
 copy of the table would report `true`.
 
-The phase report named both: `allow_option_gated_builtins` went from 0.33 ms to
-2.90 ms and `prepare_execution` from 1.18 ms to 3.85 ms across the `#26`
-boundary, while every other phase was flat.
+The phase report located the cost without ambiguity: on unfixed master the two
+marks that each contain one build were `allow_option_gated_builtins` **2.80 ms**
+and `prepare_execution` **3.76 ms**, while the marks carrying no build —
+`primordials`, `install_early_globals` — were unchanged. After the fix the same
+two marks are **0.33 ms** and **1.24 ms**, because one build went from
+**2.60 ms to 0.087 ms** (measured in-process, 200 calls after warm-up, on the
+unfixed and fixed binaries respectively). Two builds at those per-call costs is
+5.2 ms → 0.17 ms, about 5.0 ms recovered, which is what the batch measurements
+below show. `install_cjs_loader` sits at ~2.9 ms on both, which is the loader
+itself rather than an option read and is why it is not evidence of anything here.
 
 Measured on one machine in one session, all binaries interleaved in a single
 batch, 100 runs each, `-e ''`, release build. Absolute milliseconds drift
@@ -266,15 +313,21 @@ node 21.08 / `05c691b2` 27.21 / master 32.20 / changed 27.05 ms. So the recovery
 is **4.6–5.7 ms** across three batches, which is the whole regression; the
 leftover difference against `05c691b2` sits inside this machine's spread.
 
-Removing the duplicate allow-list call is worth only **~0.2 ms** at the median
-once the `Arc` fix has made the lookups cheap: measured across 80 interleaved
-runs, the `Arc` fix alone gave 27.28 ms and `Arc` + removal gave 27.05 ms
-(medians), which is inside one p25-to-p75 band. Before the `Arc` fix the same
-duplicate was ~2.9 ms, because it was a second full O(n²) build — so the removal
-is worth stating as "it was expensive only while lookups cloned, and it is gone
-because it was Node's call made twice rather than because it is now the
-bottleneck." This does **not** close the remaining ~6 ms gap to node; that is
-separate work.
+Removing the duplicate allow-list call is worth **~0.2 ms** at the median once
+the `Arc` fix has made the lookups cheap: across 80 interleaved runs, the `Arc`
+fix alone gave 27.28 ms and `Arc` + removal gave 27.05 ms, and on the pre-fix
+tree removing the duplicate alone gave 30.01 → 29.86 ms over 60 runs. All three
+deltas are inside a single p25-to-p75 band.
+
+**It did not remove a build.** Counting calls to `getCLIOptionsValues` in the
+process shows **two on every tree** — pre-`#26`, unfixed master, and this head —
+because `allowOptionGatedBuiltins` and `patchProcessObject` both read through the
+same memo, so the duplicate call simply moved the *first* build earlier rather
+than adding a third. What `#26` changed is the cost of each build, not how many
+there are. The duplicate call is gone because it was Node's call made twice and
+because its comment stated a false premise, not because it was the bottleneck.
+
+This does **not** close the remaining ~6 ms gap to node; that is separate work.
 
 ### Phase medians on this head
 
@@ -296,16 +349,3 @@ longer a call before pre-execution. The duplication was already cheap after the
 `Arc` fix; it is gone because it was Node's call made twice, not because it was
 the expensive part.
 
-## What is left (continued)
-
-The structural fix beyond this is a V8 startup snapshot: build primordials, the
-realm bootstrap and the builtin table once, then `Context::from_snapshot`. The
-`v8` crate exposes `Isolate::snapshot_creator`, `SnapshotCreator::set_default_context`
-and `Context::from_snapshot` for this. It is the same shape as the code cache —
-one artefact produced at build time, consumed per process — but it covers module
-*execution* as well as compilation, which is the remaining 15 ms. It is a larger
-change than the cache because the snapshot has to reproduce the exact isolate
-state `main` builds by hand (platform, flags, isolate callbacks, microtask
-policy), and because the builtin table and `hook_slot`'s thread-locals would have
-to survive serialisation. The code cache landed first because it removes the
-larger, better-isolated share of the cost with no change to bootstrap order.

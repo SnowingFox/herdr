@@ -154,13 +154,25 @@ static PROCESS_STORE: std::sync::OnceLock<std::sync::Mutex<std::sync::Arc<Store>
 ///
 /// # Why this hands back a shared handle and not a clone
 ///
-/// It used to return `Store` by value, which deep-cloned all 251 entries on
-/// *every* lookup. [`crate::values::cli_values`] looks up one option per table
-/// entry to build its list, so a single `getCLIOptionsValues()` call did 251
-/// clones of 251 entries — and startup calls it twice, once through
-/// `BuiltinModule.allowOptionGatedBuiltins` and once through
-/// `prepareMainThreadExecution`. That was 5.1 ms of the 26 ms startup, added
-/// when the store became process-wide for worker threads (#26).
+/// It used to return `Store` by value, which deep-cloned the whole store on
+/// *every* lookup. The store holds **217** entries — the table has 251 options,
+/// but `ParsedValue::default_of` returns `None` for `kNoOp` and `kV8Option`,
+/// which have no field in Node either. [`crate::values::cli_values`] looks up
+/// one option per table entry to build its list, so a single
+/// `getCLIOptionsValues()` call did 251 lookups, each deep-cloning a 217-entry
+/// vector: roughly 54,500 pair clones per call.
+///
+/// A process builds that list twice, and both builds are in Node's own startup
+/// rather than a rustnode duplication. The first read comes from the CommonJS
+/// loader's `initializeCJS` -> `initializeCjsConditions` ->
+/// `getOptionValue('--conditions')`; `prepareExecution` then calls
+/// `refreshRuntimeOptions()`, whose `refreshOptions()` sets `optionsDict =
+/// undefined`, so the next read (`addReadOnlyProcessAlias` from
+/// `patchProcessObject`) rebuilds. Both go through the one memoized
+/// `getCLIOptionsFromBinding`, so this is one module instance with a
+/// deliberately cleared cache, not two instances. #26 made each of those two
+/// builds cost O(lookups x entries) instead of O(lookups), which is the ~5 ms
+/// it added to startup.
 ///
 /// The handle has to be `Arc` and not `Rc` because the process-wide slot lives
 /// in a `static`, which requires `Send + Sync`.
@@ -808,13 +820,16 @@ mod tests {
 
     /// Installing must share one store rather than hand out copies.
     ///
-    /// The lookup used to return `Store` by value, which deep-cloned all 251
-    /// entries per call. `cli_values()` looks one option up per table entry, so
-    /// a single `getCLIOptionsValues()` did 251 clones of 251 entries, and
-    /// startup calls it twice — 5.1 ms of a 26 ms startup. A clone is also a
-    /// correctness hazard in its own right: a copy taken before a later
-    /// [`Store::set`] cannot see the correction, so this pins identity and not
-    /// only the cost.
+    /// The lookup used to return `Store` by value, which deep-cloned the whole
+    /// store per call. It holds 217 entries (see the count test below for why
+    /// that is not `OPTIONS.len()`), and `cli_values()` looks one option up per
+    /// table entry, so a single `getCLIOptionsValues()` did 251 lookups each
+    /// cloning 217 entries. Startup builds that list twice — not because of a
+    /// duplicate call, but because `refreshRuntimeOptions()` clears the memo
+    /// between the CJS loader's first read and `patchProcessObject`'s second.
+    /// A clone is also a correctness hazard in its own right: a copy taken
+    /// before a later [`Store::set`] cannot see the correction, so this pins
+    /// identity and not only the cost.
     ///
     /// The install here touches only this thread's slot. The rest of this
     /// module's tests assert what an *uninstalled* process reports, so a test
