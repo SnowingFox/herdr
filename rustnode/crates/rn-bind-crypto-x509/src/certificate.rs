@@ -121,6 +121,11 @@ pub(crate) fn set_state(
     // a pointer that was written.
     let marker = v8::Boolean::new(scope, true);
     object.set_internal_field(PRESENT_FIELD as usize, marker.into());
+    // The clone/transfer machinery finds a handle through this private mark, the
+    // way `BaseObject`'s wrapper private does. Without it `structuredClone` and a
+    // worker `postMessage` produce a plain `Object`, which looks like success and
+    // silently loses the certificate.
+    rn_core::host_object::mark(scope, object, CERTIFICATE_KIND);
     let address = pointer as usize;
     let _ = v8::Weak::with_guaranteed_finalizer(
         scope,
@@ -1077,6 +1082,50 @@ pub(crate) fn to_legacy(
         Some(Some(value)) => rv.set(value),
         Some(None) => rv.set_undefined(),
         None => {}
+    }
+}
+
+/// The `host_object` kind a certificate handle is marked with.
+pub(crate) const CERTIFICATE_KIND: &str = "X509Certificate";
+
+/// Registers the certificate as a cloneable native handle.
+///
+/// Called from [`crate::install_classes`], which runs while the binding registry is
+/// built and so before the first clone can reach the table.
+pub(crate) fn register_clone_kind() {
+    rn_core::host_object::register_kind(CERTIFICATE_KIND, clone_for_messaging);
+}
+
+/// `X509Certificate::CloneForMessaging`, which copies the snapshot reference.
+///
+/// Node's `X509CertificateTransferData` holds the `shared_ptr<const
+/// X509CertificateSnapshot>` and the index; this holds the equivalent, which is a
+/// cheap clone of the shared DER list.
+fn clone_for_messaging<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<std::rc::Rc<dyn rn_core::host_object::TransferData>> {
+    let payload = with_state(scope, object, |state| (state.snapshot.clone(), state.index))?;
+    Some(std::rc::Rc::new(CertificateClone {
+        snapshot: payload.0,
+        index: payload.1,
+    }))
+}
+
+/// The receiving half of a certificate clone.
+struct CertificateClone {
+    snapshot: Snapshot,
+    index: usize,
+}
+
+impl rn_core::host_object::TransferData for CertificateClone {
+    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+        // `Deserialize` rebuilds through `X509Certificate::New(env, snapshot_,
+        // snapshot_index_)` and then wraps the result in the JavaScript class with
+        // `new InternalX509Certificate(handle)`, so the clone is a real
+        // `X509Certificate` and its getters work. `new_certificate` is that same
+        // path: it rebuilds the issuer chain and constructs the JavaScript subclass.
+        crate::install::rebuild_from_snapshot(scope, self.snapshot.clone(), self.index)
     }
 }
 

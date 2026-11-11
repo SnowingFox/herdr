@@ -28,6 +28,15 @@ use rn_v8_sys::v8;
 
 use crate::alt_names::object_text;
 
+/// An opaque `STACK_OF(ASN1_TYPE)`, which `openssl-sys` does not name.
+///
+/// Only handed back to OpenSSL and walked through `OPENSSL_sk_num`/`_value`, so it
+/// never needs a layout.
+#[repr(C)]
+struct OpaqueStack {
+    _opaque: [u8; 0],
+}
+
 extern "C" {
     fn X509_NAME_entry_count(name: *const ffi::X509_NAME) -> std::ffi::c_int;
     fn X509_NAME_get_entry(
@@ -42,6 +51,21 @@ extern "C" {
         out: *mut *const std::ffi::c_uchar,
         out_len: *mut usize,
     ) -> std::ffi::c_int;
+    fn d2i_ASN1_SEQUENCE_ANY(
+        out: *mut *mut OpaqueStack,
+        input: *mut *const std::ffi::c_uchar,
+        length: std::ffi::c_long,
+    ) -> *mut OpaqueStack;
+    fn OPENSSL_sk_pop_free(
+        stack: *mut std::ffi::c_void,
+        free: unsafe extern "C" fn(*mut std::ffi::c_void),
+    );
+    fn ASN1_TYPE_get(value: *const ffi::ASN1_TYPE) -> std::ffi::c_int;
+    fn OPENSSL_sk_num(stack: *const std::ffi::c_void) -> std::ffi::c_int;
+    fn OPENSSL_sk_value(
+        stack: *const std::ffi::c_void,
+        index: std::ffi::c_int,
+    ) -> *mut std::ffi::c_void;
     fn X509_get_ext_count(certificate: *const ffi::X509) -> std::ffi::c_int;
     fn X509_get_ext(
         certificate: *const ffi::X509,
@@ -126,6 +150,12 @@ pub(crate) fn inspect_name(certificate: &X509, subject: bool) -> Option<NameInsp
         if count < 0 {
             return None;
         }
+        // OpenSSL does not surface an empty RDN as a `X509_NAME` entry, so a
+        // malformed Name whose RDN set is present but empty would otherwise be
+        // inspected as a valid, shorter name. Counting the encoded RDN sets
+        // independently and requiring agreement is what `InspectName` does, and
+        // `test-crypto-x509-inspection.js` asserts the rejection.
+        let encoded_rdns = encoded_rdn_count(pointer)?;
         let mut attributes = Vec::with_capacity(count as usize);
         let mut previous_set: i32 = -1;
         for index in 0..count {
@@ -153,6 +183,14 @@ pub(crate) fn inspect_name(certificate: &X509, subject: bool) -> Option<NameInsp
                     None
                 },
             });
+        }
+        let inspected_sets = if previous_set < 0 {
+            0
+        } else {
+            previous_set as usize + 1
+        };
+        if inspected_sets != encoded_rdns {
+            return None;
         }
         let raw = name_der(pointer);
         Some(NameInspection { attributes, raw })
@@ -249,6 +287,67 @@ unsafe fn name_der(name: *const ffi::X509_NAME) -> Option<Vec<u8>> {
     // SAFETY: the name owns `length` bytes at `data`, and the copy happens before
     // the name is dropped.
     Some(unsafe { std::slice::from_raw_parts(data, length) }.to_vec())
+}
+
+/// Adapts a concrete destructor to the `void *` form `OPENSSL_sk_pop_free` takes.
+///
+/// The two function types have identical ABIs; this is a cast rather than a
+/// wrapper so the stack sees the real destructor symbol.
+fn transparent_free<T>(
+    free: unsafe extern "C" fn(*mut T),
+) -> unsafe extern "C" fn(*mut std::ffi::c_void) {
+    // SAFETY: `*mut T` and `*mut c_void` have the same representation, and the
+    // caller only ever passes pointers the stack holds.
+    unsafe { std::mem::transmute(free) }
+}
+
+/// The number of RDN sets the *encoding* holds, counted independently of the
+/// `X509_NAME` entries.
+///
+/// Re-encoding the name as a `SEQUENCE` of `SET`s is the only way to see an empty
+/// RDN: `X509_NAME_entry_count` skips it, so the two counts disagree exactly when
+/// the input is malformed. A non-`SET` child or trailing bytes are also failures.
+///
+/// # Safety
+///
+/// `name` must be a live `X509_NAME`.
+unsafe fn encoded_rdn_count(name: *const ffi::X509_NAME) -> Option<usize> {
+    let mut der: *const std::ffi::c_uchar = std::ptr::null();
+    let mut length: usize = 0;
+    // SAFETY: both out-parameters are valid and the name is live.
+    if unsafe { X509_NAME_get0_der(name, &mut der, &mut length) } != 1 || der.is_null() {
+        return None;
+    }
+    let start = der;
+    let mut cursor = der;
+    // SAFETY: `d2i_ASN1_SEQUENCE_ANY` reads at most `length` bytes from `start`
+    // and allocates the result, released below.
+    unsafe {
+        let sequence = d2i_ASN1_SEQUENCE_ANY(
+            std::ptr::null_mut(),
+            &mut cursor,
+            length as std::ffi::c_long,
+        );
+        if sequence.is_null() {
+            return None;
+        }
+        // Trailing bytes mean the DER is not exactly one SEQUENCE.
+        if cursor != start.add(length) {
+            OPENSSL_sk_pop_free(sequence.cast(), transparent_free(ffi::ASN1_TYPE_free));
+            return None;
+        }
+        let count = OPENSSL_sk_num(sequence.cast());
+        let mut ok = count >= 0;
+        for index in 0..count {
+            let entry = OPENSSL_sk_value(sequence.cast(), index).cast::<ffi::ASN1_TYPE>();
+            if entry.is_null() || ASN1_TYPE_get(entry) != ffi::V_ASN1_SET {
+                ok = false;
+                break;
+            }
+        }
+        OPENSSL_sk_pop_free(sequence.cast(), transparent_free(ffi::ASN1_TYPE_free));
+        ok.then_some(count as usize)
+    }
 }
 
 /// One raw extension.

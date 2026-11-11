@@ -94,11 +94,25 @@ fn with_classes<R>(body: impl FnOnce(&mut Classes) -> R) -> R {
     CLASSES.with(|slot| body(&mut slot.borrow_mut()))
 }
 
+/// Rebuilds a certificate from a snapshot index, for the clone/transfer path.
+///
+/// The receiving half of `CloneForMessaging`, kept here rather than in
+/// `certificate` so the one place that knows how to construct a certificate from a
+/// snapshot stays the one place.
+pub(crate) fn rebuild_from_snapshot<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    snapshot: Snapshot,
+    index: usize,
+) -> Option<v8::Local<'s, v8::Object>> {
+    new_certificate(scope, snapshot, index, None)
+}
+
 /// Installs the X.509 members onto `target`, which is the `crypto` namespace.
 pub fn install_classes<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
 ) -> Result<(), String> {
+    crate::certificate::register_clone_kind();
     for (name, callback) in [
         (
             "createX509CertificateClass",
