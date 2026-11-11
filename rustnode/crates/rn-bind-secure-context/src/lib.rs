@@ -166,11 +166,23 @@ pub const NAMESPACE_STUBS: &[(&str, &str)] = &[
 /// empty and `init` fills them in. The context is created here so the internal
 /// field is valid immediately, which makes `getTicketKeys()` before `init` report
 /// `NotInitialised` from the state rather than reading a null pointer.
+///
+/// # The `new.target` guard
+///
+/// A call without `new` must return `undefined` and do nothing, which is what
+/// Node's `New` does: V8 gives a plain callback the global object as `this`, and
+/// that object has no internal fields, so writing one aborts the process with
+/// `Check failed: Internal field out of bounds`. Measured before the guard:
+/// 100 of 100 runs died on `SetAlignedPointerInInternalField`. Real `node`
+/// returns `undefined` and keeps working. See the `call_without_new` test.
 fn constructor(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
+    if args.new_target().is_undefined() {
+        return;
+    }
     let this = args.this();
     let pointer = Box::into_raw(Box::new(RefCell::new(Context::default())));
     this.set_aligned_pointer_in_internal_field(

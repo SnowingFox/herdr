@@ -94,6 +94,12 @@ pub const MEMBERS: &[&str] = &[
     "Verify",
     "SignJob",
     "RSACipherJob",
+    // `SecureContext`, installed by `rn-bind-secure-context` from
+    // `src/crypto/crypto_context.cc`. It is on this object because
+    // `src/node_crypto.cc` aggregates a dozen `Initialize` calls onto one
+    // `target`, and it must exist before `tls_wrap::wrap` will accept a context
+    // (`lib/internal/tls/wrap.js` checks `instanceof NativeSecureContext`).
+    "SecureContext",
     // The `RSAKeyVariant` values `keygen.js` puts in `RsaKeyPairGenJob`'s second
     // slot. Without them the argument is `undefined`, the variant defaults to
     // PKCS#1, and every `rsa-pss` generation silently produces a plain RSA key.
@@ -260,10 +266,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     (
         "RandomPrimeJob",
         "Prime generation is part of the key surface, deferred with KeyObject.",
-    ),
-    (
-        "SecureContext",
-        "A TLS secure context needs the tls binding; this crate does not own it.",
     ),
     (
         "TurboShakeJob",
@@ -679,7 +681,12 @@ impl BindingModule for Crypto {
         // the base-class stand-in `crate::classes::create_x509_certificate_class`
         // installed above, so that binding must not run as well.
         rn_bind_crypto_x509::install_classes(scope, object)?;
-        // The job handles, whose instances expose `run()`.
+        // `SecureContext`. Same aggregation: `src/crypto/crypto_context.cc`
+        // installs onto the object `src/node_crypto.cc` passes in, not onto a
+        // namespace of its own. It has to be reachable before `tls_wrap` exists,
+        // because `lib/internal/tls/wrap.js:832` rejects a context that is not
+        // `instanceof NativeSecureContext`.
+        rn_bind_secure_context::install_classes(scope, object)?;
         install_job_class(scope, object, "HashJob", hash_job)?;
         install_job_class(scope, object, "HmacJob", hmac_job)?;
         crate::kdf::install_job_class(scope, object, "PBKDF2Job", crate::kdf::pbkdf2_constructor)?;
