@@ -158,10 +158,18 @@ shell_view() {
       com = 0
       # The `<<` survives the lexer only when it is code, so a heredoc mentioned
       # in prose cannot swallow the rest of the file.
-      if (state == "n" && index(out, "<<") > 0) {
+      #
+      # This must fire inside a command substitution too. `script="$(cat <<JS`
+      # opens a heredoc while the lexer is in the substitution state, and testing
+      # only the top-level state left the whole JavaScript body -- including its
+      # closing delimiter -- being scanned as shell. That made
+      # negative-control-napi-threadsafe.sh look like it had no zero-valued exit
+      # at all, because the `exit 0` past the heredoc was swallowed with it.
+      if ((state == "n" || state == "sub") && index(out, "<<") > 0) {
         d = out
         sub(/^.*<</, "<<", d)
-        if (match(d, /^<<-?[[:space:]]*[\047"]?[A-Za-z_][A-Za-z0-9_]*/)) {
+        # `<<<` is a here-string, not a heredoc: it has no body and no delimiter.
+        if (d !~ /^<<</ && match(d, /^<<-?[[:space:]]*[\047"]?[A-Za-z_][A-Za-z0-9_]*/)) {
           tag = substr(d, RSTART, RLENGTH)
           sub(/^<<-?[[:space:]]*/, "", tag)
           gsub(/[\047"]/, "", tag)
@@ -278,12 +286,24 @@ functions_that_exit() {
 }
 
 # Prints the line number when `fn` is invoked somewhere its `exit` cannot reach
-# the caller. Three shapes swallow it, and every one of them runs the call in a
-# subshell: inside `$( )` or backticks, as an element of a pipeline whose status
-# comes from another element, and inside an explicit `( )` group.
+# the caller. Three shapes swallow it, and every one runs the call in a subshell:
+# inside `$( )` or backticks, as a non-final element of a pipeline whose status
+# therefore comes from another command, and inside an explicit `( )` group.
+#
+# Two things this deliberately does not flag, because in both the `exit` really
+# does set the script's status:
+#
+#   * `[ cond ] || fail "msg"` and `cmd && fail "msg"` at the top level. `||` and
+#     `&&` are control operators, not pipes: `fail` runs in the main shell, so its
+#     `exit 1` is the script's status. A first version of this scanner set `pipe`
+#     on the second character of a doubled operator and reported these as
+#     swallowed, which is a false positive on the most common shape in these
+#     controls.
+#   * a call that is the *last* element of a pipeline, `x | fail`. Nothing follows
+#     to mask its status, so the exit still propagates.
 #
 # The call site is found by walking the line rather than by regex, because
-# `out="$(f "$x")"`, `x=$(a; f)` and `if f; then` all contain the name and only
+# `out="$(f "$x")"`, `x=$(a; f)` and `if f; then` all contain the name while only
 # some of them are the defect.
 subshell_invocation() {
   awk -v fn="$1" '
@@ -308,28 +328,38 @@ subshell_invocation() {
       }
       if (callpos == 0) next
 
-      # Region state at the call site.
-      depth = 0; pipe = 0; tick = 0
+      # Region state *before* the call. `||` and `&&` are consumed as a pair so
+      # the second character is not read as a pipe; without that, every
+      # `cond || fail` in the tree looked like a swallowed exit.
+      depth = 0; pipe_before = 0; tick = 0
       for (i = 1; i < callpos; i++) {
         c = substr(line, i, 1)
-        if (c == "`") { tick = !tick; continue }
-        if (tick) continue
+        if (tick) { if (c == "`") tick = 0; continue }
+        if (c == "`") { tick = 1; continue }
         if (c == "\\") { i++; continue }
+        if (c == "|") {
+          if (substr(line, i + 1, 1) == "|") { i++; continue }
+          pipe_before = 1
+          continue
+        }
+        if (c == "&") {
+          if (substr(line, i + 1, 1) == "&") { i++; continue }
+          pipe_before = 1
+          continue
+        }
         if (c == "$" && substr(line, i + 1, 1) == "(") { depth++; i++; continue }
         if (c == "(") depth++
         else if (c == ")") { if (depth > 0) depth-- }
-        else if (c == "|") { if (substr(line, i + 1, 1) != "|") pipe = 1 }
-        else if (c == "&") { if (substr(line, i + 1, 1) != "&") pipe = 1 }
       }
 
-      # A pipe after the call is just as fatal: in `build ... | tee` the exit in
-      # the build element is discarded and the pipeline reports tee. Only this
-      # statement counts, so a `;` ends the search.
-      rest = substr(line, callpos + length(fn))
-      sub(/;.*$/, "", rest)
-      if (rest ~ /[^|]\|[^|]/ || rest ~ /\|[[:space:]]*$/) pipe = 1
+      # Region state *after* the call. A pipe here means the call is not the last
+      # element, so its exit cannot be the status of the whole pipeline. A pipe
+      # that only leads to another element is what matters; `;` ends the statement.
+      tail = substr(line, callpos + length(fn))
+      sub(/;.*$/, "", tail)
+      pipe_after = (tail ~ /[^|]\|[^|]/ || tail ~ /(^|[^|])\|[[:space:]]*$/)
 
-      if (depth > 0 || tick || pipe) print FNR
+      if (depth > 0 || tick || pipe_before || pipe_after) print FNR
     }
   ' "$2"
 }
@@ -349,18 +379,27 @@ documented_codes() {
 }
 
 # Prints "<line>\t<code>\t<polarity>" for every literal `exit`, where polarity is
-# what the messages on that path say the exit means.
+# what the message on that path says the exit means.
 #
-# This is the assertion that separates "has a non-zero exit somewhere" from "the
-# failure path is the one with the non-zero exit". The difference matters: a
-# control can keep a usage-error `exit 2` that satisfies every count-based check
-# while its actual failure path prints `FAIL: ...` and exits 0, which is the
-# cipher defect with the numbers still looking right.
+# This separates "has a non-zero exit somewhere" from "the failure path is the one
+# with the non-zero exit". The difference matters: a control can keep a usage-error
+# `exit 2` that satisfies every count-based check while its actual failure path
+# prints `FAIL: ...` and exits 0, which is the cipher defect with the numbers
+# still looking right.
 #
-# The path is the contiguous run of lines before the exit at the same or deeper
-# indentation, bounded to a few lines. A path is a failure path when its messages
-# say so and never say success, and the reverse. Both or neither means the exit is
-# not classifiable from the text, and no claim is made about it.
+# It reads the *original* source, not the lexed view. The lexer blanks quoted text
+# precisely because it is data, but the verdict words live in exactly that text
+# (`echo "PASS: ..."`), so classifying from the view would see the bare function
+# name `fail` on a guard line and miss the `PASS` it is guarding. Only the string
+# literals of `echo`/`printf` lines are read, which is where the words that matter
+# actually are; a call like `fail "no shell"` contributes nothing, because the
+# function name is not a message.
+#
+# The message belonging to an exit is the nearest `echo`/`printf` above it at the
+# same or deeper indentation. Nearest, not "everything in the block": walking the
+# whole block reaches the previous statement's message, and `[ x ] || fail ...`
+# above a `echo "PASS"` is a different statement whose word `fail` says nothing
+# about the exit below it.
 exit_polarity() {
   awk '
     { line[FNR] = $0; total = FNR }
@@ -374,16 +413,22 @@ exit_polarity() {
 
         match(L, /^[[:space:]]*/)
         ind = RLENGTH
-        msg = tolower(L)
-        j = i - 1
-        while (j >= 1 && j >= i - 6) {
+
+        msg = ""
+        for (j = i - 1; j >= 1 && j >= i - 8; j--) {
           M = line[j]
           if (M ~ /^[[:space:]]*$/) break
           match(M, /^[[:space:]]*/)
           if (RLENGTH < ind) break
-          msg = msg " " tolower(M)
-          j--
+          if (M !~ /(^|[^[:alnum:]_])(echo|printf)([[:space:]]|$)/) continue
+          # The literal argument only: everything inside the first pair of quotes.
+          if (match(M, /\047[^\047]*\047/) || match(M, /"[^"]*"/)) {
+            msg = tolower(substr(M, RSTART + 1, RLENGTH - 2))
+            break
+          }
         }
+        if (msg == "") continue
+
         fail = (msg ~ /(^|[^a-z])(fail|failed|failure|unexpected|abort|aborted|misbehav|refus)/)
         succ = (msg ~ /(^|[^a-z])(pass|passed|ok)([^a-z]|$)/)
         if (fail && !succ) print i "\t" code "\tfail"
@@ -501,7 +546,7 @@ assert_control() {
     elif [ "$p_kind" = pass ] && [ "$p_code" -ne 0 ]; then
       polarity_bad="$polarity_bad line $p_line (success path exits $p_code)"
     fi
-  done < <(exit_polarity "$view")
+  done < <(exit_polarity "$path")
   if [ -n "$polarity_bad" ]; then
     no "$name has an exit whose code contradicts the message on its path:$polarity_bad"
   else
@@ -586,6 +631,49 @@ if ! out="$(run "${1:-}")"; then
 fi
 echo "$out"
 echo "PASS"
+exit 0
+SH
+
+  # The shape that most often appears in these controls, and the one a pipe bug
+  # turns into a false positive: a guard whose failure branch is `|| fail`, and a
+  # guard whose failure branch is `cond && fail`. `||` and `&&` are control
+  # operators, not pipes, so `fail` runs in the main shell and its `exit 1` is
+  # the script's status. Every assertion a call site makes must therefore be
+  # checked with the call in *both* the `||` and the `&&` position.
+  cat >"$dir/or-guard-control.sh" <<'SH'
+#!/usr/bin/env bash
+# Exit codes: 0 pass, 1 fail
+set -euo pipefail
+fail() {
+  printf 'RESULT: FAIL — %s\n' "$1"
+  exit 1
+}
+[ -x /bin/sh ] || fail "no shell"
+[ -x /nonexistent ] && fail "this must not be reached"
+echo "PASS: the guards held"
+exit 0
+SH
+
+  # The heredoc-in-a-substitution shape. `script="$(cat <<JS` opens the heredoc
+  # while the lexer is inside `$( )`, and a scanner that only looks for heredocs
+  # at the top level goes on reading the JavaScript body as shell. Here the body
+  # contains nothing that resembles an exit, so the only effect is that the
+  # `exit 0` after the closing delimiter must still be found.
+  cat >"$dir/heredoc-in-substitution-control.sh" <<'SH'
+#!/usr/bin/env bash
+# Exit codes: 0 pass, 2 usage
+set -euo pipefail
+case "${1:-}" in
+  run) ;;
+  *) echo "usage: $0 run" >&2; exit 2 ;;
+esac
+script="$(cat <<JS
+const assert = require('assert');
+assert.strictEqual(1, 1);
+JS
+)"
+[ -n "$script" ] || { echo "FAIL: empty script" >&2; exit 1; }
+echo "PASS: the generated script was read"
 exit 0
 SH
 
@@ -687,7 +775,8 @@ SH
   chmod -x "$dir/not-executable-control.sh"
 
   local case expected
-  for case in ok:pass cmdsub:fail pipeline:fail subshell:fail print-only:fail \
+  for case in ok:pass or-guard:pass heredoc-in-substitution:pass \
+              cmdsub:fail pipeline:fail subshell:fail print-only:fail \
               always-zero:fail doc-mismatch:fail failure-exits-zero:fail \
               not-executable:fail; do
     expected="${case#*:}"
