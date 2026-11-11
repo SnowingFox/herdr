@@ -23,7 +23,6 @@ use std::cell::Cell;
 use std::ffi::c_void;
 
 use rn_v8_sys::v8;
-
 thread_local! {
     /// Address of the `HandleScope` the current Node-API call runs inside.
     ///
@@ -95,6 +94,23 @@ pub(crate) unsafe fn with_scope<'s, R>(
     // owns the guard. `'s` is the caller's assertion about that frame.
     let scope: &mut v8::PinScope<'s, '_> = unsafe { &mut *(pointer as *mut v8::PinScope<'s, '_>) };
     Some(f(scope))
+}
+
+/// Enters the isolate and its context for code that libuv called back.
+///
+/// A libuv completion — an async work's `complete`, a thread-safe function's
+/// queued value, a finalizer — runs on the isolate's thread but with no V8 scope
+/// of any kind: `uv_run` is an ordinary Rust call, not a V8 callback. Touching
+/// JavaScript there requires a handle scope and an entered context, and those have
+/// to be recovered from the isolate the runtime recorded when it installed the
+/// bindings, which is what `rn-uv`'s callback module owns.
+///
+/// Returning `None` means no isolate has been recorded, so there is nothing to
+/// call into. A completion delivered then is dropped rather than faulting.
+pub(crate) fn with_context<R>(
+    body: impl FnOnce(&mut v8::PinScope<'_, '_, v8::Context>) -> R,
+) -> Option<R> {
+    rn_uv::callback::with_context(body)
 }
 
 #[cfg(test)]

@@ -95,10 +95,18 @@ fn nothing_is_exported_beyond_the_declared_surface() {
 fn the_surface_is_not_empty_and_covers_the_core() {
     // A zero-length export set would make the two tests above vacuously pass.
     let exported = exported_node_api_symbols();
-    assert!(
-        exported.len() >= 40,
-        "only {} Node-API symbols exported: {exported:?}",
-        exported.len()
+    // Pinned exactly rather than as a floor: a floor lets a shim disappear while
+    // the test stays green, and the number is a fact about this build that a
+    // reviewer can check against `shims::EXPORTED`. The count only moves when a
+    // shim is added or removed, and that is a deliberate, visible change.
+    //
+    // `EXTRA_EXPECTED_SYMBOLS` is not added in: its one entry,
+    // `node_api_get_module_file_name`, is also listed in `shims::EXPORTED` because
+    // the runtime defines it, so counting it twice would overstate the surface.
+    assert_eq!(
+        exported.len(),
+        rn_napi::EXPORTED.len(),
+        "the binary must publish exactly the declared surface: {exported:?}"
     );
     // The handful the end-to-end addon cannot work without, named individually so a
     // regression points at the missing capability rather than at a count.

@@ -1557,9 +1557,13 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libloading",
+ "libuv-sys2",
  "rn-core",
+ "rn-errors",
+ "rn-uv",
  "rn-v8-sys",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
