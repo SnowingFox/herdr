@@ -304,7 +304,7 @@ build moved — `allow_option_gated_builtins` **2.80 ms** and `prepare_execution
 duplicate call is what supplied the first one. A head with it removed has no
 `allow_option_gated_builtins` mark at all; only `prepare_execution` remains, and
 on the current head it is **1.24 ms**. Do not compare the two across trees:
-`0.33 ms` for that mark belongs to `a99cf945`, the intermediate commit that still
+`0.34 ms` for that mark belongs to `a99cf945`, the intermediate commit that still
 applied the allow-list twice, and quoting it beside a duplicate-free head mixes
 two different programs.
 
