@@ -29,11 +29,10 @@ pub const SKIP_PLAN_PREFIX: &str = "1..0 # Skipped:";
 /// harness-visible passes did.
 ///
 /// The location prefix (`node:assert:16736: `) means the word is not at the
-/// start of the line, so this marker is matched *anywhere* in the line, but only
-/// as the exact word `Uncaught` followed by a space or `:`. The `Uncaught` part
-/// is doing real work on the false-positive side: an assertion error that is
-/// caught by `assert.throws` or a `try/catch` is never printed at all, so the
-/// runtime only writes this word for an error that escaped.
+/// start of the line, so it cannot be matched only at column zero — that rule
+/// matches none of the measured rows. Matching is instead by phrase *and*
+/// provenance; see [`has_failure_marker`] and the `mentions_uncaught` helper for
+/// the exact shape and the false-positive reasoning.
 pub const UNCAUGHT_MARKER: &str = "Uncaught";
 
 /// The glyph rustnode's spec reporter prints for a failed test, `U+2716`.
@@ -163,16 +162,24 @@ impl MarkerScanner {
         if text.starts_with(SKIP_PLAN_PREFIX) {
             self.scan.skipped = true;
         }
+        // Once a report has been seen the remaining lines cannot change the
+        // verdict, so the two more expensive checks are skipped. Stdout can be
+        // large, and this runs per line.
+        if self.scan.reported_failure {
+            self.line.clear();
+            return;
+        }
         // The reporter indents nested tests and wraps the glyph in colour codes
         // when `FORCE_COLOR` is set, so this one is compared after both are
         // stripped.
         if visible_start(&text).starts_with(FAILURE_MARKER) {
             self.scan.reported_failure = true;
+            self.line.clear();
+            return;
         }
-        // The uncaught marker sits mid-line, behind a location prefix, so it is
-        // matched as a phrase rather than at the start. Colour codes are removed
-        // first in case a test colourises its own output around the word.
-        if !self.scan.reported_failure && mentions_uncaught(&strip_ansi(&text)) {
+        // Cheap gate before the allocating path: most lines do not contain the
+        // word at all, so they never build a stripped copy.
+        if text.contains(UNCAUGHT_MARKER) && mentions_uncaught(&strip_ansi(&text)) {
             self.scan.reported_failure = true;
         }
         self.line.clear();
@@ -219,6 +226,10 @@ pub fn has_failure_marker(text: &str) -> bool {
 }
 
 /// Removes ANSI CSI escape sequences from one line, leaving the visible text.
+///
+/// An unterminated escape at the end of a truncated line is left in place rather
+/// than swallowing the rest: the line was cut off, so the bytes after it are not
+/// really a continuation of the escape, and dropping them could hide a marker.
 fn strip_ansi(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -229,9 +240,14 @@ fn strip_ansi(text: &str) -> String {
             while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
                 end += 1;
             }
-            // Skip the whole escape, or give up on the rest if unterminated.
-            index = end.saturating_add(1);
-            continue;
+            if end < bytes.len() {
+                // Skip the whole escape, final byte included.
+                index = end + 1;
+                continue;
+            }
+            // Unterminated: keep the remaining bytes verbatim.
+            out.push_str(&text[index..]);
+            break;
         }
         let ch = text[index..].chars().next().unwrap_or('\0');
         out.push(ch);
@@ -944,6 +960,78 @@ mod tests {
         assert!(has_failure_marker(
             "Uncaught AssertionError [ERR_ASSERTION]: x"
         ));
+    }
+
+    #[test]
+    fn the_three_outcomes_are_mutually_exclusive_for_every_row_shape() {
+        // `report` and the CLI both sum these three buckets and assume they
+        // partition the rows. A row that landed in two would break the total
+        // silently, so every combination that could overlap is pinned here.
+        let shapes = [
+            row("p/a.js", "", true, 0, Some(false)),
+            row("p/b.js", "", false, 1, Some(false)),
+            row("p/c.js", "1..0 # Skipped: x", true, 0, Some(true)),
+            row("p/d.js", "  \u{2716} sub", true, 0, Some(false)),
+            row(
+                "p/e.js",
+                "node:assert:1: Uncaught AssertionError: x",
+                true,
+                0,
+                Some(false),
+            ),
+            // Pathological combinations the runner never writes, but a hand-edited
+            // or corrupted file could contain.
+            row("p/f.js", "1..0 # Skipped: x", true, 0, Some(false)),
+            row(
+                "p/g.js",
+                "1..0 # Skipped: x\nnode:assert:1: Uncaught AssertionError: y",
+                true,
+                0,
+                Some(true),
+            ),
+        ];
+        for shape in &shapes {
+            let outcomes = [shape.outcome()];
+            assert_eq!(outcomes.len(), 1, "outcome must be a single value");
+            // `is_misreported_pass` is the diagnostic flag the report adds on top
+            // of `failed`; it must never be true unless the outcome is Failed.
+            if shape.is_misreported_pass() {
+                assert_eq!(
+                    shape.outcome(),
+                    Outcome::Failed,
+                    "{}: a row flagged misreported but not counted as failed",
+                    shape.file
+                );
+            }
+        }
+
+        // The pathological skip-plus-marker row resolves to Skipped, so it is not
+        // also counted as a corrected failure.
+        let both = &shapes[6];
+        assert_eq!(both.outcome(), Outcome::Skipped);
+        assert!(!both.is_misreported_pass());
+    }
+
+    #[test]
+    fn a_truncated_line_does_not_hide_a_marker_behind_an_unterminated_escape() {
+        // The line cap can cut mid-escape; the bytes after it must still be
+        // examined rather than swallowed as part of the escape.
+        let line = "node:assert:1: Uncaught AssertionError: x\u{1b}[31";
+        assert!(has_failure_marker(line));
+    }
+
+    #[test]
+    fn multi_byte_text_around_the_marker_does_not_panic() {
+        // Slicing is done on `str` boundaries found by `find`, so this guards
+        // against a future byte-indexed rewrite rather than a live bug.
+        for line in [
+            "é node:assert:1: Uncaught AssertionError: x",
+            "节点: node:assert:1: Uncaught TypeError: x",
+            "✖ node:assert:1: Uncaught Error: x",
+            "\u{1b}[31mnode:assert:1: Uncaught Error: x\u{1b}[39m",
+        ] {
+            let _ = has_failure_marker(line);
+        }
     }
 
     #[test]

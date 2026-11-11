@@ -268,13 +268,24 @@ fn run_command(args: &[String]) -> Result<u8, String> {
         .iter()
         .filter(|r| r.outcome() == result::Outcome::Skipped)
         .count();
+    // Count failures directly rather than by subtraction: the three outcomes are
+    // disjoint by construction, but a subtraction would silently underflow into a
+    // huge `usize` if that ever stopped holding.
+    let failed_total = results_vec
+        .iter()
+        .filter(|r| r.outcome() == result::Outcome::Failed)
+        .count();
     let misreported_total = results_vec
         .iter()
         .filter(|r| r.is_misreported_pass())
         .count();
-    let failed_total = results_vec.len() - passed_total - skipped_total;
     let judged = passed_total + failed_total;
     let total = results_vec.len();
+    debug_assert_eq!(
+        passed_total + skipped_total + failed_total,
+        total,
+        "every row must land in exactly one outcome"
+    );
 
     // A skip is neither a pass nor a failure, so the headline rate is passes
     // over files that actually ran, and the skipped count is printed next to it
