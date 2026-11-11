@@ -362,6 +362,21 @@ pub fn utf8_length(units: &[u16]) -> usize {
     if units.iter().all(|unit| *unit < 0x80) {
         return units.len();
     }
+    // Well-formed UTF-16 cannot contain a surrogate that is not half of a pair,
+    // so the pair rule below collapses to "a pair is 4, everything else is its
+    // scalar width" and simdutf can count it. This is the same pair of calls
+    // `String::Utf8Length` makes. The length is only taken through here once
+    // validity is known: `utf8_length_from_utf16le` assumes valid input, while
+    // `StringBytes::Size` uses the `_with_replacement` variant, and the two
+    // differ on exactly the inputs this branch excludes.
+    if units.len() >= UTF16_SIMD_THRESHOLD && v8::simdutf::validate_utf16le(units) {
+        return v8::simdutf::utf8_length_from_utf16le(units);
+    }
+    utf8_length_scalar(units)
+}
+
+/// The scalar counter, and the only path for ill-formed UTF-16.
+fn utf8_length_scalar(units: &[u16]) -> usize {
     let mut length = 0;
     let mut index = 0;
     while index < units.len() {
@@ -395,15 +410,31 @@ pub fn utf8_length(units: &[u16]) -> usize {
     length
 }
 
+/// Below this, validating and then counting in SIMD costs more than one scalar
+/// pass. The crossover is where simdutf's fixed cost stops dominating, roughly
+/// where the `v8` crate puts its own UTF-16 threshold.
+const UTF16_SIMD_THRESHOLD: usize = 32;
+
 /// `StringBytes::Size` for a one-byte string: `utf8_length_from_latin1`.
 ///
 /// V8 stores a string that fits in Latin-1 as one byte per character, so the
 /// caller has no `u16` units to count and none need to be materialised. Every
 /// byte below `0x80` is one UTF-8 byte and every other byte is two, because a
 /// Latin-1 code point in `0x80..=0xFF` needs a two-byte sequence.
+///
+/// `StringBytes::Size` calls `simdutf::utf8_length_from_latin1` here, so the
+/// long-input case calls the same function through the copy of simdutf V8
+/// already links. That has no validity subtleties — every Latin-1 byte is a
+/// valid code point — so unlike the UTF-16 path there is no second
+/// implementation to disagree with. Short inputs stay on the scalar sum
+/// because the FFI call has a fixed cost that only pays off above a few dozen
+/// bytes.
 pub fn utf8_length_from_latin1(bytes: &[u8]) -> usize {
     if bytes.is_ascii() {
         return bytes.len();
+    }
+    if bytes.len() >= LATIN1_SIMD_THRESHOLD {
+        return v8::simdutf::utf8_length_from_latin1(bytes);
     }
     // One addition per byte rather than a branch per byte; `(b >> 7)` is the
     // high-bit test without the branch, and the sum vectorises.
@@ -413,6 +444,10 @@ pub fn utf8_length_from_latin1(bytes: &[u8]) -> usize {
             .map(|byte| usize::from(byte >> 7))
             .sum::<usize>()
 }
+
+/// Below this, the simdutf FFI call costs more than the scalar sum it replaces.
+/// The `v8` crate uses the same 128 for its own one-byte length path.
+const LATIN1_SIMD_THRESHOLD: usize = 128;
 
 /// UTF-8 length of one scalar value.
 fn utf8_len(scalar: u32) -> usize {
@@ -1111,6 +1146,44 @@ mod tests {
             utf8_length(&[0xE9, 0xFF, 0x7F, 0x00]),
             utf8_length_from_latin1(&[0xE9, 0xFF, 0x7F, 0x00])
         );
+    }
+
+    #[test]
+    fn utf8_length_handles_long_ill_formed_strings() {
+        // The SIMD path in `utf8_length` is gated on `validate_utf16le`, which
+        // is what makes it safe: `utf8_length_from_utf16le` assumes well-formed
+        // input, and `StringBytes::Size` uses the `_with_replacement` variant
+        // precisely because these strings reach it. Every case here is longer
+        // than `UTF16_SIMD_THRESHOLD`, so each one exercises the gate rather
+        // than the scalar-only short path.
+        let mut pairs = Vec::new();
+        for _ in 0..200 {
+            pairs.extend_from_slice(&[0xD83D, 0xDE00]);
+        }
+        assert!(pairs.len() > UTF16_SIMD_THRESHOLD);
+        assert_eq!(utf8_length(&pairs), 800);
+        assert_eq!(encode_utf8(&pairs, usize::MAX).len(), 800);
+
+        // One lone lead surrogate in the middle of an otherwise valid string
+        // must still be 3 bytes, and must invalidate the whole string for the
+        // SIMD path rather than being silently counted as something else.
+        let mut lone_lead = pairs.clone();
+        lone_lead.insert(100, 0xD800);
+        assert_eq!(utf8_length(&lone_lead), 803);
+        assert_eq!(encode_utf8(&lone_lead, usize::MAX).len(), 803);
+
+        // A lone trail surrogate, likewise.
+        let mut lone_trail = pairs.clone();
+        lone_trail.insert(100, 0xDC00);
+        assert_eq!(utf8_length(&lone_trail), 803);
+        assert_eq!(encode_utf8(&lone_trail, usize::MAX).len(), 803);
+
+        // A long run of one-byte characters with a single three-byte scalar at
+        // the end: the tail must not be lost by a width assumption.
+        let mut mostly_ascii = vec![0x61u16; 300];
+        mostly_ascii.push(0x20AC);
+        assert_eq!(utf8_length(&mostly_ascii), 303);
+        assert_eq!(encode_utf8(&mostly_ascii, usize::MAX).len(), 303);
     }
 
     #[test]
