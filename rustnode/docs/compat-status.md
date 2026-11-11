@@ -186,34 +186,44 @@ python3 tools/test-tail-map.py run --node /tmp/frozen/rustnode \
 python3 tools/test-tail-map.py score /tmp/smoke.json
 ```
 
-The old text reported 0 of 10, split across `require is not defined`, an ESM
-loading error and two rejected CLI options. Those were real at the time and are all
-fixed now.
+The old text reported **0 of 10**, split across `require is not defined` (6 files),
+an ESM loading error (1), and two rejected CLI options (2 × `--expose-internals`,
+1 × `--no-warnings`). Those were real on the bring-up binary and every one is fixed
+now, so this is a disproved claim rather than a deleted one: the same ten files pass.
 
-**Full suite — no current figure; the last two measurements are recorded with their
-scope and rule, and neither is "the" pass rate.**
+The old text also said to expect the number to stay at 0 until `rn-module` and
+`rn-cli` landed, and then to move in steps rather than a curve, because a single fix
+would unblock thousands of files. That is what happened; the full-suite figure below
+is the curve.
 
-The honest full-suite number is **unmeasured on current `master`**. Two scoring
-defects were found after the last measurement was taken, and the second is not yet
-merged, so any figure taken today would be optimistic by a known amount:
+**Full suite — 2732 of 5714 files pass (47.8%), measured on `368e32ac`.**
+
+That is the current number, and it is measured with the four-marker rule on a binary
+built from that commit. An earlier version of this section said the figure was
+unmeasurable pending #51; #51 merged at 11:11:55Z on 2026-11-11 via the `2fc0b17f`
+merge, so it is measurable and has been measured.
+
+Why the rule matters, and why a bare exit-code rate is not comparable: two defects
+made `rn-harness` grade failures as passes.
 
 1. `common.skip()` prints `1..0 # Skipped:` and exits 0, so a file that tested
-   nothing was graded as passing.
-2. Until #51 lands, `beforeExit` is never emitted, so `node:test`'s `test:summary`
-   never runs and a file whose subtests failed exits 0. #51 is open; current
-   `master` does not contain it.
+   nothing was graded as passing. 485 files carry a skip marker on this tree.
+2. Before #51, `beforeExit` was never emitted, so `node:test`'s `test:summary` never
+   ran and a file whose subtests failed exited 0.
 
-What has been measured, with provenance:
+For scale, the same tool at the same scope on an earlier tree:
 
 | scope | commit | binary | scoring rule | result |
 | --- | --- | --- | --- | --- |
-| 8 suites, 5714 files | `7af7b306` (pre-#51) | `c4ff9845…` | four-marker, pre-#51 | 2855 passed (50.0%) |
-| 8 suites, 5714 files | `52f79555` (#51) | `d8c0d9cd…` | four-marker, post-#51 | 2572 passed (45.0%) |
+| 8 suites, 5714 files | `7af7b306` (pre-#51) | `c4ff9845…` | four-marker | 2855 passed (50.0%) |
+| 8 suites, 5714 files | `52f79555` (#51) | `d8c0d9cd…` | four-marker | 2572 passed (45.0%) |
+| 8 suites, 5714 files | `368e32ac` (current) | `3c50d5e7…` | four-marker | **2732 passed (47.8%)** |
 
-Both used the pinned tree `f344e7f552e3656bd37517151c5dc87d22b33771` and the
-commands in `docs/test-tail.md`, which also explains why the four-marker rule is a
-floor rather than a proof. Do not quote either number as current: the second is from
-an unmerged branch, and the first predates #51.
+The rate moved 45.0% → 47.8% because merges between those two trees closed whole
+families — `worker_threads`, `fs/promises.cp`, the inspector namespace (329 skips to
+zero) — not because the measurement changed. All three rows used the pinned tree
+`f344e7f552e3656bd37517151c5dc87d22b33771` and the commands in `docs/test-tail.md`,
+which also explains why the rule is a floor rather than a proof.
 
 The old text reported 1 of 5,666 files passing and named
 `parallel/test-regression-object-prototype.js` as the only pass. That was true of the
