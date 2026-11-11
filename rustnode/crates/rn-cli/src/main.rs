@@ -269,15 +269,16 @@ fn main() {
             // is truthy, which Node applies in
             // `internal/process/pre_execution.js:488`. rustnode does not run
             // `pre_execution.js`, so this applies the same call with the same
-            // `getOptionValue`. That makes the *allow-list* correct.
+            // `getOptionValue`.
             //
-            // It does not by itself make a builtin reachable or unreachable at
-            // the `require('node:...')` boundary: the CJS resolver currently
-            // bypasses the allow-list for `node:`-scheme ids, so `quic`, `dtls`
-            // and `bench` load even though `canBeRequiredByUsers` reports false
-            // for them. That is a pre-existing defect on master, tracked
-            // separately; this call is still the right shape because the
-            // resolver fix will consume its result.
+            // This builds the allow-list; the `require('node:...')` boundary is
+            // what enforces it. That boundary is the vendored CJS loader's
+            // `BuiltinModule.normalizeRequirableId`, which is why
+            // `install_cjs_loader` below must keep the global `require` sending
+            // every `node:` id through the file loader. Routing the scheme
+            // branch to the realm loader instead skipped that check and loaded
+            // `quic`, `dtls` and `bench` even though `canBeRequiredByUsers`
+            // reports false for them.
             bootstrap::allow_option_gated_builtins(scope, &loaders);
             bootstrap::install_early_globals(scope, &loaders);
             // The CommonJS loader turns `require` from a builtin lookup into a

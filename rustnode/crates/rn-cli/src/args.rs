@@ -288,11 +288,11 @@ const UNIMPLEMENTED: &[&str] = &[
 /// works is a lie the flag prints on every run.
 ///
 /// Being listed here says only that the flag's feature is present. It does not
-/// mean the flag is *consumed*: `--no-experimental-sqlite` is recorded into the
-/// parsed option store and read by `realm.js`'s policy table, but the CJS
-/// resolver currently bypasses the allow-list for `node:`-scheme ids, so passing
-/// it does not actually gate the module. That is a pre-existing resolver defect,
-/// separate from this list.
+/// mean the flag is *consumed* by everything that could consult it: the
+/// `node:sqlite` gate is now real because the option value reaches
+/// `realm.js`'s policy table *and* the `node:` resolution path asks that table.
+/// `--no-experimental-sqlite` therefore throws `ERR_UNKNOWN_BUILTIN_MODULE`,
+/// the same code Node gives for a builtin it does not expose.
 const IMPLEMENTED_EXPERIMENTAL: &[&str] = &[
     "--experimental-bench",
     "--experimental-stream-iter",
