@@ -1,0 +1,23 @@
+[package]
+name = "rn-bind-crypto-dh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "`DiffieHellman` and `DiffieHellmanGroup` for internalBinding('crypto')"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# The same OpenSSL `rn-bind-crypto` builds and links. `openssl-src` is a single
+# artifact in the dependency graph, so this is a new edge onto one library, not
+# a second linkage: cargo resolves `openssl-sys` once and both crates call into
+# the SSL and BN symbols of that one build.
+openssl = { version = "=0.10.82", features = ["vendored"] }
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
+# Access to the raw `BIGNUM *`/`BN_CTX *` that `openssl` wraps. `openssl` does
+# not re-export its `foreign-types` dependency, so the traits that turn a
+# `BigNum` into a pointer have to be imported from the crate directly. Not a new
+# dependency in the graph: `openssl` already depends on exactly this version.
+foreign-types = "0.3"

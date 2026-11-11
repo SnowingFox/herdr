@@ -57,6 +57,11 @@ pub const MEMBERS: &[&str] = &[
     "PBKDF2Job",
     "ScryptJob",
     "HKDFJob",
+    // Diffie-Hellman. Installed by `rn-bind-crypto-dh`, which owns
+    // `src/crypto/crypto_dh.cc`; the classes are on this object because that is
+    // the namespace Node aggregates them onto.
+    "DiffieHellman",
+    "DiffieHellmanGroup",
     // Random.
     "randomFillSync",
     "secureBuffer",
@@ -163,13 +168,10 @@ pub const DEFERRED: &[(&str, &str)] = &[
     ),
     (
         "DHBitsJob",
-        "Diffie-Hellman is part of the asymmetric key surface, deferred with KeyObject.",
+        "The async `crypto.diffieHellman()` form is a CryptoJob; the sync `run()` path \
+         and the shared `CryptoJob` machinery land with the rest of the job family.",
     ),
     ("DhKeyPairGenJob","Key generation and DH share the asymmetric key surface, deferred with KeyObject."),
-    ("DiffieHellman","Diffie-Hellman is part of the asymmetric key surface, deferred with KeyObject."),
-    (
-        "DiffieHellmanGroup","Named Diffie-Hellman groups need the DH surface, deferred with KeyObject."
-    ),
     ("DsaKeyPairGenJob","Key generation is part of the asymmetric key surface, deferred with KeyObject."),
     ("ECDH","ECDH is part of the asymmetric key surface, deferred with KeyObject."),
     ("ECDHConvertKey","ECDH key conversion needs the EC key surface, deferred with KeyObject."),
@@ -674,6 +676,11 @@ impl BindingModule for Crypto {
         // The `Hash` and `Hmac` handle classes.
         install_hash_class(scope, object)?;
         install_hmac_class(scope, object)?;
+        // The Diffie-Hellman classes. They live in `rn-bind-crypto-dh` because
+        // `src/crypto/crypto_dh.cc` is a separate translation unit in Node, but
+        // they are members of *this* namespace object, which is how
+        // `src/node_crypto.cc` aggregates them too.
+        rn_bind_crypto_dh::install_classes(scope, object)?;
         // The job handles, whose instances expose `run()`.
         install_job_class(scope, object, "HashJob", hash_job)?;
         install_job_class(scope, object, "HmacJob", hmac_job)?;
