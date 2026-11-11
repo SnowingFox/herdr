@@ -8,11 +8,11 @@
 //!
 //! # What is deferred, and why
 //!
-//! Five members are declared deferred rather than faked:
+//! Four members are declared deferred rather than faked:
 //!
-//! * `dlopen` and `dlopenBinary` need the Node-API addon loader, which does not
-//!   exist yet. Returning success without loading anything would be a lie that
-//!   surfaces much later as a missing addon.
+//! * `dlopenBinary` loads an addon from bytes already in memory, for a virtual
+//!   file system. It needs `AddonImage`'s self-cleaning memfd, which is a
+//!   separate slice; `dlopen` itself is real and lives in `dlopen.rs`.
 //! * `causeSegfault` exists only so Node's own tests can prove the crash
 //!   handler works. It has no other caller and deliberately crashes.
 //! * `execve` replaces the process image. The event loop that has to quiesce
@@ -24,8 +24,13 @@
 
 use std::sync::OnceLock;
 
+mod dlopen;
+
+use dlopen::dlopen as dlopen_binding;
 use rn_core::{AliasedUint8Array, BindingModule, InstallCtx};
 use rn_v8_sys::v8;
+
+pub use dlopen::{last_env, loaded_addon_count};
 
 /// Members exposed on the namespace object, matching
 /// `contracts/process_methods.json`.
@@ -66,12 +71,8 @@ pub const MEMBERS: &[&str] = &[
 /// Members this build does not install yet, each with the reason.
 pub const DEFERRED: &[(&str, &str)] = &[
     (
-        "dlopen",
-        "needs the Node-API addon loader; a silent success would surface much later as a missing addon",
-    ),
-    (
         "dlopenBinary",
-        "needs the Node-API addon loader, same as dlopen",
+        "loads an addon from bytes via a self-cleaning image; dlopen itself is implemented",
     ),
     (
         "causeSegfault",
@@ -158,8 +159,9 @@ impl BindingModule for ProcessMethods {
         });
 
         let object = v8::Object::new(scope);
-        let values: [(&str, v8::Local<v8::Value>); 26] = [
+        let values: [(&str, v8::Local<v8::Value>); 27] = [
             ("hrtimeBuffer", array),
+            ("dlopen", function(scope, "dlopen", dlopen_binding)?),
             ("cwd", function(scope, "cwd", cwd)?),
             ("chdir", function(scope, "chdir", chdir)?),
             ("umask", function(scope, "umask", umask)?),

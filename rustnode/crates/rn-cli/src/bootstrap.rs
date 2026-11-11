@@ -701,6 +701,15 @@ fn install_process_methods<'s>(
         }
     }
 
+    // `internal/bootstrap/node.js` assigns `process.dlopen = rawMethods.dlopen`
+    // straight from the binding rather than through `wrapProcessMethods` — which
+    // is why it is not in the loop above: `wrapped` does not carry it. That
+    // bootstrap module cannot run here, so the one assignment it makes for this
+    // member is made directly.
+    if let Some(value) = get_property(scope, binding, "dlopen") {
+        let _ = set(scope, process, "dlopen", value);
+    }
+
     // `process.exit` is `process.reallyExit` behind a check, and the wrapper's
     // version is used here. The comment that used to sit here said `exit` stayed
     // the bootstrap's stub because the wrapper calls `process.reallyExit`, but
