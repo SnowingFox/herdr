@@ -196,7 +196,7 @@ The old text also said to expect the number to stay at 0 until `rn-module` and
 would unblock thousands of files. That is what happened; the full-suite figure below
 is the curve.
 
-**Full suite — 2732 of 5714 files pass (47.8%), measured on `368e32ac`.**
+**Full suite — 2731 of 5714 files pass (47.8%), measured on `f0649774`.**
 
 That is the current number, and it is measured with the four-marker rule on a binary
 built from that commit. An earlier version of this section said the figure was
@@ -217,7 +217,7 @@ For scale, the same tool at the same scope on an earlier tree:
 | --- | --- | --- | --- | --- |
 | 8 suites, 5714 files | `7af7b306` (pre-#51) | `c4ff9845…` | four-marker | 2855 passed (50.0%) |
 | 8 suites, 5714 files | `52f79555` (#51) | `d8c0d9cd…` | four-marker | 2572 passed (45.0%) |
-| 8 suites, 5714 files | `368e32ac` (current) | `3c50d5e7…` | four-marker | **2732 passed (47.8%)** |
+| 8 suites, 5714 files | `f0649774` | `dc9355c7…` | four-marker | **2731 passed (47.8%)** |
 
 The rate moved 45.0% → 47.8% because merges between those two trees closed whole
 families — `worker_threads`, `fs/promises.cp`, the inspector namespace (329 skips to
