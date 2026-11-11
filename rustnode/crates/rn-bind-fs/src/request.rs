@@ -57,6 +57,44 @@ pub fn classify<'s>(
     (Delivery::Sync, None)
 }
 
+/// Classifies a call whose request slot is a *fixed* position, not the tail.
+///
+/// `stat` and `fstat` are the two members whose request argument is followed by
+/// a real operand, so [`classify`] must not be pointed at their last argument.
+/// Both JS shapes are `stat(path, useBigint, req, throwIfNoEntry)` and
+/// `fstat(fd, useBigint, req, shouldNotThrow)`, and `src/node_file.cc` reads
+/// slot 2 in both:
+///
+/// ```text
+/// if (!args[2]->IsUndefined()) {  // stat(path, use_bigint, req, ...)
+///   FSReqBase* req_wrap_async = GetReqWrap(args, 2, use_bigint);
+/// ```
+///
+/// The distinction is load-bearing rather than cosmetic. `fs.promises.stat`
+/// passes `options.throwIfNoEntry`, which defaults to `true`, as slot 3 — so
+/// classifying the *tail* answered "synchronous" for a promise-mode call. The
+/// binding then returned the raw `Float64Array`/`BigInt64Array` of stat slots
+/// where `internal/fs/promises.js` awaited it, and `await` on a typed array
+/// throws `TypeError: Method Promise.prototype.then called on incompatible
+/// receiver`. `lstat` is three arguments long, so its request slot *is* the
+/// tail and it never showed the bug.
+///
+/// `undefined` in the slot means "no request", which is what the callback-free
+/// `binding.stat(path, bigint, undefined, throwIfNoEntry)` sync form passes.
+pub fn classify_slot<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    index: i32,
+) -> (Delivery, Option<Local<'s, v8::Object>>) {
+    if args.length() <= index {
+        return classify(scope, None);
+    }
+    let slot = args.get(index);
+    // Only an absent slot falls through to `classify`; `undefined` here is the
+    // sync form's explicit "no request", which `classify` also answers.
+    classify(scope, Some(slot))
+}
+
 /// Detects the `kUsePromises` sentinel.
 ///
 /// The symbol is created once at install time and published as a property on

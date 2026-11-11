@@ -43,14 +43,33 @@ macro_rules! mkfn {
     }};
 }
 
-/// Delivers a finished operation according to the trailing-argument mode.
+/// Delivers a finished operation according to the request-slot mode.
+///
+/// The default form classifies the *tail* argument, which is right for every
+/// member whose request is the last argument. `stat` and `fstat` put a real
+/// operand after the request, so they use the `slot` form; `request.rs`'s
+/// [`classify_slot`] explains why reading their tail silently turned a
+/// promise-mode call into a synchronous one.
 ///
 /// Expanded inline in each binding so the callback's own lifetimes apply; a
 /// generic helper would have to unify three independent V8 lifetimes and cannot.
 macro_rules! conclude {
     ($scope:expr, $args:expr, $rv:expr, $completion:expr) => {{
-        let completion = $completion;
         let (mode, request) = classify($scope, tail(&$args));
+        conclude_with!($scope, $rv, $completion, mode, request)
+    }};
+    (slot $index:expr; $scope:expr, $args:expr, $rv:expr, $completion:expr) => {{
+        let (mode, request) = crate::request::classify_slot($scope, &$args, $index);
+        conclude_with!($scope, $rv, $completion, mode, request)
+    }};
+}
+
+/// The shared delivery half of [`conclude!`], after the mode is known.
+macro_rules! conclude_with {
+    ($scope:expr, $rv:expr, $completion:expr, $mode:expr, $request:expr) => {{
+        let completion = $completion;
+        let mode = $mode;
+        let request = $request;
         match mode {
             Delivery::Sync => match completion.payload {
                 Ok(Payload::Unit) => $rv.set_undefined(),
@@ -837,7 +856,10 @@ fn stat_like<'a, 's, 'i>(
             Err(error) => Completion::failed(error),
         },
     };
-    conclude!(scope, args, rv, completion);
+    // `stat(path, useBigint, req, throwIfNoEntry)`: the request is slot 2, and
+    // slot 3 is a real operand. Reading the tail here answered "synchronous" for
+    // every `fs.promises.stat`, which hands back the raw stat array.
+    conclude!(slot 2; scope, args, rv, completion);
 }
 
 /// `fstat(fd, useBigint, [req], [shouldNotThrow])`.
@@ -858,7 +880,8 @@ fn fstat_binding<'a, 's, 'i>(
         Err(_) if suppress => Completion::value(v8::undefined(scope).into()),
         Err(error) => Completion::failed(error),
     };
-    conclude!(scope, args, rv, completion);
+    // Same shape as `stat`: `fstat(fd, useBigint, req, shouldNotThrow)`.
+    conclude!(slot 2; scope, args, rv, completion);
 }
 
 /// `statfs(path, useBigint, [req])`.
