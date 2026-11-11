@@ -334,3 +334,27 @@ Measured: `test-domexception-cause.js`, `test-domexception-subclass.js`,
 `test-webcrypto-random.js` all went from fail to pass, with no file regressing.
 `tools/per-context-control.sh` is the negative control: 7 of its 8 checks fail
 against the pre-fix binary and all 8 pass against this one.
+
+### Version skew against the local `node` binary
+
+The reference binary available on a development machine is a released `node`
+(v22 here), but the behaviour rustnode has to reproduce is the pinned Node 28
+tree in `tools/node-pin.toml`. Those disagree in places, and when they do the
+pin wins: a difference the pinned tests demand is not a divergence from Node,
+it is a divergence from an older Node. Parity scripts therefore assert the
+pinned answer instead of diffing every line against the local binary, and say
+which lines they exempt and why.
+
+The cipher surface is the current example. Under v22, `ctsMode` and
+`xtsStandard` are accepted and ignored on a cipher that does not implement
+them; at the pin they throw `ERR_CRYPTO_UNSUPPORTED_OPERATION`, because
+`CipherBase::CommonInit` in the pinned tree's `src/crypto/crypto_cipher.cc`
+selects the cipher and then applies those `OSSL_PARAM`s, and a cipher that does
+not advertise them fails there before any key or IV is used.
+`crates/rn-bind-crypto-cipher` follows the pin, so a parity run against v22 is
+expected to differ on exactly those two shapes and must match byte for byte
+everywhere else.
+
+The rule is not cipher-specific: when a parity run disagrees with the local
+binary, check the pinned test tree first. "Matches v22" is evidence about v22,
+not about the target.
