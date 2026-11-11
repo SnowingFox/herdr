@@ -67,6 +67,19 @@ pub trait Scheduler {
     fn has_external_work(&self) -> bool {
         false
     }
+
+    /// Called once the loop has run dry, and again after each idle it reaches.
+    ///
+    /// This is `beforeExit`. Node emits it from inside `SpinEventLoopInternal`
+    /// between the liveness check and the next iteration, which is why a handler
+    /// that schedules work revives the loop instead of running after it is gone.
+    ///
+    /// Returns whether the emit left work behind. `false` means nothing is left
+    /// and the process may exit; the default is `false`, so a scheduler with no
+    /// JavaScript to notify does not need to implement it.
+    fn before_exit(&mut self) -> bool {
+        false
+    }
 }
 
 /// A loop over libuv.
@@ -143,17 +156,28 @@ impl Loop {
     /// ever exiting, which only a test should have to care about. The runtime
     /// passes [`u32::MAX`] because a real program is allowed to run forever;
     /// tests use a small number so a bug fails instead of hanging.
+    ///
+    /// When the loop runs dry, [`Scheduler::before_exit`] is offered the idle
+    /// before the process is allowed to stop. That is `beforeExit`, and Node
+    /// emits it from this same position so a handler can schedule work and keep
+    /// the process alive. The loop continues while the emit revives it.
     pub fn run<S: Scheduler>(&mut self, scheduler: &mut S, turn_limit: u32) -> StopReason {
         if scheduler.exit_requested() {
             return StopReason::ExitRequested;
         }
         for _ in 0..turn_limit {
             if !self.tick(scheduler) {
-                return if scheduler.exit_requested() || rn_core_exit_requested() {
-                    StopReason::ExitRequested
-                } else {
-                    StopReason::Idle
-                };
+                if scheduler.exit_requested() || rn_core_exit_requested() {
+                    return StopReason::ExitRequested;
+                }
+                // Nothing is left: offer `beforeExit` its one chance to schedule
+                // something, and keep looping if it did. The emit is repeated on
+                // every later idle, which is what Node does, so a handler that
+                // schedules work on each call keeps a process alive indefinitely.
+                if scheduler.before_exit() {
+                    continue;
+                }
+                return StopReason::Idle;
             }
             // An uncaught exception aborts the process the way Node does: the
             // error is already printed by the callback that threw, so the loop
@@ -326,6 +350,83 @@ mod tests {
             "`run` reports the exit request even when it stops before a turn"
         );
         assert_eq!(scheduler.drains.get(), 0);
+    }
+
+    #[test]
+    fn an_idle_loop_offers_before_exit_exactly_once() {
+        // `beforeExit` is emitted from the idle, not from the end of `run`, so a
+        // scheduler is asked before the process is allowed to stop. A scheduler
+        // that says it did not revive anything must not be asked twice.
+        #[derive(Default)]
+        struct Idle {
+            drains: Cell<u32>,
+            befores: Cell<u32>,
+        }
+
+        impl Scheduler for Idle {
+            fn drain(&mut self) {
+                self.drains.set(self.drains.get() + 1);
+            }
+
+            fn exit_requested(&self) -> bool {
+                false
+            }
+
+            fn before_exit(&mut self) -> bool {
+                self.befores.set(self.befores.get() + 1);
+                false
+            }
+        }
+
+        let mut scheduler = Idle::default();
+        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
+        assert_eq!(event_loop.run(&mut scheduler, 10), StopReason::Idle);
+        assert_eq!(scheduler.befores.get(), 1, "`beforeExit` is emitted once");
+    }
+
+    #[test]
+    fn a_before_exit_that_revives_the_loop_keeps_it_running() {
+        // The documented contract: a handler that schedules work prevents the
+        // exit. The loop has to re-enter rather than treat the idle as final, and
+        // it must offer `beforeExit` again on the next idle.
+        #[derive(Default)]
+        struct Reviving {
+            befores: Cell<u32>,
+            revivals: u32,
+        }
+
+        impl Scheduler for Reviving {
+            fn drain(&mut self) {}
+
+            fn exit_requested(&self) -> bool {
+                false
+            }
+
+            fn before_exit(&mut self) -> bool {
+                let n = self.befores.get() + 1;
+                self.befores.set(n);
+                if n <= self.revivals {
+                    return true;
+                }
+                false
+            }
+        }
+
+        let mut scheduler = Reviving {
+            revivals: 2,
+            ..Reviving::default()
+        };
+        let mut event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
+        assert_eq!(
+            event_loop.run(&mut scheduler, 10),
+            StopReason::Idle,
+            "the loop settles once the revival stops"
+        );
+        assert_eq!(
+            scheduler.befores.get(),
+            3,
+            "two revivals mean three idles, so three emits"
+        );
     }
 
     #[test]

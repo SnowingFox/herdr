@@ -439,3 +439,189 @@ fn a_spawned_child_reports_its_exit_event() {
     );
     assert_eq!(printed, "exit 7\n");
 }
+
+#[test]
+fn a_natural_exit_runs_the_exit_handlers() {
+    // The loop settling is the ordinary way a process ends, and `exit` has to be
+    // emitted for it just as it is for an explicit `process.exit()`. It was not:
+    // the CLI read `process.exitCode` and called `std::process::exit` directly, so
+    // every `process.on('exit', ...)` in `test/common` and `lib/**` was silently
+    // skipped. That is what let a failing `node:test` file exit 0.
+    let printed = same_as_node(
+        "process.on('exit', (code) => console.log('EXIT EVENT', code));\n\
+         console.log('body');",
+    );
+    assert_eq!(printed, "body\nEXIT EVENT 0\n");
+}
+
+#[test]
+fn a_natural_exit_emit_is_guarded_by_exiting() {
+    // A listener that calls `process.exit()` must not make the event fire a
+    // second time: the exit sequence sets `process._exiting` before emitting, the
+    // same flag `per_thread.js` checks. The event is counted rather than printed
+    // because a second emit is the bug.
+    //
+    // Nothing is printed by real `node` here either: the re-entrant `exit()`
+    // terminates inside the first listener, so the second never runs. The check
+    // is that rustnode agrees on that, and on the status.
+    let printed = same_as_node(
+        "let n = 0;\n\
+         process.on('exit', () => { n++; process.exit(); });\n\
+         process.on('exit', () => console.log('sees', n));",
+    );
+    assert_eq!(printed, "");
+}
+
+#[test]
+fn before_exit_is_emitted_before_exit() {
+    let printed = same_as_node(
+        "process.on('beforeExit', (code) => console.log('BEFORE', code));\n\
+         process.on('exit', (code) => console.log('EXIT', code));",
+    );
+    assert_eq!(printed, "BEFORE 0\nEXIT 0\n");
+}
+
+#[test]
+fn work_scheduled_from_before_exit_prevents_the_exit() {
+    // This is the documented contract, not an edge case: `beforeExit` may
+    // schedule work, and the process then keeps running. `internal/test_runner`'s
+    // `harness.js` is built on it — its `exitHandler` waits for pending subtests
+    // there — so getting it wrong is what made a failing `node:test` file exit 0
+    // even though the failure itself was reported.
+    let printed = same_as_node(
+        "let n = 0;\n\
+         process.on('beforeExit', () => {\n\
+           console.log('BE', ++n);\n\
+           if (n < 3) setTimeout(() => console.log('timer', n), 1);\n\
+         });",
+    );
+    assert_eq!(printed, "BE 1\ntimer 1\nBE 2\ntimer 2\nBE 3\n");
+}
+
+#[test]
+fn a_tick_from_before_exit_does_not_prevent_the_exit() {
+    // The counterpart to the test above: `nextTick` and microtasks are drained
+    // during the emit's own checkpoint and do not keep the loop alive, so the
+    // process still exits. Node's `test-process-beforeexit.js` pins the same
+    // asymmetry.
+    let printed = same_as_node(
+        "process.on('beforeExit', () => {\n\
+           console.log('BE');\n\
+           process.nextTick(() => console.log('tick'));\n\
+           queueMicrotask(() => console.log('micro'));\n\
+         });",
+    );
+    assert_eq!(printed, "BE\ntick\nmicro\n");
+}
+
+#[test]
+fn the_exit_handler_can_change_the_status() {
+    // Node re-reads `process.exitCode` after emitting, because a handler is
+    // allowed to change it. The argument is the resolved code (`0`), while
+    // `process.exitCode` is still unset inside the handler — the two are
+    // different values, and real `node` shows both.
+    let output = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .arg("-e")
+        .arg(
+            "process.on('exit', (code) => {\n\
+               console.log('saw', code, 'exitCode =', process.exitCode);\n\
+               process.exitCode = 5;\n\
+             });",
+        )
+        .output()
+        .expect("rustnode runs");
+    assert_eq!(output.status.code(), Some(5));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "saw 0 exitCode = undefined"
+    );
+}
+
+#[test]
+fn a_failing_nested_subtest_exits_non_zero() {
+    // The regression this work exists for. `node:test` reports failure by setting
+    // `process.exitCode` from a `test:summary` listener, and that summary is only
+    // produced when the harness's `beforeExit` handler finalises the root test.
+    // Without `beforeExit` the report printed and the process still exited 0, so
+    // `tools/harness` graded a file with failing subtests as a pass.
+    let output = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .arg("-e")
+        .arg(
+            "const { test } = require('node:test');\n\
+             test('outer', async (t) => {\n\
+               await t.test('inner passes', () => {});\n\
+               await t.test('inner fails', () => { throw new Error('boom'); });\n\
+             });",
+        )
+        .output()
+        .expect("rustnode runs");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a failing subtest must not exit 0; stdout was {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("fail 2"),
+        "no failure summary in stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn a_passing_subtest_file_exits_zero() {
+    // The control for the test above: the fix must not make every `node:test`
+    // file fail. Without it, an implementation that always exits 1 would pass.
+    let output = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .arg("-e")
+        .arg(
+            "const { test } = require('node:test');\n\
+             test('outer', async (t) => {\n\
+               await t.test('inner passes', () => {});\n\
+             });",
+        )
+        .output()
+        .expect("rustnode runs");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a passing subtest file must exit 0; stdout was {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn an_explicit_process_exit_still_reports_its_code() {
+    // The explicit path already reached `per_thread.js`'s wrapper. It is checked
+    // here because the natural path was rebuilt around the same emit and a shared
+    // helper must not change what the explicit call does.
+    for code in [0, 5] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+            .arg("-e")
+            .arg(format!(
+                "process.on('exit', (c) => console.log('EVENT', c));\n\
+                 process.exit({code});"
+            ))
+            .output()
+            .expect("rustnode runs");
+        assert_eq!(output.status.code(), Some(code));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("EVENT {code}")
+        );
+    }
+}
+
+#[test]
+fn an_uncaught_exception_still_exits_one_and_emits_exit() {
+    // An uncaught throw is the third way a process ends. Node emits `exit` with
+    // 1 for it, which is asserted alongside the status so a fix for the natural
+    // path cannot regress the fatal one.
+    let output = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .arg("-e")
+        .arg("process.on('exit', (c) => console.log('EVENT', c)); throw new Error('boom');")
+        .output()
+        .expect("rustnode runs");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "EVENT 1");
+}
