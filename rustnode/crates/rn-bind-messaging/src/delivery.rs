@@ -155,7 +155,7 @@ pub fn deliver<'s>(scope: &mut v8::PinScope<'s, '_>, port: &Rc<PortInner>) -> bo
         let payload = {
             let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
             let scope = &mut try_catch.init();
-            deserialize::deserialize(scope, &message.data, &message.array_buffers)
+            deserialize::deserialize(scope, &message)
                 .ok()
                 .map(|payload| (v8::Global::new(scope, payload.value), payload.ports))
         };

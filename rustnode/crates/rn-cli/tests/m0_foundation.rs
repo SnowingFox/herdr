@@ -415,3 +415,88 @@ fn a_runtime_v8_flag_does_not_abort_the_process() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "accepted");
 }
+
+#[test]
+fn a_cloneable_host_object_survives_structured_clone() {
+    // The `kClone`/`kDeserialize` round trip. `internal/test/transfer`'s `F` is
+    // Node's own fixture for exactly this: it marks itself with `markTransferMode`,
+    // returns `deserializeInfo: 'internal/test/transfer:F'` from `[kClone]`, and
+    // reads its state back in `[kDeserialize]`.
+    //
+    // Two things have to hold, and they fail separately. `instanceof F` proves the
+    // create-object hook ran and resolved the class by name; `b === 1` proves the
+    // `data` from `[kClone]` reached `[kDeserialize]` through the message buffer.
+    // `E` is the unmarked superclass, so `c instanceof E` also catches a clone that
+    // came back with the wrong prototype.
+    let out = rustnode(&[
+        "--expose-internals",
+        "-e",
+        "const { F, E } = require('internal/test/transfer');\n\
+         const c = structuredClone(new F(1));\n\
+         console.log(c instanceof F, c instanceof E, c.b, c.constructor.name);",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true true 1 F");
+}
+
+#[test]
+fn a_block_list_clone_is_still_a_working_block_list() {
+    // The reported bug as a user sees it: `test/parallel/test-blocklist-clone.js`
+    // reduced to its assertions. A `BlockList` keeps its rules in a native handle,
+    // so a clone that dropped the handle arrived as a plain object and `check` was
+    // not a function.
+    //
+    // The mutability assertion is the part that pins Node's semantics rather than
+    // mere survival: `SocketAddressBlockListWrap::TransferData` shares the rule
+    // set, so adding to the clone is visible through the original.
+    let out = rustnode(&[
+        "-e",
+        "const { BlockList } = require('net');\n\
+         const bl = new BlockList();\n\
+         bl.addAddress('123.123.123.123');\n\
+         const c = structuredClone(bl);\n\
+         console.log(BlockList.isBlockList(c), c.check('123.123.123.123'),\n\
+                     c.check('123.123.123.124'), c !== bl);\n\
+         c.addAddress('123.123.123.124');\n\
+         console.log(bl.check('123.123.123.124'), c.check('123.123.123.124'));",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "true true false true\ntrue true"
+    );
+}
+
+#[test]
+fn a_cloneable_host_object_survives_post_message() {
+    // The same round trip through `MessagePort` rather than `structuredClone`, so
+    // the fix is pinned as the messaging mechanism rather than one entry point's
+    // behaviour. `receiveMessageOnPort` reads synchronously, which keeps the test
+    // free of event-loop ordering.
+    let out = rustnode(&[
+        "--expose-internals",
+        "-e",
+        "const { F } = require('internal/test/transfer');\n\
+         const { MessageChannel, receiveMessageOnPort } = require('worker_threads');\n\
+         const { port1, port2 } = new MessageChannel();\n\
+         port2.postMessage({ inner: new F(7) });\n\
+         const got = receiveMessageOnPort(port1);\n\
+         const c = got.message.inner;\n\
+         console.log(c instanceof F, c.b);\n\
+         port1.close(); port2.close();",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "true 7");
+}

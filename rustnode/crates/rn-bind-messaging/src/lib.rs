@@ -112,6 +112,12 @@ const PORT_FIELD: i32 = 0;
 
 thread_local! {
     /// The deserializer object-creation callback `js_transferable.js` installs.
+    ///
+    /// Node keeps this on `Environment` as `messaging_deserialize_create_object_`
+    /// and calls it from `JSTransferable::Data::Deserialize` with the
+    /// `deserializeInfo` string a `[kClone]` method returned. It is the hook that
+    /// turns `'internal/blocklist:InternalBlockList'` into a real
+    /// `InternalBlockList` instance whose prototype is `BlockList.prototype`.
     static CREATE_OBJECT: RefCell<Option<v8::Global<v8::Function>>> =
         const { RefCell::new(None) };
 
@@ -552,7 +558,6 @@ fn post_message<'s>(
     if !dispatched {
         // Node emits a warning rather than throwing, so a script that posts on a
         // detached port keeps running.
-        rn_core::hook_slot::write_stderr("Warning: MessagePortData is not entangled.\n");
         rv.set(v8::Boolean::new(scope, false).into());
         return;
     }
@@ -662,7 +667,7 @@ fn receive_message_on_port(
         set_no_message(scope, &mut rv);
         return;
     }
-    match deserialize::deserialize(scope, &message.data, &message.array_buffers) {
+    match deserialize::deserialize(scope, &message) {
         Ok(deserialized) => rv.set(deserialized.value),
         Err(()) => set_no_message(scope, &mut rv),
     }
@@ -851,16 +856,254 @@ fn set_deserializer_create_object_function(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
 ) {
-    let callback = v8::Local::<v8::Function>::try_from(args.get(0))
-        .ok()
-        .map(|callback| v8::Global::new(scope, callback));
-    CREATE_OBJECT.with(|slot| *slot.borrow_mut() = callback);
+    // `SetDeserializerCreateObjectFunction`: `CHECK(args[0]->IsFunction())` then
+    // store it on the realm. Type-strict on purpose — a non-function here would
+    // be stored and only fail much later, inside a deserialisation, with nothing
+    // pointing back at the caller that installed it.
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(0)) else {
+        throw_type_error(
+            scope,
+            "setDeserializerCreateObjectFunction requires a function",
+        );
+        return;
+    };
+    let callback = v8::Global::new(scope, callback);
+    CREATE_OBJECT.with(|slot| *slot.borrow_mut() = Some(callback));
 }
 
-/// The delegate that makes plain (non-host) values serializable.
-struct PlainSerializer;
+/// Calls the create-object hook, Node's `JSTransferable::Data::Deserialize`.
+///
+/// This is the call that reconstructs a host object from the
+/// `deserializeInfo` string its `[kClone]` returned. Node's shape:
+///
+/// ```text
+/// CHECK(!env->messaging_deserialize_create_object().IsEmpty());
+/// if (!create_object->Call(context, Null(isolate), 1, &info).ToLocal(&ret) ||
+///     !ret->IsObject()) return {};
+/// if (!JSTransferable::IsJSTransferable(env, context, ret.As<Object>())) return {};
+/// ```
+///
+/// Both post-conditions are checked here rather than dropped, because the object
+/// the hook returns is what `[kDeserialize]` is later called on: a non-object or
+/// an unmarked object would fail at a point that names neither the hook nor the
+/// `deserializeInfo` that produced it.
+pub(crate) fn create_object_from_info<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    deserialize_info: &str,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let callback = CREATE_OBJECT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|callback| v8::Local::new(scope, callback))
+    });
+    let Some(callback) = callback else {
+        // Node `CHECK`s here, which aborts. A missing hook is a bootstrap bug —
+        // `js_transferable.js` installs it from `setup()` — so the message says
+        // which bootstrap step is missing instead of throwing something vague.
+        throw_type_error(
+            scope,
+            "Cannot deserialize a host object: \
+             internal/worker/js_transferable setup() has not run",
+        );
+        return None;
+    };
+    let info = v8::String::new(scope, deserialize_info)?;
+    // `Null(isolate)` as `this`: the hook is a plain arrow function in
+    // `js_transferable.js`, so it never reads its receiver.
+    let argument = info.into();
+    let created = callback.call(scope, v8::null(scope).into(), &[argument])?;
+    let Ok(object) = v8::Local::<v8::Object>::try_from(created) else {
+        throw_type_error(
+            scope,
+            &format!("The create-object hook returned a non-object for {deserialize_info}"),
+        );
+        return None;
+    };
+    // `JSTransferable::IsJSTransferable`: the hook may return any object, but only
+    // a marked one can be filled in by `[kDeserialize]`.
+    if js_transfer_mode(scope, object).is_none() {
+        throw_type_error(
+            scope,
+            &format!("The create-object hook returned an unmarked object for {deserialize_info}"),
+        );
+        return None;
+    }
+    Some(object)
+}
 
-impl v8::ValueSerializerImpl for PlainSerializer {
+/// The `transfer_mode_private_symbol` `markTransferMode` writes.
+fn transfer_mode_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Symbol> {
+    // The same identity `util.privateSymbols` installs, from the shared table in
+    // `rn_core`. A symbol created here would be a different key and every
+    // `markTransferMode` write would be invisible to this read.
+    rn_core::symbol(scope, "node:transfer_mode")
+}
+
+/// Whether `markTransferMode` stamped this object, Node's `HasPrivate` probe.
+///
+/// Presence, not a mode test: an object marked `kDisallowCloneAndTransfer` is
+/// still a `JSTransferable`, and Node answers "this is a host object, and it
+/// cannot be cloned" rather than falling through to copying its properties.
+pub(crate) fn js_marked(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+) -> bool {
+    let key = transfer_mode_key(scope);
+    object.has(scope, key.into()).unwrap_or(false)
+}
+
+/// The transfer mode `markTransferMode` stored, if this object is marked.
+///
+/// `JSTransferable::GetTransferMode` requires a `Uint32` and otherwise disallows,
+/// so a non-numeric value reports "not cloneable" rather than guessing.
+pub(crate) fn js_transfer_mode(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+) -> Option<rn_core::host_object::TransferMode> {
+    let key = transfer_mode_key(scope);
+    let value = object.get(scope, key.into())?;
+    if !value.is_uint32() {
+        return None;
+    }
+    Some(rn_core::host_object::TransferMode::from_bits(
+        value.uint32_value(scope)?,
+    ))
+}
+
+/// Runs `[kClone]` on a marked object, Node's `JSTransferable::CloneForMessaging`.
+///
+/// `TransferOrClone<kCloneable>` in `src/node_messaging.cc` is exactly this: look
+/// the symbol up, require a function, call it with no arguments, then take
+/// `data` and `deserializeInfo` off the result. The `data` value is held in the
+/// payload; `deserializeInfo` is handed to the create-object hook on the way back.
+pub(crate) fn js_clone_for_messaging<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<std::rc::Rc<dyn rn_core::host_object::TransferData>> {
+    let mode = js_transfer_mode(scope, object)?;
+    if !mode.is_cloneable() {
+        return None;
+    }
+    let Ok(symbol) =
+        rn_bind_symbols::ensure(scope, "messaging_clone_symbol", "messaging_clone_symbol")
+    else {
+        return None;
+    };
+    let method = object.get(scope, symbol.into())?;
+    let method = v8::Local::<v8::Function>::try_from(method).ok()?;
+
+    // `Call(context, target(), 0, nullptr)`: the object is the receiver, so a
+    // `[kClone]` written against `this` sees its own state.
+    let result = method.call(scope, object.into(), &[])?;
+    let result = v8::Local::<v8::Object>::try_from(result).ok()?;
+
+    let data = get_key(scope, result, "data")?;
+    let info = get_key(scope, result, "deserializeInfo")?;
+    // `Utf8Value` in Node stringifies, so a non-string that converts is accepted
+    // and one that does not is a clone failure.
+    let info = info.to_string(scope)?;
+    Some(std::rc::Rc::new(JsClone {
+        deserialize_info: info.to_rust_string_lossy(scope),
+        data: v8::Global::new(scope, data),
+    }))
+}
+
+/// `object.name`, as a value.
+fn get_key<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let key = v8::String::new(scope, name)?;
+    object.get(scope, key.into())
+}
+
+/// One object cloned through `kClone`, Node's `JSTransferable::Data`.
+///
+/// The two fields `[kClone]` returned, held apart because they are consumed at
+/// different times: `deserializeInfo` names the class to build *before* the
+/// payload is read, and `data` is that class's state, written after the payload.
+struct JsClone {
+    /// `'module:Constructor'`, from the `[kClone]` result.
+    deserialize_info: String,
+    /// The `data` value, held across the call.
+    data: v8::Global<v8::Value>,
+}
+
+impl rn_core::host_object::TransferData for JsClone {
+    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+        // `JSTransferable::Data::Deserialize`. This is the call the bug report
+        // names: the hook was stored by
+        // `setDeserializerCreateObjectFunction` and never invoked, so a cloned
+        // `BlockList` never got a `BlockList`-shaped object to fill in.
+        create_object_from_info(scope, &self.deserialize_info)
+    }
+
+    fn write_data(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        serializer: &dyn v8::ValueSerializerHelper,
+    ) -> bool {
+        // `FinalizeTransferWrite` writes `data_` into the serializer, which is
+        // what puts it after the main payload in the message buffer.
+        let data: v8::Local<v8::Value> = v8::Local::new(scope, &self.data);
+        serializer
+            .write_value(scope.get_current_context(), data)
+            .unwrap_or(false)
+    }
+
+    fn read_data(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        deserializer: &dyn v8::ValueDeserializerHelper,
+        target: v8::Local<'_, v8::Object>,
+    ) -> bool {
+        // `JSTransferable::FinalizeTransferRead`: read the value that follows the
+        // main payload, then call `this[kDeserialize](data)` when the prototype
+        // has one. A missing or non-function hook is *not* an error in Node — it
+        // returns `JustVoid()` — because `kClone` alone is enough for an object
+        // whose receiver needs no state.
+        let context = scope.get_current_context();
+        let Some(data) = deserializer.read_value(context) else {
+            return false;
+        };
+        let Ok(symbol) = rn_bind_symbols::ensure(
+            scope,
+            "messaging_deserialize_symbol",
+            "messaging_deserialize_symbol",
+        ) else {
+            return true;
+        };
+        let Some(method) = target.get(scope, symbol.into()) else {
+            return true;
+        };
+        let Ok(method) = v8::Local::<v8::Function>::try_from(method) else {
+            return true;
+        };
+        method.call(scope, target.into(), &[data]).is_some()
+    }
+}
+
+/// The delegate `structuredClone` uses to serialize.
+///
+/// Node's `StructuredClone` goes through `Message::Serialize` with an empty
+/// transfer list, which means it uses the *same* `SerializerDelegate` as
+/// `postMessage` — host objects included. This mirrors that rather than using the
+/// "no host objects" delegate it used before, because that delegate is why a
+/// `BlockList` clone lost its handle: with `is_host_object` answering `Some(false)`
+/// for everything, V8 copied the enumerable properties of the wrapper and never
+/// asked for the clone payload.
+struct PlainSerializer<'a> {
+    host_objects: &'a RefCell<Vec<v8::Global<v8::Object>>>,
+}
+
+impl v8::ValueSerializerImpl for PlainSerializer<'_> {
+    fn has_custom_host_object(&self, _isolate: &v8::Isolate) -> bool {
+        // Same reason as the `postMessage` delegate: the decision belongs to the
+        // transfer-mode marking, not to V8 counting embedder fields.
+        true
+    }
+
     fn throw_data_clone_error<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
@@ -873,12 +1116,51 @@ impl v8::ValueSerializerImpl for PlainSerializer {
 
     fn is_host_object<'s>(
         &self,
-        _scope: &mut v8::PinScope<'s, '_>,
-        _object: v8::Local<'s, v8::Object>,
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
     ) -> Option<bool> {
-        // No host objects are registered, so nothing is one. Returning `None`
-        // here would abort the clone; `Some(false)` is the correct answer.
-        Some(false)
+        Some(
+            crate::port_state_of(scope, object).is_some()
+                || rn_core::host_object::is_registered(scope, object)
+                || js_marked(scope, object),
+        )
+    }
+
+    fn write_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+        serializer: &dyn v8::ValueSerializerHelper,
+    ) -> Option<bool> {
+        // `structuredClone` has no transfer list, so a transferable-only object
+        // cannot be cloned — Node throws here too, with this text.
+        if crate::port_state_of(scope, object).is_some() {
+            throw_type_error(
+                scope,
+                "Object that needs transfer was found in message but not listed in transferList",
+            );
+            return None;
+        }
+        let mode = rn_core::host_object::transfer_mode(scope, object)
+            .or_else(|| js_transfer_mode(scope, object));
+        let Some(mode) = mode else {
+            throw_type_error(scope, "Cannot clone object of unsupported type.");
+            return None;
+        };
+        if !mode.is_cloneable() {
+            throw_type_error(
+                scope,
+                "Object that needs transfer was found in message but not listed in transferList",
+            );
+            return None;
+        }
+        let id = {
+            let mut host_objects = self.host_objects.borrow_mut();
+            host_objects.push(v8::Global::new(scope, object));
+            host_objects.len() as u32 - 1
+        };
+        serializer.write_uint32(id);
+        Some(true)
     }
 }
 
@@ -888,18 +1170,63 @@ fn structured_clone(
     mut rv: v8::ReturnValue,
 ) {
     let value = args.get(0);
-    let serializer = v8::ValueSerializer::new(scope, Box::new(PlainSerializer));
+    let host_objects = RefCell::new(Vec::new());
+    let serializer = v8::ValueSerializer::new(
+        scope,
+        Box::new(PlainSerializer {
+            host_objects: &host_objects,
+        }),
+    );
+    // `WriteHeader` before the value, matching `Message::Serialize`. It is not
+    // cosmetic: `ReadValue` picks V8's legacy whole-buffer reader when the
+    // wire-format version is 0, and that reader refuses the clone data appended
+    // after the payload, so a clone carrying any `data` would fail to read back.
+    v8::ValueSerializerHelper::write_header(&serializer);
     let Some(true) = serializer.write_value(scope.get_current_context(), value) else {
         // V8 has already thrown, which is what `structuredClone` should do for
         // an uncloneable value (a function, a WeakMap, a symbol).
         return;
     };
-    let data = serializer.release();
 
-    let deserializer = v8::ValueDeserializer::new(scope, Box::new(PlainDeserializer), &data);
-    match deserializer.read_value(scope.get_current_context()) {
-        Some(cloned) => rv.set(cloned),
-        None => {
+    // `SerializerDelegate::Finish`, which interleaves the clone hook with the
+    // write of its data, exactly as `serialize::serialize` does. Both halves have
+    // to be in one loop because writing a `[kClone]` payload can reach *more* host
+    // objects — a `BlockList` wrapper's payload is `{ handle }`, and that handle is
+    // a cloneable native object of its own — so the vector grows while it is
+    // walked.
+    let mut clones: Vec<Rc<dyn rn_core::host_object::TransferData>> = Vec::new();
+    let mut index = 0;
+    loop {
+        let count = host_objects.borrow().len();
+        if index >= count {
+            break;
+        }
+        let object = {
+            let slots = host_objects.borrow();
+            match slots.get(index) {
+                Some(object) => v8::Local::new(scope, object),
+                None => continue,
+            }
+        };
+        let clone = rn_core::host_object::clone_for_messaging(scope, object)
+            .or_else(|| js_clone_for_messaging(scope, object));
+        let Some(clone) = clone else {
+            return;
+        };
+        if !clone.write_data(scope, &serializer) {
+            return;
+        }
+        clones.push(clone);
+        index += 1;
+    }
+
+    let data = serializer.release();
+    drop(serializer);
+
+    let message = crate::port::Message::new(data, Vec::new(), Vec::new(), clones, 0);
+    match deserialize::deserialize(scope, &message) {
+        Ok(deserialized) => rv.set(deserialized.value),
+        Err(()) => {
             // A read failure means the bytes were malformed, which cannot
             // happen from a clone we just wrote; throwing keeps it visible.
             throw_type_error(
@@ -907,31 +1234,6 @@ fn structured_clone(
                 "structuredClone: the serialized value could not be read back",
             );
         }
-    }
-}
-
-struct PlainDeserializer;
-
-impl v8::ValueDeserializerImpl for PlainDeserializer {
-    fn get_shared_array_buffer_from_id<'s>(
-        &self,
-        scope: &mut v8::PinScope<'s, '_>,
-        _id: u32,
-    ) -> Option<v8::Local<'s, v8::SharedArrayBuffer>> {
-        throw_type_error(scope, "structuredClone cannot transfer a SharedArrayBuffer");
-        None
-    }
-
-    fn get_wasm_module_from_id<'s>(
-        &self,
-        scope: &mut v8::PinScope<'s, '_>,
-        _id: u32,
-    ) -> Option<v8::Local<'s, v8::WasmModuleObject>> {
-        throw_type_error(
-            scope,
-            "structuredClone cannot transfer a WebAssembly.Module",
-        );
-        None
     }
 }
 

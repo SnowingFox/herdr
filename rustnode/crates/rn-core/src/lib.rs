@@ -13,6 +13,7 @@ pub mod env;
 pub mod error;
 pub mod handle;
 pub mod hook_slot;
+pub mod host_object;
 pub mod queue;
 pub mod symbol;
 

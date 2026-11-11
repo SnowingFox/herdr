@@ -30,8 +30,11 @@
 mod address;
 mod blocklist;
 
+use std::cell::RefCell;
 use std::ffi::c_void;
+use std::rc::Rc;
 
+use rn_core::host_object::TransferData;
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
@@ -39,6 +42,23 @@ pub use address::{Family, SocketAddress, AF_INET, AF_INET6};
 pub use blocklist::{BlockList, Rule};
 
 use blocklist::family_from_af;
+
+/// The `rn_core::host_object` kind a `BlockList` handle is marked with.
+///
+/// Node's counterpart is the `SocketAddressBlockListWrap` class itself: the
+/// transfer machinery asks `GetTransferMode()` on the wrapper, so there is no name
+/// to give. A registry needs one, and it is private to this crate.
+const BLOCK_LIST_KIND: &str = "block_list:BlockList";
+
+/// The `rn_core::host_object` kind a `SocketAddress` handle is marked with.
+///
+/// `SocketAddressBase` is `kCloneable` in Node too, and `lib/internal/socketaddress.js`
+/// gives it a `[kClone]`, but its state is a *value* rather than a shared rule set:
+/// `TransferData` copies the `SocketAddress`, so a clone is independent. It is also
+/// not reached through the JS wrapper that a clone carries — `SocketAddress` clones
+/// go through `InternalSocketAddress`, which is the JavaScript-level half. The mark
+/// exists so a raw handle clone behaves like Node's rather than silently copying.
+const SOCKET_ADDRESS_KIND: &str = "block_list:SocketAddress";
 
 /// Members exposed on the namespace object, matching `contracts/block_list.json`.
 pub const MEMBERS: &[&str] = &["AF_INET", "AF_INET6", "BlockList", "SocketAddress"];
@@ -94,6 +114,109 @@ impl BindingModule for BlockListBinding {
 /// Registers the `block_list` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(BlockListBinding);
+    // The `internalBinding('block_list')` namespace and its clone hooks are one
+    // unit: a `BlockList` handle is only ever built here, so the hook and the
+    // marking are registered together with the module.
+    rn_core::host_object::register_kind(BLOCK_LIST_KIND, block_list_clone);
+    rn_core::host_object::register_kind(SOCKET_ADDRESS_KIND, socket_address_clone);
+}
+
+/// `SocketAddressBlockListWrap::CloneForMessaging`.
+///
+/// Node's returns `std::make_unique<TransferData>(this)`, whose constructor copies
+/// the `shared_ptr`. [`BlockListClone`] copies the `Rc` for the same reason, so the
+/// receiving handle wraps the same rules.
+fn block_list_clone<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<Rc<dyn TransferData>> {
+    let list = block_list_handle(scope, object)?;
+    Some(Rc::new(BlockListClone { list }))
+}
+
+/// `SocketAddressBase::CloneForMessaging`, which copies the address.
+fn socket_address_clone<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<Rc<dyn TransferData>> {
+    let _ = scope;
+    let address = with_state::<SocketAddress, _>(object, |address| *address)?;
+    Some(Rc::new(SocketAddressClone { address }))
+}
+
+/// The receiving half of a `BlockList` clone.
+struct BlockListClone {
+    /// The rules, shared with the handle this was cloned from.
+    list: Rc<RefCell<BlockList>>,
+}
+
+impl TransferData for BlockListClone {
+    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+        // `SocketAddressBlockListWrap::TransferData::Deserialize` calls `New(env,
+        // std::move(blocklist_))`, which builds a fresh wrapper over the shared
+        // rules. `new_block_list_object` is the same thing: an instance of the
+        // `BlockList` template, with the constructor deliberately not run so the
+        // fresh wrapper does not get a *new* rule set.
+        let object = new_block_list_object(scope)?;
+        install_shared_block_list(scope, object, Rc::clone(&self.list));
+        rn_core::host_object::mark(scope, object, BLOCK_LIST_KIND);
+        Some(object)
+    }
+}
+
+/// The receiving half of a `SocketAddress` clone, which copies the address.
+struct SocketAddressClone {
+    address: SocketAddress,
+}
+
+impl TransferData for SocketAddressClone {
+    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+        // `SocketAddressBase::TransferData::Deserialize` calls
+        // `SocketAddressBase::Create(env, std::move(address_))`, a new wrapper
+        // around a copy of the address. The constructor is not run, so the object
+        // gets the template's prototype and the address is installed directly.
+        let object = new_socket_address_object(scope)?;
+        install_state(scope, object, self.address);
+        Some(object)
+    }
+}
+
+/// A `BlockList` instance without running its constructor.
+///
+/// The constructor allocates a *new* rule set, so it must not run for a receiving
+/// handle. Node has the same problem and solves it with
+/// `GetConstructorTemplate(env)->InstanceTemplate()->NewInstance(context)`.
+fn new_block_list_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let template = BLOCK_LIST_TEMPLATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|template| v8::Local::new(scope, template))
+    })?;
+    template.new_instance(scope)
+}
+
+/// A `SocketAddress` instance without running its constructor.
+fn new_socket_address_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let template = SOCKET_ADDRESS_TEMPLATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|template| v8::Local::new(scope, template))
+    })?;
+    template.new_instance(scope)
+}
+
+thread_local! {
+    /// The `BlockList` instance template, for rebuilding a cloned handle.
+    static BLOCK_LIST_TEMPLATE: RefCell<Option<v8::Global<v8::ObjectTemplate>>> =
+        const { RefCell::new(None) };
+
+    /// The `SocketAddress` instance template, for the same reason.
+    static SOCKET_ADDRESS_TEMPLATE: RefCell<Option<v8::Global<v8::ObjectTemplate>>> =
+        const { RefCell::new(None) };
 }
 
 fn define_constant(
@@ -195,6 +318,92 @@ fn with_state<T, R>(object: v8::Local<v8::Object>, body: impl FnOnce(&mut T) -> 
     Some(body(unsafe { &mut *pointer }))
 }
 
+/// Boxes a `BlockList` handle, sharing the rules with any clone of it.
+///
+/// Node's `SocketAddressBlockListWrap` holds a
+/// `std::shared_ptr<SocketAddressBlockList>`, and its
+/// `TransferData::Deserialize` builds the receiving handle around *that same*
+/// pointer. So a cloned `BlockList` is a second wrapper over one rule set: adding
+/// a rule to either is visible through both, which is what
+/// `test-blocklist-clone.js` asserts after the clone.
+///
+/// `Rc<RefCell<_>>` is the Rust equivalent for a single-threaded isolate. It is
+/// per-handle rather than per-object so the sharing is explicit: the two wrappers
+/// reference one `Rc`, and whichever is collected last drops the rules.
+fn install_shared_block_list(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+    list: Rc<RefCell<BlockList>>,
+) {
+    let slot = Box::into_raw(Box::new(BlockListSlot { list }));
+    object.set_aligned_pointer_in_internal_field(
+        STATE_FIELD,
+        slot.cast::<c_void>().cast_const(),
+        0,
+    );
+    let address = slot as usize;
+    let weak = v8::Weak::with_guaranteed_finalizer(
+        scope,
+        object,
+        Box::new(move || {
+            // SAFETY: the pointer came from `Box::into_raw` above and no other
+            // owner exists; this finalizer runs exactly once. Dropping the slot
+            // drops one `Rc`, so the rules live until the last handle goes.
+            drop(unsafe { Box::from_raw(address as *mut BlockListSlot) });
+        }),
+    );
+    std::mem::forget(weak);
+}
+
+/// The boxed state behind a `BlockList` handle.
+///
+/// A separate type from `BlockList` so the other namespaces' `install_state` stays
+/// a plain box: only this one is shared, because only this one is cloneable.
+struct BlockListSlot {
+    list: Rc<RefCell<BlockList>>,
+}
+
+/// Borrows the shared rules behind a `BlockList` handle.
+fn with_block_list<R>(
+    object: v8::Local<'_, v8::Object>,
+    body: impl FnOnce(&mut BlockList) -> R,
+) -> Option<R> {
+    // SAFETY: the field only ever holds a pointer produced by
+    // `install_shared_block_list` for this object's own template, and `object` is a
+    // live local.
+    let pointer = unsafe { object.get_aligned_pointer_from_internal_field(STATE_FIELD, 0) }
+        as *const BlockListSlot;
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: `pointer` is the live allocation, and `body` cannot re-enter
+    // JavaScript while the borrow is held — which is also why the `RefCell` is
+    // never already mutably borrowed here.
+    let slot = unsafe { &*pointer };
+    let mut list = slot.list.try_borrow_mut().ok()?;
+    Some(body(&mut list))
+}
+
+/// The rules behind a handle, when it is one this crate built.
+fn block_list_handle<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<Rc<RefCell<BlockList>>> {
+    if object.internal_field_count() == 0 {
+        return None;
+    }
+    let pointer = unsafe { object.get_aligned_pointer_from_internal_field(STATE_FIELD, 0) }
+        as *const BlockListSlot;
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: as in `with_block_list`; the clone is what keeps the rules alive
+    // after the object that owns this slot is collected.
+    let slot = unsafe { &*pointer };
+    let _ = scope;
+    Some(Rc::clone(&slot.list))
+}
+
 /// One of the `AF_INET`/`AF_INET6` arguments, read as a family.
 fn family_argument(
     scope: &mut v8::PinScope<'_, '_>,
@@ -221,6 +430,12 @@ fn socket_address_constructor<'s>(
     template
         .instance_template(scope)
         .set_internal_field_count(1);
+    // Same reason as `BlockList`: a cloned `SocketAddress` is built from the
+    // template rather than through the constructor, which would demand arguments
+    // the deserializer does not have.
+    SOCKET_ADDRESS_TEMPLATE.with(|slot| {
+        *slot.borrow_mut() = Some(v8::Global::new(scope, template.instance_template(scope)))
+    });
 
     let prototype = template.prototype_template(scope);
     let methods: [(&str, v8::Local<v8::FunctionTemplate>); 3] = [
@@ -297,6 +512,7 @@ fn socket_address_new(
 
     let object = args.this();
     install_state(scope, object, address);
+    rn_core::host_object::mark(scope, object, SOCKET_ADDRESS_KIND);
     rv.set(object.into());
 }
 
@@ -391,6 +607,12 @@ fn block_list_constructor<'s>(
     template
         .instance_template(scope)
         .set_internal_field_count(1);
+    // Kept for the clone hook: a receiving `BlockList` needs an instance of this
+    // template built without running the constructor, because the constructor
+    // would allocate a fresh rule set instead of sharing the sender's.
+    BLOCK_LIST_TEMPLATE.with(|slot| {
+        *slot.borrow_mut() = Some(v8::Global::new(scope, template.instance_template(scope)))
+    });
 
     let prototype = template.prototype_template(scope);
     let methods: [(&str, v8::Local<v8::FunctionTemplate>); 12] = [
@@ -432,7 +654,11 @@ fn block_list_new(
         return;
     }
     let object = args.this();
-    install_state(scope, object, BlockList::new());
+    install_shared_block_list(scope, object, Rc::new(RefCell::new(BlockList::new())));
+    // `Node`'s `BaseObject` constructor records the wrapper, which is what
+    // `IsBaseObject` later finds and what makes the handle reachable from
+    // `CloneForMessaging`. The mark plays that part here.
+    rn_core::host_object::mark(scope, object, BLOCK_LIST_KIND);
     rv.set(object.into());
 }
 
@@ -465,7 +691,7 @@ fn add_address(
     let Some(address) = socket_address_argument(scope, &args, 0, "address") else {
         return;
     };
-    with_state::<BlockList, _>(args.this(), |list| list.add_address(address));
+    with_block_list(args.this(), |list| list.add_address(address));
     rv.set(v8::Boolean::new(scope, true).into());
 }
 
@@ -494,7 +720,7 @@ fn add_addresses(
         };
         addresses.push(address);
     }
-    with_state::<BlockList, _>(args.this(), |list| {
+    with_block_list(args.this(), |list| {
         for address in addresses {
             list.add_address(address);
         }
@@ -522,7 +748,7 @@ fn add_range(
         rv.set(v8::Boolean::new(scope, false).into());
         return;
     }
-    with_state::<BlockList, _>(args.this(), |list| list.add_range(start, end));
+    with_block_list(args.this(), |list| list.add_range(start, end));
     rv.set(v8::Boolean::new(scope, true).into());
 }
 
@@ -538,7 +764,7 @@ fn add_subnet(
     let Some(prefix) = prefix_argument(scope, &args, &network) else {
         return;
     };
-    with_state::<BlockList, _>(args.this(), |list| list.add_subnet(network, prefix));
+    with_block_list(args.this(), |list| list.add_subnet(network, prefix));
     rv.set(v8::Boolean::new(scope, true).into());
 }
 
@@ -570,7 +796,7 @@ fn remove_address(
     let Some(address) = socket_address_argument(scope, &args, 0, "address") else {
         return;
     };
-    with_state::<BlockList, _>(args.this(), |list| list.remove_address(address));
+    with_block_list(args.this(), |list| list.remove_address(address));
 }
 
 /// `removeRange(start, end)`.
@@ -585,7 +811,7 @@ fn remove_range(
     let Some(end) = socket_address_argument(scope, &args, 1, "end") else {
         return;
     };
-    with_state::<BlockList, _>(args.this(), |list| list.remove_range(start, end));
+    with_block_list(args.this(), |list| list.remove_range(start, end));
 }
 
 /// `removeSubnet(network, prefix)`.
@@ -600,7 +826,7 @@ fn remove_subnet(
     let Some(prefix) = prefix_argument(scope, &args, &network) else {
         return;
     };
-    with_state::<BlockList, _>(args.this(), |list| list.remove_subnet(network, prefix));
+    with_block_list(args.this(), |list| list.remove_subnet(network, prefix));
 }
 
 /// `check(address)` where `address` is a `SocketAddress`.
@@ -612,8 +838,7 @@ fn check(
     let Some(address) = socket_address_argument(scope, &args, 0, "address") else {
         return;
     };
-    let blocked =
-        with_state::<BlockList, _>(args.this(), |list| list.apply(&address)).unwrap_or(false);
+    let blocked = with_block_list(args.this(), |list| list.apply(&address)).unwrap_or(false);
     rv.set(v8::Boolean::new(scope, blocked).into());
 }
 
@@ -639,8 +864,7 @@ fn check_string(
         rv.set(v8::Boolean::new(scope, false).into());
         return;
     };
-    let blocked =
-        with_state::<BlockList, _>(args.this(), |list| list.apply(&address)).unwrap_or(false);
+    let blocked = with_block_list(args.this(), |list| list.apply(&address)).unwrap_or(false);
     rv.set(v8::Boolean::new(scope, blocked).into());
 }
 
@@ -650,8 +874,7 @@ fn get_rules(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let rules =
-        with_state::<BlockList, _>(args.this(), |list| list.list_rules()).unwrap_or_default();
+    let rules = with_block_list(args.this(), |list| list.list_rules()).unwrap_or_default();
     let array = v8::Array::new(scope, rules.len() as i32);
     for (index, rule) in rules.iter().enumerate() {
         if let Some(value) = v8::String::new(scope, rule) {
@@ -667,7 +890,7 @@ fn get_size(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let size = with_state::<BlockList, _>(args.this(), |list| list.size()).unwrap_or(0);
+    let size = with_block_list(args.this(), |list| list.size()).unwrap_or(0);
     rv.set(v8::Number::new(scope, size as f64).into());
 }
 
@@ -677,6 +900,6 @@ fn clear(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_>,
 ) {
-    with_state::<BlockList, _>(args.this(), |list| list.clear());
+    with_block_list(args.this(), |list| list.clear());
     let _ = scope;
 }
