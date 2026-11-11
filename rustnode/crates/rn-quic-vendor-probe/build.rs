@@ -152,11 +152,29 @@ const NGHTTP3_SOURCES: &[&str] = &[
 ];
 
 fn main() {
-    let deps = node_deps_dir();
-    let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("shim");
-
-    println!("cargo:rerun-if-changed={}", shim.display());
+    println!("cargo:rerun-if-changed={}", shim_dir().display());
     println!("cargo:rerun-if-env-changed=RN_QUIC_NODE_DEPS");
+    // `unexpected_cfgs` is warn-by-default; declaring the probe's flag here is
+    // what keeps a clean `cargo clippy --workspace` quiet on machines that have
+    // no Node checkout.
+    println!("cargo:rustc-check-cfg=cfg(quic_probe_enabled)");
+
+    let Some(deps) = node_deps_dir() else {
+        // No checkpoint configured. This is the normal case in CI and for any
+        // contributor who is not looking at QUIC, so it must not fail the
+        // build: the crate compiles to an empty library and its tests are
+        // compiled out. Failing here would take the whole workspace gate
+        // hostage to an optional checkout that only the probe needs.
+        println!(
+            "cargo:warning=RN_QUIC_NODE_DEPS is unset; rn-quic-vendor-probe builds \
+             an empty library. Set it to a Node checkout's deps directory to run \
+             the probe."
+        );
+        return;
+    };
+    println!("cargo:rustc-cfg=quic_probe_enabled");
+
+    let shim = shim_dir();
 
     let openssl = openssl_src::Build::new().build();
     openssl.print_cargo_metadata();
@@ -172,15 +190,14 @@ fn main() {
     build_shim(&shim, &deps, &openssl_include);
 }
 
-/// The `deps` directory of a Node checkout at the pin.
-fn node_deps_dir() -> PathBuf {
-    match std::env::var_os("RN_QUIC_NODE_DEPS") {
-        Some(dir) => PathBuf::from(dir),
-        None => panic!(
-            "set RN_QUIC_NODE_DEPS to the `deps` directory of a Node checkout at \
-             the pin, e.g. RN_QUIC_NODE_DEPS=/tmp/nodepin/deps"
-        ),
-    }
+fn shim_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("shim")
+}
+
+/// The `deps` directory of a Node checkout at the pin, or `None` when the
+/// operator has not pointed the probe at one.
+fn node_deps_dir() -> Option<PathBuf> {
+    std::env::var_os("RN_QUIC_NODE_DEPS").map(PathBuf::from)
 }
 
 fn build_ngtcp2(deps: &Path, openssl_include: &Path) {
