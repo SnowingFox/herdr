@@ -31,11 +31,22 @@ esac
 
 binary="$root/target/debug/rustnode"
 work="$(mktemp -d)"
-guarded="crates/rn-cli/src/event_loop.rs"
+# The file the `guard` arm breaks. It has moved once already (`rn-cli/src/event_loop.rs`
+# became `rn-realm/src/runtime.rs`), so it is resolved rather than hard-coded: a stale
+# path made the guard's `cp` fail, the build then succeeded because nothing had been
+# broken, and the arm still printed PASS — for the wrong reason. A guard that can pass
+# by failing to find its target is not a guard.
+guarded=""
+for candidate in crates/rn-realm/src/runtime.rs crates/rn-cli/src/event_loop.rs; do
+  if [ -f "$candidate" ]; then
+    guarded="$candidate"
+    break
+  fi
+done
 
 restore() {
-  if [ -f "$work/event_loop.rs" ]; then
-    cp "$work/event_loop.rs" "$guarded"
+  if [ -n "$guarded" ] && [ -f "$work/guarded.rs" ]; then
+    cp "$work/guarded.rs" "$guarded"
   fi
   rm -rf "$work"
 }
@@ -134,14 +145,31 @@ BE 2" \
 
 if [ "$arm" = "guard" ]; then
   printf '== guard: a failed build must abort before any check runs ==\n'
-  cp "$guarded" "$work/event_loop.rs"
+  if [ -z "$guarded" ]; then
+    printf 'RESULT: FAIL (no source file to break; the guard cannot prove anything)\n' >&2
+    exit 1
+  fi
+  printf 'breaking %s\n' "$guarded"
+  if ! cp "$guarded" "$work/guarded.rs"; then
+    printf 'RESULT: FAIL (cannot read %s)\n' "$guarded" >&2
+    exit 1
+  fi
   printf '\ncompile_error!("negative control: this build must fail");\n' >> "$guarded"
+
+  # The build must fail *because of the injected error*, not for some other reason:
+  # a build that fails for an unrelated cause would also abort, so printing PASS on
+  # any failure would prove nothing. The log has to name the message injected above.
   if build_arm "a deliberately broken build"; then
     printf 'RESULT: FAIL (the broken build was accepted)\n' >&2
     exit 1
   fi
-  printf '\nABORTED as required: no stale binary was tested\n'
-  printf 'RESULT: PASS (the guard aborts on build failure)\n'
+  if ! grep -q "negative control: this build must fail" "$work/build.log"; then
+    printf 'RESULT: FAIL (the build failed, but not because of the injected error)\n' >&2
+    tail -20 "$work/build.log" >&2
+    exit 1
+  fi
+  printf '\nABORTED as required: the injected error stopped the build and no stale binary was tested\n'
+  printf 'RESULT: PASS (the guard aborts on build failure, and provably on this one)\n'
   exit 0
 fi
 
