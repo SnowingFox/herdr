@@ -95,8 +95,12 @@ fn run(binary: &str, script: &str, limit: Duration) -> Run {
         .wait_with_output()
         .unwrap_or_else(|error| panic!("cannot collect {binary}'s output: {error}"));
     Run {
-        stdout: String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim_end().to_string(),
+        stdout: String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr)
+            .trim_end()
+            .to_string(),
         exit_code: status.and_then(|status| status.code()),
         timed_out,
         elapsed: started.elapsed(),
@@ -120,7 +124,11 @@ fn same_output_as_node(script: &str, expected: &str) {
         "`node` printed something unexpected; the expectation in this test is wrong"
     );
 
-    let actual = run(env!("CARGO_BIN_EXE_rustnode"), script, Duration::from_secs(20));
+    let actual = run(
+        env!("CARGO_BIN_EXE_rustnode"),
+        script,
+        Duration::from_secs(20),
+    );
     assert!(
         !actual.timed_out,
         "rustnode hung for {}ms on {script}\nstdout: {}\nstderr: {}",
@@ -172,7 +180,10 @@ fn async_local_storage_survives_a_socket_read_callback() {
     // `InternalCallbackScope` restores it around the callback. Without the
     // capture the read callback runs with whatever frame the process last set,
     // which outside any `run()` is `undefined`.
-    same_output_as_node(ALS_SOCKET_SCRIPT, "in run: request-store\nin read: request-store");
+    same_output_as_node(
+        ALS_SOCKET_SCRIPT,
+        "in run: request-store\nin read: request-store",
+    );
 }
 
 #[test]
@@ -400,13 +411,16 @@ fn an_uncaught_error_that_nothing_handles_still_exits_non_zero() {
         reference.stderr
     );
 
-    let actual = run(env!("CARGO_BIN_EXE_rustnode"), script, Duration::from_secs(20));
+    let actual = run(
+        env!("CARGO_BIN_EXE_rustnode"),
+        script,
+        Duration::from_secs(20),
+    );
     assert!(
         !actual.timed_out,
         "rustnode hung instead of exiting on an unhandled uncaught exception; \
          stdout: {}\nstderr: {}",
-        actual.stdout,
-        actual.stderr
+        actual.stdout, actual.stderr
     );
     assert_eq!(
         actual.exit_code,

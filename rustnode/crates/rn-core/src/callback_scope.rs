@@ -248,26 +248,26 @@ mod tests {
         // before `async_wrap` installs is not silently dropped.
         HOOKS.with(|slot| *slot.borrow_mut() = None);
         assert!(!is_installed());
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+        let mut isolate = v8::Isolate::new(Default::default());
+        let storage = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut storage.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let args = ScopeArgs {
+            context: AsyncContext::NONE,
+            resource: None,
+            frame: None,
+        };
         let mut ran = false;
-        {
-            let platform = v8::new_default_platform(0, false).make_shared();
-            v8::V8::initialize_platform(platform);
-            v8::V8::initialize();
-            let mut isolate = v8::Isolate::new(Default::default());
-            let storage = std::pin::pin!(v8::HandleScope::new(&mut isolate));
-            let scope = &mut storage.init();
-            let context = v8::Context::new(scope, Default::default());
-            let scope = &mut v8::ContextScope::new(scope, context);
-            let args = ScopeArgs {
-                context: AsyncContext::NONE,
-                resource: None,
-                frame: None,
-            };
-            let result = with_scope(scope, args, |_| 7);
-            assert_eq!(result, Some(7));
+        let result = with_scope(scope, args, |_| {
             ran = true;
-        }
-        assert!(ran);
+            7
+        });
+        assert_eq!(result, Some(7));
+        assert!(ran, "the body must run even with no implementation");
     }
 
     #[test]

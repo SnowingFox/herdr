@@ -741,9 +741,7 @@ fn push_context(
         state.ids_stack.set_float(offset * 2, previous_execution);
         state.ids_stack.set_float(offset * 2 + 1, previous_trigger);
         state.hook_fields.set(HOOK_FIELDS[7].1, (offset + 1) as u32);
-        state
-            .id_fields
-            .set_float(UID_FIELDS[0].1, context.async_id);
+        state.id_fields.set_float(UID_FIELDS[0].1, context.async_id);
         state
             .id_fields
             .set_float(UID_FIELDS[1].1, context.trigger_async_id);
@@ -756,7 +754,7 @@ fn push_context(
 /// stack for the reason Node's comment gives: a fatal exception may already have
 /// cleared it.
 fn pop_context(scope: &mut v8::PinScope<'_, '_>, expected: f64) {
-    if !(expected > 0.0) {
+    if expected <= 0.0 {
         return;
     }
     STATE.with(|state| {
@@ -799,7 +797,11 @@ fn pop_context(scope: &mut v8::PinScope<'_, '_>, expected: f64) {
                     .unwrap_or(0)
             });
             if let Some(key) = v8::String::new(scope, "length") {
-                resources.set(scope, key.into(), v8::Integer::new_from_unsigned(scope, length).into());
+                resources.set(
+                    scope,
+                    key.into(),
+                    v8::Integer::new_from_unsigned(scope, length).into(),
+                );
             }
         }
     });
