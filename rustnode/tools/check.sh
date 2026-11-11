@@ -103,6 +103,37 @@ step "the cipher control still reports a void run as a void run"
 # the source tree modified.
 ./tools/cipher-negative-control.sh --self-test
 
+step "the mustCall control still has a verdict to report"
+# `common.mustCall` compares its call count in a `process.on('exit')` handler,
+# so on a runtime whose `exit` event never fires on a natural loop exit a file
+# that never ran its callback still exits 0. That is what let ~2850 files under
+# `test/parallel` report a pass without checking anything, and it is why the
+# suite's headline number was overstated.
+#
+# Two tiers, because the full verdict needs Node's own `test/common/index.js`,
+# which is never vendored (103 MB, tied to a revision):
+#
+#   * the self-test is tree-independent and runs here. It proves the control
+#     still fails against `/bin/true`, which is the property that makes a green
+#     control mean something. A control whose verdict path cannot report a
+#     failure is worse than no control, and this is the cheap half of the
+#     contract.
+#   * the full verdict runs only where the tree exists. It is NOT run here by
+#     default because it measures the runtime's exit behaviour, not the control:
+#     against current `master` it correctly reports three failures, and wiring
+#     that in would turn every unrelated PR red until the exit fix lands. The
+#     exit fix's own PR is what flips it.
+./tools/mustcall-negative-control.sh --self-test
+
+mustcall_tests="${RUSTNODE_TEST_CACHE:-${TMPDIR:-/tmp}}/rustnode-node-test/test"
+if [ -f "$mustcall_tests/common/index.js" ]; then
+  echo "mustcall control: a Node test tree is present at $mustcall_tests;"
+  echo "mustcall control: run ./tools/mustcall-negative-control.sh --quick --tests $mustcall_tests"
+  echo "mustcall control: for the full verdict (it fails until the exit fix lands)"
+else
+  echo "mustcall control: no Node test tree; the full verdict was not measured"
+fi
+
 if [ "$quick" -eq 0 ]; then
   step "running the workspace tests"
   cargo test --workspace

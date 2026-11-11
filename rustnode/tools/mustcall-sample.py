@@ -68,8 +68,27 @@ class Outcome:
     registrations: int = 0
     runtime_exit: int | None = None
     node_exit: int | None = None
+    node_unsatisfied: int | None = None
     error: str | None = None
     samples: list[str] = field(default_factory=list)
+
+    @property
+    def contaminated(self) -> bool:
+        """Passing here while an assertion it registered never ran.
+
+        The reference runtime, when available, is what makes this a claim
+        about *rustnode* rather than about the file: the same instrumented run
+        under `node` reports how many assertions that file leaves unsatisfied
+        on a runtime with a working exit event. A file that is also
+        unsatisfied under `node` (a parent whose child owns the assertions, a
+        platform skip) is not evidence about the exit path, so it is excluded
+        from the rate and counted separately.
+        """
+        if self.registrations == 0 or self.unsatisfied == 0:
+            return False
+        if self.node_unsatisfied is None:
+            return True
+        return self.unsatisfied > self.node_unsatisfied
 
 
 def load_passes(results_dir: Path) -> dict[str, bool]:
@@ -247,17 +266,29 @@ def main() -> int:
                 outcome.node_exit = run_once(
                     args.reference, name, workdir, node_log, args.timeout
                 )
+                _, node_unsat, _, _ = parse_log(node_log)
+                outcome.node_unsatisfied = node_unsat
             outcomes.append(outcome)
             print(
                 f"[{index}/{len(sampled)}] {name}: {regs} registrations, "
-                f"{unsat} unsatisfied, exit {outcome.runtime_exit}",
+                f"{unsat} unsatisfied (node {outcome.node_unsatisfied}), "
+                f"exit {outcome.runtime_exit}",
                 file=sys.stderr,
             )
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
     measured = [o for o in outcomes if o.registrations > 0]
-    contaminated = [o for o in measured if o.unsatisfied > 0]
+    contaminated = [o for o in measured if o.contaminated]
+    # Files that report unsatisfied assertions on *both* runtimes are not
+    # evidence about the exit path: a parent whose children own the assertions,
+    # a platform skip, or a test whose async work never completes registers an
+    # expectation that no runtime satisfies. Comparing the two counts is what
+    # separates "the exit handler did not run" from "this file always looks
+    # like this", and the rate is computed over the former only.
+    both_unsatisfied = [
+        o for o in measured if o.unsatisfied > 0 and not o.contaminated
+    ]
     low, high = wilson(len(contaminated), len(measured))
 
     summary = {
@@ -273,6 +304,10 @@ def main() -> int:
         "registrations_total": sum(o.registrations for o in measured),
         "reference": args.reference,
         "reference_failing": sum(1 for o in measured if o.node_exit not in (0, None)),
+        "excluded_unsatisfied_on_both": [
+            {"file": o.file, "unsatisfied": o.unsatisfied, "node": o.node_unsatisfied}
+            for o in both_unsatisfied
+        ],
         "outcomes": [o.__dict__ for o in outcomes],
     }
 
@@ -291,13 +326,21 @@ def main() -> int:
         print(f"unsatisfied assertions in those files: {summary['unsatisfied_total']}")
         if args.reference:
             print(f"of the same files, failing under node: {summary['reference_failing']}")
+            print(
+                f"excluded (unsatisfied on both runtimes): {len(both_unsatisfied)}"
+            )
         print()
         for o in sorted(measured, key=lambda o: (-o.unsatisfied, o.file)):
-            if o.unsatisfied:
+            if o.unsatisfied and o.contaminated:
                 print(
                     f"  {o.unsatisfied:>3} unsatisfied / {o.registrations:>3} "
-                    f"in {o.file}  ({', '.join(o.samples)})"
+                    f"(node {o.node_unsatisfied}) in {o.file}  ({', '.join(o.samples)})"
                 )
+        for o in both_unsatisfied:
+            print(
+                f"  excluded: {o.unsatisfied:>3} unsatisfied on rustnode and "
+                f"{o.node_unsatisfied} on node in {o.file}"
+            )
     return 0
 
 

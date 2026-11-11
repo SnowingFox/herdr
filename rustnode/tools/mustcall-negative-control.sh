@@ -203,20 +203,24 @@ control() {
 # a green control meaningful. It runs the same case list against a binary that
 # exits 0 for every program — `/bin/true` — and requires the control to report
 # a failure. A control that passes against `/bin/true` is measuring nothing.
+#
+# It deliberately needs no Node test tree. `/bin/true` never loads the probe, so
+# the `common/index.js` path is never read, and requiring a 103 MB checkout just
+# to prove the control can fail would keep the cheap half of the contract out of
+# the gate. That is the half that catches a verdict path which cannot report a
+# failure at all.
 self_test() {
-  if ! locate_tests; then
-    echo "SELF-TEST ABORTED: no Node test tree, so the probe cannot load mustCall." >&2
-    return 1
-  fi
   if [ ! -x /bin/true ]; then
     echo "SELF-TEST ABORTED: /bin/true is missing." >&2
     return 1
   fi
-  local saved="$binary"
+  local saved_binary="$binary" saved_tests="$tests_dir"
   binary="/bin/true"
+  tests_dir="${tests_dir:-/nonexistent}"
   local rc=0
   control >/dev/null 2>&1 || rc=$?
-  binary="$saved"
+  binary="$saved_binary"
+  tests_dir="$saved_tests"
   if [ "$rc" -eq 0 ]; then
     echo "SELF-TEST FAILED: the control passed against /bin/true, which never enforces anything." >&2
     return 1
@@ -225,16 +229,16 @@ self_test() {
   return 0
 }
 
-if ! locate_tests; then
-  echo "RESULT: NO VERDICT - no Node test tree, so mustCall cannot be measured." >&2
-  exit 3
-fi
-
 if [ "$mode" = "self-test" ]; then
   if ! self_test; then
     exit 1
   fi
   exit 0
+fi
+
+if ! locate_tests; then
+  echo "RESULT: NO VERDICT - no Node test tree, so mustCall cannot be measured." >&2
+  exit 3
 fi
 
 if [ -n "${RUSTNODE_MUSTCALL_BIN:-}" ]; then
