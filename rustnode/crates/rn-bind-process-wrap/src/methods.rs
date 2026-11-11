@@ -117,7 +117,7 @@ pub unsafe extern "C" fn after_close(handle_pointer: *mut uv::uv_handle_t) {
 
     rn_uv::callback::with_context(|scope| {
         let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
-        rn_uv::stream_base::call_onclose(scope, object);
+        rn_uv::stream_base::call_onclose_unscoped(scope, object);
     });
 
     // `HandleWrap::OnClose` releases the wrap's reference to the object once

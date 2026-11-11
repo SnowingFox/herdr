@@ -394,6 +394,7 @@ fn new(
     // state, which is the same ordering the TCP constructor uses.
     crate::handle::with_handle(object, |handle| {
         rn_bind_async_wrap::async_reset(scope, &mut handle.state.async_wrap, object, object, None);
+        handle.state.context_frame = rn_bind_async_wrap::current_context_frame(scope);
     });
     rv.set(object.into());
 }

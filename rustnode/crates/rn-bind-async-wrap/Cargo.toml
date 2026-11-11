@@ -15,6 +15,11 @@ rn-v8-sys.workspace = true
 # minted here would be a different key and every `lookupPublicResource` would
 # silently miss.
 rn-bind-symbols = { path = "../rn-bind-symbols" }
+# A callback that runs inside a scope and throws has to reach
+# `process._fatalException`. `rn-errors` is the one implementation of that
+# order in the runtime -- the event loop, the timers and the thread-safe
+# functions all route through it -- and a second copy would be free to drift.
+rn-errors = { path = "../rn-errors" }
 tracing.workspace = true
 
 [dev-dependencies]

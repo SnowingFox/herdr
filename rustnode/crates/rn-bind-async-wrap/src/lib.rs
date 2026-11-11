@@ -257,6 +257,26 @@ pub fn async_reset(
     );
 }
 
+/// `AsyncReset` for a handle whose `StreamState` this crate cannot name.
+///
+/// The frame capture in `AsyncReset` is `src/async_wrap.cc:635`'s
+/// `set_context_frame(async_context_frame::current())`. A socket needs it for
+/// `AsyncLocalStorage` to reach its callbacks, and only the binding that owns
+/// the `StreamState` can store it — `rn-uv` owns the field, and the binding
+/// already has the `&mut` borrow.
+///
+/// This is the same call as [`async_reset`] with the frame returned instead of
+/// written, so the two cannot disagree about when the capture happens: it is
+/// after the id is assigned, which is when Node captures it.
+pub fn current_context_frame(scope: &mut v8::PinScope<'_, '_>) -> Option<v8::Global<v8::Value>> {
+    let frame = scope.get_continuation_preserved_embedder_data();
+    if frame.is_undefined() {
+        None
+    } else {
+        Some(v8::Global::new(scope.as_ref(), frame))
+    }
+}
+
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
     static HOOKS: RefCell<Hooks> = const {
@@ -402,6 +422,11 @@ impl BindingModule for AsyncWrap {
         for (name, value) in values {
             set(scope, object, name, value)?;
         }
+        // The scope every native callback needs. Registered here because this is
+        // where the shared arrays exist and where `async_context_frame` has been
+        // installed; `rn-uv` asks `rn-core` for a scope and never learns that
+        // this crate answers.
+        register_callback_scope();
         Ok(object)
     }
 }
@@ -586,6 +611,291 @@ pub fn provider_name(provider: u32) -> Option<&'static str> {
         .iter()
         .find(|(_, id)| *id == provider)
         .map(|(name, _)| *name)
+}
+
+/// The `AsyncWrap` implementation of [`rn_core::callback_scope`].
+///
+/// Every method below is a fragment of `src/api/callback.cc`, cited at the
+/// method. It is registered by [`AsyncWrap::install`], so a stream read or a
+/// write completion that runs through `rn_uv` gets the same treatment a timer
+/// callback already does.
+struct ScopeHooks;
+
+impl rn_core::callback_scope::CallbackScopeHooks for ScopeHooks {
+    fn open(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        args: &rn_core::callback_scope::ScopeArgs,
+    ) -> Option<v8::Global<v8::Value>> {
+        // `async_context_frame::exchange(env, context_frame)`
+        // (`src/api/callback.cc:117`). **First**, before the context is pushed
+        // and before `before` fires: the constructor exchanges the frame at
+        // `:117`, pushes at `:124` and emits `before` at `:127`. Order matters
+        // because a `before` hook that reads `getStore()` sees the callback's own
+        // frame — hooking it up after the push but before the exchange would have
+        // the hook observe the caller's.
+        let prior = exchange_frame(scope, args.frame.as_ref());
+
+        // `async_hooks()->push_async_context(async_id, trigger_async_id, object)`
+        // (`src/api/callback.cc:124`). This is what makes `executionAsyncId()`
+        // inside the callback answer the resource's id, and it happens whether
+        // or not any hook is enabled: the id stack is state JavaScript reads
+        // directly.
+        push_context(scope, args.context, args.resource.as_ref());
+
+        // `AsyncWrap::EmitBefore` (`src/api/callback.cc:127`), guarded by the
+        // same `async_id != 0 && !skip_hooks_`.
+        if args.context.is_resource() {
+            emit_hook(scope, HOOK_FIELDS[1].1, args.context.async_id);
+        }
+
+        prior
+    }
+
+    fn close(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        args: &rn_core::callback_scope::ScopeArgs,
+        prior_frame: Option<v8::Global<v8::Value>>,
+        threw: bool,
+    ) {
+        // `if (!failed_ && async_context_.async_id != 0 && !skip_hooks_)
+        //      AsyncWrap::EmitAfter(...)` (`src/api/callback.cc:154`). Node
+        // skips `after` for a callback that threw, and the `after` the user
+        // sees is emitted from the fatal-exception path instead.
+        if !threw && args.context.is_resource() {
+            emit_hook(scope, HOOK_FIELDS[2].1, args.context.async_id);
+        }
+
+        // `env_->async_hooks()->pop_async_context(async_context_.async_id)`
+        // (`src/api/callback.cc:159`). Unconditional, exactly as Node's is: a
+        // throw must not leave the id stack deeper for the rest of the process.
+        pop_context(scope, args.context.async_id);
+
+        // `async_context_frame::set(env_, prior_context_frame_.Get(isolate))`
+        // (`src/api/callback.cc:161`). The other direction of the exchange, and
+        // it is what stops a store written inside the callback from leaking out
+        // to the next thing that runs. Also unconditional.
+        restore_frame(scope, prior_frame);
+    }
+
+    fn report_uncaught(&self, scope: &mut v8::PinScope<'_, '_>, error: v8::Local<v8::Value>) {
+        // `TriggerUncaughtException` hands the error to `process._fatalException`
+        // first and only prints when that declines. `rn_errors` is the one
+        // implementation of that order in the runtime: the event loop, the timers
+        // and the thread-safe functions all use it, and a second copy here would
+        // be free to drift.
+        rn_errors::report_uncaught_exception(scope, error);
+    }
+}
+
+/// Pushes an async context onto the shared stack.
+///
+/// `AsyncHooks::push_async_context` (`src/env.cc:133`) stores the *outgoing*
+/// pair so the matching pop restores it, then installs the incoming one.
+fn push_context(
+    scope: &mut v8::PinScope<'_, '_>,
+    context: rn_core::callback_scope::AsyncContext,
+    resource: Option<&v8::Global<v8::Object>>,
+) {
+    if !context.is_resource() {
+        return;
+    }
+    // `execution_async_resources[offset] = resource`. Only the JS-visible
+    // resource goes in this array; `executionAsyncResource()` reads it by index,
+    // so an entry that is missing reads as `undefined` rather than as the wrong
+    // resource.
+    let offset = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.hook_fields.get(HOOK_FIELDS[7].1))
+            .unwrap_or(0) as usize
+    });
+    if let Some(resource) = resource {
+        let local = v8::Local::new(scope, resource);
+        RESOURCES.with(|slot| {
+            if let Some(resources) = slot.borrow().as_ref() {
+                let resources = v8::Local::new(scope, resources);
+                resources.set_index(scope, offset as u32, local.into());
+            }
+        });
+    }
+    STATE.with(|state| {
+        let state = state.borrow();
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        let offset = state.hook_fields.get(HOOK_FIELDS[7].1).unwrap_or(0) as usize;
+        if offset * 2 >= ASYNC_IDS_STACK_LENGTH {
+            return;
+        }
+        let previous_execution = state
+            .id_fields
+            .get_float(UID_FIELDS[0].1)
+            .unwrap_or(INVALID_ASYNC_ID);
+        let previous_trigger = state
+            .id_fields
+            .get_float(UID_FIELDS[1].1)
+            .unwrap_or(INVALID_ASYNC_ID);
+        state.ids_stack.set_float(offset * 2, previous_execution);
+        state.ids_stack.set_float(offset * 2 + 1, previous_trigger);
+        state.hook_fields.set(HOOK_FIELDS[7].1, (offset + 1) as u32);
+        state.id_fields.set_float(UID_FIELDS[0].1, context.async_id);
+        state
+            .id_fields
+            .set_float(UID_FIELDS[1].1, context.trigger_async_id);
+    });
+}
+
+/// Pops the innermost async context, restoring the pair it saved.
+///
+/// `AsyncHooks::pop_async_context` (`src/env.cc:173`). Tolerant of an empty
+/// stack for the reason Node's comment gives: a fatal exception may already have
+/// cleared it.
+fn pop_context(scope: &mut v8::PinScope<'_, '_>, expected: f64) {
+    if expected <= 0.0 {
+        return;
+    }
+    STATE.with(|state| {
+        let state = state.borrow();
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        let depth = state.hook_fields.get(HOOK_FIELDS[7].1).unwrap_or(0) as usize;
+        if depth == 0 {
+            return;
+        }
+        let offset = depth - 1;
+        // `async_id_fields_[kExecutionAsyncId] = async_ids_stack_[2 * offset]`.
+        // The restore is the point of the pop: without it the next callback to
+        // run would inherit this one's id.
+        let saved_execution = state
+            .ids_stack
+            .get_float(offset * 2)
+            .unwrap_or(INVALID_ASYNC_ID);
+        let saved_trigger = state
+            .ids_stack
+            .get_float(offset * 2 + 1)
+            .unwrap_or(INVALID_ASYNC_ID);
+        state.id_fields.set_float(UID_FIELDS[0].1, saved_execution);
+        state.id_fields.set_float(UID_FIELDS[1].1, saved_trigger);
+        state.hook_fields.set(HOOK_FIELDS[7].1, offset as u32);
+    });
+    // `js_execution_async_resources()->Set(length, offset)` — the JS array's
+    // `length` is the shadow of the stack depth, and `executionAsyncResource()`
+    // reads `execution_async_resources[index]` directly, so the stale entry has
+    // to go for the same reason.
+    RESOURCES.with(|slot| {
+        if let Some(resources) = slot.borrow().as_ref() {
+            let resources = v8::Local::new(scope, resources);
+            let length = STATE.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .and_then(|state| state.hook_fields.get(HOOK_FIELDS[7].1))
+                    .unwrap_or(0)
+            });
+            if let Some(key) = v8::String::new(scope, "length") {
+                resources.set(
+                    scope,
+                    key.into(),
+                    v8::Integer::new_from_unsigned(scope, length).into(),
+                );
+            }
+        }
+    });
+}
+
+/// Calls one `async_hooks` listener kind with `async_id`.
+///
+/// `AsyncWrap::Emit` (`src/async_wrap.cc`): the counter in `async_hook_fields` is
+/// what says whether anybody is listening, so a disabled hook costs one array
+/// read. A hook that throws is fatal in Node (`emitHook`'s `catch` calls
+/// `fatalError`), which `fatal_hook_error` reproduces.
+fn emit_hook(scope: &mut v8::PinScope<'_, '_>, field: usize, async_id: f64) {
+    let enabled = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.hook_fields.get(field))
+            .unwrap_or(0)
+    });
+    if enabled == 0 {
+        return;
+    }
+    let hook = HOOKS.with(|hooks| {
+        let hooks = hooks.borrow();
+        let hook = if field == HOOK_FIELDS[1].1 {
+            hooks.before.as_ref()
+        } else {
+            hooks.after.as_ref()
+        };
+        hook.map(|hook| v8::Local::new(scope, hook))
+    });
+    let Some(hook) = hook else {
+        return;
+    };
+    let argument: v8::Local<v8::Value> = v8::Number::new(scope, async_id).into();
+    let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
+    let scope = &mut try_catch.init();
+    let _ = hook.call(scope, v8::undefined(scope).into(), &[argument]);
+    if let Some(exception) = scope.exception() {
+        // `fatalError(e)` in `lib/internal/async_hooks.js`: the JS `emitHook`
+        // catches a throwing hook and rethrows it, so the exception escapes
+        // `AsyncWrap::Emit` into `MakeCallback` and becomes the callback's own.
+        // Reporting it through the shared path is the closest honest equivalent,
+        // and it keeps the exception from being left pending on the isolate.
+        rn_errors::report_uncaught_exception(scope, exception);
+    }
+}
+
+/// Installs `frame` and returns the one it replaced, rooted.
+///
+/// `async_context_frame::exchange` (`src/async_context_frame.cc:41`) skips the
+/// set when the frame is unchanged, which is the common case and avoids a V8
+/// call per callback.
+fn exchange_frame(
+    scope: &mut v8::PinScope<'_, '_>,
+    frame: Option<&v8::Global<v8::Value>>,
+) -> Option<v8::Global<v8::Value>> {
+    let prior = scope.get_continuation_preserved_embedder_data();
+    let wanted: v8::Local<v8::Value> = match frame {
+        Some(frame) => v8::Local::new(scope, frame),
+        // An absent frame is `undefined`: `AsyncContextFrame.current()` answers
+        // `undefined` outside any `run()`, and that is what `getStore()` turns
+        // into the storage's default value.
+        None => v8::undefined(scope).into(),
+    };
+    if prior != wanted {
+        scope.set_continuation_preserved_embedder_data(wanted);
+    }
+    // `undefined` needs no root: it is not a value that can be collected, and
+    // keeping a `Global` for it would be a slot to free for no reason.
+    if prior.is_undefined() {
+        None
+    } else {
+        Some(v8::Global::new(scope.as_ref(), prior))
+    }
+}
+
+/// Puts `prior` back, the exit half of the exchange.
+fn restore_frame(scope: &mut v8::PinScope<'_, '_>, prior: Option<v8::Global<v8::Value>>) {
+    let value: v8::Local<v8::Value> = match prior {
+        Some(prior) => v8::Local::new(scope, &prior),
+        None => v8::undefined(scope).into(),
+    };
+    scope.set_continuation_preserved_embedder_data(value);
+}
+
+/// Registers the scope implementation with the kernel.
+///
+/// Called from [`AsyncWrap::install`], which is the point where the shared
+/// arrays and the frame binding both exist. Registering here rather than from
+/// the CLI is what keeps the dependency pointing one way: `rn-uv` asks
+/// `rn-core` for a scope and never learns that `async_wrap` exists.
+pub fn register_callback_scope() {
+    rn_core::callback_scope::set_hooks(std::rc::Rc::new(ScopeHooks));
 }
 
 /// `AsyncWrap::EmitAsyncInit`.

@@ -8,6 +8,7 @@ pub mod abi;
 pub mod aliased_buffer;
 pub mod async_wrap;
 pub mod binding;
+pub mod callback_scope;
 pub mod codec;
 pub mod env;
 pub mod error;

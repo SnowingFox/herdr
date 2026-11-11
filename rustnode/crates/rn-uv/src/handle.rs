@@ -110,6 +110,22 @@ pub struct StreamState {
     /// runs with no such mapping available, so the object is rooted here instead
     /// and released when the wrapper is finalised.
     pub owner_object: Option<v8::Global<v8::Object>>,
+    /// `AsyncWrap`'s `kAsyncContextFrame`, rooted.
+    ///
+    /// Node stores the frame in the handle object's internal field
+    /// (`kAsyncContextFrame`, `src/async_wrap.h:123`) and `AsyncReset` fills it
+    /// from `async_context_frame::current()` (`src/async_wrap.cc:635`). This is
+    /// that field, kept beside `owner_object` for the same reason: the callback
+    /// that needs it runs from `uv_run`, where only a Rust-side value is
+    /// guaranteed reachable.
+    ///
+    /// It is what makes `AsyncLocalStorage` propagate into a socket callback. A
+    /// callback that does not install it runs with whatever frame the last
+    /// callback left behind, which outside a `run()` is `undefined`.
+    ///
+    /// `None` is Node's empty internal field — no frame captured — which reads
+    /// as `undefined`, the same value `getStore()` reports outside any `run()`.
+    pub context_frame: Option<v8::Global<v8::Value>>,
     /// `StreamResource::listener_`, innermost first.
     ///
     /// Empty means "deliver to JavaScript", which is where Node keeps a
@@ -135,6 +151,7 @@ impl StreamState {
             bytes_written: 0,
             async_wrap: rn_core::AsyncWrapState::uninitialised(rn_core::async_wrap::PROVIDER_NONE),
             owner_object: None,
+            context_frame: None,
             listeners: Vec::new(),
         }
     }
@@ -316,13 +333,27 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
     if state.is_null() {
         return;
     }
-    let Some(owner) = ({
+    let Some((owner, context, frame)) = ({
         // SAFETY: the caller guarantees `state` is live. The borrow ends with
         // this block, before anything below can re-enter and mutate the state.
         let state = unsafe { &*state };
-        state.owner_object.clone()
+        state.owner_object.clone().map(|owner| {
+            (
+                owner,
+                rn_core::callback_scope::AsyncContext {
+                    async_id: state.async_wrap.async_id,
+                    trigger_async_id: state.async_wrap.trigger_async_id,
+                },
+                state.context_frame.clone(),
+            )
+        })
     }) else {
         return;
+    };
+    let context_args = || rn_core::callback_scope::ScopeArgs {
+        context,
+        resource: Some(owner.clone()),
+        frame: frame.clone(),
     };
 
     if status > 0 {
@@ -331,14 +362,22 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
         };
         publish_read_count(status);
         callback::with_context(|scope| {
-            let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
-            let Some(handler) = onread_of(scope, object) else {
-                return;
-            };
-            let buffer = allocation.into_array_buffer(scope);
-            let argument: v8::Local<v8::Value> = buffer.into();
-            let receiver: v8::Local<v8::Value> = object.into();
-            let _ = handler.call(&*scope, receiver, &[argument]);
+            // `CallJSOnreadMethod` ends in `wrap->MakeCallback(onread, ...)`
+            // (`src/stream_base.cc:514`), so the callback runs inside an
+            // `InternalCallbackScope` for the handle's async wrap. Without this
+            // the read callback sees no async context, no frame — which is what
+            // `AsyncLocalStorage` reports as `undefined` — and a throw from it
+            // reaches nobody.
+            let _ = rn_core::callback_scope::with_scope(scope, context_args(), |scope| {
+                let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
+                let Some(handler) = onread_of(scope, object) else {
+                    return;
+                };
+                let buffer = allocation.into_array_buffer(scope);
+                let argument: v8::Local<v8::Value> = buffer.into();
+                let receiver: v8::Local<v8::Value> = object.into();
+                let _ = handler.call(&*scope, receiver, &[argument]);
+            });
         });
         return;
     }
@@ -351,12 +390,18 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
 
     publish_read_count(status);
     callback::with_context(|scope| {
-        let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
-        let Some(handler) = onread_of(scope, object) else {
-            return;
-        };
-        let receiver: v8::Local<v8::Value> = object.into();
-        let _ = handler.call(&*scope, receiver, &[]);
+        // The EOF/error arm of `CallJSOnreadMethod`, same scope as the data arm:
+        // `onStreamRead` with no argument is what `lib/net.js` turns into
+        // `'end'`/`'error'`, and a throw from an `'end'` handler is just as
+        // uncaught as one from `'data'`.
+        let _ = rn_core::callback_scope::with_scope(scope, context_args(), |scope| {
+            let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
+            let Some(handler) = onread_of(scope, object) else {
+                return;
+            };
+            let receiver: v8::Local<v8::Value> = object.into();
+            let _ = handler.call(&*scope, receiver, &[]);
+        });
     });
 }
 
