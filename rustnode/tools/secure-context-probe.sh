@@ -108,16 +108,25 @@ wired_install() {
   cp "$cargo_toml" "$backup_toml" || return 1
 
   # The function that carries the edits, so the trap has one place to undo them.
+  # Idempotent on purpose. Until the coordinator's `install.rs` edit lands this
+  # adds the call; once it has landed the file already contains it and this is a
+  # no-op. Without the guard, running `after` on the merged tree would append a
+  # second identical call and the build would fail with a duplicate statement —
+  # the control would then report NO VERDICT on a correct tree.
   apply_wiring() {
     python3 - "$install_rs" "$cargo_toml" <<'PYEOF'
 import sys
 install_rs, cargo_toml = sys.argv[1], sys.argv[2]
+
 s = open(install_rs).read()
-needle = '        rn_bind_crypto_keys::install_classes(scope, object)?;'
-if needle not in s:
-    sys.exit("the install_classes call site is not where this script expects")
-s = s.replace(needle, needle + '\n        rn_bind_secure_context::install_classes(scope, object)?;', 1)
-open(install_rs, "w").write(s)
+call = 'rn_bind_secure_context::install_classes(scope, object)?;'
+if call not in s:
+    needle = '        rn_bind_crypto_keys::install_classes(scope, object)?;'
+    if needle not in s:
+        sys.exit("the install_classes call site is not where this script expects")
+    s = s.replace(needle, needle + '\n        ' + call, 1)
+    open(install_rs, "w").write(s)
+
 s = open(cargo_toml).read()
 if "rn-bind-secure-context" not in s:
     s = s.replace("[dependencies]", "[dependencies]\nrn-bind-secure-context = { path = \"../rn-bind-secure-context\" }", 1)
