@@ -21,6 +21,9 @@ rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 # needs libuv's own `UV_E*` name and message strings. That table is the `uv`
 # namespace's, so the two cannot disagree about how an error reads.
 rn-bind-uv = { path = "../rn-bind-uv" }
+# `bind`/`connect`/`open`/`send`/`recvStart` check the `net` scope, which the
+# process's one model answers through `rn_permission::runtime`.
+rn-permission = { path = "../rn-permission" }
 
 [dev-dependencies]
 serde_json.workspace = true

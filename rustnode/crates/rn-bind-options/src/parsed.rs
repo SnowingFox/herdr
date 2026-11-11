@@ -377,6 +377,16 @@ impl Store {
             self.values.push((name.to_string(), value));
         }
     }
+
+    /// Forces `name` to `value`, creating it if the table has no entry.
+    ///
+    /// This exists for values the runtime derives rather than parses, which
+    /// `getCLIOptionsValues` still reports: `Environment::InitializePermission`
+    /// sets `options_->allow_native_addons = false` under a bare `--permission`,
+    /// and `--addons` is how that field is published.
+    pub fn force(&mut self, name: &str, value: ParsedValue) {
+        self.set(name, value);
+    }
 }
 
 /// Replaces `_` with `-` after the leading dashes, as `Parse` does.

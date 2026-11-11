@@ -19,6 +19,9 @@ v8.workspace = true
 # the process loop — the same arrangement `rn-uv`'s keepalive handle uses.
 libuv-sys2.workspace = true
 rn-uv.workspace = true
+# `Agent::StartIoThread` checks the `inspector` scope before it starts the
+# endpoint, so `inspector.open()` under `--permission` is denied unless granted.
+rn-permission = { path = "../rn-permission" }
 libc.workspace = true
 tracing.workspace = true
 serde_json.workspace = true

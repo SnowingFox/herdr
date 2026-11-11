@@ -326,6 +326,34 @@ pub fn get_write_queue_size(
     rv.set(v8::Integer::new_from_unsigned(scope, size).into());
 }
 
+/// The `net` permission check a `PipeWrap` entry point makes.
+///
+/// Returns `true` when the caller must return without doing anything else.
+/// `resource` is only read when the model is installed and enforcing, so a run
+/// without `--permission` pays one thread-local borrow and one boolean load.
+fn deny_net(
+    scope: &mut v8::PinScope<'_, '_>,
+    resource: &str,
+    throw: bool,
+    rv: &mut v8::ReturnValue<'_>,
+) -> bool {
+    match rn_permission::runtime::deny_net(resource) {
+        // `THROW_IF_INSUFFICIENT_PERMISSIONS` throws for `bind`, `listen`,
+        // `fchmod` and `open`.
+        Some(denied) if throw => {
+            denied.throw(scope);
+            true
+        }
+        // `ERR_ACCESS_DENIED_IF_INSUFFICIENT_PERMISSIONS` hands the error back
+        // to `lib/net.js`, which builds its `ExceptionWithHostPort` from it.
+        Some(denied) => {
+            rv.set(denied.to_value(scope));
+            true
+        }
+        None => false,
+    }
+}
+
 /// `PipeWrap::Bind`: `bind(path)`.
 ///
 /// Uses `uv_pipe_bind2` with `UV_PIPE_NO_TRUNCATE`, as Node does, so a path too
@@ -339,6 +367,12 @@ pub fn bind(
         rv.set(v8::Integer::new(scope, EINVAL).into());
         return;
     };
+    // `PipeWrap::Bind` names the socket path, which is the one gated resource a
+    // pipe has. Checked before the bind so a denial cannot leave the socket file
+    // behind on disk.
+    if deny_net(scope, &path, true, &mut rv) {
+        return;
+    }
     // A path may legitimately start with `\0` (the Linux abstract namespace), so
     // this must not go through `CString`: the length is passed explicitly.
     let bytes = path.as_bytes();
@@ -370,6 +404,11 @@ pub fn listen(
 ) {
     let object = args.this();
     let backlog = arg_i32(scope, &args, 0);
+    // Before the handle is registered with the loop or `owner_object` is parked,
+    // so a denied listen leaves the handle exactly as it was.
+    if deny_net(scope, "", true, &mut rv) {
+        return;
+    }
     let status = pipe::with_handle(object, |handle| {
         if !handle.state.is_alive() {
             return EINVAL;
@@ -481,6 +520,13 @@ pub fn connect(
         return;
     };
 
+    // `ERR_ACCESS_DENIED_IF_INSUFFICIENT_PERMISSIONS` names the socket path and
+    // reports the denial as the return value, for the same reason the TCP
+    // connect does.
+    if deny_net(scope, &path, false, &mut rv) {
+        return;
+    }
+
     let status = pipe::with_handle(object, |handle| {
         if !handle.state.is_alive() {
             return EBADF;
@@ -492,6 +538,10 @@ pub fn connect(
 }
 
 /// `PipeWrap::Open`: adopt an existing descriptor.
+///
+/// Like `tcp_wrap`'s `open`, the standard streams and the IPC channel are exempt:
+/// `lib/internal/child_process.js` opens the channel's `Pipe` by descriptor, so
+/// requiring `--allow-net` there would break every fork under `--permission`.
 pub fn open(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -500,6 +550,11 @@ pub fn open(
     let Some(fd) = args.get(0).integer_value(scope) else {
         return;
     };
+    if !rn_permission::runtime::is_process_stdio_or_ipc_channel(fd as i32)
+        && deny_net(scope, "", true, &mut rv)
+    {
+        return;
+    }
     let status = pipe::with_handle(args.this(), |handle| {
         if !handle.state.is_alive() {
             return EBADF;
@@ -520,6 +575,11 @@ pub fn fchmod(
     let Some(mode) = args.get(0).int32_value(scope) else {
         return;
     };
+    // `PipeWrap::Fchmod` gates the mode change, which is a property of the socket
+    // file a bind created.
+    if deny_net(scope, "", true, &mut rv) {
+        return;
+    }
     let status = pipe::with_handle(args.this(), |handle| {
         if !handle.state.is_alive() {
             return EBADF;

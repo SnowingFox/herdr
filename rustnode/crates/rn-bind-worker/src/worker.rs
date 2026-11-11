@@ -137,6 +137,17 @@ fn worker_constructor(
         return;
     }
 
+    // `THROW_IF_INSUFFICIENT_PERMISSIONS(env, kWorkerThreads, "")` is the first
+    // thing `Worker::New` does — before it even reads `is_internal` — so it gates
+    // *every* worker, including the internal ones Node creates for itself. That
+    // ordering is deliberate: a "internal workers are exempt" shortcut here would
+    // make `new Worker()` succeed under `--permission` for anything able to pass
+    // the internal flag.
+    if let Some(denied) = rn_permission::runtime::check_worker(scope) {
+        denied.throw(scope);
+        return;
+    }
+
     let first = args.get(0);
     let eval = first.is_null();
     let filename = if first.is_null() || first.is_undefined() {

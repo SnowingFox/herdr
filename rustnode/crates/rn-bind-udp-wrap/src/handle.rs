@@ -57,6 +57,16 @@ pub struct UdpHandle {
     /// pointer is what makes an abandoned buffer free itself when the handle is
     /// closed.
     pub pending_allocation: Option<rn_uv::handle::Allocation>,
+    /// `UDPWrap::net_permission_granted_`: whether this handle has already been
+    /// allowed onto the network, so `recvStart` does not re-check it on every
+    /// call.
+    ///
+    /// Set by a successful `bind`, `connect` or `open`, exactly as
+    /// `src/udp_wrap.cc` sets it, and by the first `recvStart` that passes the
+    /// check. A handle that was granted a socket this way keeps receiving after
+    /// `process.permission.drop('net')`, which is Node's behaviour: the drop
+    /// stops the next socket, not the one already bound.
+    pub net_permission_granted: bool,
     /// The finalizer registration, parked here so it lives as long as the
     /// handle.
     pub weak: Option<v8::Weak<v8::Object>>,
@@ -83,6 +93,7 @@ impl UdpHandle {
             owner_object: None,
             async_id: crate::next_async_id(),
             pending_allocation: None,
+            net_permission_granted: false,
             weak: None,
         }))
     }

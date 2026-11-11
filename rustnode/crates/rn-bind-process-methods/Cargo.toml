@@ -22,4 +22,13 @@ rn-napi = { path = "../rn-napi" }
 # runtime's exit sequence frees the state a running job is still using, so the
 # drain has to happen here rather than in a destructor.
 rn-uv.workspace = true
+# `DLOpenImpl` first asks whether the process allows native addons at all
+# (`--no-addons`, or `--permission` without `--allow-addons`), and that answer is
+# the `--addons` option value. Reading it from the option store keeps one
+# interpretation of the flag rather than a second parser here.
+rn-bind-options = { path = "../rn-bind-options" }
+# The other half of that answer comes from the model: `InitializePermission`
+# clears `allow_native_addons` when a bare `--permission` did not grant `addon`,
+# so the check has to ask the same model the `dlopen` scope check uses.
+rn-permission = { path = "../rn-permission" }
 libc.workspace = true

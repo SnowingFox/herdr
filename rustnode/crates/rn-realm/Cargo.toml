@@ -23,6 +23,9 @@ rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 rn-bind-zlib = { path = "../rn-bind-zlib" }
 rn-js2c = { path = "../rn-js2c" }
 rn-napi = { path = "../rn-napi" }
+# `getLinkedBinding` checks the `addon` scope against the module name before it
+# reports the binding missing, which is the order `src/node_binding.cc` uses.
+rn-permission = { path = "../rn-permission" }
 rn-uv = { path = "../rn-uv" }
 rn-v8-sys = { path = "../rn-v8-sys" }
 v8.workspace = true

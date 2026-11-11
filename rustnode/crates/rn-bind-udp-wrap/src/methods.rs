@@ -24,7 +24,43 @@ use rn_uv::handle::{Allocation, HandleState};
 
 use crate::handle::{self as udp, UdpHandle};
 use crate::send;
-use crate::{EBADF, EINVAL};
+use crate::{EACCES, EBADF, EINVAL};
+
+/// The `net` permission check a `UDPWrap` entry point makes.
+///
+/// `src/udp_wrap.cc` has three shapes and they differ in how they report:
+///
+/// * `DoBind` uses `ERR_ACCESS_DENIED_IF_INSUFFICIENT_PERMISSIONS`, so the error
+///   object is the *return value* and `lib/dgram.js` wraps it in an
+///   `ExceptionWithHostPort`;
+/// * `DoConnect`, `Open` and `DoSend` use `THROW_IF_INSUFFICIENT_PERMISSIONS`
+///   with `args.GetReturnValue().Set(UV_EACCES)` as the variadic tail, so the
+///   error is thrown and `UV_EACCES` is what a caller that catches it sees
+///   returned;
+/// * `RecvStart` throws `UV_EACCES` too, but only once per handle, because a
+///   socket that was already allowed to bind must not be re-checked on every
+///   `recvStart`.
+///
+/// `resource` is the address for `bind` and empty everywhere else.
+pub(crate) fn deny_net(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_>,
+    resource: &str,
+    throw: bool,
+) -> bool {
+    match rn_permission::runtime::deny_net(resource) {
+        Some(denied) if throw => {
+            denied.throw(scope);
+            rv.set(v8::Integer::new(scope, EACCES).into());
+            true
+        }
+        Some(denied) => {
+            rv.set(denied.to_value(scope));
+            true
+        }
+        None => false,
+    }
+}
 
 /// `HandleWrap::Close`.
 pub fn close(
@@ -201,6 +237,11 @@ pub fn get_fd(
 }
 
 /// `UDPWrap::Open`: adopt an existing descriptor.
+///
+/// `UDPWrap::Open` throws and returns `UV_EACCES`, and unlike the stream handles
+/// it has no standard-stream or IPC exemption: Node checks it unconditionally,
+/// which is why `dgram.createSocket({ fd })` is denied even for fd 0-2 in
+/// `test-permission-net-udp-handle.js`.
 pub fn open(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -210,12 +251,19 @@ pub fn open(
         rv.set(v8::Integer::new(scope, EINVAL).into());
         return;
     };
+    if deny_net(scope, &mut rv, "", true) {
+        return;
+    }
     let status = udp::with_handle(args.this(), |handle| {
         if !handle.is_alive() {
             return EBADF;
         }
         // SAFETY: the handle is live and `fd` is the caller's descriptor.
-        unsafe { uv::uv_udp_open(handle.raw(), fd as uv::uv_os_sock_t) }
+        let status = unsafe { uv::uv_udp_open(handle.raw(), fd as uv::uv_os_sock_t) };
+        if status == 0 {
+            handle.net_permission_granted = true;
+        }
+        status
     })
     .unwrap_or(EBADF);
     rv.set(v8::Integer::new(scope, status).into());
@@ -249,6 +297,11 @@ fn bind_family(
         rv.set(v8::Integer::new(scope, EINVAL).into());
         return;
     };
+    // `DoBind` checks after it has read the address and before it reads the port
+    // and flags, and it names the address in the denial.
+    if deny_net(scope, rv, &address, false) {
+        return;
+    }
     let port = args.get(1).uint32_value(scope).unwrap_or(0) as u16;
     let flags = args.get(2).uint32_value(scope).unwrap_or(0);
 
@@ -269,7 +322,12 @@ fn bind_family(
         // outlives the call.
         let raw = handle.raw();
 
-        unsafe { uv::uv_udp_bind(raw, ptr::from_ref(&storage).cast::<uv::sockaddr>(), flags) }
+        let status =
+            unsafe { uv::uv_udp_bind(raw, ptr::from_ref(&storage).cast::<uv::sockaddr>(), flags) };
+        if status == 0 {
+            handle.net_permission_granted = true;
+        }
+        status
     })
     .unwrap_or(EBADF);
     rv.set(v8::Integer::new(scope, status).into());
@@ -299,6 +357,11 @@ fn connect_family(
     rv: &mut v8::ReturnValue<'_>,
     family: u8,
 ) {
+    // `DoConnect` checks the permission before it reads either argument, because
+    // it gates on the socket rather than on a resource.
+    if deny_net(scope, rv, "", true) {
+        return;
+    }
     let Some(address) = crate::arg_string(scope, args, 0) else {
         rv.set(v8::Integer::new(scope, EINVAL).into());
         return;
@@ -319,7 +382,13 @@ fn connect_family(
             return EBADF;
         }
         // SAFETY: the handle is live and `storage` holds a parsed address.
-        unsafe { uv::uv_udp_connect(handle.raw(), ptr::from_ref(&storage).cast::<uv::sockaddr>()) }
+        let status = unsafe {
+            uv::uv_udp_connect(handle.raw(), ptr::from_ref(&storage).cast::<uv::sockaddr>())
+        };
+        if status == 0 {
+            handle.net_permission_granted = true;
+        }
+        status
     })
     .unwrap_or(EBADF);
     rv.set(v8::Integer::new(scope, status).into());
@@ -822,6 +891,18 @@ pub fn recv_start(
     let status = udp::with_handle(args.this(), |handle| {
         if !handle.is_alive() {
             return EBADF;
+        }
+        // `UDPWrap::RecvStart` gates the first receive on a handle that was not
+        // already let onto the network by a bind/connect/open. It is checked here
+        // rather than in the caller so the check sees the handle's own flag, and
+        // `net_permission_granted_ = true` afterwards rather than before means a
+        // denied start leaves the flag unset.
+        if !handle.net_permission_granted {
+            if let Some(denied) = rn_permission::runtime::deny_net("") {
+                denied.throw(scope);
+                return EACCES;
+            }
+            handle.net_permission_granted = true;
         }
         // SAFETY: the handle is live, and both callbacks read the owner through
         // `data`, which the constructor stored.

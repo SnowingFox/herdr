@@ -40,6 +40,42 @@ thread_local! {
     static ADDONS: RefCell<Vec<LoadedAddon>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Whether this process may load native addons at all.
+///
+/// `Environment::no_native_addons()` is `!options_->allow_native_addons`, and
+/// `Environment::InitializePermission` clears that option under a bare
+/// `--permission` when `--allow-addons` was not given — deliberately not in
+/// audit mode, where the denial has to come from the permission check instead so
+/// it can be published.
+///
+/// rustnode models the same derivation here because the option the CLI publishes
+/// is only the user's `--addons`/`--no-addons` flag. The second half of the rule
+/// is this function's own: a permission model that enforces `addon` and did not
+/// grant it means Node would have cleared `allow_native_addons`.
+fn native_addons_allowed() -> bool {
+    let Some(value) = rn_bind_options::parsed::value_of("--addons") else {
+        // No option store installed: a test binary or a bare binding harness.
+        // Node's default is `true`, and inventing `false` here would make every
+        // embedder that never parsed a command line unable to load addons.
+        return true;
+    };
+    let allowed = match value {
+        rn_bind_options::parsed::ParsedValue::Bool(flag) => flag,
+        // A non-boolean here means the table changed shape. Defaulting to the
+        // permissive answer keeps an embedder working; the alternative would
+        // silently disable every addon.
+        _ => true,
+    };
+    if !allowed {
+        return false;
+    }
+    // `InitializePermission` clears it when the model enforces `addon` and the
+    // process is not in audit mode. Asking the model rather than re-reading
+    // `--allow-addons` means a `process.permission.drop('addon')` revokes the
+    // loader as well, which is what `test-permission-drop-addons.js` asserts.
+    !rn_permission::runtime::enforces_addon_without_grant()
+}
+
 /// The `process.dlopen(module, filename[, flags])` binding.
 ///
 /// Node's signature is `(module, filename)` with an optional integer `flags`. The
@@ -117,6 +153,29 @@ pub(crate) fn dlopen(
     };
     let filename = filename.to_rust_string_lossy(scope);
     let path = Path::new(&filename);
+
+    // `DLOpenImpl` throws `ERR_DLOPEN_DISABLED` when the environment has native
+    // addons switched off and only then checks the permission scope, so the
+    // order decides which error `test-permission-audit-addons-does-not-deny.js`
+    // sees: a bare `--permission` turns addons off (`allow_native_addons =
+    // false`), producing `ERR_DLOPEN_DISABLED`, while `--permission-audit`
+    // deliberately leaves them on so the denial can be published instead.
+    //
+    // Both checks run before `rn_napi::load`, which is what makes "before any
+    // `dlopen(3)`" true: nothing below this point maps the file.
+    if !native_addons_allowed() {
+        throw_code(
+            scope,
+            "ERR_DLOPEN_DISABLED",
+            "Cannot load native addon because loading addons is disabled.",
+            false,
+        );
+        return;
+    }
+    if let Some(denied) = rn_permission::runtime::check_addon(scope, "") {
+        denied.throw(scope);
+        return;
+    }
 
     // SAFETY: `scope` is the callback scope V8 established for this call, and the
     // addon's exported values go straight into `module.exports`, which outlives the

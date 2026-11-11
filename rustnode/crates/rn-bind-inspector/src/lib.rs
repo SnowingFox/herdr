@@ -513,6 +513,15 @@ fn open_callback(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_>,
 ) {
+    // `Agent::StartIoThread` is where `src/inspector_agent.cc` checks the
+    // `inspector` scope, and it is reached by `inspector.open()`. The resource in
+    // Node's call is a label for the internal entry point (`"StartIoThread"`),
+    // not something user code passes, so it is reported as such here rather than
+    // being taken from the port or host.
+    if let Some(denied) = rn_permission::runtime::check_inspector(scope, "StartIoThread") {
+        denied.throw(scope);
+        return;
+    }
     if SERVER.with(|slot| slot.borrow().is_some()) {
         throw_error(scope, "Inspector is already activated");
         return;

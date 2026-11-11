@@ -222,11 +222,27 @@ impl FsScope {
 }
 
 /// How a boolean scope behaves, mirroring `boolean_permission.h`.
+///
+/// The C++ stores a single `flag_` whose *meaning* differs per kind, so the
+/// methods below are not symmetric:
+///
+/// ```text
+/// DenyOnly:      Apply -> flag_ = true,  Drop -> flag_ = true,  granted = !flag_
+/// AllowRevoke:   Apply -> flag_ = true,  Drop -> flag_ = false, granted =  flag_
+/// ```
+///
+/// For `DenyOnlyPermission` that means `flag_` is "denied": a scope is granted
+/// only while nothing has touched it, and both `Apply` and `Drop` leave it
+/// denied for good. That is what the header's own comment describes — "once
+/// denied, the permission cannot be re-granted" — and it is why
+/// `--allow-child-process` followed by `process.permission.drop('child')` has to
+/// deny the spawn rather than keep allowing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BooleanKind {
-    /// `DenyOnlyPermission`: once granted a scope can never be dropped.
+    /// `DenyOnlyPermission`: `Apply` and `Drop` both deny, permanently.
     DenyOnly,
-    /// `AllowRevokePermission`: `Apply` grants, `Drop` revokes.
+    /// `AllowRevokePermission`: `Apply` grants, `Drop` revokes, `Apply` again
+    /// grants again.
     AllowRevoke,
 }
 
@@ -234,6 +250,9 @@ enum BooleanKind {
 struct BooleanScope {
     kind: BooleanKind,
     granted: bool,
+    /// For [`BooleanKind::DenyOnly`]: whether something has denied the scope, so
+    /// a later `Apply` cannot grant it again.
+    irrevocably_denied: bool,
 }
 
 impl BooleanScope {
@@ -241,18 +260,25 @@ impl BooleanScope {
         Self {
             kind,
             granted: false,
+            irrevocably_denied: false,
         }
     }
 
     fn grant(&mut self) {
+        // `Apply` on a `DenyOnlyPermission` sets the same `flag_` that `Drop`
+        // does, so a scope that has been denied stays denied.
+        if self.kind == BooleanKind::DenyOnly && self.irrevocably_denied {
+            return;
+        }
         self.granted = true;
     }
 
-    /// `Drop` on a `DenyOnlyPermission` is a no-op, which is what makes
-    /// `--allow-child-process` and friends irrevocable.
+    /// `Drop` on a `DenyOnlyPermission` denies the scope for good; on an
+    /// `AllowRevokePermission` it only revokes the current grant.
     fn drop_all(&mut self) {
-        if self.kind == BooleanKind::AllowRevoke {
-            self.granted = false;
+        self.granted = false;
+        if self.kind == BooleanKind::DenyOnly {
+            self.irrevocably_denied = true;
         }
     }
 
@@ -883,6 +909,15 @@ impl PermissionModel {
         self.check_boolean(PermissionScope::Inspector, "")
     }
 
+    /// [`Self::check_inspector`] with the resource Node names.
+    ///
+    /// `inspector_agent.cc` passes its own entry-point name (`"StartIoThread"`,
+    /// `"WaitForConnect"`) rather than a user-supplied string, so the denial's
+    /// `resource` identifies where the inspector was reached from.
+    pub fn check_inspector_named(&self, resource: &str) -> Result<(), AccessDenied> {
+        self.check_boolean(PermissionScope::Inspector, resource)
+    }
+
     /// Checks opening a network server or socket.
     pub fn check_net(&self, resource: &str) -> Result<(), AccessDenied> {
         self.check_boolean(PermissionScope::Net, resource)
@@ -1246,7 +1281,12 @@ mod tests {
     }
 
     #[test]
-    fn deny_only_scopes_cannot_be_dropped() {
+    fn dropping_a_deny_only_scope_denies_it_for_good() {
+        // `BooleanPermission<true>::Drop` sets the same `flag_` that `Apply`
+        // does, and `is_granted` returns `!flag_`, so a drop revokes the grant
+        // and a later apply cannot restore it. That is what
+        // `test-permission-drop-child-process.js` and
+        // `test-permission-drop-addons.js` assert.
         let model = PermissionModel::with_cwd(
             cwd(),
             PermissionConfig {
@@ -1255,12 +1295,21 @@ mod tests {
                 ..PermissionConfig::enforce()
             },
         );
-        model.drop_permission(PermissionScope::ChildProcess, "");
         assert!(model.check_child_process().is_ok());
-        // `net` is an allow-revoke scope, so it does go away.
+        model.drop_permission(PermissionScope::ChildProcess, "");
+        assert!(!model.has(PermissionScope::ChildProcess, None));
+        assert!(model.check_child_process().is_err());
+        // Re-applying cannot grant it again, which is the "deny only" half.
+        model.grant_fs(PermissionScope::ChildProcess, "");
+        assert!(model.check_child_process().is_err());
+
+        // `net` is an allow-revoke scope: it goes away, and a re-apply grants it
+        // again.
         model.drop_permission(PermissionScope::Net, "");
         assert!(!model.has(PermissionScope::Net, None));
         assert!(model.check_net("example.com").is_err());
+        model.grant_fs(PermissionScope::Net, "");
+        assert!(model.check_net("example.com").is_ok());
     }
 
     #[test]

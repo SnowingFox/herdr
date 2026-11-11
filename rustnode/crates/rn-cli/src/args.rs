@@ -251,23 +251,33 @@ const PERMISSION_BOOLEAN_GRANTS: &[&str] = &[
 /// * `--allow-natives-syntax` — forwarded to V8, so `%DebugPrint` and the other
 ///   natives intrinsics parse instead of throwing `SyntaxError`.
 ///
-/// `--permission` was the fourth. It is still here, and the reason is worth
-/// stating precisely, because most of the model now works: `fs.read`,
-/// `fs.write`, `child` and `env` are enforced, but `net` is not — `tcp_wrap`,
-/// `udp_wrap` and `pipe_wrap` have no `kNet` check yet, so
-/// `server.listen()` succeeds under `--permission`. A process that believes it
-/// has denied the network but has not is the exact failure this list exists to
-/// prevent, so the flag keeps its warning until that lands. `worker`, `addon`,
-/// `wasi`, `inspector`, `ffi` and `openssl.store` are unenforced too, but for a
-/// different reason: this build has no `Worker` constructor, addon loader, WASI
-/// implementation, inspector or FFI surface to gate at all.
+/// `--permission` was the fourth, and it has now left the list too. Every scope
+/// that is enforced is listed in `crates/rn-permission`'s module documentation;
+/// the ones that are not, and the reason each cannot be, are:
+///
+/// * `wasi` — rustnode has no `internalBinding('wasi')`, so `new WASI()` already
+///   throws "the namespace has no Rust implementation yet". A permission check
+///   in front of that would report the wrong cause.
+/// * `ffi` — no `node:ffi` surface either; `require('node:ffi')` fails on the
+///   missing binding for the same reason.
+/// * `openssl.store` — the crypto layer has no STORE-loader path to gate.
+///
+/// The three above are all "no surface exists", so the warning would name a
+/// permission gap where the real gap is a missing feature.
+///
+/// `worker`, `inspector`, `net`, `addon`, `fs` and `child` *are* enforced, so
+/// none of them belongs here. `worker` became enforceable with the
+/// worker_threads landing; `inspector.open()` checks `inspector`.
+///
+/// `--permission` itself is deliberately absent: the warning is what told a user
+/// the model was not enforced, and for the scopes above the honest signal is the
+/// missing-feature error, not a permission one.
 const UNIMPLEMENTED: &[&str] = &[
     "--experimental-network-inspection",
     "--experimental-shadow-realm",
     "--experimental-vm-modules",
     "--experimental-web-worker",
     "--js-source-phase-imports",
-    "--permission",
 ];
 
 /// Experimental flags whose behaviour *is* implemented.
@@ -455,6 +465,19 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
     // both. The flags only — never the script path or its arguments, which
     // Node's parser stops at too.
     options.parsed = rn_bind_options::Store::parse(&options.exec_argv);
+    // `Environment::InitializePermission` clears `allow_native_addons` when
+    // `--permission` (not `--permission-audit`) was given without
+    // `--allow-addons`, which is what makes `process.dlopen` throw
+    // `ERR_DLOPEN_DISABLED` before the permission check runs. The flag is
+    // published as `--addons`, so the derived value goes into the same store
+    // `getOptionValue('--addons')` reads. Audit mode deliberately keeps addons
+    // enabled so the `addon` check can publish the denial instead.
+    if config_wants_addons_disabled(&options.exec_argv) {
+        options.parsed.force(
+            "--addons",
+            rn_bind_options::parsed::ParsedValue::Bool(false),
+        );
+    }
     // The permission model is the one thing this parser builds rather than
     // describes: `PermissionConfig::from_args` already reads these flags in both
     // spellings and owns the 68 tests that pin its grammar, so routing through
@@ -485,6 +508,34 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
         config,
     ));
     options
+}
+
+/// Whether `--permission` was given without `--allow-addons` and without audit
+/// mode, which is the case `Environment::InitializePermission` turns native
+/// addons off for.
+///
+/// `--permission-audit` is the exception: it leaves `allow_native_addons` alone so
+/// the `addon` scope check, not a disabled loader, produces the denial — and that
+/// denial is what gets published to `node:permission-model:addon`.
+fn config_wants_addons_disabled(argv: &[String]) -> bool {
+    let mut enforcing = false;
+    let mut audit = false;
+    let mut allow_addons = false;
+    for argument in argv {
+        match argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(name, _)| name)
+        {
+            "--permission" => enforcing = true,
+            "--permission-audit" => {
+                enforcing = true;
+                audit = true;
+            }
+            "--allow-addons" => allow_addons = true,
+            _ => {}
+        }
+    }
+    enforcing && !audit && !allow_addons
 }
 
 /// The working directory the permission model resolves relative grants against.
@@ -634,19 +685,26 @@ mod tests {
 
     #[test]
     fn permission_grants_are_not_reported_unimplemented() {
-        // `net` is the one scope this build cannot enforce yet, so
-        // `--permission` itself keeps its warning; the grants must not add any.
+        // Every scope this build has a surface for is now enforced, so
+        // `--permission` and its grants must all leave the list empty. A grant
+        // in it would be a warning that is no longer true.
         let options = parse_of(&[
             "--permission",
             "--allow-fs-read=/tmp",
             "--allow-fs-write=/tmp",
             "--allow-child-process",
             "--allow-env=A",
+            "--allow-net",
+            "--allow-addons",
             "-e",
             "1",
         ])
         .expect("parses");
-        assert_eq!(options.unimplemented, ["--permission"]);
+        assert!(
+            options.unimplemented.is_empty(),
+            "{:?}",
+            options.unimplemented
+        );
     }
 
     #[test]

@@ -20,6 +20,9 @@ rn-bind-options = { path = "../rn-bind-options" }
 # The check phase is where a worker's exit is reported, and its handle lives
 # there. The hook is additive so neither crate has to know the other.
 rn-bind-timers = { path = "../rn-bind-timers" }
+# `Worker::New` checks the `worker` scope before it reads any argument, so
+# creating a worker under `--permission` is denied unless it was granted.
+rn-permission = { path = "../rn-permission" }
 rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
 rn-module-wrap = { path = "../rn-module-wrap" }
 rn-uv = { path = "../rn-uv" }

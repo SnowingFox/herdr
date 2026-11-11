@@ -17,6 +17,9 @@ rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 rn-uv.workspace = true
 rn-v8-sys.workspace = true
 tracing.workspace = true
+# `bind`/`listen`/`connect`/`open`/`fchmod` check the `net` scope, which the
+# process's one model answers through `rn_permission::runtime`.
+rn-permission = { path = "../rn-permission" }
 
 [dev-dependencies]
 serde_json.workspace = true
