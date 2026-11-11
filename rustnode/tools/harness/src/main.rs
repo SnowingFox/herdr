@@ -240,12 +240,12 @@ fn run_command(args: &[String]) -> Result<u8, String> {
     let mut announce = |result: &result::FileResult| {
         done += 1;
         if !quiet {
-            let status = if result.passed {
-                "pass"
-            } else if result.timed_out {
-                "timeout"
-            } else {
-                "fail"
+            let status = match result.outcome() {
+                result::Outcome::Passed => "pass",
+                result::Outcome::Skipped => "skip",
+                result::Outcome::Failed if result.is_misreported_pass() => "fail*",
+                result::Outcome::Failed if result.timed_out => "timeout",
+                result::Outcome::Failed => "fail",
             };
             println!(
                 "  [{done}/{}] {status:<7} {:>6}ms {}",
@@ -260,17 +260,48 @@ fn run_command(args: &[String]) -> Result<u8, String> {
     let run_id = runner::run_id();
     let file_name = runner::result_file_name(&run_id, label.as_deref());
     let written = runner::write_results(&results, &file_name, &results_vec)?;
-    let passed_total = results_vec.iter().filter(|r| r.passed).count();
+    let passed_total = results_vec
+        .iter()
+        .filter(|r| r.outcome() == result::Outcome::Passed)
+        .count();
+    let skipped_total = results_vec
+        .iter()
+        .filter(|r| r.outcome() == result::Outcome::Skipped)
+        .count();
+    // Count failures directly rather than by subtraction: the three outcomes are
+    // disjoint by construction, but a subtraction would silently underflow into a
+    // huge `usize` if that ever stopped holding.
+    let failed_total = results_vec
+        .iter()
+        .filter(|r| r.outcome() == result::Outcome::Failed)
+        .count();
+    let misreported_total = results_vec
+        .iter()
+        .filter(|r| r.is_misreported_pass())
+        .count();
+    let judged = passed_total + failed_total;
     let total = results_vec.len();
+    debug_assert_eq!(
+        passed_total + skipped_total + failed_total,
+        total,
+        "every row must land in exactly one outcome"
+    );
 
+    // A skip is neither a pass nor a failure, so the headline rate is passes
+    // over files that actually ran, and the skipped count is printed next to it
+    // rather than folded into either side. `fail*` rows are failures the runtime
+    // reported as successes; they are already inside `failed`.
     println!(
-        "{passed_total}/{total} passed ({:.1}%)",
-        if total == 0 {
+        "{passed_total}/{judged} judged passed ({:.1}%); {skipped_total} skipped; {failed_total} failed ({misreported_total} exit 0 with failing output); {total} total",
+        if judged == 0 {
             0.0
         } else {
-            passed_total as f64 / total as f64 * 100.0
+            passed_total as f64 / judged as f64 * 100.0
         }
     );
+    if misreported_total > 0 {
+        println!("fail* marks a file whose own output reported a failing test while it exited 0");
+    }
     println!("results written to {}", written.display());
     println!("run `rn-harness report` for the per-subsystem breakdown");
 

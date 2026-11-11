@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::result::{suite_of, FileResult};
+use crate::result::{suite_of, FileResult, MarkerScanner, ScanResult};
 use crate::select::{TestFile, PARALLEL_SAFE_SUITES};
 
 /// Bytes of stderr kept per test, enough to show the first failing assertion.
@@ -259,16 +259,32 @@ fn execute(
         }
     }
 
-    let (stdout_head, stderr_head) = collect_output(pipe_receiver);
+    let (stdout_head, stderr_head, scan) = collect_output(pipe_receiver);
     let mut stderr_head = String::from_utf8_lossy(&stderr_head).trim_end().to_string();
     if timed_out && stderr_head.is_empty() {
         stderr_head = format!("timed out after {:?}", config.timeout);
     }
 
+    // A killed process never got to state its own verdict, so a skip line it
+    // printed before the timeout does not excuse the hang.
+    //
+    // Two skip forms: the `common.skip()` plan line, and a `node:test` file whose
+    // every mark was a skip. The second is decided by the whole scan, not by the
+    // plan line, so it has to be computed here while the full stream is still in
+    // hand — `stdout_head` may have been truncated before the marks appeared.
+    let skipped = !timed_out && (scan.skipped || scan.only_skipped_tests());
+    // A failure marker only matters when the process claimed success: a non-zero
+    // exit is already recorded as failed, so the marker adds nothing there.
+    let exited_zero = exit_code == Some(0);
+    let passed = !timed_out && !skipped && exited_zero;
+    let misreported = scan.reported_failure && passed;
+
     FileResult {
         file: test.relative.clone(),
         suite: suite_of(&test.relative),
-        passed: !timed_out && exit_code == Some(0),
+        passed,
+        skipped: Some(skipped),
+        misreported: Some(misreported),
         exit_code,
         duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         timed_out,
@@ -286,19 +302,28 @@ enum Stream {
 }
 
 /// Starts a reader thread that forwards one pipe's first `cap` bytes.
+///
+/// The reader also keeps reading past `cap`: stdout is scanned for both markers
+/// over the whole stream, because `stdout_head` keeps only the first couple of
+/// KiB and a marker may be printed after that. Discarding the rest without
+/// looking would make a long-running test's verdict invisible.
 fn spawn_drain(
     mut pipe: impl Read + Send + 'static,
     cap: usize,
     stream: Stream,
-    sender: mpsc::Sender<(Stream, Vec<u8>)>,
+    sender: mpsc::Sender<(Stream, Vec<u8>, ScanResult)>,
 ) {
     std::thread::spawn(move || {
         let mut kept = Vec::new();
+        let mut scanner = MarkerScanner::new();
         let mut buffer = [0u8; 4096];
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
+                    if matches!(stream, Stream::Stdout) {
+                        scanner.push(&buffer[..read]);
+                    }
                     let room = cap.saturating_sub(kept.len());
                     kept.extend_from_slice(&buffer[..read.min(room)]);
                 }
@@ -306,7 +331,12 @@ fn spawn_drain(
                 Err(_) => break,
             }
         }
-        let _ = sender.send((stream, kept));
+        // The last line usually has no trailing newline, so it has to be
+        // evaluated explicitly or a marker on it would be lost.
+        if matches!(stream, Stream::Stdout) {
+            scanner.finish();
+        }
+        let _ = sender.send((stream, kept, scanner.result()));
     });
 }
 
@@ -315,21 +345,32 @@ fn spawn_drain(
 /// A killed test may have left a grandchild holding the pipe open. Blocking on
 /// that would turn a 30-second timeout into an unbounded wait, so a pipe that
 /// stays open past the grace period is abandoned with whatever it delivered.
-fn collect_output(receiver: mpsc::Receiver<(Stream, Vec<u8>)>) -> (Vec<u8>, Vec<u8>) {
+///
+/// The third element is what the stdout stream proved: whether it carried a skip
+/// plan line, and whether it announced a failing test. A pipe abandoned before
+/// its reader finished reports whatever the reader had scanned by then, which is
+/// the honest answer for output that was never delivered.
+fn collect_output(
+    receiver: mpsc::Receiver<(Stream, Vec<u8>, ScanResult)>,
+) -> (Vec<u8>, Vec<u8>, ScanResult) {
     let deadline = Instant::now() + DRAIN_GRACE;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
+    let mut scan = ScanResult::default();
     let mut remaining = 2;
     while remaining > 0 {
         let left = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(left) {
-            Ok((Stream::Stdout, bytes)) => stdout = bytes,
-            Ok((Stream::Stderr, bytes)) => stderr = bytes,
+            Ok((Stream::Stdout, bytes, found)) => {
+                stdout = bytes;
+                scan = found;
+            }
+            Ok((Stream::Stderr, bytes, _)) => stderr = bytes,
             Err(_) => break,
         }
         remaining -= 1;
     }
-    (stdout, stderr)
+    (stdout, stderr, scan)
 }
 
 /// Puts the child in its own process group so the whole tree can be killed.
@@ -479,6 +520,251 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(!result.timed_out);
         assert_eq!(result.suite, "parallel");
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+    }
+
+    #[test]
+    fn a_plan_line_on_stdout_is_a_skip_not_a_pass() {
+        let tree = TempTree::new("skip");
+        // What `common.skip()` does: print the plan line, then exit 0.
+        let test = tree.script(
+            "test-skip.sh",
+            "printf '1..0 # Skipped: no IPv6 support\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.exit_code, Some(0), "the runtime really exits 0");
+        assert!(!result.passed, "a skip must not be recorded as a pass");
+        assert_eq!(result.skipped, Some(true));
+        assert_eq!(result.outcome(), crate::result::Outcome::Skipped);
+    }
+
+    #[test]
+    fn a_known_issues_style_skip_exiting_one_is_a_skip_not_a_failure() {
+        let tree = TempTree::new("skip-known-issues");
+        // `common.skip()` exits 1 under `test/known_issues/**`, so the exit code
+        // cannot tell this apart from a real assertion failure.
+        let test = tree.script(
+            "test-known-issues-skip.sh",
+            "printf '1..0 # Skipped: V8 inspector is disabled\\n'; exit 1\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.exit_code, Some(1));
+        assert!(!result.passed);
+        assert_eq!(result.outcome(), crate::result::Outcome::Skipped);
+    }
+
+    #[test]
+    fn the_skip_text_mid_line_is_not_a_skip() {
+        let tree = TempTree::new("skip-midline");
+        // A test that merely mentions the marker in a diagnostic, and passes.
+        let test = tree.script(
+            "test-mention.sh",
+            "printf 'note: 1..0 # Skipped: is what common.skip prints\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+        assert!(
+            result.stdout_head.contains("1..0 # Skipped:"),
+            "the text really is in the output: {}",
+            result.stdout_head
+        );
+
+        // And the same text mid-line must not rescue a genuinely failing file.
+        let failing = tree.script(
+            "test-mention-fail.sh",
+            "printf 'note: 1..0 # Skipped: is what common.skip prints\\n'; exit 1\n",
+        );
+        let failed = execute(&config, &config.working_dir(), "test", &failing);
+        assert_eq!(failed.outcome(), crate::result::Outcome::Failed);
+    }
+
+    #[test]
+    fn a_skip_printed_after_more_than_the_kept_stdout_is_still_a_skip() {
+        let tree = TempTree::new("skip-late");
+        // The marker lands past STDOUT_HEAD_BYTES, so the recorded head cannot
+        // carry it. The scanner sees the whole stream, so the verdict survives.
+        let test = tree.script(
+            "test-skip-late.sh",
+            "i=0; while [ $i -lt 300 ]; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; i=$((i+1)); done; \
+             printf '1..0 # Skipped: late skip\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Skipped);
+        assert!(
+            !result.stdout_head.contains("1..0 # Skipped:"),
+            "the head is supposed to be truncated, not the whole output: {} bytes",
+            result.stdout_head.len()
+        );
+    }
+
+    #[test]
+    fn a_hung_test_that_printed_a_skip_line_is_a_timeout_not_a_skip() {
+        let tree = TempTree::new("skip-then-hang");
+        let test = tree.script(
+            "test-skip-hang.sh",
+            "printf '1..0 # Skipped: then hung\\n'; sleep 30\n",
+        );
+        let mut config = shell_config(&tree);
+        config.timeout = Duration::from_millis(300);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert!(result.timed_out);
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+    }
+
+    #[test]
+    fn a_zero_exit_that_reported_a_failing_test_is_a_failure() {
+        let tree = TempTree::new("hollow");
+        // Exactly the rustnode shape: a failing subtest, then exit 0 because the
+        // runtime never propagated the failure.
+        let test = tree.script(
+            "test-hollow.sh",
+            "printf '\\342\\226\\266 outer\\n  \\342\\234\\224 inner passes\\n  \\342\\234\\226 inner fails\\n\\342\\234\\226 outer\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "the runtime really claims success"
+        );
+        assert!(
+            result.passed,
+            "the raw exit code is still recorded as a pass"
+        );
+        assert_eq!(result.skipped, Some(false));
+        assert_eq!(result.misreported, Some(true));
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+        assert!(result.is_misreported_pass());
+    }
+
+    #[test]
+    fn the_failure_glyph_inside_a_message_does_not_override_a_pass() {
+        let tree = TempTree::new("hollow-midline");
+        // A test that merely mentions the glyph, e.g. asserting on captured
+        // child output, and genuinely passes.
+        let test = tree.script(
+            "test-mention-glyph.sh",
+            "printf 'out: \\342\\234\\226 failing tests:\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+        assert_eq!(result.misreported, Some(false));
+    }
+
+    #[test]
+    fn a_failure_glyph_with_a_nonzero_exit_is_an_ordinary_failure() {
+        let tree = TempTree::new("glyph-nonzero");
+        let test = tree.script(
+            "test-glyph-fail.sh",
+            "printf '  \\342\\234\\226 inner fails\\n'; exit 1\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+        assert!(
+            !result.is_misreported_pass(),
+            "a non-zero exit needs no correction"
+        );
+    }
+
+    #[test]
+    fn a_failure_glyph_printed_after_the_kept_stdout_is_still_seen() {
+        let tree = TempTree::new("glyph-late");
+        let test = tree.script(
+            "test-glyph-late.sh",
+            "i=0; while [ $i -lt 300 ]; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; i=$((i+1)); done; \
+             printf '  \\342\\234\\226 inner fails\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+        assert!(
+            !result.stdout_head.contains('\u{2716}'),
+            "the head is supposed to be truncated: {} bytes",
+            result.stdout_head.len()
+        );
+    }
+
+    #[test]
+    fn a_skip_only_node_test_file_is_a_skip_not_a_pass() {
+        let tree = TempTree::new("nested-skip");
+        // Exactly the shape `test-assert-checktag.js` produces: one bare skip
+        // mark, nothing else, exit 0.
+        let test = tree.script(
+            "test-bare-skip.sh",
+            "printf '\\357\\271\\243 <anonymous> (0.836915ms) # SKIP\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.passed, "a skip must not be recorded as a pass");
+        assert_eq!(result.skipped, Some(true));
+        assert_eq!(result.outcome(), crate::result::Outcome::Skipped);
+    }
+
+    #[test]
+    fn a_node_test_file_that_also_passed_is_not_a_skip() {
+        let tree = TempTree::new("nested-skip-mixed");
+        let test = tree.script(
+            "test-bare-skip-mixed.sh",
+            "printf '\\357\\271\\243 skipped (0.1ms) # SKIP\\n\\342\\234\\224 passed (0.2ms)\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+        assert_eq!(result.skipped, Some(false));
+    }
+
+    #[test]
+    fn an_uncaught_assertion_on_stdout_with_exit_zero_is_a_failure() {
+        let tree = TempTree::new("uncaught");
+        let test = tree.script(
+            "test-uncaught.sh",
+            "printf 'node:assert:16736: Uncaught AssertionError: The input did not match\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.passed, "the raw exit code is still a pass");
+        assert_eq!(result.misreported, Some(true));
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+    }
+
+    #[test]
+    fn a_test_that_catches_its_assertions_still_passes() {
+        let tree = TempTree::new("caught-assertion");
+        // `assert.throws` and `try/catch` are how a large part of test/parallel
+        // exercises error paths. If catching an assertion produced the marker,
+        // every one of those would be demoted, so this is the false-positive
+        // case that matters most.
+        let test = tree.script("test-caught.sh", "printf 'caught ok\\nPASS\\n'; exit 0\n");
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+        assert_eq!(result.misreported, Some(false));
+    }
+
+    #[test]
+    fn assertion_text_printed_as_data_does_not_override_a_pass() {
+        let tree = TempTree::new("assertion-data");
+        // A test that prints captured child output which happens to contain the
+        // phrase, but in a shape the runtime never produces for its own error.
+        let test = tree.script(
+            "test-assertion-data.sh",
+            "printf 'child stderr: Uncaught AssertionError: expected 1 to equal 2\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(
+            result.outcome(),
+            crate::result::Outcome::Passed,
+            "text after an arbitrary prefix is not the runtime's own report"
+        );
     }
 
     #[test]

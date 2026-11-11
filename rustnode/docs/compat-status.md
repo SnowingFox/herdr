@@ -144,6 +144,61 @@ run writes one `run-<timestamp>[-label].json`. `report` reads all of them and
 keeps the newest outcome per test file, so fixed tests turn green without
 re-running everything and repeated runs never inflate the total.
 
+### How the pass rate is counted
+
+A file is in exactly one of three states: **passed**, **skipped** or **failed**,
+and `passed + skipped + failed` always equals the total.
+
+**A skip** is detected from one of two forms, both of which assert nothing:
+
+- the `1..0 # Skipped: <reason>` plan line that `common.skip()` prints. The exit
+  code cannot stand in for it: `skip()` exits 0 from `test/parallel/**` and 1 from
+  `test/known_issues/**`, so exit codes alone read a skipped parallel test as a
+  pass and a skipped known-issue test as a failure. Matched only at the start of a
+  line, and only after scanning the whole stdout stream rather than the truncated
+  head.
+- a `node:test` file whose **every** mark was a skip — `﹣ name # SKIP`, or
+  `﹣ name # <reason>` for a skip with a custom message. This counts only when no
+  `✔`, `▶` or `✖` appears anywhere and the exit code is 0. A file that ran any
+  passing or failing test keeps its real verdict, and a `describe` whose children
+  all skip is a pass, because the suite itself reports `✔`.
+
+**A hollow pass** is a file that exited 0 while its own output reported a failure.
+Two mechanisms produce this, from disjoint populations:
+
+- **`Uncaught AssertionError`** on stdout, from plain `assert` calls that escaped.
+  The uncaught-exception path never sets the exit code, so the process reports
+  success. Matched when `Uncaught` is followed by an error name and a colon and
+  is either at the start of the line or preceded by a `:<line-number>:`
+  location — that prefix is what distinguishes the runtime's own report from a
+  test echoing captured child output, which stays a pass. A caught assertion
+  (`assert.throws`, `try/catch`) prints nothing, so it is never involved.
+- **`✖`** on stdout, from `node:test` subtests. Matched at the start of a line
+  after leading whitespace and ANSI escapes.
+
+Both are matched in the same pass over the whole stdout stream, and such a row
+counts as **failed**. `report` prints how many of the failures were corrected
+this way, so the count is auditable rather than silent.
+
+The `✖` rule is **rustnode-shaped**: real Node writes TAP (`not ok 2 - ...`) when
+stdout is piped and would not match. Switching rustnode to TAP output would
+disable that half until the marker is updated; the `Uncaught` half is unaffected
+and carries most of the correction.
+
+Marker evidence is cumulative across builds: a recorded value is ORed with a scan
+of the row's recorded stdout, so a stronger rule still applies to result files
+written by an older, narrower build.
+
+The rate is **`passed / (passed + failed)`**. Skips are excluded from both
+sides, because a skipped file asserts nothing: counting it as a pass inflates
+the number and counting it as a failure understates it. `report` prints all
+three counts as separate columns and lists the skipped files, and a cluster where
+nothing was judged prints `—` rather than a misleading `0.0%`.
+
+Numbers recorded before this classification existed are re-read: a row without
+the fields uses its recorded stdout to recover whether it skipped and whether it
+reported a failure.
+
 ### What the numbers mean today
 
 **Measured smoke subset — 0 of 10 files pass.**
@@ -180,6 +235,12 @@ takes about six seconds because most files exit immediately.
 
 Both numbers are a starting line, not a trend. Re-measure rather than quoting
 these: they move every time a crate lands.
+
+**These two snapshots predate skip detection** and were counted with skips as
+passes, so the smoke figure may be slightly pessimistic and the full-suite figure
+slightly optimistic. 1287 of the 4587 files in `test/parallel` call `skip()` at
+all, and in one recorded 400-file run 4 of 286 "passes" were skips, so expect the
+full-suite number to move by a few files when it is re-measured.
 
 ### Checking your own subsystem
 
