@@ -325,6 +325,95 @@ pub fn encode_utf8(units: &[u16], max: usize) -> Vec<u8> {
     out
 }
 
+/// `StringBytes::Size` for `utf8`: the UTF-8 byte length of `units`, counted
+/// without producing the bytes.
+///
+/// This is deliberately not `encode_utf8(units, usize::MAX).len()`. That was
+/// the original implementation and it is correct, but it allocates a `u16`
+/// copy of the string and then an entire encoded `Vec<u8>` to measure it, so
+/// `Buffer.byteLength` cost three passes and two allocations where Node costs
+/// one pass and none. `Buffer.byteLength` is called on every buffer-sized
+/// string a program writes, so the length is worth its own counter.
+///
+/// # Semantics
+///
+/// These are `StringBytes::Size`'s, which calls
+/// `simdutf::utf8_length_from_utf16_with_replacement`:
+///
+/// * every ASCII unit is one byte,
+/// * every other BMP scalar is two or three bytes by its value,
+/// * a surrogate *pair* is one four-byte scalar,
+/// * an unpaired surrogate is one U+FFFD, so **three** bytes.
+///
+/// That last rule is the one to get right, and it is why the pair must be
+/// combined rather than counted unit by unit: `"\uD800"` is 3, but `"\uD83D\uDE00"`
+/// is 4 and not 6. Counting each surrogate as three would make the first
+/// correct for the wrong reason and the second wrong.
+///
+/// `write` must agree with this (`Buffer#write` returns the count that
+/// `Buffer#byteLength` reports for the same string), which is why both walk
+/// the same pair rule. They stay separate functions: `write` emits bytes,
+/// truncates at a character boundary, and has to size a buffer, so folding it
+/// into a counter would make one depend on the other's `max` handling.
+pub fn utf8_length(units: &[u16]) -> usize {
+    // The overwhelmingly common case for `Buffer.byteLength` callers. A single
+    // wide scan is much cheaper than the per-unit match below, and it answers
+    // in units rather than needing to add anything up.
+    if units.iter().all(|unit| *unit < 0x80) {
+        return units.len();
+    }
+    let mut length = 0;
+    let mut index = 0;
+    while index < units.len() {
+        let unit = units[index];
+        if (0xD800..0xDC00).contains(&unit) {
+            match units.get(index + 1) {
+                Some(next) if (0xDC00..0xE000).contains(next) => {
+                    length += 4;
+                    index += 2;
+                }
+                // Unpaired lead surrogate: one replacement character.
+                _ => {
+                    length += 3;
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if (0xDC00..0xE000).contains(&unit) {
+            // Unpaired trail surrogate on its own.
+            length += 3;
+        } else if unit < 0x80 {
+            length += 1;
+        } else if unit < 0x800 {
+            length += 2;
+        } else {
+            length += 3;
+        }
+        index += 1;
+    }
+    length
+}
+
+/// `StringBytes::Size` for a one-byte string: `utf8_length_from_latin1`.
+///
+/// V8 stores a string that fits in Latin-1 as one byte per character, so the
+/// caller has no `u16` units to count and none need to be materialised. Every
+/// byte below `0x80` is one UTF-8 byte and every other byte is two, because a
+/// Latin-1 code point in `0x80..=0xFF` needs a two-byte sequence.
+pub fn utf8_length_from_latin1(bytes: &[u8]) -> usize {
+    if bytes.is_ascii() {
+        return bytes.len();
+    }
+    // One addition per byte rather than a branch per byte; `(b >> 7)` is the
+    // high-bit test without the branch, and the sum vectorises.
+    bytes.len()
+        + bytes
+            .iter()
+            .map(|byte| usize::from(byte >> 7))
+            .sum::<usize>()
+}
+
 /// UTF-8 length of one scalar value.
 fn utf8_len(scalar: u32) -> usize {
     match scalar {
@@ -957,6 +1046,70 @@ mod tests {
         assert_eq!(
             decode_utf8_lossy(&[0xF0, 0x9F, 0x98, 0x80]),
             vec![0xD83D, 0xDE00]
+        );
+    }
+
+    #[test]
+    fn utf8_length_matches_the_encoder_and_node() {
+        // Every expectation here is `Buffer.byteLength` on node 22, which is
+        // also `Buffer.from(s).length`. The nine rows are the table that pins
+        // the rewrite: the lone-surrogate rows are 3 bytes (one U+FFFD each),
+        // and the pair rows prove pairs are combined rather than counted twice.
+        let cases: &[(&[u16], usize)] = &[
+            (&[], 0),
+            (&[0x61], 1),
+            (&[0x00E9], 2),
+            (&[0x20AC], 3),
+            (&[0xD83D, 0xDE00], 4),
+            (&[0x61, 0xD83D, 0xDE00, 0x62], 6),
+            (&[0xD800], 3),
+            (&[0xDC00], 3),
+            (&[0x61, 0xD800, 0x62], 5),
+            // Adjacent surrogates in the wrong order are two replacements.
+            (&[0xDC00, 0xD800], 6),
+            (&[0xD800, 0xD800], 6),
+            // A trail surrogate after a lead that is not its pair still counts
+            // as two replacements, not one four-byte scalar.
+            (&[0xD800, 0xD800, 0xDC00], 7),
+            // Boundaries of the two- and three-byte ranges.
+            (&[0x7F, 0x80, 0x7FF, 0x800, 0xFFFF], 1 + 2 + 2 + 3 + 3),
+        ];
+        for (units, expected) in cases {
+            assert_eq!(utf8_length(units), *expected, "units {units:?}");
+            // The counter and the encoder must never disagree: `Buffer#write`
+            // reports the number of bytes `Buffer#byteLength` predicts.
+            assert_eq!(
+                encode_utf8(units, usize::MAX).len(),
+                *expected,
+                "encoder disagrees on units {units:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_length_from_latin1_is_the_same_row_for_one_byte_strings() {
+        // A one-byte V8 string is Latin-1 by definition, so this must agree
+        // with `utf8_length` over the same code units.
+        let cases: &[(&[u8], usize)] = &[
+            (b"", 0),
+            (b"a", 1),
+            // One byte per character, so this is one code point per element.
+            (&[0xE9], 2),
+            (&[0xFF], 2),
+            (&[0x7F, 0x80], 3),
+            (&[0x00], 1),
+            (&[0xE9, 0xFF, 0x7F, 0x00], 6),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(utf8_length_from_latin1(bytes), *expected, "bytes {bytes:?}");
+        }
+        // And the general counter must agree when fed the same values as units:
+        // a one-byte V8 string is Latin-1 by definition, so `Buffer.byteLength`
+        // has to answer the same whether V8 stored the string as one byte or
+        // two.
+        assert_eq!(
+            utf8_length(&[0xE9, 0xFF, 0x7F, 0x00]),
+            utf8_length_from_latin1(&[0xE9, 0xFF, 0x7F, 0x00])
         );
     }
 
