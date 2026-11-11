@@ -17,6 +17,15 @@ libz-rs-sys = { version = "=0.6.8", default-features = false, features = ["std"]
 # equivalent.
 brotli = { version = "=8.0.4", default-features = false, features = ["std"] }
 brotli-decompressor = { version = "=5.0.3", default-features = false, features = ["std"] }
+# zstd, with its C sources vendored in the crate and compiled by cc-rs. Node
+# vendors zstd 1.5.7 (`deps/zstd`) and this dependency is pinned to exactly
+# `+zstd.1.5.7`, so both sides run the same compressor. There is no pure-Rust
+# alternative: `ruzstd` decodes but its encoder levels are unimplemented and it
+# has no streaming or dictionary API, which the `ZstdCompress`/`ZstdDecompress`
+# handles require. `bindgen` and `legacy` are off because the pregenerated
+# bindings are checked in and Node builds zstd without the legacy decoder;
+# leaving them off also keeps libclang out of the build.
+zstd-sys = { version = "=2.0.17", default-features = false, features = ["zdict_builder"] }
 
 [dev-dependencies]
 serde_json.workspace = true
