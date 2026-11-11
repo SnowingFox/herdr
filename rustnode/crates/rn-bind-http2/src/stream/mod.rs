@@ -66,6 +66,14 @@ pub struct StreamHandleState {
     /// placeholder id collapses a stream's async context onto whatever id it
     /// borrowed — which is what `AsyncLocalStorage` reports as the wrong store.
     pub async_wrap: rn_core::AsyncWrapState,
+    /// The async context frame captured when the stream was created.
+    ///
+    /// `AsyncWrap`'s constructor stores `async_context_frame::current()`, and every
+    /// callback the resource runs restores it. `AsyncLocalStorage` propagates
+    /// through *this*, not through the id: without it `storage.getStore()` is
+    /// `undefined` inside a stream callback even though `executionAsyncId()` is
+    /// right.
+    pub context_frame: Option<v8::Global<v8::Value>>,
 }
 
 /// Builds the `Http2Stream` constructor and its prototype.
@@ -195,6 +203,7 @@ pub fn handle_for<'s>(
         // The id comes from the one sequence the JavaScript side also draws from,
         // which is what `Environment::new_async_id` guarantees and what a local
         // counter would not.
+        context_frame: rn_bind_async_wrap::current_context_frame(scope),
         async_wrap: rn_core::AsyncWrapState {
             async_id: rn_bind_async_wrap::next_async_id(),
             trigger_async_id: current_trigger_async_id(),
@@ -269,15 +278,21 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
         rn_uv::stream::with_state(|state| {
             state.set(rn_uv::handle::K_READ_BYTES_OR_ERROR, payload.len() as u32)
         });
-        let handler = onread_of(scope, object);
-        let Some(handler) = handler else {
-            return;
-        };
         let store = v8::ArrayBuffer::new_backing_store_from_boxed_slice(payload.into_boxed_slice());
         let store: v8::SharedRef<v8::BackingStore> = store.into();
         let buffer: v8::Local<v8::Value> =
             v8::ArrayBuffer::with_backing_store(scope, &store).into();
-        let _ = handler.call(scope, object.into(), &[buffer]);
+        // Inside the stream's async scope: `onStreamRead` is a stream callback, so
+        // it runs as the stream resource with the frame captured at its creation.
+        let _ = in_stream_scope(scope, session, stream_id, |scope| {
+            let Some(object) = object_for(scope, session, stream_id) else {
+                return;
+            };
+            let Some(handler) = onread_of(scope, object) else {
+                return;
+            };
+            let _ = handler.call(scope, object.into(), &[buffer]);
+        });
     });
 }
 
@@ -305,16 +320,63 @@ pub fn emit_eof(session: &SessionState, stream_id: i32) {
         rn_uv::stream::with_state(|state| {
             state.set(rn_uv::handle::K_READ_BYTES_OR_ERROR, EOF as u32)
         });
-        let Some(handler) = onread_of(scope, object) else {
-            return;
-        };
-        // No buffer argument, as `CallJSOnreadMethod` does for an error.
-        let _ = handler.call(scope, object.into(), &[]);
+        // The EOF push is what makes the `Duplex` emit `'end'`, so it has to run in
+        // the stream's async scope like any other callback. Left unscoped, `'data'`
+        // saw the store and `'end'` did not — the asymmetry that made this look
+        // half-fixed.
+        let _ = in_stream_scope(scope, session, stream_id, |scope| {
+            let Some(object) = object_for(scope, session, stream_id) else {
+                return;
+            };
+            let Some(handler) = onread_of(scope, object) else {
+                return;
+            };
+            // No buffer argument, as `CallJSOnreadMethod` does for an error.
+            let _ = handler.call(scope, object.into(), &[]);
+        });
     });
 }
 
 /// `UV_EOF`.
 const EOF: i32 = -4095;
+
+/// Runs `body` inside `stream_id`'s captured async context.
+///
+/// This is `InternalCallbackScope` for this stream: `async_hooks` sees the
+/// resource, and `AsyncLocalStorage` sees the frame that was current when the
+/// stream was created. Both come from the handle state rather than from whatever
+/// happened to be executing when the callback fired.
+///
+/// A callback for a stream that has been closed runs unscoped. That is deliberate:
+/// the earlier cut of this reached through the handle unconditionally and
+/// segfaulted, because a destroyed stream's state is no longer safe to read.
+fn in_stream_scope<R>(
+    scope: &mut v8::PinScope<'_, '_>,
+    session: &SessionState,
+    stream_id: i32,
+    body: impl FnOnce(&mut v8::PinScope<'_, '_>) -> R,
+) -> Option<R> {
+    let handle = session.handles.borrow().get(&stream_id).cloned()?;
+    let object = v8::Local::new(scope, &handle);
+    let (context, frame) = with_state(object, |state| {
+        (
+            rn_core::callback_scope::AsyncContext {
+                async_id: state.async_wrap.async_id(),
+                trigger_async_id: state.async_wrap.trigger_async_id,
+            },
+            state.context_frame.clone(),
+        )
+    })?;
+    rn_core::callback_scope::with_scope(
+        scope,
+        rn_core::callback_scope::ScopeArgs {
+            context,
+            resource: Some(v8::Global::new(scope.as_ref(), object)),
+            frame,
+        },
+        body,
+    )
+}
 
 /// The `onread` a stream handle carries, if `core.js` assigned one.
 fn onread_of<'s>(
@@ -358,14 +420,19 @@ pub fn call_stream_callback<'s>(
     pick: impl FnOnce(&crate::SessionCallbacks) -> Option<v8::Global<v8::Function>>,
     args: &[v8::Local<'s, v8::Value>],
 ) {
-    let Some(object) = object_for(scope, session, stream_id) else {
+    // Inside the stream's async scope, like every other per-stream callback.
+    // `onStreamClose` is what emits `'end'`, so an unscoped call here is why
+    // `AsyncLocalStorage.getStore()` was `undefined` in an `'end'` handler.
+    let Some(global) = crate::callbacks::pick_global(pick) else {
         return;
     };
-    let Some(callback) = crate::callbacks::pick_global(pick) else {
-        return;
-    };
-    let callback = v8::Local::new(scope, callback);
-    let _ = callback.call(scope, object.into(), args);
+    let callback = v8::Local::new(scope, global);
+    let _ = in_stream_scope(scope, session, stream_id, |scope| {
+        let Some(object) = object_for(scope, session, stream_id) else {
+            return;
+        };
+        let _ = callback.call(scope, object.into(), args);
+    });
 }
 
 /// `Http2Stream::GetID`.
