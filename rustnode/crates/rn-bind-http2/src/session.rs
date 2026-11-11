@@ -511,13 +511,10 @@ pub fn consume(
         return Ok(());
     }
     // SAFETY: `stream_object` is a live local, so any state a binding attached to
-    // it outlives this call.
-    let pointer = unsafe { rn_uv::streams::stream_of(scope, stream_object) };
-    let Some(pointer) = pointer else {
-        return Err("Http2Session.consume requires a stream handle".to_string());
-    };
-    // SAFETY: the pointer is the state the owning binding attached and keeps alive.
-    let stream_state = unsafe { rn_uv::handle::owner(pointer) };
+    // it outlives this call. `state_of` reads the state symbol first and falls
+    // back to the stream symbol, so a `JSStream` (which has no libuv handle) is
+    // accepted alongside a `TCP` or `Pipe`.
+    let stream_state = unsafe { rn_uv::streams::state_of(scope, stream_object) };
     let Some(stream_state) = stream_state else {
         return Err("Http2Session.consume requires a stream handle".to_string());
     };

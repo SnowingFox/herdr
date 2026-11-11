@@ -125,3 +125,72 @@ pub unsafe fn stream_of(
         Some(pointer)
     }
 }
+
+/// The per-isolate symbol a `*mut StreamState` is stored under.
+///
+/// [`STREAM_SYMBOL`] carries a `uv_stream_t*`, which is what a spawn needs. That
+/// is not enough for a stream whose `stream` field is null — a `JSStream` is a
+/// `StreamBase` with no libuv handle underneath it — and such a stream still has a
+/// `StreamState` with a listener chain, an owner object and byte counters. So the
+/// state pointer gets its own symbol, and `StreamBase::FromObject`'s callers read
+/// this one first: Node unwraps the `BaseObject`, not the handle, so the state is
+/// the closer analogue anyway.
+pub const STATE_SYMBOL: &str = "node:rustnode:uv_stream_state";
+
+/// The symbol a state pointer is stored under, per isolate.
+fn state_symbol<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Symbol> {
+    let description =
+        v8::String::new(scope, STATE_SYMBOL).unwrap_or_else(|| v8::String::empty(scope));
+    v8::Symbol::for_key(scope, description)
+}
+
+/// Records `state` on `object` under [`STATE_SYMBOL`].
+///
+/// Separate from [`attach`] because a stream with no libuv handle has a state but
+/// no `uv_stream_t` to publish, and `attach` returns early for exactly that case.
+///
+/// # Safety
+///
+/// `state` must outlive `object`, which every binding guarantees by keeping it in
+/// the same allocation as the handle and freeing it from the finalizer.
+pub unsafe fn attach_state(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+    state: *mut StreamState,
+) {
+    if state.is_null() {
+        return;
+    }
+    let external = v8::External::new(scope, state.cast());
+    let symbol = state_symbol(scope);
+    object.set(scope, symbol.into(), external.into());
+}
+
+/// The `StreamState` behind a JavaScript stream handle, attached or not.
+///
+/// Falls back to [`stream_of`]'s handle when a binding only published the stream,
+/// which keeps every existing caller working without teaching them about the new
+/// symbol.
+///
+/// # Safety
+///
+/// The returned pointer belongs to the binding that attached it and stays valid
+/// until that binding's close callback runs.
+pub unsafe fn state_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+) -> Option<*mut StreamState> {
+    let symbol = state_symbol(scope);
+    if let Some(value) = object.get(scope, symbol.into()) {
+        if let Ok(external) = v8::Local::<v8::External>::try_from(value) {
+            let pointer = external.value().cast::<StreamState>();
+            if !pointer.is_null() {
+                return Some(pointer);
+            }
+        }
+    }
+    // SAFETY: the caller gives the same guarantee for the fallback.
+    let stream = unsafe { stream_of(scope, object) }?;
+    // SAFETY: a stream this crate's bindings published has its state in `data`.
+    unsafe { crate::handle::owner(stream) }
+}
