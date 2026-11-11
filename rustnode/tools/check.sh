@@ -183,6 +183,14 @@ step "the vendored merve is unchanged"
 # change that answer without failing anything else.
 ./tools/verify-merve.sh
 
+step "an http2 request completes and the process exits by itself"
+# Two different http2 leaks have already hidden behind a `124` in this family: an
+# accepted socket nobody owned, and a body whose END_STREAM was never sent. Both
+# cost a timeout per file while looking like slowness. The probe asserts the
+# exchange completed (`bodies`/`ends`) and that the loop drained on its own, so a
+# silent early exit cannot pass it.
+./tools/http2-lifecycle-probe.sh
+
 step "the vendored nghttp2 is unchanged"
 # HTTP/2's frame state machine, HPACK tables and error strings are `node:http2`'s
 # compatibility surface, so the C library is held to the pinned Node revision
