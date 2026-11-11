@@ -795,19 +795,23 @@ mod tests {
         .expect("write");
 
         let tally = tally(&dir.0).expect("tally");
-        assert_eq!(tally.latest.len(), 9, "every row must parse");
+        assert_eq!(tally.latest.len(), 10, "every row must parse");
         let report = report(&tally, &dir.0);
 
         let expected = [
+            "parallel/test-assert-checktag.js",
             "parallel/test-child-process-exec-any-shells-windows.js",
             "parallel/test-child-process-stdio-overlapped.js",
             "parallel/test-cluster-dgram-ipv6only.js",
             "parallel/test-cluster-net-listen-ipv6only-false.js",
         ];
         let reported: Vec<&str> = report.skips.iter().map(|row| row.file.as_str()).collect();
-        assert_eq!(reported, expected, "all four rows must be skips");
+        assert_eq!(
+            reported, expected,
+            "four plan-line skips and one bare-glyph skip, in file order"
+        );
 
-        assert_eq!(report.skipped, 4);
+        assert_eq!(report.skipped, 5);
         // test-fs-open.js is the only clean pass; the three hollow passes and the
         // one real failure are all failures.
         assert_eq!(report.passed, 1, "only test-fs-open.js really passed");
@@ -816,13 +820,16 @@ mod tests {
             report.misreported, 3,
             "two rows printed the reporter glyph, one an uncaught assertion"
         );
-        assert_eq!(report.total, 9);
-        assert_eq!(report.passed + report.skipped + report.failed, 9);
-        // 1 of 5 judged files pass. The old harness said 8 of 9 (88.9%).
+        assert_eq!(report.total, 10);
+        assert_eq!(report.passed + report.skipped + report.failed, 10);
+        // 1 of 5 judged files pass. The old harness said 9 of 10 (90%).
         assert!((report.rate - 0.2).abs() < 1e-9, "rate was {}", report.rate);
 
-        assert_eq!(report.skips[0].reason, "Windows specific test.");
-        assert_eq!(report.skips[2].reason, "no IPv6 support");
+        // The bare-glyph row has no plan line, so its reason is empty rather than
+        // a parsed message; the outcome is what matters.
+        assert_eq!(report.skips[0].reason, "");
+        assert_eq!(report.skips[1].reason, "Windows specific test.");
+        assert_eq!(report.skips[3].reason, "no IPv6 support");
 
         let corrected: Vec<&str> = report
             .failures

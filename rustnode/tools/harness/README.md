@@ -47,14 +47,33 @@ that was failing in an old run but passes now must read as passing without
 deleting history. The newest recorded outcome wins; totals count files, not
 recorded rows.
 
-**Passed, skipped and failed are three different things.** Node's `common.skip()`
-prints `1..0 # Skipped: <reason>` and then calls `process.exit(0)`, so a skipped
-file exits like a passing one; under `test/known_issues/**` it exits 1 instead,
-so a skipped file there exits like a failing one. The exit code therefore cannot
-classify a run, and the runner scans the *whole* stdout stream — not the truncated
-`stdout_head` — for a plan line at the start of a line. A test that merely
-mentions the marker inside a message does not match, because the text must sit in
-the first column.
+**Passed, skipped and failed are three different things.** Skips arrive in three
+forms, and all three are detected:
+
+| form | what prints | exits |
+| --- | --- | --- |
+| `common.skip()` in `test/parallel/**` | `1..0 # Skipped: <reason>` | 0 |
+| `common.skip()` in `test/known_issues/**` | `1..0 # Skipped: <reason>` | 1 |
+| every test in a `node:test` file skipped | `﹣ <anonymous> (0.8ms) # SKIP` | 0 |
+
+The exit code cannot classify any of them, which is why the markers are read
+directly. The plan line is matched only in column zero, because `console.log`
+always puts it there and an indented mention in a diagnostic must not count. It
+is scanned from the **whole** stdout stream, not the truncated `stdout_head`.
+
+The bare-glyph form is `﹣` (`U+FE63`, the reporter's `hyphen:minus`) at the start
+of a line. It counts only when **nothing else ran**: no `✔`, no `▶` and no `✖`
+anywhere, on an exit-0 row. That narrowness is deliberate, because the glyph
+alone is not enough:
+
+- a mixed file skips some tests and runs others — `test-runner-module-mocking.js`
+  has 1 skip, 10 passes and 43 failures, and calling it a skip would hide 43 real
+  failures;
+- a `describe` whose children all skip still prints `✔ outer suite`, because the
+  suite itself passed.
+
+The glyph is keyed on rather than the `# SKIP` word because a skip carrying a
+custom message prints `﹣ name # <reason>`, not `# SKIP`.
 
 A skip is reported as its own outcome: it is neither a pass nor a failure, since
 it asserts nothing. `report` prints `passed`, `skipped` and `failed` as separate

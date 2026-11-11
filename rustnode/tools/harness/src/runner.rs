@@ -267,7 +267,12 @@ fn execute(
 
     // A killed process never got to state its own verdict, so a skip line it
     // printed before the timeout does not excuse the hang.
-    let skipped = scan.skipped && !timed_out;
+    //
+    // Two skip forms: the `common.skip()` plan line, and a `node:test` file whose
+    // every mark was a skip. The second is decided by the whole scan, not by the
+    // plan line, so it has to be computed here while the full stream is still in
+    // hand — `stdout_head` may have been truncated before the marks appeared.
+    let skipped = !timed_out && (scan.skipped || scan.only_skipped_tests());
     // A failure marker only matters when the process claimed success: a non-zero
     // exit is already recorded as failed, so the marker adds nothing there.
     let exited_zero = exit_code == Some(0);
@@ -683,6 +688,36 @@ mod tests {
             "the head is supposed to be truncated: {} bytes",
             result.stdout_head.len()
         );
+    }
+
+    #[test]
+    fn a_skip_only_node_test_file_is_a_skip_not_a_pass() {
+        let tree = TempTree::new("nested-skip");
+        // Exactly the shape `test-assert-checktag.js` produces: one bare skip
+        // mark, nothing else, exit 0.
+        let test = tree.script(
+            "test-bare-skip.sh",
+            "printf '\\357\\271\\243 <anonymous> (0.836915ms) # SKIP\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(!result.passed, "a skip must not be recorded as a pass");
+        assert_eq!(result.skipped, Some(true));
+        assert_eq!(result.outcome(), crate::result::Outcome::Skipped);
+    }
+
+    #[test]
+    fn a_node_test_file_that_also_passed_is_not_a_skip() {
+        let tree = TempTree::new("nested-skip-mixed");
+        let test = tree.script(
+            "test-bare-skip-mixed.sh",
+            "printf '\\357\\271\\243 skipped (0.1ms) # SKIP\\n\\342\\234\\224 passed (0.2ms)\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+        assert_eq!(result.skipped, Some(false));
     }
 
     #[test]

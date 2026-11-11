@@ -90,10 +90,13 @@ import sys
 report = json.load(open(sys.argv[1]))
 
 expected_skips = {
+    # four `1..0 # Skipped:` plan-line skips
     "parallel/test-child-process-exec-any-shells-windows.js",
     "parallel/test-child-process-stdio-overlapped.js",
     "parallel/test-cluster-dgram-ipv6only.js",
     "parallel/test-cluster-net-listen-ipv6only-false.js",
+    # one bare-glyph skip: `﹣ <anonymous> # SKIP`, no plan line at all
+    "parallel/test-assert-checktag.js",
 }
 reported_skips = {row["file"] for row in report["skips"]}
 
@@ -122,8 +125,8 @@ if expected_misreported - reported_misreported:
 if report["passed"] != 1:
     print(f"FAIL: expected exactly 1 pass, got {report['passed']}")
     sys.exit(1)
-if report["skipped"] != 4:
-    print(f"FAIL: expected 4 skips, got {report['skipped']}")
+if report["skipped"] != 5:
+    print(f"FAIL: expected 5 skips, got {report['skipped']}")
     sys.exit(1)
 if report["failed"] != 4:
     print(f"FAIL: expected 4 failures, got {report['failed']}")
@@ -138,7 +141,7 @@ if report["passed"] + report["skipped"] + report["failed"] != report["total"]:
     print("FAIL: the three outcomes do not reconcile with total")
     sys.exit(1)
 
-print(f"PASS: 4 skips / {report['passed']} pass / {report['failed']} failure "
+print(f"PASS: {report['skipped']} skips (incl. one bare-glyph) / {report['passed']} pass / {report['failed']} failure "
       f"({report['misreported']} corrected hollow passes) / {report['total']} total; "
       f"rate {report['rate']:.3f} over judged files")
 PY

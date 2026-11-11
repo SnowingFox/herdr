@@ -149,14 +149,19 @@ re-running everything and repeated runs never inflate the total.
 A file is in exactly one of three states: **passed**, **skipped** or **failed**,
 and `passed + skipped + failed` always equals the total.
 
-**A skip** is detected from the `1..0 # Skipped: <reason>` plan line a test prints
-when it calls `common.skip()`. The exit code cannot stand in for the marker:
-`skip()` exits 0 from `test/parallel/**` and 1 from `test/known_issues/**`, so
-exit codes alone read a skipped parallel test as a pass and a skipped
-known-issue test as a failure. Detection matches the marker only at the start of
-a line, and only after scanning the whole stdout stream rather than the
-truncated head, so a test that mentions the text in a message is not
-misclassified and a skip printed late is not missed.
+**A skip** is detected from one of two forms, both of which assert nothing:
+
+- the `1..0 # Skipped: <reason>` plan line that `common.skip()` prints. The exit
+  code cannot stand in for it: `skip()` exits 0 from `test/parallel/**` and 1 from
+  `test/known_issues/**`, so exit codes alone read a skipped parallel test as a
+  pass and a skipped known-issue test as a failure. Matched only at the start of a
+  line, and only after scanning the whole stdout stream rather than the truncated
+  head.
+- a `node:test` file whose **every** mark was a skip — `﹣ name # SKIP`, or
+  `﹣ name # <reason>` for a skip with a custom message. This counts only when no
+  `✔`, `▶` or `✖` appears anywhere and the exit code is 0. A file that ran any
+  passing or failing test keeps its real verdict, and a `describe` whose children
+  all skip is a pass, because the suite itself reports `✔`.
 
 **A hollow pass** is a file that exited 0 while its own output reported a failure.
 Two mechanisms produce this, from disjoint populations:

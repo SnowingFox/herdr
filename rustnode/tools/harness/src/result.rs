@@ -61,6 +61,22 @@ pub const UNCAUGHT_MARKER: &str = "Uncaught";
 /// by that switch, which is why it carries most of the correction.
 pub const FAILURE_MARKER: &str = "\u{2716}";
 
+/// The reporter's skip symbol, `U+FE63` (`﹣`), from
+/// `reporterUnicodeSymbolMap['hyphen:minus']`.
+///
+/// A `node:test` file that skips its tests prints
+/// `﹣ <anonymous> (0.8ms) # SKIP` and exits 0, which is a *third* skip form: it
+/// is neither the `common.skip()` plan line nor a failure. On its own that is
+/// only visible as a skip when the whole file skipped, which is why the rule
+/// below also requires that nothing else ran.
+pub const NESTED_SKIP_MARKER: &str = "\u{FE63}";
+
+/// The reporter's passing symbol, `U+2714` (`✔`).
+pub const PASS_MARKER: &str = "\u{2714}";
+
+/// The reporter's suite symbol, `U+25B6` (`▶`).
+pub const SUITE_MARKER: &str = "\u{25B6}";
+
 /// What a file actually did, as opposed to how it exited.
 ///
 /// A skipped file asserts nothing, so it is deliberately neither a pass nor a
@@ -91,6 +107,25 @@ pub struct ScanResult {
     /// A `✖` appeared at the start of a line, after leading whitespace and ANSI
     /// colour escapes. Means the reporter announced a failing test.
     pub reported_failure: bool,
+    /// A `﹣` line appeared in the reporter's skip position.
+    pub nested_skip: bool,
+    /// A `✔` line appeared, so at least one test passed.
+    pub passed_test: bool,
+    /// A `▶` line appeared, so a suite header was emitted.
+    pub suite_header: bool,
+}
+
+impl ScanResult {
+    /// Whether this file ran no assertions at all.
+    ///
+    /// True when the only marks the reporter emitted were skip marks: something
+    /// was skipped, and nothing passed, failed or opened a suite. A file that has
+    /// any passing or failing test is **not** a skip, whatever else it skipped —
+    /// so a mixed file keeps its real verdict, and a `describe` whose children
+    /// all skipped is not a skip either, because the suite itself reports `✔`.
+    pub fn only_skipped_tests(&self) -> bool {
+        self.nested_skip && !self.passed_test && !self.reported_failure && !self.suite_header
+    }
 }
 
 /// Detects both markers at the start of a line, across chunk boundaries.
@@ -162,24 +197,27 @@ impl MarkerScanner {
         if text.starts_with(SKIP_PLAN_PREFIX) {
             self.scan.skipped = true;
         }
-        // Once a report has been seen the remaining lines cannot change the
-        // verdict, so the two more expensive checks are skipped. Stdout can be
-        // large, and this runs per line.
-        if self.scan.reported_failure {
-            self.line.clear();
-            return;
-        }
-        // The reporter indents nested tests and wraps the glyph in colour codes
-        // when `FORCE_COLOR` is set, so this one is compared after both are
-        // stripped.
-        if visible_start(&text).starts_with(FAILURE_MARKER) {
+        // The reporter indents nested tests and wraps every glyph in colour codes
+        // when `FORCE_COLOR` is set, so all three are compared after the prefix
+        // is stripped. They have to be read even once a failure is seen, because
+        // "did anything else run" decides whether a skip-only file skipped.
+        let visible = visible_start(&text);
+        if visible.starts_with(FAILURE_MARKER) {
             self.scan.reported_failure = true;
-            self.line.clear();
-            return;
-        }
-        // Cheap gate before the allocating path: most lines do not contain the
-        // word at all, so they never build a stripped copy.
-        if text.contains(UNCAUGHT_MARKER) && mentions_uncaught(&strip_ansi(&text)) {
+        } else if visible.starts_with(NESTED_SKIP_MARKER) {
+            // `﹣ name # SKIP`, or `﹣ name # <reason>` when the skip carries a
+            // message. The glyph alone is the signal: `hyphen:minus` has exactly
+            // one assignment site in the reporter, inside the `skip !== undefined`
+            // branch, so nothing else prints it. `# TODO` keeps the fail glyph on
+            // a failing todo and the pass glyph on a passing one.
+            self.scan.nested_skip = true;
+        } else if visible.starts_with(PASS_MARKER) {
+            self.scan.passed_test = true;
+        } else if visible.starts_with(SUITE_MARKER) {
+            self.scan.suite_header = true;
+        } else if text.contains(UNCAUGHT_MARKER) && mentions_uncaught(&strip_ansi(&text)) {
+            // Only the allocating path is gated: it is the expensive one, and
+            // once true it can never become false.
             self.scan.reported_failure = true;
         }
         self.line.clear();
@@ -433,15 +471,43 @@ impl FileResult {
         }
     }
 
-    /// Whether this row is a skip, including rows recorded before `skipped` existed.
+    /// Whether this row is a skip, including rows recorded before `skipped`
+    /// existed.
+    ///
+    /// Three forms count:
+    ///
+    /// 1. A `1..0 # Skipped:` plan line, which is what `common.skip()` prints.
+    /// 2. A recorded `skipped: true`, which preserves a verdict the full-stream
+    ///    scan reached but the retained head cannot show.
+    /// 3. A `node:test` file whose every mark was a skip — see
+    ///    [`FileResult::only_skipped_tests`].
     ///
     /// Marker evidence is **cumulative**: a recorded `true` stands, and a marker
     /// found in the recorded stdout also counts. This is not a fallback chain
-    /// that lets a recorded value hide new evidence — see
-    /// [`FileResult::reported_failure`] for why that distinction matters when a
-    /// detection rule is extended.
+    /// that lets a recorded value hide new evidence.
     pub fn is_skipped(&self) -> bool {
-        self.skipped == Some(true) || has_skip_plan_line(&self.stdout_head)
+        self.skipped == Some(true)
+            || has_skip_plan_line(&self.stdout_head)
+            || self.only_skipped_tests()
+    }
+
+    /// Whether stdout showed a `node:test` file that ran nothing.
+    ///
+    /// The form is `﹣ <name> # SKIP` with no `✔`, `▶` or `✖` anywhere: every
+    /// test in the file skipped. This must not be inferred from the glyph alone.
+    /// Two cases show why:
+    ///
+    /// - A mixed file prints skips *and* real results. `test-runner-module-mocking.js`
+    ///   has 1 skip, 10 passes and 43 failures; calling it a skip would be wrong.
+    /// - A `describe` whose children all skip still prints `✔ outer suite`,
+    ///   because the suite itself passed. That is a pass, not a skip.
+    ///
+    /// It also only applies to an exit-0 row. A non-zero exit is already a
+    /// failure, and calling it a skip would hide that.
+    pub fn only_skipped_tests(&self) -> bool {
+        self.exit_code == Some(0)
+            && !self.timed_out
+            && scan_text(&self.stdout_head).only_skipped_tests()
     }
 
     /// Whether stdout announced a failure the exit code denied.
@@ -900,7 +966,98 @@ mod tests {
         }
     }
 
-    // --- the uncaught marker: the larger hollow-pass population --------------
+    // --- the bare skip glyph: a node:test file that ran nothing --------------
+
+    #[test]
+    fn a_file_with_only_skip_marks_is_a_skip() {
+        // Verbatim rustnode output for `test-assert-checktag.js`, captured by
+        // running it: one skipped `<anonymous>` test, nothing else, exit 0.
+        let stdout = "\u{FE63} <anonymous> (2.061786ms) # SKIP";
+        let skipped = row("parallel/test-assert-checktag.js", stdout, true, 0, None);
+        assert_eq!(skipped.outcome(), Outcome::Skipped);
+        assert!(skipped.only_skipped_tests());
+        // A plan line is absent, so this is genuinely a third form.
+        assert!(!has_skip_plan_line(stdout));
+    }
+
+    #[test]
+    fn a_file_that_mixed_skips_with_real_results_keeps_its_verdict() {
+        // `test-runner-module-mocking.js` really prints 1 skip, 10 passes and 43
+        // failures. Counting it as a skip would hide 43 real failures.
+        let mixed = "  \u{FE63} skipped one (1ms) # SKIP\n  \u{2714} passed one (1ms)\n  \u{2716} failed one (1ms)";
+        assert_eq!(
+            row(
+                "parallel/test-runner-module-mocking.js",
+                mixed,
+                true,
+                0,
+                None
+            )
+            .outcome(),
+            Outcome::Failed,
+            "the failure already decided this row"
+        );
+        // And a mixed row that passed overall is still a pass.
+        let mixed_ok = "\u{FE63} skipped one (1ms) # SKIP\n\u{2714} passed one (1ms)";
+        assert_eq!(
+            row("parallel/test-x.js", mixed_ok, true, 0, None).outcome(),
+            Outcome::Passed
+        );
+        assert!(!row("parallel/test-x.js", mixed_ok, true, 0, None).only_skipped_tests());
+    }
+
+    #[test]
+    fn a_describe_whose_children_all_skip_is_a_pass_not_a_skip() {
+        // Captured from a `describe` with two skipped `it`s: the children print
+        // `﹣` but the suite itself prints `✔ outer suite`. That pass is real, so
+        // requiring zero `▶`/`✔` is what keeps this from being called a skip.
+        let stdout = "\u{25B6} outer suite\n  \u{FE63} a (0.5ms) # SKIP\n  \u{FE63} b (0.08ms) # SKIP\n\u{2714} outer suite (1.6ms)";
+        let suite = row("parallel/test-suite.js", stdout, true, 0, None);
+        assert_eq!(suite.outcome(), Outcome::Passed);
+        assert!(!suite.only_skipped_tests());
+    }
+
+    #[test]
+    fn a_bare_suite_header_alone_prevents_a_skip_verdict() {
+        // Even without a `✔`, a `▶` means the reporter opened a suite, so the
+        // file did more than skip. Narrow on purpose: the pure-skip shape has no
+        // header at all.
+        let stdout = "\u{25B6} outer\n  \u{FE63} a # SKIP";
+        assert!(!row("parallel/test-y.js", stdout, true, 0, None).only_skipped_tests());
+    }
+
+    #[test]
+    fn a_skip_carrying_a_custom_message_is_still_a_skip() {
+        // `{ skip: 'reason' }` prints `﹣ name # reason`, not `# SKIP`, so the
+        // rule must key on the glyph rather than the word. Captured from
+        // rustnode: `﹣ with a reason (0.86ms) # not on this platform`.
+        let stdout = "\u{FE63} with a reason (0.860251ms) # not on this platform";
+        let r = row("parallel/test-x.js", stdout, true, 0, None);
+        assert_eq!(r.outcome(), Outcome::Skipped);
+        assert!(r.only_skipped_tests());
+    }
+
+    #[test]
+    fn a_skip_glyph_outside_the_reporter_position_is_not_a_skip() {
+        // The glyph only counts at the start of a line, where the reporter puts
+        // it. A test printing it mid-line is still a pass. (A line that *starts*
+        // with it is the real shape even without a message, which is why that
+        // case is not listed here.)
+        let stdout = "note: \u{FE63} is the skip symbol";
+        let r = row("parallel/test-z.js", stdout, true, 0, None);
+        assert_eq!(r.outcome(), Outcome::Passed, "wrongly skipped: {stdout}");
+    }
+
+    #[test]
+    fn a_skip_only_shape_on_a_nonzero_exit_is_still_a_failure() {
+        // The bare-skip rule applies only to exit 0. A non-zero exit must not be
+        // relabelled a skip.
+        let stdout = "\u{FE63} <anonymous> (2ms) # SKIP";
+        assert_eq!(
+            row("parallel/test-w.js", stdout, false, 1, None).outcome(),
+            Outcome::Failed
+        );
+    }
 
     /// Verbatim rustnode stdout for `test-crypto-keygen-rsa-pss.js`, captured by
     /// running it directly: an assertion that escaped, printed to stdout, with

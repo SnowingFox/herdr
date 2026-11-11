@@ -97,5 +97,16 @@
     "flags": [],
     "stdout_head": "",
     "stderr_head": "ReferenceError: require is not defined"
+  },
+  {
+    "file": "parallel/test-assert-checktag.js",
+    "suite": "parallel",
+    "passed": true,
+    "exit_code": 0,
+    "duration_ms": 161,
+    "timed_out": false,
+    "flags": [],
+    "stdout_head": "\ufe63 <anonymous> (0.836915ms) # SKIP",
+    "stderr_head": ""
   }
 ]
