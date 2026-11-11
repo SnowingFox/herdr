@@ -173,17 +173,17 @@ fn publish(scope: &mut v8::PinScope<'_, '_>, denied: &AccessDeniedError) {
         ("permission", denied.permission()),
         ("resource", denied.resource()),
     ] {
-        if let (Some(key), Some(text)) = (
-            v8::String::new(scope, name),
-            v8::String::new(scope, value),
-        ) {
+        if let (Some(key), Some(text)) =
+            (v8::String::new(scope, name), v8::String::new(scope, value))
+        {
             message.set(scope, key.into(), text.into());
         }
     }
     // `drop` is `undefined` for a denial, which is what `Publish` passes for
     // `dropped=false`; the property is present so a subscriber destructuring it
     // sees `undefined` rather than nothing.
-    if let (Some(key), Some(undefined)) = (v8::String::new(scope, "drop"), Some(v8::undefined(scope)))
+    if let (Some(key), Some(undefined)) =
+        (v8::String::new(scope, "drop"), Some(v8::undefined(scope)))
     {
         message.set(scope, key.into(), undefined.into());
     }
@@ -283,7 +283,10 @@ pub fn deny_addon(resource: &str) -> Option<AccessDeniedError> {
 /// `test-permission-audit-addons-does-not-deny.js` draws: audit mode reaches the
 /// real loader, logs the denial, and fails with `ERR_DLOPEN_FAILED` for a missing
 /// file rather than `ERR_DLOPEN_DISABLED`.
-pub fn check_addon<'s>(scope: &mut v8::PinScope<'s, '_>, resource: &str) -> Option<AccessDeniedError> {
+pub fn check_addon<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    resource: &str,
+) -> Option<AccessDeniedError> {
     let denied = observe(|model| model.check_addon_named(resource))?;
     publish(scope, &denied);
     if is_audit() {
@@ -294,7 +297,10 @@ pub fn check_addon<'s>(scope: &mut v8::PinScope<'s, '_>, resource: &str) -> Opti
 
 /// [`deny_net`] for a call site with a V8 scope, publishing the denial to
 /// `node:permission-model:net` first.
-pub fn check_net<'s>(scope: &mut v8::PinScope<'s, '_>, resource: &str) -> Option<AccessDeniedError> {
+pub fn check_net<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    resource: &str,
+) -> Option<AccessDeniedError> {
     let denied = observe(|model| model.check_net(resource))?;
     publish(scope, &denied);
     if is_audit() {

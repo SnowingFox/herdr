@@ -382,8 +382,9 @@ fn connect_family(
             return EBADF;
         }
         // SAFETY: the handle is live and `storage` holds a parsed address.
-        let status =
-            unsafe { uv::uv_udp_connect(handle.raw(), ptr::from_ref(&storage).cast::<uv::sockaddr>()) };
+        let status = unsafe {
+            uv::uv_udp_connect(handle.raw(), ptr::from_ref(&storage).cast::<uv::sockaddr>())
+        };
         if status == 0 {
             handle.net_permission_granted = true;
         }

@@ -473,9 +473,10 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
     // `getOptionValue('--addons')` reads. Audit mode deliberately keeps addons
     // enabled so the `addon` check can publish the denial instead.
     if config_wants_addons_disabled(&options.exec_argv) {
-        options
-            .parsed
-            .force("--addons", rn_bind_options::parsed::ParsedValue::Bool(false));
+        options.parsed.force(
+            "--addons",
+            rn_bind_options::parsed::ParsedValue::Bool(false),
+        );
     }
     // The permission model is the one thing this parser builds rather than
     // describes: `PermissionConfig::from_args` already reads these flags in both
@@ -521,7 +522,10 @@ fn config_wants_addons_disabled(argv: &[String]) -> bool {
     let mut audit = false;
     let mut allow_addons = false;
     for argument in argv {
-        match argument.split_once('=').map_or(argument.as_str(), |(name, _)| name) {
+        match argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(name, _)| name)
+        {
             "--permission" => enforcing = true,
             "--permission-audit" => {
                 enforcing = true;
@@ -696,7 +700,11 @@ mod tests {
             "1",
         ])
         .expect("parses");
-        assert!(options.unimplemented.is_empty(), "{:?}", options.unimplemented);
+        assert!(
+            options.unimplemented.is_empty(),
+            "{:?}",
+            options.unimplemented
+        );
     }
 
     #[test]
