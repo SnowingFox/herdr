@@ -185,7 +185,14 @@ fn an_enabled_option_makes_its_builtin_reachable_again() {
 
 #[test]
 fn ordinary_builtins_are_unaffected() {
-    for id in ["fs", "node:fs", "path", "node:path", "assert", "node:assert"] {
+    for id in [
+        "fs",
+        "node:fs",
+        "path",
+        "node:path",
+        "assert",
+        "node:assert",
+    ] {
         assert_eq!(outcome(&[], id), "LOADS", "{id} must keep working");
     }
 }
