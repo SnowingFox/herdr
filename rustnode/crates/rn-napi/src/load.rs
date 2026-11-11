@@ -192,6 +192,10 @@ pub unsafe fn load<'s>(
     // The guard is what makes every `napi_*` call the addon makes from here on
     // resolve to this scope.
     let guard = crate::scope::ScopeGuard::enter(scope);
+    // Record the isolate and context now, so a finalizer or a backing-store
+    // deleter that runs with no Node-API scope can still re-enter V8 later. This
+    // is the first point where an addon exists that could outlive a callback.
+    crate::scope::remember_context(scope);
     let handle = crate::values::to_napi(exports.into());
     // SAFETY: `callback` is the addon's own exported function, `env` is the box
     // just created, and `handle` is a value from the scope the guard published.

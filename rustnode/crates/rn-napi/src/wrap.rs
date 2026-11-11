@@ -68,6 +68,14 @@ pub(crate) struct Wrap {
     /// Set once the finalizer has run, so it runs exactly once even when both the
     /// guaranteed finalizer and `napi_delete_reference` reach it.
     pub(crate) finalized: bool,
+    /// The weak handle that carries the finalizer.
+    ///
+    /// **Dropping a `v8::Weak` deregisters its finalizer** — `impl Drop for Weak`
+    /// calls `remove_finalizer` (`handle.rs:1167` in rusty_v8). Holding the handle
+    /// only transiently with `let _ =` therefore installed a finalizer and removed
+    /// it in the same expression, which is why the wrap finalizer never ran. The
+    /// handle lives here so it survives as long as the object might.
+    weak: Option<v8::Weak<v8::Object>>,
 }
 
 // SAFETY: the wrap is created and consumed on the isolate's thread. Its raw
@@ -123,11 +131,47 @@ pub(crate) unsafe fn wrap_of<'s>(
 
 /// Runs a wrap's finalizer once, then frees the box when the runtime owns it.
 ///
+/// # Threading
+///
+/// The addon's callback is **deferred to the loop's thread**, because a weak
+/// callback fires on whichever thread ran the collection and calling into V8 from
+/// there is undefined behaviour. That is right for the GC path, which is the only
+/// caller of this function. [`run_finalizer_now`] is the variant for a caller that
+/// is already on the isolate's thread and must see the finalizer run before it
+/// returns — `napi_remove_wrap` is that caller.
+///
 /// # Safety
 ///
 /// `pointer` must come from this module, and the caller must not use it
 /// afterwards when the wrap is not owned by the addon.
-pub(crate) unsafe fn run_finalizer(pointer: *mut Wrap) {
+unsafe fn run_finalizer(pointer: *mut Wrap) {
+    unsafe { finish_finalizer(pointer, true) };
+}
+
+/// Frees a runtime-owned wrap's box without running its finalizer.
+///
+/// Used by `napi_remove_wrap`, where the addon takes the pointer back: running the
+/// finalizer would free the allocation the addon now owns.
+///
+/// # Safety
+///
+/// `pointer` must be a runtime-owned wrap this module allocated, already detached
+/// from its object.
+unsafe fn discard_runtime_wrap(pointer: *mut Wrap) {
+    if pointer.is_null() {
+        return;
+    }
+    // SAFETY: the caller guarantees this is one of this module's allocations and
+    // that nothing else reaches it.
+    drop(unsafe { Box::from_raw(pointer) });
+}
+
+/// Shared body of the two finalizer entry points.
+///
+/// # Safety
+///
+/// As [`run_finalizer`].
+unsafe fn finish_finalizer(pointer: *mut Wrap, defer: bool) {
     if pointer.is_null() {
         return;
     }
@@ -136,11 +180,39 @@ pub(crate) unsafe fn run_finalizer(pointer: *mut Wrap) {
     if !wrap.finalized {
         wrap.finalized = true;
         if let Some(finalize) = wrap.finalize {
-            // SAFETY: the addon's own callback, with the environment it installed
-            // the wrap against. Both the guaranteed finalizer and
-            // `napi_delete_reference` run on the isolate's thread, which is where
-            // addon callbacks must run.
-            unsafe { finalize(wrap.env, wrap.data, wrap.finalize_hint) };
+            let env = wrap.env as usize;
+            let data = wrap.data as usize;
+            let hint = wrap.finalize_hint as usize;
+            if defer {
+                // V8 may call the weak callback from a GC thread, so the addon's
+                // finalizer is deferred to the loop's thread where a scope exists.
+                let _ = rn_core::finalizer::enqueue(move |scope| {
+                    let guard = crate::scope::ScopeGuard::enter(scope);
+                    // SAFETY: the addon's own callback with the pointers it
+                    // supplied; it is being told to release `data` now.
+                    unsafe {
+                        finalize(
+                            env as *mut NapiEnv,
+                            data as *mut c_void,
+                            hint as *mut c_void,
+                        )
+                    };
+                    drop(guard);
+                });
+            } else {
+                // Already on the isolate's thread inside a scope
+                // (`napi_remove_wrap`), so running it here is both legal and what
+                // Node does: the addon expects the finalizer to have run when that
+                // call returns.
+                // SAFETY: as above.
+                unsafe {
+                    finalize(
+                        env as *mut NapiEnv,
+                        data as *mut c_void,
+                        hint as *mut c_void,
+                    )
+                };
+            }
         }
     }
     if !wrap.owned_by_addon {
@@ -197,20 +269,18 @@ pub(crate) unsafe fn install<'s>(
     // the addon never deletes its reference. It frees the box only when the
     // runtime owns it, because an addon-owned box must survive until the addon's
     // `napi_delete_reference` — `napi_unwrap` may still be called through it.
-    let owned_by_addon = unsafe { (*pointer).owned_by_addon };
-    let _ = v8::Weak::with_guaranteed_finalizer(
+    let weak = v8::Weak::with_guaranteed_finalizer(
         scope,
         object,
         Box::new(move || {
             // SAFETY: `pointer` was allocated above for this object alone, and
             // this finalizer is the only thing that frees a runtime-owned box.
             unsafe { run_finalizer(pointer) };
-            if owned_by_addon {
-                // The addon still holds a reference, so the box stays until that
-                // is deleted; nothing here may free it.
-            }
         }),
     );
+    // Stored on the wrap so the handle outlives this call: dropping it would
+    // deregister the finalizer.
+    unsafe { (*pointer).weak = Some(weak) };
     Some(pointer)
 }
 
@@ -251,6 +321,7 @@ pub(crate) unsafe fn wrap_object<'s>(
         env,
         owned_by_addon: wants_reference,
         finalized: false,
+        weak: None,
     });
     // SAFETY: `object` is a live object from `scope`.
     let Some(pointer) = (unsafe { install(scope, object, wrap) }) else {
@@ -307,15 +378,26 @@ pub(crate) unsafe fn remove<'s>(
     object.delete_private(scope, key)?;
     // SAFETY: the pointer came from `wrap_of`, so it is one of this module's.
     let wrap = unsafe { &*pointer };
+    // Read the fields *before* the finalizer runs: a runtime-owned wrap frees its
+    // box inside `run_finalizer_now`, so reading afterwards is a use-after-free.
+    // That bug returned a garbage pointer to the addon, which then freed an
+    // address it did not own.
     let data = wrap.data;
-    if wrap.owned_by_addon {
+    let owned_by_addon = wrap.owned_by_addon;
+    if owned_by_addon {
         // Node's `ResetFinalizer`: the addon still holds the reference and may
         // delete it later, but the finalizer must not run now.
         unsafe { reset_finalizer(pointer) };
     } else {
-        // SAFETY: the runtime owned it and the property is gone, so this is the
-        // last reference.
-        unsafe { run_finalizer(pointer) };
+        // The addon is taking the pointer back and owns it from here, so the
+        // finalizer must **not** run: it would free the allocation the addon is
+        // about to use. Node reaches the same outcome by deleting the reference,
+        // which for `RemoveWrap` drops the finalizer with it.
+        //
+        // This frees only the box that recorded the wrap.
+        // SAFETY: the runtime owned the box and the property is gone, so nothing
+        // else may reach it.
+        unsafe { discard_runtime_wrap(pointer) };
     }
     Some(data)
 }
@@ -332,6 +414,7 @@ mod tests {
             env: std::ptr::null_mut(),
             owned_by_addon,
             finalized: false,
+            weak: None,
         })
     }
 

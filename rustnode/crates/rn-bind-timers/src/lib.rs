@@ -324,6 +324,10 @@ fn setup_timers(
     // lazily matters: a destroy queued from the script body must arm the handle
     // before the loop decides it has nothing left to do.
     rn_core::native_immediates::set_wakeup(arm_check_phase);
+    // The finalizer queue deliberately does *not* register `arm_check_phase`: a
+    // finalizer is enqueued from a V8 GC thread, and `uv_check_start` on that
+    // thread creates handles on a loop nothing pumps. Loop liveness is answered by
+    // `has_external_work` instead, and the existing check phase drains the queue.
 }
 
 fn toggle_immediate_ref(
@@ -514,8 +518,13 @@ unsafe extern "C" fn on_check(_handle: *mut uv::uv_check_t) {
     // due in this iteration is reported before any `setImmediate` callback. Doing
     // it the other way round puts every destroy one immediate too late.
     let native_pending = rn_core::native_immediates::has_pending();
-    if native_pending {
+    // Node-API finalizers deferred from a V8 GC thread run here, before the
+    // native immediates, for the same reason those run before `processImmediate`:
+    // this is the first point in the iteration with a scope on the isolate's
+    // thread, and a finalizer may queue an immediate of its own.
+    if native_pending || rn_core::finalizer::has_pending() {
         rn_uv::callback::with_context(|scope| {
+            rn_core::finalizer::run_pending(scope);
             rn_core::native_immediates::run_and_clear(scope);
         });
     }
@@ -610,6 +619,11 @@ pub fn check_phase_pending() -> bool {
     // one) runs at the start of this phase, so its presence keeps the handle
     // armed exactly like a JavaScript immediate does.
     if rn_core::native_immediates::has_pending() {
+        return true;
+    }
+    // A deferred Node-API finalizer is work for this phase too, and the handle has
+    // to be armed or the iteration that would run it never happens.
+    if rn_core::finalizer::has_pending() {
         return true;
     }
     if immediate_count() > 0 {

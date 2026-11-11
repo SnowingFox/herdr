@@ -12,6 +12,7 @@ pub mod callback_scope;
 pub mod codec;
 pub mod env;
 pub mod error;
+pub mod finalizer;
 pub mod handle;
 pub mod hook_slot;
 pub mod host_object;

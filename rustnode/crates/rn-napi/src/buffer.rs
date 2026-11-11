@@ -43,6 +43,14 @@ struct ExternalBuffer {
 
 /// The deleter V8 calls when an external buffer becomes unreachable.
 ///
+/// # Threading
+///
+/// V8 may call this from a GC thread, which is not the isolate's thread. The
+/// addon's finalizer therefore cannot run here — it may call `napi_throw_error`
+/// or create values, and both need a scope on the isolate's thread. It is
+/// deferred through [`crate::finalizer`], the same way Node parks it on
+/// `pending_finalizers` and drains from `SetImmediate`.
+///
 /// # Safety
 ///
 /// Called by V8 with the `deleter_data` given to `new_backing_store_from_ptr`.
@@ -58,9 +66,30 @@ unsafe extern "C" fn drop_external_buffer(
     // `external_backing_store`, and V8 calls the deleter exactly once.
     let buffer = unsafe { Box::from_raw(deleter_data as *mut ExternalBuffer) };
     if let Some(finalize) = buffer.finalize {
-        // SAFETY: the addon's own callback with the pointer it supplied. V8 runs
-        // this on the isolate's thread, which is where addon callbacks must run.
-        unsafe { finalize(buffer.env, buffer.data, buffer.finalize_hint) };
+        let env = buffer.env as usize;
+        let data = buffer.data as usize;
+        let hint = buffer.finalize_hint as usize;
+        // The closure is `Send` because it captures only addresses, and it runs
+        // on the loop's thread where a scope exists.
+        let queued = rn_core::finalizer::enqueue(move |scope| {
+            let guard = crate::scope::ScopeGuard::enter(scope);
+            // SAFETY: the addon's own callback with the pointers it supplied. The
+            // addon owns `data` and is being told to release it now.
+            unsafe {
+                finalize(
+                    env as *mut NapiEnv,
+                    data as *mut c_void,
+                    hint as *mut c_void,
+                )
+            };
+            drop(guard);
+        });
+        if !queued {
+            tracing::error!(
+                "an external buffer's finalizer could not be queued; \
+                 the addon's release callback will not run"
+            );
+        }
     }
     // The addon's `data` is the addon's to free, and it has just been told to.
     drop(buffer);

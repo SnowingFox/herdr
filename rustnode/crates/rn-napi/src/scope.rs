@@ -113,6 +113,26 @@ pub(crate) fn with_context<R>(
     rn_uv::callback::with_context(body)
 }
 
+/// Records the isolate and context so a callback with no Node-API scope can
+/// re-enter V8.
+///
+/// `rn-uv`'s callback module owns the storage, but nothing guarantees a binding
+/// that calls `remember_context` is installed before an addon finalizer runs.
+/// `rn-napi` therefore records it at `process.dlopen` time, which is the first
+/// moment an addon can have created anything that outlives a callback.
+///
+/// Idempotent; repeated calls store the same isolate and an equivalent context.
+pub(crate) fn remember_context(scope: &mut v8::PinScope<'_, '_>) {
+    rn_uv::callback::remember_context(scope);
+}
+
+/// Whether a context has been recorded, so a shim can report a real failure
+/// instead of a misleading one.
+#[cfg(test)]
+pub(crate) fn has_context() -> bool {
+    rn_uv::callback::has_context()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

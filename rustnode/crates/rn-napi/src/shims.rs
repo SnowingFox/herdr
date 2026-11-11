@@ -1432,7 +1432,13 @@ fn throw_coded(
 ) -> NapiStatus {
     let text = crate::env::c_string(msg);
     let code = crate::env::c_string(code);
-    let created = in_scope(|scope| {
+    // Inside a Node-API entry point there is already a scope. A finalizer or a
+    // backing-store deleter has none — V8 calls it from its own machinery — so
+    // the fallback enters the recorded context, which is what makes
+    // `napi_throw_error` from a finalizer actually schedule the exception.
+    // Without it the throw silently did nothing and `uncaughtException` never
+    // fired, which is a hollow pass rather than a visible failure.
+    let build = |scope: &mut v8::PinScope<'_, '_>| -> Option<v8::Global<v8::Value>> {
         let message = v8::String::new(scope, &text)?;
         let exception = match kind {
             ErrorKind::Error => v8::Exception::error(scope, message),
@@ -1449,11 +1455,30 @@ fn throw_coded(
                 }
             }
         }
-        Some(exception)
-    });
-    match created {
-        Some(Some(exception)) => {
-            throw(env, exception);
+        scope.throw_exception(exception);
+        Some(v8::Global::new(&**scope, exception))
+    };
+
+    let recorded = match in_scope(build) {
+        Some(recorded) => Some(recorded),
+        // No scope: enter the recorded context and try again.
+        None => crate::scope::with_context(|scope| {
+            let guard = crate::scope::ScopeGuard::enter(scope);
+            let recorded = build(scope);
+            drop(guard);
+            recorded
+        }),
+    };
+    match recorded {
+        Some(Some(global)) => {
+            // The exception was thrown and rooted; record it so
+            // `napi_is_exception_pending` agrees.
+            // SAFETY: `env` is null or one of this crate's environments.
+            if let Some(environment) = unsafe { env_from(env) } {
+                let _ = environment.exceptions().try_borrow_mut().map(|mut state| {
+                    state.set(global);
+                });
+            }
             status(env, NapiStatus::Ok)
         }
         Some(None) => status(env, NapiStatus::GenericFailure),
@@ -2890,22 +2915,40 @@ pub unsafe extern "C" fn napi_create_external(
                 let address = data as usize;
                 let hint = finalize_hint as usize;
                 let env_address = env as usize;
-                let _ = v8::Weak::with_guaranteed_finalizer(
+                let weak = v8::Weak::with_guaranteed_finalizer(
                     scope,
                     external,
                     Box::new(move || {
-                        // SAFETY: the addon's own callback, with the environment and
-                        // hint it registered. The pointer's validity is the addon's
-                        // contract, and it has now been told to release it.
-                        unsafe {
-                            finalize(
-                                env_address as *mut NapiEnv,
-                                address as *mut c_void,
-                                hint as *mut c_void,
-                            )
-                        };
+                        // V8 may run this on a GC thread, so the addon's callback is
+                        // deferred to the loop's thread — the same reason a buffer's
+                        // deleter defers.
+                        let _ = rn_core::finalizer::enqueue(move |scope| {
+                            let guard = crate::scope::ScopeGuard::enter(scope);
+                            // SAFETY: the addon's own callback with the pointers it
+                            // supplied; it is being told to release `data` now.
+                            unsafe {
+                                finalize(
+                                    env_address as *mut NapiEnv,
+                                    address as *mut c_void,
+                                    hint as *mut c_void,
+                                )
+                            };
+                            drop(guard);
+                        });
                     }),
                 );
+                // The handle has to outlive this call: dropping a `v8::Weak`
+                // deregisters its finalizer, so `let _ =` would install one and
+                // remove it in the same expression. `into_raw` releases the handle
+                // without that, which is the documented way to persist it past the
+                // scope that created it. The allocation it describes is reclaimed
+                // when the weak callback runs.
+                if let Some(raw) = weak.into_raw() {
+                    // SAFETY: `raw` came from `into_raw` on this handle, and
+                    // leaking it is the conservative choice `into_raw` documents:
+                    // the finalizer still owns the box and will run.
+                    std::mem::forget(raw);
+                }
             }
             Ok(to_napi(external.into()))
         },
