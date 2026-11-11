@@ -103,6 +103,42 @@ step "the cipher control still reports a void run as a void run"
 # the source tree modified.
 ./tools/cipher-negative-control.sh --self-test
 
+step "the exit handler can still fail a process"
+# `common.mustCall` fails a file by calling `process.exit(1)` from inside a
+# `process.on('exit')` listener. Before #60 wired the emit, that listener never
+# ran on a natural loop exit, so ~2850 files under `test/parallel` reported a
+# pass without checking anything and the suite's headline number was overstated.
+#
+# The Rust suite guards the emit itself (`a_natural_exit_runs_the_exit_handlers`
+# and eight neighbours), but not this composition: `same_as_node` asserts
+# `status.success()` on *both* runtimes, so no test there can express "exits 1",
+# and the one test that calls `process.exit()` inside a handler passes no code.
+# A regression where the emit runs but a re-entrant exit's code is dropped would
+# leave every one of those green while `mustCall` silently became a no-op again.
+#
+# `--mechanism` asserts exactly that pair and needs no Node test tree, so it can
+# run on every machine. The full six-case matrix still needs Node's own
+# `test/common` and stays opt-in; it passes on current master.
+#
+# The binary is made executable first. The cipher self-test above restores
+# `target/debug/rustnode` by `cp`-ing a `mktemp` backup into the path it deleted,
+# which leaves the file mode 0600, and the next `cargo` invocation is what
+# repairs it. `per-context-control.sh` and its audit work around the same thing
+# by running earlier; this step cannot, because a control that execs a
+# non-executable binary reports exit 126 and reads as a *runtime* failure rather
+# than a missing mode bit. Restoring the mode here is the narrow fix: it makes
+# the step independent of how the preceding self-test restored the binary,
+# instead of depending on its restore behaviour staying what it is today.
+chmod +x target/debug/rustnode
+./tools/mustcall-negative-control.sh --mechanism
+
+mustcall_tests="${RUSTNODE_TEST_CACHE:-${TMPDIR:-/tmp}}/rustnode-node-test/test"
+if [ -f "$mustcall_tests/common/index.js" ]; then
+  echo "mustcall control: a Node test tree is present at $mustcall_tests;"
+  echo "mustcall control: ./tools/mustcall-negative-control.sh --quick --tests $mustcall_tests"
+  echo "mustcall control: runs the full six-case matrix as well"
+fi
+
 if [ "$quick" -eq 0 ]; then
   step "running the workspace tests"
   cargo test --workspace
