@@ -102,23 +102,40 @@ if missing:
     print(f"FAIL: these recorded skips were not reported as skipped: {sorted(missing)}")
     sys.exit(1)
 
+# The two hollow passes: exited 0, output said a subtest failed.
+expected_misreported = {
+    "parallel/test-assert-deep.js",
+    "parallel/test-runner-reporters.js",
+}
+reported_misreported = {
+    row["file"] for row in report["failures"] if row["misreported"]
+}
+if expected_misreported - reported_misreported:
+    print("FAIL: these exit-0 rows reported a failing test but were not corrected: "
+          f"{sorted(expected_misreported - reported_misreported)}")
+    sys.exit(1)
+
 # The control must not be a blanket reclassification: the real pass and the real
 # failure in the same file must keep their old verdicts.
 if report["passed"] != 1:
     print(f"FAIL: expected exactly 1 pass, got {report['passed']}")
     sys.exit(1)
-if report["failed"] != 1:
-    print(f"FAIL: expected exactly 1 failure, got {report['failed']}")
-    sys.exit(1)
 if report["skipped"] != 4:
     print(f"FAIL: expected 4 skips, got {report['skipped']}")
+    sys.exit(1)
+if report["failed"] != 3:
+    print(f"FAIL: expected 3 failures, got {report['failed']}")
+    sys.exit(1)
+if report["misreported"] > report["failed"]:
+    print("FAIL: misreported must be a subset of failed")
     sys.exit(1)
 if report["passed"] + report["skipped"] + report["failed"] != report["total"]:
     print("FAIL: the three outcomes do not reconcile with total")
     sys.exit(1)
 
-print(f"PASS: 4 skips / {report['passed']} pass / {report['failed']} failure / "
-      f"{report['total']} total; rate {report['rate']:.3f} over judged files")
+print(f"PASS: 4 skips / {report['passed']} pass / {report['failed']} failure "
+      f"({report['misreported']} corrected hollow passes) / {report['total']} total; "
+      f"rate {report['rate']:.3f} over judged files")
 PY
 [ $? -eq 0 ] || exit 1
 

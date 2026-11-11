@@ -44,6 +44,28 @@
     "stderr_head": ""
   },
   {
+    "file": "parallel/test-runner-reporters.js",
+    "suite": "parallel",
+    "passed": true,
+    "exit_code": 0,
+    "duration_ms": 153,
+    "timed_out": false,
+    "flags": [],
+    "stdout_head": "\u25b6 node:test reporters\n  \u001b[31m\u2716 should default to outputing TAP to stdout \u001b[90m(66.293103ms)\u001b[39m\u001b[39m\n  \u001b[31m\u2716 should default destination to stdout when passing a single reporter \u001b[90m(60.468593ms)\u001b[39m\u001b[39m\n  \u001b[31m\u2716 should throw when passing reporters without a destination \u001b[90m(56.646105ms)\u001b[39m\u001b[39m\n\u001b[31m\u2716 node:test reporters \u001b[90m(68.988395ms)\u001b[39m\u001b[39m",
+    "stderr_head": ""
+  },
+  {
+    "file": "parallel/test-assert-deep.js",
+    "suite": "parallel",
+    "passed": true,
+    "exit_code": 0,
+    "duration_ms": 402,
+    "timed_out": false,
+    "flags": [],
+    "stdout_head": "\u2714 deepEqual (4.758636ms)\n\u2714 loose deepEqual (2.749957ms)\n\u2714 date (1.139879ms)\n\u2716 Crypto (2.427672ms)\n\u2714 Comparing two identical WeakMap instances (0.055139ms)\n\u2716 Comparing two different WeakMap instances (0.261115ms)",
+    "stderr_head": ""
+  },
+  {
     "file": "parallel/test-fs-open.js",
     "suite": "parallel",
     "passed": true,

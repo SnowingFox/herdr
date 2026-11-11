@@ -29,6 +29,9 @@ pub struct ClusterRow {
     pub total: usize,
     /// Files that actually asserted something: `passed + failed`.
     pub judged: usize,
+    /// Files counted as failed because their output announced a failing test
+    /// while the process exited 0. A subset of `failed`, not a fourth column.
+    pub misreported: usize,
     /// `passed / judged`, or 0.0 when nothing in the cluster ran.
     pub rate: f64,
 }
@@ -49,6 +52,10 @@ pub struct Report {
     pub total: usize,
     /// Files that actually asserted something: `passed + failed`.
     pub judged: usize,
+    /// Files counted as failed because their own output announced a failing test
+    /// while the process exited 0. A subset of `failed`, reported so the
+    /// correction is visible rather than silent.
+    pub misreported: usize,
     /// `passed / judged`, with skips excluded from the denominator.
     pub rate: f64,
     /// Failing files, longest-to-fix first is not knowable, so alphabetical.
@@ -73,6 +80,11 @@ pub struct FailureRow {
     pub cluster: String,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    /// The process exited 0 but its own output announced a failing test.
+    ///
+    /// This is the hollow-pass case: a subtest failed and the runtime reported
+    /// success, because `test:summary` never reached the exit-code path.
+    pub misreported: bool,
     /// Truncated first stderr line, enough to name the missing builtin.
     pub reason: String,
 }
@@ -126,13 +138,13 @@ pub fn tally(dir: &Path) -> Result<Tally, String> {
 
 /// Builds the report from a tally.
 pub fn report(tally: &Tally, results_dir: &Path) -> Report {
-    // (passed, skipped, failed)
-    let mut totals: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
+    // (passed, skipped, failed, misreported)
+    let mut totals: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
     let mut failures = Vec::new();
     let mut skips = Vec::new();
     for result in tally.latest.values() {
         let cluster = cluster_of(&result.file);
-        let entry = totals.entry(cluster.clone()).or_insert((0, 0, 0));
+        let entry = totals.entry(cluster.clone()).or_insert((0, 0, 0, 0));
         match result.outcome() {
             Outcome::Passed => entry.0 += 1,
             Outcome::Skipped => {
@@ -145,12 +157,20 @@ pub fn report(tally: &Tally, results_dir: &Path) -> Report {
             }
             Outcome::Failed => {
                 entry.2 += 1;
+                // A corrected pass is counted in `failed` and named here, so the
+                // report can say how much of the failure count came from the
+                // output disagreeing with the exit code.
+                let misreported = result.is_misreported_pass();
+                if misreported {
+                    entry.3 += 1;
+                }
                 failures.push(FailureRow {
                     file: result.file.clone(),
                     cluster,
                     exit_code: result.exit_code,
                     timed_out: result.timed_out,
-                    reason: first_line(&result.stderr_head),
+                    misreported,
+                    reason: failure_reason(result),
                 });
             }
         }
@@ -160,7 +180,7 @@ pub fn report(tally: &Tally, results_dir: &Path) -> Report {
 
     let clusters: Vec<ClusterRow> = totals
         .into_iter()
-        .map(|(cluster, (passed, skipped, failed))| {
+        .map(|(cluster, (passed, skipped, failed, misreported))| {
             let judged = passed + failed;
             ClusterRow {
                 cluster,
@@ -169,6 +189,7 @@ pub fn report(tally: &Tally, results_dir: &Path) -> Report {
                 failed,
                 total: passed + skipped + failed,
                 judged,
+                misreported,
                 rate: rate(passed, judged),
             }
         })
@@ -176,6 +197,7 @@ pub fn report(tally: &Tally, results_dir: &Path) -> Report {
     let passed: usize = clusters.iter().map(|row| row.passed).sum();
     let skipped: usize = clusters.iter().map(|row| row.skipped).sum();
     let failed: usize = clusters.iter().map(|row| row.failed).sum();
+    let misreported: usize = clusters.iter().map(|row| row.misreported).sum();
     let total: usize = clusters.iter().map(|row| row.total).sum();
     let judged = passed + failed;
 
@@ -188,10 +210,23 @@ pub fn report(tally: &Tally, results_dir: &Path) -> Report {
         failed,
         total,
         judged,
+        misreported,
         rate: rate(passed, judged),
         failures,
         skips,
     }
+}
+
+/// Why a failing row failed, in the form that is most useful to a reader.
+///
+/// A corrected pass has no stderr worth showing — the process claimed success
+/// and may have written nothing there — so the reason names the evidence that
+/// actually decided the verdict.
+fn failure_reason(result: &FileResult) -> String {
+    if result.is_misreported_pass() {
+        return "exit 0 but output reported a failing test".to_string();
+    }
+    first_line(&result.stderr_head)
 }
 
 /// The rate column for one row.
@@ -310,15 +345,27 @@ pub fn render_table(report: &Report) -> String {
         "rate is passed / (passed + failed); {} skipped file(s) are excluded\n",
         report.skipped
     ));
+    if report.misreported > 0 {
+        out.push_str(&format!(
+            "{} of the {} failed file(s) exited 0 while their output reported a failing test\n",
+            report.misreported, report.failed
+        ));
+    }
 
     if !report.failures.is_empty() {
         const SHOWN: usize = 10;
         out.push_str(&format!("\nfailing files ({}):\n", report.failures.len()));
         for failure in report.failures.iter().take(SHOWN) {
-            let status = match (failure.timed_out, failure.exit_code) {
-                (true, _) => "timeout".to_string(),
-                (false, Some(code)) => format!("exit {code}"),
-                (false, None) => "signal".to_string(),
+            let status = if failure.misreported {
+                // The exit code is the misleading part, so say what it was and
+                // that the output disagreed rather than printing a bare exit 0.
+                "exit 0 ✖".to_string()
+            } else {
+                match (failure.timed_out, failure.exit_code) {
+                    (true, _) => "timeout".to_string(),
+                    (false, Some(code)) => format!("exit {code}"),
+                    (false, None) => "signal".to_string(),
+                }
             };
             out.push_str(&format!(
                 "  {:<52} {:<9} {}\n",
@@ -361,6 +408,7 @@ mod tests {
             suite: suite_of(file),
             passed,
             skipped: Some(false),
+            misreported: Some(false),
             exit_code: Some(if passed { 0 } else { 1 }),
             duration_ms: 5,
             timed_out: false,
@@ -378,6 +426,7 @@ mod tests {
             suite: suite_of(file),
             passed: false,
             skipped: Some(true),
+            misreported: Some(false),
             exit_code: Some(0),
             duration_ms: 5,
             timed_out: false,
@@ -614,9 +663,123 @@ mod tests {
         assert_eq!(report.total, 1);
     }
 
-    /// The four rows named in the bug report: real skips from a recorded run,
-    /// written before `skipped` existed, all recorded as `passed: true` with
-    /// exit 0. Reproduced from `run-1794255368768.json` against the pinned tree.
+    /// A row that exited 0 while its own output announced a failing test.
+    fn hollow_result(file: &str, stdout: &str) -> FileResult {
+        FileResult {
+            file: file.to_string(),
+            suite: suite_of(file),
+            passed: true,
+            skipped: Some(false),
+            misreported: Some(true),
+            exit_code: Some(0),
+            duration_ms: 5,
+            timed_out: false,
+            flags: Vec::new(),
+            stdout_head: stdout.to_string(),
+            stderr_head: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_hollow_pass_is_counted_as_failed_and_reported_as_misreported() {
+        let dir = TempDir::new("hollow");
+        write_run(
+            &dir.0,
+            "run-0000000100.json",
+            &[
+                result("parallel/test-fs-open.js", true, ""),
+                hollow_result(
+                    "parallel/test-runner-reporters.js",
+                    "▶ node:test reporters\n  ✖ first\n✖ node:test reporters",
+                ),
+            ],
+        );
+        let report = report(&tally(&dir.0).expect("tally"), &dir.0);
+        assert_eq!(report.passed, 1, "only the clean file passes");
+        assert_eq!(
+            report.failed, 1,
+            "the hollow pass counts against the runtime"
+        );
+        assert_eq!(report.misreported, 1, "and is named as a correction");
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            report.passed + report.skipped + report.failed,
+            report.total,
+            "the correction must not break the sum"
+        );
+        assert_eq!(report.total, 2);
+        assert!((report.rate - 0.5).abs() < 1e-9, "rate was {}", report.rate);
+
+        let row = report
+            .failures
+            .iter()
+            .find(|row| row.file == "parallel/test-runner-reporters.js")
+            .expect("the hollow pass must be listed as a failure");
+        assert!(row.misreported);
+        assert_eq!(row.exit_code, Some(0));
+        assert!(
+            row.reason
+                .contains("exit 0 but output reported a failing test"),
+            "the reason must name the disagreement: {}",
+            row.reason
+        );
+    }
+
+    #[test]
+    fn misreported_is_a_subset_of_failed_not_a_fourth_population() {
+        let dir = TempDir::new("hollow-subset");
+        write_run(
+            &dir.0,
+            "run-0000000100.json",
+            &[
+                hollow_result("parallel/test-runner-reporters.js", "  ✖ first"),
+                result("parallel/test-buffer-bytelength.js", false, "no buffer"),
+                skipped_result("parallel/test-a-skip.js", "no IPv6 support"),
+            ],
+        );
+        let report = report(&tally(&dir.0).expect("tally"), &dir.0);
+        assert_eq!(report.failed, 2, "one ordinary failure plus one correction");
+        assert_eq!(report.misreported, 1);
+        assert!(
+            report.misreported <= report.failed,
+            "misreported must never exceed failed"
+        );
+        assert_eq!(report.passed, 0);
+        assert_eq!(report.total, 3);
+        let cluster_misreported: usize = report.clusters.iter().map(|row| row.misreported).sum();
+        assert_eq!(cluster_misreported, report.misreported);
+    }
+
+    #[test]
+    fn an_old_file_with_a_hollow_pass_re_reads_as_failed() {
+        let dir = TempDir::new("old-hollow");
+        // No `misreported` key: this is what the previous harness wrote for a
+        // file whose subtests failed and which still exited 0.
+        let old = r#"[
+          {
+            "file": "parallel/test-runner-reporters.js",
+            "suite": "parallel",
+            "passed": true,
+            "skipped": false,
+            "exit_code": 0,
+            "duration_ms": 189,
+            "timed_out": false,
+            "stdout_head": "\u25b6 node:test reporters\n  \u001b[31m\u2716 first \u001b[39m\n  \u001b[31m\u2716 second \u001b[39m",
+            "stderr_head": ""
+          }
+        ]"#;
+        std::fs::create_dir_all(&dir.0).expect("mkdir");
+        std::fs::write(dir.0.join("run-0000000100.json"), old).expect("write");
+        let report = report(&tally(&dir.0).expect("tally"), &dir.0);
+        assert_eq!(report.passed, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.misreported, 1);
+        assert_eq!(report.total, 1);
+    }
+
+    /// The four rows named in the bug report, plus two hollow passes: real
+    /// records from runs against the pinned tree, written before `skipped` and
+    /// `misreported` existed, all recorded as `passed: true` with exit 0.
     fn recorded_skips_fixture() -> &'static str {
         include_str!("../tests/fixtures/run-1794255368768-skips.json")
     }
@@ -632,7 +795,7 @@ mod tests {
         .expect("write");
 
         let tally = tally(&dir.0).expect("tally");
-        assert_eq!(tally.latest.len(), 6, "every row must parse");
+        assert_eq!(tally.latest.len(), 8, "every row must parse");
         let report = report(&tally, &dir.0);
 
         let expected = [
@@ -645,15 +808,39 @@ mod tests {
         assert_eq!(reported, expected, "all four rows must be skips");
 
         assert_eq!(report.skipped, 4);
+        // test-fs-open.js is the only clean pass; the two hollow passes and the
+        // one real failure are all failures.
         assert_eq!(report.passed, 1, "only test-fs-open.js really passed");
-        assert_eq!(report.failed, 1, "test-buffer-bytelength.js really failed");
-        assert_eq!(report.total, 6);
-        assert_eq!(report.passed + report.skipped + report.failed, 6);
-        // 1 of 2 judged files pass. The old code said 5 of 6 (83.3%).
-        assert!((report.rate - 0.5).abs() < 1e-9, "rate was {}", report.rate);
+        assert_eq!(report.failed, 3);
+        assert_eq!(
+            report.misreported, 2,
+            "two rows exited 0 but reported failure"
+        );
+        assert_eq!(report.total, 8);
+        assert_eq!(report.passed + report.skipped + report.failed, 8);
+        // 1 of 4 judged files pass. The old harness said 7 of 8 (87.5%).
+        assert!(
+            (report.rate - 0.25).abs() < 1e-9,
+            "rate was {}",
+            report.rate
+        );
 
         assert_eq!(report.skips[0].reason, "Windows specific test.");
         assert_eq!(report.skips[2].reason, "no IPv6 support");
+
+        let corrected: Vec<&str> = report
+            .failures
+            .iter()
+            .filter(|row| row.misreported)
+            .map(|row| row.file.as_str())
+            .collect();
+        assert_eq!(
+            corrected,
+            vec![
+                "parallel/test-assert-deep.js",
+                "parallel/test-runner-reporters.js"
+            ]
+        );
     }
 
     #[test]

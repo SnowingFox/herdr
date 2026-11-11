@@ -243,6 +243,7 @@ fn run_command(args: &[String]) -> Result<u8, String> {
             let status = match result.outcome() {
                 result::Outcome::Passed => "pass",
                 result::Outcome::Skipped => "skip",
+                result::Outcome::Failed if result.is_misreported_pass() => "fail*",
                 result::Outcome::Failed if result.timed_out => "timeout",
                 result::Outcome::Failed => "fail",
             };
@@ -267,21 +268,29 @@ fn run_command(args: &[String]) -> Result<u8, String> {
         .iter()
         .filter(|r| r.outcome() == result::Outcome::Skipped)
         .count();
+    let misreported_total = results_vec
+        .iter()
+        .filter(|r| r.is_misreported_pass())
+        .count();
     let failed_total = results_vec.len() - passed_total - skipped_total;
     let judged = passed_total + failed_total;
     let total = results_vec.len();
 
     // A skip is neither a pass nor a failure, so the headline rate is passes
     // over files that actually ran, and the skipped count is printed next to it
-    // rather than folded into either side.
+    // rather than folded into either side. `fail*` rows are failures the runtime
+    // reported as successes; they are already inside `failed`.
     println!(
-        "{passed_total}/{judged} judged passed ({:.1}%); {skipped_total} skipped; {failed_total} failed; {total} total",
+        "{passed_total}/{judged} judged passed ({:.1}%); {skipped_total} skipped; {failed_total} failed ({misreported_total} exit 0 with failing output); {total} total",
         if judged == 0 {
             0.0
         } else {
             passed_total as f64 / judged as f64 * 100.0
         }
     );
+    if misreported_total > 0 {
+        println!("fail* marks a file whose own output reported a failing test while it exited 0");
+    }
     println!("results written to {}", written.display());
     println!("run `rn-harness report` for the per-subsystem breakdown");
 

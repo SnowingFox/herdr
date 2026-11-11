@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::result::{suite_of, FileResult, SkipScanner};
+use crate::result::{suite_of, FileResult, MarkerScanner, ScanResult};
 use crate::select::{TestFile, PARALLEL_SAFE_SUITES};
 
 /// Bytes of stderr kept per test, enough to show the first failing assertion.
@@ -259,7 +259,7 @@ fn execute(
         }
     }
 
-    let (stdout_head, stderr_head, skipped) = collect_output(pipe_receiver);
+    let (stdout_head, stderr_head, scan) = collect_output(pipe_receiver);
     let mut stderr_head = String::from_utf8_lossy(&stderr_head).trim_end().to_string();
     if timed_out && stderr_head.is_empty() {
         stderr_head = format!("timed out after {:?}", config.timeout);
@@ -267,14 +267,19 @@ fn execute(
 
     // A killed process never got to state its own verdict, so a skip line it
     // printed before the timeout does not excuse the hang.
-    let skipped = skipped && !timed_out;
-    let passed = !timed_out && !skipped && exit_code == Some(0);
+    let skipped = scan.skipped && !timed_out;
+    // A failure marker only matters when the process claimed success: a non-zero
+    // exit is already recorded as failed, so the marker adds nothing there.
+    let exited_zero = exit_code == Some(0);
+    let passed = !timed_out && !skipped && exited_zero;
+    let misreported = scan.reported_failure && passed;
 
     FileResult {
         file: test.relative.clone(),
         suite: suite_of(&test.relative),
         passed,
         skipped: Some(skipped),
+        misreported: Some(misreported),
         exit_code,
         duration_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         timed_out,
@@ -293,19 +298,19 @@ enum Stream {
 
 /// Starts a reader thread that forwards one pipe's first `cap` bytes.
 ///
-/// The reader also keeps reading past `cap`: stdout is scanned for the skip plan
-/// line over the whole stream, because `stdout_head` keeps only the first couple
-/// of KiB and a skipped file may print before it skips. Discarding the rest
-/// without looking would make a long-running test's skip invisible.
+/// The reader also keeps reading past `cap`: stdout is scanned for both markers
+/// over the whole stream, because `stdout_head` keeps only the first couple of
+/// KiB and a marker may be printed after that. Discarding the rest without
+/// looking would make a long-running test's verdict invisible.
 fn spawn_drain(
     mut pipe: impl Read + Send + 'static,
     cap: usize,
     stream: Stream,
-    sender: mpsc::Sender<(Stream, Vec<u8>, bool)>,
+    sender: mpsc::Sender<(Stream, Vec<u8>, ScanResult)>,
 ) {
     std::thread::spawn(move || {
         let mut kept = Vec::new();
-        let mut scanner = SkipScanner::new();
+        let mut scanner = MarkerScanner::new();
         let mut buffer = [0u8; 4096];
         loop {
             match pipe.read(&mut buffer) {
@@ -321,7 +326,12 @@ fn spawn_drain(
                 Err(_) => break,
             }
         }
-        let _ = sender.send((stream, kept, scanner.found()));
+        // The last line usually has no trailing newline, so it has to be
+        // evaluated explicitly or a marker on it would be lost.
+        if matches!(stream, Stream::Stdout) {
+            scanner.finish();
+        }
+        let _ = sender.send((stream, kept, scanner.result()));
     });
 }
 
@@ -331,29 +341,31 @@ fn spawn_drain(
 /// that would turn a 30-second timeout into an unbounded wait, so a pipe that
 /// stays open past the grace period is abandoned with whatever it delivered.
 ///
-/// The third element says whether the stdout stream carried a skip plan line. A
-/// pipe abandoned before its reader finished reports whatever the reader had
-/// scanned by then, which is the honest answer for output that was never
-/// delivered.
-fn collect_output(receiver: mpsc::Receiver<(Stream, Vec<u8>, bool)>) -> (Vec<u8>, Vec<u8>, bool) {
+/// The third element is what the stdout stream proved: whether it carried a skip
+/// plan line, and whether it announced a failing test. A pipe abandoned before
+/// its reader finished reports whatever the reader had scanned by then, which is
+/// the honest answer for output that was never delivered.
+fn collect_output(
+    receiver: mpsc::Receiver<(Stream, Vec<u8>, ScanResult)>,
+) -> (Vec<u8>, Vec<u8>, ScanResult) {
     let deadline = Instant::now() + DRAIN_GRACE;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    let mut skipped = false;
+    let mut scan = ScanResult::default();
     let mut remaining = 2;
     while remaining > 0 {
         let left = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(left) {
             Ok((Stream::Stdout, bytes, found)) => {
                 stdout = bytes;
-                skipped = found;
+                scan = found;
             }
             Ok((Stream::Stderr, bytes, _)) => stderr = bytes,
             Err(_) => break,
         }
         remaining -= 1;
     }
-    (stdout, stderr, skipped)
+    (stdout, stderr, scan)
 }
 
 /// Puts the child in its own process group so the whole tree can be killed.
@@ -596,6 +608,81 @@ mod tests {
         let result = execute(&config, &config.working_dir(), "test", &test);
         assert!(result.timed_out);
         assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+    }
+
+    #[test]
+    fn a_zero_exit_that_reported_a_failing_test_is_a_failure() {
+        let tree = TempTree::new("hollow");
+        // Exactly the rustnode shape: a failing subtest, then exit 0 because the
+        // runtime never propagated the failure.
+        let test = tree.script(
+            "test-hollow.sh",
+            "printf '\\342\\226\\266 outer\\n  \\342\\234\\224 inner passes\\n  \\342\\234\\226 inner fails\\n\\342\\234\\226 outer\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "the runtime really claims success"
+        );
+        assert!(
+            result.passed,
+            "the raw exit code is still recorded as a pass"
+        );
+        assert_eq!(result.skipped, Some(false));
+        assert_eq!(result.misreported, Some(true));
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+        assert!(result.is_misreported_pass());
+    }
+
+    #[test]
+    fn the_failure_glyph_inside_a_message_does_not_override_a_pass() {
+        let tree = TempTree::new("hollow-midline");
+        // A test that merely mentions the glyph, e.g. asserting on captured
+        // child output, and genuinely passes.
+        let test = tree.script(
+            "test-mention-glyph.sh",
+            "printf 'out: \\342\\234\\226 failing tests:\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+        assert_eq!(result.misreported, Some(false));
+    }
+
+    #[test]
+    fn a_failure_glyph_with_a_nonzero_exit_is_an_ordinary_failure() {
+        let tree = TempTree::new("glyph-nonzero");
+        let test = tree.script(
+            "test-glyph-fail.sh",
+            "printf '  \\342\\234\\226 inner fails\\n'; exit 1\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+        assert!(
+            !result.is_misreported_pass(),
+            "a non-zero exit needs no correction"
+        );
+    }
+
+    #[test]
+    fn a_failure_glyph_printed_after_the_kept_stdout_is_still_seen() {
+        let tree = TempTree::new("glyph-late");
+        let test = tree.script(
+            "test-glyph-late.sh",
+            "i=0; while [ $i -lt 300 ]; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; i=$((i+1)); done; \
+             printf '  \\342\\234\\226 inner fails\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+        assert!(
+            !result.stdout_head.contains('\u{2716}'),
+            "the head is supposed to be truncated: {} bytes",
+            result.stdout_head.len()
+        );
     }
 
     #[test]

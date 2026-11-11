@@ -146,9 +146,10 @@ re-running everything and repeated runs never inflate the total.
 
 ### How the pass rate is counted
 
-A file is in exactly one of three states: **passed**, **skipped** or **failed**.
+A file is in exactly one of three states: **passed**, **skipped** or **failed**,
+and `passed + skipped + failed` always equals the total.
 
-A skip is detected from the `1..0 # Skipped: <reason>` plan line a test prints
+**A skip** is detected from the `1..0 # Skipped: <reason>` plan line a test prints
 when it calls `common.skip()`. The exit code cannot stand in for the marker:
 `skip()` exits 0 from `test/parallel/**` and 1 from `test/known_issues/**`, so
 exit codes alone read a skipped parallel test as a pass and a skipped
@@ -157,15 +158,25 @@ a line, and only after scanning the whole stdout stream rather than the
 truncated head, so a test that mentions the text in a message is not
 misclassified and a skip printed late is not missed.
 
+**A hollow pass** is a file that exited 0 while its own output announced a
+failing test. `test:summary` is never emitted, so the runtime never sets a
+non-zero exit code and the process reports success after an assertion failed.
+The same scan looks for the reporter's `✖` at the start of a line — after
+leading whitespace and ANSI colour escapes — and such a row counts as **failed**.
+`report` prints how many of the failures were corrected this way, so the number
+is auditable rather than silent. This is a rustnode-shaped rule: real Node writes
+TAP (`not ok 2 - ...`) when stdout is piped, and would not match. Switching
+rustnode to TAP output would disable this check until the marker is updated.
+
 The rate is **`passed / (passed + failed)`**. Skips are excluded from both
 sides, because a skipped file asserts nothing: counting it as a pass inflates
 the number and counting it as a failure understates it. `report` prints all
-three counts as separate columns and lists the skipped files, and
-`passed + skipped + failed` always equals the total. A cluster where nothing was
-judged prints `—` rather than a misleading `0.0%`.
+three counts as separate columns and lists the skipped files, and a cluster where
+nothing was judged prints `—` rather than a misleading `0.0%`.
 
 Numbers recorded before this classification existed are re-read: a row without
-the field uses its recorded stdout to recover whether it skipped.
+the fields uses its recorded stdout to recover whether it skipped and whether it
+reported a failure.
 
 ### What the numbers mean today
 

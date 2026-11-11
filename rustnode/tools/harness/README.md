@@ -63,10 +63,30 @@ excluded from either side. `passed + skipped + failed` always equals the total, 
 cluster with nothing judged prints `—` instead of a `0.0%` that would read as
 total failure, and the skipped files are listed so the exclusion is auditable.
 
-Result rows written before `skipped` existed still load. A missing field means
-"not recorded", and the row's recorded stdout is used to recover the answer, so
-historical runs reclassify correctly instead of staying wrong forever. A recorded
-value always wins over the stdout text.
+**A file can exit 0 while reporting a failed subtest.** `test:summary` is never
+emitted, so `harness.js`'s `if (!data.success) process.exitCode = ...` never runs
+and a file whose subtests failed can still exit 0. The runner scans the same
+stdout stream for a `✖` at the start of a line (after leading whitespace and ANSI
+colour escapes, because a test that sets `FORCE_COLOR` — rustnode's own
+`test-runner-reporters.js` does — indents it and wraps it in escapes). A row that
+exited 0 while its output announced a failure is counted as **failed**, and
+`report` says how many of the failures were this kind, so the correction is
+visible rather than silent. This is a correction, not a fourth column:
+`misreported` is always a subset of `failed`, and the three-way sum is unchanged.
+
+The `✖` rule is deliberately **rustnode-shaped**. Real Node, with stdout piped as
+the harness always pipes it, writes TAP (`not ok 2 - inner fails`) and never that
+glyph. If rustnode switches to TAP output to match Node, this marker stops
+matching and the correction silently stops firing; the test
+`a_passing_row_that_reported_a_failing_subtest_is_corrected_to_failed` pins the
+rule so that switch has to deal with it. Precedence: a timeout is a failure, a
+skip outranks both (it said nothing ran), then a `passed` row is checked against
+the failure marker, then `passed` decides.
+
+Result rows written before either field existed still load. A missing field means
+"not recorded", and the row's recorded stdout is used to recover both answers, so
+historical runs reclassify instead of staying wrong forever. A recorded value
+always wins over the stdout text.
 
 **A run that measured something exits 0 even when nothing passes.** The number
 is the deliverable early on. Gate on `report` or on the result files, not on the
