@@ -199,14 +199,10 @@ fn permission_channel<'s>(
 ) -> Option<v8::Local<'s, v8::Object>> {
     let name = format!("node:permission-model:{}", channel_suffix(scope_kind));
     let require = rn_core::hook_slot::require(scope)?;
-    let Some(id) = v8::String::new(scope, "node:diagnostics_channel") else {
-        return None;
-    };
+    let id = v8::String::new(scope, "node:diagnostics_channel")?;
     let exports = require.call(scope, v8::undefined(scope).into(), &[id.into()])?;
     let exports = v8::Local::<v8::Object>::try_from(exports).ok()?;
-    let Some(key) = v8::String::new(scope, "channel") else {
-        return None;
-    };
+    let key = v8::String::new(scope, "channel")?;
     let channel = exports.get(scope, key.into())?;
     let channel = v8::Local::<v8::Function>::try_from(channel).ok()?;
     let name = v8::String::new(scope, &name)?;
