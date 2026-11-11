@@ -119,6 +119,17 @@ step "the exit handler can still fail a process"
 # `--mechanism` asserts exactly that pair and needs no Node test tree, so it can
 # run on every machine. The full six-case matrix still needs Node's own
 # `test/common` and stays opt-in; it passes on current master.
+#
+# The binary is made executable first. The cipher self-test above restores
+# `target/debug/rustnode` by `cp`-ing a `mktemp` backup into the path it deleted,
+# which leaves the file mode 0600, and the next `cargo` invocation is what
+# repairs it. `per-context-control.sh` and its audit work around the same thing
+# by running earlier; this step cannot, because a control that execs a
+# non-executable binary reports exit 126 and reads as a *runtime* failure rather
+# than a missing mode bit. Restoring the mode here is the narrow fix: it makes
+# the step independent of how the preceding self-test restored the binary,
+# instead of depending on its restore behaviour staying what it is today.
+chmod +x target/debug/rustnode
 ./tools/mustcall-negative-control.sh --mechanism
 
 mustcall_tests="${RUSTNODE_TEST_CACHE:-${TMPDIR:-/tmp}}/rustnode-node-test/test"
