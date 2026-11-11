@@ -155,6 +155,31 @@ impl v8::inspector::V8InspectorClientImpl for Client {
         crate::pause::run_pause_loop();
     }
 
+    /// Maps a script's resource name to the URL the debugger reports for it.
+    ///
+    /// This is the *only* correct place for the `file://` conversion, and finding that
+    /// out cost a regression. rustnode's CommonJS scripts were reported to a debugger as
+    /// `/tmp/x.js` where Node reports `file:///tmp/x.js`, so
+    /// `Debugger.setBreakpointByUrl` — which every Node test builds with
+    /// `pathToFileURL` — resolved to zero locations and never hit.
+    ///
+    /// The obvious fix, converting the filename in `ScriptOrigin`, is wrong: it also
+    /// changes what `Error.prepareStackTrace`'s `CallSite.getFileName()` reports, and
+    /// measured on Node 22 that is the bare path. Node compiles with the bare path
+    /// (`node_contextify.cc:1447`) and converts here, through this hook, which V8
+    /// consults when it builds a `Debugger.scriptParsed` event and not when it builds a
+    /// stack frame.
+    fn resource_name_to_url(
+        &self,
+        resource_name: &v8::inspector::StringView<'_>,
+    ) -> Option<v8::UniquePtr<v8::inspector::StringBuffer>> {
+        let name = crate::session::string_view_to_string(resource_name);
+        let url = file_url_for(&name);
+        let buffer =
+            v8::inspector::StringBuffer::create(v8::inspector::StringView::from(url.as_bytes()));
+        Some(buffer)
+    }
+
     fn quit_message_loop_on_pause(&self) {
         // Node: `waiting_for_resume_ = false` (`:590`). V8 calls this from inside
         // `Debugger.resume`, on the paused thread, so it only has to flip the flag the
@@ -188,6 +213,51 @@ impl v8::inspector::V8InspectorClientImpl for Client {
         // long as the inspector exists, and V8 consumes the value during this callback.
         Some(unsafe { leak_local(local) })
     }
+}
+
+/// The `file://` URL a debugger should report for `resource_name`.
+///
+/// Absolute paths gain a scheme; anything else is returned unchanged, which is what Node
+/// does — a synthetic name like `evalmachine.<anonymous>` is reported as-is, and
+/// prefixing it would invent a URL that does not name a file.
+pub fn file_url_for(resource_name: &str) -> String {
+    if !resource_name.starts_with('/') {
+        return resource_name.to_string();
+    }
+    let mut encoded = String::with_capacity(resource_name.len() + 8);
+    encoded.push_str("file://");
+    for byte in resource_name.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'/'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b':'
+            | b'@'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b'['
+            | b']' => encoded.push(char::from(byte)),
+            other => {
+                use std::fmt::Write;
+                let _ = write!(encoded, "%{other:02X}");
+            }
+        }
+    }
+    encoded
 }
 
 /// Erases a `Local`'s lifetime.
@@ -387,4 +457,42 @@ pub fn schedule_pause_on_next_statement(
     let buffer = reason.as_bytes();
     let view = v8::inspector::StringView::from(buffer);
     session.schedule_pause_on_next_statement(view, view);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_url_for;
+
+    #[test]
+    fn an_absolute_path_becomes_a_file_url() {
+        // Measured on Node 22: `Debugger.scriptParsed` reports `file:///tmp/x.js` for a
+        // CommonJS file whose `__filename` is `/tmp/x.js`.
+        assert_eq!(file_url_for("/tmp/x.js"), "file:///tmp/x.js");
+        assert_eq!(file_url_for("/"), "file:///");
+    }
+
+    #[test]
+    fn a_synthetic_name_is_left_alone() {
+        // `vm.Script`'s default and a `//# sourceURL=magic.js` comment both name
+        // something that is not a file. A scheme on either would be a URL that opens
+        // nothing, which is worse than the bare name Node reports.
+        for name in [
+            "evalmachine.<anonymous>",
+            "test.js",
+            "magic.js",
+            "",
+            "node:internal/modules/cjs/loader",
+            "file:///already/a/url.js",
+        ] {
+            assert_eq!(file_url_for(name), name, "{name} must not be rewritten");
+        }
+    }
+
+    #[test]
+    fn a_space_and_a_percent_are_encoded() {
+        // A path with a space is common enough to matter: `foo bar/x.js` as a raw URL
+        // would truncate at the space in any client that parses it.
+        assert_eq!(file_url_for("/tmp/a b.js"), "file:///tmp/a%20b.js");
+        assert_eq!(file_url_for("/tmp/a%b.js"), "file:///tmp/a%25b.js");
+    }
 }
