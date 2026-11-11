@@ -340,6 +340,10 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
         // incomplete without it.
         rn_bind_messaging::has_message_port_work()
     }
+
+    fn before_exit(&mut self) -> bool {
+        emit_before_exit(self.scope, self.hooks) == Settled::Revived
+    }
 }
 
 /// Runs the loop until nothing is left and returns why it stopped.
@@ -350,6 +354,209 @@ pub fn run_loop<'s, 'i>(
     let mut event_loop = Loop::new(rn_io::Backend::Libuv)?;
     let mut scheduler = V8Scheduler::new(scope, hooks);
     Ok(event_loop.run(&mut scheduler, u32::MAX))
+}
+
+/// Whether the loop still has work after an idle `beforeExit` was emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// Nothing was scheduled: the process may run its `exit` sequence.
+    Idle,
+    /// A handler scheduled work, so the loop has to run again.
+    Revived,
+}
+
+/// Emits `beforeExit` once and reports whether it left work behind.
+///
+/// This is Node's `EmitProcessBeforeExit` (`src/api/hooks.cc`), called from the
+/// place `SpinEventLoopInternal` (`src/api/embed_helpers.cc`) calls it: after the
+/// loop has run dry, and again after every idle the loop reaches. A handler that
+/// schedules a timer, an immediate or a listening socket keeps the process alive
+/// past the point where it would otherwise stop — that is the documented
+/// contract, not an edge case. `internal/test_runner/harness.js` is built on it
+/// (its `exitHandler` waits for pending subtests from `beforeExit`), and
+/// `test/parallel/test-process-beforeexit.js` exists to pin the revive-and-repeat
+/// behaviour.
+///
+/// The handler's argument is the code the process would exit with right now,
+/// which is what Node passes.
+///
+/// Liveness is re-read after the emit, exactly as Node does, because scheduling
+/// work from the handler is only observable that way. A `nextTick` or a
+/// microtask does not count: Node runs those during the emit's own checkpoint and
+/// still exits, which is why `test-process-beforeexit.js` expects a `nextTick`
+/// alone to end the process.
+///
+/// An emit that throws settles the loop rather than reviving it, which is what
+/// Node's `IsNothing()` branch does: it breaks out to the exit sequence. The
+/// exception has already gone through the fatal path, so by the time the caller
+/// reaches `exit` the status is 1 and `exit` has usually been emitted already.
+pub fn emit_before_exit(scope: &mut v8::PinScope, hooks: &RuntimeHooks) -> Settled {
+    let emitted = match process_object(scope) {
+        Some(process) => match function_property(scope, process.into(), "emit") {
+            Some(emit) => emit_event(scope, process, emit, "beforeExit"),
+            None => false,
+        },
+        None => false,
+    };
+
+    // Node drains the platform's queued callbacks between the emit and the
+    // liveness check. Draining here also gives a handler's promises and ticks
+    // the checkpoint they would get in Node, so a harness that awaits pending
+    // subtests from `beforeExit` finishes before this decision is made.
+    hooks.drain(scope);
+
+    if !emitted {
+        return Settled::Idle;
+    }
+    if rn_uv::uv_loop::is_active() || rn_bind_messaging::has_message_port_work() {
+        Settled::Revived
+    } else {
+        Settled::Idle
+    }
+}
+
+/// Runs Node's exit sequence and returns the status to terminate with.
+///
+/// This is `EmitProcessExitInternal` (`src/api/hooks.cc`): mark the process as
+/// exiting, emit `exit` with the current code, then re-read the code because a
+/// handler is allowed to change it.
+///
+/// The emit goes through `process.emit` rather than `process.exit`, and that
+/// distinction is observable. `internal/process/per_thread.js`'s `exit` wrapper
+/// also calls `process.reallyExit` after emitting, so reaching it here would run
+/// a user-patched `reallyExit` a second time: Node runs it once, from the
+/// explicit `process.exit()` call, and the natural exit terminates from C++
+/// without going through it again.
+///
+/// `_exiting` is set first, exactly as `env->set_exiting(true)` does, so an
+/// `exit` listener that calls `process.exit()` cannot make the event fire twice.
+///
+/// `when_unset` is the status Node would report if `process.exitCode` is unset:
+/// `0` for a normal finish. An uncaught exception instead *overwrites*
+/// `process.exitCode` with 1 before emitting, which is [`emit_exit_after_failure`].
+///
+/// A handler that throws is reported through Node's fatal-exception path rather
+/// than swallowed. Node leaves the status alone in that case, which is why the
+/// code is only defaulted to 1 when nothing set one.
+pub fn emit_exit(scope: &mut v8::PinScope, when_unset: i32) -> i32 {
+    let Some(process) = process_object(scope) else {
+        return when_unset;
+    };
+    // `_exiting` is Node's own "the exit sequence already ran" flag. The fatal
+    // paths set it before they emit: `internal/process/execution.js` does it
+    // when an uncaught exception reaches `onGlobalUncaughtException`, and
+    // `per_thread.js` does it for an explicit `process.exit()`. Node then
+    // terminates from C++ without ever reaching `EmitProcessExitInternal`, so a
+    // process that is already exiting must not emit again here.
+    if exiting(scope, process) {
+        return read_exit_code(scope).unwrap_or(when_unset);
+    }
+    let _ = set(
+        scope,
+        process.into(),
+        "_exiting",
+        v8::Boolean::new(scope, true).into(),
+    );
+
+    let code = read_exit_code(scope).unwrap_or(when_unset);
+    let Some(emit) = function_property(scope, process.into(), "emit") else {
+        return read_exit_code(scope).unwrap_or(code);
+    };
+
+    // The emit runs in its own scope: a listener's throw must not leave a
+    // pending exception behind for the caller's scope to trip over.
+    let threw = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let scope = &mut try_catch.init();
+        let Some(name) = v8::String::new(scope, "exit") else {
+            return when_unset;
+        };
+        let code_value = v8::Integer::new(scope, code);
+        let _ = emit.call(scope, process.into(), &[name.into(), code_value.into()]);
+        if scope.has_caught() {
+            if let Some(exception) = scope.exception() {
+                report_uncaught(scope, exception);
+            }
+            true
+        } else {
+            false
+        }
+    };
+
+    match read_exit_code(scope) {
+        Some(code) => code,
+        None if threw => 1,
+        None => when_unset,
+    }
+}
+
+/// Runs the exit sequence after an uncaught exception.
+///
+/// This is `internal/process/execution.js`'s handler, which does not merely
+/// default the status: it writes `kGenericUserError` over whatever the script
+/// had put in `process.exitCode` before emitting, so `process.exitCode = 3;
+/// throw new Error()` exits 1 in Node rather than 3. The handler still runs, and
+/// a code it sets is what the process ends with.
+pub fn emit_exit_after_failure(scope: &mut v8::PinScope) -> i32 {
+    if let Some(process) = process_object(scope) {
+        let _ = set(
+            scope,
+            process.into(),
+            "exitCode",
+            v8::Integer::new(scope, 1).into(),
+        );
+    }
+    emit_exit(scope, 1)
+}
+
+/// Whether `process._exiting` says the exit sequence already ran.
+fn exiting<'s>(scope: &mut v8::PinScope<'s, '_>, process: v8::Local<'s, v8::Object>) -> bool {
+    get(scope, process.into(), "_exiting").is_some_and(|value| value.is_true())
+}
+/// The `process` object, when the realm bootstrap installed one.
+fn process_object<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    let global = scope.get_current_context().global(scope);
+    let process = get(scope, global.into(), "process")?;
+    v8::Local::<v8::Object>::try_from(process).ok()
+}
+
+/// `process.exitCode`, or `None` when it is unset.
+fn read_exit_code(scope: &mut v8::PinScope) -> Option<i32> {
+    let process = process_object(scope)?;
+    let code = get(scope, process.into(), "exitCode")?;
+    if code.is_undefined() || code.is_null() {
+        return None;
+    }
+    code.integer_value(scope).map(|code| code as i32)
+}
+
+/// Emits one process-lifecycle event with its status argument.
+///
+/// Returns whether the emit completed. A handler's throw is handed to Node's
+/// fatal-exception path rather than escaping into the caller: `beforeExit` is
+/// not inside any `try` the user wrote, so the exception is uncaught there just
+/// as it is in Node, which prints it and decides the exit status.
+fn emit_event(
+    scope: &mut v8::PinScope,
+    process: v8::Local<v8::Object>,
+    emit: v8::Local<v8::Function>,
+    event: &str,
+) -> bool {
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut try_catch.init();
+    let Some(name) = v8::String::new(scope, event) else {
+        return false;
+    };
+    let code = read_exit_code(scope).unwrap_or(0);
+    let code = v8::Integer::new(scope, code);
+    let _ = emit.call(scope, process.into(), &[name.into(), code.into()]);
+    if scope.has_caught() {
+        if let Some(exception) = scope.exception() {
+            report_uncaught(scope, exception);
+        }
+        return false;
+    }
+    true
 }
 
 fn call_require<'s>(
