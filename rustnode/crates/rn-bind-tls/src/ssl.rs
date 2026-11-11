@@ -145,8 +145,17 @@ impl Ssl {
         unsafe {
             crate::ffi_extra::ssl_set_mode(raw, SSL_MODE_RELEASE_BUFFERS);
             crate::ffi_extra::ssl_set_mode(raw, SSL_MODE_AUTO_RETRY);
-            // `NOTE: This could be overridden in SetVerifyMode`.
-            ffi::SSL_set_verify(raw, ffi::SSL_VERIFY_NONE, None);
+            // `NOTE: This could be overridden in SetVerifyMode`. The callback is
+            // Node's `VerifyCallback`, which always returns 1: OpenSSL must not
+            // abort a handshake over a chain it does not like, because
+            // `rejectUnauthorized: false` means JavaScript decides. Without it a
+            // server with `SSL_VERIFY_PEER` sends `SSL alert 48` (`unknown_ca`)
+            // and the connection never completes.
+            crate::peer_cert::set_verify(
+                raw,
+                ffi::SSL_VERIFY_NONE,
+                Some(crate::peer_cert::always_continue),
+            );
         }
 
         match kind {
