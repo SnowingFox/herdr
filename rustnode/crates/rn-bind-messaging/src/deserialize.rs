@@ -34,13 +34,12 @@ use rn_v8_sys::v8;
 
 /// The objects one message rebuilt, in the id order the payload references.
 ///
-/// Transfer-list slots first, then clones — Node's receiving `host_objects` vector,
-/// and the reason [`crate::port::Message::transferred_count`] exists.
+/// Transfer-list entries first, then clones — Node's receiving `host_objects`
+/// vector. One vector, because the serializer wrote one id space: an id is an
+/// index into this, with no boundary to get wrong.
 struct Rebuilt {
-    /// The ports, as the objects the receiver now owns.
-    ports: Vec<v8::Global<v8::Object>>,
-    /// The cloned host objects.
-    hosts: Vec<v8::Global<v8::Object>>,
+    /// Every rebuilt object, by the id the payload used for it.
+    objects: Vec<v8::Global<v8::Object>>,
 }
 
 /// The delegate V8 asks for a host object by id.
@@ -64,15 +63,9 @@ impl v8::ValueDeserializerImpl for Lookup<'_> {
             crate::throw_type_error(scope, "Could not read a transferred object's id");
             return None;
         }
-        // One id space: below the boundary is a transfer-list slot, at or above it
-        // is a clone. Getting this wrong resolves a clone against a port and
-        // produces an object of the wrong type rather than a clean failure.
-        let ports = self.rebuilt.ports.len();
-        let object = if (id as usize) < ports {
-            self.rebuilt.ports.get(id as usize)
-        } else {
-            self.rebuilt.hosts.get(id as usize - ports)
-        };
+        // One id space, so one lookup: the id the payload carries is an index into
+        // the vector `rebuild` produced, in the same order the serializer numbered.
+        let object = self.rebuilt.objects.get(id as usize);
         let Some(object) = object else {
             crate::throw_type_error(scope, "The message referenced an object that was not sent");
             return None;
@@ -109,24 +102,18 @@ pub fn deserialize<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     message: &crate::port::Message,
 ) -> Result<Deserialized<'s>, ()> {
-    // Phase 1: every transferred object, before V8 is involved. Both of these reach
-    // JavaScript — `clone_port_into` runs the port's `oninit`, and a clone's
-    // `rebuild` calls the create-object hook — which is exactly why they cannot
-    // happen inside `read_host_object`.
-    let mut ports = Vec::with_capacity(message.ports.len());
-    for source in &message.ports {
-        let source: v8::Local<v8::Object> = v8::Local::new(scope, source);
-        let rebuilt = crate::clone_port_into(scope, source).ok_or(())?;
-        ports.push(v8::Global::new(scope, rebuilt));
+    // Phase 1: every transferred object, before V8 is involved. Both kinds reach
+    // JavaScript — a `PortTransferData::rebuild` builds a port object and runs its
+    // `oninit`, and a clone's `rebuild` calls the create-object hook — which is
+    // exactly why they cannot happen inside `read_host_object`.
+    let mut objects = Vec::with_capacity(message.host_objects.len());
+    for payload in message.host_objects.iter() {
+        // `rebuild` is where a transfer is inverted: `TransferForMessaging` ran on
+        // the sender, and this builds the receiving object from the moved state.
+        let rebuilt = payload.rebuild(scope).ok_or(())?;
+        objects.push(v8::Global::new(scope, rebuilt));
     }
-    let mut hosts = Vec::with_capacity(message.host_objects.len());
-    for clone in message.host_objects.iter() {
-        // `rebuild` is where a clone hook is inverted: `[kClone]` ran on the
-        // sender, and this builds the object `[kDeserialize]` will fill in.
-        let rebuilt = clone.rebuild(scope).ok_or(())?;
-        hosts.push(v8::Global::new(scope, rebuilt));
-    }
-    let rebuilt = Rebuilt { ports, hosts };
+    let rebuilt = Rebuilt { objects };
 
     // Phase 2: the payload. No JavaScript from here until `read_value` returns.
     let deserializer =
@@ -148,19 +135,32 @@ pub fn deserialize<'s>(
 
     // Phase 3: each clone's own state, then `this[kDeserialize]`. The sender
     // appended one value per clone in vector order after the payload, so reading
-    // them back in the same order is the contract between the two halves.
-    for (clone, target) in message.host_objects.iter().zip(&rebuilt.hosts) {
+    // them back in the same order is the contract between the two halves. A
+    // transferred port has no trailing state, so its `read_data` is the default
+    // no-op.
+    for (payload, target) in message.host_objects.iter().zip(&rebuilt.objects) {
         let target: v8::Local<v8::Object> = v8::Local::new(scope, target);
-        if !clone.read_data(scope, &deserializer, target) {
+        if !payload.read_data(scope, &deserializer, target) {
             return Err(());
         }
     }
     drop(deserializer);
 
-    Ok(Deserialized {
-        value,
-        ports: rebuilt.ports,
-    })
+    // `emitMessage(data, ports, type)` wants the transferred ports alone, and a
+    // rebuilt port is the only object here that answers `port_state_of`. Filtering
+    // the one vector this way keeps the ports array in id order without a second
+    // list to keep in step.
+    let ports = rebuilt
+        .objects
+        .iter()
+        .filter(|object| {
+            let object: v8::Local<v8::Object> = v8::Local::new(scope, *object);
+            crate::port_state_of(scope, object).is_some()
+        })
+        .cloned()
+        .collect();
+
+    Ok(Deserialized { value, ports })
 }
 
 /// What one message deserialized into.

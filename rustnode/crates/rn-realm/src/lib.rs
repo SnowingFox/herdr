@@ -17,10 +17,24 @@
 //! JavaScript layer reaches a Rust namespace, so it is where the binding registry
 //! is consulted.
 
+pub mod runtime;
+pub mod versions;
+
 use rn_js2c::builtin_by_id;
 use rn_v8_sys::v8;
 
-use crate::versions;
+pub use runtime::{
+    clear_runtime, install_eval_builtins, install_runtime, run_loop, runtime_exit_requested,
+    runtime_has_external_work, with_runtime, Runtime,
+};
+
+/// The minimal bootstrap that runs before Node's own builtins do.
+///
+/// It installs `process` and `console` from the `__argv`/`__stdout` hand-off, so
+/// [`install_globals`] and the realm bootstrap have something to work with. It
+/// is `include_str!`d from `bootstrap.js`, which is the file to read for what it
+/// defines.
+const BOOTSTRAP: &str = include_str!("bootstrap.js");
 
 /// The result of running the realm bootstrap.
 pub struct Bootstrapped {
@@ -776,6 +790,19 @@ fn install_process_state_switch<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<
     run_bootstrap_script(scope, "internal/bootstrap/switches/does_own_process_state")
 }
 
+/// Runs one `internal/main/**` script with the parameters its kind declares.
+///
+/// `internal/main/worker_thread.js` is the worker-side entry point. It is a
+/// `kMainScript`, so it compiles with `(process, require, internalBinding,
+/// primordials)` — the same shape as a bootstrap script, which is why this shares
+/// [`run_bootstrap_script`]'s body. It differs in one way that matters: it does
+/// *not* return until the realm's loop has stopped, because it installs the
+/// `port.on('message')` handler that runs the user script and then starts the
+/// port, so the loop is what finishes it.
+pub fn run_main_script(scope: &mut v8::PinScope<'_, '_>, id: &str) -> Option<String> {
+    run_bootstrap_script(scope, id)
+}
+
 /// Runs one `internal/bootstrap/**` script with the parameters its kind declares.
 ///
 /// Returns the script's error message when it threw, which is more useful than
@@ -799,14 +826,32 @@ pub fn run_bootstrap_script(scope: &mut v8::PinScope<'_, '_>, id: &str) -> Optio
     let scope = &mut try_catch.init();
     let _ = function.call(scope, v8::undefined(scope).into(), &arguments);
     if scope.has_caught() {
-        return Some(
-            scope
-                .exception()
-                .map(|exception| exception.to_rust_string_lossy(scope))
-                .unwrap_or_default(),
-        );
+        // The `stack` is included because a Node internal assertion's message
+        // names no source line: the stack is the only part that says *where*,
+        // and without it a one-line fix becomes a hunt.
+        let text = scope.exception().map(|exception| {
+            let value: v8::Local<v8::Value> = exception;
+            exception_stack(scope, value).unwrap_or_else(|| value.to_rust_string_lossy(scope))
+        });
+        return Some(text.unwrap_or_default());
     }
     None
+}
+
+/// An exception's `stack` when it has one, which is what identifies the site.
+fn exception_stack(
+    scope: &mut v8::PinScope<'_, '_>,
+    exception: v8::Local<'_, v8::Value>,
+) -> Option<String> {
+    let object = v8::Local::<v8::Object>::try_from(exception).ok()?;
+    let key = v8::String::new(scope, "stack")?;
+    let stack = object.get(scope, key.into())?;
+    if stack.is_undefined() {
+        return None;
+    }
+    stack
+        .to_string(scope)
+        .map(|text| text.to_rust_string_lossy(scope))
 }
 
 /// Installs `process.stdout`, `stdin` and `stderr` from Node's own bootstrap.
@@ -862,7 +907,7 @@ pub fn install_console<'s>(scope: &mut v8::PinScope<'s, '_>, require: v8::Local<
     }
 }
 
-/// Reads the `primordials` global the realm bootstrap installs.
+/// Installs the `primordials` global the realm bootstrap installs.
 fn primordials_from_global<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Option<v8::Local<'s, v8::Value>> {
@@ -1123,10 +1168,12 @@ pub fn run_main<'s>(
 /// Runs the realm bootstrap and returns the loaders it created.
 pub fn bootstrap_realm(
     scope: &mut v8::PinScope,
-    registry: &'static rn_core::BindingRegistry,
     script_args: &[String],
     exec_argv: &[String],
 ) -> Result<Bootstrapped, String> {
+    if rn_core::realm::installed().is_none() {
+        return Err("no binding registry is installed for this realm".to_string());
+    }
     let global = scope.get_current_context().global(scope);
 
     let primordials = v8::Object::new(scope);
@@ -1139,7 +1186,7 @@ pub fn bootstrap_realm(
     set_global(scope, global, "primordials", primordials.into())?;
 
     let get_linked_binding = function_of(scope, "getLinkedBinding", get_linked_binding)?;
-    let get_internal_binding = internal_binding_dispatcher(scope, registry)?;
+    let get_internal_binding = internal_binding_dispatcher(scope)?;
 
     let realm = builtin_by_id("internal/bootstrap/realm")
         .ok_or("the realm bootstrap is missing from the builtin table")?;
@@ -1511,14 +1558,20 @@ fn node_platform() -> &'static str {
 /// This is the single path from JavaScript to a Rust binding. An unknown
 /// namespace must throw with the name in it, because the alternative is an
 /// `undefined` that fails much later and much less clearly.
+///
+/// # Why the registry is looked up per call
+///
+/// It used to be captured as a `&'static` pointer in the callback's data slot,
+/// which only worked because the CLI leaked exactly one registry for the
+/// process. A worker thread runs its own realm with its own registry, and two
+/// isolates must never share one — the objects a registry caches are V8 handles
+/// belonging to one isolate. `rn_core::realm` keeps the registry for the thread
+/// that is bootstrapping, so the lookup is a thread-local read and the pointer
+/// never has to outlive anything.
 fn internal_binding_dispatcher<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    registry: &'static rn_core::BindingRegistry,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let external = v8::External::new(scope, registry as *const _ as *mut std::ffi::c_void);
-    let template = v8::FunctionTemplate::builder(get_internal_binding)
-        .data(external.into())
-        .build(scope);
+    let template = v8::FunctionTemplate::builder(get_internal_binding).build(scope);
     let function = template
         .get_function(scope)
         .ok_or("cannot allocate getInternalBinding")?;
@@ -1539,15 +1592,10 @@ fn get_internal_binding(
     };
     let name = name.to_rust_string_lossy(scope);
 
-    let Ok(external) = v8::Local::<v8::External>::try_from(args.data()) else {
-        throw(scope, "getInternalBinding was called without a registry");
+    let Some(registry) = rn_core::realm::installed() else {
+        throw(scope, "getInternalBinding was called outside a realm");
         return;
     };
-    // SAFETY: the pointer comes from a `&'static BindingRegistry` in
-    // `internal_binding_dispatcher`, so it outlives every callback that can
-    // read it.
-    let registry = unsafe { &*(external.value() as *const rn_core::BindingRegistry) };
-
     match registry.install(scope, &name) {
         Ok(object) => rv.set(object.into()),
         Err(message) => throw(scope, message.as_str()),
@@ -1651,4 +1699,107 @@ fn throw(scope: &mut v8::PinScope, message: &str) {
     };
     let exception = v8::Exception::error(scope, message);
     scope.throw_exception(exception);
+}
+
+/// Installs the hand-off globals and runs the minimal bootstrap script.
+///
+/// This is the first thing that runs in a fresh isolate: `__argv`, `__stdout`,
+/// `__stderr` and `__v8Version` exist only long enough for `bootstrap.js` to
+/// copy them onto `process` and `console`, and it deletes them on the way out.
+/// Leaving them visible makes `test/common/index.js` fail every test with
+/// "Unexpected global(s) found", which is why the script is the one that owns
+/// their lifetime.
+///
+/// # Why a worker calls this too
+///
+/// A worker isolate starts with nothing — no `process`, no `console`, no way to
+/// print the reason it failed. Node's worker bootstrap assumes a realm that
+/// already has them, so a worker that skipped this would fail at the first
+/// `debuglog()` with a `ReferenceError` that names no cause. The hand-off is
+/// per-isolate, so this writes the worker's own `argv` and its own stream
+/// objects; `__stdout` and `__stderr` write to the process's real descriptors,
+/// which is what Node's `createWorkerStdio` does underneath anyway.
+pub fn install_globals(scope: &mut v8::PinScope, args: &[String]) -> Result<(), String> {
+    let global = scope.get_current_context().global(scope);
+
+    let argv = v8::Array::new(scope, args.len() as i32);
+    for (index, arg) in args.iter().enumerate() {
+        let value = v8::String::new(scope, arg).ok_or("cannot allocate argv entry")?;
+        argv.set_index(scope, index as u32, value.into());
+    }
+    set_global(scope, global, "__argv", argv.into())?;
+
+    let stdout = make_stream_object(scope, StdStream::Stdout)?;
+    set_global(scope, global, "__stdout", stdout.into())?;
+
+    let stderr = make_stream_object(scope, StdStream::Stderr)?;
+    set_global(scope, global, "__stderr", stderr.into())?;
+
+    let version = v8::String::new(scope, v8::V8::get_version()).ok_or("cannot allocate version")?;
+    set_global(scope, global, "__v8Version", version.into())?;
+
+    let source = v8::String::new(scope, BOOTSTRAP).ok_or("cannot allocate bootstrap source")?;
+    let script = v8::Script::compile(scope, source, None).ok_or("cannot compile bootstrap")?;
+    script.run(scope).ok_or("cannot run bootstrap")?;
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum StdStream {
+    Stdout,
+    Stderr,
+}
+
+impl StdStream {
+    fn write(self, text: &str) {
+        use std::io::Write;
+        match self {
+            Self::Stdout => {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(text.as_bytes());
+                let _ = out.flush();
+            }
+            Self::Stderr => {
+                let mut err = std::io::stderr().lock();
+                let _ = err.write_all(text.as_bytes());
+                let _ = err.flush();
+            }
+        }
+    }
+}
+
+fn stream_write_callback(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    let Some(text) = args.get(0).to_string(scope) else {
+        return;
+    };
+    let text = text.to_rust_string_lossy(scope);
+    let Some(external) = v8::Local::<v8::External>::try_from(args.data()).ok() else {
+        return;
+    };
+    // SAFETY: the pointer comes from `Box::into_raw` in `make_stream_object` and
+    // lives for the whole process, so the read is valid for the callback's life.
+    let stream = unsafe { *external.value().cast::<StdStream>() };
+    stream.write(&text);
+}
+
+fn make_stream_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    stream: StdStream,
+) -> Result<v8::Local<'s, v8::Object>, String> {
+    let external = v8::External::new(scope, Box::into_raw(Box::new(stream)).cast());
+    let template = v8::FunctionTemplate::builder(stream_write_callback)
+        .data(external.into())
+        .build(scope);
+    let function = template
+        .get_function(scope)
+        .ok_or("cannot allocate stream write function")?;
+    let object = v8::Object::new(scope);
+    let key = v8::String::new(scope, "write").ok_or("cannot allocate key")?;
+    object.set(scope, key.into(), function.into());
+    Ok(object)
 }

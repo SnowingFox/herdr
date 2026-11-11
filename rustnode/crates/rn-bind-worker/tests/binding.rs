@@ -155,11 +155,7 @@ fn the_thread_facts_are_writable_and_configurable() {
 }
 
 #[test]
-fn the_namespace_has_exactly_the_contract_members_and_no_worker_yet() {
-    // `Worker` is deferred, so it must be absent rather than a stub: a
-    // constructor that neither started a thread nor delivered a message would
-    // hang `new Worker(...)` instead of failing where it is used.
-    //
+fn the_namespace_has_exactly_the_contract_members() {
     // The list is `Object.getOwnPropertyNames`, so it pins that `members()` and
     // the installed object agree. On this one point it is stricter than a stock
     // Node binary: Node installs the six thread facts as lazy per-isolate
@@ -172,6 +168,14 @@ fn the_namespace_has_exactly_the_contract_members_and_no_worker_yet() {
     // produced. The observable value is identical — `undefined` either way —
     // and installing it keeps `members()` from naming a property the object
     // does not carry.
+    //
+    // `Worker` is included now. It used to be filtered out because it was
+    // deferred with a written reason, and this test existed to prove the deferral
+    // was honest — that `Worker` was *absent* rather than a stub that would hang
+    // `new Worker(...)` instead of failing where it is used. The constructor
+    // exists, so the honest expectation is the whole contract, and dropping the
+    // filter is what keeps this test from silently passing on a namespace that
+    // lost a member.
     let contract: serde_json::Value =
         serde_json::from_str(include_str!("../../../contracts/worker.json"))
             .expect("the worker contract parses");
@@ -179,7 +183,6 @@ fn the_namespace_has_exactly_the_contract_members_and_no_worker_yet() {
         .as_object()
         .expect("members")
         .keys()
-        .filter(|name| name.as_str() != "Worker")
         .cloned()
         .collect();
     expected.sort();
@@ -187,6 +190,25 @@ fn the_namespace_has_exactly_the_contract_members_and_no_worker_yet() {
     let actual = read("Object.getOwnPropertyNames(__worker).sort()");
     let actual: Vec<String> = serde_json::from_str(&actual).expect("a string array");
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn the_worker_member_is_a_constructor_with_the_methods_the_js_layer_calls() {
+    // `lib/internal/worker.js` does `new WorkerImpl(url, env, execArgv, limits,
+    // trackUnmanagedFds, isInternal, name)` and then calls `startThread()`,
+    // `stopThread()`, `ref()`, `unref()`, `hasRef()`, `getResourceLimits()`,
+    // `loopIdleTime()` and `loopStartTime()` on it, plus reads and assigns
+    // `messagePort`, `threadId`, `threadName` and `onexit`. A missing one is a
+    // `TypeError` at the first worker rather than a compile failure, so pin them.
+    assert_eq!(
+        read(
+            "[typeof __worker.Worker, \
+               ['startThread','stopThread','ref','unref','hasRef','getResourceLimits', \
+                'loopIdleTime','loopStartTime'] \
+                 .every((n) => typeof __worker.Worker.prototype[n] === 'function')]"
+        ),
+        "[\"function\",true]"
+    );
 }
 
 #[test]

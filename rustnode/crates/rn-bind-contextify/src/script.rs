@@ -677,6 +677,26 @@ fn script_new<'s>(
         "sourceMapURL",
         script.get_source_mapping_url(scope),
     );
+
+    // `hostDefinedOptionId` is how `internal/modules/esm/utils.js` finds the
+    // script's registry: `registerModule(referrer, ...)` reads
+    // `referrer[host_defined_option_symbol]` and uses the symbol as a WeakMap
+    // key, so the value must be *a symbol* or the map refuses it with "Invalid
+    // value used as weak map key".
+    //
+    // Node stores it in the Script's real host-defined options and reads it back
+    // with `ScriptOrigin`/`GetHostDefinedOptionId`. This binding has no path to
+    // those, so the same symbol is written as a property on the wrapper, which is
+    // the only thing the JS layer reads. `vm.Script` passes `undefined` here and
+    // gets no property, which is why the failure only appeared on the
+    // `compileScript` path `worker_thread.js` uses.
+    if let Some(symbol) = symbol {
+        if let Some(key) = v8::String::new(scope, "hostDefinedOptionId") {
+            let _ = that.set(scope, key.into(), symbol.into());
+        }
+        let mark = host_defined_option_symbol(scope);
+        rn_core::define_mark(scope, that, mark, symbol.into());
+    }
 }
 
 fn compile_unbound<'s>(

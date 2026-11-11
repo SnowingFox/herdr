@@ -123,28 +123,47 @@ thread_local! {
     static PARSED: RefCell<Option<Store>> = const { RefCell::new(None) };
 }
 
-/// Records the process's parsed option values.
+/// Records the process's parsed option values, for every thread.
+///
+/// The command line describes the *process*, and a worker inherits it: Node's
+/// `PerProcessOptions` is a process-global singleton for the same reason, and
+/// `Worker::New` only builds a per-isolate `PerProcessOptions` on top of it.
+/// Keeping this per thread would make a worker see the recorded table defaults
+/// instead of what the process was started with, and the first symptom was a
+/// worker taking the TypeScript path because `--strip-types` was back at its
+/// recorded default.
+///
+/// The thread-local is still read first so a test can install its own store
+/// without changing what the rest of the process sees.
 pub fn install(store: Store) {
+    PROCESS_STORE.get_or_init(|| std::sync::Mutex::new(store.clone()));
     PARSED.with(|parsed| {
         *parsed.borrow_mut() = Some(store);
     });
 }
 
+/// The process's store, visible to every thread.
+static PROCESS_STORE: std::sync::OnceLock<std::sync::Mutex<Store>> = std::sync::OnceLock::new();
+
+/// The store for this thread: its own if it installed one, else the process's.
+fn store() -> Option<Store> {
+    let installed = PARSED.with(|parsed| parsed.borrow().clone());
+    if installed.is_some() {
+        return installed;
+    }
+    PROCESS_STORE.get()?.lock().ok().map(|store| store.clone())
+}
+
 /// One option's parsed value, if the CLI installed a store.
 #[must_use]
 pub fn value_of(name: &str) -> Option<ParsedValue> {
-    PARSED.with(|parsed| {
-        parsed
-            .borrow()
-            .as_ref()
-            .and_then(|store| store.value_of(name))
-    })
+    store().and_then(|store| store.value_of(name))
 }
 
 /// Every parsed value, in table order, for a caller that wants them all.
 #[must_use]
 pub fn all_values() -> Option<Vec<(String, ParsedValue)>> {
-    PARSED.with(|parsed| parsed.borrow().as_ref().map(|store| store.values.clone()))
+    store().map(|store| store.values)
 }
 
 /// The parsed values for this process.
@@ -343,7 +362,15 @@ impl Store {
     }
 
     /// Writes `value` for `name`, replacing an earlier one.
-    fn set(&mut self, name: &str, value: ParsedValue) {
+    ///
+    /// Public so the runtime can correct a recorded default that describes the
+    /// reference binary rather than this one. The one caller is `--strip-types`:
+    /// it is recorded as `default: true` because Node 28 ships amaro, and this
+    /// build vendors none, so the TypeScript path would throw
+    /// `ERR_NO_TYPESCRIPT` on the first `eval` script. Fixing the *value* keeps
+    /// the recorded table honest and makes the runtime tell the truth about
+    /// itself, which is the same rule `config.hasInspector` follows.
+    pub fn set(&mut self, name: &str, value: ParsedValue) {
         if let Some(entry) = self.values.iter_mut().find(|(option, _)| option == name) {
             entry.1 = value;
         } else {

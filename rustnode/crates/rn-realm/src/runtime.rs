@@ -42,11 +42,11 @@ use rn_v8_sys::v8;
 ///
 /// Held as `Global`s because a `Scheduler` outlives any one `HandleScope`: the
 /// functions are reached from a fresh scope on each phase.
-pub struct RuntimeHooks {
+pub struct Runtime {
     run_next_ticks: v8::Global<v8::Function>,
 }
 
-impl RuntimeHooks {
+impl Runtime {
     /// Installs the task queue, the timer callbacks and the timer globals.
     ///
     /// Returns `Err` with the reason when the vendored modules cannot be loaded,
@@ -147,6 +147,17 @@ impl RuntimeHooks {
         let scope = &mut try_catch.init();
         let _ = run_next_ticks.call(scope, v8::undefined(scope).into(), &[]);
         if scope.has_caught() {
+            // A terminated isolate reports `has_caught()` with no exception: V8
+            // aborts the call at a safepoint, which is what
+            // `worker.terminate()` produces, and it is not an error the realm
+            // should report. Treating it as one posted a serialized `null` to the
+            // parent, which surfaced as `Uncaught null: null` and an
+            // `ERR_UNHANDLED_ERROR` from `Worker.emit` — after a terminate that
+            // had worked perfectly. Node distinguishes the two with
+            // `TryCatchScope::HasTerminated`.
+            if scope.has_terminated() {
+                return;
+            }
             if let Some(exception) = scope.exception() {
                 report_uncaught(scope, exception);
             }
@@ -299,11 +310,11 @@ fn define_global(
 /// script ask to exit".
 pub struct V8Scheduler<'a, 's, 'i> {
     scope: &'a mut v8::PinScope<'s, 'i>,
-    hooks: &'a RuntimeHooks,
+    hooks: &'a Runtime,
 }
 
 impl<'a, 's, 'i> V8Scheduler<'a, 's, 'i> {
-    pub fn new(scope: &'a mut v8::PinScope<'s, 'i>, hooks: &'a RuntimeHooks) -> Self {
+    pub fn new(scope: &'a mut v8::PinScope<'s, 'i>, hooks: &'a Runtime) -> Self {
         Self { scope, hooks }
     }
 
@@ -355,14 +366,20 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
         // A debugger being attached keeps `node --inspect` alive after the script
         // finishes, which is what lets a client evaluate in a process that has already
         // run its entry point. Node's `Agent::IsActive` does the same.
-        rn_bind_inspector::is_attached() || rn_bind_inspector::has_pending_messages()
+        if rn_bind_inspector::is_attached() || rn_bind_inspector::has_pending_messages() {
+            return true;
+        }
+        // A running `Worker` has its own loop on another thread, so nothing on
+        // this loop is ref'd while it runs. Without this the parent returned
+        // idle the moment the script ended, before a worker had printed anything.
+        rn_bind_timers::has_external_work()
     }
 }
 
 /// Runs the loop until nothing is left and returns why it stopped.
 pub fn run_loop<'s, 'i>(
     scope: &mut v8::PinScope<'s, 'i>,
-    hooks: &RuntimeHooks,
+    hooks: &Runtime,
 ) -> Result<StopReason, String> {
     let mut event_loop = Loop::new(rn_io::Backend::Libuv)?;
     let mut scheduler = V8Scheduler::new(scope, hooks);
@@ -421,4 +438,62 @@ fn set(
     let key = v8::String::new(scope, name).ok_or("cannot allocate a property name")?;
     object.set(scope, key.into(), value);
     Ok(())
+}
+
+thread_local! {
+    /// The runtime installed on this thread.
+    ///
+    /// `Runtime::install` returns the value for a caller that wants to hold it,
+    /// but the worker's loop needs it after the install call has returned and a
+    /// `Scheduler` cannot own it (the `Scheduler` is created per run). Recording
+    /// it here is the same arrangement `rn_bind_options::parsed` uses for the
+    /// option store: one per thread, replaced rather than accumulated.
+    static INSTALLED: std::cell::RefCell<Option<Runtime>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Installs the runtime and records it for this thread.
+///
+/// This is what a realm that drives its own loop calls. The CLI keeps the
+/// returned value instead, because it constructs the loop itself.
+pub fn install_runtime<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+) -> Result<(), String> {
+    let runtime = Runtime::install(scope, require)?;
+    INSTALLED.with(|slot| *slot.borrow_mut() = Some(runtime));
+    Ok(())
+}
+
+/// Runs `body` with the runtime installed on this thread, or returns `None`.
+///
+/// The worker's loop needs the runtime after `install_runtime` has returned, and
+/// a `Scheduler` cannot own it because the `Scheduler` is created per run.
+/// Recording it per thread is the same arrangement `rn_bind_options::parsed`
+/// uses for the option store.
+pub fn with_runtime<R>(body: impl FnOnce(&Runtime) -> R) -> Option<R> {
+    INSTALLED.with(|slot| slot.borrow().as_ref().map(body))
+}
+
+/// Whether the recorded runtime says the loop should stop.
+///
+/// This is the `Scheduler` answer without a `Scheduler`, for a caller that is
+/// between two runs.
+#[must_use]
+pub fn runtime_exit_requested() -> bool {
+    rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED)
+}
+
+/// Whether the recorded runtime has work outside libuv.
+///
+/// A ref'd receiving `MessagePort` pins a loop open in Node even though it owns
+/// no libuv handle, so libuv's own liveness answer is incomplete without it.
+#[must_use]
+pub fn runtime_has_external_work() -> bool {
+    rn_bind_messaging::has_message_port_work()
+}
+
+/// Clears the recorded runtime, so a new realm on this thread cannot inherit the
+/// hooks of the isolate that ran before it.
+pub fn clear_runtime() {
+    INSTALLED.with(|slot| *slot.borrow_mut() = None);
 }

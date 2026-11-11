@@ -34,11 +34,13 @@
 pub mod addr;
 pub mod callback;
 pub mod handle;
+pub mod ledger;
 pub mod listener;
 pub mod stream;
 pub mod stream_base;
 pub mod streams;
 pub mod uv_loop;
+pub mod wake;
 
 pub use libuv_sys2 as sys;
 

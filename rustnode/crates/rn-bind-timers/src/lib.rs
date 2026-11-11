@@ -108,6 +108,19 @@ thread_local! {
     /// the consumer lives in another namespace, so the consumer registers here
     /// rather than this crate depending on it.
     static CHECK_PHASE_HOOK: Cell<Option<fn(&mut v8::PinScope<'_, '_>)>> = const { Cell::new(None) };
+
+    /// Additional check-phase hooks, run after the primary one.
+    ///
+    /// A list rather than one slot because the producers live in crates that
+    /// cannot depend on each other; see `add_check_phase_hook`.
+    static EXTRA_CHECK_PHASE_HOOKS: RefCell<Vec<fn(&mut v8::PinScope<'_, '_>)>> =
+        const { RefCell::new(Vec::new()) };
+
+    /// Predicates for work that keeps the process alive outside libuv.
+    static EXTERNAL_WORK: RefCell<Vec<fn() -> bool>> = const { RefCell::new(Vec::new()) };
+
+    /// Predicates for work the check phase must run, beyond immediates.
+    static EXTRA_CHECK_PHASE_PENDING: RefCell<Vec<fn() -> bool>> = const { RefCell::new(Vec::new()) };
     /// Whether that extra work has anything queued.
     ///
     /// A `MessagePort` with a message waiting needs the check phase to run once,
@@ -393,6 +406,7 @@ fn ensure_timer_handle() -> Option<*mut uv::uv_timer_t> {
             }
             // SAFETY: `uv_timer_init` succeeded, so the slot is initialised.
             handles.timer = Some(unsafe { assume_init(handle) });
+            rn_uv::ledger::record_created();
         }
         handles
             .timer
@@ -416,6 +430,7 @@ fn ensure_immediate_handles() -> Option<(*mut uv::uv_check_t, *mut uv::uv_idle_t
             }
             // SAFETY: `uv_check_init` succeeded.
             let check = unsafe { assume_init(handle) };
+            rn_uv::ledger::record_created();
             // The check handle is started on demand by `toggleImmediateRef(true)`
             // and unref'd once the queue drains, so it is created inactive here:
             // an active ref'd check handle would keep the process alive forever,
@@ -433,6 +448,7 @@ fn ensure_immediate_handles() -> Option<(*mut uv::uv_check_t, *mut uv::uv_idle_t
             }
             // SAFETY: `uv_idle_init` succeeded.
             let idle = unsafe { assume_init(handle) };
+            rn_uv::ledger::record_created();
             // The idle handle is unref'd at init, as Node's is. It exists only to
             // make `uv__io_poll` return without waiting while an immediate is
             // outstanding; an active *ref'd* idle handle would keep the process
@@ -517,6 +533,14 @@ unsafe extern "C" fn on_check(_handle: *mut uv::uv_check_t) {
     if let Some(hook) = hook {
         rn_uv::callback::with_context(hook);
     }
+    // The additional hooks run after the primary one, in registration order.
+    // Each is a separate `with_context` so a hook that throws cannot leave the
+    // isolate entered for the next one.
+    let extra: Vec<fn(&mut v8::PinScope<'_, '_>)> =
+        EXTRA_CHECK_PHASE_HOOKS.with(|hooks| hooks.borrow().clone());
+    for hook in extra {
+        rn_uv::callback::with_context(hook);
+    }
     // `processImmediate` decrements `immediateInfo[1]` directly when it runs an
     // immediate, so `toggleImmediateRef(false)` is not called for the last one
     // and the ref this handle took would keep the loop alive forever. Node's
@@ -543,11 +567,38 @@ unsafe extern "C" fn on_check(_handle: *mut uv::uv_check_t) {
 
 /// Registers the callback the check phase runs after `processImmediate`.
 ///
-/// One slot, replaced rather than accumulated: Node has exactly one set of
-/// check-phase work per environment, and a second registration would mean two
-/// deliveries per iteration.
+/// Replaces the previous hook. Used by the realm that owns the phase.
 pub fn set_check_phase_hook(hook: fn(&mut v8::PinScope<'_, '_>)) {
     CHECK_PHASE_HOOK.with(|slot| slot.set(Some(hook)));
+}
+
+/// Adds a second check-phase hook, kept alongside the first.
+///
+/// The phase has more than one producer of work and they live in crates that
+/// must not depend on each other: `rn-realm` owns the `MessagePort` delivery,
+/// and `rn-bind-worker` reports worker exits from the same phase — but the worker
+/// crate depends on `rn-realm`, so `rn-realm` cannot name it. A list keeps the
+/// ownership honest: each producer registers itself and neither has to know
+/// about the other.
+///
+/// Registered at most once per function pointer, so a realm that installs twice
+/// on the same thread does not run the same hook twice per iteration.
+pub fn add_check_phase_hook(hook: fn(&mut v8::PinScope<'_, '_>)) {
+    EXTRA_CHECK_PHASE_HOOKS.with(|hooks| {
+        let mut hooks = hooks.borrow_mut();
+        if !hooks.contains(&hook) {
+            hooks.push(hook);
+        }
+    });
+}
+
+/// Removes a hook added by [`add_check_phase_hook`].
+///
+/// A worker's realm installs its own hooks on its thread; clearing them when the
+/// realm ends is what stops a reused thread from running a disposed isolate's
+/// callbacks.
+pub fn clear_extra_check_phase_hooks() {
+    EXTRA_CHECK_PHASE_HOOKS.with(|hooks| hooks.borrow_mut().clear());
 }
 
 /// Whether an immediate is queued or a ref'd check-phase consumer is waiting.
@@ -564,6 +615,9 @@ pub fn check_phase_pending() -> bool {
     if immediate_count() > 0 {
         return true;
     }
+    if rn_bind_worker_pending() {
+        return true;
+    }
     CHECK_PHASE_PENDING.with(|pending| pending.borrow().is_some_and(|pending| pending()))
 }
 
@@ -574,6 +628,67 @@ pub fn check_phase_pending() -> bool {
 /// registers here so this crate keeps owning the handle without depending on it.
 pub fn set_check_phase_pending(pending: fn() -> bool) {
     CHECK_PHASE_PENDING.with(|slot| *slot.borrow_mut() = Some(pending));
+}
+
+/// Adds a predicate saying the check phase has work beyond immediates.
+///
+/// Additive for the same reason the hooks are: a worker's exit is reported from
+/// this phase and the worker crate cannot be named here.
+pub fn add_check_phase_pending_predicate(predicate: fn() -> bool) {
+    EXTRA_CHECK_PHASE_PENDING.with(|predicates| {
+        let mut predicates = predicates.borrow_mut();
+        if !predicates.contains(&predicate) {
+            predicates.push(predicate);
+        }
+    });
+}
+
+/// Removes every predicate added by [`add_check_phase_pending_predicate`].
+pub fn clear_check_phase_pending_predicates() {
+    EXTRA_CHECK_PHASE_PENDING.with(|predicates| predicates.borrow_mut().clear());
+}
+
+/// Whether an added predicate says the check phase has work.
+fn rn_bind_worker_pending() -> bool {
+    EXTRA_CHECK_PHASE_PENDING
+        .with(|predicates| predicates.borrow().iter().any(|predicate| predicate()))
+}
+
+/// Adds a predicate that keeps the process alive outside libuv.
+///
+/// A running `Worker` is the case: its thread has its own loop, so nothing on
+/// *this* loop records it, and yet Node's process waits for it. Additive for the
+/// same reason [`add_check_phase_hook`] is — the producers cannot depend on each
+/// other.
+pub fn add_external_work_predicate(predicate: fn() -> bool) {
+    EXTERNAL_WORK.with(|predicates| {
+        let mut predicates = predicates.borrow_mut();
+        if !predicates.contains(&predicate) {
+            predicates.push(predicate);
+        }
+    });
+}
+
+/// Removes every predicate added by [`add_external_work_predicate`].
+pub fn clear_external_work_predicates() {
+    EXTERNAL_WORK.with(|predicates| predicates.borrow_mut().clear());
+}
+
+/// Whether any registered predicate says the process must stay alive.
+///
+/// Arming the check phase here is deliberate: this function is only asked when
+/// the loop is deciding whether to keep running, and a `true` answer means the
+/// work it is keeping the loop for runs in the *check phase*. libuv's check
+/// handle is started on demand, so without this the loop would run iterations
+/// whose phase never fires and spin until the turn limit.
+#[must_use]
+pub fn has_external_work() -> bool {
+    let pending =
+        EXTERNAL_WORK.with(|predicates| predicates.borrow().iter().any(|predicate| predicate()));
+    if pending {
+        arm_check_phase();
+    }
+    pending
 }
 
 /// Arms the check phase for work that does not go through `setImmediate`.
@@ -926,6 +1041,112 @@ fn throw(scope: &mut v8::PinScope, message: &str) {
     };
     let exception = v8::Exception::error(scope, message);
     scope.throw_exception(exception);
+}
+
+/// Closes the three libuv handles this crate owns on the current thread.
+///
+/// **This is what makes a worker's loop able to end.** `uv_run(UV_RUN_DEFAULT)`
+/// returns only when nothing is referenced, so a timer handle left *started* —
+/// the normal state after `setInterval` — keeps the loop alive forever, and a
+/// `terminate()` that only stopped running JavaScript would hang. Node's
+/// `Environment` has the same requirement and does it in `TimerWrapHandle` and
+/// `Immediate` teardown: stop the handle, then close it.
+///
+/// Each handle is stopped before it is closed, because `uv_close` on a started
+/// timer leaves libuv calling back into a handle whose Rust owner is going away.
+/// The storage is *not* freed here: the close callback is the only place that
+/// knows libuv is finished with it, and `rn_uv::uv_loop::close_loop` is what
+/// pumps the loop until that callback runs.
+///
+/// Idempotent, because a teardown can run twice on a thread — once from the
+/// realm's own exit and once from the loop's `Drop`.
+///
+/// Returns how many handles it asked libuv to close, so a caller can compare its
+/// total against what it created.
+pub fn close_handles() -> usize {
+    let (timer, check, idle) = HANDLES.with(|handles| {
+        let mut handles = handles.borrow_mut();
+        (
+            handles.timer.take(),
+            handles.check.take(),
+            handles.idle.take(),
+        )
+    });
+
+    let mut closing = 0usize;
+    // The storage has to outlive the close: libuv keeps the handle pointer and
+    // writes to it until the callback runs. So each box is deliberately leaked
+    // here and reclaimed by its typed close callback, which is the only place
+    // that knows libuv is finished with it. Dropping the `Pin<Box<_>>` at the end
+    // of this function would free storage libuv is still writing to — and then
+    // the callback's `Box::from_raw` would free it a second time.
+    if let Some(timer) = timer {
+        let pointer = std::ptr::from_ref(&*timer).cast_mut();
+        // SAFETY: `timer` was initialised by `ensure_timer_handle`, and this is
+        // the only path that closes it because `HANDLES` gave up the box above.
+        unsafe {
+            uv::uv_timer_stop(pointer);
+            uv::uv_close(pointer.cast(), Some(timer_closed));
+        }
+        std::mem::forget(timer);
+        closing += 1;
+    }
+    if let Some(check) = check {
+        let pointer = std::ptr::from_ref(&*check).cast_mut();
+        // SAFETY: as above.
+        unsafe {
+            uv::uv_check_stop(pointer);
+            uv::uv_close(pointer.cast(), Some(check_closed));
+        }
+        std::mem::forget(check);
+        closing += 1;
+    }
+    if let Some(idle) = idle {
+        let pointer = std::ptr::from_ref(&*idle).cast_mut();
+        // SAFETY: as above.
+        unsafe {
+            uv::uv_idle_stop(pointer);
+            uv::uv_close(pointer.cast(), Some(idle_closed));
+        }
+        std::mem::forget(idle);
+        closing += 1;
+    }
+    closing
+}
+
+/// Records and frees a closed timer handle.
+///
+/// # Safety
+///
+/// Called by libuv as the `uv_close` callback for a `uv_timer_t` whose `Pin<Box<_>>`
+/// was released by [`close_handles`].
+unsafe extern "C" fn timer_closed(handle: *mut uv::uv_handle_t) {
+    rn_uv::ledger::record_closed();
+    // SAFETY: `close_handles` released the box that owned this handle, and libuv
+    // is done with it now, so this is the one deallocation.
+    unsafe { drop(Box::from_raw(handle as *mut uv::uv_timer_t)) };
+}
+
+/// Records and frees a closed check handle.
+///
+/// # Safety
+///
+/// As [`timer_closed`], for a `uv_check_t`.
+unsafe extern "C" fn check_closed(handle: *mut uv::uv_handle_t) {
+    rn_uv::ledger::record_closed();
+    // SAFETY: as in `timer_closed`.
+    unsafe { drop(Box::from_raw(handle as *mut uv::uv_check_t)) };
+}
+
+/// Records and frees a closed idle handle.
+///
+/// # Safety
+///
+/// As [`timer_closed`], for a `uv_idle_t`.
+unsafe extern "C" fn idle_closed(handle: *mut uv::uv_handle_t) {
+    rn_uv::ledger::record_closed();
+    // SAFETY: as in `timer_closed`.
+    unsafe { drop(Box::from_raw(handle as *mut uv::uv_idle_t)) };
 }
 
 #[cfg(test)]

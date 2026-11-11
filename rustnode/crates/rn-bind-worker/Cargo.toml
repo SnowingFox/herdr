@@ -9,7 +9,23 @@ description = "internalBinding('worker') for rustnode"
 
 [dependencies]
 rn-core.workspace = true
+rn-io.workspace = true
+# A worker's `parentPort` is a `MessagePort` with its other end in another
+# isolate, so the port transport is this crate's only way to talk to the parent.
+rn-bind-messaging = { path = "../rn-bind-messaging" }
+# The worker's own realm is the same bootstrap the main thread runs, against a
+# second registry. Duplicating it here is how the two would drift.
+rn-realm = { path = "../rn-realm" }
+rn-bind-options = { path = "../rn-bind-options" }
+# The check phase is where a worker's exit is reported, and its handle lives
+# there. The hook is additive so neither crate has to know the other.
+rn-bind-timers = { path = "../rn-bind-timers" }
+rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
+rn-module-wrap = { path = "../rn-module-wrap" }
+rn-uv = { path = "../rn-uv" }
 rn-v8-sys.workspace = true
+tracing.workspace = true
+v8.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

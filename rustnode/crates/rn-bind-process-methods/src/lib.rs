@@ -336,6 +336,22 @@ fn kill(
     }
 }
 
+/// `process.reallyExit(code)`: end this *realm*, not the process.
+///
+/// On the main thread that is the process, which is what `std::process::exit`
+/// does. In a worker it is not: `lib/internal/main/worker_thread.js`'s uncaught
+/// path ends with `process.exit()`, and a worker whose script throws must report
+/// a non-zero exit code through `worker.on('exit')` while the parent keeps
+/// running. Calling `std::process::exit` there killed the whole process from the
+/// worker's thread, which showed up as "starting a worker makes the parent's
+/// event loop disappear".
+///
+/// So the two cases are distinguished by asking whether this realm is the main
+/// thread. Off the main thread the exit is recorded the way Node records it —
+/// `process._exiting = true` and the exit code — and the realm's loop is what
+/// stops, because [`rn_core::hook_slot::EXIT_REQUESTED`] is set. The exit code
+/// travels out through the worker's `exitCode`, which is what
+/// `WorkerHandle::exit_code` reports to `worker.on('exit')`.
 fn really_exit(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -347,7 +363,14 @@ fn really_exit(
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    std::process::exit(code);
+
+    if rn_bind_worker::realm_facts().is_main_thread {
+        std::process::exit(code);
+    }
+    // In a worker: record the code where the parent will read it, mark the realm
+    // as exiting so `process.exit()` cannot run twice, and let the loop stop.
+    rn_bind_worker::record_worker_exit_code(scope, code);
+    rn_core::hook_slot::set_flag(scope, rn_core::hook_slot::EXIT_REQUESTED, true);
 }
 
 fn abort(

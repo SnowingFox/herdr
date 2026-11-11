@@ -4,8 +4,6 @@
 //! scope — `assert(internalBinding('worker').isMainThread)` and
 //! `internalBinding('worker').threadId` — so *every* entry in Node's own test
 //! tree fails before the first line of a test runs until the namespace exists.
-//! That is why the main-thread surface lands here first, separately from the
-//! `Worker` constructor.
 //!
 //! # The shape Node really returns
 //!
@@ -37,7 +35,18 @@
 //! `!isMainThread` and never tests for presence — and keeping `members()`
 //! honest is worth more than reproducing V8's laziness.
 //!
-//! # What this build reports on the main thread
+//! # The six facts are per thread, not per process
+//!
+//! `isMainThread`, `threadId`, `threadName`, `isInternalThread`,
+//! `ownsProcessState` and `resourceLimits` describe *the realm being
+//! bootstrapped*, which is why Node installs them from a per-isolate template.
+//! A worker's own realm must see `isMainThread === false` and its own
+//! `threadId`, while the parent keeps answering `true` and `0`. They are read
+//! from a thread-local realm record for exactly that reason; a process-global
+//! constant would make the worker believe it is the main thread and
+//! `internal/worker.js` would then skip installing `parentPort` entirely.
+//!
+//! # What the main thread reports
 //!
 //! Values were checked against a real `node --expose-internals` binary, not
 //! inferred from the source alone:
@@ -64,13 +73,6 @@
 //! makeResourceLimits(...) : {}`) and `createWorkerStdio()` is the only caller
 //! of the second, reached solely from the worker-side bootstrap switch.
 //!
-//! # `Worker` is deferred
-//!
-//! See `DEFERRED` below. A constructor that returned an object capable of
-//! neither starting a thread nor posting a message would make
-//! `new Worker(...)` hang instead of failing where it is used, so the name is
-//! declared absent rather than stubbed.
-//!
 //! # The `k*` values are indices, not sizes
 //!
 //! `lib/internal/worker.js` uses them to address a shared `Float64Array`:
@@ -86,11 +88,61 @@
 //! wrong limit enforced — so the order below is load-bearing and pinned by a
 //! test.
 
+pub mod handle;
+pub mod parent;
+pub mod registry;
+pub mod run;
+mod worker;
+
+use std::cell::RefCell;
+
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
+pub use crate::handle::{next_thread_id, SpawnRequest, WorkerHandle, JOIN_TIMEOUT};
+pub use crate::parent::{any_keeps_loop_alive, has_finished, report_finished, tracked_count};
+
+/// The worker crate's share of the check phase.
+///
+/// Registered by the realm that owns the loop, because this crate cannot install
+/// it itself: the check handle belongs to `rn-bind-timers` and the realm's
+/// install is what arms it. The body reports every worker whose thread has
+/// stopped, which is Node's `onexit` timing.
+fn report_worker_exits(scope: &mut v8::PinScope<'_, '_>) {
+    let _ = report_finished(scope);
+}
+
+/// Registers this crate's check-phase hook, and its liveness predicate.
+///
+/// Called by the realm's runtime install, on every thread. On the main thread it
+/// is what makes `worker.on('exit')` fire; in a worker it is harmless — that
+/// thread has no workers of its own unless the worker creates one, in which case
+/// it needs exactly the same wiring.
+pub fn install_check_phase() {
+    // The parent needs a `uv_async_t` of its own before any worker can tell it
+    // anything: `ThreadToken::notify` finds no handle without one, so a worker's
+    // finish would be a silent no-op. The callback runs on *this* thread, from
+    // inside its loop, which is the only place that can arm this thread's check
+    // handle — the very thing a foreign thread cannot do for itself.
+    rn_uv::wake::install_current_thread(|| {
+        rn_bind_timers::arm_check_phase();
+        rn_bind_messaging::schedule_ports_with_mail();
+    });
+    rn_bind_timers::add_check_phase_hook(report_worker_exits);
+    // A running worker pins the loop even though it owns nothing on this loop's
+    // libuv handle set: its thread has a loop of its own. Node calls this
+    // `env->add_refs(1)` on `startThread`.
+    rn_bind_timers::add_external_work_predicate(any_keeps_loop_alive);
+    // And the phase has to stay armed while an exit is owed, or the report runs
+    // after the loop has already decided it has nothing to do.
+    rn_bind_timers::add_check_phase_pending_predicate(has_finished);
+}
+pub use crate::run::WorkerThread;
+pub use crate::worker::install_worker_constructor;
+
 /// Members exposed on the namespace object, matching `contracts/worker.json`.
 pub const MEMBERS: &[&str] = &[
+    "Worker",
     "getEnvMessagePort",
     "isInternalThread",
     "isMainThread",
@@ -106,13 +158,9 @@ pub const MEMBERS: &[&str] = &[
 ];
 
 /// Members this build does not install yet.
-pub const DEFERRED: &[(&str, &str)] = &[(
-    "Worker",
-    "needs a second isolate, a MessagePort pair with a cross-thread transport, \
-     and the worker-side bootstrap that runs lib/internal/main/worker_thread.js; \
-     a constructor that started no thread and delivered no message would hang \
-     new Worker() instead of failing at the point of use",
-)];
+///
+/// Empty: this crate installs every member of `contracts/worker.json`.
+pub const DEFERRED: &[(&str, &str)] = &[];
 
 /// Index of `maxYoungGenerationSizeMb` in the shared resource-limit array.
 ///
@@ -145,6 +193,93 @@ pub const MAIN_THREAD_ID: i32 = 0;
 /// `worker_threads.threadName`.
 pub const MAIN_THREAD_NAME: &str = "";
 
+/// The facts about the realm on this thread.
+///
+/// `Environment` holds these per isolate in Node; this is the same split, one
+/// level up. The default is the main thread, which is what a realm that never
+/// called [`set_realm`] is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealmFacts {
+    /// `internalBinding('worker').isMainThread`.
+    pub is_main_thread: bool,
+    /// `threadId`, from `AllocateEnvironmentThreadId`.
+    pub thread_id: i32,
+    /// `threadName`, as passed to `Environment::Create`.
+    pub thread_name: String,
+    /// `isInternalThread`, which only the module-loader worker sets.
+    pub is_internal_thread: bool,
+    /// `ownsProcessState`: false in a worker, because `process` is shared.
+    pub owns_process_state: bool,
+}
+
+impl Default for RealmFacts {
+    fn default() -> Self {
+        Self {
+            is_main_thread: true,
+            thread_id: MAIN_THREAD_ID,
+            thread_name: MAIN_THREAD_NAME.to_string(),
+            is_internal_thread: false,
+            owns_process_state: true,
+        }
+    }
+}
+
+impl RealmFacts {
+    /// The facts `Worker::Run` passes to `CreateEnvironment` for a worker.
+    ///
+    /// `ownsProcessState` is false because a worker does not own the process:
+    /// that is what makes `process.chdir`, `process.abort` and the credential
+    /// setters unavailable there, and it is the switch
+    /// `internal/bootstrap/switches/does_not_own_process_state.js` selects on.
+    #[must_use]
+    pub fn worker(thread_id: i32, thread_name: impl Into<String>) -> Self {
+        Self {
+            is_main_thread: false,
+            thread_id,
+            thread_name: thread_name.into(),
+            is_internal_thread: false,
+            owns_process_state: false,
+        }
+    }
+}
+
+thread_local! {
+    /// The facts for the realm bootstrapping on this thread.
+    ///
+    /// A `RefCell` rather than a `OnceCell` because a worker thread bootstraps
+    /// one realm and then exits; the main thread never replaces its value, and a
+    /// reused thread would set it again.
+    static FACTS: RefCell<RealmFacts> = RefCell::new(RealmFacts::default());
+
+    /// The resource limits this realm enforces, or `None` on the main thread.
+    ///
+    /// `ResourceLimitsGetter` returns nothing without a worker context, so this
+    /// stays `None` on the main thread and `getResourceLimits` reports
+    /// `undefined` there.
+    static RESOURCE_LIMITS: RefCell<Option<[f64; 4]>> = const { RefCell::new(None) };
+}
+
+/// Records the facts for the realm this thread is bootstrapping.
+///
+/// Called by the worker thread before its realm bootstrap and by nothing on the
+/// main thread, which is why the default already describes the main thread.
+pub fn set_realm(facts: RealmFacts, resource_limits: Option<[f64; 4]>) {
+    FACTS.with(|slot| *slot.borrow_mut() = facts);
+    RESOURCE_LIMITS.with(|slot| *slot.borrow_mut() = resource_limits);
+}
+
+/// The facts for this thread's realm.
+#[must_use]
+pub fn realm_facts() -> RealmFacts {
+    FACTS.with(|slot| slot.borrow().clone())
+}
+
+/// The limits this realm enforces, if it is a worker.
+#[must_use]
+pub fn resource_limits() -> Option<[f64; 4]> {
+    RESOURCE_LIMITS.with(|slot| *slot.borrow())
+}
+
 pub struct Worker;
 
 impl BindingModule for Worker {
@@ -166,6 +301,7 @@ impl BindingModule for Worker {
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
         let object = v8::Object::new(scope);
+        let facts = realm_facts();
 
         // `NODE_DEFINE_CONSTANT`: enumerable, non-writable, non-configurable.
         for (name, value) in [
@@ -188,23 +324,35 @@ impl BindingModule for Worker {
         // creates exactly the attributes V8 reports for them on Node:
         // writable, enumerable and configurable.
         //
-        // `resourceLimits` is deliberately `undefined`: the getter in
+        // `resourceLimits` is `undefined` on the main thread: the getter in
         // `node_worker.cc` returns nothing when the environment has no worker
-        // context, which on the main thread it never does. `lib/internal/worker.js`
-        // branches on `isMainThread` before reading it, so an absent value is the
-        // correct one and a made-up object would be the wrong one.
+        // context, which on the main thread it never does. In a worker it is the
+        // array `lib/internal/worker.js` turns into the public object.
+        let limits: v8::Local<v8::Value> = match resource_limits() {
+            Some(limits) => float64_array(scope, &limits),
+            None => v8::undefined(scope).into(),
+        };
         let members: [(&str, v8::Local<v8::Value>); 6] = [
-            ("threadId", v8::Integer::new(scope, MAIN_THREAD_ID).into()),
+            ("threadId", v8::Integer::new(scope, facts.thread_id).into()),
             (
                 "threadName",
-                v8::String::new(scope, MAIN_THREAD_NAME)
+                v8::String::new(scope, &facts.thread_name)
                     .ok_or("cannot allocate the thread name")?
                     .into(),
             ),
-            ("isMainThread", v8::Boolean::new(scope, true).into()),
-            ("isInternalThread", v8::Boolean::new(scope, false).into()),
-            ("ownsProcessState", v8::Boolean::new(scope, true).into()),
-            ("resourceLimits", v8::undefined(scope).into()),
+            (
+                "isMainThread",
+                v8::Boolean::new(scope, facts.is_main_thread).into(),
+            ),
+            (
+                "isInternalThread",
+                v8::Boolean::new(scope, facts.is_internal_thread).into(),
+            ),
+            (
+                "ownsProcessState",
+                v8::Boolean::new(scope, facts.owns_process_state).into(),
+            ),
+            ("resourceLimits", limits),
         ];
         for (name, value) in members {
             define(scope, object, name, value, v8::PropertyAttribute::NONE)?;
@@ -219,6 +367,16 @@ impl BindingModule for Worker {
             object,
             "getEnvMessagePort",
             get_env_message_port,
+            v8::PropertyAttribute::NONE,
+        )?;
+
+        // The constructor `lib/internal/worker.js` calls as `new WorkerImpl(...)`.
+        let constructor = install_worker_constructor(scope)?;
+        define(
+            scope,
+            object,
+            "Worker",
+            constructor,
             v8::PropertyAttribute::NONE,
         )?;
 
@@ -239,11 +397,50 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
 /// gap: `createWorkerStdio()` in `lib/internal/worker/io.js` is the only caller
 /// and it runs only from the worker-side bootstrap switch.
 fn get_env_message_port(
-    _scope: &mut v8::PinScope<'_, '_>,
+    scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue,
+    mut rv: v8::ReturnValue<'_>,
 ) {
-    // Leaving the return value unset yields `undefined`.
+    // Leaving the return value unset yields `undefined`, which is what the main
+    // thread must report.
+    if let Some(port) = rn_core::hook_slot::env_message_port(scope) {
+        rv.set(port.into());
+    }
+}
+
+/// Builds a `Float64Array` from `values`, the way `parseResourceLimits` expects.
+///
+/// The `v8` crate's `Float64Array::new` takes an `ArrayBuffer` plus an offset and
+/// length, so the buffer is allocated first. Index access on a typed array is
+/// `Value`-typed in this binding, which is why the values go in as `Number`s.
+fn float64_array<'s>(scope: &mut v8::PinScope<'s, '_>, values: &[f64]) -> v8::Local<'s, v8::Value> {
+    let buffer = v8::ArrayBuffer::new(scope, std::mem::size_of_val(values));
+    let Some(array) = v8::Float64Array::new(scope, buffer, 0, values.len()) else {
+        return v8::undefined(scope).into();
+    };
+    for (index, value) in values.iter().enumerate() {
+        let index = u32::try_from(index).unwrap_or(0);
+        let number = v8::Number::new(scope, *value);
+        let _ = array.set_index(scope, index, number.into());
+    }
+    array.into()
+}
+
+/// Reads `length` doubles out of a `Float64Array` value, or `None` when the
+/// value is not one.
+fn read_float64_array(
+    scope: &v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    length: usize,
+) -> Option<Vec<f64>> {
+    let array = v8::Local::<v8::Float64Array>::try_from(value).ok()?;
+    let mut values = Vec::with_capacity(length);
+    for index in 0..length {
+        let index = u32::try_from(index).ok()?;
+        let entry = array.get_index(scope, index)?;
+        values.push(entry.number_value(scope)?);
+    }
+    Some(values)
 }
 
 fn function<'s>(
@@ -308,8 +505,114 @@ mod tests {
     }
 
     #[test]
-    fn the_deferred_member_is_only_worker() {
-        assert_eq!(DEFERRED.len(), 1);
-        assert_eq!(DEFERRED[0].0, "Worker");
+    fn nothing_is_deferred_any_more() {
+        // `Worker` used to be here with a reason that was correct at the time.
+        // Keeping the list empty is the assertion that the whole namespace is
+        // installed, so a future gap has to be declared rather than inherited.
+        assert!(DEFERRED.is_empty(), "the worker namespace is complete");
     }
+
+    #[test]
+    fn the_main_thread_facts_are_the_defaults() {
+        let facts = RealmFacts::default();
+        assert!(facts.is_main_thread);
+        assert_eq!(facts.thread_id, MAIN_THREAD_ID);
+        assert_eq!(facts.thread_name, MAIN_THREAD_NAME);
+        assert!(!facts.is_internal_thread);
+        assert!(facts.owns_process_state);
+    }
+
+    #[test]
+    fn a_worker_does_not_own_the_process_and_is_not_the_main_thread() {
+        // `does_not_own_process_state.js` is selected on this, and
+        // `lib/internal/worker.js` guards `parentPort` installation on
+        // `isMainThread` being false. Both would silently do the wrong thing if
+        // these two flags were the main thread's.
+        let facts = RealmFacts::worker(7, "WorkerThread");
+        assert!(!facts.is_main_thread);
+        assert!(!facts.owns_process_state);
+        assert_eq!(facts.thread_id, 7);
+        assert_eq!(facts.thread_name, "WorkerThread");
+    }
+}
+
+thread_local! {
+    /// The parent's stop flag, published by [`publish_stop_flag`].
+    ///
+    /// A reference to the parent's `Arc`, not a copy: `worker.terminate()` sets
+    /// it from the parent's thread, and `terminate_execution` can abort V8 inside
+    /// any callback. `worker_thread.js`'s `process._fatalException` then runs,
+    /// cannot serialize the abort, and posts `COULD_NOT_SERIALIZE_ERROR` — which
+    /// the parent emits as `Uncaught null: null` after a terminate that actually
+    /// worked. Node avoids the path with `env->set_can_call_into_js(false)` in
+    /// `Worker::Exit`; this is the same answer at the one place JavaScript asks.
+    static STOP_FLAG: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// The exit code a worker's `process.exit()` recorded.
+    ///
+    /// Set by `process.reallyExit` when the realm is not the main thread. The
+    /// worker's loop stops on [`rn_core::hook_slot::EXIT_REQUESTED`], and this is
+    /// what the thread body reports to the parent afterwards.
+    static EXIT_CODE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Publishes the shared stop flag for this worker's realm.
+///
+/// The flag is an `Arc<AtomicBool>` the parent sets from its own thread, so the
+/// realm-local copy has to be a reference to it rather than a `bool`: a
+/// termination can arrive at any moment, including in the middle of a callback,
+/// and the fatal handler must see it immediately rather than at the next
+/// scheduler check.
+pub fn publish_stop_flag(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    STOP_FLAG.with(|slot| *slot.borrow_mut() = Some(flag));
+}
+
+/// Whether this worker's realm is stopping.
+pub fn is_stopping() -> bool {
+    STOP_FLAG.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+    })
+}
+
+/// Drops the published flag, so a reused thread starts clean.
+pub fn clear_stopping() {
+    STOP_FLAG.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// Records the exit code a worker's `process.exit()` asked for.
+///
+/// This is `process.reallyExit`'s worker branch. It also sets `process._exiting`,
+/// which is what makes a second `process.exit()` a no-op and what `lib/**` reads
+/// to decide whether output should still be flushed.
+pub fn record_worker_exit_code(scope: &mut v8::PinScope<'_, '_>, code: i32) {
+    EXIT_CODE.with(|slot| slot.set(Some(code)));
+    if let Some(process) = global_process(scope) {
+        if let Some(key) = v8::String::new(scope, "exitCode") {
+            let _ = process.set(scope, key.into(), v8::Integer::new(scope, code).into());
+        }
+        if let Some(key) = v8::String::new(scope, "_exiting") {
+            let _ = process.set(scope, key.into(), v8::Boolean::new(scope, true).into());
+        }
+    }
+}
+
+/// The exit code a worker's `process.exit()` asked for, if any.
+#[must_use]
+pub fn recorded_exit_code() -> Option<i32> {
+    EXIT_CODE.with(std::cell::Cell::get)
+}
+
+/// Clears the recorded exit code, so a reused thread starts clean.
+pub fn clear_exit_code() {
+    EXIT_CODE.with(|slot| slot.set(None));
+}
+
+fn global_process<'s>(scope: &v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "process")?;
+    let process = global.get(scope, key.into())?;
+    v8::Local::<v8::Object>::try_from(process).ok()
 }

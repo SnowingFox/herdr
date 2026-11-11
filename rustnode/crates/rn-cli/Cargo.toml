@@ -33,6 +33,10 @@ rn-permission = { path = "../rn-permission" }
 rn-bind-crypto = { path = "../rn-bind-crypto" }
 rn-module = { path = "../rn-module" }
 rn-io = { path = "../rn-io" }
+# The realm bootstrap is shared with worker threads: a worker is a second isolate
+# running the same `internal/bootstrap/realm.js` sequence, so it has to be one
+# implementation rather than a copy that can drift.
+rn-realm = { path = "../rn-realm" }
 # `process.versions.uv` reports the libuv this binary linked, which `rn-uv`
 # reads from `uv_version_string` rather than from a manifest.
 rn-uv = { path = "../rn-uv" }
@@ -46,6 +50,9 @@ rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 # state. Opening it here is what makes top-level `triggerAsyncId()` answer 1.
 rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
+# A worker's exit is reported from the parent's check phase, so the CLI wires
+# that hook when it installs the loop.
+rn-bind-worker = { path = "../rn-bind-worker" }
 rn-napi = { path = "../rn-napi" }
 # `process.versions.zlib` and `.zstd` come from the libraries the binary
 # actually links, so the CLI asks those bindings rather than restating a

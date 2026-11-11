@@ -41,12 +41,12 @@
 //! a clone hook is ever invoked.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use rn_core::host_object::{self, TransferData};
 use rn_v8_sys::v8;
 
-use crate::port::Message;
+use crate::port::{Message, PortTransferData};
 
 /// The transfer list of one `postMessage`, resolved into concrete objects.
 struct Transfers<'s> {
@@ -55,6 +55,23 @@ struct Transfers<'s> {
     array_buffers: Vec<v8::Local<'s, v8::ArrayBuffer>>,
     /// Ports being handed over rather than copied.
     ports: Vec<v8::Local<'s, v8::Object>>,
+}
+
+/// One entry in the id space, while the message is still being built.
+///
+/// The vector of these *is* the id space: the transfer list seeds it and
+/// `WriteHostObject` appends to it, so a slot's index is the id the payload
+/// carries. Keeping the payload in the same slot as the handle is what makes
+/// "which object does id `n` name" a single lookup on both sides of the post.
+pub(crate) struct Slot {
+    /// The sender's own object, for `transfer_index`.
+    handle: v8::Global<v8::Object>,
+    /// What the message carries for this id.
+    ///
+    /// A transfer-list port has one from the start, because handing the queue
+    /// over is what transferring it means. A clone's payload only exists once the
+    /// `Finish` loop has run its clone hook, which is why this starts empty.
+    payload: Option<Arc<dyn TransferData>>,
 }
 
 /// Collects host objects while the message is serialized.
@@ -67,11 +84,11 @@ pub(crate) struct Delegate<'a> {
     /// Node's `SerializerDelegate::host_objects_`: the transfer list seeds it and
     /// `WriteHostObject` appends to it, so the vector order and the id order are
     /// the same thing.
-    pub host_objects: &'a RefCell<Vec<v8::Global<v8::Object>>>,
+    host_objects: &'a RefCell<Vec<Slot>>,
     /// How many of those slots arrived through the transfer list.
     ///
     /// Node's `first_cloned_object_index_`.
-    pub transferred: usize,
+    transferred: usize,
 }
 
 impl v8::ValueSerializerImpl for Delegate<'_> {
@@ -170,7 +187,10 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
 
         let id = {
             let mut host_objects = self.host_objects.borrow_mut();
-            host_objects.push(v8::Global::new(scope, object));
+            host_objects.push(Slot {
+                handle: v8::Global::new(scope, object),
+                payload: None,
+            });
             host_objects.len() as u32 - 1
         };
         serializer.write_uint32(id);
@@ -190,8 +210,8 @@ impl Delegate<'_> {
         object: v8::Local<'s, v8::Object>,
     ) -> Option<usize> {
         let host_objects = self.host_objects.borrow();
-        for (index, existing) in host_objects.iter().take(self.transferred).enumerate() {
-            let existing: v8::Local<v8::Object> = v8::Local::new(scope, existing);
+        for (index, slot) in host_objects.iter().take(self.transferred).enumerate() {
+            let existing: v8::Local<v8::Object> = v8::Local::new(scope, &slot.handle);
             if existing.strict_equals(object.into()) {
                 return Some(index);
             }
@@ -202,15 +222,14 @@ impl Delegate<'_> {
 
 /// Serializes `value`, detaching everything in `transfer_list`.
 ///
-/// On success returns the message and the ports the caller must hand over. On
-/// failure returns the text to report as an exception, or `None` when V8 has
-/// already scheduled one — throwing again would replace a precise message with a
-/// generic one and leave two exceptions pending.
+/// On success returns the message. On failure returns the text to report as an
+/// exception, or `None` when V8 has already scheduled one — throwing again would
+/// replace a precise message with a generic one and leave two exceptions pending.
 pub fn serialize<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
     transfer_list: v8::Local<'s, v8::Value>,
-) -> Result<(Message, Vec<v8::Global<v8::Object>>), Option<String>> {
+) -> Result<Message, Option<String>> {
     let context = scope.get_current_context();
     let transfers = collect_transfers(scope, transfer_list)?;
 
@@ -227,10 +246,26 @@ pub fn serialize<'s>(
     // Node seeds `host_objects_` with the transferable entries before writing the
     // value, so `WriteHostObject` finds them by index. Same order here, and in the
     // same place: the ids the payload references are these indices.
+    //
+    // Each transfer-list port goes in as a `PortTransferData` carrying the queue,
+    // not as a bare handle. A `MessagePort` is never cloned, so that payload is the
+    // only thing the receiver can rebuild one from — and keeping it in the same
+    // slot as the id is what stops the sender's vector and the receiver's vector
+    // from disagreeing about which object an id names.
     {
         let mut slots = host_objects.borrow_mut();
         for port in &transfers.ports {
-            slots.push(v8::Global::new(scope, *port));
+            let Some(state) = crate::port_state_of(scope, *port) else {
+                // `collect_transfers` accepted it as a port, so this cannot fail
+                // unless the object changed mid-serialize.
+                crate::throw_data_clone_exception_str(scope, "The port could not be transferred");
+                return Err(None);
+            };
+            let payload = PortTransferData::for_port(Arc::clone(&state.data));
+            slots.push(Slot {
+                handle: v8::Global::new(scope, *port),
+                payload: Some(payload),
+            });
         }
     }
 
@@ -267,6 +302,19 @@ pub fn serialize<'s>(
         }
     }
 
+    // `TransferForMessaging` for each port, at the same point in the sequence as
+    // Node: after the value is written, never before. The sender gives up its end
+    // here, so a port that was handed over refuses to post or receive, and the
+    // queue belongs to the receiver alone once the message is dispatched.
+    // A detached port cannot be reached from the receiving side, so this must not
+    // run when serialization failed — which the early returns above already
+    // guarantee.
+    for port in &transfers.ports {
+        if let Some(state) = crate::port_state_of(scope, *port) {
+            state.detach_for_transfer();
+        }
+    }
+
     // `SerializerDelegate::Finish`, which interleaves `CloneForMessaging` and
     // `FinalizeTransferWrite` in one loop. Both halves have to be here rather than
     // in two passes because writing a clone's data can itself reach *more* host
@@ -279,7 +327,6 @@ pub fn serialize<'s>(
     // Writing the clone data into the same serializer is also required: it has to
     // land after the main payload in one buffer, because the receiver reads it back
     // from the same stream in the same order.
-    let mut clones: Vec<Rc<dyn TransferData>> = Vec::new();
     let mut index = transferred;
     loop {
         let count = host_objects.borrow().len();
@@ -289,7 +336,7 @@ pub fn serialize<'s>(
         let object = {
             let slots = host_objects.borrow();
             match slots.get(index) {
-                Some(object) => v8::Local::new(scope, object),
+                Some(slot) => v8::Local::new(scope, &slot.handle),
                 None => continue,
             }
         };
@@ -303,25 +350,30 @@ pub fn serialize<'s>(
         if !clone.write_data(scope, &serializer) {
             return Err(None);
         }
-        clones.push(clone);
+        // The clone's payload lands in the slot its id already names, so the
+        // receiver's vector needs no second walk to line up.
+        let mut slots = host_objects.borrow_mut();
+        match slots.get_mut(index) {
+            Some(slot) => slot.payload = Some(clone),
+            None => return Err(None),
+        }
         index += 1;
     }
 
     let data = serializer.release();
     drop(serializer);
-    // The message keeps the transfer-list objects so the receiver can rebuild them
-    // by id, and the caller gets its own handles so it can detach them on the
-    // sending side.
-    let ports: Vec<v8::Global<v8::Object>> = host_objects
-        .borrow()
-        .iter()
-        .take(transferred)
-        .cloned()
-        .collect();
-    Ok((
-        Message::new(data, backing_stores, ports, clones, transferred),
-        host_objects.into_inner(),
-    ))
+
+    // One vector is the whole message: the transfer-list entries carrying their
+    // payloads, then the clones, in the id order the payload references.
+    let slots = host_objects.into_inner();
+    let mut payloads: Vec<Arc<dyn TransferData>> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let Some(payload) = slot.payload else {
+            return Err(None);
+        };
+        payloads.push(payload);
+    }
+    Ok(Message::new(data, backing_stores, payloads, transferred))
 }
 
 /// Reads and validates the transfer list before anything is serialized.
@@ -405,22 +457,71 @@ fn collect_transfers<'s>(
 mod tests {
     use super::*;
 
+    /// A payload that carries nothing, so a test can compare entries by identity.
+    struct Named;
+
+    impl TransferData for Named {
+        fn rebuild<'s>(
+            &self,
+            scope: &mut v8::PinScope<'s, '_>,
+        ) -> Option<v8::Local<'s, v8::Object>> {
+            Some(v8::Object::new(scope))
+        }
+    }
+
     #[test]
     fn a_close_marker_is_distinguishable_from_an_empty_message() {
         // Both carry no bytes, so the flag is the only thing that tells them apart.
         // `ReceiveMessage` relies on it to dispatch `close` rather than trying to
         // deserialize an empty payload.
         assert!(Message::close_marker().close);
-        assert!(!Message::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0).close);
+        assert!(!Message::new(Vec::new(), Vec::new(), Vec::new(), 0).close);
     }
 
     #[test]
-    fn a_message_remembers_where_the_clones_begin() {
-        // The receiver subtracts this from every clone id, so a wrong value
-        // resolves a clone against a transfer-list slot and produces a port where
-        // a handle was expected.
-        let message = Message::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 2);
-        assert_eq!(message.transferred_count, 2);
-        assert_eq!(Message::close_marker().transferred_count, 0);
+    fn one_vector_puts_every_transfer_before_every_clone() {
+        // The ids the payload writes are indices into `host_objects`, so an id
+        // below `transferred_count` has to name a transfer-list entry and one at
+        // or above it a clone. Two vectors meant the deserializer had to guess
+        // which one an id named, and a clone could resolve to a port — a wrong
+        // object with the right shape rather than a clean failure.
+        //
+        // The names are what makes this checkable: asserting only the length
+        // would pass for any ordering, including the broken one.
+        let port_a: Arc<dyn TransferData> = Arc::new(Named);
+        let port_b: Arc<dyn TransferData> = Arc::new(Named);
+        let clone_a: Arc<dyn TransferData> = Arc::new(Named);
+        let message = Message::new(
+            Vec::new(),
+            Vec::new(),
+            vec![port_a.clone(), port_b.clone(), clone_a.clone()],
+            2,
+        );
+
+        assert_eq!(message.transferred_count, 2, "two transfer-list entries");
+        assert_eq!(
+            message.host_objects.len(),
+            3,
+            "every id is in this one vector"
+        );
+
+        // Identity, not a downcast: the vector must hold *these* payloads at
+        // *these* indices. A length check alone passes for any ordering.
+        let entry = |index: usize| Arc::as_ptr(&message.host_objects[index]);
+        assert_eq!(
+            entry(0),
+            Arc::as_ptr(&port_a),
+            "id 0 must be the first transferred port"
+        );
+        assert_eq!(
+            entry(1),
+            Arc::as_ptr(&port_b),
+            "id 1 must be the second transferred port"
+        );
+        assert_eq!(
+            entry(message.transferred_count),
+            Arc::as_ptr(&clone_a),
+            "the id at `transferred_count` must be the first clone"
+        );
     }
 }

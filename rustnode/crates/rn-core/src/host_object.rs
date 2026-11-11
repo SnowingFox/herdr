@@ -22,7 +22,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use rn_v8_sys::v8;
 
@@ -86,7 +86,7 @@ impl TransferMode {
 /// returned, which is why both live in one vector: they are two `TransferData`
 /// implementations, exactly as `JSTransferable::Data` and
 /// `SocketAddressBlockListWrap::TransferData` both derive from the same base.
-pub trait TransferData {
+pub trait TransferData: Send + Sync {
     /// Builds the receiving object, Node's `TransferData::Deserialize`.
     fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>>;
 
@@ -122,7 +122,7 @@ pub trait TransferData {
 pub type CloneFn = for<'s> fn(
     &mut v8::PinScope<'s, '_>,
     v8::Local<'s, v8::Object>,
-) -> Option<Rc<dyn TransferData>>;
+) -> Option<Arc<dyn TransferData>>;
 
 thread_local! {
     /// Registered kinds, keyed by the name a handle is marked with.
@@ -227,7 +227,7 @@ fn stamped_mode(
 pub fn clone_for_messaging<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-) -> Option<Rc<dyn TransferData>> {
+) -> Option<Arc<dyn TransferData>> {
     let kind = kind_of(scope, object)?;
     let clone = KINDS.with(|kinds| kinds.borrow().get(kind).copied())?;
     clone(scope, object)
@@ -279,7 +279,7 @@ mod tests {
     fn never_clones<'s>(
         _scope: &mut v8::PinScope<'s, '_>,
         _object: v8::Local<'s, v8::Object>,
-    ) -> Option<Rc<dyn TransferData>> {
+    ) -> Option<Arc<dyn TransferData>> {
         None
     }
 
