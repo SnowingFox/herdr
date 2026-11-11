@@ -289,8 +289,30 @@ fn dispatch(
         return;
     };
 
+    // Node asks `V8InspectorSession::canDispatchMethod` first and only falls through to
+    // its own dispatcher when V8 says no. This is the same order with the same
+    // reasoning: a method V8 owns must reach V8, and one it does not must not be handed
+    // to it, or the frontend gets `method not found` for a domain that exists.
+    if let Some(reply) = crate::domains::dispatch(&message) {
+        for (method, params) in &reply.notifications {
+            deliver(
+                index,
+                crate::domains::Reply::notification_message(method, params),
+            );
+        }
+        deliver(index, reply.to_message());
+        return;
+    }
+
     let view = v8::inspector::StringView::from(message.as_bytes());
     session.dispatch_protocol_message(view);
+
+    // A pause requested while this message was being dispatched — `Debugger.pause` is
+    // the case that matters — needs its `Debugger.paused` to reach the frontend, and
+    // V8 has already produced it by the time `dispatch` returns.
+    if crate::pause::pause_requested() && crate::pause::take_pause_request() {
+        crate::pause::wake();
+    }
 }
 
 /// `connection.disconnect()`.
@@ -336,6 +358,21 @@ pub fn pause_all(reason: &str) {
         });
     }
     crate::server::pause_all_sessions(reason);
+}
+
+/// Sends `message` to every open `Connection`.
+pub fn broadcast(message: &str) {
+    let indices: Vec<usize> = SLOTS.with(|slots| {
+        slots
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| slot.as_ref().map(|_| index))
+            .collect()
+    });
+    for index in indices {
+        deliver(index, message.to_string());
+    }
 }
 
 fn throw_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {

@@ -688,6 +688,20 @@ pub fn drain(scope: &mut v8::PinScope<'_, '_>, shared: &Arc<Shared>) -> usize {
             };
             SESSIONS.with(|sessions| sessions.borrow_mut().insert(connection, session));
         }
+        // Node's two-stage dispatch: a Node-specific domain is answered here, and
+        // anything else goes to V8. Handing a `NodeRuntime.enable` to V8 would answer
+        // `method not found`, which is what a client reads as "this build has no
+        // inspector".
+        if let Some(reply) = crate::domains::dispatch(&message) {
+            for (method, params) in &reply.notifications {
+                shared.send_to(
+                    connection,
+                    crate::domains::Reply::notification_message(method, params),
+                );
+            }
+            shared.send_to(connection, reply.to_message());
+            continue;
+        }
         SESSIONS.with(|sessions| {
             if let Some(session) = sessions.borrow().get(&connection) {
                 let view = v8::inspector::StringView::from(message.as_bytes());
@@ -696,6 +710,19 @@ pub fn drain(scope: &mut v8::PinScope<'_, '_>, shared: &Arc<Shared>) -> usize {
         });
     }
     count
+}
+
+/// Sends `message` to every connection this server has sessions for.
+///
+/// `shared` is passed in rather than reached through a thread-local because the sessions
+/// table is per-isolate and the `Shared` belongs to the server that owns it; a
+/// thread-local copy would be a second source of truth for which connections exist.
+pub fn broadcast(shared: &Arc<Shared>, message: &str) {
+    let recipients: Vec<usize> =
+        SESSIONS.with(|sessions| sessions.borrow().keys().copied().collect());
+    for connection in recipients {
+        shared.send_to(connection, message.to_string());
+    }
 }
 
 /// Whether any frontend message is waiting.
