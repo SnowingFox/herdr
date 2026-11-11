@@ -325,6 +325,130 @@ pub fn encode_utf8(units: &[u16], max: usize) -> Vec<u8> {
     out
 }
 
+/// `StringBytes::Size` for `utf8`: the UTF-8 byte length of `units`, counted
+/// without producing the bytes.
+///
+/// This is deliberately not `encode_utf8(units, usize::MAX).len()`. That was
+/// the original implementation and it is correct, but it allocates a `u16`
+/// copy of the string and then an entire encoded `Vec<u8>` to measure it, so
+/// `Buffer.byteLength` cost three passes and two allocations where Node costs
+/// one pass and none. `Buffer.byteLength` is called on every buffer-sized
+/// string a program writes, so the length is worth its own counter.
+///
+/// # Semantics
+///
+/// These are `StringBytes::Size`'s, which calls
+/// `simdutf::utf8_length_from_utf16_with_replacement`:
+///
+/// * every ASCII unit is one byte,
+/// * every other BMP scalar is two or three bytes by its value,
+/// * a surrogate *pair* is one four-byte scalar,
+/// * an unpaired surrogate is one U+FFFD, so **three** bytes.
+///
+/// That last rule is the one to get right, and it is why the pair must be
+/// combined rather than counted unit by unit: `"\uD800"` is 3, but `"\uD83D\uDE00"`
+/// is 4 and not 6. Counting each surrogate as three would make the first
+/// correct for the wrong reason and the second wrong.
+///
+/// `write` must agree with this (`Buffer#write` returns the count that
+/// `Buffer#byteLength` reports for the same string), which is why both walk
+/// the same pair rule. They stay separate functions: `write` emits bytes,
+/// truncates at a character boundary, and has to size a buffer, so folding it
+/// into a counter would make one depend on the other's `max` handling.
+pub fn utf8_length(units: &[u16]) -> usize {
+    // The overwhelmingly common case for `Buffer.byteLength` callers. A single
+    // wide scan is much cheaper than the per-unit match below, and it answers
+    // in units rather than needing to add anything up.
+    if units.iter().all(|unit| *unit < 0x80) {
+        return units.len();
+    }
+    // Well-formed UTF-16 cannot contain a surrogate that is not half of a pair,
+    // so the pair rule below collapses to "a pair is 4, everything else is its
+    // scalar width" and simdutf can count it. This is the same pair of calls
+    // `String::Utf8Length` makes. The length is only taken through here once
+    // validity is known: `utf8_length_from_utf16le` assumes valid input, while
+    // `StringBytes::Size` uses the `_with_replacement` variant, and the two
+    // differ on exactly the inputs this branch excludes.
+    if units.len() >= UTF16_SIMD_THRESHOLD && v8::simdutf::validate_utf16le(units) {
+        return v8::simdutf::utf8_length_from_utf16le(units);
+    }
+    utf8_length_scalar(units)
+}
+
+/// The scalar counter, and the only path for ill-formed UTF-16.
+fn utf8_length_scalar(units: &[u16]) -> usize {
+    let mut length = 0;
+    let mut index = 0;
+    while index < units.len() {
+        let unit = units[index];
+        if (0xD800..0xDC00).contains(&unit) {
+            match units.get(index + 1) {
+                Some(next) if (0xDC00..0xE000).contains(next) => {
+                    length += 4;
+                    index += 2;
+                }
+                // Unpaired lead surrogate: one replacement character.
+                _ => {
+                    length += 3;
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if (0xDC00..0xE000).contains(&unit) {
+            // Unpaired trail surrogate on its own.
+            length += 3;
+        } else if unit < 0x80 {
+            length += 1;
+        } else if unit < 0x800 {
+            length += 2;
+        } else {
+            length += 3;
+        }
+        index += 1;
+    }
+    length
+}
+
+/// Below this, validating and then counting in SIMD costs more than one scalar
+/// pass. The crossover is where simdutf's fixed cost stops dominating, roughly
+/// where the `v8` crate puts its own UTF-16 threshold.
+const UTF16_SIMD_THRESHOLD: usize = 32;
+
+/// `StringBytes::Size` for a one-byte string: `utf8_length_from_latin1`.
+///
+/// V8 stores a string that fits in Latin-1 as one byte per character, so the
+/// caller has no `u16` units to count and none need to be materialised. Every
+/// byte below `0x80` is one UTF-8 byte and every other byte is two, because a
+/// Latin-1 code point in `0x80..=0xFF` needs a two-byte sequence.
+///
+/// `StringBytes::Size` calls `simdutf::utf8_length_from_latin1` here, so the
+/// long-input case calls the same function through the copy of simdutf V8
+/// already links. That has no validity subtleties — every Latin-1 byte is a
+/// valid code point — so unlike the UTF-16 path there is no second
+/// implementation to disagree with. Short inputs stay on the scalar sum
+/// because the FFI call has a fixed cost that only pays off above a few dozen
+/// bytes.
+pub fn utf8_length_from_latin1(bytes: &[u8]) -> usize {
+    if bytes.is_ascii() {
+        return bytes.len();
+    }
+    if bytes.len() >= LATIN1_SIMD_THRESHOLD {
+        return v8::simdutf::utf8_length_from_latin1(bytes);
+    }
+    // One addition per byte rather than a branch per byte; `(b >> 7)` is the
+    // high-bit test without the branch, and the sum vectorises.
+    bytes.len()
+        + bytes
+            .iter()
+            .map(|byte| usize::from(byte >> 7))
+            .sum::<usize>()
+}
+
+/// Below this, the simdutf FFI call costs more than the scalar sum it replaces.
+/// The `v8` crate uses the same 128 for its own one-byte length path.
+const LATIN1_SIMD_THRESHOLD: usize = 128;
+
 /// UTF-8 length of one scalar value.
 fn utf8_len(scalar: u32) -> usize {
     match scalar {
@@ -958,6 +1082,108 @@ mod tests {
             decode_utf8_lossy(&[0xF0, 0x9F, 0x98, 0x80]),
             vec![0xD83D, 0xDE00]
         );
+    }
+
+    #[test]
+    fn utf8_length_matches_the_encoder_and_node() {
+        // Every expectation here is `Buffer.byteLength` on node 22, which is
+        // also `Buffer.from(s).length`. The nine rows are the table that pins
+        // the rewrite: the lone-surrogate rows are 3 bytes (one U+FFFD each),
+        // and the pair rows prove pairs are combined rather than counted twice.
+        let cases: &[(&[u16], usize)] = &[
+            (&[], 0),
+            (&[0x61], 1),
+            (&[0x00E9], 2),
+            (&[0x20AC], 3),
+            (&[0xD83D, 0xDE00], 4),
+            (&[0x61, 0xD83D, 0xDE00, 0x62], 6),
+            (&[0xD800], 3),
+            (&[0xDC00], 3),
+            (&[0x61, 0xD800, 0x62], 5),
+            // Adjacent surrogates in the wrong order are two replacements.
+            (&[0xDC00, 0xD800], 6),
+            (&[0xD800, 0xD800], 6),
+            // A trail surrogate after a lead that is not its pair still counts
+            // as two replacements, not one four-byte scalar.
+            (&[0xD800, 0xD800, 0xDC00], 7),
+            // Boundaries of the two- and three-byte ranges.
+            (&[0x7F, 0x80, 0x7FF, 0x800, 0xFFFF], 1 + 2 + 2 + 3 + 3),
+        ];
+        for (units, expected) in cases {
+            assert_eq!(utf8_length(units), *expected, "units {units:?}");
+            // The counter and the encoder must never disagree: `Buffer#write`
+            // reports the number of bytes `Buffer#byteLength` predicts.
+            assert_eq!(
+                encode_utf8(units, usize::MAX).len(),
+                *expected,
+                "encoder disagrees on units {units:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_length_from_latin1_is_the_same_row_for_one_byte_strings() {
+        // A one-byte V8 string is Latin-1 by definition, so this must agree
+        // with `utf8_length` over the same code units.
+        let cases: &[(&[u8], usize)] = &[
+            (b"", 0),
+            (b"a", 1),
+            // One byte per character, so this is one code point per element.
+            (&[0xE9], 2),
+            (&[0xFF], 2),
+            (&[0x7F, 0x80], 3),
+            (&[0x00], 1),
+            (&[0xE9, 0xFF, 0x7F, 0x00], 6),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(utf8_length_from_latin1(bytes), *expected, "bytes {bytes:?}");
+        }
+        // And the general counter must agree when fed the same values as units:
+        // a one-byte V8 string is Latin-1 by definition, so `Buffer.byteLength`
+        // has to answer the same whether V8 stored the string as one byte or
+        // two.
+        assert_eq!(
+            utf8_length(&[0xE9, 0xFF, 0x7F, 0x00]),
+            utf8_length_from_latin1(&[0xE9, 0xFF, 0x7F, 0x00])
+        );
+    }
+
+    #[test]
+    fn utf8_length_handles_long_ill_formed_strings() {
+        // The SIMD path in `utf8_length` is gated on `validate_utf16le`, which
+        // is what makes it safe: `utf8_length_from_utf16le` assumes well-formed
+        // input, and `StringBytes::Size` uses the `_with_replacement` variant
+        // precisely because these strings reach it. Every case here is longer
+        // than `UTF16_SIMD_THRESHOLD`, so each one exercises the gate rather
+        // than the scalar-only short path.
+        let mut pairs = Vec::new();
+        for _ in 0..200 {
+            pairs.extend_from_slice(&[0xD83D, 0xDE00]);
+        }
+        assert!(pairs.len() > UTF16_SIMD_THRESHOLD);
+        assert_eq!(utf8_length(&pairs), 800);
+        assert_eq!(encode_utf8(&pairs, usize::MAX).len(), 800);
+
+        // One lone lead surrogate in the middle of an otherwise valid string
+        // must still be 3 bytes, and must invalidate the whole string for the
+        // SIMD path rather than being silently counted as something else.
+        let mut lone_lead = pairs.clone();
+        lone_lead.insert(100, 0xD800);
+        assert_eq!(utf8_length(&lone_lead), 803);
+        assert_eq!(encode_utf8(&lone_lead, usize::MAX).len(), 803);
+
+        // A lone trail surrogate, likewise.
+        let mut lone_trail = pairs.clone();
+        lone_trail.insert(100, 0xDC00);
+        assert_eq!(utf8_length(&lone_trail), 803);
+        assert_eq!(encode_utf8(&lone_trail, usize::MAX).len(), 803);
+
+        // A long run of one-byte characters with a single three-byte scalar at
+        // the end: the tail must not be lost by a width assumption.
+        let mut mostly_ascii = vec![0x61u16; 300];
+        mostly_ascii.push(0x20AC);
+        assert_eq!(utf8_length(&mostly_ascii), 303);
+        assert_eq!(encode_utf8(&mostly_ascii, usize::MAX).len(), 303);
     }
 
     #[test]

@@ -166,6 +166,13 @@ pub(crate) fn encode_units(units: &[u16], encoding: Encoding, max: usize) -> Vec
 }
 
 /// `byteLengthUtf8`: the UTF-8 byte length of a string.
+///
+/// This counts and never encodes. `StringBytes::Size` reads the string through
+/// `String::ValueView`, which is a borrowed view of the string's existing
+/// storage, so a one-byte string is counted in place and a two-byte one is
+/// counted without being copied. The earlier version built a `Vec<u16>` and then
+/// an encoded `Vec<u8>` just to take its length, which was correct but made the
+/// cost grow with the length of the string in a way Node's does not.
 pub(crate) fn byte_length_utf8(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -175,8 +182,15 @@ pub(crate) fn byte_length_utf8(
         args::throw_type_error(scope, "argument must be a string");
         return None;
     };
-    let units = string_to_units(&string, scope);
-    Some(codec::encode_utf8(&units, usize::MAX).len() as f64)
+    // `ValueView` borrows the string's storage and forbids a GC while it is
+    // alive, so nothing here may allocate or run JavaScript. Counting does
+    // neither. The view is dropped before this returns.
+    let view = v8::ValueView::new(scope, string);
+    let length = match view.data() {
+        v8::ValueViewData::OneByte(bytes) => codec::utf8_length_from_latin1(bytes),
+        v8::ValueViewData::TwoByte(units) => codec::utf8_length(units),
+    };
+    Some(length as f64)
 }
 
 /// `byteLengthUtf8Fast`: the same length.
