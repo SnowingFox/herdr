@@ -333,11 +333,17 @@ impl WrapState {
         // `enc_in_ = enc_out_ = nullptr` in Node. There are no such fields here:
         // `enc_in()`/`enc_out()` read the BIOs back from the SSL, so there is
         // nothing left pointing at a freed BIO.
-        // The callback slot is keyed by this state's address, so it has to go
-        // with the state: a later wrap that reuses the address must not be
-        // matched by a stale entry.
-        crate::callback::unregister(self as *const WrapState as *const RefCell<WrapState>);
-        self.callback = None;
+        // The callback slot is keyed by the state cell's address, so it has to go
+        // with the state: a later wrap that reuses the address must not be matched
+        // by a stale entry.
+        //
+        // `self` is the `WrapState` *inside* the cell, so its address is not the
+        // cell's. Casting one to the other compiles and never matches, which is why
+        // the slot is dropped through the handles it carries rather than by looking
+        // itself up.
+        if let Some(handles) = self.callback.take() {
+            handles.unregister();
+        }
         self.pending_output.clear();
         self.pending_cleartext.clear();
         self.pending_cleartext_output.clear();

@@ -172,12 +172,6 @@ pending_method!(
     "it attaches a stapled OCSP response"
 );
 pending_method!(
-    pending_set_servername,
-    "setServername",
-    4,
-    "it calls SSL_set_tlsext_host_name and interacts with the SNI callback"
-);
-pending_method!(
     pending_set_session,
     "setSession",
     4,
@@ -230,12 +224,6 @@ pending_method!(
     "getPeerFinished",
     4,
     "it reads the peer's Finished message, which needs a completed handshake"
-);
-pending_method!(
-    pending_get_session,
-    "getSession",
-    4,
-    "it needs a handshake that produced a session"
 );
 pending_method!(
     pending_enable_psk_callback,
@@ -308,7 +296,7 @@ pub fn install_into<'s>(
         "setALPNProtocols" => method!(pending_set_alpn_protocols),
         "setKeyCert" => method!(pending_set_key_cert),
         "setOCSPResponse" => method!(pending_set_ocsp_response),
-        "setServername" => method!(pending_set_servername),
+        "setServername" => method!(set_servername),
         "setSession" => method!(pending_set_session),
         "exportKeyingMaterial" => method!(pending_export_keying_material),
         "getALPNNegotiatedProtocol" => method!(get_alpn_negotiated_protocol),
@@ -320,7 +308,7 @@ pub fn install_into<'s>(
         "getPeerX509Certificate" => method!(pending_get_peer_x509_certificate),
         "hasPeerCertificate" => method!(pending_has_peer_certificate),
         "getPeerFinished" => method!(pending_get_peer_finished),
-        "getSession" => method!(pending_get_session),
+        "getSession" => method!(get_session),
         "enablePskCallback" => method!(pending_enable_psk_callback),
         "setPskIdentityHint" => method!(pending_set_psk_identity_hint),
 
@@ -395,6 +383,81 @@ fn receive<'s>(
         // SAFETY: `stream` is the wrap's own `underlying`, live while it holds it.
         unsafe { crate::stream::flush(scope, object, stream, None) };
     }
+}
+
+/// `TLSWrap::GetSession` (`crypto_tls.cc:1977`): the current session as DER.
+///
+/// `SSL_get_session` then `i2d_SSL_SESSION` into a `Buffer`. An absent session is
+/// `undefined`, not an empty buffer — the binding simply does not set a return
+/// value, which JavaScript reads as `undefined`.
+///
+/// This is on the **server's accept path**, not an optional query:
+/// `lib/internal/tls/wrap.js`'s new-session handling reads it while a connection
+/// is being established, and a throw there aborts `'connection'` before
+/// `'secureConnection'` — which is why a server never accepted at all while this
+/// was a stub.
+fn get_session<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let der = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return None;
+        }
+        // SAFETY: `ssl` is live, checked above. The session is owned by the SSL.
+        let session = unsafe { openssl_sys::SSL_get_session(ssl) };
+        if session.is_null() {
+            return None;
+        }
+        // SAFETY: `session` is live for the SSL's lifetime; a null output pointer
+        // asks only for the encoded length.
+        let length = unsafe { openssl_sys::i2d_SSL_SESSION(session, std::ptr::null_mut()) };
+        if length <= 0 {
+            return None;
+        }
+        let mut bytes = vec![0u8; length as usize];
+        let mut cursor = bytes.as_mut_ptr();
+        // SAFETY: `bytes` has exactly `length` bytes, and `i2d_SSL_SESSION`
+        // advances `cursor` past what it wrote without overrunning the buffer it
+        // was given room for.
+        let written = unsafe { openssl_sys::i2d_SSL_SESSION(session, &mut cursor) };
+        if written <= 0 {
+            return None;
+        }
+        bytes.truncate(written as usize);
+        Some(bytes)
+    });
+
+    let Some(Some(bytes)) = der else {
+        // No session, or none that can be encoded: the binding leaves the return
+        // value unset, which is `undefined`.
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+    let Some(view) = v8::Uint8Array::new(scope, array_buffer, 0, array_buffer.byte_length()) else {
+        rv.set(v8::undefined(scope).into());
+        return;
+    };
+    if let Some(prototype) = buffer_prototype(scope) {
+        view.set_prototype(scope, prototype.into());
+    }
+    rv.set(view.into());
+}
+
+/// `Buffer.prototype` from the global, so a buffer this crate builds is a real
+/// `Buffer` rather than a bare `Uint8Array`.
+fn buffer_prototype<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    let global = scope.get_current_context().global(scope);
+    let buffer_key = v8::String::new(scope, "Buffer")?;
+    let buffer = global.get(scope, buffer_key.into())?;
+    let buffer = v8::Local::<v8::Object>::try_from(buffer).ok()?;
+    let prototype_key = v8::String::new(scope, "prototype")?;
+    let value = buffer.get(scope, prototype_key.into())?;
+    v8::Local::<v8::Object>::try_from(value).ok()
 }
 
 /// `TLSWrap::GetCipher` (`crypto_tls.cc:2060`), via `GetCipherInfo`.
@@ -636,6 +699,71 @@ fn get_alpn_negotiated_protocol<'s>(
         },
         // Node's `GetALPNNegotiatedProto` sets `false`, not `null`.
         None => rv.set(v8::Boolean::new(scope, false).into()),
+    }
+}
+
+/// `TLSWrap::SetServername` (`crypto_tls.cc:1539`): the SNI host name.
+///
+/// `SSL_set_tlsext_host_name`, which is `SSL_ctrl(SSL_CTRL_SET_TLSEXT_HOSTNAME)`.
+///
+/// This is **not** optional on the client path: `lib/internal/tls/wrap.js:1072`
+/// calls it from `_init` whenever `connectOptions.servername` is set, and
+/// `tls.connect` derives that from `host`. While this was a stub, `tls.connect({
+/// host })` threw inside `_init` and left the socket half-built, so the process
+/// never exited — the same symptom as the teardown bugs, from a completely
+/// different cause.
+///
+/// The three `CHECK`s are `TypeError`s here: a server wrap, a started wrap, or a
+/// destroyed one is a caller bug rather than a user error, and a real `node` would
+/// abort on each.
+fn set_servername<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let value = args.get(0);
+    let Ok(text) = v8::Local::<v8::String>::try_from(value) else {
+        throw_type_error(scope, "setServername expects a string");
+        return;
+    };
+    let name = text.to_rust_string_lossy(scope);
+    // A NUL inside the name would truncate the C string OpenSSL receives, so it is
+    // rejected rather than silently cut.
+    if name.as_bytes().contains(&0) {
+        throw_type_error(scope, "setServername must not contain a NUL byte");
+        return;
+    }
+    let ready = with_state(args.this(), |state| {
+        if state.kind != crate::ssl::Kind::Client {
+            return Err("setServername is client-only");
+        }
+        if state.flags.started {
+            return Err("setServername must be called before start()");
+        }
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return Err("setServername after destroySSL");
+        }
+        let Ok(c_string) = std::ffi::CString::new(name.clone()) else {
+            return Err("setServername must not contain a NUL byte");
+        };
+        // SAFETY: `ssl` is live, checked above, and `c_string` outlives the call.
+        // OpenSSL copies the name into the SSL's extension state.
+        //
+        // `openssl_sys::SSL_set_tlsext_host_name` is the crate's expansion of the
+        // same `SSL_ctrl` the macro uses, so there is no second copy here.
+        unsafe {
+            openssl_sys::SSL_set_tlsext_host_name(
+                ssl,
+                c_string.as_ptr() as *mut std::os::raw::c_char,
+            );
+        }
+        Ok(())
+    });
+    match ready {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_type_error(scope, message),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
     }
 }
 

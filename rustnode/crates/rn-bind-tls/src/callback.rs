@@ -230,6 +230,7 @@ pub fn register(
         depth,
         pending_done,
         pending_start,
+        cell: Some(cell),
     }
 }
 
@@ -247,6 +248,13 @@ pub struct CallbackHandles {
     pub pending_done: Rc<Cell<bool>>,
     /// A `HANDSHAKE_START` event awaiting delivery.
     pub pending_start: Rc<Cell<bool>>,
+    /// The state cell this set of handles was registered for.
+    ///
+    /// Held so [`CallbackHandles::unregister`] can drop the slot without a caller
+    /// having to reconstruct the address. `None` for a set made by
+    /// [`CallbackHandles::clone_handles`], which is for delivery only and never
+    /// unregisters.
+    pub cell: Option<*const RefCell<WrapState>>,
 }
 
 impl CallbackHandles {
@@ -262,6 +270,19 @@ impl CallbackHandles {
             depth: Rc::clone(&self.depth),
             pending_done: Rc::clone(&self.pending_done),
             pending_start: Rc::clone(&self.pending_start),
+            // Delivery-only: the owning set is the one that unregisters, so this
+            // copy must not drop the slot a second time.
+            cell: None,
+        }
+    }
+
+    /// Drops this wrap's slot from the callback table.
+    ///
+    /// Idempotent and a no-op for a delivery-only copy. Called by
+    /// [`crate::state::WrapState::destroy`], which is the one teardown path.
+    pub fn unregister(&self) {
+        if let Some(cell) = self.cell {
+            unregister(cell);
         }
     }
 }

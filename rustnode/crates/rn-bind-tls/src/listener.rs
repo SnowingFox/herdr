@@ -127,10 +127,9 @@ impl WrapListener {
     /// Hands decrypted cleartext to JavaScript through the wrap's own
     /// `StreamBase`.
     ///
-    /// `TLSWrap::EmitRead` in Node calls the wrap's own `StreamResource`, not the
-    /// underlying socket's: the cleartext belongs to *this* stream, and
-    /// `lib/net.js` has assigned `onread` on the `TLSWrap` object. Sending it
-    /// through the socket would deliver plaintext to the ciphertext path.
+    /// Kept as a method so the listener's own read path can drain what its cycle
+    /// produced; [`deliver_cleartext`] is the same operation for a caller that
+    /// has the object rather than the listener.
     ///
     /// # R2
     ///
@@ -352,14 +351,29 @@ impl StreamListener for WrapListener {
     /// Increment 1 has no shutdown path; the pending shutdown a later increment
     /// holds is completed by `destroy()` with `UV_ECANCELED` (R3), so nothing is
     /// left waiting here.
+    /// `StreamListener::OnStreamAfterShutdown`.
+    ///
+    /// `TLSWrap` does **not** override this in Node (`crypto_tls.h` declares no
+    /// such member), so it inherits `StreamListener`'s default: hand the completion
+    /// to the previous listener, which reaches JavaScript and calls the request's
+    /// `oncomplete`.
+    ///
+    /// An empty body here was the last piece of the "process will not exit" bug.
+    /// The `ShutdownWrap` that `lib/net.js` passes to `handle.shutdown(req)` is
+    /// completed **from this callback**: swallowing it left the writable side
+    /// unfinished, so `'finish'` never fired, `destroySoon` was never called, the
+    /// socket never closed, and `server.close()`'s callback never ran — while the
+    /// loop exited anyway once nothing else was ref'd, which is why the earlier
+    /// assertions on `'data'` passed while the close path did not.
     fn on_stream_after_shutdown<'s>(
         &mut self,
-        _this: &ListenerRef,
-        _scope: &mut v8::PinScope<'s, '_>,
-        _request: v8::Local<'s, v8::Object>,
-        _handle: Option<v8::Local<'s, v8::Object>>,
-        _status: i32,
+        this: &ListenerRef,
+        scope: &mut v8::PinScope<'s, '_>,
+        request: v8::Local<'s, v8::Object>,
+        handle: Option<v8::Local<'s, v8::Object>>,
+        status: i32,
     ) {
+        this.forward_after_shutdown(scope, request, handle, status);
     }
 
     /// `TLSWrap::OnStreamWantsWrite`.
@@ -384,6 +398,80 @@ impl StreamListener for WrapListener {
             state.listener = None;
         });
     }
+}
+
+/// Calls a wrap's `onerror` handler with `message`, as Node's `ClearOut` does.
+///
+/// `crypto_tls.cc:1007` is `MakeCallback(env->onerror_string(), 1, &error)`, and
+/// the error object carries `library`/`function`/`reason`/`code` beside its
+/// message. `lib/internal/tls/wrap.js`'s `_tlsError` reads the message and turns it
+/// into the `'error'` emission that destroys the socket, so an unset handler is a
+/// handshake that fails silently.
+pub fn deliver_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<v8::Object>,
+    message: &str,
+) {
+    let Some(key) = v8::String::new(scope, "onerror") else {
+        return;
+    };
+    let Some(value) = object.get(scope, key.into()) else {
+        return;
+    };
+    let Ok(handler) = v8::Local::<v8::Function>::try_from(value) else {
+        // No handler yet: `tls.createServer` installs one in `_init`, so a wrap
+        // without one has no socket behind it to notify.
+        return;
+    };
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let error = v8::Exception::error(scope, text);
+    let receiver: v8::Local<v8::Value> = object.into();
+    let _ = handler.call(scope, receiver, &[error]);
+}
+
+/// Emits whatever cleartext a wrap has produced, through its own `StreamBase`.
+///
+/// Called by [`crate::cycle::run`] once its borrow is released, and by the
+/// listener. Takes the bytes out under a scoped borrow so the emit itself holds
+/// none (R2).
+pub fn deliver_cleartext(object: v8::Local<v8::Object>) {
+    let cleartext = with_state(object, |state| {
+        if state.pending_cleartext_output.is_empty() {
+            return None;
+        }
+        Some(std::mem::take(&mut state.pending_cleartext_output))
+    });
+    let Some(Some(bytes)) = cleartext else {
+        return;
+    };
+    let length = bytes.len();
+    if length == 0 {
+        return;
+    }
+    let reader = with_state(object, |state| &mut state.reader as *mut _);
+    let Some(reader) = reader else {
+        return;
+    };
+    let Some(mut allocation) = rn_uv::handle::Allocation::new(length) else {
+        tracing::error!(length, "TLSWrap could not allocate a cleartext buffer");
+        return;
+    };
+    // SAFETY: `allocation` has at least `length` bytes and `bytes` has exactly
+    // `length`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), allocation.base(), length);
+    }
+    // SAFETY: `reader` is the wrap's own `StreamState`, live for the wrap's whole
+    // life, and `emit_read` owns the allocation from here.
+    unsafe {
+        rn_uv::listener::emit_read(
+            reader,
+            length as isize,
+            rn_uv::listener::ReadBuffer::Allocated(allocation),
+        )
+    };
 }
 
 /// Pushes a listener for `object`'s state onto `stream`.

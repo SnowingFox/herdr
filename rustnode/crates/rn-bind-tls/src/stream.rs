@@ -302,32 +302,67 @@ fn shutdown<'s>(
             state.flags.shutdown = true;
             return Ok(0);
         }
+        // `crypto_tls.cc:1344`: the first `SSL_shutdown` sends the close-notify
+        // and returns 0; the second waits for the peer's and returns 1. Node calls
+        // it twice for exactly that reason, and discarding the result (as an
+        // earlier version did) still sends the notify.
+        //
         // SAFETY: `ssl` is live, checked above.
-        unsafe {
-            if openssl_sys::SSL_shutdown(ssl) == 0 {
-                openssl_sys::SSL_shutdown(ssl);
-            }
+        let first = unsafe { openssl_sys::SSL_shutdown(ssl) };
+        if first == 0 {
+            // SAFETY: as above.
+            unsafe { openssl_sys::SSL_shutdown(ssl) };
         }
         state.flags.shutdown = true;
-        // The close-notify is in `enc_out_`; `flush` hands it to the socket.
+        // The close-notify is now in `enc_out_`. Node ends `DoShutdown` with
+        // `EncOut()` (`crypto_tls.cc:1350`), and that is the step an earlier
+        // version omitted: without it the notify stays in the BIO, the socket's
+        // `shutdown` never reaches the peer, and neither side ever closes.
+        //
+        // SAFETY: `ssl` is live, checked above, and `state` is this borrow.
+        unsafe { crate::cycle::enc_out(state, ssl) };
         Ok(0)
     });
 
     match plan {
         Some(Ok(0)) => {
-            // Drain the close-notify out. `flush` completes the request itself
-            // when there is nothing left to send, which is the common case for a
-            // socket that is already idle.
-            if let Some(Some(status)) = with_state(object, |state| Some(state.underlying)) {
-                if let Some(stream) = status {
-                    // SAFETY: `stream` is the wrap's own `underlying`, live.
-                    unsafe { flush(scope, object, stream, Some(request)) };
+            // `crypto_tls.cc:1351`: `EncOut()` produced the close-notify, then the
+            // **underlying stream's own** `DoShutdown` puts a FIN on the wire and
+            // completes the request.
+            //
+            // Two ordering constraints, both learned by measurement:
+            //
+            // * the close-notify must go out *before* the FIN, or the peer sees a
+            //   truncated stream instead of a clean close;
+            // * the request must be completed by the stream's shutdown callback,
+            //   not locally — `lib/net.js` only marks the writable side finished
+            //   from `afterShutdown`, and if that never runs the socket never
+            //   closes and `server.close()`'s callback never fires.
+            let underlying = with_state(object, |state| state.underlying).flatten();
+            let Some(stream) = underlying else {
+                rn_bind_stream_wrap::wrap::report_completion(scope, request, 0, None, None);
+                rv.set(v8::Integer::new(scope, 0).into());
+                return;
+            };
+            // The notify is flushed *without* the caller's request: it is
+            // ciphertext, not the caller's write, and passing the request here
+            // would complete it before the FIN was even issued. The caller's
+            // completion follows from `queue_shutdown` below.
+            //
+            // SAFETY: `stream` is the wrap's own `underlying`, live while it holds
+            // it.
+            let _ = unsafe { flush(scope, object, stream, None) };
+            // SAFETY: the stream is live and `request` is the caller's
+            // `ShutdownWrap`, kept alive by `lib/net.js`.
+            let status = unsafe {
+                let state = &mut *stream;
+                if state.stream.is_null() {
+                    0
                 } else {
-                    // Nothing to write to, so the request is complete.
-                    rn_bind_stream_wrap::wrap::report_completion(scope, request, 0, None, None);
+                    rn_uv::stream::queue_shutdown(scope, state.stream, request, object)
                 }
-            }
-            rv.set(v8::Integer::new(scope, 0).into());
+            };
+            rv.set(v8::Integer::new(scope, status).into());
         }
         Some(Ok(_)) => rv.set(v8::Integer::new(scope, 0).into()),
         Some(Err(status)) => rv.set(v8::Integer::new(scope, status).into()),

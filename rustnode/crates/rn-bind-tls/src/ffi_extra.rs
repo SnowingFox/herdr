@@ -25,7 +25,7 @@ use std::os::raw::{c_char, c_int, c_long};
 
 use openssl_sys as ffi;
 
-/// `#define SSL_CB_HANDSHAKE_START 0x10` in `ssl.h:1146`.
+/// #define SSL_CB_HANDSHAKE_START 0x10` in `ssl.h:1146`.
 pub const SSL_CB_HANDSHAKE_START: c_int = 0x10;
 /// `#define SSL_CB_HANDSHAKE_DONE 0x20` in `ssl.h:1147`.
 pub const SSL_CB_HANDSHAKE_DONE: c_int = 0x20;

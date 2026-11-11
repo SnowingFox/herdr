@@ -37,6 +37,7 @@
 use std::cell::RefCell;
 
 use openssl_sys as ffi;
+use rn_v8_sys::v8;
 
 use crate::ssl::{Kind, Ssl};
 use crate::state::WrapState;
@@ -172,6 +173,10 @@ pub unsafe fn run(cell: *mut RefCell<WrapState>) -> CycleOutcome {
             handles.clone_handles(),
         )
     });
+    // Everything the delivery steps need, taken under the borrow and used after
+    // it: the ciphertext to send, the cleartext to emit, the stream to send on
+    // and the object to complete through.
+    let mut outbound = None;
     let mut deliver = None;
     if let Some((established, has_event, handles)) = recorded {
         if established {
@@ -184,12 +189,58 @@ pub unsafe fn run(cell: *mut RefCell<WrapState>) -> CycleOutcome {
                 .map(|object| (object.clone(), handles));
         }
     }
+    // An error `ClearOut` recorded is delivered to `onerror` once the borrow is
+    // released. Node's `ClearOut` does this itself (`crypto_tls.cc:1007`
+    // `MakeCallback(onerror)`), and it is what makes `tls.createServer` emit
+    // `tlsClientError` and destroy the socket. Recording it without delivering
+    // left a failed handshake with nothing happening at all: no JS event, no
+    // close, and the accepted socket ref'd forever.
+    let failure = state.error.take().and_then(|message| {
+        state
+            .object
+            .as_ref()
+            .map(|object| (object.clone(), message))
+    });
+    if let (Some(stream), Some(object), false) = (
+        state.underlying,
+        state.object.as_ref(),
+        state.pending_output.is_empty() && state.pending_cleartext_output.is_empty(),
+    ) {
+        outbound = Some((object.clone(), stream));
+    }
     drop(state);
-    // The events the info callback recorded are delivered now that no borrow is
-    // held and no SSL stack frame is below this call (R2). This is where
-    // `secureConnect` is reachable from the user's perspective.
+
+    // Delivery happens with no borrow held and no SSL stack frame below (R2).
+    //
+    // `Cycle` owns all three outputs, which is Node's shape: `EncOut` is the third
+    // phase of `Cycle` (`crypto_tls.cc:2338`), so there is no path that encrypts
+    // without sending. An earlier version left `flush` to the *caller*, and the
+    // nested cycle that `on_stream_after_write` runs produced the ciphertext after
+    // the caller's flush had already returned — which sent nothing and left the
+    // peer waiting forever.
+    if let Some((object, stream)) = outbound {
+        let _ = rn_uv::callback::with_context(|scope| {
+            let object = v8::Local::new(scope, object);
+            // Cleartext goes up through the wrap's own `StreamBase`, ciphertext
+            // down through the wrapped stream.
+            crate::listener::deliver_cleartext(object);
+            // SAFETY: `stream` is the wrap's own `underlying`, live while it holds
+            // it.
+            unsafe { crate::stream::flush(scope, object, stream, None) };
+        });
+    }
+    // The events the info callback recorded are delivered last, so `secureConnect`
+    // sees a stream whose first flight has already been sent.
     if let Some((object, handles)) = deliver {
         crate::callback::deliver_events(Some(&object), &handles);
+    }
+    // A failed handshake reports itself after its alert has been flushed, so the
+    // peer sees a TLS alert rather than a truncated stream.
+    if let Some((object, message)) = failure {
+        let _ = rn_uv::callback::with_context(|scope| {
+            let object = v8::Local::new(scope, object);
+            crate::listener::deliver_error(scope, object, &message);
+        });
     }
     CycleOutcome::Cycled
 }

@@ -10,25 +10,14 @@
 //! sweep for exactly this reason — a stale binary here would test the previous
 //! landing.
 //!
-//! # The two `#[ignore]`d tests, and exactly what they show
+//! # Every TLS test here also asserts that the process exits
 //!
-//! Both are kept rather than deleted because what they assert is the target, and
-//! what they currently do is a precise description of the remaining gap:
-//!
-//! * `a_tls13_handshake_completes` — the handshake **does** complete. OpenSSL
-//!   finishes it on both sides, `onhandshakedone` fires, and
-//!   `getProtocol()`/`getCipher()` report `TLSv1.3` and a real suite. What fails
-//!   is that the process does not exit afterwards: the accepted socket's
-//!   `TLSWrap` keeps the loop alive after `destroy()`.
-//! * `application_data_crosses_the_connection` — the client's `"ping"` **is**
-//!   encrypted, sent, and decrypted, and the server's `'data'` handler sees it.
-//!   The reply decrypts too (`ClearOut` produces its cleartext, observable as a
-//!   non-zero cleartext count), but it does not arrive as `'data'` on the client,
-//!   and the process does not exit.
-//!
-//! Both are teardown/delivery problems in the *reverse* direction, not handshake
-//! problems. They are recorded here so the next increment starts from a
-//! measurement rather than from "TLS does not work".
+//! An earlier version of this file asserted values and nothing else, and that hid
+//! the defect that mattered most: the handshake worked, data crossed, and the
+//! process then hung forever. A TLS stack that cannot let a process exit hangs
+//! every `test-tls-*` file it would otherwise pass, so `run_tls` bounds the run and
+//! every caller checks the exit status. `tools/tls-exit-control.sh` is the same
+//! property as a standalone control with a negative case.
 //!
 //! # Why a subprocess rather than an in-process isolate
 //!
@@ -39,6 +28,29 @@
 //! legible failure), so it is checked where it is observable.
 
 use std::process::Command;
+
+/// Runs a TLS script that must exit on its own within a few seconds.
+///
+/// `run` already bounds the run with `timeout 20`, which is right for the scripted
+/// assertions but too generous to distinguish "finished" from "hung". A correct TLS
+/// teardown finishes in well under a second, so this insists on it: a process that
+/// needs 20 seconds to exit is the bug, not a slow machine.
+///
+/// Returns `(stdout, stderr, exit_code)`.
+fn run_tls(script: &str) -> (String, String, i32) {
+    let output = Command::new("timeout")
+        .arg("6")
+        .arg(binary())
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("the rustnode binary runs");
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(-1),
+    )
+}
 
 /// A self-signed key/certificate pair, generated once per test process.
 ///
@@ -305,6 +317,110 @@ fn a_tls_socket_constructs() {
     );
 }
 
+/// A TLS connection whose `host` is an **IP literal** still does not let the
+/// process exit, and this test records that rather than hiding it.
+///
+/// Every event completes — `secureConnect`, `'data'`, `'end'`, `'close'` and the
+/// `server.close()` callback — and the loop still reports a **referenced, active
+/// timer** afterwards. Measured with `uv_walk`:
+///
+/// | `host` | exits | timers after close |
+/// | --- | --- | --- |
+/// | omitted | yes, ~70ms | all `active=0` |
+/// | `'localhost'` | yes, ~85ms | all `active=0` |
+/// | `'127.0.0.1'` | **no** | one `active=1` |
+///
+/// So the difference is the address-literal branch of `net.connect`, not the TLS
+/// handshake: an IP skips `dns.lookup` and completes the connect from
+/// `_handle.connect` directly. `handshakeTimeout: 0` also makes it exit, which
+/// points at the handshake timer being armed a second time on that branch and
+/// never cleared, after `_finishInit` cleared the first one.
+///
+/// The `#[ignore]` is deliberate: the assertion is the *desired* behaviour, and it
+/// fails today. Removing the attribute is the definition of done for this gap.
+#[test]
+#[ignore = "an IP-literal host leaves a referenced timer armed after close; the \
+            handshake and all events succeed, the process just never exits"]
+fn an_ip_literal_host_lets_the_process_exit() {
+    let Some((key, cert)) = certificate() else {
+        return;
+    };
+    let script = format!(
+        "\
+        const tls = require('tls'); \
+        const fs = require('fs'); \
+        const opts = {{ \
+          key: fs.readFileSync('{key}'), \
+          cert: fs.readFileSync('{cert}'), \
+        }}; \
+        const server = tls.createServer(opts, (sock) => sock.end('x')); \
+        server.listen(0, '127.0.0.1', () => {{ \
+          const c = tls.connect( \
+            {{ port: server.address().port, host: '127.0.0.1', rejectUnauthorized: false }}); \
+          c.on('data', () => {{ c.end(); server.close(() => console.log('CLOSED')); }}); \
+        }});",
+        key = key.display(),
+        cert = cert.display()
+    );
+    let (stdout, _stderr, code) = run_tls(&script);
+    assert_eq!(code, 0, "the process must exit; stdout: {stdout}");
+    assert!(stdout.contains("CLOSED"), "stdout: {stdout}");
+}
+
+/// A TLS connection lets the process exit, and `server.close()` reaches its
+/// callback.
+///
+/// This is the property PR #62 was missing: every other test asserts a value, so a
+/// process that decrypts correctly and then hangs forever passed all of them.
+///
+/// `CLOSED` is printed from inside the `server.close()` callback, so it cannot
+/// appear unless the listening handle *and* the accepted socket really closed. An
+/// exited-but-not-closed process prints nothing and fails on the code, and a hung
+/// one is killed by `run_tls`'s timeout and fails on the code too.
+#[test]
+fn a_tls_connection_lets_the_process_exit() {
+    let Some((key, cert)) = certificate() else {
+        return;
+    };
+    let script = format!(
+        "\
+        const tls = require('tls'); \
+        const fs = require('fs'); \
+        const opts = {{ \
+          key: fs.readFileSync('{key}'), \
+          cert: fs.readFileSync('{cert}'), \
+        }}; \
+        const server = tls.createServer(opts, (s) => {{ s.end('x'); }}); \
+        server.on('tlsClientError', (e) => console.log('S:ERR ' + e.message)); \
+        server.listen(0, () => {{ \
+          const c = tls.connect( \
+            {{ port: server.address().port, rejectUnauthorized: false }}, \
+            () => {{ \
+              c.on('data', () => {{ \
+                c.end(); \
+                server.close(() => console.log('CLOSED')); \
+              }}); \
+            }}); \
+          c.on('error', (e) => console.log('C:ERR ' + e.message)); \
+        }});",
+        key = key.display(),
+        cert = cert.display()
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    assert_eq!(
+        code, 0,
+        "the process must exit 0 within 6s; got {code}. stdout: {stdout} stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("CLOSED"),
+        "server.close() must reach its callback; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("S:ERR") && !stdout.contains("C:ERR"),
+        "no side may report an error; stdout: {stdout} stderr: {stderr}"
+    );
+}
+
 /// A full TLS 1.3 handshake completes between a client and a server in one
 /// process, and `secureConnect` fires.
 ///
@@ -315,8 +431,6 @@ fn a_tls_socket_constructs() {
 /// any one of them throwing stops `secureConnect` after OpenSSL has already
 /// finished.
 #[test]
-#[ignore = "the handshake completes, but the process does not exit afterwards; see the \
-            module docs on the accepted-socket teardown gap"]
 fn a_tls13_handshake_completes() {
     let Some((key, cert)) = certificate() else {
         // No `openssl` on the machine: the fixture cannot be built, so the
@@ -332,23 +446,25 @@ fn a_tls13_handshake_completes() {
           key: fs.readFileSync('{key}'), \
           cert: fs.readFileSync('{cert}'), \
         }}; \
-        const server = tls.createServer(opts, () => {{}}); \
+        const server = tls.createServer(opts, (sock) => sock.end('x')); \
         server.on('tlsClientError', (e) => console.log('S:ERR ' + e.message)); \
         server.listen(0, '127.0.0.1', () => {{ \
           const c = tls.connect( \
-            {{ port: server.address().port, host: '127.0.0.1', rejectUnauthorized: false }}, \
+            {{ port: server.address().port, host: 'localhost', rejectUnauthorized: false }}, \
             () => {{ \
               console.log('SECURE:' + c.getProtocol() + ':' + c.getCipher().name); \
-              c.destroy(); \
-              server.close(); \
             }}); \
-          c.on('error', (e) => {{ console.log('C:ERR ' + e.message); c.destroy(); server.close(); }}); \
+          c.on('data', () => {{ c.end(); server.close(() => console.log('CLOSED')); }}); \
+          c.on('error', (e) => {{ console.log('C:ERR ' + e.message); server.close(); }}); \
         }});",
         key = key.display(),
         cert = cert.display()
     );
-    let (stdout, stderr, ok) = run(&script);
-    assert!(ok, "the handshake script must run; stderr: {stderr}");
+    let (stdout, stderr, code) = run_tls(&script);
+    assert_eq!(
+        code, 0,
+        "the handshake must finish and the process exit; got {code}.\nscript:\n{script}\nstdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(
         stdout.contains("SECURE:TLSv1.3:"),
         "the handshake must complete with a cipher; got {stdout}, stderr: {stderr}"
@@ -366,32 +482,41 @@ fn a_tls13_handshake_completes() {
 /// `onread`. A one-way check is enough to prove the encryption, the record
 /// framing and the listener direction are all correct.
 #[test]
-#[ignore = "the server decrypts the payload, but the reply never reaches the client as \
-            'data' and the process does not exit; see the module docs"]
 fn application_data_crosses_the_connection() {
-    if !std::path::Path::new("/tmp/tls-key.pem").exists() {
+    let Some((key, cert)) = certificate() else {
         return;
-    }
-    let script = "\
+    };
+    let script = format!(
+        "\
         const tls = require('tls'); \
         const fs = require('fs'); \
-        const opts = { \
-          key: fs.readFileSync('/tmp/tls-key.pem'), \
-          cert: fs.readFileSync('/tmp/tls-cert.pem'), \
-        }; \
-        const server = tls.createServer(opts, (sock) => { \
-          sock.on('data', (d) => console.log('GOT:' + d.toString())); \
-        }); \
-        server.listen(0, '127.0.0.1', () => { \
+        const opts = {{ \
+          key: fs.readFileSync('{key}'), \
+          cert: fs.readFileSync('{cert}'), \
+        }}; \
+        const server = tls.createServer(opts, (sock) => {{ \
+          sock.on('data', (d) => {{ \
+            console.log('GOT:' + d.toString()); \
+            sock.end(); \
+          }}); \
+        }}); \
+        server.listen(0, '127.0.0.1', () => {{ \
           const c = tls.connect( \
-            { port: server.address().port, host: '127.0.0.1', rejectUnauthorized: false }, \
+            {{ port: server.address().port, host: 'localhost', rejectUnauthorized: false }}, \
             () => c.write('hello over tls')); \
-        });";
-    let (stdout, stderr, ok) = run(script);
-    assert!(ok, "the data script must run; stderr: {stderr}");
+          c.on('close', () => server.close()); \
+        }});",
+        key = key.display(),
+        cert = cert.display()
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    assert_eq!(
+        code, 0,
+        "the data must cross and the process exit; got {code}. stdout: {stdout} stderr: {stderr}"
+    );
     assert!(
         stdout.contains("GOT:hello over tls"),
-        "the server must decrypt the payload; got {stdout}, stderr: {stderr}"
+        "the server must decrypt the payload; stdout: {stdout} stderr: {stderr}"
     );
 }
 
