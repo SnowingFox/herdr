@@ -43,6 +43,7 @@
 //! property access.
 
 pub mod alt_names;
+pub mod bio;
 pub mod blocklist;
 pub mod dates;
 pub mod der_accessors;

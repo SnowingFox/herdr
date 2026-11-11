@@ -27,18 +27,6 @@ extern "C" {
     fn ASN1_TIME_check(time: *const ffi::ASN1_TIME) -> std::ffi::c_int;
     fn ASN1_TIME_print(bio: *mut ffi::BIO, time: *const ffi::ASN1_TIME) -> std::ffi::c_int;
     fn ASN1_TIME_to_tm(time: *const ffi::ASN1_TIME, out: *mut Tm) -> std::ffi::c_int;
-    fn BIO_new(kind: *const ffi::BIO_METHOD) -> *mut ffi::BIO;
-    fn BIO_s_mem() -> *const ffi::BIO_METHOD;
-    fn BIO_free(bio: *mut ffi::BIO) -> std::ffi::c_int;
-    fn BIO_get_mem_data(
-        bio: *mut ffi::BIO,
-        contents: *mut *mut std::ffi::c_char,
-    ) -> std::ffi::c_long;
-    fn BIO_write(
-        bio: *mut ffi::BIO,
-        data: *const std::ffi::c_void,
-        length: std::ffi::c_int,
-    ) -> std::ffi::c_int;
 }
 
 /// `struct tm`, as `ASN1_TIME_to_tm` fills it.
@@ -79,47 +67,15 @@ pub fn print_time(certificate: &X509, from: bool) -> Option<String> {
     }
     // SAFETY: `time` is borrowed from `certificate`, which outlives the call.
     let printable = unsafe { ASN1_TIME_check(time) == 1 };
-    // SAFETY: a memory BIO is created and released here.
-    unsafe {
-        let bio = BIO_new(BIO_s_mem());
-        if bio.is_null() {
-            return None;
-        }
+    crate::bio::with_memory_bio(|bio| {
         if printable {
-            if ASN1_TIME_print(bio, time) <= 0 {
-                BIO_free(bio);
-                return None;
-            }
+            // SAFETY: the BIO and the time value are both live for the call.
+            unsafe { ASN1_TIME_print(bio.raw(), time) > 0 }
         } else {
             // `BIOPointer::WriteAll(bio, "Bad time value")`, byte for byte.
-            let text = b"Bad time value";
-            if BIO_write(
-                bio,
-                text.as_ptr().cast::<std::ffi::c_void>(),
-                text.len() as std::ffi::c_int,
-            ) <= 0
-            {
-                BIO_free(bio);
-                return None;
-            }
+            bio.write(b"Bad time value")
         }
-        let mut data: *mut std::ffi::c_char = std::ptr::null_mut();
-        let length = BIO_get_mem_data(bio, &mut data);
-        if length < 0 || (length > 0 && data.is_null()) {
-            BIO_free(bio);
-            return None;
-        }
-        // `ToV8Value` builds the string with `String::NewFromUtf8`, which rejects
-        // invalid UTF-8; `ASN1_TIME_print` output is ASCII.
-        let text = if length == 0 {
-            Some(String::new())
-        } else {
-            let bytes = std::slice::from_raw_parts(data.cast::<u8>(), length as usize);
-            std::str::from_utf8(bytes).ok().map(str::to_string)
-        };
-        BIO_free(bio);
-        text
-    }
+    })
 }
 
 /// The POSIX seconds of the field, or `None` when it will not convert.

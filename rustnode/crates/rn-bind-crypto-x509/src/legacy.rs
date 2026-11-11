@@ -334,13 +334,6 @@ extern "C" {
         out: *mut *mut ffi::BIGNUM,
     ) -> std::ffi::c_int;
     fn BN_print(bio: *mut ffi::BIO, value: *const ffi::BIGNUM) -> std::ffi::c_int;
-    fn BIO_new(kind: *const ffi::BIO_METHOD) -> *mut ffi::BIO;
-    fn BIO_s_mem() -> *const ffi::BIO_METHOD;
-    fn BIO_free(bio: *mut ffi::BIO) -> std::ffi::c_int;
-    fn BIO_get_mem_data(
-        bio: *mut ffi::BIO,
-        contents: *mut *mut std::ffi::c_char,
-    ) -> std::ffi::c_long;
     fn i2d_PUBKEY(key: *const ffi::EVP_PKEY, out: *mut *mut u8) -> std::ffi::c_int;
     fn EC_POINT_point2buf(
         group: *const ffi::EC_GROUP,
@@ -376,31 +369,10 @@ unsafe fn bn_param(key: *const ffi::EVP_PKEY, name: &std::ffi::CStr) -> Option<*
 ///
 /// `value` must be a live `BIGNUM`.
 unsafe fn bn_hex(value: *const ffi::BIGNUM) -> Option<String> {
-    // SAFETY: a memory BIO is created and freed here, and `value` is live.
-    unsafe {
-        let bio = BIO_new(BIO_s_mem());
-        if bio.is_null() {
-            return None;
-        }
-        if BN_print(bio, value) != 1 {
-            BIO_free(bio);
-            return None;
-        }
-        let mut data: *mut std::ffi::c_char = std::ptr::null_mut();
-        let length = BIO_get_mem_data(bio, &mut data);
-        let text = if length <= 0 || data.is_null() {
-            None
-        } else {
-            std::str::from_utf8(std::slice::from_raw_parts(
-                data.cast::<u8>(),
-                length as usize,
-            ))
-            .ok()
-            .map(str::to_string)
-        };
-        BIO_free(bio);
-        text
-    }
+    crate::bio::with_memory_bio(|bio| {
+        // SAFETY: the BIO and the `BIGNUM` are both live for the call.
+        unsafe { BN_print(bio.raw(), value) == 1 }
+    })
 }
 
 /// `i2d_PUBKEY`: the SPKI of a key.

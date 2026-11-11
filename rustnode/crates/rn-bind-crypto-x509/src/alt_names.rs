@@ -75,21 +75,6 @@ struct X509Algor {
 // `openssl-sys` does export. Declaring the typed wrappers here is what lets the
 // general-name stacks be walked without a second binding generator.
 extern "C" {
-    fn sk_GENERAL_NAME_num(stack: *const ffi::stack_st_GENERAL_NAME) -> std::ffi::c_int;
-    fn sk_GENERAL_NAME_value(
-        stack: *const ffi::stack_st_GENERAL_NAME,
-        index: std::ffi::c_int,
-    ) -> *mut ffi::GENERAL_NAME;
-    fn sk_ACCESS_DESCRIPTION_num(stack: *const ffi::stack_st_ACCESS_DESCRIPTION)
-        -> std::ffi::c_int;
-    fn sk_ACCESS_DESCRIPTION_value(
-        stack: *const ffi::stack_st_ACCESS_DESCRIPTION,
-        index: std::ffi::c_int,
-    ) -> *mut ffi::ACCESS_DESCRIPTION;
-    fn ACCESS_DESCRIPTION_pop_free(
-        stack: *mut ffi::stack_st_ACCESS_DESCRIPTION,
-        free: unsafe extern "C" fn(*mut ffi::ACCESS_DESCRIPTION),
-    );
     fn X509_ALGOR_get0(
         object: *mut *const ffi::ASN1_OBJECT,
         parameter_type: *mut std::ffi::c_int,
@@ -130,14 +115,16 @@ extern "C" {
         indent: std::ffi::c_int,
         flags: std::ffi::c_ulong,
     ) -> std::ffi::c_int;
-    fn BIO_new(kind: *const ffi::BIO_METHOD) -> *mut ffi::BIO;
-    fn BIO_s_mem() -> *const ffi::BIO_METHOD;
-    fn BIO_free(bio: *mut ffi::BIO) -> std::ffi::c_int;
-    fn BIO_get_mem_data(
-        bio: *mut ffi::BIO,
-        contents: *mut *mut std::ffi::c_char,
-    ) -> std::ffi::c_long;
     fn OBJ_obj2nid(object: *const ffi::ASN1_OBJECT) -> std::ffi::c_int;
+    fn OPENSSL_sk_num(stack: *const std::ffi::c_void) -> std::ffi::c_int;
+    fn OPENSSL_sk_value(
+        stack: *const std::ffi::c_void,
+        index: std::ffi::c_int,
+    ) -> *mut std::ffi::c_void;
+    fn OPENSSL_sk_pop_free(
+        stack: *mut std::ffi::c_void,
+        free: unsafe extern "C" fn(*mut std::ffi::c_void),
+    );
 }
 
 /// The `GetSubjectAltNameString` outcomes.
@@ -214,7 +201,7 @@ fn format_general_names(certificate: &X509, index: i32, separator: &str) -> Opti
         return None;
     }
     // SAFETY: `names` is a live `GENERAL_NAMES` stack.
-    let count = unsafe { sk_GENERAL_NAME_num(names) };
+    let count = unsafe { OPENSSL_sk_num(names.cast()) };
     // An empty extension is a failure in `SafeX509SubjectAltNamePrint`
     // (`ok = count > 0`), not an empty string.
     let mut output = String::new();
@@ -224,7 +211,7 @@ fn format_general_names(certificate: &X509, index: i32, separator: &str) -> Opti
             break;
         }
         // SAFETY: `position` is in range.
-        let name = unsafe { sk_GENERAL_NAME_value(names, position) };
+        let name = unsafe { OPENSSL_sk_value(names.cast(), position) }.cast::<ffi::GENERAL_NAME>();
         if name.is_null() {
             ok = false;
             break;
@@ -254,7 +241,7 @@ fn format_info_access(extension: *mut ffi::X509_EXTENSION) -> Option<String> {
         return None;
     }
     // SAFETY: `descriptions` is a live stack.
-    let count = unsafe { sk_ACCESS_DESCRIPTION_num(descriptions) };
+    let count = unsafe { OPENSSL_sk_num(descriptions.cast()) };
     let mut output = String::new();
     let mut ok = count > 0;
     for position in 0..count {
@@ -262,7 +249,8 @@ fn format_info_access(extension: *mut ffi::X509_EXTENSION) -> Option<String> {
             break;
         }
         // SAFETY: `position` is in range.
-        let description = unsafe { sk_ACCESS_DESCRIPTION_value(descriptions, position) };
+        let description = unsafe { OPENSSL_sk_value(descriptions.cast(), position) }
+            .cast::<ffi::ACCESS_DESCRIPTION>();
         if description.is_null() {
             ok = false;
             break;
@@ -293,8 +281,25 @@ fn format_info_access(extension: *mut ffi::X509_EXTENSION) -> Option<String> {
         };
     }
     // SAFETY: released exactly once, with the element destructor.
-    unsafe { ACCESS_DESCRIPTION_pop_free(descriptions, ffi::ACCESS_DESCRIPTION_free) };
+    unsafe {
+        OPENSSL_sk_pop_free(
+            descriptions.cast(),
+            transparent_free(ffi::ACCESS_DESCRIPTION_free),
+        )
+    };
     ok.then_some(output)
+}
+
+/// Adapts a concrete destructor to the `void *` form `OPENSSL_sk_pop_free` takes.
+///
+/// The two function types have identical ABIs; this is a cast rather than a
+/// wrapper so the stack sees the real destructor symbol.
+fn transparent_free<T>(
+    free: unsafe extern "C" fn(*mut T),
+) -> unsafe extern "C" fn(*mut std::ffi::c_void) {
+    // SAFETY: `*mut T` and `*mut c_void` have the same representation, and the
+    // caller only ever passes pointers the stack holds.
+    unsafe { std::mem::transmute(free) }
 }
 
 /// `ncrypto::PrintGeneralName`: one `GENERAL_NAME` into `out`.
@@ -445,32 +450,14 @@ unsafe fn push_directory_name(out: &mut String, name: *mut ffi::X509_NAME) -> bo
     if name.is_null() {
         return false;
     }
-    // SAFETY: `name` is live; the BIO is created and freed here.
-    unsafe {
-        let bio = BIO_new(BIO_s_mem());
-        if bio.is_null() {
-            return false;
-        }
-        let flags = crate::names::rfc2253_in_json_flags();
-        let written = X509_NAME_print_ex(bio, name, 0, flags);
-        if written < 0 {
-            BIO_free(bio);
-            return false;
-        }
-        let mut data: *mut std::ffi::c_char = std::ptr::null_mut();
-        let length = BIO_get_mem_data(bio, &mut data);
-        if length < 0 {
-            BIO_free(bio);
-            return false;
-        }
-        let bytes = if length == 0 {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(data.cast::<u8>(), length as usize)
-        };
-        push_alt_name(out, bytes, AltNameOption::Utf8, None);
-        BIO_free(bio);
-    }
+    let flags = crate::names::rfc2253_in_json_flags();
+    let Some(printed) = crate::bio::with_memory_bio(|bio| {
+        // SAFETY: the BIO and the name are both live for the call.
+        unsafe { X509_NAME_print_ex(bio.raw(), name, 0, flags) >= 0 }
+    }) else {
+        return false;
+    };
+    push_alt_name(out, printed.as_bytes(), AltNameOption::Utf8, None);
     true
 }
 

@@ -5,24 +5,22 @@
 //! gap, but the module that needs the member at load time simply cannot be
 //! required. Those seven are implemented here.
 //!
-//! # The three class factories
+//! # The class factories
 //!
 //! `keys.js` runs `createNativeKeyObjectClass(...)` and `createCryptoKeyClass(...)`
-//! at module scope to build its class hierarchy, and `x509.js` runs
-//! `createX509CertificateClass(...)` the same way. Each factory is handed a
-//! callback and returns whatever that callback returns — an array of the classes
-//! the JavaScript then destructures.
+//! at module scope to build its class hierarchy. Each factory is handed a callback
+//! and returns whatever that callback returns — an array of the classes the
+//! JavaScript then destructures.
 //!
 //! Node's versions create a V8 `FunctionTemplate` that stores an `ncrypto` handle,
 //! and the JavaScript subclasses rely on that base holding the handle for every
-//! later method. Implementing that faithfully is the whole `KeyObject` surface,
-//! which stays deferred. What these do is supply the **class shape**: a base
-//! constructor that accepts and retains its arguments, so extending it works and
-//! the module loads. A call that would need real key material still fails, and
-//! `createPublicKey`, `KeyObjectHandle` and the rest stay in `DEFERRED`, so
-//! `rn-compat` and this crate's tests both keep showing the key surface as
-//! missing. That is the honest line: the namespace is loadable, the key API is
-//! not, and both facts are recorded.
+//! later method. Implementing that faithfully is the whole `KeyObject` surface.
+//! What these do is supply the **class shape**: a base constructor that accepts
+//! and retains its arguments, so extending it works and the module loads.
+//!
+//! `createX509CertificateClass` used to have a stand-in here as well. It is gone:
+//! `rn-bind-crypto-x509` now installs the real class, and two implementations of
+//! one member where only the later one is reachable is worse than one.
 //!
 //! # The four list and lifecycle members
 //!
@@ -107,18 +105,6 @@ pub(crate) fn create_crypto_key_class<'s>(
     match call_with_base_class(scope, &args, "createCryptoKeyClass") {
         Some(value) => rv.set(value),
         None => throw_type_error(scope, "createCryptoKeyClass needs a callback"),
-    }
-}
-
-/// `createX509CertificateClass(callback)`.
-pub(crate) fn create_x509_certificate_class<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue,
-) {
-    match call_with_base_class(scope, &args, "createX509CertificateClass") {
-        Some(value) => rv.set(value),
-        None => throw_type_error(scope, "createX509CertificateClass needs a callback"),
     }
 }
 

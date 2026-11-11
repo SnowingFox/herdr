@@ -19,6 +19,10 @@ rn-bind-crypto-cipher = { path = "../rn-bind-crypto-cipher" }
 # `crypto_spkac.cc`. A separate crate for the same reason, and the classes land
 # on this namespace object.
 rn-bind-crypto-keys = { path = "../rn-bind-crypto-keys" }
+# `X509Certificate`, `parsePKCS12`, the SPKI blocklist and the root store:
+# `src/crypto/crypto_x509.cc` and `crypto_pkcs12.cc`. Same one-translation-unit
+# split, and the members land on this namespace object.
+rn-bind-crypto-x509 = { path = "../rn-bind-crypto-x509" }
 # `Sign`/`Verify`/`SignJob`/`RSACipherJob` from `src/crypto/crypto_sig.cc` and
 # `crypto_rsa.cc`. Installed onto this namespace object for the same reason the
 # DH and keys classes are: Node aggregates a dozen translation units onto one
