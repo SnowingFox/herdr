@@ -171,8 +171,13 @@ mod tests {
 
     /// A request is remembered until its completion, so the exit path can reach
     /// it, and forgotten afterwards so a recycled address is not cancelled.
+    ///
+    /// Holds the crate-wide state lock: `in_flight` is process-global, so this
+    /// case races a sibling that measures the same list under parallel test
+    /// execution. See [`crate::GLOBAL_STATE`].
     #[test]
     fn a_registered_request_is_tracked_until_unregistered() {
+        let _serialised = crate::global_state_guard();
         let mut request: uv::uv_work_t = unsafe { std::mem::zeroed() };
         let pointer = &mut request as *mut uv::uv_work_t;
 
@@ -199,6 +204,7 @@ mod tests {
     /// libuv's bug rather than a reason to panic in a callback.
     #[test]
     fn unregistering_an_unknown_address_is_a_no_op() {
+        let _serialised = crate::global_state_guard();
         let mut request: uv::uv_work_t = unsafe { std::mem::zeroed() };
         let pointer = &mut request as *mut uv::uv_work_t;
         let before = list_snapshot();
