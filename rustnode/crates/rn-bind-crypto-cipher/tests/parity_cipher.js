@@ -184,13 +184,17 @@ function hex(buffer) {
 // The error shapes, which are part of the observable surface.
 //
 // Two of these deliberately disagree with a local `node` v22, and agree with the
-// pinned Node 28 tree instead. `test/parallel/test-crypto-cipheriv-cbc-cts.js`
-// and `-xts.js` at the pin assert ERR_CRYPTO_UNSUPPORTED_OPERATION for
-// `ctsMode`/`xtsStandard` on a cipher that does not implement them, which is what
+// pinned Node 28 tree instead. At the pin, three files assert
+// ERR_CRYPTO_UNSUPPORTED_OPERATION for `ctsMode`/`xtsStandard` on a cipher that
+// does not implement them: `test/parallel/test-crypto-cipherbase-options-fast-path.js`,
+// `test/parallel/test-crypto-cipheriv-cbc-cts.js` and
+// `test/parallel/test-crypto-cipheriv-decipheriv.js`. That is what
 // `CipherBase::CommonInit` throws; the v22 on this machine predates that check and
-// accepts the option silently. The pin is authoritative, so these print the pin's
-// answer and the diff against v22 is expected. See `docs/project-context.md`'s
-// version-skew table.
+// accepts the option silently. (`test/parallel/test-crypto-cipheriv-xts.js` is not
+// one of them: it round-trips XTS ciphers and checks the repeated-update state
+// errors, and contains no such assertion.) The pin is authoritative, so these
+// print the pin's answer and the diff against v22 is expected. See
+// `docs/compat-status.md`'s "Version skew against the local `node` binary".
 // ---------------------------------------------------------------------------
 {
   const key = Buffer.alloc(16);

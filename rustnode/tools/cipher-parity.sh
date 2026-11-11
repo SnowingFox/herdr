@@ -19,8 +19,9 @@
 #                      `ctsMode`/`xtsStandard` on a cipher that does not implement
 #                      them; v22 accepts the option silently.
 #
-# Everything else must match byte for byte. `docs/project-context.md` records the
-# version-skew rule this follows.
+# Everything else must match byte for byte. `docs/compat-status.md` records the
+# version-skew rule this follows, under "Version skew against the local `node`
+# binary".
 #
 # Usage: tools/cipher-parity.sh [--keep]
 set -uo pipefail
