@@ -42,11 +42,11 @@ cd rustnode
 ```
 
 It prints
-`vendor/libnode-js matches the pinned Node revision (435 lib files, 1 deps file)`
+`vendor/libnode-js matches the pinned Node revision (435 lib files, 3 deps files)`
 and exits 0, or names the modified file and exits 1. The check is a plain
 `sha256sum -c` against `vendor/libnode-js/LIBJS.sha256` plus a file count, so it
 needs no network and no Node binary. **Current state: passing, 435 `lib/` files
-and 1 `deps/` file.**
+and 3 `deps/` files.**
 
 If a genuine Node bug requires a JavaScript change, that is a design decision,
 not a local edit: it means the native layer cannot express what the JavaScript
@@ -57,8 +57,13 @@ reason. Node's js2c embeds `lib/**` and an explicit `deps_files` list into one
 builtin table, and `lib/**` requires that bundle by id — without it,
 `require('internal/deps/undici/undici')` throws `Missing internal module` and
 `fetch`, `Response`, `FormData` and the WebAssembly streaming callback are all
-unreachable. The two trees are counted separately (435 and 1): a single total
-would let one gain a file while the other lost one and still balance.
+unreachable. The two trees are counted separately (435 and 3): a single total
+would let one gain a file while the other lost one and still balance. The three
+`deps/` files are `undici/undici.js` plus acorn's `dist/acorn.js` and
+`acorn-walk/dist/walk.js`, which `lib/internal/repl/*`,
+`lib/internal/errors/error_source.js` and
+`lib/internal/modules/esm/module_job.js` parse with; `tools/node-pin.toml`
+records why the eleven `deps/v8/tools/**.mjs` entries stay out.
 
 ## Gate 2: binding contracts
 
@@ -83,16 +88,26 @@ RUSTNODE_CONTRACT_OUT=/tmp/recorded.json \
 cargo run -p contract-gen -- /tmp/recorded.json --out contracts
 ```
 
-**Current state: not yet enforcing anything.** `contracts/` does not exist, so
-`rn-compat` prints `no contracts in ...; shape check skipped` and exits 0. Gate 2
-is scaffolding until the first contract files land, and a green `rn-compat` today
-means nothing. The recording path also needs a Node build where
-`require('node:module').internalBinding` is reachable; on the Node 22 build
-available here it is not, so contracts have to be recorded from a Node 28 binary.
+**Current state: enforcing, against 74 contract files.** An earlier version of this
+section said `contracts/` did not exist and that a green `rn-compat` meant nothing.
+That is no longer true. `cargo run -p rn-compat -- contracts` now ends with:
 
-Until `contracts/` is populated, a binding crate's `members()` list is backed
-only by reading the JavaScript call sites. That is the honest state: gate 2 is
-the gate that makes a binding crate's claim checkable, and it is not switched on.
+```
+binding shapes match .../contracts contracts (14 namespace(s) unregistered, 0 placeholder)
+coverage ratchet holds: 59 namespace(s) recorded complete are still complete
+```
+
+Read those two lines carefully, because they say different things. **`unregistered`
+is bring-up state**: a namespace with a contract that no Rust crate installs yet is
+reported and does not fail the gate, so 14 of 74 namespaces are still uncovered.
+**`placeholder` must be 0**, and the coverage ratchet fails the build if a namespace
+that used to cover its contract stops doing so. `./tools/check.sh` runs exactly this
+command with `--baseline contracts/complete-namespaces.txt`, so a regression cannot
+pass the gate silently.
+
+Recording a contract still needs a Node build where
+`require('node:module').internalBinding` is reachable; on the Node 22 build
+available here it is not, so contracts are recorded from a Node 28 binary.
 
 ## Gate 3: Node's own test suite
 
@@ -146,40 +161,73 @@ re-running everything and repeated runs never inflate the total.
 
 ### What the numbers mean today
 
-**Measured smoke subset — 0 of 10 files pass.**
+These two numbers were bring-up measurements taken when the runtime could not load
+a CommonJS module, and they had been stale for a long time. They are replaced here
+with measurements, and the method is stated so the next person can repeat or refute
+it.
 
-This is one specific named subset: the fixed 10-file list in `SMOKE_SUBSET`
-(`parallel/test-assert.js`, `test-buffer-bytelength.js`, `test-fs-open.js`,
-`test-path-parse-format.js`, `test-util-inspect.js`, `test-events-once.js`,
-`test-querystring-escape.js`, `test-string-decoder.js`, `test-timers-ordering.js`,
-and `es-module/test-esm-import-meta.mjs`). Measured with the debug `rustnode`
-binary against Node's test tree at its default branch.
+**Smoke subset — 10 of 10 files pass.** The subset is the fixed 10-file list in
+`SMOKE_SUBSET` (`parallel/test-assert.js`, `test-buffer-bytelength.js`,
+`test-fs-open.js`, `test-path-parse-format.js`, `test-util-inspect.js`,
+`test-events-once.js`, `test-querystring-escape.js`, `test-string-decoder.js`,
+`test-timers-ordering.js`, and `es-module/test-esm-import-meta.mjs`). Measured
+against the pinned tree with the four-marker rule, so a skip or a `node:test`
+failure would not be counted as a pass:
 
-The ten failures split into four causes, each naming the missing layer:
+```bash
+cd rustnode
+python3 tools/test-tail-map.py run --node /tmp/frozen/rustnode \
+    --tests /tmp/node-pin/test --out /tmp/smoke.json \
+    --only parallel/test-assert.js --only parallel/test-buffer-bytelength.js \
+    --only parallel/test-fs-open.js --only parallel/test-path-parse-format.js \
+    --only parallel/test-util-inspect.js --only parallel/test-events-once.js \
+    --only parallel/test-querystring-escape.js --only parallel/test-string-decoder.js \
+    --only parallel/test-timers-ordering.js --only es-module/test-esm-import-meta.mjs
+python3 tools/test-tail-map.py score /tmp/smoke.json
+```
 
-| Count | Cause | Owner |
-| --- | --- | --- |
-| 6 | `ReferenceError: require is not defined` | module loading (`rn-module`) |
-| 1 | `SyntaxError: Cannot use import statement outside a module` | ESM loading (`rn-module`) |
-| 2 | `unsupported option '--expose-internals'` | CLI option parsing (`rn-cli`) |
-| 1 | `unsupported option '--no-warnings'` | CLI option parsing (`rn-cli`) |
+The old text reported **0 of 10**, split across `require is not defined` (6 files),
+an ESM loading error (1), and two rejected CLI options (2 × `--expose-internals`,
+1 × `--no-warnings`). Those were real on the bring-up binary and every one is fixed
+now, so this is a disproved claim rather than a deleted one: the same ten files pass.
 
-None of these is a binding bug yet. The runtime cannot load a CommonJS module or
-accept Node's flags, so no test reaches an `internalBinding()` call. Expect this
-number to stay at 0 until `rn-module` and `rn-cli` land, and then to move in
-steps rather than a curve, because a single fix (module loading) unblocks
-thousands of files at once.
+The old text also said to expect the number to stay at 0 until `rn-module` and
+`rn-cli` landed, and then to move in steps rather than a curve, because a single fix
+would unblock thousands of files. That is what happened; the full-suite figure below
+is the curve.
 
-**Measured full suite — 1 of 5,666 files pass.** Same binary, same test tree,
-every suite the harness knows: `parallel` (5,161), `sequential` (128),
-`es-module` (252), `internet` (40), `pummel` (75), `message` (24),
-`known_issues` (21). The single pass is
-`parallel/test-regression-object-prototype.js`, which uses no `require` and no
-flags — it exercises the V8 and prototype layer that already works. The full run
-takes about six seconds because most files exit immediately.
+**Full suite — 2732 of 5714 files pass (47.8%), measured on `368e32ac`.**
 
-Both numbers are a starting line, not a trend. Re-measure rather than quoting
-these: they move every time a crate lands.
+That is the current number, and it is measured with the four-marker rule on a binary
+built from that commit. An earlier version of this section said the figure was
+unmeasurable pending #51; #51 merged at 11:11:55Z on 2026-11-11 via the `2fc0b17f`
+merge, so it is measurable and has been measured.
+
+Why the rule matters, and why a bare exit-code rate is not comparable: two defects
+made `rn-harness` grade failures as passes.
+
+1. `common.skip()` prints `1..0 # Skipped:` and exits 0, so a file that tested
+   nothing was graded as passing. 485 files carry a skip marker on this tree.
+2. Before #51, `beforeExit` was never emitted, so `node:test`'s `test:summary` never
+   ran and a file whose subtests failed exited 0.
+
+For scale, the same tool at the same scope on an earlier tree:
+
+| scope | commit | binary | scoring rule | result |
+| --- | --- | --- | --- | --- |
+| 8 suites, 5714 files | `7af7b306` (pre-#51) | `c4ff9845…` | four-marker | 2855 passed (50.0%) |
+| 8 suites, 5714 files | `52f79555` (#51) | `d8c0d9cd…` | four-marker | 2572 passed (45.0%) |
+| 8 suites, 5714 files | `368e32ac` (current) | `3c50d5e7…` | four-marker | **2732 passed (47.8%)** |
+
+The rate moved 45.0% → 47.8% because merges between those two trees closed whole
+families — `worker_threads`, `fs/promises.cp`, the inspector namespace (329 skips to
+zero) — not because the measurement changed. All three rows used the pinned tree
+`f344e7f552e3656bd37517151c5dc87d22b33771` and the commands in `docs/test-tail.md`,
+which also explains why the rule is a floor rather than a proof.
+
+The old text reported 1 of 5,666 files passing and named
+`parallel/test-regression-object-prototype.js` as the only pass. That was true of the
+bring-up binary; it is not true now.
 
 ### Checking your own subsystem
 
