@@ -146,15 +146,91 @@ pub fn has_reference(
 /// have no fallback, so a handle without this method throws
 /// `this._handle.getAsyncId is not a function` from inside `net`.
 ///
-/// The id comes from the state's own allocation, not a fresh value on every
-/// call: an async id identifies the *resource*, so two calls must agree.
+/// The id comes from the handle's own state, not a fresh value on every call: an
+/// async id identifies the *resource*, so two calls must agree and `asyncReset`
+/// is the only thing that changes it.
+///
+/// `kInvalidAsyncId` is the answer for a receiver that is not a handle, which is
+/// what `args.GetReturnValue().Set(kInvalidAsyncId)` before
+/// `ASSIGN_OR_RETURN_UNWRAP` amounts to.
 pub fn get_async_id(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let id = tcp::with_handle(args.this(), |handle| handle.state.async_id).unwrap_or(0);
-    rv.set(v8::Number::new(scope, id as f64).into());
+    let id = tcp::with_handle(args.this(), |handle| handle.state.async_wrap.async_id())
+        .unwrap_or(rn_core::INVALID_ASYNC_ID);
+    rv.set(v8::Number::new(scope, id).into());
+}
+
+/// `AsyncWrap::GetProviderType`.
+///
+/// `lib/internal/http/agent.js` reads this when it builds the `ReusedHandle` it
+/// passes to `asyncReset`, so the `init` hook that follows names the resource
+/// with the kind it already was:
+///
+/// ```js
+/// handle.asyncReset(new ReusedHandle(handle.getProviderType(), handle));
+/// ```
+///
+/// Answering `PROVIDER_NONE` for a non-handle is Node's own default, set before
+/// the unwrap.
+pub fn get_provider_type(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let provider = tcp::with_handle(args.this(), |handle| handle.state.async_wrap.provider())
+        .unwrap_or(rn_core::async_wrap::PROVIDER_NONE);
+    rv.set(v8::Integer::new_from_unsigned(scope, provider).into());
+}
+
+/// `AsyncWrap::AsyncReset`.
+///
+/// Assigns the handle a new async id and runs the `destroy`/`init` pair that
+/// goes with the change. `lib/internal/http/agent.js::asyncResetHandle` calls
+/// this on a socket pulled back out of the keep-alive pool, which is what makes
+/// a reused connection a *new* async resource rather than a continuation of the
+/// previous request's:
+///
+/// ```js
+/// const handle = socket._handle;
+/// if (handle && typeof handle.asyncReset === 'function') {
+///   handle.asyncReset(new ReusedHandle(handle.getProviderType(), handle));
+///   socket[async_id_symbol] = handle.getAsyncId();
+/// }
+/// ```
+///
+/// The argument contract is `src/async_wrap.cc`'s: `CHECK(args[0]->IsObject())`,
+/// and an optional second argument that is used as the id when it is a number
+/// and ignored otherwise.
+pub fn async_reset(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_>,
+) {
+    // `CHECK(args[0]->IsObject())`. A non-object here is a caller bug, and Node
+    // crashes on it; throwing keeps the process alive without hiding the bug.
+    let Ok(resource) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        crate::handle::throw_type_error(scope, "asyncReset requires a resource object");
+        return;
+    };
+    // `args[1]->IsNumber() ? args[1].As<Number>()->Value() : kInvalidAsyncId`.
+    let execution_async_id = if args.get(1).is_number() {
+        args.get(1).number_value(scope)
+    } else {
+        None
+    };
+    let object = args.this();
+    tcp::with_handle(object, |handle| {
+        rn_bind_async_wrap::async_reset(
+            scope,
+            &mut handle.state.async_wrap,
+            resource,
+            object,
+            execution_async_id,
+        );
+    });
 }
 
 /// `StreamBase::ReadStartJS`.

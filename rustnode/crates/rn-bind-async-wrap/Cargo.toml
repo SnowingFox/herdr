@@ -10,3 +10,12 @@ description = "internalBinding('async_wrap') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+# `AsyncWrapState::reset` writes `resource_symbol` on the handle it resets, and
+# `emitInitNative` reads it back through `internalBinding('symbols')`. A symbol
+# minted here would be a different key and every `lookupPublicResource` would
+# silently miss.
+rn-bind-symbols = { path = "../rn-bind-symbols" }
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

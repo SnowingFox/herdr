@@ -130,16 +130,31 @@ fn the_provider_table_covers_every_async_resource_kind() {
     assert_eq!(output, "70 NONE 0 29 number");
 }
 
+/// `setupHooks` refuses a second call, whatever it is given.
+///
+/// `SetupHooks` starts with `CHECK(args[0]->IsObject())` and then
+/// `CHECK(env->async_hooks_init_function().IsEmpty())`, so by the time a script
+/// can reach the binding the bootstrap has already filled the table and any
+/// further call is a programming error. The five-positional-argument form this
+/// binding used to accept was not Node's signature at all — `SetupHooks` reads
+/// one object with named properties — so a positional call installed nothing
+/// while looking like it worked.
 #[test]
-fn setup_hooks_accepts_the_five_callbacks() {
+fn setup_hooks_refuses_a_second_call() {
     let output = run(&format!(
         "{PRELUDE}
-        let called = false;
-        aw.setupHooks(() => {{ called = true; }}, null, null, null, null);
-        console.log(typeof aw.setupHooks, called);"
+        const results = [];
+        for (const argument of [undefined, 1, 'x', {{ init() {{}} }}]) {{
+          try {{ aw.setupHooks(argument); results.push('accepted'); }}
+          catch (error) {{ results.push(error.constructor.name); }}
+        }}
+        console.log(results.join(','));"
     ));
-    // Registering must not invoke.
-    assert_eq!(output, "function false");
+    let output = output.trim().to_string();
+    // A function is an object to V8, so `IsObject()` admits it; the guard that
+    // refuses every one of these is the already-installed check, which is what
+    // stops the bootstrap's table being replaced.
+    assert_eq!(output, "TypeError,TypeError,TypeError,TypeError");
 }
 
 #[test]
@@ -190,4 +205,124 @@ fn the_generated_provider_names_match_the_recorded_contract() {
     extra.sort_unstable();
     assert!(missing.is_empty(), "not generated: {missing:?}");
     assert!(extra.is_empty(), "generated but not recorded: {extra:?}");
+}
+
+/// `setupHooks` is called once, by the bootstrap, with Node's own `nativeHooks`.
+///
+/// `src/async_wrap.cc::SetupHooks` reads `args[0]` as an object and pulls
+/// `init`, `before`, `after`, `destroy` and `promise_resolve` off it by name, and
+/// `CHECK(env->async_hooks_init_function().IsEmpty())` makes a second call a
+/// hard error. `internal/bootstrap/node.js` is the only caller:
+///
+///     const { nativeHooks } = require('internal/async_hooks');
+///     internalBinding('async_wrap').setupHooks(nativeHooks);
+///
+/// rustnode reads positional arguments instead of that object, which left every
+/// slot empty: `async_hook_fields` still counted the enabled hooks, so
+/// `async_hooks` looked enabled while `EmitAsyncInit` and `EmitDestroy` had no
+/// function to call. This asserts the table is populated, because that is what a
+/// second `setupHooks` call now refuses to overwrite.
+#[test]
+fn the_bootstrap_installs_the_native_hook_table_once() {
+    let output = run(&format!(
+        "{PRELUDE}
+        let second = 'none';
+        try {{ aw.setupHooks({{ init() {{}} }}); }}
+        catch (error) {{ second = error.constructor.name; }}
+        console.log(typeof aw.setupHooks, second);"
+    ));
+    // A second call is refused, which is only possible when the first one
+    // installed a function.
+    assert_eq!(output, "function TypeError");
+}
+
+/// A native `init` reaches the hooks a script enabled, with Node's four
+/// arguments.
+///
+/// The provider, id and trigger id are checked together because they are the
+/// three things `EmitAsyncInit` supplies; an implementation that passed the
+/// resource where the id belongs would still call the function.
+#[test]
+fn a_native_init_reaches_the_enabled_hook() {
+    let output = run(&format!(
+        "{PRELUDE}
+        const ah = require('async_hooks');
+        const events = [];
+        ah.createHook({{
+          init(async_id, type, trigger, resource) {{
+            events.push([async_id, type, typeof trigger, typeof resource]);
+          }},
+        }}).enable();
+        const tcp = realm.internalBinding('tcp_wrap');
+        const handle = new tcp.TCP(tcp.constants.SOCKET);
+        const first = handle.getAsyncId();
+        handle.asyncReset({{ tag: 'reused' }});
+        const second = handle.getAsyncId();
+        handle.close();
+        const seen = events.filter((event) => event[1] === 'TCPWRAP');
+        console.log(JSON.stringify({{ seen, first, second }}));"
+    ));
+    let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    let seen = value["seen"].as_array().expect("init events");
+    // One `init` from the constructor's own `AsyncReset`, one from the explicit
+    // `asyncReset`, matching Node: a handle is a resource from construction, not
+    // from its first reuse.
+    assert_eq!(seen.len(), 2, "one init per reset: {seen:?}");
+    let first = value["first"].as_f64().expect("first id");
+    let second = value["second"].as_f64().expect("second id");
+    assert!(first > 0.0, "a handle is born with an id, not -1");
+    assert!(second > first, "a reset allocates a larger id");
+    assert_eq!(seen[0][0].as_f64(), Some(first));
+    assert_eq!(seen[1][0].as_f64(), Some(second));
+    // `triggerAsyncId` and `resource` both have to be real values: Node passes a
+    // number and the resource object the caller handed over.
+    assert_eq!(seen[0][2], serde_json::json!("number"));
+    assert_eq!(seen[0][3], serde_json::json!("object"));
+}
+
+/// `queueDestroyAsyncId` queues the id for the `destroy` hook instead of
+/// dropping it.
+///
+/// `lib/internal/async_hooks.js::emitDestroyScript` calls this whenever a
+/// resource reports it is gone, so a no-op implementation here means no
+/// `destroy` hook ever fires for anything — which is what rustnode shipped
+/// before. The hook is called from the check phase rather than inline, matching
+/// `AsyncWrap::EmitDestroy`'s deferral through `destroy_async_id_list`.
+#[test]
+fn queue_destroy_async_id_is_deferred_and_then_called() {
+    let output = run(&format!(
+        "{PRELUDE}
+        const ah = require('async_hooks');
+        const seen = [];
+        ah.createHook({{ destroy(id) {{ seen.push(id); }} }}).enable();
+        aw.queueDestroyAsyncId(4242);
+        console.log('sync', seen.length);
+        setImmediate(() => console.log('deferred', seen.join(',')));"
+    ));
+    // Deferred, not inline: Node queues the id and drains it from the check
+    // phase, so the synchronous read sees nothing. The `setImmediate` is itself
+    // an async resource, so its id is destroyed in the same phase and appears
+    // too; what matters is that 4242 arrives and the explicit `setImmediate`
+    // callback ran after the queue drained.
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "sync 0");
+    let deferred = lines[1].strip_prefix("deferred ").expect("deferred line");
+    assert!(
+        deferred.split(',').any(|id| id == "4242"),
+        "queueDestroyAsyncId must reach the destroy hook: {output}"
+    );
+}
+
+/// `queueDestroyAsyncId` requires a number, as `CHECK(args[0]->IsNumber())` does.
+///
+/// The type is checked rather than converted: `number_value` would read `'42'`
+/// as 42, and a binding that coerces hides the caller's bug.
+#[test]
+fn queue_destroy_async_id_requires_a_number() {
+    let output = run(&format!(
+        "{PRELUDE}
+        try {{ aw.queueDestroyAsyncId('not a number'); console.log('accepted'); }}
+        catch (error) {{ console.log(error.constructor.name); }}"
+    ));
+    assert_eq!(output, "TypeError");
 }

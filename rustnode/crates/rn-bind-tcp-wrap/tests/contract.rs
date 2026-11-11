@@ -42,7 +42,25 @@ fn init_v8() {
 }
 
 /// Installs the namespace and binds it to `__tcp` in the global object.
+///
+/// `async_wrap` is installed first, and that ordering is part of the contract
+/// rather than a convenience: `getAsyncId` draws from its counter and
+/// `asyncReset` emits through its hook table, so a `TCP` built without it has no
+/// id space to draw from. `lib/internal/bootstrap/node.js` reaches
+/// `async_wrap`'s binding before any handle exists for the same reason.
 fn install<'s>(scope: &mut v8::PinScope<'s, '_>) {
+    let async_wrap = rn_bind_async_wrap::AsyncWrap
+        .install(
+            scope,
+            &mut InstallCtx {
+                async_ids: &mut AsyncIds::new(),
+            },
+        )
+        .expect("installing the async_wrap namespace must not fail");
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "__async").expect("allocating __async");
+    global.set(scope, key.into(), async_wrap.into());
+
     let object = TcpWrap
         .install(
             scope,
@@ -435,6 +453,184 @@ fn the_module_declares_exactly_what_it_installs() {
     assert!(
         TcpWrap.deferred().is_empty(),
         "every recorded member is installed, so nothing is deferred"
+    );
+}
+
+/// `AsyncWrap`'s three methods, which the `HandleWrap` template inherits.
+///
+/// `getAsyncId` alone is not enough: `lib/internal/http/agent.js::asyncResetHandle`
+/// feature-detects `asyncReset` and silently does nothing when it is absent, so a
+/// handle without it keeps the previous request's id and
+/// `socket[async_id_symbol]` stays `-1`. `getProviderType` is what builds the
+/// `ReusedHandle` it passes to the reset.
+///
+/// `src/async_wrap.cc::GetConstructorTemplate` installs all three on one
+/// prototype, which is why they are asserted together.
+#[test]
+fn a_tcp_handle_exposes_the_async_wrap_methods() {
+    let report = eval(
+        r#"
+        const handle = new __tcp.TCP(__tcp.constants.SOCKET);
+        const names = ['getAsyncId', 'asyncReset', 'getProviderType'];
+        const results = names.map((name) => typeof handle[name]);
+        handle.close();
+        results.join(',')
+        "#,
+    );
+    assert_eq!(report, "function,function,function");
+}
+
+/// `getProviderType` reports the provider `src/tcp_wrap.cc` selects from the
+/// socket type, and `Providers.TCPWRAP`/`TCPSERVERWRAP` are the ids it reports.
+///
+/// The mapping is observable: `asyncResetHandle` puts this value into the
+/// `ReusedHandle` that the `init` hook receives as `resource.type`, so a wrong
+/// one labels a reused socket as the wrong kind of resource without failing
+/// anything else.
+#[test]
+fn a_handle_reports_the_provider_for_its_socket_type() {
+    let report = eval(
+        r#"
+        const client = new __tcp.TCP(__tcp.constants.SOCKET);
+        const server = new __tcp.TCP(__tcp.constants.SERVER);
+        const out = [client.getProviderType(), server.getProviderType()];
+        client.close();
+        server.close();
+        out.join(',')
+        "#,
+    );
+    // `PROVIDER_TCPWRAP` is 42 and `PROVIDER_TCPSERVERWRAP` is 41, matching
+    // `NODE_ASYNC_PROVIDER_TYPES` in `src/async_wrap.h`.
+    assert_eq!(
+        report, "42,41",
+        "SOCKET is TCPWRAP, SERVER is TCPSERVERWRAP"
+    );
+}
+
+/// `getAsyncId` answers `kInvalidAsyncId` for a receiver that is not a handle.
+///
+/// `src/async_wrap.cc::GetAsyncId` sets `-1` as the return value *before* it
+/// unwraps, so a detached or forged receiver gets `-1` rather than throwing.
+/// `lib/net.js` checks the method exists and then trusts the answer, which is
+/// why this has to be a number rather than `undefined`.
+#[test]
+fn an_unwrapped_receiver_reports_no_async_id_and_no_provider() {
+    let report = eval(
+        r#"
+        const method = (name) => __tcp.TCP.prototype[name];
+        const out = [
+          method('getAsyncId').call({}),
+          method('getProviderType').call({}),
+        ];
+        out.join(',')
+        "#,
+    );
+    assert_eq!(report, "-1,0", "PROVIDER_NONE is 0");
+}
+
+/// A handle's async id changes when it is reset, and the id is freshly allocated
+/// rather than reused.
+///
+/// This is the assertion `test-async-hooks-http-agent` makes implicitly: the
+/// agent pulls a socket out of the keep-alive pool, calls `asyncReset`, and
+/// stores `handle.getAsyncId()` as the socket's `async_id_symbol`. An id that did
+/// not change would mean the second request inherited the first one's resource.
+#[test]
+fn async_reset_assigns_a_fresh_async_id() {
+    let report = eval(
+        r#"
+        const handle = new __tcp.TCP(__tcp.constants.SOCKET);
+        const before = handle.getAsyncId();
+        handle.asyncReset({ tag: 'reused' });
+        const after = handle.getAsyncId();
+        handle.close();
+        [before > 0, after > 0, after !== before, after > before].join(',')
+        "#,
+    );
+    assert_eq!(
+        report, "true,true,true,true",
+        "a reset must allocate a new, larger id rather than replay the old one"
+    );
+}
+
+/// The optional second argument to `asyncReset` is used as the id when it is a
+/// number, matching `args[1]->IsNumber() ? args[1]->As<Number>()->Value() :
+/// kInvalidAsyncId`.
+#[test]
+fn async_reset_uses_an_explicit_id_when_one_is_given() {
+    let report = eval(
+        r#"
+        const handle = new __tcp.TCP(__tcp.constants.SOCKET);
+        handle.asyncReset({ tag: 'reused' }, 12345);
+        const id = handle.getAsyncId();
+        handle.close();
+        id
+        "#,
+    );
+    assert_eq!(report, "12345");
+}
+
+/// The second argument being a non-number falls back to allocating, which is
+/// what the `IsNumber()` test in `AsyncReset` amounts to.
+#[test]
+fn async_reset_allocates_when_the_id_argument_is_not_a_number() {
+    let report = eval(
+        r#"
+        const handle = new __tcp.TCP(__tcp.constants.SOCKET);
+        const before = handle.getAsyncId();
+        handle.asyncReset({ tag: 'reused' }, 'not a number');
+        const after = handle.getAsyncId();
+        handle.close();
+        [after > 0, after !== before].join(',')
+        "#,
+    );
+    assert_eq!(report, "true,true");
+}
+
+/// `asyncReset` requires an object, as `CHECK(args[0]->IsObject())` does.
+#[test]
+fn async_reset_requires_a_resource_object() {
+    let report = eval(
+        r#"
+        const handle = new __tcp.TCP(__tcp.constants.SOCKET);
+        const results = [];
+        for (const argument of [undefined, 1, 'x', null]) {
+          try { handle.asyncReset(argument); results.push('accepted'); }
+          catch (error) { results.push(error.constructor.name); }
+        }
+        handle.close();
+        results.join(',')
+        "#,
+    );
+    assert_eq!(
+        report, "TypeError,TypeError,TypeError,TypeError",
+        "a non-object resource is a caller bug, not a silent no-op"
+    );
+}
+
+/// A reset attaches the resource to the handle under `resource_symbol`, which is
+/// how `emitInitNative` decides which object a hook sees.
+///
+/// `AsyncWrap::AsyncReset` does `obj->Set(resource_symbol, resource)` only when
+/// the resource is not the object itself. `lookupPublicResource` reads that same
+/// key, so a reset that skipped it would hand the hook the raw handle instead of
+/// the `ReusedHandle` the caller passed.
+#[test]
+fn async_reset_attaches_the_resource_under_the_shared_symbol() {
+    let report = eval(
+        r#"
+        const handle = new __tcp.TCP(__tcp.constants.SOCKET);
+        const resource = { tag: 'reused' };
+        handle.asyncReset(resource);
+        const attached = Object.getOwnPropertySymbols(handle)
+          .find((symbol) => handle[symbol] === resource);
+        handle.close();
+        [attached !== undefined, String(attached)].join(',')
+        "#,
+    );
+    assert_eq!(
+        report, "true,Symbol(resource_symbol)",
+        "the symbol must be the shared one from internalBinding('symbols')"
     );
 }
 

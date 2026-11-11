@@ -305,6 +305,12 @@ fn setup_timers(
     // `uv_*_init` calls inside a poll that is already timed out.
     let _ = ensure_timer_handle();
     let _ = ensure_immediate_handles();
+    // Native immediates (`AsyncWrap::EmitDestroy`'s deferred `destroy`) are
+    // queued by another crate and drained from this one's check phase, so the
+    // queue needs a way to ask for that phase. Registering here rather than
+    // lazily matters: a destroy queued from the script body must arm the handle
+    // before the loop decides it has nothing left to do.
+    rn_core::native_immediates::set_wakeup(arm_check_phase);
 }
 
 fn toggle_immediate_ref(
@@ -480,12 +486,23 @@ unsafe extern "C" fn on_timer(_handle: *mut uv::uv_timer_t) {
     unsafe { run_timer_callback() };
 }
 
-/// `uv_check_t`'s callback: run `processImmediate`.
+/// `uv_check_t`'s callback: run the native immediates, then `processImmediate`.
 ///
 /// # Safety
 ///
 /// Called by libuv with the check handle this module initialised.
 unsafe extern "C" fn on_check(_handle: *mut uv::uv_check_t) {
+    // `Environment::CheckImmediate` runs `RunAndClearNativeImmediates()` *before*
+    // `processImmediate`, and the order is observable: `AsyncWrap::EmitDestroy`
+    // defers a `destroy` hook through the native queue, so a destroy that became
+    // due in this iteration is reported before any `setImmediate` callback. Doing
+    // it the other way round puts every destroy one immediate too late.
+    let native_pending = rn_core::native_immediates::has_pending();
+    if native_pending {
+        rn_uv::callback::with_context(|scope| {
+            rn_core::native_immediates::run_and_clear(scope);
+        });
+    }
     // SAFETY: as in `on_timer`.
     unsafe { run_immediate_callback() };
     // Anything else Node runs in the check phase. A `MessagePort` becomes
@@ -538,6 +555,12 @@ pub fn set_check_phase_hook(hook: fn(&mut v8::PinScope<'_, '_>)) {
 /// The check handle is started on demand, so this is also the signal that the
 /// handle must be started before the next iteration for its work to run.
 pub fn check_phase_pending() -> bool {
+    // A native immediate (`AsyncWrap::EmitDestroy`'s deferred `destroy`, for
+    // one) runs at the start of this phase, so its presence keeps the handle
+    // armed exactly like a JavaScript immediate does.
+    if rn_core::native_immediates::has_pending() {
+        return true;
+    }
     if immediate_count() > 0 {
         return true;
     }

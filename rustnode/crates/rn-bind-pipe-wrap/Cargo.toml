@@ -10,6 +10,10 @@ description = "internalBinding('pipe_wrap') for rustnode"
 [dependencies]
 libuv-sys2.workspace = true
 rn-core.workspace = true
+# `Pipe` is an `AsyncWrap` too: its constructor emits the first `init` through
+# `internalBinding('async_wrap')`'s hooks, and `getAsyncId` answers from that
+# namespace's shared id sequence.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 rn-uv.workspace = true
 rn-v8-sys.workspace = true
 tracing.workspace = true

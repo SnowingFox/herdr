@@ -11,6 +11,10 @@ description = "internalBinding('tcp_wrap') for rustnode"
 libuv-sys2.workspace = true
 rn-core.workspace = true
 rn-uv.workspace = true
+# `asyncReset` emits `init`/`destroy` through `internalBinding('async_wrap')`'s
+# registered hooks, and `getAsyncId` answers from the id space that namespace's
+# counter advances. A private counter here would hand out ids a hook never saw.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 tracing.workspace = true
 rn-v8-sys.workspace = true
 

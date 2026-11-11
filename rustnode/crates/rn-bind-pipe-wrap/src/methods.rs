@@ -133,13 +133,17 @@ pub fn has_reference(
 }
 
 /// `AsyncWrap::GetAsyncId`; see the `tcp_wrap` copy for why `net` needs it.
+///
+/// `kInvalidAsyncId` is the answer for a receiver that is not a handle, which is
+/// what Node sets before `ASSIGN_OR_RETURN_UNWRAP`.
 pub fn get_async_id(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let id = pipe::with_handle(args.this(), |handle| handle.state.async_id).unwrap_or(0);
-    rv.set(v8::Number::new(scope, id as f64).into());
+    let id = pipe::with_handle(args.this(), |handle| handle.state.async_wrap.async_id())
+        .unwrap_or(rn_core::INVALID_ASYNC_ID);
+    rv.set(v8::Number::new(scope, id).into());
 }
 
 /// `StreamBase::ReadStartJS`.
