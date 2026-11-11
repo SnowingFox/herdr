@@ -89,6 +89,15 @@ pub(crate) struct Delegate<'a> {
     ///
     /// Node's `first_cloned_object_index_`.
     transferred: usize,
+    /// Shared buffers already written, in id order.
+    ///
+    /// Node's `seen_shared_array_buffers_`. A shared buffer is *not* a transfer
+    /// list entry: it is shared memory, so it stays usable on the sending side
+    /// and the id only tells the receiver which backing store to reattach. Ids
+    /// are deduplicated by identity within one message, so a `Uint32Array` view
+    /// and the `SharedArrayBuffer` behind it cost one entry, and both sides end
+    /// up with the same buffer rather than two copies.
+    shared_array_buffers: &'a RefCell<Vec<v8::Global<v8::SharedArrayBuffer>>>,
 }
 
 impl v8::ValueSerializerImpl for Delegate<'_> {
@@ -196,6 +205,37 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
         serializer.write_uint32(id);
         Some(true)
     }
+
+    fn get_shared_array_buffer_id<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        shared_array_buffer: v8::Local<'s, v8::SharedArrayBuffer>,
+    ) -> Option<u32> {
+        // Node's `SerializerDelegate::GetSharedArrayBufferId`. A shared buffer is
+        // copied by reference, never transferred: it stays usable on the sending
+        // side, so this is not a transfer-list entry and does not consult one.
+        //
+        // The id is deduplicated by identity within this message. That is the part
+        // a naive implementation gets wrong: a `Uint32Array` view writes its buffer
+        // as well, and if each got its own id the receiver would build two distinct
+        // shared buffers from one allocation and the counter would stop being
+        // shared between them.
+        let wanted: v8::Local<'s, v8::Object> = shared_array_buffer.into();
+        {
+            let seen = self.shared_array_buffers.borrow();
+            for (index, existing) in seen.iter().enumerate() {
+                let existing: v8::Local<v8::SharedArrayBuffer> = v8::Local::new(scope, existing);
+                let existing: v8::Local<v8::Object> = existing.into();
+                if existing.strict_equals(wanted.into()) {
+                    return Some(index as u32);
+                }
+            }
+        }
+
+        let mut seen = self.shared_array_buffers.borrow_mut();
+        seen.push(v8::Global::new(scope, shared_array_buffer));
+        Some(seen.len() as u32 - 1)
+    }
 }
 
 impl Delegate<'_> {
@@ -234,12 +274,14 @@ pub fn serialize<'s>(
     let transfers = collect_transfers(scope, transfer_list)?;
 
     let host_objects = RefCell::new(Vec::new());
+    let shared_array_buffers = RefCell::new(Vec::new());
     let transferred = transfers.ports.len();
     let serializer = v8::ValueSerializer::new(
         scope,
         Box::new(Delegate {
             host_objects: &host_objects,
             transferred,
+            shared_array_buffers: &shared_array_buffers,
         }),
     );
 
@@ -373,7 +415,26 @@ pub fn serialize<'s>(
         };
         payloads.push(payload);
     }
-    Ok(Message::new(data, backing_stores, payloads, transferred))
+
+    // The shared buffers the payload referenced, in id order, so the receiver
+    // reattaches the same allocation instead of an empty one. Taken after the
+    // clone loop because writing a clone's data can reach more shared buffers.
+    let shared_array_buffers: Vec<v8::SharedRef<v8::BackingStore>> = shared_array_buffers
+        .into_inner()
+        .iter()
+        .map(|buffer| {
+            let buffer: v8::Local<v8::SharedArrayBuffer> = v8::Local::new(scope, buffer);
+            buffer.get_backing_store()
+        })
+        .collect();
+
+    Ok(Message::new(
+        data,
+        backing_stores,
+        shared_array_buffers,
+        payloads,
+        transferred,
+    ))
 }
 
 /// Reads and validates the transfer list before anything is serialized.
@@ -475,7 +536,7 @@ mod tests {
         // `ReceiveMessage` relies on it to dispatch `close` rather than trying to
         // deserialize an empty payload.
         assert!(Message::close_marker().close);
-        assert!(!Message::new(Vec::new(), Vec::new(), Vec::new(), 0).close);
+        assert!(!Message::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0).close);
     }
 
     #[test]
@@ -492,6 +553,7 @@ mod tests {
         let port_b: Arc<dyn TransferData> = Arc::new(Named);
         let clone_a: Arc<dyn TransferData> = Arc::new(Named);
         let message = Message::new(
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             vec![port_a.clone(), port_b.clone(), clone_a.clone()],

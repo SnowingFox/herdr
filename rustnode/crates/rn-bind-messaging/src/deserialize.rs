@@ -48,6 +48,13 @@ struct Rebuilt {
 /// `read_host_object` runs with JavaScript disabled.
 struct Lookup<'a> {
     rebuilt: &'a Rebuilt,
+    /// One `SharedArrayBuffer` per backing store the message carries, in id order.
+    ///
+    /// Node builds this vector before reading the payload
+    /// (`Message::Deserialize`'s `shared_array_buffers`), so each id resolves to
+    /// exactly one object. Building it here rather than on demand is what keeps
+    /// two references to one shared buffer pointing at one buffer.
+    shared_array_buffers: &'a [v8::Global<v8::SharedArrayBuffer>],
 }
 
 impl v8::ValueDeserializerImpl for Lookup<'_> {
@@ -76,15 +83,20 @@ impl v8::ValueDeserializerImpl for Lookup<'_> {
     fn get_shared_array_buffer_from_id<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
-        _transfer_id: u32,
+        transfer_id: u32,
     ) -> Option<v8::Local<'s, v8::SharedArrayBuffer>> {
-        // A shared buffer cannot be transferred, only shared, and sharing one
-        // between two threads is the case this build does not have a Worker for.
-        crate::throw_type_error(
-            scope,
-            "Cannot transfer a SharedArrayBuffer without a second thread",
-        );
-        None
+        // Node's `Message::Deserialize` resolves this id against
+        // `shared_array_buffers`, the vector built from the message's own list.
+        // There is nothing to transfer here: the buffer was never detached, so
+        // the sender and the receiver hold the same allocation.
+        let Some(buffer) = self.shared_array_buffers.get(transfer_id as usize) else {
+            crate::throw_type_error(
+                scope,
+                "The message referenced a shared buffer that was not sent",
+            );
+            return None;
+        };
+        Some(v8::Local::new(scope, buffer))
     }
 
     fn get_wasm_module_from_id<'s>(
@@ -115,9 +127,28 @@ pub fn deserialize<'s>(
     }
     let rebuilt = Rebuilt { objects };
 
+    // Phase 1b: one `SharedArrayBuffer` per backing store the message carried.
+    // Built before the payload is read so an id resolves to exactly one object,
+    // which is what makes two references to one shared buffer stay one buffer.
+    // `with_backing_store` attaches the same allocation rather than copying it.
+    let shared_array_buffers: Vec<v8::Global<v8::SharedArrayBuffer>> = message
+        .shared_array_buffers
+        .iter()
+        .map(|store| {
+            let buffer = v8::SharedArrayBuffer::with_backing_store(scope, store);
+            v8::Global::new(scope, buffer)
+        })
+        .collect();
+
     // Phase 2: the payload. No JavaScript from here until `read_value` returns.
-    let deserializer =
-        v8::ValueDeserializer::new(scope, Box::new(Lookup { rebuilt: &rebuilt }), &message.data);
+    let deserializer = v8::ValueDeserializer::new(
+        scope,
+        Box::new(Lookup {
+            rebuilt: &rebuilt,
+            shared_array_buffers: &shared_array_buffers,
+        }),
+        &message.data,
+    );
     for (id, store) in message.array_buffers.iter().enumerate() {
         let buffer = v8::ArrayBuffer::with_backing_store(scope, store);
         v8::ValueDeserializerHelper::transfer_array_buffer(&deserializer, id as u32, buffer);
