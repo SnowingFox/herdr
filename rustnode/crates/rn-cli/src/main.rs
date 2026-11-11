@@ -194,7 +194,26 @@ fn main() {
     // `--inspect` opens the endpoint before anything else runs, and prints the URL the
     // way Node does. `--inspect-brk` additionally blocks until a client attaches, which
     // is what makes the first line of user code the first line a debugger sees.
+    //
+    // `Agent::Start`/`StartIoThread` check the `inspector` scope, so an
+    // `--inspect` under `--permission` without `--allow-inspector` is refused
+    // before the endpoint opens. There is no JavaScript frame to throw into at
+    // this point, so the failure is reported and the process exits the way
+    // Node's does for a rejected startup flag; `test-permission-inspector-brk.js`
+    // asserts the exit status and the `Access to this API has been restricted`
+    // text on stderr.
     if let Some(request) = options.inspect.as_ref() {
+        // `Agent::Start`/`StartIoThread` check the `inspector` scope, so an
+        // `--inspect` under `--permission` without `--allow-inspector` is refused
+        // before the endpoint opens. There is no JavaScript frame to throw into at
+        // this point, so the failure is reported and the process exits the way
+        // Node's does for a rejected startup flag;
+        // `test-permission-inspector-brk.js` asserts the exit status and the
+        // `Access to this API has been restricted` text on stderr.
+        if let Some(denied) = rn_permission::runtime::deny_inspector() {
+            eprintln!("Error: {}", denied.message());
+            std::process::exit(1);
+        }
         match rn_bind_inspector::start_server(request.host.as_str(), request.port) {
             Ok(url) => {
                 eprintln!("Debugger listening on {url}");

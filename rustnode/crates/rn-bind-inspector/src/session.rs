@@ -198,6 +198,16 @@ fn constructor(
         return;
     };
 
+    // `Agent::Connect` checks the `inspector` scope with `"Connect"` as the
+    // resource, before it looks at whether an inspector exists at all. This is the
+    // path `new Session(); session.connect()` takes, which is why it needs the
+    // check even though it never calls `inspector.open()`:
+    // `test-permission-inspector.js` asserts exactly that shape.
+    if let Some(denied) = rn_permission::runtime::check_inspector(scope, "Connect") {
+        denied.throw(scope);
+        return;
+    }
+
     // `Session.connect()` is legal without `open()` — `lib/internal/util/inspector.js`
     // uses exactly that to talk to the inspector in-process — so the inspector is
     // created here when it does not exist yet rather than requiring `--inspect`.
