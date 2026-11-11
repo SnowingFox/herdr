@@ -12,22 +12,54 @@ use serde::{Deserialize, Serialize};
 /// as a failure and a skipped parallel test as a pass.
 pub const SKIP_PLAN_PREFIX: &str = "1..0 # Skipped:";
 
+/// The word that marks an uncaught exception in rustnode's output: `Uncaught`.
+///
+/// This is the *primary* hollow-pass marker, and it is much larger in practice
+/// than the reporter glyph. When an assertion fails outside `node:test` — a
+/// plain `assert.strictEqual` in a test file, which is most of `test/parallel` —
+/// rustnode prints
+///
+/// ```text
+/// node:assert:16736: Uncaught AssertionError: The input did not match ...
+/// ```
+///
+/// to **stdout** and then exits 0, because the uncaught-exception path never
+/// sets the exit code. Measured on a `test/parallel` sample, 9 of 400 files did
+/// this on exit 0; on the `test-crypto-key*`/`rsa*`/`ec*` family 16 of 31
+/// harness-visible passes did.
+///
+/// The location prefix (`node:assert:16736: `) means the word is not at the
+/// start of the line, so this marker is matched *anywhere* in the line, but only
+/// as the exact word `Uncaught` followed by a space or `:`. The `Uncaught` part
+/// is doing real work on the false-positive side: an assertion error that is
+/// caught by `assert.throws` or a `try/catch` is never printed at all, so the
+/// runtime only writes this word for an error that escaped.
+pub const UNCAUGHT_MARKER: &str = "Uncaught";
+
 /// The glyph rustnode's spec reporter prints for a failed test, `U+2716`.
 ///
-/// This is deliberately a *rustnode-shaped* rule, not a Node one. Real Node,
-/// with stdout piped as the harness always pipes it, writes TAP
+/// This covers the *other* half: files that use `node:test` and fail a subtest.
+/// Those print the spec reporter's `✖` and never a word like `Uncaught`, because
+/// the failure is reported as a test result rather than an exception. Keeping
+/// both markers is not redundancy — they are disjoint populations:
+///
+/// | file uses | failure appears as |
+/// | --- | --- |
+/// | `node:test` | `  ✖ inner fails` |
+/// | plain `assert` | `node:assert:16736: Uncaught AssertionError: ...` |
+///
+/// This glyph is deliberately a *rustnode-shaped* rule, not a Node one. Real
+/// Node, with stdout piped as the harness always pipes it, writes TAP
 /// (`not ok 2 - inner fails`) and never this glyph; rustnode writes the spec
-/// reporter's output instead because `test:summary` is never emitted. Matching
-/// the glyph therefore buys detection of the failure rustnode currently reports
-/// and then denies with exit 0, at the cost of being tied to rustnode's reporter
-/// choice.
+/// reporter's output instead because `test:summary` is never emitted.
 ///
 /// The consequence, stated so it is not a surprise later: if rustnode switches
-/// to TAP output to match Node, this marker stops matching and
-/// `misreported_passes` silently goes back to zero. The test
+/// to TAP output to match Node, this marker stops matching and those rows
+/// silently go back to counting as passes. The test
 /// `a_passing_row_that_reported_a_failing_subtest_is_corrected_to_failed` pins
 /// the rule, and `docs`/README record the dependency, so the switch has to deal
-/// with it rather than quietly lose the check.
+/// with it rather than quietly lose the check. [`UNCAUGHT_MARKER`] is unaffected
+/// by that switch, which is why it carries most of the correction.
 pub const FAILURE_MARKER: &str = "\u{2716}";
 
 /// What a file actually did, as opposed to how it exited.
@@ -90,10 +122,15 @@ pub struct MarkerScanner {
     scan: ScanResult,
 }
 
-/// Enough for indentation, a colour escape and the marker with room to spare.
-/// A line longer than this cannot still be *starting* with a marker past the
-/// cap, so dropping the tail loses nothing.
-const LINE_PREFIX_CAP: usize = 64;
+/// First bytes of each line retained for matching.
+///
+/// Grown from 64 when the `Uncaught` marker arrived: its line carries a location
+/// prefix (`node:internal/assert/utils:4640: `) before the word, so the buffer
+/// has to hold more than the word itself. A line longer than this cannot still
+/// be *starting* with the reporter glyph past the cap, and the `Uncaught` phrase
+/// appears within the first few dozen bytes of every observed line, so dropping
+/// the tail loses nothing.
+const LINE_PREFIX_CAP: usize = 256;
 
 impl MarkerScanner {
     pub fn new() -> Self {
@@ -130,6 +167,12 @@ impl MarkerScanner {
         // when `FORCE_COLOR` is set, so this one is compared after both are
         // stripped.
         if visible_start(&text).starts_with(FAILURE_MARKER) {
+            self.scan.reported_failure = true;
+        }
+        // The uncaught marker sits mid-line, behind a location prefix, so it is
+        // matched as a phrase rather than at the start. Colour codes are removed
+        // first in case a test colourises its own output around the word.
+        if !self.scan.reported_failure && mentions_uncaught(&strip_ansi(&text)) {
             self.scan.reported_failure = true;
         }
         self.line.clear();
@@ -173,6 +216,117 @@ fn visible_start(text: &str) -> &str {
 /// Whether `text` contains a line the reporter marked as a failing test.
 pub fn has_failure_marker(text: &str) -> bool {
     scan_text(text).reported_failure
+}
+
+/// Removes ANSI CSI escape sequences from one line, leaving the visible text.
+fn strip_ansi(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
+            let mut end = index + 2;
+            while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                end += 1;
+            }
+            // Skip the whole escape, or give up on the rest if unterminated.
+            index = end.saturating_add(1);
+            continue;
+        }
+        let ch = text[index..].chars().next().unwrap_or('\0');
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+/// Whether a line reports an uncaught exception.
+///
+/// Two shapes occur in real rustnode output, and both are matched:
+///
+/// ```text
+/// Uncaught AssertionError [ERR_ASSERTION]: plain mismatch
+/// node:assert:16736: Uncaught AssertionError: The input did not match ...
+/// ```
+///
+/// The second is the common one and puts a location prefix in front, so a rule
+/// requiring the word at the start of the line would match **none** of the 9
+/// measured cases. The prefix is the discriminator, and it has a specific shape:
+/// `<module or path>:<line>: `, that is, something ending in a colon and a line
+/// number. That is what separates the runtime reporting its own error from a
+/// test echoing captured child output, which reads
+/// `child stderr: Uncaught AssertionError: ...` — arbitrary text, no line
+/// number, and a passing file that prints it must stay a pass.
+///
+/// So a line matches when `Uncaught` is followed by an error name and a colon,
+/// **and** it is either at the start of the line or preceded by a
+/// `:<digits>: ` location. Both restrictions are load-bearing; each one alone
+/// admits a wrong answer.
+fn mentions_uncaught(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut from = 0;
+    while let Some(found) = line[from..].find(UNCAUGHT_MARKER) {
+        let start = from + found;
+        from = start + UNCAUGHT_MARKER.len();
+
+        // The word must not be part of a longer identifier.
+        let before_ok = start == 0
+            || !line[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if !before_ok {
+            continue;
+        }
+
+        // `Uncaught <ErrorName>:` or `Uncaught <ErrorName> [CODE]`.
+        let Some(after_space) = line[start + UNCAUGHT_MARKER.len()..].strip_prefix(' ') else {
+            continue;
+        };
+        let name: String = after_space
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .collect();
+        let tail = &after_space[name.len()..];
+        let capitalised = name.chars().next().is_some_and(|c| c.is_uppercase());
+        if !capitalised || !(tail.starts_with(':') || tail.starts_with(" [")) {
+            continue;
+        }
+
+        // Either the start of the line, or a `:<line-number>: ` location.
+        let line_start = line[..start].trim_start_matches([' ', '\t']).is_empty();
+        if line_start || preceded_by_location(bytes, start) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the text before `start` ends with a `:<line-number>:` location.
+///
+/// Accepts `node:assert:16736: `, `node:internal/assert/utils:4640: ` and
+/// `/path/to/test-file.js:898: `; rejects `child stderr: ` or any other prose.
+fn preceded_by_location(bytes: &[u8], start: usize) -> bool {
+    let mut index = start;
+    // Trailing space of the prefix.
+    if index == 0 || bytes[index - 1] != b' ' {
+        return false;
+    }
+    index -= 1;
+    if index == 0 || bytes[index - 1] != b':' {
+        return false;
+    }
+    index -= 1;
+    // At least one digit of line number.
+    let digits_end = index;
+    while index > 0 && bytes[index - 1].is_ascii_digit() {
+        index -= 1;
+    }
+    if index == digits_end {
+        return false;
+    }
+    // And the colon that introduces the line number.
+    index > 0 && bytes[index - 1] == b':'
 }
 
 /// Scans a complete stdout blob for both markers.
@@ -264,19 +418,31 @@ impl FileResult {
     }
 
     /// Whether this row is a skip, including rows recorded before `skipped` existed.
+    ///
+    /// Marker evidence is **cumulative**: a recorded `true` stands, and a marker
+    /// found in the recorded stdout also counts. This is not a fallback chain
+    /// that lets a recorded value hide new evidence — see
+    /// [`FileResult::reported_failure`] for why that distinction matters when a
+    /// detection rule is extended.
     pub fn is_skipped(&self) -> bool {
-        self.skipped
-            .unwrap_or_else(|| has_skip_plan_line(&self.stdout_head))
+        self.skipped == Some(true) || has_skip_plan_line(&self.stdout_head)
     }
 
     /// Whether stdout announced a failure the exit code denied.
     ///
-    /// The recorded field wins when present; otherwise the row's stdout is
-    /// scanned, so a result file written before this field existed still gets
-    /// the right answer.
+    /// Cumulative for the same reason as [`FileResult::is_skipped`], and it
+    /// matters more here because this rule *was* extended: the first version
+    /// matched only the reporter's `✖`, which misses the much larger
+    /// `Uncaught AssertionError` population. A row recorded under the narrow rule
+    /// carries `misreported: Some(false)`, and treating that as final would mask
+    /// every uncaught case in any result file written by that build.
+    ///
+    /// So the two sources are ORed rather than one winning. A byte prefix of the
+    /// stream can only miss a marker, never invent one, so scanning the retained
+    /// head cannot produce evidence the full stream lacked; the OR is therefore
+    /// sound, and it means strengthening the rule always applies to old files.
     pub fn reported_failure(&self) -> bool {
-        self.misreported
-            .unwrap_or_else(|| has_failure_marker(&self.stdout_head))
+        self.misreported == Some(true) || has_failure_marker(&self.stdout_head)
     }
 
     /// What the file did, in one answer.
@@ -476,7 +642,10 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_field_wins_over_the_stdout_text() {
+    fn a_recorded_false_does_not_hide_a_plan_line_in_the_stdout() {
+        // Same cumulative rule as `misreported`. A `1..0 # Skipped:` line in
+        // column zero can only be evidence the writer failed to interpret, never
+        // a false positive invented by truncation, so it is not discarded.
         let recorded = row(
             "parallel/test-x.js",
             "1..0 # Skipped: said in a trace",
@@ -484,7 +653,19 @@ mod tests {
             0,
             Some(false),
         );
-        assert_eq!(recorded.outcome(), Outcome::Passed);
+        assert_eq!(recorded.outcome(), Outcome::Skipped);
+
+        // What actually guards the false-positive direction is position: an
+        // indented or mid-line mention is not a plan line, so a recorded pass
+        // stands there.
+        let indented = row(
+            "parallel/test-y.js",
+            "  note: 1..0 # Skipped: mentioned in a message",
+            true,
+            0,
+            Some(false),
+        );
+        assert_eq!(indented.outcome(), Outcome::Passed);
     }
 
     #[test]
@@ -654,16 +835,37 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_misreported_field_wins_over_the_stdout_text() {
+    fn marker_evidence_from_the_stdout_is_never_masked_by_a_recorded_false() {
+        // A row written by the narrower ✖-only build records `misreported:
+        // Some(false)` for a file that printed an uncaught assertion, because
+        // that build could not see it. The stronger rule must still find it, or
+        // extending a detection rule would never apply to existing files.
         let mut recorded = row(
-            "parallel/test-x.js",
-            "  ✖ mentioned in a trace",
+            "parallel/test-crypto-keygen-rsa-pss.js",
+            "node:assert:16736: Uncaught AssertionError: mismatch",
             true,
             0,
             Some(false),
         );
         recorded.misreported = Some(false);
-        assert_eq!(recorded.outcome(), Outcome::Passed);
+        assert_eq!(recorded.outcome(), Outcome::Failed);
+        assert!(recorded.is_misreported_pass());
+    }
+
+    #[test]
+    fn a_recorded_marker_stands_even_when_the_head_was_truncated() {
+        // The converse: the full-stream scan saw a marker the retained head
+        // cannot show, so the recorded value is what preserves it.
+        let mut recorded = row(
+            "parallel/test-x.js",
+            "x".repeat(4096).as_str(),
+            true,
+            0,
+            None,
+        );
+        recorded.skipped = Some(false);
+        recorded.misreported = Some(true);
+        assert_eq!(recorded.outcome(), Outcome::Failed);
     }
 
     #[test]
@@ -678,6 +880,107 @@ mod tests {
             assert!(
                 scanner.result().reported_failure,
                 "missed the marker when split after byte {split}"
+            );
+        }
+    }
+
+    // --- the uncaught marker: the larger hollow-pass population --------------
+
+    /// Verbatim rustnode stdout for `test-crypto-keygen-rsa-pss.js`, captured by
+    /// running it directly: an assertion that escaped, printed to stdout, with
+    /// the process still exiting 0.
+    const UNCAUGHT_STDOUT: &str = "node:assert:16736: Uncaught AssertionError: The input did not match the regular expression /operation not supported for this keytype/. Input:\n\n'TypeError: method is not a function'\n";
+
+    #[test]
+    fn an_uncaught_assertion_on_stdout_is_a_failure() {
+        assert!(has_failure_marker(UNCAUGHT_STDOUT));
+
+        // The shapes observed across 9 real rows, all with the location prefix
+        // in front of the word.
+        for line in [
+            "node:assert:5579: Uncaught AssertionError: function should not have been called",
+            "node:internal/assert/utils:4640: Uncaught AssertionError: Expected values to be strictly equal:",
+            "/tmp/node-test/test/parallel/test-cli-node-options-disallowed.js:898: Uncaught TypeError: Cannot read properties of null",
+            "Uncaught AssertionError [ERR_ASSERTION]: plain mismatch",
+            "  Uncaught Error: indented",
+            "\u{1b}[31mUncaught AssertionError: colourised\u{1b}[39m",
+        ] {
+            assert!(has_failure_marker(line), "missed: {line}");
+        }
+    }
+
+    #[test]
+    fn the_uncaught_word_inside_data_is_not_a_failure() {
+        // A test that prints captured output or a diagnostic containing the word
+        // must not be demoted. These are the shapes a `contains` on the bare
+        // word would catch, and the location-prefix rule does not.
+        for line in [
+            "child stderr: Uncaught AssertionError: expected 1 to equal 2",
+            "stderr: Error: boom\nUncaughtException event fired",
+            "process.on('uncaughtException', handler)",
+            "note: an Uncaught error would appear here",
+            "assert.match(out, /Uncaught AssertionError/)",
+            "the child said 'Uncaught' and then exited",
+            "reUncaughtThing",
+            "UncaughtException",
+            "Uncaught",
+            "Uncaught AssertionError",
+        ] {
+            assert!(!has_failure_marker(line), "false positive on: {line}");
+        }
+    }
+
+    #[test]
+    fn a_location_prefix_is_what_separates_a_report_from_an_echo() {
+        // Both of these contain the same words; only one is the runtime
+        // reporting its own error.
+        assert!(has_failure_marker(
+            "node:assert:16736: Uncaught AssertionError: mismatch"
+        ));
+        assert!(!has_failure_marker(
+            "child stderr: Uncaught AssertionError: mismatch"
+        ));
+        // A bare report at column zero is also the runtime.
+        assert!(has_failure_marker(
+            "Uncaught AssertionError [ERR_ASSERTION]: x"
+        ));
+    }
+
+    #[test]
+    fn a_caught_assertion_is_not_an_uncaught_failure() {
+        // `assert.throws` and `try/catch` never print, so a passing file that
+        // exercises them must stay a pass. This is the false-positive direction
+        // the rule is most exposed to, so it is pinned end to end in the runner
+        // tests too; here it guards the scanner.
+        let caught = "caught ok\nPASS\n";
+        assert!(!has_failure_marker(caught));
+    }
+
+    #[test]
+    fn a_passing_row_with_only_an_uncaught_line_is_corrected_to_failed() {
+        let hollow = row(
+            "parallel/test-crypto-keygen-rsa-pss.js",
+            UNCAUGHT_STDOUT,
+            true,
+            0,
+            Some(false),
+        );
+        assert_eq!(hollow.outcome(), Outcome::Failed);
+        assert!(hollow.is_misreported_pass());
+    }
+
+    #[test]
+    fn the_uncaught_marker_is_found_across_every_chunk_split() {
+        let text = UNCAUGHT_STDOUT;
+        let bytes = text.as_bytes();
+        for split in 0..bytes.len() {
+            let mut scanner = MarkerScanner::new();
+            scanner.push(&bytes[..split]);
+            scanner.push(&bytes[split..]);
+            scanner.finish();
+            assert!(
+                scanner.result().reported_failure,
+                "missed the uncaught marker when split after byte {split}"
             );
         }
     }

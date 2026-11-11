@@ -66,6 +66,17 @@
     "stderr_head": ""
   },
   {
+    "file": "parallel/test-crypto-keygen-rsa-pss.js",
+    "suite": "parallel",
+    "passed": true,
+    "exit_code": 0,
+    "duration_ms": 240,
+    "timed_out": false,
+    "flags": [],
+    "stdout_head": "node:assert:16736: Uncaught AssertionError: The input did not match the regular expression /operation not supported for this keytype/. Input:\n\n'TypeError: method is not a function'\n",
+    "stderr_head": ""
+  },
+  {
     "file": "parallel/test-fs-open.js",
     "suite": "parallel",
     "passed": true,

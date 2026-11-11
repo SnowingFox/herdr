@@ -158,15 +158,31 @@ a line, and only after scanning the whole stdout stream rather than the
 truncated head, so a test that mentions the text in a message is not
 misclassified and a skip printed late is not missed.
 
-**A hollow pass** is a file that exited 0 while its own output announced a
-failing test. `test:summary` is never emitted, so the runtime never sets a
-non-zero exit code and the process reports success after an assertion failed.
-The same scan looks for the reporter's `✖` at the start of a line — after
-leading whitespace and ANSI colour escapes — and such a row counts as **failed**.
-`report` prints how many of the failures were corrected this way, so the number
-is auditable rather than silent. This is a rustnode-shaped rule: real Node writes
-TAP (`not ok 2 - ...`) when stdout is piped, and would not match. Switching
-rustnode to TAP output would disable this check until the marker is updated.
+**A hollow pass** is a file that exited 0 while its own output reported a failure.
+Two mechanisms produce this, from disjoint populations:
+
+- **`Uncaught AssertionError`** on stdout, from plain `assert` calls that escaped.
+  The uncaught-exception path never sets the exit code, so the process reports
+  success. Matched when `Uncaught` is followed by an error name and a colon and
+  is either at the start of the line or preceded by a `:<line-number>:`
+  location — that prefix is what distinguishes the runtime's own report from a
+  test echoing captured child output, which stays a pass. A caught assertion
+  (`assert.throws`, `try/catch`) prints nothing, so it is never involved.
+- **`✖`** on stdout, from `node:test` subtests. Matched at the start of a line
+  after leading whitespace and ANSI escapes.
+
+Both are matched in the same pass over the whole stdout stream, and such a row
+counts as **failed**. `report` prints how many of the failures were corrected
+this way, so the count is auditable rather than silent.
+
+The `✖` rule is **rustnode-shaped**: real Node writes TAP (`not ok 2 - ...`) when
+stdout is piped and would not match. Switching rustnode to TAP output would
+disable that half until the marker is updated; the `Uncaught` half is unaffected
+and carries most of the correction.
+
+Marker evidence is cumulative across builds: a recorded value is ORed with a scan
+of the row's recorded stdout, so a stronger rule still applies to result files
+written by an older, narrower build.
 
 The rate is **`passed / (passed + failed)`**. Skips are excluded from both
 sides, because a skipped file asserts nothing: counting it as a pass inflates

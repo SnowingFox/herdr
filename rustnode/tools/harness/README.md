@@ -63,30 +63,45 @@ excluded from either side. `passed + skipped + failed` always equals the total, 
 cluster with nothing judged prints `—` instead of a `0.0%` that would read as
 total failure, and the skipped files are listed so the exclusion is auditable.
 
-**A file can exit 0 while reporting a failed subtest.** `test:summary` is never
-emitted, so `harness.js`'s `if (!data.success) process.exitCode = ...` never runs
-and a file whose subtests failed can still exit 0. The runner scans the same
-stdout stream for a `✖` at the start of a line (after leading whitespace and ANSI
-colour escapes, because a test that sets `FORCE_COLOR` — rustnode's own
-`test-runner-reporters.js` does — indents it and wraps it in escapes). A row that
-exited 0 while its output announced a failure is counted as **failed**, and
-`report` says how many of the failures were this kind, so the correction is
-visible rather than silent. This is a correction, not a fourth column:
-`misreported` is always a subset of `failed`, and the three-way sum is unchanged.
+**A file can exit 0 while reporting a failure.** Two disjoint mechanisms do
+this, and both are detected from the same single scan of the whole stdout stream:
 
-The `✖` rule is deliberately **rustnode-shaped**. Real Node, with stdout piped as
-the harness always pipes it, writes TAP (`not ok 2 - inner fails`) and never that
-glyph. If rustnode switches to TAP output to match Node, this marker stops
-matching and the correction silently stops firing; the test
-`a_passing_row_that_reported_a_failing_subtest_is_corrected_to_failed` pins the
-rule so that switch has to deal with it. Precedence: a timeout is a failure, a
-skip outranks both (it said nothing ran), then a `passed` row is checked against
-the failure marker, then `passed` decides.
+| the file uses | the failure appears as |
+| --- | --- |
+| plain `assert` (most of `test/parallel`) | `node:assert:16736: Uncaught AssertionError: ...` |
+| `node:test` | `  ✖ inner fails` |
 
-Result rows written before either field existed still load. A missing field means
-"not recorded", and the row's recorded stdout is used to recover both answers, so
-historical runs reclassify instead of staying wrong forever. A recorded value
-always wins over the stdout text.
+- **`Uncaught`** is the larger population. An assertion that escapes is printed
+  to stdout and the process still exits 0, because the uncaught-exception path
+  never sets the exit code. On a 400-file `test/parallel` sample 9 files did this;
+  on the `test-crypto-key*`/`rsa*`/`ec*` family 16 of 31 harness-visible passes
+  did. The word sits behind a location prefix, so it is matched where `Uncaught`
+  is followed by an error name and a colon and is either at the start of the line
+  or preceded by a `:<line-number>:` location. That location is what separates
+  the runtime reporting its own error from a test echoing captured child output
+  (`child stderr: Uncaught AssertionError: ...`), which stays a pass. A caught
+  assertion — `assert.throws`, `try/catch` — prints nothing at all, so it is never
+  involved.
+- **`✖`** covers `node:test` files, which report failures as test results rather
+  than exceptions. It is matched at the start of a line after leading whitespace
+  and ANSI colour escapes, because a test that sets `FORCE_COLOR` (rustnode's own
+  `test-runner-reporters.js` does) colourises its own output even when stdout is a
+  pipe. This one is deliberately **rustnode-shaped**: real Node writes TAP
+  (`not ok 2 - ...`) when stdout is piped and would never match. If rustnode
+  switches to TAP output, this marker stops matching — the `Uncaught` rule is
+  unaffected, which is why it carries most of the correction.
+
+A row that exited 0 while reporting either kind of failure is counted as
+**failed**, and `report` says how many of the failures were corrected this way so
+the number is auditable rather than silent. This is a correction, not a fourth
+column: `misreported` is always a subset of `failed`, and
+`passed + skipped + failed == total` is unchanged.
+
+Marker evidence is cumulative across builds. A recorded `misreported` value is
+ORed with a scan of the row's recorded stdout rather than overriding it, so
+strengthening the rule still applies to result files written by an older,
+narrower build — which matters here, because the rule was extended once already
+and the first version would have masked every `Uncaught` row.
 
 **A run that measured something exits 0 even when nothing passes.** The number
 is the deliverable early on. Gate on `report` or on the result files, not on the

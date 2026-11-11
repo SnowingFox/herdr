@@ -686,6 +686,53 @@ mod tests {
     }
 
     #[test]
+    fn an_uncaught_assertion_on_stdout_with_exit_zero_is_a_failure() {
+        let tree = TempTree::new("uncaught");
+        let test = tree.script(
+            "test-uncaught.sh",
+            "printf 'node:assert:16736: Uncaught AssertionError: The input did not match\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.exit_code, Some(0));
+        assert!(result.passed, "the raw exit code is still a pass");
+        assert_eq!(result.misreported, Some(true));
+        assert_eq!(result.outcome(), crate::result::Outcome::Failed);
+    }
+
+    #[test]
+    fn a_test_that_catches_its_assertions_still_passes() {
+        let tree = TempTree::new("caught-assertion");
+        // `assert.throws` and `try/catch` are how a large part of test/parallel
+        // exercises error paths. If catching an assertion produced the marker,
+        // every one of those would be demoted, so this is the false-positive
+        // case that matters most.
+        let test = tree.script("test-caught.sh", "printf 'caught ok\\nPASS\\n'; exit 0\n");
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(result.outcome(), crate::result::Outcome::Passed);
+        assert_eq!(result.misreported, Some(false));
+    }
+
+    #[test]
+    fn assertion_text_printed_as_data_does_not_override_a_pass() {
+        let tree = TempTree::new("assertion-data");
+        // A test that prints captured child output which happens to contain the
+        // phrase, but in a shape the runtime never produces for its own error.
+        let test = tree.script(
+            "test-assertion-data.sh",
+            "printf 'child stderr: Uncaught AssertionError: expected 1 to equal 2\\n'; exit 0\n",
+        );
+        let config = shell_config(&tree);
+        let result = execute(&config, &config.working_dir(), "test", &test);
+        assert_eq!(
+            result.outcome(),
+            crate::result::Outcome::Passed,
+            "text after an arbitrary prefix is not the runtime's own report"
+        );
+    }
+
+    #[test]
     fn a_nonzero_exit_keeps_stderr() {
         let tree = TempTree::new("fail");
         let test = tree.script("test-fail.sh", "echo boom >&2; exit 3\n");

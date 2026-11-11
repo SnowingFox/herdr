@@ -102,10 +102,12 @@ if missing:
     print(f"FAIL: these recorded skips were not reported as skipped: {sorted(missing)}")
     sys.exit(1)
 
-# The two hollow passes: exited 0, output said a subtest failed.
+# The hollow passes: exited 0, output said a failure. Two mechanisms, and the
+# control must see both or it only guards half the rule.
 expected_misreported = {
-    "parallel/test-assert-deep.js",
-    "parallel/test-runner-reporters.js",
+    "parallel/test-assert-deep.js",          # reporter glyph ✖
+    "parallel/test-runner-reporters.js",     # reporter glyph ✖
+    "parallel/test-crypto-keygen-rsa-pss.js", # node:assert:16736: Uncaught ...
 }
 reported_misreported = {
     row["file"] for row in report["failures"] if row["misreported"]
@@ -123,8 +125,11 @@ if report["passed"] != 1:
 if report["skipped"] != 4:
     print(f"FAIL: expected 4 skips, got {report['skipped']}")
     sys.exit(1)
-if report["failed"] != 3:
-    print(f"FAIL: expected 3 failures, got {report['failed']}")
+if report["failed"] != 4:
+    print(f"FAIL: expected 4 failures, got {report['failed']}")
+    sys.exit(1)
+if report["misreported"] != 3:
+    print(f"FAIL: expected 3 corrected rows, got {report['misreported']}")
     sys.exit(1)
 if report["misreported"] > report["failed"]:
     print("FAIL: misreported must be a subset of failed")

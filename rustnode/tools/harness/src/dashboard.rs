@@ -795,7 +795,7 @@ mod tests {
         .expect("write");
 
         let tally = tally(&dir.0).expect("tally");
-        assert_eq!(tally.latest.len(), 8, "every row must parse");
+        assert_eq!(tally.latest.len(), 9, "every row must parse");
         let report = report(&tally, &dir.0);
 
         let expected = [
@@ -808,22 +808,18 @@ mod tests {
         assert_eq!(reported, expected, "all four rows must be skips");
 
         assert_eq!(report.skipped, 4);
-        // test-fs-open.js is the only clean pass; the two hollow passes and the
+        // test-fs-open.js is the only clean pass; the three hollow passes and the
         // one real failure are all failures.
         assert_eq!(report.passed, 1, "only test-fs-open.js really passed");
-        assert_eq!(report.failed, 3);
+        assert_eq!(report.failed, 4);
         assert_eq!(
-            report.misreported, 2,
-            "two rows exited 0 but reported failure"
+            report.misreported, 3,
+            "two rows printed the reporter glyph, one an uncaught assertion"
         );
-        assert_eq!(report.total, 8);
-        assert_eq!(report.passed + report.skipped + report.failed, 8);
-        // 1 of 4 judged files pass. The old harness said 7 of 8 (87.5%).
-        assert!(
-            (report.rate - 0.25).abs() < 1e-9,
-            "rate was {}",
-            report.rate
-        );
+        assert_eq!(report.total, 9);
+        assert_eq!(report.passed + report.skipped + report.failed, 9);
+        // 1 of 5 judged files pass. The old harness said 8 of 9 (88.9%).
+        assert!((report.rate - 0.2).abs() < 1e-9, "rate was {}", report.rate);
 
         assert_eq!(report.skips[0].reason, "Windows specific test.");
         assert_eq!(report.skips[2].reason, "no IPv6 support");
@@ -838,6 +834,7 @@ mod tests {
             corrected,
             vec![
                 "parallel/test-assert-deep.js",
+                "parallel/test-crypto-keygen-rsa-pss.js",
                 "parallel/test-runner-reporters.js"
             ]
         );
