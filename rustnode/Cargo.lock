@@ -853,6 +853,7 @@ dependencies = [
  "libc",
  "rn-bind-uv",
  "rn-core",
+ "rn-permission",
  "rn-v8-sys",
  "serde_json",
 ]

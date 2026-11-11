@@ -254,6 +254,18 @@ fn getaddrinfo(
         return;
     }
 
+    // `GetAddrInfo` checks the `net` scope on the hostname before it looks
+    // anything up, and a denial is delivered through the ordinary completion
+    // rather than returned: `ERR_ACCESS_DENIED_IF_INSUFFICIENT_PERMISSIONS` sets
+    // the return value to the error for the callback path, and `dns.lookup`
+    // passes an IP literal through without reaching here at all, which is why
+    // `dns.lookup('127.0.0.1')` still works under a bare `--permission`.
+    if let Some(denied) = rn_permission::runtime::deny_net(&hostname) {
+        deliver::deliver(scope, request, Payload::PermissionDenied(denied));
+        rv.set(v8::Integer::new(scope, 0).into());
+        return;
+    }
+
     match sys::getaddrinfo(&hostname, family, hints, order) {
         Ok(addresses) => {
             let Some(array) = string_array(scope, &addresses) else {
@@ -304,6 +316,14 @@ fn getnameinfo(
         return;
     };
     let parsed: SocketAddr = parsed.with_port(port);
+
+    // `GetNameInfo` delivers the denial as the `oncomplete` error object;
+    // `dns.lookupService` reads `err.code` from it.
+    if let Some(denied) = rn_permission::runtime::deny_net(&address) {
+        deliver::deliver(scope, request, Payload::PermissionDenied(denied));
+        rv.set(v8::Integer::new(scope, 0).into());
+        return;
+    }
 
     match sys::getnameinfo(&parsed) {
         Ok((hostname, service)) => {
@@ -704,6 +724,13 @@ fn get_host_by_addr(
         rv.set(v8::Integer::new(scope, channel::code::EBADNAME).into());
         return;
     };
+    // `ReverseTraits::Send` denies a `net` denial through the query completion,
+    // naming the address rather than the reverse name.
+    if let Some(denied) = rn_permission::runtime::deny_net(&address) {
+        deliver::deliver(scope, request, Payload::PermissionDenied(denied));
+        rv.set(v8::Integer::new(scope, 0).into());
+        return;
+    }
     respond_with_query(scope, &args, &mut rv, request, &name, RecordType::Ptr);
 }
 
@@ -718,6 +745,13 @@ fn run_query(
         return;
     };
     let name = args.get(1).to_rust_string_lossy(scope);
+    // `QueryTraits::Send` gates every record query on the `net` scope and
+    // reports the denial through the completion.
+    if let Some(denied) = rn_permission::runtime::deny_net(&name) {
+        deliver::deliver(scope, request, Payload::PermissionDenied(denied));
+        rv.set(v8::Integer::new(scope, 0).into());
+        return;
+    }
     respond_with_query(scope, args, rv, request, &name, rtype);
 }
 

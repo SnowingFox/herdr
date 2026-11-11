@@ -172,7 +172,7 @@ pub(crate) fn dlopen(
         );
         return;
     }
-    if let Some(denied) = rn_permission::runtime::deny_addon("") {
+    if let Some(denied) = rn_permission::runtime::check_addon(scope, "") {
         denied.throw(scope);
         return;
     }

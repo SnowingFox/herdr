@@ -45,6 +45,21 @@ fn main() {
     }
     rn_permission::runtime::install_shared(options.permission.clone());
 
+    // `Environment::Initialize` records the IPC channel's descriptor from
+    // `NODE_CHANNEL_FD` before any JavaScript runs, so that a later change to the
+    // environment cannot change which descriptor counts as the channel. The
+    // `net` scope exempts that descriptor, because a fork or cluster child is
+    // handed the channel rather than opening it; without the record,
+    // `setupChildProcessIpcChannel()`'s `Pipe.open(fd)` would be denied under a
+    // bare `--permission` and the child would fail during pre-execution.
+    if let Ok(channel) = std::env::var("NODE_CHANNEL_FD") {
+        if let Ok(fd) = channel.trim().parse::<i32>() {
+            if fd >= 0 {
+                rn_permission::runtime::set_ipc_channel_fd(fd);
+            }
+        }
+    }
+
     // `--allow-env` is enforced by removing everything it does not grant, not by
     // checking a read later: the environment block is read directly by every C
     // library and inherited by every child process, so there is no call to hook.

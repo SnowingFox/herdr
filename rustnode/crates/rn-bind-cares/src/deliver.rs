@@ -15,6 +15,7 @@
 //! process instead of the threadpool, which is the same trade `rn-bind-fs` makes
 //! and is recorded in the crate README.
 
+use rn_permission::AccessDeniedError;
 use rn_v8_sys::v8;
 
 use crate::sys::LookupError;
@@ -33,6 +34,15 @@ pub(crate) enum Payload<'s> {
     /// array (`queryCname`, `querySoa`, and the plain-string queries), which is
     /// why the third argument is optional rather than always present.
     Query(QueryPayload<'s>),
+    /// A denied `net` check: the `oncomplete` call receives the
+    /// `ERR_ACCESS_DENIED` error object as its only argument.
+    ///
+    /// That is `SET_INSUFFICIENT_PERMISSION_ERROR_CALLBACK`, which does
+    /// `MakeCallback(oncomplete, 1, &arg)` with the error rather than a status —
+    /// so `lib/dns.js`'s `if (errCode)` branch reads `err.code` off the object
+    /// itself, which is why a status code here would produce
+    /// `Cannot read properties of null (reading 'code')`.
+    PermissionDenied(AccessDeniedError),
 }
 
 /// The three arguments a `QueryReqWrap.oncomplete` call receives.
@@ -53,6 +63,7 @@ enum Rooted {
     Addresses(Result<v8::Global<v8::Array>, i32>),
     NameInfo(Result<(v8::Global<v8::String>, v8::Global<v8::String>), i32>),
     Query(RootedQuery),
+    PermissionDenied(AccessDeniedError),
 }
 
 enum RootedQuery {
@@ -76,6 +87,7 @@ fn root<'s>(scope: &mut v8::PinScope<'s, '_>, payload: Payload<'s>) -> Rooted {
             Rooted::Addresses(Ok(v8::Global::new(scope.as_ref(), addresses)))
         }
         Payload::Addresses(Err(error)) => Rooted::Addresses(Err(error.0)),
+        Payload::PermissionDenied(denied) => Rooted::PermissionDenied(denied),
         Payload::NameInfo(Ok((hostname, service))) => Rooted::NameInfo(Ok((
             v8::Global::new(scope.as_ref(), hostname),
             v8::Global::new(scope.as_ref(), service),
@@ -189,6 +201,9 @@ fn trampoline(
             v8::Integer::new(scope, status).into(),
             v8::null(scope).into(),
         ],
+        // `MakeCallback(oncomplete, 1, &arg)`: the error object is the only
+        // argument. `lib/dns.js` reads `err.code` off it directly.
+        Rooted::PermissionDenied(denied) => vec![denied.to_value(scope)],
     };
 
     // `this` is the request object, matching `req_wrap->MakeCallback(...)`.

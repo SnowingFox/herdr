@@ -10,6 +10,11 @@ description = "internalBinding('cares_wrap') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+# `getaddrinfo`, `getnameinfo`, `getHostByAddr` and the `query*` methods all
+# check the `net` scope, because a DNS lookup is network access. The denial is
+# delivered to `oncomplete` as the error object, which is what
+# `SET_INSUFFICIENT_PERMISSION_ERROR_CALLBACK` does.
+rn-permission = { path = "../rn-permission" }
 libc.workspace = true
 
 [dev-dependencies]

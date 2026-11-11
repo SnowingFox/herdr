@@ -251,23 +251,19 @@ const PERMISSION_BOOLEAN_GRANTS: &[&str] = &[
 /// * `--allow-natives-syntax` — forwarded to V8, so `%DebugPrint` and the other
 ///   natives intrinsics parse instead of throwing `SyntaxError`.
 ///
-/// `--permission` was the fourth. It is still here, and the reason is worth
-/// stating precisely, because most of the model now works: `fs.read`,
-/// `fs.write`, `child` and `env` are enforced, but `net` is not — `tcp_wrap`,
-/// `udp_wrap` and `pipe_wrap` have no `kNet` check yet, so
-/// `server.listen()` succeeds under `--permission`. A process that believes it
-/// has denied the network but has not is the exact failure this list exists to
-/// prevent, so the flag keeps its warning until that lands. `worker`, `addon`,
-/// `wasi`, `inspector`, `ffi` and `openssl.store` are unenforced too, but for a
-/// different reason: this build has no `Worker` constructor, addon loader, WASI
-/// implementation, inspector or FFI surface to gate at all.
+/// `--permission` was the fourth. It has now left the list too: `fs.read`,
+/// `fs.write`, `child`, `env`, `net` and `addon` are all enforced, which is the
+/// set this build has a surface for. `worker` is still unenforced but gated on
+/// the unmerged worker_threads branch, `inspector` has its own change open, and
+/// `wasi`, `ffi` and `openssl.store` have no implementation to gate at all —
+/// `new WASI()` already fails on the missing `wasi` binding rather than on a
+/// permission, so a permission warning over it would name the wrong cause.
 const UNIMPLEMENTED: &[&str] = &[
     "--experimental-network-inspection",
     "--experimental-shadow-realm",
     "--experimental-vm-modules",
     "--experimental-web-worker",
     "--js-source-phase-imports",
-    "--permission",
 ];
 
 /// Experimental flags whose behaviour *is* implemented.
@@ -671,19 +667,22 @@ mod tests {
 
     #[test]
     fn permission_grants_are_not_reported_unimplemented() {
-        // `net` is the one scope this build cannot enforce yet, so
-        // `--permission` itself keeps its warning; the grants must not add any.
+        // Every scope this build has a surface for is now enforced, so
+        // `--permission` and its grants must all leave the list empty. A grant
+        // in it would be a warning that is no longer true.
         let options = parse_of(&[
             "--permission",
             "--allow-fs-read=/tmp",
             "--allow-fs-write=/tmp",
             "--allow-child-process",
             "--allow-env=A",
+            "--allow-net",
+            "--allow-addons",
             "-e",
             "1",
         ])
         .expect("parses");
-        assert_eq!(options.unimplemented, ["--permission"]);
+        assert!(options.unimplemented.is_empty(), "{:?}", options.unimplemented);
     }
 
     #[test]
