@@ -1,9 +1,18 @@
 //! The `node:`-scheme branch of `require()` must ask the builtin allow-list.
 //!
 //! `realm.js` keeps every option-gated builtin in `builtinModulePolicies` and
-//! exposes an entry only when its option is true, which is what
-//! `allow_option_gated_builtins` applies from the parsed command line. That
-//! builds the allow-list; the `node:` resolution branch is what enforces it.
+//! exposes an entry only when its option is true, which
+//! `BuiltinModule.allowOptionGatedBuiltins(getOptionValue)` applies from the
+//! parsed command line. That builds the allow-list; the `node:` resolution
+//! branch is what enforces it.
+//!
+//! It is applied exactly once, by Node's own
+//! `prepareMainThreadExecution` (`setupOptionGatedBuiltins()` at
+//! `internal/process/pre_execution.js:121`), which `rn_realm::prepare_execution`
+//! invokes. An earlier duplicate call in `main.rs` applied it a second time
+//! before pre-execution; nothing between the two needed a gated builtin, so it
+//! was removed rather than kept as harmless. These tests therefore cover the
+//! single Node-shaped call.
 //!
 //! rustnode used to route a `node:` id to the realm's *internal* loader, which
 //! has no allow-list by design — Node's own internals require gated modules at

@@ -169,39 +169,132 @@ The accessor kept its old signature, `fn store() -> Option<Store>`, and gained a
 PROCESS_STORE.get()?.lock().ok().map(|store| store.clone())
 ```
 
-A `Store` holds 251 `(String, ParsedValue)` entries, so every lookup deep-cloned
-the entire table. `values::cli_values()` calls `value_of` **once per option** to
-build the list `getCLIOptionsValues()` returns, so one call did 251 clones of
-251 entries. Startup calls it twice — once through
-`BuiltinModule.allowOptionGatedBuiltins`, once through
-`prepareMainThreadExecution` — which measured as 2.6 ms + 2.5 ms.
+### The numbers that matter, and the two that are easy to confuse
 
-The phase report named it directly: `allow_option_gated_builtins` went from
-0.33 ms to 2.90 ms and `prepare_execution` from 1.18 ms to 3.85 ms across the
-`#26` boundary, while every other phase was flat.
+The option **table** has **251** entries. The **store** holds **217** of them:
+`ParsedValue::default_of` returns `None` for `kNoOp` and `kV8Option`, which have
+no field in Node either, and the table contains 19 + 15 = 34 such entries
+(`DefaultValue::Undefined` appears exactly 34 times, the same count from the
+other side). Both numbers are correct about different things.
 
-The fix hands back an `Arc<Store>` instead of a `Store`, so both lookups observe
-one allocation. `Arc` rather than `Rc` because the process-wide slot is a
-`static`. Worker inheritance is unchanged, and
+So one `getCLIOptionsValues()` call did **251 lookups, each deep-cloning a
+217-entry vector** — about 54,500 `(String, ParsedValue)` pair clones. Writing
+"251 clones of 251 entries" is off by 34 and is the kind of figure that gets
+quoted, so `a_parsed_store_holds_only_the_options_that_have_a_default` in
+`rn-bind-options` pins the 217 *derived from the table* rather than as a
+literal: adding an option keeps the test honest.
+
+### It was called twice, and only one of those calls was Node's
+
+Startup built the list twice, measured as 2.6 ms + 2.5 ms. Two separate causes,
+both worth stating plainly because the original code and an earlier draft of
+this document presented the pair as if it were Node's own arrangement:
+
+1. **`main.rs` applied the allow-list a second time.** It called
+   `allow_option_gated_builtins` before pre-execution, with the comment
+   "rustnode does not run `pre_execution.js`". That is false: `prepare_execution`
+   invokes `prepareMainThreadExecution`, whose `prepareExecution` calls
+   `setupOptionGatedBuiltins()` at `internal/process/pre_execution.js:121` —
+   which *is* `BuiltinModule.allowOptionGatedBuiltins(getOptionValue)`. Node
+   applies it once, from inside pre-execution; rustnode applied it twice.
+   Nothing between the two calls needs a gated builtin: `install_early_globals`
+   reaches only `buffer`, `encoding`, `worker/js_transferable`, `async_hooks` and
+   `util`, and `install_cjs_loader` only `modules/cjs/loader`; workers likewise
+   call `install_early_globals` and never the allow-list. The duplicate call is
+   **removed**, along with the now-dead `rn_realm::allow_option_gated_builtins`,
+   so rustnode now does it the way Node does.
+2. **`prepareExecution` deliberately clears the memo.** `getCLIOptionsValues()`
+   is memoized in `internal/options.js:33` (`optionsDict ??=`), but the first
+   read happens earlier, from the CJS loader's `initializeCJS` →
+   `initializeCjsConditions` → `getOptionValue('--conditions')`. Then
+   `prepareExecution` calls `refreshRuntimeOptions()` →
+   `refreshOptions()`, which sets `optionsDict = undefined`, so the next read
+   rebuilds. Captured stacks, in order:
+
+   ```text
+   #1  getCLIOptionsFromBinding  node:internal/options:34
+       getOptionValue           node:internal/options:202
+       initializeCjsConditions  node:internal/modules/helpers:220
+       initializeCJS            node:internal/modules/cjs/loader:513
+
+   #2  getCLIOptionsFromBinding  node:internal/options:34
+       getOptionValue           node:internal/options:202
+       addReadOnlyProcessAlias  node:internal/process/pre_execution:427
+       patchProcessObject       node:internal/process/pre_execution:409
+       prepareExecution         node:internal/process/pre_execution:115
+   ```
+
+   This is **not** two module instances: `require('internal/options')` is the
+   same object through both loaders and `getOptionValue` is the same function,
+   which was checked directly rather than assumed. It is one instance whose
+   cache is invalidated on purpose. Node's ordering differs: it calls
+   `refreshRuntimeOptions()` *before* `initializeModuleLoaders` (which is what
+   reaches `initializeCJS`), so Node refreshes an unpopulated memo and its one
+   later read builds once. rustnode reaches `initializeCJS` from
+   `install_cjs_loader` before `prepare_execution`, so the refresh discards a
+   real value. That ordering is a genuine divergence from Node and is left
+   alone here: after the `Arc` fix it costs 0.08 ms.
+
+### The fix
+
+Hand back an `Arc<Store>` instead of a `Store`, so every lookup observes one
+allocation. `Arc` rather than `Rc` because the process-wide slot is a `static`.
+Worker inheritance is unchanged, and
 `a_worker_reads_the_option_values_this_process_was_started_with` in
 `rn-cli/tests/m0_foundation.rs` pins it: it reads `--strip-types`, a value the
 runtime *corrects* rather than parses, so a worker that fell back to a fresh
 copy of the table would report `true`.
 
-Measured on one machine in one session, both binaries interleaved in a single
-batch, 80 runs each, `-e ''`, release build:
+The phase report named both: `allow_option_gated_builtins` went from 0.33 ms to
+2.90 ms and `prepare_execution` from 1.18 ms to 3.85 ms across the `#26`
+boundary, while every other phase was flat.
 
-| binary | median | min | p25 | vs node |
-| --- | --- | --- | --- | --- |
-| node | 22.10 ms | 18.50 ms | 20.59 ms | — |
-| before `#26` (`05c691b2`) | 28.32 ms | 25.62 ms | 27.41 ms | 0.78x |
-| master `c236ee9c` | 33.11 ms | 30.19 ms | 32.22 ms | 0.67x |
-| master + this fix | 27.43 ms | 24.80 ms | 26.67 ms | 0.81x |
+Measured on one machine in one session, all binaries interleaved in a single
+batch, 100 runs each, `-e ''`, release build. Absolute milliseconds drift
+between batches on this machine, so the *difference* is the number to read; a
+second 80-run batch is quoted below it.
 
-The fix recovers 5.4–5.7 ms depending on the batch, which is the whole
-regression and slightly more (the residual difference against `05c691b2` is
-inside this machine's spread). It does **not** close the remaining ~5.5 ms gap
-to node; that is separate work.
+| binary | median | min | p25 | p75 | vs node |
+| --- | --- | --- | --- | --- | --- |
+| node | 18.99 ms | 16.33 ms | 18.13 ms | 20.15 ms | — |
+| before `#26` (`05c691b2`) | 24.99 ms | 22.31 ms | 24.35 ms | 25.92 ms | 0.76x |
+| master `c236ee9c` | 29.51 ms | 26.99 ms | 28.86 ms | 30.76 ms | 0.64x |
+| master + this change | 24.92 ms | 21.84 ms | 24.09 ms | 25.50 ms | 0.76x |
+
+A second batch, 80 runs each, on the same binaries' predecessors gave
+node 21.08 / `05c691b2` 27.21 / master 32.20 / changed 27.05 ms. So the recovery
+is **4.6–5.7 ms** across three batches, which is the whole regression; the
+leftover difference against `05c691b2` sits inside this machine's spread.
+
+Removing the duplicate allow-list call is worth only **~0.2 ms** at the median
+once the `Arc` fix has made the lookups cheap: measured across 80 interleaved
+runs, the `Arc` fix alone gave 27.28 ms and `Arc` + removal gave 27.05 ms
+(medians), which is inside one p25-to-p75 band. Before the `Arc` fix the same
+duplicate was ~2.9 ms, because it was a second full O(n²) build — so the removal
+is worth stating as "it was expensive only while lookups cloned, and it is gone
+because it was Node's call made twice rather than because it is now the
+bottleneck." This does **not** close the remaining ~6 ms gap to node; that is
+separate work.
+
+### Phase medians on this head
+
+`RN_PROFILE_PHASES=1`, 40 runs, median `delta` per phase, from the shipped
+binary:
+
+```text
+primordials                    3.29 ms
+realm.js executed              2.53 ms
+install_early_globals          5.21 ms
+install_cjs_loader             2.95 ms
+install_stdio + console        1.44 ms
+prepare_execution              1.24 ms
+```
+
+`prepare_execution` is the single Node-shaped application of the allow-list, and
+there is no longer an `allow_option_gated_builtins` mark because there is no
+longer a call before pre-execution. The duplication was already cheap after the
+`Arc` fix; it is gone because it was Node's call made twice, not because it was
+the expensive part.
 
 ## What is left (continued)
 

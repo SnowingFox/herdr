@@ -298,23 +298,31 @@ fn main() {
             // can resolve a specifier; Node's user-land loader does that, and
             // this stands in for it until `contextify` unblocks the real one.
             bootstrap::wrap_require_with_scheme_support(scope, &loaders);
-            // `realm.js` keeps every option-gated builtin in
-            // `builtinModulePolicies` and exposes an entry only when its option
-            // is truthy, which Node applies in
-            // `internal/process/pre_execution.js:488`. rustnode does not run
-            // `pre_execution.js`, so this applies the same call with the same
-            // `getOptionValue`.
+            // The option-gated builtin allow-list (`quic`, `dtls`, `sqlite`,
+            // `bench`, `vfs`, ...) is applied exactly once, by Node's own
+            // `prepareMainThreadExecution` below: `prepareExecution` calls
+            // `setupOptionGatedBuiltins()` at
+            // `internal/process/pre_execution.js:121`, which is
+            // `BuiltinModule.allowOptionGatedBuiltins(getOptionValue)`.
             //
-            // This builds the allow-list; the `require('node:...')` boundary is
-            // what enforces it. That boundary is the vendored CJS loader's
-            // `BuiltinModule.normalizeRequirableId`, which is why
-            // `install_cjs_loader` below must keep the global `require` sending
-            // every `node:` id through the file loader. Routing the scheme
-            // branch to the realm loader instead skipped that check and loaded
-            // `quic`, `dtls` and `bench` even though `canBeRequiredByUsers`
-            // reports false for them.
-            bootstrap::allow_option_gated_builtins(scope, &loaders);
-            rn_core::profile::mark("allow_option_gated_builtins");
+            // This used to also call `allowOptionGatedBuiltins` here, on the
+            // stated belief that "rustnode does not run `pre_execution.js`". It
+            // does — `prepare_execution` invokes `prepareMainThreadExecution` —
+            // so Node applied the call once and rustnode applied it twice, and
+            // nothing between the two calls needs a gated builtin:
+            // `install_early_globals` reaches only `buffer`, `encoding`,
+            // `worker/js_transferable`, `async_hooks` and `util`, and
+            // `install_cjs_loader` only `modules/cjs/loader`. Both the suite and
+            // the worker path behave identically without it, so the second
+            // application was pure cost and is gone.
+            //
+            // The `require('node:...')` boundary is what *enforces* the list:
+            // the vendored CJS loader's `BuiltinModule.normalizeRequirableId`,
+            // which is why `install_cjs_loader` below must keep the global
+            // `require` sending every `node:` id through the file loader.
+            // Routing the scheme branch to the realm loader instead skipped that
+            // check and loaded `quic`, `dtls` and `bench` even though
+            // `canBeRequiredByUsers` reports false for them.
             bootstrap::install_early_globals(scope, &loaders);
             rn_core::profile::mark("install_early_globals");
             // The CommonJS loader turns `require` from a builtin lookup into a

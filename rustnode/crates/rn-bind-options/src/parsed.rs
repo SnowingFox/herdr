@@ -223,6 +223,27 @@ impl Store {
             .map(|(_, value)| value.clone())
     }
 
+    /// How many entries the store holds.
+    ///
+    /// Not `OPTIONS.len()`: `ParsedValue::default_of` returns `None` for
+    /// `kNoOp` and `kV8Option`, which have no field in Node either, so those
+    /// options never enter the store. The difference is what makes "the table
+    /// has 251 entries" and "the store has 217" both true at once, and getting
+    /// it wrong puts a wrong number in a doc that gets quoted.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Whether the store holds no entries.
+    ///
+    /// Always false for a parsed store — every table option with a default is
+    /// present — but `len` without `is_empty` is not a clippy-clean pair.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
     /// Walks `argv` the way `OptionsParser<Options>::Parse` does.
     ///
     /// Synthetic arguments from an alias expansion are prepended to a queue of
@@ -815,6 +836,50 @@ mod tests {
         );
     }
 
+    /// The store's size is the options that *have* a default, not the table's.
+    ///
+    /// `OPTIONS.len()` is 251, but `ParsedValue::default_of` returns `None` for
+    /// `kNoOp` and `kV8Option` — they have no field in Node either — so a parsed
+    /// store holds 217. Both numbers are correct about different things, and
+    /// confusing them is how "251 clones of 251 entries" got written into a doc.
+    ///
+    /// The expectation is derived from the table rather than written as 217, so
+    /// adding an option keeps this honest instead of requiring an edit here.
+    #[test]
+    fn a_parsed_store_holds_only_the_options_that_have_a_default() {
+        let expected = OPTIONS
+            .iter()
+            .filter(|option| ParsedValue::default_of(option).is_some())
+            .count();
+        let store = parsed(&[]);
+
+        assert_eq!(
+            store.len(),
+            expected,
+            "a parsed store must hold one entry per option that has a default"
+        );
+        assert!(
+            expected < OPTIONS.len(),
+            "the table must still contain options with no default, or this test \
+             is no longer measuring the distinction it exists for"
+        );
+
+        // The same count from the other side: `kNoOp` and `kV8Option` are
+        // exactly the kinds `default_of` skips.
+        let no_default = OPTIONS
+            .iter()
+            .filter(|option| {
+                matches!(option.kind, kind::NO_OP | kind::V8_OPTION)
+                    || matches!(option.default, DefaultValue::Undefined)
+            })
+            .count();
+        assert_eq!(
+            OPTIONS.len() - expected,
+            no_default,
+            "the options missing from the store must be the ones with no field"
+        );
+    }
+
     /// `all_values` must keep reporting every parsed entry.
     ///
     /// Its caller is `getCLIOptionsValues`, whose whole contract is the parsed
@@ -823,7 +888,7 @@ mod tests {
     #[test]
     fn all_values_still_reports_every_parsed_entry() {
         let store = parsed(&["--experimental-bench"]);
-        let expected = store.values.len();
+        let expected = store.len();
         assert!(expected > 0, "a parsed store is not empty");
         install_for_this_thread_only(store);
 
