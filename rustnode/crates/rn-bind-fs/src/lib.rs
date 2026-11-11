@@ -27,6 +27,7 @@ pub mod dirent;
 pub mod error;
 pub mod flags;
 pub mod fsops;
+pub mod permission;
 pub mod request;
 pub mod stats;
 

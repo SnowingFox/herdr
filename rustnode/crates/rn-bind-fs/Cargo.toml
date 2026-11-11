@@ -9,5 +9,6 @@ description = "internalBinding('fs') for rustnode"
 
 [dependencies]
 rn-core.workspace = true
+rn-permission = { path = "../rn-permission" }
 rn-v8-sys.workspace = true
 libc.workspace = true

@@ -14,12 +14,13 @@ pub mod error;
 pub mod handle;
 pub mod hook_slot;
 pub mod host_object;
+pub mod native_immediates;
 pub mod queue;
 pub mod symbol;
 
 pub use abi::{BindingModule, InstallCtx};
 pub use aliased_buffer::{AliasedUint8Array, Element};
-pub use async_wrap::AsyncIds;
+pub use async_wrap::{AsyncIds, AsyncWrapState, INVALID_ASYNC_ID};
 pub use binding::{BindingRegistry, Installer, Namespace};
 pub use codec::Encoding;
 pub use env::Env;

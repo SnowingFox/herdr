@@ -88,6 +88,19 @@ impl TcpHandle {
         })
     }
 
+    /// The provider `src/tcp_wrap.cc` selects from the socket type.
+    ///
+    /// `TCPWrap::New` maps `SOCKET` to `PROVIDER_TCPWRAP` and `SERVER` to
+    /// `PROVIDER_TCPSERVERWRAP` before the constructor runs, so the kind is
+    /// answerable from `getProviderType()` before any reset.
+    pub fn provider(kind: i32) -> u32 {
+        if kind == crate::SERVER {
+            rn_core::async_wrap::PROVIDER_TCPSERVERWRAP
+        } else {
+            rn_core::async_wrap::PROVIDER_TCPWRAP
+        }
+    }
+
     /// The `uv_stream_t` a stream operation takes.
     pub fn stream(&self) -> *mut uv::uv_stream_t {
         self.state.stream
@@ -98,7 +111,17 @@ impl TcpHandle {
 ///
 /// This is the address a method needs; callers that want a borrow use
 /// [`with_handle`].
+///
+/// The internal-field count is checked first because V8 aborts in debug builds
+/// and reads out-of-bounds memory in release builds when a field outside the
+/// object's range is asked for. That check is what
+/// `BaseObject::FromJSObject` performs before it casts, so it is also what
+/// makes `ASSIGN_OR_RETURN_UNWRAP` answer `UV_EBADF` for a receiver that is not
+/// a handle instead of crashing.
 pub fn raw_handle(object: v8::Local<v8::Object>) -> Option<*mut TcpHandle> {
+    if object.internal_field_count() <= HANDLE_FIELD as usize {
+        return None;
+    }
     // SAFETY: the field only ever holds a pointer produced by `install`, and the
     // object is a live local so the allocation has not been freed.
     let pointer = unsafe { object.get_aligned_pointer_from_internal_field(HANDLE_FIELD, 0) }
@@ -212,6 +235,30 @@ pub fn constructor<'s>(
         (
             "getAsyncId",
             v8::FunctionTemplate::builder(crate::methods::get_async_id)
+                .length(0)
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .build(scope),
+        ),
+        // `AsyncWrap::AsyncReset` and `AsyncWrap::GetProviderType`, which
+        // `lib/internal/http/agent.js::asyncResetHandle` needs before it will
+        // reset a pooled socket:
+        //
+        //     if (handle && typeof handle.asyncReset === 'function')
+        //       handle.asyncReset(new ReusedHandle(handle.getProviderType(), handle))
+        //
+        // A missing `asyncReset` is not an error there — the branch is simply
+        // skipped — so without these two the reused socket keeps the previous
+        // request's id and `socket[async_id_symbol]` stays `-1`.
+        (
+            "asyncReset",
+            v8::FunctionTemplate::builder(crate::methods::async_reset)
+                .length(1)
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .build(scope),
+        ),
+        (
+            "getProviderType",
+            v8::FunctionTemplate::builder(crate::methods::get_provider_type)
                 .length(0)
                 .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
@@ -495,9 +542,21 @@ fn new(
         return;
     };
     handle.kind = kind;
+    // `TCPWrap::New` picks the provider from the socket type *before* the
+    // constructor body runs, and `ConnectionWrap`'s base `AsyncWrap(env, object,
+    // provider)` then calls `AsyncReset(object)`. That reset is what allocates
+    // the handle's first async id and emits its first `init`, so a socket is
+    // traceable from construction rather than from its first reset.
+    handle.state.async_wrap = rn_core::AsyncWrapState::uninitialised(TcpHandle::provider(kind));
 
     let object = args.this();
     install(scope, object, handle, args);
+    // The initial reset runs after `install` so the object already carries its
+    // native state: `emitInitNative` calls into JavaScript, and a hook that
+    // reads `handle.getAsyncId()` would otherwise reach an uninstalled handle.
+    crate::handle::with_handle(object, |handle| {
+        rn_bind_async_wrap::async_reset(scope, &mut handle.state.async_wrap, object, object, None);
+    });
 
     // The defaults `src/tcp_wrap.cc` pre-creates. Setting them here as well as on
     // the instance template is what makes them observable: `lib/net.js` reads

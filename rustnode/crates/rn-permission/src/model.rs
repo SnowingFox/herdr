@@ -312,7 +312,12 @@ impl EnvScope {
         if self.drop_all {
             return false;
         }
-        self.allow_all
+        // `IsRuntimeEnvironmentDefault(param)` comes before the granted
+        // patterns in the C++: the variables Node itself reads stay readable
+        // whatever `--allow-env` says, which is what makes `TZ` and `PATH`
+        // answer `true` under a bare `--permission`.
+        crate::env::is_runtime_default(name)
+            || self.allow_all
             || self
                 .patterns
                 .iter()
@@ -322,7 +327,7 @@ impl EnvScope {
 
 /// `EnvNameMatchesPattern`: `*`, an exact name, or a prefix followed by `*`.
 /// Names are case-insensitive on Windows, where environment names are.
-fn env_name_matches(pattern: &str, name: &str) -> bool {
+pub fn env_name_matches(pattern: &str, name: &str) -> bool {
     let (pattern, name) = if cfg!(windows) {
         (pattern.to_ascii_uppercase(), name.to_ascii_uppercase())
     } else {
@@ -334,7 +339,10 @@ fn env_name_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-fn normalize_env_name(name: &str) -> String {
+/// The key under which a name is stored in the dropped and warned sets.
+///
+/// Case-insensitive on Windows, where environment variable names are.
+pub fn normalize_env_name(name: &str) -> String {
     if cfg!(windows) {
         name.to_ascii_uppercase()
     } else {
@@ -785,29 +793,47 @@ impl PermissionModel {
     /// The only work when the model is disabled is a boolean load; when it is
     /// enabled the path is resolved lexically and looked up in the tree.
     pub fn check_fs_read(&self, path: &str) -> Result<(), AccessDenied> {
-        self.check_fs(path, PermissionScope::FileSystemRead)
+        self.check_fs(path.as_bytes(), PermissionScope::FileSystemRead)
     }
 
     /// Checks a filesystem write.
     pub fn check_fs_write(&self, path: &str) -> Result<(), AccessDenied> {
+        self.check_fs(path.as_bytes(), PermissionScope::FileSystemWrite)
+    }
+
+    /// [`Self::check_fs_read`] for a path that is not known to be UTF-8.
+    ///
+    /// The binding layer receives paths as `Buffer`s as often as `string`s, and
+    /// Node compares the raw bytes, so the check has to accept them without a
+    /// conversion step that could change which grant matches. Only the denial's
+    /// `resource` field goes through `String::from_utf8_lossy`, which is what
+    /// Node's `ToV8Value` does to a `std::string_view` too.
+    pub fn check_fs_read_bytes(&self, path: &[u8]) -> Result<(), AccessDenied> {
+        self.check_fs(path, PermissionScope::FileSystemRead)
+    }
+
+    /// [`Self::check_fs_write`] for a path that is not known to be UTF-8.
+    pub fn check_fs_write_bytes(&self, path: &[u8]) -> Result<(), AccessDenied> {
         self.check_fs(path, PermissionScope::FileSystemWrite)
     }
 
-    fn check_fs(&self, path: &str, scope: PermissionScope) -> Result<(), AccessDenied> {
+    fn check_fs(&self, path: &[u8], scope: PermissionScope) -> Result<(), AccessDenied> {
         if !self.enabled {
             return Ok(());
         }
         let granted = match self.fs_scope(scope) {
-            Some(target) => lock_read(target).grants_path(&path::resolve_path_bytes(
-                self.cwd.as_bytes(),
-                path.as_bytes(),
-            )),
+            Some(target) => {
+                lock_read(target).grants_path(&path::resolve_path_bytes(self.cwd.as_bytes(), path))
+            }
             None => false,
         };
         if granted {
             Ok(())
         } else {
-            Err(AccessDenied::new(scope, path))
+            Err(AccessDenied::new(
+                scope,
+                String::from_utf8_lossy(path).into_owned(),
+            ))
         }
     }
 
@@ -1261,7 +1287,14 @@ mod tests {
         );
         assert!(model.has(PermissionScope::Env, Some("PORT")));
         assert!(model.has(PermissionScope::Env, Some("APP_TOKEN")));
-        assert!(!model.has(PermissionScope::Env, Some("HOME")));
+        // `IsRuntimeEnvironmentDefault(param)` is part of the C++ `is_granted`,
+        // so the variables Node reads itself answer `true` without a grant.
+        // `test-permission-env-scrub.js` pins exactly this for `TZ`, and the
+        // scrub keeps the same list, so `has()` and the surviving environment
+        // agree.
+        assert!(model.has(PermissionScope::Env, Some("TZ")));
+        assert!(model.has(PermissionScope::Env, Some("PATH")));
+        assert!(!model.has(PermissionScope::Env, Some("RN_NOT_A_RUNTIME_DEFAULT")));
         assert!(!model.has(PermissionScope::Env, Some("*")));
         assert!(!model.has(PermissionScope::Env, None));
         model.drop_permission(PermissionScope::Env, "PORT");

@@ -21,6 +21,64 @@ fn main() {
         std::process::exit(1);
     }
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Flags that V8 owns are handed to it before initialization, the way Node's
+    // `V8::Initialize` path does. `--max-old-space-size` is the one observable
+    // through `v8.getHeapStatistics().heap_size_limit`, so ignoring it made that
+    // field a fixed 1.5 GB no matter what the command line said.
+    forward_v8_flags(&args);
+
+    // The command line is parsed before anything is built, because the
+    // permission model it produces has to exist before the binding registry
+    // does: `rn_permission::register` installs `internalBinding('permission')`
+    // around whatever model is already there, and the `fs`, `child_process` and
+    // `worker` checks read the same one. Parsing later would leave the binding
+    // holding a disabled model while the CLI held an enforcing one.
+    let options = match args::parse(&args) {
+        Ok(options) => options,
+        Err(message) => {
+            eprintln!("rustnode: {message}");
+            std::process::exit(9);
+        }
+    };
+    // A flag whose feature has not landed must not pass silently, or a test
+    // that needed it looks like it exercised something it did not.
+    for flag in &options.unimplemented {
+        eprintln!("rustnode: warning: {flag} is accepted but not implemented");
+    }
+    rn_permission::runtime::install_shared(options.permission.clone());
+
+    // `--allow-env` is enforced by removing everything it does not grant, not by
+    // checking a read later: the environment block is read directly by every C
+    // library and inherited by every child process, so there is no call to hook.
+    // That has to happen before V8 is initialised, because the platform thread
+    // pool starts there and the scrub is not synchronised with `getenv()`.
+    //
+    // A malformed pattern is a startup error, which is what Node's option
+    // validation does (`--allow-env must be '*', a variable name, or a variable
+    // name prefix followed by '*'`), and it exits with 9 like every other
+    // rejected flag.
+    let allow_env = rn_permission::env::parse_allow_list(&options.permission_config.allow_env);
+    if options.permission_config.enabled {
+        if allow_env
+            .iter()
+            .any(|pattern| !rn_permission::env::is_valid_pattern(pattern))
+        {
+            eprintln!(
+                "rustnode: --allow-env must be '*', a variable name, or a \
+                 variable name prefix followed by '*'"
+            );
+            std::process::exit(9);
+        }
+        if options.permission_config.audit {
+            let denied = rn_permission::env::record_audited(&allow_env);
+            options.permission.record_removed_env_vars(denied);
+        } else {
+            let removed = rn_permission::env::scrub(&allow_env);
+            options.permission.record_removed_env_vars(removed);
+        }
+    }
+
     let mut env = Env::new();
     let mut registry = rn_core::BindingRegistry::new();
     install_all(&mut registry);
@@ -71,19 +129,6 @@ fn main() {
     let scope = &mut scope.init();
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
-
-    let options = match args::parse(&args) {
-        Ok(options) => options,
-        Err(message) => {
-            eprintln!("rustnode: {message}");
-            std::process::exit(9);
-        }
-    };
-    // A flag whose feature has not landed must not pass silently, or a test
-    // that needed it looks like it exercised something it did not.
-    for flag in &options.unimplemented {
-        eprintln!("rustnode: warning: {flag} is accepted but not implemented");
-    }
 
     // `lib/**` reads option values through `internalBinding('options')`, and
     // that binding can only report them if it is told what the command line

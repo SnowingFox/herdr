@@ -782,8 +782,11 @@ dependencies = [
 name = "rn-bind-async-wrap"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-symbols",
  "rn-core",
  "rn-v8-sys",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -888,6 +891,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rn-core",
+ "rn-permission",
  "rn-v8-sys",
 ]
 
@@ -1025,6 +1029,7 @@ name = "rn-bind-pipe-wrap"
 version = "0.1.0"
 dependencies = [
  "libuv-sys2",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-uv",
  "rn-v8-sys",
@@ -1048,6 +1053,7 @@ dependencies = [
  "libc",
  "libuv-sys2",
  "rn-core",
+ "rn-permission",
  "rn-uv",
  "rn-v8-sys",
  "serde_json",
@@ -1094,6 +1100,7 @@ dependencies = [
  "libc",
  "libuv-sys2",
  "rn-core",
+ "rn-permission",
  "rn-uv",
  "rn-v8-sys",
  "serde_json",
@@ -1141,6 +1148,7 @@ name = "rn-bind-tcp-wrap"
 version = "0.1.0"
 dependencies = [
  "libuv-sys2",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-uv",
  "rn-v8-sys",
@@ -1174,6 +1182,7 @@ name = "rn-bind-tty-wrap"
 version = "0.1.0"
 dependencies = [
  "libuv-sys2",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-uv",
  "rn-v8-sys",
@@ -1365,6 +1374,7 @@ dependencies = [
  "rn-module",
  "rn-module-wrap",
  "rn-napi",
+ "rn-permission",
  "rn-util",
  "rn-uv",
  "rn-v8-sys",

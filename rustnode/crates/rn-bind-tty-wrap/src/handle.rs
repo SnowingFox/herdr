@@ -310,7 +310,24 @@ fn new(
 
     let object = args.this();
     match TtyHandle::new(fd) {
-        Some((handle, _status)) => install(scope, object, handle),
+        Some((mut handle, _status)) => {
+            // `src/tty_wrap.cc` passes `PROVIDER_TTYWRAP` to the `AsyncWrap` base,
+            // whose constructor resets and so allocates the first id and emits
+            // the first `init`. Doing it before `install` would call into
+            // JavaScript with an uninstalled handle, so the reset follows it.
+            handle.state.async_wrap =
+                rn_core::AsyncWrapState::uninitialised(rn_core::async_wrap::PROVIDER_TTYWRAP);
+            install(scope, object, handle);
+            crate::handle::with_handle(object, |handle| {
+                rn_bind_async_wrap::async_reset(
+                    scope,
+                    &mut handle.state.async_wrap,
+                    object,
+                    object,
+                    None,
+                );
+            });
+        }
         None => {
             // `uv_tty_init` failed. `src/tty_wrap.cc` marks the wrap
             // uninitialised and reports the status through the second argument,

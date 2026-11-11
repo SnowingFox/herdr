@@ -20,7 +20,7 @@ use rn_v8_sys::v8;
 use rn_v8_sys::v8::Local;
 
 use crate::args::Encoding;
-use crate::complete::{deliver_to_callback, deliver_to_promise, Completion, Payload};
+use crate::complete::{deliver_to_callback, deliver_to_promise, Completion, Failure, Payload};
 use crate::error::FsError;
 use crate::fsops::{self, TimeSpec};
 use crate::request::{classify, install_sentinel, throw_error, Delivery};
@@ -53,7 +53,10 @@ macro_rules! conclude {
                     let array = v8::Array::new_with_elements($scope, &[first, second]);
                     $rv.set(array.into());
                 }
-                Err(error) => throw_error($scope, &error),
+                Err(Failure::Syscall(error)) => throw_error($scope, &error),
+                Err(Failure::Denied(error)) => {
+                    error.throw($scope);
+                }
             },
             Delivery::Callback => {
                 if let Some(request) = request {
@@ -485,9 +488,12 @@ fn open_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "open") else {
         return;
     };
-    let completion = match fsops::open(&path, flags, mode) {
-        Ok(fd) => Completion::value(v8::Number::new(scope, f64::from(fd)).into()),
-        Err(error) => Completion::failed(error),
+    let completion = match crate::permission::deny_open(&path, flags) {
+        Some(denied) => Completion::denied(denied),
+        None => match fsops::open(&path, flags, mode) {
+            Ok(fd) => Completion::value(v8::Number::new(scope, f64::from(fd)).into()),
+            Err(error) => Completion::failed(error),
+        },
     };
     conclude!(scope, args, rv, completion);
 }
@@ -737,16 +743,26 @@ fn stat_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s>,
 ) {
-    stat_like(scope, args, rv, Follow::Yes, "stat");
+    stat_like(scope, args, rv, Follow::Yes, "stat", true);
 }
 
 /// `lstat(path, useBigint, [req])`.
+///
+/// Deliberately unchecked, matching `LStat` in `src/node_file.cc`: it is the one
+/// `fs` member of this family that the native layer does not gate. The reason is
+/// visible in `lib/fs.js`'s `realpathSync`, which walks the path one component
+/// at a time with `binding.lstat` after checking the fully resolved path up
+/// front; a per-component check there would deny every component above the
+/// granted one and make `realpathSync` unusable under the model.
+///
+/// The JavaScript `lstat` and `lstatSync` still check `fs.read`, so user code
+/// cannot reach an ungranted path this way.
 fn lstat_binding<'a, 's, 'i>(
     scope: &'a mut v8::PinScope<'s, 'i>,
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s>,
 ) {
-    stat_like(scope, args, rv, Follow::No, "lstat");
+    stat_like(scope, args, rv, Follow::No, "lstat", false);
 }
 
 fn stat_like<'a, 's, 'i>(
@@ -755,6 +771,7 @@ fn stat_like<'a, 's, 'i>(
     mut rv: v8::ReturnValue<'s>,
     follow: Follow,
     syscall: &'static str,
+    check_read: bool,
 ) {
     let bigint = args.length() > 1 && args.get(1).boolean_value(scope);
     let no_entry_is_ok = args.length() > 3 && args.get(3).is_false();
@@ -762,17 +779,25 @@ fn stat_like<'a, 's, 'i>(
         return;
     };
 
-    let completion = match StatFields::for_path(&path, follow) {
-        Ok(fields) => match stats_value(scope, fields, bigint) {
-            Some(value) => Completion::value(value),
-            None => Completion::failed(FsError::from_errno(syscall, libc::ENOMEM)),
+    let denied = if check_read {
+        crate::permission::deny_read(&path)
+    } else {
+        None
+    };
+    let completion = match denied {
+        Some(denied) => Completion::denied(denied),
+        None => match StatFields::for_path(&path, follow) {
+            Ok(fields) => match stats_value(scope, fields, bigint) {
+                Some(value) => Completion::value(value),
+                None => Completion::failed(FsError::from_errno(syscall, libc::ENOMEM)),
+            },
+            // Both mean "nothing there" for the no-throw form, matching
+            // `is_uv_error_except_no_entry_dir`.
+            Err(error) if no_entry_is_ok && matches!(error.code(), "ENOENT" | "ENOTDIR") => {
+                Completion::value(v8::undefined(scope).into())
+            }
+            Err(error) => Completion::failed(error),
         },
-        // Both mean "nothing there" for the no-throw form, matching
-        // `is_uv_error_except_no_entry_dir`.
-        Err(error) if no_entry_is_ok && matches!(error.code(), "ENOENT" | "ENOTDIR") => {
-            Completion::value(v8::undefined(scope).into())
-        }
-        Err(error) => Completion::failed(error),
     };
     conclude!(scope, args, rv, completion);
 }
@@ -809,12 +834,15 @@ fn statfs_binding<'a, 's, 'i>(
         return;
     };
 
-    let completion = match StatFsFields::for_path(&path) {
-        Ok(fields) => match statfs_value(scope, fields, bigint) {
-            Some(value) => Completion::value(value),
-            None => Completion::failed(FsError::from_errno("statfs", libc::ENOMEM)),
+    let completion = match crate::permission::deny_read(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => match StatFsFields::for_path(&path) {
+            Ok(fields) => match statfs_value(scope, fields, bigint) {
+                Some(value) => Completion::value(value),
+                None => Completion::failed(FsError::from_errno("statfs", libc::ENOMEM)),
+            },
+            Err(error) => Completion::failed(error),
         },
-        Err(error) => Completion::failed(error),
     };
     conclude!(scope, args, rv, completion);
 }
@@ -835,25 +863,28 @@ fn readdir_binding<'a, 's, 'i>(
         return;
     };
 
-    let completion = match fsops::readdir(&path) {
-        Ok(entries) => {
-            if with_types {
-                match dirent_pair(scope, &entries, encoding) {
-                    Some(value) => Completion::value(value),
-                    None => Completion::failed(FsError::from_errno("scandir", libc::ENOMEM)),
-                }
-            } else {
-                match name_array(
-                    scope,
-                    entries.iter().map(|entry| entry.name.as_slice()),
-                    encoding,
-                ) {
-                    Some(value) => Completion::value(value),
-                    None => Completion::failed(FsError::from_errno("scandir", libc::ENOMEM)),
+    let completion = match crate::permission::deny_read(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => match fsops::readdir(&path) {
+            Ok(entries) => {
+                if with_types {
+                    match dirent_pair(scope, &entries, encoding) {
+                        Some(value) => Completion::value(value),
+                        None => Completion::failed(FsError::from_errno("scandir", libc::ENOMEM)),
+                    }
+                } else {
+                    match name_array(
+                        scope,
+                        entries.iter().map(|entry| entry.name.as_slice()),
+                        encoding,
+                    ) {
+                        Some(value) => Completion::value(value),
+                        None => Completion::failed(FsError::from_errno("scandir", libc::ENOMEM)),
+                    }
                 }
             }
-        }
-        Err(error) => Completion::failed(error),
+            Err(error) => Completion::failed(error),
+        },
     };
     conclude!(scope, args, rv, completion);
 }
@@ -909,11 +940,15 @@ fn name_array<'s, 'iter>(
 // ---------------------------------------------------------------------------
 
 /// Implements the common `member(path, [req])` shape.
+///
+/// `check` is the scope Node gates the member with: `deny_write` for every
+/// single-operand path member except the ones that only read.
 fn unary_path_member<'a, 's, 'i, F>(
     scope: &'a mut v8::PinScope<'s, 'i>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
     syscall: &'static str,
+    check: fn(&[u8]) -> Option<rn_permission::AccessDeniedError>,
     operation: F,
 ) where
     F: FnOnce(&[u8]) -> Result<(), FsError>,
@@ -921,11 +956,18 @@ fn unary_path_member<'a, 's, 'i, F>(
     let Some(path) = required_path(scope, &args, 0, syscall) else {
         return;
     };
-    let completion = Completion::from_result(operation(&path));
+    let completion = match check(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(operation(&path)),
+    };
     conclude!(scope, args, rv, completion);
 }
 
 /// `rename(oldPath, newPath, [req])`.
+///
+/// `fs.read` on the old path and `fs.write` on both, matching
+/// `Rename`'s three checks: a rename removes the source as well as creating the
+/// destination.
 fn rename_binding<'a, 's, 'i>(
     scope: &'a mut v8::PinScope<'s, 'i>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -937,7 +979,13 @@ fn rename_binding<'a, 's, 'i>(
     let Some(to) = required_path(scope, &args, 1, "rename") else {
         return;
     };
-    let completion = Completion::from_result(fsops::rename(&from, &to));
+    let denied = crate::permission::deny_read(&from)
+        .or_else(|| crate::permission::deny_write(&from))
+        .or_else(|| crate::permission::deny_write(&to));
+    let completion = match denied {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::rename(&from, &to)),
+    };
     conclude!(scope, args, rv, completion);
 }
 
@@ -947,7 +995,14 @@ fn rmdir_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s>,
 ) {
-    unary_path_member(scope, args, rv, "rmdir", fsops::rmdir);
+    unary_path_member(
+        scope,
+        args,
+        rv,
+        "rmdir",
+        crate::permission::deny_write,
+        fsops::rmdir,
+    );
 }
 
 /// `unlink(path, [req])`.
@@ -956,7 +1011,14 @@ fn unlink_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     rv: v8::ReturnValue<'s>,
 ) {
-    unary_path_member(scope, args, rv, "unlink", fsops::unlink);
+    unary_path_member(
+        scope,
+        args,
+        rv,
+        "unlink",
+        crate::permission::deny_write,
+        fsops::unlink,
+    );
 }
 
 /// `mkdir(path, mode, recursive, [req])`.
@@ -974,18 +1036,25 @@ fn mkdir_binding<'a, 's, 'i>(
         return;
     };
 
-    let completion = match fsops::mkdir(&path, mode, recursive) {
-        Ok(Some(created)) => match name_value(scope, &created, Encoding::Utf8) {
-            Some(value) => Completion::value(value),
-            None => Completion::failed(FsError::from_errno("mkdir", libc::ENOMEM)),
+    let completion = match crate::permission::deny_write(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => match fsops::mkdir(&path, mode, recursive) {
+            Ok(Some(created)) => match name_value(scope, &created, Encoding::Utf8) {
+                Some(value) => Completion::value(value),
+                None => Completion::failed(FsError::from_errno("mkdir", libc::ENOMEM)),
+            },
+            Ok(None) => Completion::unit(),
+            Err(error) => Completion::failed(error),
         },
-        Ok(None) => Completion::unit(),
-        Err(error) => Completion::failed(error),
     };
     conclude!(scope, args, rv, completion);
 }
 
 /// `link(existingPath, newPath, [req])`.
+///
+/// `fs.read` and `fs.write` on the existing path, then `fs.write` on the new
+/// one: a hard link makes the source reachable under a new name, so both halves
+/// are needed just as `Symlink` needs both for its target.
 fn link_binding<'a, 's, 'i>(
     scope: &'a mut v8::PinScope<'s, 'i>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -997,13 +1066,22 @@ fn link_binding<'a, 's, 'i>(
     let Some(new_path) = required_path(scope, &args, 1, "link") else {
         return;
     };
-    let completion = Completion::from_result(fsops::link(&existing, &new_path));
+    let denied = crate::permission::deny_read(&existing)
+        .or_else(|| crate::permission::deny_write(&existing))
+        .or_else(|| crate::permission::deny_write(&new_path));
+    let completion = match denied {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::link(&existing, &new_path)),
+    };
     conclude!(scope, args, rv, completion);
 }
 
 /// `symlink(target, path, type, [req])`.
 ///
 /// The `type` argument is Windows-only and ignored by `uv_fs_symlink` on Unix.
+/// The target needs `fs.read` **and** `fs.write` because following the link
+/// later is a read of whatever it names and a write to it is a write through the
+/// link, and the link itself needs `fs.write`.
 fn symlink_binding<'a, 's, 'i>(
     scope: &'a mut v8::PinScope<'s, 'i>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -1015,7 +1093,13 @@ fn symlink_binding<'a, 's, 'i>(
     let Some(link_path) = required_path(scope, &args, 1, "symlink") else {
         return;
     };
-    let completion = Completion::from_result(fsops::symlink(&target, &link_path));
+    let denied = crate::permission::deny_read(&target)
+        .or_else(|| crate::permission::deny_write(&target))
+        .or_else(|| crate::permission::deny_write(&link_path));
+    let completion = match denied {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::symlink(&target, &link_path)),
+    };
     conclude!(scope, args, rv, completion);
 }
 
@@ -1030,12 +1114,15 @@ fn readlink_binding<'a, 's, 'i>(
         return;
     };
 
-    let completion = match fsops::readlink(&path) {
-        Ok(target) => match name_value(scope, &target, encoding) {
-            Some(value) => Completion::value(value),
-            None => Completion::failed(FsError::from_errno("readlink", libc::ENOMEM)),
+    let completion = match crate::permission::deny_read(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => match fsops::readlink(&path) {
+            Ok(target) => match name_value(scope, &target, encoding) {
+                Some(value) => Completion::value(value),
+                None => Completion::failed(FsError::from_errno("readlink", libc::ENOMEM)),
+            },
+            Err(error) => Completion::failed(error),
         },
-        Err(error) => Completion::failed(error),
     };
     conclude!(scope, args, rv, completion);
 }
@@ -1061,6 +1148,14 @@ fn cp_sync_check_paths_binding<'a, 's, 'i>(
     };
     let dereference = args.get(2).is_true();
     let recursive = args.get(3).is_true();
+
+    // `CpSyncCheckPaths` checks the source's read scope and the destination's
+    // write scope before it stats either, so a denied pair never reaches the
+    // filesystem.
+    if let Some(denied) = crate::permission::deny_copy(&src, &dest) {
+        denied.throw(scope);
+        return;
+    }
 
     let src_path = path_from_bytes(&src);
     let dest_path = path_from_bytes(&dest);
@@ -1101,12 +1196,15 @@ fn realpath_binding<'a, 's, 'i>(
         return;
     };
 
-    let completion = match fsops::realpath(&path) {
-        Ok(resolved) => match name_value(scope, &resolved, encoding) {
-            Some(value) => Completion::value(value),
-            None => Completion::failed(FsError::from_errno("realpath", libc::ENOMEM)),
+    let completion = match crate::permission::deny_read(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => match fsops::realpath(&path) {
+            Ok(resolved) => match name_value(scope, &resolved, encoding) {
+                Some(value) => Completion::value(value),
+                None => Completion::failed(FsError::from_errno("realpath", libc::ENOMEM)),
+            },
+            Err(error) => Completion::failed(error),
         },
-        Err(error) => Completion::failed(error),
     };
     conclude!(scope, args, rv, completion);
 }
@@ -1121,7 +1219,10 @@ fn access_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "access") else {
         return;
     };
-    let completion = Completion::from_result(fsops::access(&path, mode));
+    let completion = match crate::permission::deny_read(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::access(&path, mode)),
+    };
     conclude!(scope, args, rv, completion);
 }
 
@@ -1138,7 +1239,10 @@ fn copy_file_binding<'a, 's, 'i>(
     let Some(destination) = required_path(scope, &args, 1, "copyfile") else {
         return;
     };
-    let completion = Completion::from_result(fsops::copy_file(&source, &destination, mode));
+    let completion = match crate::permission::deny_copy(&source, &destination) {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::copy_file(&source, &destination, mode)),
+    };
     conclude!(scope, args, rv, completion);
 }
 
@@ -1152,7 +1256,10 @@ fn chmod_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "chmod") else {
         return;
     };
-    let completion = Completion::from_result(fsops::chmod(&path, mode));
+    let completion = match crate::permission::deny_write(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::chmod(&path, mode)),
+    };
     conclude!(scope, args, rv, completion);
 }
 
@@ -1179,7 +1286,10 @@ fn chown_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "chown") else {
         return;
     };
-    let completion = Completion::from_result(fsops::chown(&path, uid, gid));
+    let completion = match crate::permission::deny_write(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::chown(&path, uid, gid)),
+    };
     conclude!(scope, args, rv, completion);
 }
 
@@ -1194,7 +1304,10 @@ fn lchown_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "lchown") else {
         return;
     };
-    let completion = Completion::from_result(fsops::lchown(&path, uid, gid));
+    let completion = match crate::permission::deny_write(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::lchown(&path, uid, gid)),
+    };
     conclude!(scope, args, rv, completion);
 }
 
@@ -1241,7 +1354,10 @@ fn utimes_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "utimes") else {
         return;
     };
-    let completion = Completion::from_result(fsops::utimes(&path, atime, mtime, true, "utimes"));
+    let completion = match crate::permission::deny_write(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::utimes(&path, atime, mtime, true, "utimes")),
+    };
     conclude!(scope, args, rv, completion);
 }
 
@@ -1256,7 +1372,10 @@ fn lutimes_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "lutimes") else {
         return;
     };
-    let completion = Completion::from_result(fsops::utimes(&path, atime, mtime, false, "lutimes"));
+    let completion = match crate::permission::deny_write(&path) {
+        Some(denied) => Completion::denied(denied),
+        None => Completion::from_result(fsops::utimes(&path, atime, mtime, false, "lutimes")),
+    };
     conclude!(scope, args, rv, completion);
 }
 
@@ -1283,12 +1402,15 @@ fn mkdtemp_binding<'a, 's, 'i>(
     let Some(prefix) = required_path(scope, &args, 0, "mkdtemp") else {
         return;
     };
-    let completion = match fsops::mkdtemp(&prefix, 0o700) {
-        Ok(created) => match name_value(scope, &created, encoding) {
-            Some(value) => Completion::value(value),
-            None => Completion::failed(FsError::from_errno("mkdtemp", libc::ENOMEM)),
+    let completion = match crate::permission::deny_write(&prefix) {
+        Some(denied) => Completion::denied(denied),
+        None => match fsops::mkdtemp(&prefix, 0o700) {
+            Ok(created) => match name_value(scope, &created, encoding) {
+                Some(value) => Completion::value(value),
+                None => Completion::failed(FsError::from_errno("mkdtemp", libc::ENOMEM)),
+            },
+            Err(error) => Completion::failed(error),
         },
-        Err(error) => Completion::failed(error),
     };
     conclude!(scope, args, rv, completion);
 }
@@ -1305,14 +1427,28 @@ fn mkstemp_binding<'a, 's, 'i>(
     let Some(prefix) = required_path(scope, &args, 0, "mkstemp") else {
         return;
     };
-    let completion = match fsops::mkstemp(&prefix) {
-        Ok((created, fd)) => match name_value(scope, &created, encoding) {
-            Some(path) => Completion::pair(path, v8::Number::new(scope, f64::from(fd)).into()),
-            None => Completion::failed(FsError::from_errno("mkstemp", libc::ENOMEM)),
+    let completion = match crate::permission::deny_open(&prefix, mkstemp_flags()) {
+        Some(denied) => Completion::denied(denied),
+        None => match fsops::mkstemp(&prefix) {
+            Ok((created, fd)) => match name_value(scope, &created, encoding) {
+                Some(path) => Completion::pair(path, v8::Number::new(scope, f64::from(fd)).into()),
+                None => Completion::failed(FsError::from_errno("mkstemp", libc::ENOMEM)),
+            },
+            Err(error) => Completion::failed(error),
         },
-        Err(error) => Completion::failed(error),
     };
     conclude!(scope, args, rv, completion);
+}
+
+/// The flag word `mkstemp` creates its file with, which `kMkstempFlags`
+/// spells in `src/node_file.cc` as `O_CREAT | O_EXCL | O_RDWR`.
+///
+/// It needs both scopes for that reason, which is why Node routes `mkstemp`
+/// through `CheckOpenPermissions` rather than a bare read or write check.
+fn mkstemp_flags() -> i32 {
+    crate::flags::uv_flags::O_CREAT
+        | crate::flags::uv_flags::O_EXCL
+        | crate::flags::uv_flags::O_RDWR
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,6 +1470,12 @@ fn rm_sync_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "rm") else {
         return;
     };
+    // `RmSync` checks the write scope before it stats anything, so a denied
+    // path reports `ERR_ACCESS_DENIED` rather than `ENOENT`.
+    if let Some(denied) = crate::permission::deny_write(&path) {
+        denied.throw(scope);
+        return;
+    }
     match fsops::rm_sync(&path, max_retries, recursive, retry_delay) {
         Ok(()) => rv.set_undefined(),
         Err(error) => throw_error(scope, &error),
@@ -1341,16 +1483,24 @@ fn rm_sync_binding<'a, 's, 'i>(
 }
 
 /// `existsSync(path)`: a boolean, never an error.
+///
+/// Except for a permission denial, which `ExistsSync` throws: answering `false`
+/// would let a gated path be probed for existence, which is exactly what the
+/// read scope exists to prevent.
 fn exists_sync_binding<'a, 's, 'i>(
     scope: &'a mut v8::PinScope<'s, 'i>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let found = match crate::args::path_bytes(scope, args.get(0)) {
-        Some(path) => fsops::exists(&path),
-        None => false,
+    let Some(path) = crate::args::path_bytes(scope, args.get(0)) else {
+        rv.set(v8::Boolean::new(scope, false).into());
+        return;
     };
-    rv.set(v8::Boolean::new(scope, found).into());
+    if let Some(denied) = crate::permission::deny_read(&path) {
+        denied.throw(scope);
+        return;
+    }
+    rv.set(v8::Boolean::new(scope, fsops::exists(&path)).into());
 }
 
 /// `readFileUtf8(path, flags)`: the synchronous fast path behind
@@ -1364,6 +1514,12 @@ fn read_file_utf8_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "open") else {
         return;
     };
+    // `ReadFileUtf8` goes through `CheckOpenPermissions`, so the flag word
+    // decides the scope rather than the member's name.
+    if let Some(denied) = crate::permission::deny_open(&path, flags) {
+        denied.throw(scope);
+        return;
+    }
     match fsops::read_file_utf8(&path, flags) {
         Ok(text) => {
             if let Some(value) = v8::String::new(scope, &text) {
@@ -1385,6 +1541,10 @@ fn write_file_utf8_binding<'a, 's, 'i>(
     let Some(path) = required_path(scope, &args, 0, "open") else {
         return;
     };
+    if let Some(denied) = crate::permission::deny_open(&path, flags) {
+        denied.throw(scope);
+        return;
+    }
     let Ok(text) = Local::<v8::String>::try_from(args.get(1)) else {
         throw_error(scope, &FsError::from_errno("write", libc::EINVAL));
         return;
