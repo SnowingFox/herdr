@@ -41,6 +41,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_serdes::register(registry);
     rn_bind_signal_wrap::register(registry);
     rn_bind_spawn_sync::register(registry);
+    rn_bind_sqlite::register(registry);
     rn_bind_stream_wrap::register(registry);
     rn_bind_string_decoder::register(registry);
     rn_bind_symbols::register(registry);

@@ -285,7 +285,15 @@ const UNIMPLEMENTED: &[&str] = &[
 /// They still travel through the generic `--experimental-` branch, but must not
 /// be reported as unimplemented, because `lib/**` now acts on them: each is read
 /// back through `internalBinding('options')` by the vendored JavaScript.
-const IMPLEMENTED_EXPERIMENTAL: &[&str] = &["--experimental-bench", "--experimental-stream-iter"];
+///
+/// `--experimental-sqlite` belongs here now that `internalBinding('sqlite')`
+/// exists: claiming it is unimplemented while `require('node:sqlite')` works is
+/// a lie the flag itself prints on every run.
+const IMPLEMENTED_EXPERIMENTAL: &[&str] = &[
+    "--experimental-bench",
+    "--experimental-stream-iter",
+    "--experimental-sqlite",
+];
 
 /// Parses the command line, or returns the message to print on a bad flag.
 pub fn parse(args: &[String]) -> Result<Options, String> {

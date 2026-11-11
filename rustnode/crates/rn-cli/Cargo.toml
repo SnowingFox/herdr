@@ -31,6 +31,9 @@ rn-permission = { path = "../rn-permission" }
 # `process.versions.openssl` has to report the version this binary actually
 # linked, so the CLI reads it from the crypto binding rather than hardcoding.
 rn-bind-crypto = { path = "../rn-bind-crypto" }
+# `process.versions.sqlite` comes from the linked amalgamation, and the test
+# suite derives `hasSQLite` from it.
+rn-bind-sqlite = { path = "../rn-bind-sqlite" }
 rn-module = { path = "../rn-module" }
 rn-io = { path = "../rn-io" }
 # The realm bootstrap is shared with worker threads: a worker is a second isolate

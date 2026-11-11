@@ -1245,6 +1245,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-sqlite"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "rn-core",
+ "rn-permission",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bind-stream-wrap"
 version = "0.1.0"
 dependencies = [
@@ -1477,6 +1489,7 @@ dependencies = [
  "rn-bind-serdes",
  "rn-bind-signal-wrap",
  "rn-bind-spawn-sync",
+ "rn-bind-sqlite",
  "rn-bind-stream-wrap",
  "rn-bind-string-decoder",
  "rn-bind-symbols",
@@ -1535,6 +1548,7 @@ dependencies = [
  "rn-bind-inspector",
  "rn-bind-messaging",
  "rn-bind-options",
+ "rn-bind-sqlite",
  "rn-bind-task-queue",
  "rn-bind-timers",
  "rn-bind-worker",
@@ -1671,6 +1685,7 @@ dependencies = [
  "rn-bind-inspector",
  "rn-bind-messaging",
  "rn-bind-options",
+ "rn-bind-sqlite",
  "rn-bind-task-queue",
  "rn-bind-timers",
  "rn-bind-zlib",

@@ -254,9 +254,14 @@ pub static OPTIONS: &[OptionInfo] = &[
         help_text: "experimental node:ffi module",
         kind: 2,
         env_setting: 0,
-        default_is_true: true,
+        // `node_options.h` defaults this to `HAVE_FFI`, and this build links no
+        // libffi, so the flag is off until it is passed. With it `true` the
+        // builtin is exposed, `lib/ffi.js` prints its "experimental" warning,
+        // and the first binding call fails — a warning promising a feature and
+        // then an unattributable error. The default is the gate.
+        default_is_true: false,
         namespace: OptionNamespace::None,
-        default: DefaultValue::Bool(true),
+        default: DefaultValue::Bool(false),
     },
     OptionInfo {
         name: "--experimental-web-worker",
@@ -290,9 +295,14 @@ pub static OPTIONS: &[OptionInfo] = &[
         help_text: "experimental node:sqlite module",
         kind: 2,
         env_setting: 0,
-        default_is_true: false,
+        // `node_options.h` defaults this to `HAVE_SQLITE`, and `build.rs`
+        // compiles the vendored amalgamation into this binary, so the field is
+        // true unless `--no-experimental-sqlite` is passed. Reporting `false`
+        // left the builtin gated on the main thread while a worker realm — which
+        // asks the same accessor — reached a different answer.
+        default_is_true: true,
         namespace: OptionNamespace::None,
-        default: DefaultValue::Bool(false),
+        default: DefaultValue::Bool(true),
     },
     OptionInfo {
         name: "--experimental-stream-iter",

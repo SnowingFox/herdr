@@ -47,6 +47,7 @@ rn-io = { path = "crates/rn-io" }
 rn-bindings = { path = "crates/rn-bindings" }
 rn-module = { path = "crates/rn-module" }
 rn-napi = { path = "crates/rn-napi" }
+rn-permission = { path = "crates/rn-permission" }
 
 [profile.release]
 opt-level = 3

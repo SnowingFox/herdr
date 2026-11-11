@@ -9,6 +9,9 @@ description = "the realm bootstrap shared by the main thread and worker threads"
 
 [dependencies]
 rn-bind-crypto = { path = "../rn-bind-crypto" }
+# `process.versions.sqlite` comes from the linked amalgamation, and the test
+# suite derives `hasSQLite` from it.
+rn-bind-sqlite = { path = "../rn-bind-sqlite" }
 rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
 rn-bind-inspector = { path = "../rn-bind-inspector" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }

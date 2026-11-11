@@ -41,6 +41,7 @@ report
 serdes
 signal_wrap
 spawn_sync
+sqlite
 stream_wrap
 string_decoder
 symbols

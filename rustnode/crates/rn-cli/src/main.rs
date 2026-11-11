@@ -264,6 +264,19 @@ fn main() {
             // can resolve a specifier; Node's user-land loader does that, and
             // this stands in for it until `contextify` unblocks the real one.
             bootstrap::wrap_require_with_scheme_support(scope, &loaders);
+            // `realm.js` gates `sqlite` behind `--experimental-sqlite` and
+            // leaves the gate to `internal/process/pre_execution.js`, which
+            // rustnode does not run yet. Without this the namespace installs
+            // correctly and `require('node:sqlite')` still reports "No such
+            // built-in module". Node 28 defaults the option to true whenever
+            // SQLite is compiled in, and it is compiled into this binary.
+            // `realm.js` gates several builtins behind an experimental option and
+            // leaves lifting those gates to `internal/process/pre_execution.js`,
+            // which rustnode does not run. This applies the same call, with the
+            // same `getOptionValue`, so the main realm and a worker realm reach
+            // the same answer — the asymmetry between them is what made
+            // `node:sqlite` reachable on the main thread but not in a worker.
+            bootstrap::allow_option_gated_builtins(scope, &loaders);
             bootstrap::install_early_globals(scope, &loaders);
             // The CommonJS loader turns `require` from a builtin lookup into a
             // real module loader, which is what makes `require('./file.js')`
