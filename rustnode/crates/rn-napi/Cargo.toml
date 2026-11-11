@@ -9,9 +9,17 @@ description = "Node-API implementation for rustnode"
 
 [dependencies]
 rn-core = { path = "../rn-core" }
+# The async-work and thread-safe-function shims queue onto the process' libuv
+# loop and re-enter V8 from its completions, both of which this crate owns.
+rn-uv = { path = "../rn-uv" }
 rn-v8-sys.workspace = true
 libc.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+# `uv_queue_work`, `uv_cancel` and `uv_async_*` are called directly: an async work
+# has to hand libuv the request its own callbacks receive, and routing that through
+# `rn-uv` would only add a pass-through type.
+libuv-sys2.workspace = true
 # The loader is already in this dependency graph through `clang-sys` (a `v8`
 # build dependency), so using it adds no new third-party code. It provides
 # `dlopen`/`dlsym` on Unix and `LoadLibraryExW`/`GetProcAddress` on Windows with

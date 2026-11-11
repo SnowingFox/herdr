@@ -65,9 +65,65 @@ pub struct NapiEscapableHandleScope {
     _private: [u8; 0],
 }
 
+/// `typedef struct napi_async_work__* napi_async_work;`
+#[repr(C)]
+pub struct NapiAsyncWork {
+    _private: [u8; 0],
+}
+
+/// `typedef struct napi_threadsafe_function__* napi_threadsafe_function;`
+#[repr(C)]
+pub struct NapiThreadsafeFunction {
+    _private: [u8; 0],
+}
+
+/// `napi_threadsafe_function_release_mode`, in declaration order.
+///
+/// The integers are ABI: `napi_tsfn_release` is 0 and `napi_tsfn_abort` is 1, and
+/// an addon passes the literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum NapiThreadsafeFunctionReleaseMode {
+    Release = 0,
+    Abort = 1,
+}
+
+/// `napi_threadsafe_function_call_mode`, in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub enum NapiThreadsafeFunctionCallMode {
+    Nonblocking = 0,
+    Blocking = 1,
+}
+
 /// `typedef napi_value (NAPI_CDECL* napi_callback)(napi_env, napi_callback_info)`
 pub type NapiCallback =
     Option<unsafe extern "C" fn(env: *mut NapiEnv, info: *mut NapiCallbackInfo) -> *mut NapiValue>;
+
+/// `typedef void (NAPI_CDECL* napi_async_execute_callback)(napi_env, void*)`
+///
+/// Runs on a thread-pool thread, so it must not touch JavaScript.
+pub type NapiAsyncExecuteCallback =
+    Option<unsafe extern "C" fn(env: *mut NapiEnv, data: *mut c_void)>;
+
+/// `typedef void (NAPI_CDECL* napi_async_complete_callback)(napi_env, napi_status, void*)`
+///
+/// Runs on the loop's thread, after `napi_async_execute_callback`.
+pub type NapiAsyncCompleteCallback =
+    Option<unsafe extern "C" fn(env: *mut NapiEnv, status: NapiStatus, data: *mut c_void)>;
+
+/// `typedef void (NAPI_CDECL* napi_threadsafe_function_call_js)(napi_env, napi_value, void*, void*)`
+///
+/// May receive a null env and a null callback when the queue is drained during
+/// teardown, which is how an addon learns its values will never reach JavaScript.
+pub type NapiThreadsafeFunctionCallJs = Option<
+    unsafe extern "C" fn(
+        env: *mut NapiEnv,
+        js_callback: *mut NapiValue,
+        context: *mut c_void,
+        data: *mut c_void,
+    ),
+>;
 
 /// `typedef void (NAPI_CDECL* napi_finalize)(napi_env, void*, void*)`
 pub type NapiFinalize =
@@ -350,6 +406,38 @@ mod tests {
         ] {
             assert!(!status.message().is_empty(), "{status:?} has no message");
         }
+    }
+
+    #[test]
+    fn thread_safe_function_mode_discriminants_match_the_header() {
+        // `napi_threadsafe_function_release_mode` is `{release, abort}` and
+        // `napi_threadsafe_function_call_mode` is `{nonblocking, blocking}`. An
+        // addon passes these as plain integers, so the order is the ABI.
+        assert_eq!(NapiThreadsafeFunctionReleaseMode::Release as i32, 0);
+        assert_eq!(NapiThreadsafeFunctionReleaseMode::Abort as i32, 1);
+        assert_eq!(NapiThreadsafeFunctionCallMode::Nonblocking as i32, 0);
+        assert_eq!(NapiThreadsafeFunctionCallMode::Blocking as i32, 1);
+    }
+
+    #[test]
+    fn the_async_callback_types_have_the_headers_shapes() {
+        // `napi_async_complete_callback` carries a `napi_status` by value, which
+        // is a C enum and therefore an `int`. A Rust enum with a narrower
+        // discriminant would shift every later argument.
+        assert_eq!(
+            std::mem::size_of::<NapiStatus>(),
+            std::mem::size_of::<std::os::raw::c_int>(),
+            "napi_status is passed by value into complete callbacks"
+        );
+        // The mode enums are likewise passed by value.
+        assert_eq!(
+            std::mem::size_of::<NapiThreadsafeFunctionCallMode>(),
+            std::mem::size_of::<std::os::raw::c_int>(),
+        );
+        assert_eq!(
+            std::mem::size_of::<NapiThreadsafeFunctionReleaseMode>(),
+            std::mem::size_of::<std::os::raw::c_int>(),
+        );
     }
 
     #[test]

@@ -35,12 +35,14 @@
 //! the link flag are both required, and the test pins the pair.
 
 pub mod abi;
+pub mod async_work;
 pub mod callback;
 pub mod env;
 pub mod load;
 pub mod scope;
 pub mod shims;
 pub mod symbols;
+pub mod threadsafe;
 pub mod values;
 
 #[cfg(unix)]

@@ -22,9 +22,15 @@
  * revision (see `tests/addon/node_api.h`), so the ABI asserted here is the one
  * the project targets rather than whichever Node happened to build this file.
  *
- * Compiled with plain C, no C++: `cc -shared -fPIC -o addon.node addon.c`. An
- * addon built as C++ would still load, but using C removes the C++ runtime from
- * the question and keeps the test about Node-API rather than about name mangling.
+ * `addon_async.c` is the other translation unit in this same addon. It covers
+ * the asynchronous half of Node-API — libuv thread-pool work and thread-safe
+ * functions — and registers its own methods from `NAPI_MODULE_INITIALIZER`
+ * below, so one `require()` exercises both.
+ *
+ * Compiled with plain C, no C++: `cc -shared -fPIC ... addon.c addon_async.c`.
+ * An addon built as C++ would still load, but using C removes the C++ runtime
+ * from the question and keeps the test about Node-API rather than about name
+ * mangling.
  */
 
 /* `node_api_get_module_file_name` is declared only for Node-API 9 and later
@@ -56,6 +62,15 @@
       return NULL;                                                   \
     }                                                                \
   } while (0)
+
+/* `addon_async.c` registers its own methods; this is the declaration it needs. */
+napi_status register_async_methods(napi_env env, napi_value exports);
+
+/* Throws a `TypeError` naming the failure, so a broken asynchronous path reports
+ * through the same channel as the synchronous ones instead of aborting. */
+void report_failure(napi_env env, const char* message) {
+  napi_throw_error(env, "ERR_ADDON_ASYNC", message);
+}
 
 /* `add(a, b)` -> a + b, proving numbers cross in and out. */
 static napi_value Add(napi_env env, napi_callback_info info) {
@@ -295,7 +310,6 @@ typedef struct {
   const char* name;
   napi_callback callback;
 } AddonMethod;
-
 static const AddonMethod kMethods[] = {
     {"add", Add},
     {"callWithNativeArgument", CallWithNativeArgument},
@@ -346,6 +360,21 @@ NAPI_MODULE_EXPORT napi_value NAPI_MODULE_INITIALIZER(napi_env env,
         "tableMarker", NULL, NULL, NULL, NULL, methods[1],
         napi_default_jsproperty, NULL};
     NODE_API_CALL(env, napi_define_properties(env, exports, 2, descriptors));
+  }
+
+  /* The asynchronous surface: libuv thread-pool work and thread-safe functions,
+   * registered from `addon_async.c`. */
+  {
+    napi_status status = register_async_methods(env, exports);
+    if (status != napi_ok) {
+      const napi_extended_error_info* info = NULL;
+      napi_get_last_error_info(env, &info);
+      napi_throw_error(env, "ERR_ADDON_ASYNC",
+                       info != NULL && info->error_message != NULL
+                           ? info->error_message
+                           : "registering the async methods failed");
+      return NULL;
+    }
   }
 
   /* A constant, so a caller can tell a real export from a default object. */

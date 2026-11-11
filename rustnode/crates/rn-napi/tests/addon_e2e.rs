@@ -315,3 +315,121 @@ fn dlopen_twice_gives_each_load_its_own_exports_object_and_functions() {
     ));
     assert_eq!(stdout, "true true 4 4");
 }
+
+#[test]
+fn async_work_runs_on_a_pool_thread_and_completes_on_the_loop_thread() {
+    // The claim is two-part, and the second half is what a synchronous stand-in
+    // would fail: `execute` must run somewhere other than the isolate's thread,
+    // and `complete` must deliver its result back through a JavaScript callback.
+    //
+    // The addon reports `executedOffThread` from inside `execute`, where it
+    // compares `pthread_self()` against the thread that created the work. A shim
+    // that ran `execute` inline would compute the right `value` and report
+    // `false`, so the value alone is not sufficient evidence and is not treated
+    // as such.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         addon.runAsyncWork(7, (result) => {{\n\
+           console.log(result.value, result.executedOffThread);\n\
+         }});",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "21 true");
+}
+
+#[test]
+fn async_work_delivers_several_independent_completions() {
+    // One work item per call, each with its own carrier and its own reference.
+    // A shim that reused a single slot per environment would hand two callbacks
+    // the same data, which this catches: the three inputs produce three distinct
+    // products, and all three must arrive.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const seen = [];\n\
+         const done = (value) => {{\n\
+           seen.push(value);\n\
+           if (seen.length === 3) console.log(seen.sort((a, b) => a - b).join(','));\n\
+         }};\n\
+         addon.runAsyncWork(1, (r) => done(r.value));\n\
+         addon.runAsyncWork(2, (r) => done(r.value));\n\
+         addon.runAsyncWork(3, (r) => done(r.value));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "3,6,9");
+}
+
+#[test]
+fn cancelled_async_work_reports_napi_cancelled_to_its_completion() {
+    // `napi_cancel_async_work` has to reach libuv's queue. The addon saturates
+    // the pool, queues one more request and cancels it, so the request never
+    // starts and its `complete` runs with `napi_cancelled` — which the addon turns
+    // into the `cancelled` flag the assertion reads.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         addon.queueAndCancel((result) => console.log(result.cancelled));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "true");
+}
+
+#[test]
+fn a_threadsafe_function_delivers_every_value_from_a_real_thread() {
+    // The headline claim for thread-safe functions: a POSIX thread created by the
+    // addon pushes 50 integers through `napi_call_threadsafe_function`, and
+    // JavaScript receives all 50, in order, on the loop's thread.
+    //
+    // "In order" is the part that matters for a queue: a shim that ran the callback
+    // on the calling thread would be a data race on V8, and one that used a stack
+    // would reorder. The finalize callback's count catches a value lost at
+    // teardown, which is the other way this silently under-delivers.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const received = [];\n\
+         addon.startThreadSafeProducer(\n\
+           (value) => received.push(value),\n\
+           50,\n\
+           (pushed) => console.log(received.length,\n\
+                                received.every((value, index) => value === index),\n\
+                                pushed));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "50 true 50");
+}
+
+#[test]
+fn a_threadsafe_functions_context_is_readable_from_the_producing_thread() {
+    // `napi_get_threadsafe_function_context` is documented for use on the thread
+    // that calls in, not on the thread that created the function. The addon
+    // compares the pointer it reads from its producer thread against the one it
+    // passed at creation, and reports whether they are equal.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         addon.threadSafeFunctionContext((matched) => console.log(matched));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "1");
+}
+
+#[test]
+fn a_threadsafe_function_keeps_the_process_alive_until_it_is_released() {
+    // A live TSFN holds a ref'd `uv_async_t`, so the process must stay alive while
+    // values are still queued even though nothing else is pending. Reaching the
+    // finalizer at all proves the loop kept running; a version that unref'd the
+    // handle at creation would exit before the producer's first push.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         let count = 0;\n\
+         addon.startThreadSafeProducer(\n\
+           () => {{ count += 1; }},\n\
+           20,\n\
+           (pushed) => console.log('finalized', count, pushed));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "finalized 20 20");
+}

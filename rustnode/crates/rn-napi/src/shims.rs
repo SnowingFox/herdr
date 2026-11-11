@@ -1745,6 +1745,302 @@ pub unsafe extern "C" fn node_api_get_module_file_name(
 }
 
 // ---------------------------------------------------------------------------
+// Async work
+// ---------------------------------------------------------------------------
+
+#[export_name = "napi_create_async_work"]
+pub unsafe extern "C" fn napi_create_async_work(
+    env: *mut NapiEnv,
+    async_resource: *mut NapiValue,
+    async_resource_name: *mut NapiValue,
+    execute: crate::abi::NapiAsyncExecuteCallback,
+    complete: crate::abi::NapiAsyncCompleteCallback,
+    data: *mut c_void,
+    result: *mut *mut crate::abi::NapiAsyncWork,
+) -> NapiStatus {
+    if execute.is_none() || result.is_null() || async_resource_name.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    // Node checks both shapes before allocating, so an addon that passed the wrong
+    // kind of resource gets `napi_object_expected` / `napi_string_expected` rather
+    // than a work item that fails later. The values themselves are not retained:
+    // rustnode has no `AsyncResource` to attach them to, which is the same
+    // limitation `napi_async_init` documents.
+    let checked = in_scope(|scope| {
+        if !async_resource.is_null() {
+            // SAFETY: the handle comes from the current scope.
+            let _ = unsafe { as_object(async_resource) }?;
+        }
+        // SAFETY: as above.
+        let _ = unsafe { as_string(async_resource_name) }?;
+        let _: &mut v8::PinScope<'_, '_> = scope;
+        Ok::<(), NapiStatus>(())
+    });
+    match checked {
+        None => return status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => return status(env, failure),
+        Some(Ok(())) => {}
+    }
+    let _ = environment;
+    let work = crate::async_work::AsyncWork::new(env, execute, complete, data);
+    // SAFETY: the caller passed a writable slot for one pointer.
+    unsafe { result.write(work.cast()) };
+    status(env, NapiStatus::Ok)
+}
+
+#[export_name = "napi_delete_async_work"]
+pub unsafe extern "C" fn napi_delete_async_work(
+    env: *mut NapiEnv,
+    work: *mut crate::abi::NapiAsyncWork,
+) -> NapiStatus {
+    if work.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `work` came from `napi_create_async_work` and the addon promises it
+    // is not still queued; Node's contract is the same and deleting queued work is
+    // a use-after-free in Node too.
+    unsafe { crate::async_work::delete_work(work) };
+    status(env, NapiStatus::Ok)
+}
+
+#[export_name = "napi_queue_async_work"]
+pub unsafe extern "C" fn napi_queue_async_work(
+    env: *mut NapiEnv,
+    work: *mut crate::abi::NapiAsyncWork,
+) -> NapiStatus {
+    if work.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let Some(loop_pointer) = rn_uv::uv_loop::loop_ptr() else {
+        return status(env, NapiStatus::GenericFailure);
+    };
+    // SAFETY: `work` came from `napi_create_async_work`.
+    let queued = unsafe { (*(work.cast::<crate::async_work::AsyncWork>())).queue(loop_pointer) };
+    match queued {
+        Ok(()) => status(env, NapiStatus::Ok),
+        Err(code) => {
+            tracing::error!(code, "uv_queue_work failed for a Node-API async work");
+            status(env, NapiStatus::GenericFailure)
+        }
+    }
+}
+
+#[export_name = "napi_cancel_async_work"]
+pub unsafe extern "C" fn napi_cancel_async_work(
+    env: *mut NapiEnv,
+    work: *mut crate::abi::NapiAsyncWork,
+) -> NapiStatus {
+    if work.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `work` came from `napi_create_async_work`.
+    let code = unsafe { (*(work.cast::<crate::async_work::AsyncWork>())).cancel() };
+    // Node reports libuv's answer through `ConvertUVErrorCode`. `UV_EBUSY` — the
+    // work already started — is `napi_generic_failure` there, which is what an
+    // addon sees when it cancels too late.
+    let failure = match code {
+        0 => return status(env, NapiStatus::Ok),
+        libuv_sys2::uv_errno_t_UV_EINVAL => NapiStatus::InvalidArg,
+        _ => NapiStatus::GenericFailure,
+    };
+    status(env, failure)
+}
+
+// ---------------------------------------------------------------------------
+// Thread-safe functions
+// ---------------------------------------------------------------------------
+
+#[export_name = "napi_create_threadsafe_function"]
+pub unsafe extern "C" fn napi_create_threadsafe_function(
+    env: *mut NapiEnv,
+    func: *mut NapiValue,
+    async_resource: *mut NapiValue,
+    async_resource_name: *mut NapiValue,
+    max_queue_size: usize,
+    initial_thread_count: usize,
+    thread_finalize_data: *mut c_void,
+    thread_finalize_cb: crate::abi::NapiFinalize,
+    context: *mut c_void,
+    call_js_cb: crate::abi::NapiThreadsafeFunctionCallJs,
+    result: *mut *mut crate::abi::NapiThreadsafeFunction,
+) -> NapiStatus {
+    if async_resource_name.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // Node rejects a zero count outright: a function no thread may call into has
+    // no way to be used, and the count is what decides when it may be freed.
+    if initial_thread_count == 0 {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // Either a function or a `call_js_cb` has to be supplied; with neither there
+    // is nothing to run when a value arrives.
+    if func.is_null() && call_js_cb.is_none() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    if unsafe { env_from(env) }.is_none() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let Some(loop_pointer) = rn_uv::uv_loop::loop_ptr() else {
+        return status(env, NapiStatus::GenericFailure);
+    };
+
+    // The function and the two resource values are resolved inside the caller's
+    // scope: the function is rooted (a `Global`), and the resources are only
+    // checked, since there is no `AsyncResource` to attach them to.
+    let prepared = in_scope(|scope| {
+        let function = if func.is_null() {
+            None
+        } else {
+            // SAFETY: the handle comes from the current scope.
+            let local = unsafe { as_function(func) }?;
+            Some(v8::Global::new(scope, local))
+        };
+        if !async_resource.is_null() {
+            // SAFETY: as above.
+            let _ = unsafe { as_object(async_resource) }?;
+        }
+        // SAFETY: as above.
+        let _ = unsafe { as_string(async_resource_name) }?;
+        Ok::<_, NapiStatus>(function)
+    });
+    let function = match prepared {
+        None => return status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => return status(env, failure),
+        Some(Ok(function)) => function,
+    };
+
+    // SAFETY: the loop pointer is this process' loop, every pointer argument is
+    // forwarded to the addon unchanged, and the function was rooted above.
+    let created = unsafe {
+        crate::threadsafe::ThreadSafeFunction::create(crate::threadsafe::NewThreadSafeFunction {
+            env,
+            function,
+            max_queue_size,
+            initial_thread_count,
+            finalize_data: thread_finalize_data,
+            finalize_cb: thread_finalize_cb,
+            context,
+            call_js: call_js_cb,
+            loop_pointer,
+        })
+    };
+    match created {
+        Ok(pointer) => {
+            // SAFETY: the caller passed a writable slot for one pointer.
+            unsafe { result.write(pointer.cast()) };
+            status(env, NapiStatus::Ok)
+        }
+        Err(failure) => status(env, failure),
+    }
+}
+
+#[export_name = "napi_get_threadsafe_function_context"]
+pub unsafe extern "C" fn napi_get_threadsafe_function_context(
+    func: *mut crate::abi::NapiThreadsafeFunction,
+    result: *mut *mut c_void,
+) -> NapiStatus {
+    // Node has no `napi_env` here and reports a bare `napi_invalid_arg`.
+    if func.is_null() || result.is_null() {
+        return NapiStatus::InvalidArg;
+    }
+    // SAFETY: `func` came from `napi_create_threadsafe_function`.
+    let context = unsafe { crate::threadsafe::context_of(func) };
+    // SAFETY: the caller passed a writable slot for one pointer.
+    unsafe { result.write(context) };
+    NapiStatus::Ok
+}
+
+#[export_name = "napi_call_threadsafe_function"]
+pub unsafe extern "C" fn napi_call_threadsafe_function(
+    func: *mut crate::abi::NapiThreadsafeFunction,
+    data: *mut c_void,
+    is_blocking: crate::abi::NapiThreadsafeFunctionCallMode,
+) -> NapiStatus {
+    if func.is_null() {
+        return NapiStatus::InvalidArg;
+    }
+    // SAFETY: `func` came from `napi_create_threadsafe_function`. This may run on
+    // any thread; that is the entry point's whole purpose.
+    unsafe { crate::threadsafe::call(func, data, is_blocking) }
+}
+
+#[export_name = "napi_acquire_threadsafe_function"]
+pub unsafe extern "C" fn napi_acquire_threadsafe_function(
+    func: *mut crate::abi::NapiThreadsafeFunction,
+) -> NapiStatus {
+    if func.is_null() {
+        return NapiStatus::InvalidArg;
+    }
+    // SAFETY: as above.
+    unsafe { crate::threadsafe::acquire(func) }
+}
+
+#[export_name = "napi_release_threadsafe_function"]
+pub unsafe extern "C" fn napi_release_threadsafe_function(
+    func: *mut crate::abi::NapiThreadsafeFunction,
+    mode: crate::abi::NapiThreadsafeFunctionReleaseMode,
+) -> NapiStatus {
+    if func.is_null() {
+        return NapiStatus::InvalidArg;
+    }
+    // SAFETY: as above.
+    unsafe { crate::threadsafe::release(func, mode) }
+}
+
+#[export_name = "napi_ref_threadsafe_function"]
+pub unsafe extern "C" fn napi_ref_threadsafe_function(
+    _env: *mut NapiEnv,
+    func: *mut crate::abi::NapiThreadsafeFunction,
+) -> NapiStatus {
+    if func.is_null() {
+        return NapiStatus::InvalidArg;
+    }
+    // SAFETY: `func` came from `napi_create_threadsafe_function`, and this runs on
+    // the loop's thread as Node requires.
+    unsafe { crate::threadsafe::ref_handle(func) };
+    NapiStatus::Ok
+}
+
+#[export_name = "napi_unref_threadsafe_function"]
+pub unsafe extern "C" fn napi_unref_threadsafe_function(
+    _env: *mut NapiEnv,
+    func: *mut crate::abi::NapiThreadsafeFunction,
+) -> NapiStatus {
+    if func.is_null() {
+        return NapiStatus::InvalidArg;
+    }
+    // SAFETY: as above.
+    unsafe { crate::threadsafe::unref_handle(func) };
+    NapiStatus::Ok
+}
+
+#[export_name = "napi_fatal_error"]
+pub unsafe extern "C" fn napi_fatal_error(
+    location: *const c_char,
+    location_len: usize,
+    message: *const c_char,
+    message_len: usize,
+) -> ! {
+    // Node aborts the process from here. An addon calls this when it cannot
+    // continue — a broken invariant on a producer thread, say — and Node's
+    // contract is that it does not return, so returning would let the addon carry
+    // on in a state it declared impossible.
+    let place = read_bytes(location, location_len)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let text = read_bytes(message, message_len)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    eprintln!("FATAL ERROR: {place} {text}");
+    std::process::abort()
+}
+
+// ---------------------------------------------------------------------------
 // The declared surface
 // ---------------------------------------------------------------------------
 
@@ -1811,6 +2107,18 @@ pub const EXPORTED: &[&str] = &[
     "napi_get_version",
     "napi_get_node_version",
     "node_api_get_module_file_name",
+    "napi_create_async_work",
+    "napi_delete_async_work",
+    "napi_queue_async_work",
+    "napi_cancel_async_work",
+    "napi_create_threadsafe_function",
+    "napi_get_threadsafe_function_context",
+    "napi_call_threadsafe_function",
+    "napi_acquire_threadsafe_function",
+    "napi_release_threadsafe_function",
+    "napi_ref_threadsafe_function",
+    "napi_unref_threadsafe_function",
+    "napi_fatal_error",
 ];
 
 /// Entry points this build does not export, each with the reason it waits.
@@ -1822,14 +2130,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     (
         "napi_async_init / napi_async_destroy / napi_make_callback / napi_open_callback_scope / napi_close_callback_scope",
         "async context plumbing needs the AsyncWrap table reachable from the addon's env",
-    ),
-    (
-        "napi_create_async_work / napi_queue_async_work / napi_cancel_async_work / napi_delete_async_work",
-        "queued work needs the libuv thread pool and the loop's completion callback",
-    ),
-    (
-        "napi_create_threadsafe_function / napi_call_threadsafe_function / napi_acquire_threadsafe_function / napi_release_threadsafe_function",
-        "cross-thread calls need the isolate Locker and the shared queue",
     ),
     (
         "napi_create_buffer / napi_create_buffer_copy / napi_create_external_buffer / napi_get_buffer_info / napi_is_buffer / node_api_create_buffer_from_arraybuffer",
@@ -1908,7 +2208,7 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "cleanup hooks need an environment teardown path, which this runtime does not have yet",
     ),
     (
-        "napi_fatal_error / napi_fatal_exception / napi_adjust_external_memory",
+        "napi_fatal_exception / napi_adjust_external_memory",
         "fatal paths need the uncaught-exception handler; external memory needs the allocator hook",
     ),
     (
