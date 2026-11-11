@@ -113,19 +113,34 @@ pub(crate) struct ExceptionState {
     /// The scheduled exception, kept as a global so it survives the handle scope
     /// of the call that threw it.
     pending: Option<v8::Global<v8::Value>>,
+    /// Set when an exception is pending in V8 but no value was captured for it.
+    ///
+    /// `napi_call_function` observes V8's own empty result and must report
+    /// `napi_pending_exception`, but it cannot read the raised value from a
+    /// `PinScope`. The flag keeps `napi_is_exception_pending` truthful in that
+    /// case, and a later `napi_get_and_clear_last_exception` still asks V8 for the
+    /// value, which is the same answer Node gives.
+    pending_without_value: bool,
 }
 
 impl ExceptionState {
     pub(crate) fn is_pending(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.pending_without_value
     }
 
     pub(crate) fn take(&mut self) -> Option<v8::Global<v8::Value>> {
+        self.pending_without_value = false;
         self.pending.take()
     }
 
     pub(crate) fn set(&mut self, exception: v8::Global<v8::Value>) {
         self.pending = Some(exception);
+        self.pending_without_value = false;
+    }
+
+    /// Records that V8 has an exception pending whose value was not captured.
+    pub(crate) fn mark_pending(&mut self) {
+        self.pending_without_value = true;
     }
 }
 
@@ -271,6 +286,29 @@ impl Env {
 
     pub(crate) fn exceptions(&self) -> &RefCell<ExceptionState> {
         &self.exceptions
+    }
+
+    /// Drops any recorded pending exception.
+    ///
+    /// A thread-safe function takes a throw out of V8's pending state and hands it
+    /// to the uncaught-exception path. Without this, a later `napi_*` call would
+    /// still see the exception as pending and report `napi_pending_exception` for
+    /// a throw that has already been delivered.
+    pub(crate) fn clear_exceptions(&self) {
+        if let Ok(mut state) = self.exceptions.try_borrow_mut() {
+            state.take();
+        }
+    }
+
+    /// Marks that an exception is pending without replacing the pending value.
+    ///
+    /// `napi_call_function` sees V8's own empty result and must report
+    /// `napi_pending_exception`; the value V8 raised stays the one
+    /// `napi_get_and_clear_last_exception` returns.
+    pub(crate) fn mark_exception_pending(&self) {
+        if let Ok(mut state) = self.exceptions.try_borrow_mut() {
+            state.mark_pending();
+        }
     }
 }
 

@@ -433,3 +433,79 @@ fn a_threadsafe_function_keeps_the_process_alive_until_it_is_released() {
     ));
     assert_eq!(stdout, "finalized 20 20");
 }
+
+#[test]
+fn a_throw_from_a_threadsafe_callback_reaches_the_uncaught_exception_listener() {
+    // A thread-safe function's callback runs with no JavaScript frame above it, so
+    // a throw there has nowhere to propagate. Node routes it through
+    // `env->CallbackIntoModule`, which lands in `TriggerUncaughtException`: the
+    // `uncaughtException` listener gets the error and the process keeps running.
+    //
+    // Before this was implemented the throw was left pending and V8's default
+    // reporter printed `Uncaught Error: ...` while the process still exited 0, so
+    // the error reached nobody who could handle it. The assertion below fails if
+    // that regresses, because the listener would never record a message.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const seen = [];\n\
+         process.on('uncaughtException', (error) => seen.push(error.message));\n\
+         addon.startThreadSafeProducer(\n\
+           () => {{ throw new Error('callback boom'); }},\n\
+           2,\n\
+           () => setTimeout(() => console.log('seen=' + seen.join(',')), 60));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "seen=callback boom,callback boom");
+}
+
+#[test]
+fn a_throw_from_a_threadsafe_finalizer_reaches_the_uncaught_exception_listener() {
+    // The finalizer is addon code too, and Node runs it through `CallFinalizer`
+    // with the same exception handling as a value callback.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const seen = [];\n\
+         process.on('uncaughtException', (error) => seen.push(error.message));\n\
+         addon.startThreadSafeProducer(\n\
+           () => {{}},\n\
+           1,\n\
+           () => {{\n\
+             queueMicrotask(() =>\n\
+               setTimeout(() => console.log('seen=' + seen.join(',')), 40));\n\
+             throw new Error('finalizer boom');\n\
+           }});",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "seen=finalizer boom");
+}
+
+#[test]
+fn a_throw_from_a_threadsafe_callback_reaches_the_listener_before_pending_microtasks() {
+    // The ordering is Node's, and it is not the intuitive one. `InternalMakeCallback`
+    // returns early with `MarkAsFailed()` when the callback throws, so
+    // `InternalCallbackScope::Close` hits `if (failed_) return;` and its
+    // `PerformCheckpoint` never runs. The uncaught trigger therefore precedes a
+    // microtask the throwing callback queued.
+    //
+    // Verified against real Node 22 with `--force-node-api-uncaught-exceptions-policy`,
+    // which reports `callback,listener,microtask`. A fix that "drained microtasks
+    // first" would produce the opposite order and be wrong.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const order = [];\n\
+         process.on('uncaughtException', () => order.push('listener'));\n\
+         addon.startThreadSafeProducer(\n\
+           () => {{\n\
+             order.push('callback');\n\
+             queueMicrotask(() => order.push('microtask'));\n\
+             throw new Error('boom');\n\
+           }},\n\
+           1,\n\
+           () => setTimeout(() => console.log(order.join(',')), 60));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "callback,listener,microtask");
+}

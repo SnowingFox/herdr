@@ -392,14 +392,23 @@ impl ThreadSafeFunction {
         }
 
         if let Some(finalize_cb) = this.finalize_cb {
-            let delivered = crate::scope::with_context(|scope| {
-                let guard = crate::scope::ScopeGuard::enter(scope);
-                // SAFETY: `finalize_cb` is the addon's own callback, `this.env` is
-                // the environment it was created against, and the scope guard
-                // makes any `napi_value` it creates valid.
-                unsafe { finalize_cb(this.env, this.finalize_data, this.context) };
-                drop(guard);
-            });
+            // The finalizer is addon code that can throw exactly like a value
+            // callback can, and Node routes it through the same
+            // `CallFinalizer`/`CallbackIntoModule` machinery, so it gets the same
+            // try-catch, checkpoint and uncaught trigger.
+            // SAFETY: `this.env` is the environment the function was created
+            // against.
+            let delivered = unsafe {
+                call_into_module(this.env, |scope| {
+                    let _ = scope;
+                    // SAFETY (fn-level): this closure body runs inside
+                    // `call_into_module`, which is `unsafe fn` and whose caller
+                    // guarantees `this.env` is live. `finalize_cb` is the addon's
+                    // own pointer, and the scope guard makes any `napi_value` it
+                    // creates valid.
+                    finalize_cb(this.env, this.finalize_data, this.context);
+                })
+            };
             if delivered.is_none() {
                 tracing::error!(
                     "a thread-safe function finalizer fired with no V8 context recorded; \
@@ -540,6 +549,75 @@ unsafe extern "C" fn on_async(handle: *mut uv::uv_async_t) {
     this.send();
 }
 
+/// Runs `body` inside the isolate with Node-API's callback semantics.
+///
+/// This is the wrapper every addon callback a thread-safe function runs goes
+/// through, and it exists so the throw handling is written once:
+///
+/// 1. `body` runs inside a `v8::TryCatch`, matching `v8impl::TryCatch` around every
+///    `napi_env__::CallIntoModule` entry.
+/// 2. If the callback threw, the exception is handed to
+///    [`trigger_fatal_exception`] **before** any microtask checkpoint, and the
+///    checkpoint does not run at all. Node reaches the same state by returning
+///    from `InternalMakeCallback` with `MarkAsFailed()` set, which makes
+///    `InternalCallbackScope::Close` return early at `if (failed_) return;`
+///    (`src/api/callback.cc`), skipping its `PerformCheckpoint`.
+/// 3. Only a callback that returned normally reaches the checkpoint, which is the
+///    order `Close` documents for the success path. A microtask that throws there
+///    is then triggered too.
+///
+/// Returns `None` when no V8 context is recorded, so the caller can report that
+/// the callback never ran.
+///
+/// # Safety
+///
+/// `env` must be the environment the callback belongs to, or null.
+unsafe fn call_into_module<R>(
+    env: *mut NapiEnv,
+    body: impl FnOnce(&mut v8::PinScope<'_, '_, v8::Context>) -> R,
+) -> Option<R> {
+    let outcome = crate::scope::with_context(|outer| {
+        let guard = crate::scope::ScopeGuard::enter(outer);
+        // `v8::TryCatch::new` wraps the handle scope the binding is already inside,
+        // so the body runs with a try-catch between V8 and the addon's callback.
+        let try_catch = std::pin::pin!(v8::TryCatch::new(outer));
+        let scope = &mut try_catch.init();
+        let result = body(scope);
+        // Node's order, from `InternalMakeCallback`: a callback that threw takes
+        // `scope.MarkAsFailed(); return MaybeLocal<Value>();` *before*
+        // `scope.Close()`, and the destructor's `Close()` then returns at
+        // `if (failed_) return;`. So the microtask checkpoint in `Close()` never
+        // runs on the throwing path, and the uncaught trigger happens first.
+        //
+        // Verified against real Node: a TSFN callback that throws and queues a
+        // microtask reports `callback, listener, microtask`, not
+        // `callback, microtask, listener`.
+        let caught = if scope.has_caught() {
+            scope.exception()
+        } else {
+            // The callback returned normally, so `Close()` does run: the checkpoint
+            // comes next and may itself surface a throw from a microtask.
+            scope.perform_microtask_checkpoint();
+            if scope.has_caught() {
+                scope.exception()
+            } else {
+                None
+            }
+        };
+        let rooted = caught.map(|exception| v8::Global::new(scope, exception));
+        let _ = &guard;
+        (result, rooted)
+    });
+    match outcome {
+        None => None,
+        Some((result, None)) => Some(result),
+        Some((result, Some(exception))) => {
+            trigger_fatal_exception(env, exception);
+            Some(result)
+        }
+    }
+}
+
 /// Runs the addon's JavaScript callback for one queued value.
 ///
 /// # Safety
@@ -548,38 +626,75 @@ unsafe extern "C" fn on_async(handle: *mut uv::uv_async_t) {
 unsafe fn deliver(this_pointer: *const ThreadSafeFunction, data: *mut c_void) {
     // SAFETY: the caller guarantees the pointer is live.
     let this = unsafe { &*this_pointer };
-    let delivered = crate::scope::with_context(|scope| {
-        let guard = crate::scope::ScopeGuard::enter(scope);
-        // The rooted function becomes a handle again inside this scope. It is
-        // `None` when the addon passed no `func`, in which case `call_js_cb` is
-        // required and receives null here, which is Node's contract.
-        let callback_handle: *mut NapiValue = match this.function.lock() {
-            Ok(slot) => match slot.as_ref() {
-                Some(rooted) => {
-                    let local: v8::Local<v8::Value> = v8::Local::new(scope, rooted).into();
-                    to_napi(local)
+    // SAFETY: `env` is the environment this function was created against, or null.
+    let delivered = unsafe {
+        call_into_module(this.env, |scope| {
+            // The rooted function becomes a handle again inside this scope. It is
+            // `None` when the addon passed no `func`, in which case `call_js_cb` is
+            // required and receives null here, which is Node's contract.
+            let callback_handle: *mut NapiValue = match this.function.lock() {
+                Ok(slot) => match slot.as_ref() {
+                    Some(rooted) => {
+                        let local: v8::Local<v8::Value> = v8::Local::new(scope, rooted).into();
+                        to_napi(local)
+                    }
+                    None => ptr::null_mut(),
+                },
+                Err(_) => ptr::null_mut(),
+            };
+            match this.call_js {
+                Some(call_js) => {
+                    // SAFETY (fn-level): `deliver` is `unsafe fn` and its caller
+                    // guarantees the TSFN is live, so `this.env`, `this.context`
+                    // and `data` are the addon's own. `call_js` is its callback.
+                    call_js(this.env, callback_handle, this.context, data);
                 }
-                None => ptr::null_mut(),
-            },
-            Err(_) => ptr::null_mut(),
-        };
-        match this.call_js {
-            Some(call_js) => {
-                // SAFETY: the addon's own callback, with the environment and
-                // context it was created with. The scope guard is alive.
-                unsafe { call_js(this.env, callback_handle, this.context, data) };
+                None => {
+                    // SAFETY (fn-level): `callback_handle` was built in `scope`
+                    // just above, and `default_call_js` only reads it there.
+                    default_call_js(scope, callback_handle);
+                }
             }
-            None => {
-                // SAFETY: `callback_handle` was just built in this scope.
-                unsafe { default_call_js(scope, callback_handle) };
-            }
-        }
-        drop(guard);
-    });
+        })
+    };
     if delivered.is_none() {
         tracing::error!(
             "a thread-safe function value arrived with no V8 context recorded; \
              it was dropped instead of being delivered"
+        );
+    }
+}
+
+/// Hands a caught exception to the runtime's uncaught-exception path.
+///
+/// Node's `CallbackIntoModule` calls `env->trigger_fatal_exception(...)`, which is
+/// `errors::TriggerUncaughtException`: `process._fatalException` gets the first
+/// chance to handle it, and only a `false` answer reaches the print-and-exit
+/// path. `rn-errors::report_uncaught_exception` implements exactly that order and
+/// is what the event loop already uses for a throwing timer callback, so a
+/// thread-safe function's throw lands in the same place as any other asynchronous
+/// throw.
+///
+/// The exception arrives as a `Global` because the scope that caught it has been
+/// left by the time this runs.
+fn trigger_fatal_exception(env: *mut NapiEnv, exception: v8::Global<v8::Value>) {
+    let triggered = crate::scope::with_context(|scope| {
+        let guard = crate::scope::ScopeGuard::enter(scope);
+        let local: v8::Local<v8::Value> = v8::Local::new(scope, &exception);
+        rn_errors::report_uncaught_exception(scope, local);
+        drop(guard);
+        // The environment's `last_exception` must not keep a stale value, or the
+        // next `napi_*` call reports `napi_pending_exception` for a throw that has
+        // already been delivered.
+        // SAFETY: `env` is null or one of this crate's environments.
+        if let Some(environment) = unsafe { crate::env::env_from(env) } {
+            environment.clear_exceptions();
+        }
+    });
+    if triggered.is_none() {
+        tracing::error!(
+            "a thread-safe function's exception could not be reported: \
+             no V8 context is recorded"
         );
     }
 }

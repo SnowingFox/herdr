@@ -1265,9 +1265,18 @@ pub unsafe extern "C" fn napi_call_function(
             // SAFETY: as above.
             arguments.push(unsafe { as_value(handle) }?);
         }
-        let value = function
-            .call(scope, receiver, &arguments)
-            .ok_or(NapiStatus::GenericFailure)?;
+        // Node's `napi_call_function` reports `napi_pending_exception` when the
+        // call threw: `CHECK_MAYBE_EMPTY_WITH_PREAMBLE` maps an empty `MaybeLocal`
+        // to `try_catch.HasCaught() ? napi_pending_exception : napi_generic_failure`.
+        // Addon code depends on the distinction -- `NODE_API_CALL` reads
+        // `napi_get_last_error_info` and would otherwise throw the generic text
+        // instead of letting the real exception propagate.
+        //
+        // The thrown value is recovered from the scope's own pending exception
+        // after `call` returns `None`, which is exactly when V8 left one there.
+        let Some(value) = function.call(scope, receiver, &arguments) else {
+            return Err(pending_exception_status(env));
+        };
         Ok(to_napi(value))
     });
     match outcome {
@@ -1366,6 +1375,25 @@ fn throw(env: *mut NapiEnv, exception: v8::Local<'_, v8::Value>) {
             state.set(global);
         });
     }
+}
+
+/// Reports `napi_pending_exception` after a call threw.
+///
+/// Node's `napi_call_function` maps an empty `MaybeLocal` to
+/// `try_catch.HasCaught() ? napi_pending_exception : napi_generic_failure`, and
+/// the status matters: `NODE_API_CALL` in an addon reads
+/// `napi_get_last_error_info` and would otherwise throw "Unknown failure" instead
+/// of letting the real exception propagate.
+///
+/// The exception itself is already pending on the isolate. Recording it in the
+/// environment's exception state is what makes `napi_is_exception_pending` and
+/// `napi_get_and_clear_last_exception` agree with the status.
+fn pending_exception_status(env: *mut NapiEnv) -> NapiStatus {
+    // SAFETY: `env` is null or one of this crate's environments.
+    if let Some(environment) = unsafe { env_from(env) } {
+        environment.mark_exception_pending();
+    }
+    NapiStatus::PendingException
 }
 
 #[export_name = "napi_throw"]
