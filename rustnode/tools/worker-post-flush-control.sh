@@ -132,7 +132,7 @@ function sabChecks() {
     assert.strictEqual(received.constructor.name, 'SharedArrayBuffer', 'received type');
     assert.strictEqual(received.byteLength, 16, 'received length');
     assert.strictEqual(new Uint8Array(received)[0], 7, 'the bytes crossed');
-    // A write through the received view must be visible from the sender's.
+    // A write through the received view must be visible on the sending side.
     new Uint8Array(received)[1] = 9;
     assert.strictEqual(view[1], 9, 'the buffer is shared, not copied');
     assert.strictEqual(original.byteLength, 16, 'the sender buffer was not detached');
@@ -143,7 +143,7 @@ function sabChecks() {
 }
 
 // One buffer, referenced twice in one message: once directly and once as a
-// `Uint32Array`'s backing store. Both ids must resolve to ONE object, or a
+// as a `Uint32Array` backing store. Both ids must resolve to ONE object, or a
 // counter written through the view stops being visible through the buffer.
 function dedupChecks() {
   const { port1, port2 } = new MessageChannel();
