@@ -58,6 +58,26 @@ step "the per-context globals audit"
 # keeps the audit's own result from depending on that restore behaviour.
 ./target/debug/rustnode tools/per-context-audit.js
 
+step "the per-context globals still behave as Node's do"
+# The control for the per-context work: DOMException is a real `Error`, the
+# messaging binding hands back the same class, and `structuredClone` survives the
+# per-isolate symbols. It ships as a plain statement for the same reason as the
+# matcher tests above -- a bare command's status is the gate's status under
+# `set -e`, while `| tee` or `$( )` would let a failing control fall through to a
+# green gate. That is not hypothetical here: this control reported a stale PASS
+# once already, which is why it re-checks the build it used.
+#
+# It belongs after the build because every assertion runs against the rustnode
+# realm, and warm it costs ~0.4s, so there is no reason to leave it opt-in.
+#
+# It runs before the cipher self-test for the same reason the audit above does:
+# that self-test restores `target/debug/rustnode` by `cp`-ing a `mktemp` backup
+# into the path it deleted, which recreates the file mode 0600. This control
+# execs the binary directly, so it has to run while the binary is still
+# executable. `cargo test` later rebuilds and restores the mode, which is why
+# nothing after the self-test noticed.
+./tools/per-context-control.sh
+
 step "the cipher control still reports a void run as a void run"
 # The control's exit contract — 3 for "the build failed, so there is no
 # verdict", distinct from 1 for "the control misbehaved" — is what stops a
