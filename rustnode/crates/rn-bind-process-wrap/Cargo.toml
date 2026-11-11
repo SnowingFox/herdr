@@ -10,6 +10,7 @@ description = "internalBinding('process_wrap') for rustnode"
 [dependencies]
 libuv-sys2.workspace = true
 rn-core.workspace = true
+rn-permission = { path = "../rn-permission" }
 rn-uv.workspace = true
 tracing.workspace = true
 rn-v8-sys.workspace = true

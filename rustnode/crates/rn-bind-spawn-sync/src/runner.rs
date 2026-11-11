@@ -265,6 +265,21 @@ pub fn spawn(
         return;
     };
 
+    // `SyncProcessRunner::Spawn` reads `options.file` and checks the child
+    // scope before the runner is constructed, so a denied executable never
+    // starts. The read-only-when-enabled guard there is only an optimisation —
+    // the check itself is unconditional — and the resource is the file name,
+    // not a resolved path.
+    if let Some(file) = crate::property(scope, options, "file") {
+        if let Ok(file) = v8::Local::<v8::String>::try_from(file) {
+            let resource = file.to_rust_string_lossy(scope);
+            if let Some(denied) = rn_permission::runtime::deny_child_process(&resource) {
+                denied.throw(scope);
+                return;
+            }
+        }
+    }
+
     let outcome = match run(scope, options) {
         Some(outcome) => outcome,
         // The option parsing already threw.
