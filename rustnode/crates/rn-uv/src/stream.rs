@@ -45,6 +45,7 @@ use crate::callback;
 use crate::handle::{
     self, Allocation, StreamState, K_BYTES_WRITTEN, K_LAST_WRITE_ERR, K_LAST_WRITE_WAS_ASYNC,
 };
+use crate::listener;
 
 thread_local! {
     /// The shared `streamBaseState` buffer.
@@ -61,9 +62,10 @@ thread_local! {
     /// The read allocation libuv is currently filling.
     ///
     /// `uv_read_start`'s allocator returns a raw buffer and the read callback
-    /// gets it back by pointer, so the length has to be remembered between the
-    /// two calls to rebuild it as an owned [`Allocation`].
-    static PENDING_ALLOCATION: RefCell<Option<(*mut u8, usize)>> = const { RefCell::new(None) };
+    /// gets it back by pointer, so what it was has to be remembered between the
+    /// two calls: the address and length of an allocation this crate made, or
+    /// the listener's own `uv_buf_t`, which is not ours to free.
+    static PENDING_ALLOCATION: RefCell<Option<PendingAllocation>> = const { RefCell::new(None) };
 }
 
 /// The `streamBaseState` typed array, created on first use.
@@ -196,6 +198,9 @@ pub unsafe fn queue_write(
     let completion = Box::new(WriteCompletion {
         request: v8::Global::new(scope.as_ref(), request),
         handle: v8::Global::new(scope.as_ref(), handle_object),
+        // SAFETY: the caller guarantees `stream` is live, and a live stream's
+        // `data` is its `StreamState`.
+        state: unsafe { handle::owner(stream) }.unwrap_or(ptr::null_mut()),
         owned,
     });
     let completion = Box::into_raw(completion);
@@ -244,6 +249,15 @@ pub unsafe fn queue_write(
 struct WriteCompletion {
     request: v8::Global<v8::Object>,
     handle: v8::Global<v8::Object>,
+    /// The stream the write was queued on, so the completion can reach its
+    /// listener chain.
+    ///
+    /// `crypto_tls.cc:784` writes its ciphertext through
+    /// `underlying_stream()->Write(...)`, and the completion arrives at the
+    /// *underlying* stream — so it has to reach the `TLSWrap` listening to it
+    /// rather than JavaScript, or the cleartext write's callback never fires and
+    /// `lib/net.js`'s `pending` count never reaches zero.
+    state: *mut StreamState,
     /// String backing storage, freed with this struct.
     #[allow(dead_code)]
     owned: Vec<Box<[u8]>>,
@@ -272,7 +286,11 @@ unsafe extern "C" fn after_write(request: *mut uv::uv_write_t, status: i32) {
     callback::with_context(|scope| {
         let request: v8::Local<v8::Object> = v8::Local::new(scope, &completion.request);
         let handle: v8::Local<v8::Object> = v8::Local::new(scope, &completion.handle);
-        report_completion(scope, request, status, Some(handle), None);
+        // SAFETY: the state outlives its handle's completions, and `emit_after_write`
+        // holds no reference to it across the listener call.
+        unsafe {
+            listener::emit_after_write(completion.state, scope, request, Some(handle), status)
+        };
     });
 }
 
@@ -280,6 +298,8 @@ unsafe extern "C" fn after_write(request: *mut uv::uv_write_t, status: i32) {
 struct ShutdownCompletion {
     request: v8::Global<v8::Object>,
     handle: v8::Global<v8::Object>,
+    /// The stream the shutdown was queued on; see [`WriteCompletion::state`].
+    state: *mut StreamState,
 }
 
 /// Issues `uv_shutdown`, reporting to `request.oncomplete`.
@@ -296,6 +316,8 @@ pub unsafe fn queue_shutdown(
     let completion = Box::new(ShutdownCompletion {
         request: v8::Global::new(scope.as_ref(), request),
         handle: v8::Global::new(scope.as_ref(), handle_object),
+        // SAFETY: as in `queue_write`.
+        state: unsafe { handle::owner(stream) }.unwrap_or(ptr::null_mut()),
     });
     let completion = Box::into_raw(completion);
 
@@ -343,7 +365,11 @@ unsafe extern "C" fn after_shutdown(request: *mut uv::uv_shutdown_t, status: i32
     callback::with_context(|scope| {
         let request: v8::Local<v8::Object> = v8::Local::new(scope, &completion.request);
         let handle: v8::Local<v8::Object> = v8::Local::new(scope, &completion.handle);
-        report_completion(scope, request, status, Some(handle), None);
+        // SAFETY: as in `after_write`; `emit_after_shutdown` holds no reference
+        // to the state across the listener call.
+        unsafe {
+            listener::emit_after_shutdown(completion.state, scope, request, Some(handle), status)
+        };
     });
 }
 
@@ -377,16 +403,40 @@ pub unsafe fn read_stop(stream: *mut uv::uv_stream_t) -> i32 {
 
 /// libuv's read allocator.
 ///
+/// This is `LibuvStreamWrap::OnUvAlloc` (`src/stream_wrap.cc:247`), whose whole
+/// body is `*buf = EmitAlloc(suggested_size)`. So the buffer does not have to be
+/// this crate's: an attached listener — `TLSWrap`'s, which points into its
+/// `NodeBIO` — decides where the bytes land.
+///
 /// # Safety
 ///
 /// Called by libuv with a live handle and a writable `uv_buf_t`.
 unsafe extern "C" fn on_alloc(
-    _handle: *mut uv::uv_handle_t,
+    handle: *mut uv::uv_handle_t,
     suggested_size: usize,
     buffer: *mut uv::uv_buf_t,
 ) {
     if buffer.is_null() {
         return;
+    }
+    let state = unsafe { handle::owner(handle.cast::<uv::uv_stream_t>()) };
+    if let Some(state) = state {
+        // SAFETY: `state` is the owner pointer the binding stored on the handle,
+        // live until the close callback runs, which is after every read.
+        if let Some(listener_buffer) = unsafe { listener::emit_alloc(state, suggested_size) } {
+            // SAFETY: `buffer` is libuv's out-parameter, live for this call. A
+            // listener's buffer is not ours to free, so nothing is parked in
+            // `PENDING_ALLOCATION`; the read callback gets it back through the
+            // `ReadBuffer::Listener` arm instead.
+            unsafe {
+                (*buffer).base = listener_buffer.base;
+                (*buffer).len = listener_buffer.len;
+            }
+            PENDING_ALLOCATION.with(|slot| {
+                *slot.borrow_mut() = Some(PendingAllocation::Listener(listener_buffer));
+            });
+            return;
+        }
     }
     let Some(mut allocation) = Allocation::new(suggested_size) else {
         // SAFETY: `buffer` is libuv's out-parameter; a zero length is how it is
@@ -406,19 +456,43 @@ unsafe extern "C" fn on_alloc(
     }
     std::mem::forget(allocation);
     PENDING_ALLOCATION.with(|slot| {
-        *slot.borrow_mut() = Some((base, length));
+        *slot.borrow_mut() = Some(PendingAllocation::Allocated((base, length)));
     });
 }
 
-/// Rebuilds the parked read allocation as an owned [`Allocation`].
-fn take_allocation() -> Option<Allocation> {
-    let (address, length) = PENDING_ALLOCATION.with(|slot| slot.borrow_mut().take())?;
-    // SAFETY: `address` and `length` are exactly what `on_alloc` handed libuv,
-    // which uses an 8-byte alignment for every read buffer.
-    Some(unsafe { Allocation::from_raw(address, length) })
+/// The allocation an `alloc_cb` produced, parked until the matching `read_cb`.
+///
+/// Node parks nothing: `stream_base-inl.h`'s `EmitRead` gets the `uv_buf_t` back
+/// from libuv and `EmitToJSStreamListener` releases it through the read slab it
+/// owns. rustnode allocates outside the slab, so the two shapes have to be told
+/// apart, and the listener's own buffer must never be freed here.
+enum PendingAllocation {
+    /// This crate allocated it; the reader frees it.
+    Allocated((*mut u8, usize)),
+    /// A listener returned it; the listener owns it.
+    Listener(uv::uv_buf_t),
+}
+
+/// Rebuilds the parked read allocation as an owned [`ReadBuffer`].
+fn take_allocation() -> Option<listener::ReadBuffer> {
+    match PENDING_ALLOCATION.with(|slot| slot.borrow_mut().take())? {
+        PendingAllocation::Allocated((address, length)) => {
+            // SAFETY: `address` and `length` are exactly what `on_alloc` handed
+            // libuv, which uses an 8-byte alignment for every read buffer.
+            Some(listener::ReadBuffer::Allocated(unsafe {
+                Allocation::from_raw(address, length)
+            }))
+        }
+        PendingAllocation::Listener(buffer) => Some(listener::ReadBuffer::Listener(buffer)),
+    }
 }
 
 /// libuv's read completion.
+///
+/// This is `LibuvStreamWrap::OnUvRead` (`src/stream_wrap.cc:289`), whose last
+/// act is `EmitRead(nread, *buf)`. Everything the read used to hand straight to
+/// `handle.onread` now goes through the listener chain, so a `TLSWrap` between
+/// the socket and JavaScript sees the ciphertext first.
 ///
 /// # Safety
 ///
@@ -433,18 +507,20 @@ unsafe extern "C" fn on_read(
         drop(take_allocation());
         return;
     };
-    // SAFETY: `state` is the owner pointer, live while the handle is, and nothing
-    // else borrows it during this callback.
-    let state = unsafe { &mut *state };
+    let buffer =
+        take_allocation().unwrap_or_else(|| listener::ReadBuffer::Listener(empty_buffer()));
+    // SAFETY: `state` is the owner pointer, live while the handle is. `emit_read`
+    // takes no reference across the listener call, so a listener that closes the
+    // socket here cannot alias it.
+    unsafe { listener::emit_read(state, status, buffer) };
+}
 
-    let allocation = if status > 0 { take_allocation() } else { None };
-    if status <= 0 {
-        // A failed or empty read still releases the allocator's buffer.
-        drop(take_allocation());
+/// A zero-length buffer, for a read that produced no allocation.
+fn empty_buffer() -> uv::uv_buf_t {
+    uv::uv_buf_t {
+        base: ptr::null_mut(),
+        len: 0,
     }
-    with_state(|stream_base_state| {
-        handle::deliver_read(state, stream_base_state, status, allocation);
-    });
 }
 
 /// Rooted JavaScript values a completion needs, so it can be handed to another

@@ -18,6 +18,9 @@
 //! * [`addr`] — the `sockaddr` conversions and the `{ address, family, port }`
 //!   shape `lib/net.js` reads out of `getsockname()`.
 //! * [`handle`] — the per-handle state every stream wrap keeps.
+//! * [`listener`] — `StreamListener`: how one stream receives the reads another
+//!   stream performed, which is what a `TLSWrap` with no libuv handle of its own
+//!   is built on.
 //! * [`stream`] — the read, write and shutdown paths `TCP` and `Pipe` share.
 //! * [`stream_base`] — the `StreamBase` methods both socket bindings install.
 //!
@@ -31,6 +34,7 @@
 pub mod addr;
 pub mod callback;
 pub mod handle;
+pub mod listener;
 pub mod stream;
 pub mod stream_base;
 pub mod streams;
