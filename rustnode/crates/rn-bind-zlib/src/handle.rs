@@ -34,13 +34,16 @@ use rn_v8_sys::v8;
 use crate::brotli::{BrotliError, BrotliStream};
 use crate::constants::*;
 use crate::zlib::{ZlibError, ZlibStream};
+use crate::zstd::{ZstdCompressStream, ZstdDecompressStream, ZstdError, CONTENTSIZE_UNKNOWN};
 use crate::AfterWrite;
 use crate::ZlibMode;
 
-/// Everything a handle can be: one of the zlib modes, or Brotli.
+/// Everything a handle can be: one of the zlib modes, Brotli, or zstd.
 pub(crate) enum Backend {
     Zlib(Box<ZlibStream>),
     Brotli(Box<BrotliStream>),
+    ZstdCompress(Box<ZstdCompressStream>),
+    ZstdDecompress(Box<ZstdDecompressStream>),
 }
 
 /// A handle's native state, owned by the JS object through an internal field.
@@ -110,6 +113,8 @@ impl HandleState {
         match &self.backend {
             Backend::Zlib(stream) => stream.error_info().map(StreamError::Zlib),
             Backend::Brotli(stream) => stream.error_info().map(StreamError::Brotli),
+            Backend::ZstdCompress(stream) => stream.error_info().cloned().map(StreamError::Zstd),
+            Backend::ZstdDecompress(stream) => stream.error_info().cloned().map(StreamError::Zstd),
         }
     }
 
@@ -117,6 +122,15 @@ impl HandleState {
         match &mut self.backend {
             Backend::Zlib(stream) => stream.write(flush, input, output),
             Backend::Brotli(stream) => stream.write(flush, input, output),
+            Backend::ZstdCompress(stream) => stream.write(flush, input, output),
+            Backend::ZstdDecompress(stream) => {
+                let after = stream.write(flush, input, output);
+                // `ZstdDecompressContext::GetErrorInfo` runs after the step and
+                // is where a truncated frame turns into `Z_BUF_ERROR`; the
+                // compressor has no equivalent check.
+                stream.check_truncated(after.avail_in, after.avail_out);
+                after
+            }
         }
     }
 
@@ -125,6 +139,9 @@ impl HandleState {
             Backend::Zlib(stream) => stream.set_params(level, strategy).map(StreamError::Zlib),
             // `BrotliCompressionStream::Params()` is a documented no-op.
             Backend::Brotli(_) => None,
+            // `ZstdStream::Params()` is likewise a documented no-op: zstd
+            // parameters are set at init and cannot be changed mid-stream.
+            Backend::ZstdCompress(_) | Backend::ZstdDecompress(_) => None,
         }
     }
 
@@ -132,6 +149,8 @@ impl HandleState {
         match &mut self.backend {
             Backend::Zlib(stream) => stream.reset().map(StreamError::Zlib),
             Backend::Brotli(stream) => stream.reset().map(StreamError::Brotli),
+            Backend::ZstdCompress(stream) => stream.reset().map(StreamError::Zstd),
+            Backend::ZstdDecompress(stream) => stream.reset().map(StreamError::Zstd),
         }
     }
 
@@ -142,6 +161,8 @@ impl HandleState {
         match &mut self.backend {
             Backend::Zlib(stream) => stream.close(),
             Backend::Brotli(stream) => stream.close(),
+            Backend::ZstdCompress(stream) => stream.close(),
+            Backend::ZstdDecompress(stream) => stream.close(),
         }
         self.pending_error = None;
         // `write_cb` and `receiver` are *not* cleared here. Node's
@@ -158,6 +179,7 @@ impl HandleState {
 pub(crate) enum StreamError {
     Zlib(ZlibError),
     Brotli(BrotliError),
+    Zstd(ZstdError),
 }
 
 impl StreamError {
@@ -165,6 +187,7 @@ impl StreamError {
         match self {
             Self::Zlib(error) => (&error.message, error.err, error.code),
             Self::Brotli(error) => (&error.message, error.err, &error.code),
+            Self::Zstd(error) => (&error.message, error.err, &error.code),
         }
     }
 
@@ -367,21 +390,20 @@ fn brotli_decoder_constructor<'s>(
 
 /// `new binding.ZstdCompress()`.
 ///
-/// Zstd is its own `node_zlib_mode` family with a separate parameter namespace,
-/// pledged source sizes and `ZSTD_e_*` directives; implementing it is a distinct
-/// piece of work from the zlib/Brotli contract this crate targets. The
-/// constructor is registered anyway because `lib/zlib.js` builds both zstd
-/// handles unconditionally — in `createDefaultHandle`, which every
-/// `zstdCompress*`/`zstdDecompress*` call reaches. Without the property the
-/// namespace shape would be wrong; with it, using zstd reports a clear
-/// "unsupported" instead of failing as a `TypeError`.
+/// The context is created here rather than in `init` because the handle has to
+/// exist before JavaScript can call `init`, and Node's `ZstdStream::New` does
+/// the same. `init` installs the parameters and the dictionary, and may replace
+/// the context when it starts over.
 fn zstd_compress_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
-    let _ = args.this();
-    throw(scope, "zstd is not implemented by rn-bind-zlib");
+    install_state(
+        scope,
+        args.this(),
+        Backend::ZstdCompress(Box::new(ZstdCompressStream::uninitialized())),
+    );
 }
 
 /// `new binding.ZstdDecompress()`; see [`zstd_compress_constructor`].
@@ -390,8 +412,11 @@ fn zstd_decompress_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
-    let _ = args.this();
-    throw(scope, "zstd is not implemented by rn-bind-zlib");
+    install_state(
+        scope,
+        args.this(),
+        Backend::ZstdDecompress(Box::new(ZstdDecompressStream::uninitialized())),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +428,8 @@ fn zstd_decompress_constructor<'s>(
 /// * `Zlib`: `(windowBits, level, memLevel, strategy, writeState, writeCallback,
 ///   dictionary[, rejectGarbageAfterEnd])`
 /// * `Brotli*`: `(params, writeState, writeCallback[, dictionary])`
+/// * `Zstd*`: `(params, pledgedSrcSize, writeState, writeCallback[,
+///   dictionary[, rejectGarbageAfterEnd]])`
 fn init<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -412,15 +439,26 @@ fn init<'s>(
 
     let outcome = with_state(object, |state| {
         let callback_index = match &mut state.backend {
-            Backend::Zlib(stream) => init_zlib(scope, &args, stream).map(|()| 5),
-            Backend::Brotli(stream) => init_brotli(scope, &args, stream).map(|()| 2),
+            Backend::Zlib(stream) => init_zlib(scope, &args, stream)
+                .map(|()| 5)
+                .map_err(InitError::Plain),
+            Backend::Brotli(stream) => init_brotli(scope, &args, stream)
+                .map(|()| 2)
+                .map_err(InitError::Plain),
+            Backend::ZstdCompress(stream) => init_zstd_compress(scope, &args, stream).map(|()| 3),
+            Backend::ZstdDecompress(stream) => {
+                init_zstd_decompress(scope, &args, stream).map(|()| 3)
+            }
         }?;
 
-        let write_state = arg_write_state(scope, &args, callback_index - 1)?;
+        let write_state =
+            arg_write_state(scope, &args, callback_index - 1).map_err(InitError::Plain)?;
 
         let Some(callback) = v8::Local::<v8::Function>::try_from(args.get(callback_index)).ok()
         else {
-            return Err("init() requires a write callback".to_string());
+            return Err(InitError::Plain(
+                "init() requires a write callback".to_string(),
+            ));
         };
 
         state.write_state = write_state;
@@ -435,9 +473,34 @@ fn init<'s>(
 
     match outcome {
         None => throw(scope, "zlib binding closed"),
-        Some(Err(message)) => throw(scope, &message),
+        Some(Err(InitError::Plain(message))) => throw(scope, &message),
+        Some(Err(InitError::InitializationFailed(message))) => throw_with_code(
+            scope,
+            ErrorKind::Error,
+            "ERR_ZLIB_INITIALIZATION_FAILED",
+            &message,
+        ),
+        // The throwing path already replaced `init()`'s own message with the
+        // more specific `ERR_INVALID_ARG_TYPE`/`ERR_OUT_OF_RANGE` exception.
+        Some(Err(InitError::AlreadyThrown)) => {}
         Some(Ok(())) => {}
     }
+}
+
+/// A failed `init()`, in the shapes Node's `Init` implementations produce.
+enum InitError {
+    /// A plain `Error` with no `code`, which is what the zlib and Brotli paths
+    /// have always thrown here.
+    Plain(String),
+    /// `ERR_ZLIB_INITIALIZATION_FAILED`, which `ZstdStream::Init` throws with
+    /// the underlying message once `ZSTD_*_setParameter` or the dictionary load
+    /// failed. `test-zlib-zstd.js` matches on this `code` and on the exact
+    /// "Setting parameter failed" text.
+    InitializationFailed(String),
+    /// An exception is already pending on the isolate: the argument validators
+    /// throw the specific `ERR_INVALID_ARG_TYPE`/`ERR_OUT_OF_RANGE` themselves
+    /// and must not have it replaced by a generic message.
+    AlreadyThrown,
 }
 
 fn init_zlib<'s>(
@@ -462,6 +525,138 @@ fn init_zlib<'s>(
             reject_garbage_after_end,
         )
         .map_err(|error| error.message)
+}
+
+/// `init` for `ZstdCompress`, whose layout is
+/// `(params, pledgedSrcSize, writeState, writeCallback[, dictionary[,
+/// rejectGarbageAfterEnd]])`.
+fn init_zstd_compress<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    stream: &mut ZstdCompressStream,
+) -> Result<(), InitError> {
+    let params = zstd_params(scope, args.get(0))?;
+    let pledged = pledged_src_size(scope, args.get(1))?;
+    let dictionary = dictionary_bytes(args.get(4));
+    // zstd compression accepts the flag for signature parity and ignores it,
+    // exactly as `ZstdCompressContext::Init` ignores its third parameter.
+    stream
+        .init(pledged, &dictionary, &params)
+        .map_err(|error| InitError::InitializationFailed(error.message))
+}
+
+/// `init` for `ZstdDecompress`, with the same layout as the compressor but a
+/// `ZSTD_d_*` parameter namespace.
+fn init_zstd_decompress<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    stream: &mut ZstdDecompressStream,
+) -> Result<(), InitError> {
+    let params = zstd_params(scope, args.get(0))?;
+    let pledged = pledged_src_size(scope, args.get(1))?;
+    let dictionary = dictionary_bytes(args.get(4));
+    let reject_garbage_after_end = args.length() >= 6 && args.get(5).is_true();
+    stream
+        .init(pledged, &dictionary, &params, reject_garbage_after_end)
+        .map_err(|error| InitError::InitializationFailed(error.message))
+}
+
+/// The parameter array as `(key, value)` pairs, widened to the `int` zstd takes.
+///
+/// `lib/zlib.js` sizes the array to the largest `ZSTD_c_`/`ZSTD_d_` constant it
+/// knows and prefills it with `-1`, which [`params_array`] already filters, so
+/// the keys that reach here are the ones the caller named. Node does not
+/// range-check them either: an out-of-band key is rejected by
+/// `ZSTD_*_setParameter`, which is what makes `{ [ZSTD_c_strategy]: 130 }`
+/// throw "Setting parameter failed" instead of a range error.
+fn zstd_params(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Result<Vec<(i32, i32)>, InitError> {
+    Ok(params_array(scope, value)
+        // `lib/zlib.js` always passes a `Uint32Array`; a caller that reaches
+        // the handle directly has no separate error shape here.
+        .map_err(InitError::Plain)?
+        .into_iter()
+        .map(|(key, value)| (key, value as i32))
+        .collect())
+}
+
+/// `pledgedSrcSize`, which `ZstdStream::Init` accepts only as a safe
+/// non-negative integer and otherwise reports as a `TypeError` or `RangeError`.
+fn pledged_src_size(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Result<u64, InitError> {
+    if value.is_undefined() {
+        return Ok(CONTENTSIZE_UNKNOWN);
+    }
+    if !value.is_number() {
+        throw_with_code(
+            scope,
+            ErrorKind::TypeError,
+            "ERR_INVALID_ARG_TYPE",
+            "The \"pledgedSrcSize\" argument must be of type number",
+        );
+        return Err(InitError::AlreadyThrown);
+    }
+    let number = value.number_value(scope).unwrap_or(f64::NAN);
+    if !number.is_finite() || number.trunc() != number || number.abs() > MAX_SAFE_INTEGER {
+        throw_with_code(
+            scope,
+            ErrorKind::RangeError,
+            "ERR_OUT_OF_RANGE",
+            "The value of \"pledgedSrcSize\" is out of range. It must be a safe integer",
+        );
+        return Err(InitError::AlreadyThrown);
+    }
+    if number < 0.0 {
+        throw_with_code(
+            scope,
+            ErrorKind::RangeError,
+            "ERR_OUT_OF_RANGE",
+            "The value of \"pledgedSrcSize\" is out of range. It must be non-negative",
+        );
+        return Err(InitError::AlreadyThrown);
+    }
+    Ok(number as u64)
+}
+
+/// `2^53 - 1`, `kMaxSafeJsInteger` in `src/util-inl.h`.
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Which JavaScript error constructor `throw_with_code` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorKind {
+    /// `THROW_ERR_*` macros whose entry in `node_errors.h` says `Error`, such as
+    /// `ERR_ZLIB_INITIALIZATION_FAILED`.
+    Error,
+    /// `THROW_ERR_INVALID_ARG_TYPE`.
+    TypeError,
+    /// `THROW_ERR_OUT_OF_RANGE`.
+    RangeError,
+}
+
+/// Throws a JavaScript error carrying `code`, which is how Node's
+/// `THROW_ERR_*` macros surface in `lib/zlib.js`.
+fn throw_with_code(scope: &mut v8::PinScope<'_, '_>, kind: ErrorKind, code: &str, message: &str) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = match kind {
+        ErrorKind::Error => v8::Exception::error(scope, text),
+        ErrorKind::TypeError => v8::Exception::type_error(scope, text),
+        ErrorKind::RangeError => v8::Exception::range_error(scope, text),
+    };
+    if let (Ok(object), Some(code)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, code),
+    ) {
+        if let Some(key) = v8::String::new(scope, "code") {
+            let _ = object.set(scope, key.into(), code.into());
+        }
+    }
+    scope.throw_exception(exception);
 }
 
 fn init_brotli<'s>(

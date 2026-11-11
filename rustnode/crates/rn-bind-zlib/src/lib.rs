@@ -12,6 +12,13 @@
 //!   inside the call, and reports completion by invoking `writeCb`.
 //! * `params(level, strategy)`, `reset()` and `close()`.
 //!
+//! The three compression families share that shape but not their argument
+//! layouts. `BrotliEncoder`/`BrotliDecoder` take `(params, writeState, writeCb[,
+//! dictionary])`, and `ZstdCompress`/`ZstdDecompress` take `(params,
+//! pledgedSrcSize, writeState, writeCb[, dictionary[, rejectGarbageAfterEnd]])`
+//! with a `ZSTD_c_*`/`ZSTD_d_*` parameter namespace instead of a level and a
+//! strategy.
+//!
 //! `writeState` is a `Uint32Array(2)`: `[availOutAfter, availInAfter]`, in that
 //! order. Both offsets are read by the JS after every write, so they have to be
 //! written back before any callback runs.
@@ -21,6 +28,7 @@ pub mod constants;
 pub mod crc;
 pub mod handle;
 pub mod zlib;
+pub mod zstd;
 
 pub use zlib::ZlibMode;
 
@@ -101,8 +109,8 @@ impl BindingModule for Zlib {
 ///
 /// Members come from `BindingModule::members`, which is what `rn-compat` checks
 /// against `contracts/zlib.json`. Nothing is declared deferred: all eight
-/// members Node exposes are installed, including `crc32c` and the two zstd
-/// constructors.
+/// members Node exposes are installed, and `ZstdCompress`/`ZstdDecompress` are
+/// real zstd contexts rather than namespace-shape placeholders.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Zlib);
 }
