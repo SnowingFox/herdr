@@ -83,12 +83,26 @@ by both scope and rule, and the differences do not add up.
 | **2731/5714 (47.8%)** | **`f0649774`** | **8 suites, 5714 files** | **four-marker** | **last full measurement — quote this one** |
 | 2645/5159 (51.3%) | `7af7b306` (pre-#51) | `test/parallel` only | four-marker | **measured here** |
 | 2393/5159 (46.4%) | `52f79555` (#51) | `test/parallel` only | four-marker | **measured here** — the honest `test/parallel` rate for that tree |
+| 2550/5159 (49.4%) | `368e32ac` | `test/parallel` only | four-marker | **measured here** — the `test/parallel` rate `docs/project-context.md` quotes |
+| 2549/5159 (49.4%) | `f0649774` | `test/parallel` only | four-marker | **measured here** — matches the eight-suite row below it |
 
-The eight-suite and `test/parallel` rows are different measurements. The current
-master figure is the eight-suite one because that is the scope with a complete
-run; the 46.4% row is the matching `test/parallel` number for the #51 tree and is
-**not** a predecessor of 47.8% in a time series — the trees differ by the merges
-between `52f79555` and `368e32ac` as well as by scope.
+The eight-suite and `test/parallel` rows are different measurements, and **neither
+is a time series**: the trees differ by merges as well as by scope. Read them as
+four independent measurements of four different trees, not as movement.
+
+The two `49.4%` rows are the ones to compare against the `test/parallel` exit-code
+rates above them, because those are also `test/parallel`. The `47.8%` eight-suite
+row is the headline because that is the scope with a complete run over every suite
+the harness selects.
+
+**Do not subtract across scopes, which is what produces a spurious residual.** The
+`test/parallel` and eight-suite skip populations are different numbers — 761 vs 808
+on the `52f79555` tree, 471 vs 485 on `368e32ac` and `f0649774` — and mixing one into
+the other leaves a handful of files that look like rounding but are not. (The
+`test/parallel` figure counts the exit-0 skips the decomposition subtracts; one
+further file, `parallel/test-worker-process-cwd.js`, carries a skip marker and exits
+non-zero, so it is already outside the exit-0 count.) See the decomposition below,
+which closes exactly when both sides come from the same run.
 
 ### Why 52.6% is superseded
 
@@ -145,10 +159,11 @@ On the same run of the same tree, the decomposition is exact:
 
 A four-file residual appears if the numbers are combined across scopes: 3197 − 808 =
 2389 is one measurement's `test/parallel` exit-0 count minus the **eight-suite** skip
-population, and 808 vs 761 is that scope difference (plus a 30 s vs 60 s timeout
-difference in the exit-0 readings). Subtracting one scope's skips from another
-scope's count leaves a few files over; at a single scope the closure is exact, as the
-table shows.
+population, which is why it lands four files from 2393 instead of on it. `test/parallel`
+carries 761 skips on that tree and the eight suites carry 808, so 808 vs 761 is the
+scope difference (plus a 30 s vs 60 s timeout difference in the exit-0 readings).
+Subtracting one scope's skips from another scope's count leaves a few files over; at a
+single scope the closure is exact, as the table shows.
 
 Do not reopen this: the two rules differ by the skip set and nothing else.
 
