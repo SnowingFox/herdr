@@ -36,6 +36,7 @@
 
 pub mod abi;
 pub mod async_work;
+pub mod buffer;
 pub mod callback;
 pub mod env;
 pub mod load;
@@ -44,6 +45,7 @@ pub mod shims;
 pub mod symbols;
 pub mod threadsafe;
 pub mod values;
+pub mod wrap;
 
 #[cfg(unix)]
 pub mod platform;
