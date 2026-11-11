@@ -42,6 +42,15 @@ explicitly before the tests because several crates spawn `target/debug/rustnode`
 from their integration tests, and `cargo test -p <crate>` does not rebuild that
 binary. A stale binary has already masked a real failure once.
 
+An exported `CARGO_TARGET_DIR` defeats every stale-binary check, including the
+`touch`-the-source-and-confirm-it-compiles one: the build really does happen, it
+just writes somewhere else, so the binary you run is untouched and a green
+`Compiling rn-cli` line means nothing. The symptom is a source change that
+apparently has no effect at all — a namespace still reporting its old member
+count after it was edited. `env | grep CARGO_TARGET_DIR` is the check that catches
+it; build scripts here that set it for a baseline must `unset` it in the same
+shell afterwards.
+
 ## Adding a binding
 
 A binding crate needs three things and nothing else:
@@ -97,6 +106,16 @@ module scope is what makes `require()` throw, which is the real failure the tool
 exists to catch. The tool rejects a `DEFERRED` block it cannot parse rather than
 reporting zero deferrals, so reword or reformat entries freely but keep them
 parseable `("member", "reason")` pairs.
+
+## http2 settings indices are not nghttp2's settings ids
+
+`Http2SettingsIndex` (`src/node_http2_state.h`) and nghttp2's
+`nghttp2_settings_id` are two different numberings, and they are not offset by
+one: `INITIAL_WINDOW_SIZE` is buffer index 2 but nghttp2 id 4, while
+`MAX_CONCURRENT_STREAMS` is index 4 but id 3. `crates/rn-bind-http2/src/state.rs`
+pins the mapping explicitly and a test asserts it, so "simplify" it to
+`index + 1` only with the table in front of you — the buffer would then apply one
+setting's value under another setting's id.
 
 ## Where the reference source is
 
