@@ -64,6 +64,16 @@ PARALLEL_SAFE = {"parallel", "es-module", "internet", "message", "node-api"}
 # Enough for any real reporter output; a runaway file cannot exhaust memory.
 KEEP_BYTES = 512 * 1024
 
+# Ambient variables that change test outcomes and are not part of the runtime
+# under test. Removed for both binaries so the comparison is like for like.
+SCRUBBED_ENV = ("NODE_DISABLE_COMPILE_CACHE", "NO_COLOR", "FORCE_COLOR")
+
+# `TERM=dumb` makes the REPL report no cursor/colour support, so tests that
+# assert on REPL editing behaviour fail for a reason that has nothing to do with
+# the runtime. A real CI runner sets a usable TERM; this harness pins one so a
+# login shell's `TERM=dumb` cannot masquerade as a runtime defect.
+FALLBACK_TERM = "xterm-256color"
+
 SKIP_PLAN = re.compile(r"^1\.\.0 # Skipped", re.M)
 SKIP_GLYPH = ": # SKIP"
 FAIL_GLYPH = "\u2716"
@@ -145,6 +155,15 @@ def serial_id(relative, pinned=None):
 def run_one(node, checkout_root, tests_root, relative, timeout, pinned_serial=None):
     argv = [node] + read_flags(os.path.join(tests_root, relative)) + [f"test/{relative}"]
     env = dict(os.environ)
+    if env.get("TERM", "dumb") == "dumb":
+        env["TERM"] = FALLBACK_TERM
+    # These are set by the developer's shell in some agent environments, not by
+    # Node, and they change what a test is allowed to observe: a compile-cache
+    # test cannot exercise the cache when NODE_DISABLE_COMPILE_CACHE=1, and a
+    # colour test cannot see colour when NO_COLOR=1/FORCE_COLOR=0. Leaving them
+    # in makes the measurement depend on who ran it.
+    for name in SCRUBBED_ENV:
+        env.pop(name, None)
     env.update(
         TEST_SERIAL_ID=serial_id(relative, pinned_serial),
         TEST_THREAD_ID="0",
