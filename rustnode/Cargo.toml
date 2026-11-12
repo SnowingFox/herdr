@@ -37,6 +37,7 @@ unicode-width = "0.2"
 parking_lot = "0.12"
 rn-v8-sys = { path = "crates/rn-v8-sys" }
 rn-core = { path = "crates/rn-core" }
+rn-errors = { path = "crates/rn-errors" }
 rn-uv = { path = "crates/rn-uv" }
 # libuv, linked as a static library built from the crate's own vendored source.
 # `net`, `http` and everything below them expect libuv handle semantics exactly

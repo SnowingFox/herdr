@@ -16,4 +16,5 @@ libc.workspace = true
 # `uv_work_t` on the process loop and deliver `ondone` from it, which needs the
 # loop and the re-enter-V8-from-`uv_run` primitive. Both are that crate's.
 rn-uv.workspace = true
+rn-errors.workspace = true
 libuv-sys2.workspace = true

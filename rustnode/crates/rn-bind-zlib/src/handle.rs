@@ -894,7 +894,22 @@ fn complete_write<'s>(
     drop(state);
 
     if let (Some(callback), Some(object)) = (callback, receiver) {
-        callback.call(scope, object.into(), &[]);
+        // A throw here is uncaught: the write completed inside `uv_run`, so
+        // nothing above it can handle one. Node's `MakeCallback` catches it and
+        // routes it through `TriggerUncaughtException`; ignoring the result
+        // leaves V8 to print the error with the process still exiting 0.
+        let caught = {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+            let inner = &mut try_catch.init();
+            let _ = callback.call(inner, object.into(), &[]);
+            inner
+                .exception()
+                .map(|exception| v8::Global::new(inner, exception))
+        };
+        if let Some(caught) = caught {
+            let exception = v8::Local::new(scope, &caught);
+            rn_errors::report_uncaught_exception(scope, exception);
+        }
     }
 }
 

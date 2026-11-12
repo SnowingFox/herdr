@@ -18,6 +18,7 @@ rn-permission = { path = "../rn-permission" }
 rn-uv.workspace = true
 tracing.workspace = true
 rn-v8-sys.workspace = true
+rn-errors.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

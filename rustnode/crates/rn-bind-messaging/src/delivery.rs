@@ -216,7 +216,22 @@ fn emit_message<'s>(
         return;
     };
     let arguments = [data, ports, kind.into()];
-    let _ = emit.call(scope, object.into(), &arguments);
+    // A throw inside a `'message'` listener is uncaught: the message arrived from
+    // the port's own delivery, not from a call the user made. Node's
+    // `MakeCallback` routes it through `TriggerUncaughtException`; ignoring the
+    // result prints it and still exits 0.
+    let caught = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
+        let inner = &mut try_catch.init();
+        let _ = emit.call(inner, object.into(), &arguments);
+        inner
+            .exception()
+            .map(|exception| v8::Global::new(inner, exception))
+    };
+    if let Some(caught) = caught {
+        let exception = v8::Local::new(&*scope, &caught);
+        rn_errors::report_uncaught_exception(scope, exception);
+    }
 }
 
 /// Builds the `ports` argument as an array of the objects a message carried.

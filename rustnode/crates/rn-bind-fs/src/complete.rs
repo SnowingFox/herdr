@@ -218,9 +218,23 @@ fn callback_trampoline(
     };
 
     let receiver: Local<v8::Value> = request.into();
-    // An exception thrown by the callback belongs to the caller's stack; V8
-    // reports it through the microtask machinery, so the result is ignored here.
-    let _ = handler.call(scope, receiver, &arguments);
+    // A throw here is uncaught: the completion runs inside `uv_run`, where
+    // nothing above it can handle one. Node's `MakeCallback` wraps the call in a
+    // `TryCatch` and routes a throw through `TriggerUncaughtException`, which is
+    // what tells `process` first and sets a non-zero exit code when it declines.
+    // Ignoring the result instead lets V8 print the error and exit 0.
+    let caught = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
+        let inner = &mut try_catch.init();
+        let _ = handler.call(inner, receiver, &arguments);
+        inner
+            .exception()
+            .map(|exception| v8::Global::new(inner, exception))
+    };
+    if let Some(caught) = caught {
+        let exception = Local::new(&*scope, &caught);
+        rn_errors::report_uncaught_exception(scope, exception);
+    }
 }
 
 /// Delivers `completion` by settling a promise created now.
