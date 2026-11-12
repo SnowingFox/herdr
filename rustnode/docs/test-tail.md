@@ -159,6 +159,15 @@ release binary at `out/Release/node`, ~44 min build. This is a real build of the
 pin, not this machine's `node` (`v22.23.4` on `PATH`, which is **not** a valid
 oracle: it fails several of these files for v22's own reasons).
 
+**That build no longer exists.** The 44-minute source build was made on
+2026-11-11 and has since been removed from the machine; `/home/ubuntu/oracle-node`
+is gone, including `out/Release/node`, and no other Node 28 built from the pin is
+on the filesystem. Every number in this and the following sections is a record of
+what that binary measured on that day and stays valid as a measurement. The
+*instruction to re-run it* is what was wrong. For new work, use the official Node
+28 nightly as described under "Running the oracle" below, and read the
+three-commit caveat there before reusing any figure that depends on streams or SEA.
+
 **Method.** Take every file rustnode fails, drop `internet` (see below), and run
 the remainder through `tools/test-tail-map.py` with the same `// Flags:` handling,
 timeout and four-marker rule, with the oracle as `--node`. Then inspect every file
@@ -240,31 +249,42 @@ excluded here for flakiness.
 sides. The suite may need network, and a network-dependent result says nothing
 about compatibility in either direction.
 
-**Reproduce.**
+**Reproduce.** The commands below are the ones that produced the numbers above.
+They need a Node 28 binary and a copy of the pinned `test/` tree, and the binary
+they name — the 44-minute source build at `/home/ubuntu/oracle-node` — **is no
+longer present**. See "Running the oracle" for the nightly that replaces it and
+for the three-commit caveat that applies to it. The `--node` and `--tests` paths
+are the only things to change; the rest of each command is unchanged.
 
 ```bash
-cd /home/ubuntu/oracle-node && git rev-parse HEAD   # f344e7f5…
-out/Release/node -v                                  # v28.0.0-pre
+# the binary: was /home/ubuntu/oracle-node/out/Release/node, now absent
+# the tree:   was /home/ubuntu/oracle-node, now absent
 
 cd rustnode && export RUSTUP_TOOLCHAIN=1.96.1 CXX=g++ \
     RUSTFLAGS="-L /usr/lib/gcc/x86_64-linux-gnu/13"
 
 python3 crates/rn-napi/tools/build-node-api-addons.py \
-    --source /home/ubuntu/oracle-node/test/node-api \
-    --output /home/ubuntu/oracle-node/test \
-    --js-native-api /home/ubuntu/oracle-node/test/js-native-api \
-    --uv-include /home/ubuntu/oracle-node/deps/uv/include
+    --source <node-tree>/test/node-api \
+    --output <node-tree>/test \
+    --js-native-api <node-tree>/test/js-native-api \
+    --uv-include <node-tree>/deps/uv/include
 
 python3 tools/test-tail-map.py run --node /tmp/frozen-oracle-control/rustnode \
-    --tests /home/ubuntu/oracle-node/test --out /tmp/rn-full.json --jobs 8 --timeout 30
+    --tests <node-tree>/test --out /tmp/rn-full.json --jobs 8 --timeout 30
 python3 tools/test-tail-map.py score /tmp/rn-full.json
 
 # then the same run with the oracle over every file the baseline failed
-python3 tools/test-tail-map.py run --node /home/ubuntu/oracle-node/out/Release/node \
-    --tests /home/ubuntu/oracle-node/test --out /tmp/oracle.json --jobs 8 --timeout 30 \
+python3 tools/test-tail-map.py run --node <node28-binary> \
+    --tests <node-tree>/test --out /tmp/oracle.json --jobs 8 --timeout 30 \
     $(sed 's|^|--only |' /tmp/failed.txt)
 python3 tools/test-tail-map.py score /tmp/oracle.json
 ```
+
+`<node-tree>` is a checkout of the pin; the "Reproducing any row" recipe above
+builds a `test/`-only one at `/tmp/node-pin`, which is enough for every step here
+except the `node-api` addon build, whose `--uv-include` needs `deps/uv/include`
+from a full tree. `<node28-binary>` is any Node 28 as described under "Running the
+oracle" — today the nightly, which is three commits behind the pin.
 
 ### The `Uncaught` marker is sound, and must not be widened
 
@@ -906,17 +926,75 @@ python3 tools/test-tail-map.py score /tmp/full.json --family tls_wrap --list
 ### Running the oracle
 
 The tool takes any runtime through `--node`, so the oracle is the same command with a
-different binary. A Node 28 built from the pin already exists on the measurement VM:
+different binary.
+
+**The build this section used to name is gone.** The oracle for every figure above
+was a source build of the pin at `/home/ubuntu/oracle-node`, with its release binary
+at `out/Release/node` — a ~44 min `./configure && make -j8` of
+`f344e7f552e3656bd37517151c5dc87d22b33771` that reported `v28.0.0-pre`, V8
+`15.6.75.33-node.11`. That directory has been removed from the machine, along with
+the `/workspace/node` symlink that pointed at it. Nothing else on the filesystem is
+Node 28 except Cursor's own bundled binaries; `node` on `PATH` is `v22.23.4` and is
+still **not** a valid oracle.
+
+**Use the official Node 28 nightly instead.** It is a published binary rather than a
+build of the pin, and it is the current stand-in:
+
+| | |
+| --- | --- |
+| binary | `/tmp/oracle-dl/node-v28.0.0-nightly20261111e8c1160d20-linux-x64/bin/node` |
+| version | `v28.0.0-nightly20261111e8c1160d20`, V8 `15.6.75.50-node.11` |
+| size / mtime | 158363856 bytes, 2026-11-11T11:02Z |
+| commit | `768315cf71`, **3 commits behind** the pin `f344e7f552` |
+
+Because it lives under `/tmp`, treat its presence as ephemeral: if the path is
+absent, re-fetch that nightly build rather than concluding that no Node 28 oracle
+can be had.
+
+**The three-commit gap: what it does and does not disqualify.** `768315cf71` is an
+ancestor of `f344e7f552`; the three commits between them touch only
+`lib/stream.js`, `lib/stream/promises.js`, `src/compile_cache.*`, `src/node_sea.cc`,
+`src/node_modules.cc`, `src/node_util.cc`, `src/env.*`, and SEA/stream tests. Nothing
+in `lib/os.js`, `src/node_os.cc`, `src/node_env_var.cc`, or libuv is affected. So the
+nightly is **behaviourally identical to the pin for interface, environment, and
+error-path questions**, and it is **not identical for stream or SEA questions** —
+`test-stream-*`, `test-sea-*`, `test-compile-cache-*`, and anything that reads
+`process.env` through a path those commits changed. For a question in that second
+group, rebuild the pin from scratch; for everything else, the nightly is a valid
+oracle and its answers need no caveat.
+
+Confirm the binary you have before quoting a result:
 
 ```bash
-/home/ubuntu/oracle-node/out/Release/node -v     # v28.0.0-pre
-ls -l /workspace/node                            # -> /home/ubuntu/oracle-node
+/tmp/oracle-dl/node-v28.0.0-nightly20261111e8c1160d20-linux-x64/bin/node -v
+# v28.0.0-nightly20261111e8c1160d20  (V8 15.6.75.50-node.11)
 ```
 
-Rebuild it only if it is gone; it takes ~44 min on 8 cores. The tree must live
-**outside** the herdr checkout (its `deps/crates` has its own `Cargo.toml`, which the
-herdr workspace would otherwise claim), which is why `/workspace/node` is a symlink,
-and `make` needs `RUSTUP_TOOLCHAIN=1.96.1` or it fails on `edition2024`:
+Run the files rustnode fails through it. `--node` is the only switch needed: the
+tool applies the same `// Flags:` handling, `TEST_*` environment and four-marker
+rule to whichever binary it is given, so the two runs are comparable by
+construction. `--tests` still needs a copy of the pinned `test/` tree; the
+"Reproducing any row" recipe above creates one at `/tmp/node-pin`:
+
+```bash
+python3 tools/test-tail-map.py run \
+    --node /tmp/oracle-dl/node-v28.0.0-nightly20261111e8c1160d20-linux-x64/bin/node \
+    --tests /tmp/node-pin/test --out /tmp/oracle.json \
+    --jobs 8 --timeout 30 $(sed 's|^|--only |' /tmp/rustnode-failures.txt)
+python3 tools/test-tail-map.py score /tmp/oracle.json
+```
+
+`internet` must stay out of that list: it may need network, and a network-dependent
+result is not evidence in either direction.
+
+**Rebuilding the pin from scratch is the fallback, not the default.** The build it
+describes is no longer present, so this is a from-zero recipe, not a repair. It
+takes ~44 min on 8 cores and is only worth doing when the question falls in the
+stream/SEA group above. The tree must live **outside** the herdr checkout (its
+`deps/crates` has its own `Cargo.toml`, which the herdr workspace would otherwise
+claim) — that is why the original tree was at `/home/ubuntu/oracle-node` with
+`/workspace/node` symlinked to it — and `make` needs `RUSTUP_TOOLCHAIN=1.96.1` or it
+fails on `edition2024`:
 
 ```bash
 mkdir -p /home/ubuntu/oracle-node && cd /home/ubuntu/oracle-node
@@ -925,22 +1003,8 @@ git fetch --depth 1 origin f344e7f552e3656bd37517151c5dc87d22b33771
 git checkout -q FETCH_HEAD
 export RUSTUP_TOOLCHAIN=1.96.1
 ./configure && make -j8
+out/Release/node -v                   # must print v28.0.0-pre
 ```
-
-Then run the files rustnode fails through it. `--node` is the only switch needed:
-the tool applies the same `// Flags:` handling, `TEST_*` environment and four-marker
-rule to whichever binary it is given, so the two runs are comparable by construction.
-
-```bash
-python3 tools/test-tail-map.py run \
-    --node /home/ubuntu/oracle-node/out/Release/node \
-    --tests /home/ubuntu/oracle-node/test --out /tmp/oracle.json \
-    --jobs 8 --timeout 30 $(sed 's|^|--only |' /tmp/rustnode-failures.txt)
-python3 tools/test-tail-map.py score /tmp/oracle.json
-```
-
-`internet` must stay out of that list: it may need network, and a network-dependent
-result is not evidence in either direction.
 
 `./tools/check.sh --quick` is the gate; `--quick` skips only the workspace test
 sweep. There is no `GATE` variable in this repository.
