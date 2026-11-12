@@ -234,19 +234,13 @@ fn trigger_uncaught_exception(
     args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
+    // This is `internalBinding('errors').triggerUncaughtException`, which is the
+    // function `internal/process/promises.js` and the ESM entry point call with
+    // `fromPromise` set. It shares the one implementation with the event loop so
+    // the two cannot disagree about the `_fatalException` ordering.
     let error = args.get(0);
     let from_promise = args.get(1).is_true();
-
-    if let Some(handler) = process_fatal_exception_handler(scope) {
-        let from_promise = v8::Boolean::new(scope, from_promise);
-        let argv = [error, from_promise.into()];
-        let result = handler.call(scope, v8::undefined(scope).into(), &argv);
-        if result.is_some_and(|value| value.is_true()) {
-            return;
-        }
-    }
-
-    report(scope, error, from_promise);
+    report_uncaught(scope, error, from_promise);
 }
 
 /// Reports an uncaught exception the way Node does, giving `process` the first
@@ -261,16 +255,56 @@ fn trigger_uncaught_exception(
 /// `process.on('uncaughtException')` both live behind `_fatalException`. The
 /// loop's `TryCatch` has already ended by the time it reports, so the exception
 /// is passed in as a value rather than taken from the scope.
-pub fn report_uncaught_exception(scope: &mut v8::PinScope<'_, '_>, error: v8::Local<v8::Value>) {
+///
+/// Returns `true` when a handler took responsibility ([`report`] does not run,
+/// and the caller must let the script continue), `false` when the exception is
+/// fatal. The entry point uses that answer to decide between running its
+/// remaining work and terminating, which is the same distinction
+/// `TriggerUncaughtException` makes by returning early.
+pub fn report_uncaught_exception(
+    scope: &mut v8::PinScope<'_, '_>,
+    error: v8::Local<v8::Value>,
+) -> bool {
+    report_uncaught(scope, error, false)
+}
+
+/// [`report_uncaught_exception`] for a rejection, which Node frames differently.
+///
+/// `from_promise` is what `internal/process/promises.js` passes to
+/// `triggerUncaughtException`, and it changes both the wrapper printed around
+/// the stack and the `type` argument `process._fatalException` receives
+/// (`'unhandledRejection'` instead of `'uncaughtException'`). A rejection
+/// therefore cannot be reported through the plain entry point without lying
+/// about which event fired.
+pub fn report_uncaught_rejection(
+    scope: &mut v8::PinScope<'_, '_>,
+    error: v8::Local<v8::Value>,
+) -> bool {
+    report_uncaught(scope, error, true)
+}
+
+/// The shared body of the two public entry points: one `_fatalException` call,
+/// then the print-and-exit path when it declines.
+fn report_uncaught(
+    scope: &mut v8::PinScope<'_, '_>,
+    error: v8::Local<v8::Value>,
+    from_promise: bool,
+) -> bool {
     if let Some(handler) = process_fatal_exception_handler(scope) {
-        let from_promise = v8::Boolean::new(scope, false);
-        let argv = [error, from_promise.into()];
+        let flag = v8::Boolean::new(scope, from_promise);
+        let argv = [error, flag.into()];
         let result = handler.call(scope, v8::undefined(scope).into(), &argv);
-        if result.is_some_and(|value| value.is_true()) {
-            return;
+        // `!handled->IsFalse()` in `src/node_errors.cc`: only a literal `false`
+        // means "unhandled". A handler that returns `undefined` — every
+        // `process.on('uncaughtException')` listener path — has the runtime's
+        // own `true` handed back by `_fatalException`, so this only sees a
+        // false answer when nothing handled the exception.
+        if result.is_some_and(|value| !value.is_false()) {
+            return true;
         }
     }
-    report(scope, error, false);
+    report(scope, error, from_promise);
+    false
 }
 
 /// Reads `process._fatalException`, which is monkey-patchable on purpose.
