@@ -250,41 +250,43 @@ sides. The suite may need network, and a network-dependent result says nothing
 about compatibility in either direction.
 
 **Reproduce.** The commands below are the ones that produced the numbers above.
-They need a Node 28 binary and a copy of the pinned `test/` tree, and the binary
-they name — the 44-minute source build at `/home/ubuntu/oracle-node` — **is no
-longer present**. See "Running the oracle" for the nightly that replaces it and
-for the three-commit caveat that applies to it. The `--node` and `--tests` paths
-are the only things to change; the rest of each command is unchanged.
+They need a Node 28 binary and a copy of the pinned `test/` tree. The binary they
+used to name — the 44-minute source build at `/home/ubuntu/oracle-node` — **is no
+longer present**; the oracle run below uses the official Node 28 nightly instead.
+See "Running the oracle" for the nightly's provenance and the three-commit caveat
+that applies to it. `--node` and `--tests` are the only things to change; the rest
+of each command is unchanged.
 
 ```bash
-# the binary: was /home/ubuntu/oracle-node/out/Release/node, now absent
-# the tree:   was /home/ubuntu/oracle-node, now absent
+# the tree: was /home/ubuntu/oracle-node, now absent — check the pin out again
+node_tree=/tmp/node-pin                          # see "Reproducing any row" above
+oracle=/tmp/oracle-dl/node-v28.0.0-nightly20261111e8c1160d20-linux-x64/bin/node
 
 cd rustnode && export RUSTUP_TOOLCHAIN=1.96.1 CXX=g++ \
     RUSTFLAGS="-L /usr/lib/gcc/x86_64-linux-gnu/13"
 
 python3 crates/rn-napi/tools/build-node-api-addons.py \
-    --source <node-tree>/test/node-api \
-    --output <node-tree>/test \
-    --js-native-api <node-tree>/test/js-native-api \
-    --uv-include <node-tree>/deps/uv/include
+    --source "$node_tree"/test/node-api \
+    --output "$node_tree"/test \
+    --js-native-api "$node_tree"/test/js-native-api \
+    --uv-include "$node_tree"/deps/uv/include
 
 python3 tools/test-tail-map.py run --node /tmp/frozen-oracle-control/rustnode \
-    --tests <node-tree>/test --out /tmp/rn-full.json --jobs 8 --timeout 30
+    --tests "$node_tree"/test --out /tmp/rn-full.json --jobs 8 --timeout 30
 python3 tools/test-tail-map.py score /tmp/rn-full.json
 
 # then the same run with the oracle over every file the baseline failed
-python3 tools/test-tail-map.py run --node <node28-binary> \
-    --tests <node-tree>/test --out /tmp/oracle.json --jobs 8 --timeout 30 \
+python3 tools/test-tail-map.py run --node "$oracle" \
+    --tests "$node_tree"/test --out /tmp/oracle.json --jobs 8 --timeout 30 \
     $(sed 's|^|--only |' /tmp/failed.txt)
 python3 tools/test-tail-map.py score /tmp/oracle.json
 ```
 
-`<node-tree>` is a checkout of the pin; the "Reproducing any row" recipe above
-builds a `test/`-only one at `/tmp/node-pin`, which is enough for every step here
-except the `node-api` addon build, whose `--uv-include` needs `deps/uv/include`
-from a full tree. `<node28-binary>` is any Node 28 as described under "Running the
-oracle" — today the nightly, which is three commits behind the pin.
+`$node_tree` must contain `deps/uv/include` for the `node-api` addon build, so the
+`test/`-only sparse checkout from "Reproducing any row" is not enough for that one
+step: widen its sparse set with `git sparse-checkout set test deps/uv` before
+building the addons. `$oracle` is three commits behind the pin — see the caveat in
+"Running the oracle" before quoting a stream or SEA result.
 
 ### The `Uncaught` marker is sound, and must not be widened
 
