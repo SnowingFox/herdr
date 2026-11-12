@@ -21,6 +21,13 @@ file counts as **passing only when it exits 0 *and* has none of four markers**:
 | `1..0 # Skipped` at column zero | `common.skip()` ran and exited 0 having tested nothing |
 | `: # SKIP` | `node:test` skipped the test |
 
+The `Uncaught` marker was adjudicated against a real Node oracle and **kept
+unchanged** — see "The `Uncaught` marker is sound, and must not be widened" below.
+Briefly: 61 of the files it catches exit 0 while having printed a genuine
+`Uncaught AssertionError`, and **none** of the 2880 passes prints the word at all,
+so the marker is separating real failures from real passes rather than reacting to
+message formatting.
+
 Everything that did not exit 0 is a failure; a timeout is a failure too, because a
 killed process never stated a verdict. Files that skip are counted separately and
 excluded from the ratio, since they measure nothing either way.
@@ -89,7 +96,8 @@ by both scope and rule, and the differences do not add up.
 | 2572/5714 (45.0%) | `52f79555` (#51) | 8 suites, 5714 files | four-marker | **measured here** |
 | 2731/5714 (47.8%) | `f0649774` | 8 suites, 5714 files | four-marker | **measured here** — superseded by the rows below |
 | 2860/5714 (50.1%) | `59d661dc` | 8 suites, 5714 files | four-marker | **measured here** — reproduces the published 2863 figure within 3 files, see below |
-| **2880/5714 (50.4%)** | **`c236ee9c`** | **8 suites, 5714 files** | **four-marker** | **last full measurement — quote this one** |
+| 2880/5714 (50.4%) | `c236ee9c` | 8 suites, 5714 files | four-marker | **last full measurement — quote this one** |
+| 2879/5714 (50.4%) | `c236ee9c` | 8 suites, 5714 files | four-marker | **same binary, immediate re-run** — the run-to-run noise band is ±1 file |
 | **2880/5692 (50.6%)** | **`c236ee9c`** | **8 suites, 5714 files** | **four-marker, oracle-corrected** | **the honest rate — see "The oracle control"** |
 | 2645/5159 (51.3%) | `7af7b306` (pre-#51) | `test/parallel` only | four-marker | **measured here** |
 | 2393/5159 (46.4%) | `52f79555` (#51) | `test/parallel` only | four-marker | **measured here** — the honest `test/parallel` rate for that tree |
@@ -185,6 +193,13 @@ misjudges and the three the harness breaks) the figure is 50.66%; if the eight
 oracle skips are also removed from the denominator it is 50.67%. All definitions
 agree to within 0.27 points.
 
+Both sides carry a run-to-run noise band, and both are smaller than the correction.
+The baseline re-run on the same binary and tree gave 2879 against 2880 (**±1 file =
+±0.018 points**), and the oracle's 29 non-passes re-ran identically (**0 flaky**). So
+the corrected rate over the noise band is **50.58%–50.60%**, and the raw rate is
+50.39%–50.40%. The correction is still larger than the noise, which is why it is
+reported to two decimals.
+
 The denominator keeps all 5714 files and subtracts only oracle failures, exactly as
 the formula above says. That is deliberately unkind to rustnode: its own 461 skips
 stay in the denominator (they are not subtracted, only the oracle's are), so this
@@ -250,6 +265,90 @@ python3 tools/test-tail-map.py run --node /home/ubuntu/oracle-node/out/Release/n
     $(sed 's|^|--only |' /tmp/failed.txt)
 python3 tools/test-tail-map.py score /tmp/oracle.json
 ```
+
+### The `Uncaught` marker is sound, and must not be widened
+
+The oracle surfaced four files where it exits 0 but the rule says fail:
+`test-repl.js`, `test-worker-exit-code.js`,
+`sequential/test-repl-timeout-throw.js` and
+`test_legacy_uncaught_exception.js`. That is either a rule defect or four genuine
+rustnode failures, and the only way to tell is to read rustnode's output next to the
+oracle's rather than assume the oracle is right about the verdict.
+
+**All four are genuine rustnode failures, decided by exit code, not by the marker.**
+
+| file | rustnode | oracle | decided by |
+| --- | --- | --- | --- |
+| `parallel/test-repl.js` | exit **1**, dies at `Uncaught null: null` on the `throw null` proxy case | exit 0, completes every transcript | exit code |
+| `parallel/test-worker-exit-code.js` | exit **1**, `wrong exit for 7-changeCodeInExitWithUncaught / expected:98 but got:0` and two more | exit 0 | exit code |
+| `sequential/test-repl-timeout-throw.js` | exit **1**, child asserted `9 !== 0` | exit 0, three `Uncaught ReferenceError: XXX` which the test expects | exit code |
+| `node-api/.../test_legacy_uncaught_exception.js` | exit **9**, `unsupported option '--no-force-node-api-uncaught-exceptions-policy'` | exit 0 | exit code |
+
+So the marker is not what fails them, and narrowing the rule would change **nothing**
+for these four. That is worth stating plainly because the natural reading of the
+oracle table — "the oracle passes, therefore the rule is wrong" — is false here: the
+oracle passes the *file*, while rustnode fails it for a reason the oracle never hits.
+
+**A narrower `Uncaught` condition was measured and rejected.** The most defensible
+candidate is to count only an in-process assertion, i.e. require the word
+`AssertionError` in the marker line, on the theory that plain `Uncaught Error:` text
+is usually leaked child stderr. Under that rule:
+
+| | files |
+| --- | --- |
+| fail → pass | 10 |
+| pass → fail | **0** |
+| passes before / after | 2880 / 2890 |
+
+Ten files is small enough that a verdict change would be reviewable rather than a
+rewrite of the measurement, so each was read against the oracle: all 10 pass there.
+But reading them individually shows the rule is right and the oracle is not
+comparable, because each names a *rustnode* gap:
+
+| file | rustnode's marker | real? |
+| --- | --- | --- |
+| `test-cluster-primary-error.js` | `Uncaught TypeError: process._kill is not a function` | `typeof process._kill === 'undefined'` on rustnode; the test *deliberately* throws `'accidental error'` in a cluster process, so the text itself is expected and this is a mixed case |
+| `test-crypto-keygen-key-object-without-encoding.js` | `Uncaught TypeError: method is not a function` (×2) | yes — cipher path is incomplete |
+| `test-tls-multiple-cas-as-string.js` | `Uncaught Error: enableCertCb is not implemented yet` (×2) | yes — a deferred TLS member, named in the message |
+| `test-inspector-stops-no-file.js` | `Uncaught Error: Cannot find module '.../no-such-script.js'` | expected output: the oracle prints the same error in its own format |
+| `test-module-loading-globalpaths.js` | `Uncaught Error: Cannot find module 'foo'` | expected output: the oracle prints it from the child process |
+| `test-module-main-preserve-symlinks-fail.js` | `Uncaught Error: Cannot find module '.../iDoNotExist'` | expected output, same shape |
+| `test-worker-error-primitive.js` | `Uncaught string: boom`, `Uncaught boolean: true` | expected output: the test transfers primitives |
+| `test-esm-symlink-type.js` | `Uncaught TypeError: Cannot read properties of null` | real, but it exits **1** on a standalone re-run, so the recorded `exit 0` is a flake |
+| `test-crypto-keygen-async-encrypted-private-key-der.js` | `Uncaught TypeError: method is not a function` | yes — cipher path incomplete |
+| `test-worker-stdio-from-preload-module.js` | `Uncaught TypeError: ...` | yes — real |
+
+The class is real on both sides: some of these are expected transcript text that
+rustnode prints in its own `Uncaught X: y` format (Node prints a source frame and
+`^` instead), and some are actual missing features. Reading them one at a time:
+**6 are real or mixed** (an incomplete cipher path, a deferred TLS member,
+`process._kill` absent, a null deref, a worker stdio type error) and **4 are expected
+transcript text** the test prints on purpose. **The distinguishing fact is not the
+marker text, and no output-only rule can separate them reliably.** A rule keyed on
+`AssertionError` would therefore credit 10 files, of which 6 are real failures and 1
+of those (`test-esm-symlink-type.js`) exits 1 on a standalone re-run and is a flake.
+That is a rule widened until it passes, which this document forbids.
+
+**The decisive measurement against widening.** Across the whole run:
+
+| | files |
+| --- | --- |
+| passes (2880) that print `Uncaught` anywhere | **0** |
+| exit-0 non-passes whose marker is `Uncaught AssertionError` | 61 |
+| exit-0 non-passes with other `Uncaught` text | 10 |
+
+Zero false positives on the pass side is the strongest evidence available that the
+marker is doing real work. It holds on both baseline runs: 0 of 2880 and 0 of 2879
+passes print `Uncaught`. Meanwhile "ignore `Uncaught` when the exit code is 0" —
+the change the oracle table invites — would flip **531 files** pass, of which only 68
+have any oracle support and 462 have none. That is not a scoring fix; it is a
+different measurement.
+
+**Verdict: the rule stays as it is.** The 71 exit-0-but-marked files are a real
+finding about rustnode, not about the rule: rustnode prints a fatal error and still
+exits 0 in those cases, which Node does not do. That is a defect in rustnode's exit
+status propagation and is now recorded as such in the failure map. The four files the
+oracle flagged are genuine failures and remain in the 2373-failure population.
 
 ### Why 52.6% is superseded
 
@@ -519,6 +618,36 @@ $ ./rustnode -e "require('fs/promises').cp('/etc/hostname','/tmp/x',{recursive:t
 cp ok
 ```
 
+### Exit status is lost after a fatal error — 71 files
+
+`71` of the 2373 failures exit **0** while having printed an `Uncaught` line. Under
+the oracle the same files either pass silently or exit non-zero, so this is a
+rustnode defect rather than a test expectation: rustnode prints a fatal error and
+then reports success.
+
+61 of the 71 carry `Uncaught AssertionError`, which means a test's own assertion
+fired and the process still exited 0:
+
+```
+$ ./rustnode test/parallel/test-domain-no-error-handler-abort-on-uncaught-0.js
+(node:… ) [DEP0032] DeprecationWarning: The `domain` module is deprecated…
+node:internal/assert/utils:4640: Uncaught AssertionError: Test should have aborted
+but instead exited with exit code 1 and signal null
+$ echo $?
+0
+```
+
+Under the oracle the same file exits 0 printing neither line. So this is not the
+test being lenient; it is the runtime failing to set an exit status for an
+assertion that already failed. The other 10 are non-assertion text — leaked child
+stderr, or an error in a context whose status never reaches the parent — and are a
+mixture of expected transcript text and real gaps.
+
+The map had been crediting these to the `Uncaught` marker without naming the
+underlying defect. It is one bug with 71 files attached, it does not overlap the
+http2 family at all, and it is the largest group in the map that is a behaviour
+defect rather than a missing namespace.
+
 ### `http2` — 335 files, now the largest single gap
 
 `internalBinding('http2'): the namespace has no Rust implementation yet` appears in
@@ -773,6 +902,45 @@ python3 tools/test-tail-map.py run --node /tmp/frozen/rustnode \
 python3 tools/test-tail-map.py score /tmp/full.json
 python3 tools/test-tail-map.py score /tmp/full.json --family tls_wrap --list
 ```
+
+### Running the oracle
+
+The tool takes any runtime through `--node`, so the oracle is the same command with a
+different binary. A Node 28 built from the pin already exists on the measurement VM:
+
+```bash
+/home/ubuntu/oracle-node/out/Release/node -v     # v28.0.0-pre
+ls -l /workspace/node                            # -> /home/ubuntu/oracle-node
+```
+
+Rebuild it only if it is gone; it takes ~44 min on 8 cores. The tree must live
+**outside** the herdr checkout (its `deps/crates` has its own `Cargo.toml`, which the
+herdr workspace would otherwise claim), which is why `/workspace/node` is a symlink,
+and `make` needs `RUSTUP_TOOLCHAIN=1.96.1` or it fails on `edition2024`:
+
+```bash
+mkdir -p /home/ubuntu/oracle-node && cd /home/ubuntu/oracle-node
+git init -q . && git remote add origin https://github.com/nodejs/node
+git fetch --depth 1 origin f344e7f552e3656bd37517151c5dc87d22b33771
+git checkout -q FETCH_HEAD
+export RUSTUP_TOOLCHAIN=1.96.1
+./configure && make -j8
+```
+
+Then run the files rustnode fails through it. `--node` is the only switch needed:
+the tool applies the same `// Flags:` handling, `TEST_*` environment and four-marker
+rule to whichever binary it is given, so the two runs are comparable by construction.
+
+```bash
+python3 tools/test-tail-map.py run \
+    --node /home/ubuntu/oracle-node/out/Release/node \
+    --tests /home/ubuntu/oracle-node/test --out /tmp/oracle.json \
+    --jobs 8 --timeout 30 $(sed 's|^|--only |' /tmp/rustnode-failures.txt)
+python3 tools/test-tail-map.py score /tmp/oracle.json
+```
+
+`internet` must stay out of that list: it may need network, and a network-dependent
+result is not evidence in either direction.
 
 `./tools/check.sh --quick` is the gate; `--quick` skips only the workspace test
 sweep. There is no `GATE` variable in this repository.
