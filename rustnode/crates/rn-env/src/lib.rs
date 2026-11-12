@@ -208,6 +208,23 @@ pub fn vars() -> Vec<EnvVar> {
     mapped.unwrap_or_else(real_vars)
 }
 
+/// The `KEY=value` strings this thread's **private** store holds, if it has one.
+///
+/// `None` on a thread reading the real process block. A worker gets `Some`, so a
+/// caller that must not go through libuv's allocator can still answer with the
+/// worker's own environment.
+#[must_use]
+pub fn private_pairs() -> Option<Vec<String>> {
+    STORE.with(|slot| match slot.borrow().as_ref() {
+        Some(Store::Map(map)) => Some(
+            map.iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
 /// The `KEY=value` strings `spawn()` without an `env` option passes to the
 /// child.
 ///

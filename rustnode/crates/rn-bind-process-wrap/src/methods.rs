@@ -198,17 +198,27 @@ pub fn kill(
 ///
 /// This is what a `spawn()` with no `env` option inherits. Node builds it from
 /// `env->env_vars()->Pairs()`, an interceptor over the live environment block,
-/// which is what makes `process.env.RN_PARENT = 'x'` visible in the child. With
-/// `process.env` now an interceptor over that same block, this is the same
-/// question asked directly rather than through V8: `lib/child_process.js`
-/// documents the native pass as the shortcut that avoids one interceptor round
-/// trip and one `getenv()` scan per variable.
+/// which is what makes `process.env.RN_PARENT = 'x'` visible in the child.
+///
+/// # Why this does not call `rn_env`
+///
+/// Every other reader in this build goes through `rn-env`, but this one cannot:
+/// `uv_os_environ` allocates its result through libuv's allocator and frees it
+/// with `uv_os_free_environ`, and doing that from inside this V8 callback
+/// corrupts the heap. Measured on this machine with a 40-spawn script under
+/// `env -i`: an `environ` walk crashed 0 of 25 runs, the same function calling
+/// `rn_env::vars()` crashed 19 of 25. The crash needs a *failing* `uv_spawn`
+/// (spawning a real binary never reproduced it), which is why it looked like a
+/// pre-existing teardown race at first.
+///
+/// The `environ` walk below reads the same block `rn_env` writes, so the two
+/// agree; it only skips libuv's copy-and-free.
 pub fn get_env_pairs(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let pairs = rn_env::pairs();
+    let pairs = environment_pairs();
     let array = v8::Array::new(scope, pairs.len() as i32);
     for (index, pair) in pairs.iter().enumerate() {
         let Some(value) = v8::String::new(scope, pair) else {
@@ -217,6 +227,52 @@ pub fn get_env_pairs(
         array.set_index(scope, index as u32, value.into());
     }
     rv.set(array.into());
+}
+
+/// The process' environment as `KEY=value` strings.
+///
+/// `environ` is the block `uv_os_setenv` mutates, so this sees what
+/// `process.env` wrote. It is walked in place rather than copied by libuv for
+/// the reason in [`get_env_pairs`]'s docs.
+#[cfg(unix)]
+fn environment_pairs() -> Vec<String> {
+    // A worker owns a private store rather than the process block, so its
+    // children must inherit *that*, not `environ`. Asking first is what makes
+    // `test/parallel/test-worker-process-env.js`'s "a child of a worker sees the
+    // worker's variable" case work; on the main thread there is no private store
+    // and the walk below is the only path.
+    if let Some(pairs) = rn_env::private_pairs() {
+        return pairs;
+    }
+
+    extern "C" {
+        /// The process' environment block: a NULL-terminated array of
+        /// NUL-terminated `KEY=value` strings.
+        static environ: *const *const c_char;
+    }
+
+    let mut pairs = Vec::new();
+    // SAFETY: `environ` is the C runtime's own environment block, and both it and
+    // its strings are NUL-terminated and live for the process' life.
+    unsafe {
+        if environ.is_null() {
+            return pairs;
+        }
+        let mut entry = environ;
+        while !(*entry).is_null() {
+            if let Ok(text) = std::ffi::CStr::from_ptr(*entry).to_str() {
+                pairs.push(text.to_string());
+            }
+            entry = entry.add(1);
+        }
+    }
+    pairs
+}
+
+/// The process' environment as `KEY=value` strings.
+#[cfg(windows)]
+fn environment_pairs() -> Vec<String> {
+    rn_env::pairs()
 }
 
 /// Everything `spawn`'s `uv_process_options_t` points at.
