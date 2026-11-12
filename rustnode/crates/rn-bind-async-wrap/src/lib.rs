@@ -1044,6 +1044,47 @@ pub fn stack_length() -> u32 {
     })
 }
 
+/// Pushes an async context around a native callback, as Node's
+/// `AsyncHooks::push_async_context` does for `PromiseRejectCallback`.
+///
+/// `src/node_task_queue.cc` pushes the promise's `async_id_symbol` and
+/// `trigger_async_id_symbol` before it calls the JavaScript handler and pops
+/// after, so `executionAsyncId()` inside `promiseRejectHandler` answers the
+/// promise's id rather than whatever the last callback left behind. The push is
+/// skipped when either id is missing — `AsyncWrap::kInvalidAsyncId` — which is
+/// the case for a promise created outside any async context (`vm` realms and
+/// the bootstrap).
+///
+/// The resource is stored so `executionAsyncResource()` inside the handler
+/// answers the promise itself, which is the same `Local`-in-the-array
+/// arrangement [`push_context`] uses for every other callback.
+pub fn push_promise_context(
+    scope: &mut v8::PinScope<'_, '_>,
+    async_id: f64,
+    trigger_async_id: f64,
+    promise: Option<v8::Local<'_, v8::Object>>,
+) {
+    let resource = promise.map(|promise| v8::Global::new(scope, promise));
+    push_context(
+        scope,
+        rn_core::callback_scope::AsyncContext {
+            async_id,
+            trigger_async_id,
+        },
+        resource.as_ref(),
+    );
+}
+
+/// Pops the context [`push_promise_context`] pushed.
+pub fn pop_promise_context(scope: &mut v8::PinScope<'_, '_>, async_id: f64) {
+    pop_context(scope, async_id);
+}
+
+/// Whether either id is `kInvalidAsyncId`, in which case no context is pushed.
+pub fn promise_context_is_pushable(async_id: f64, trigger_async_id: f64) -> bool {
+    async_id != INVALID_ASYNC_ID && trigger_async_id != INVALID_ASYNC_ID
+}
+
 fn execution_async_resource(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,

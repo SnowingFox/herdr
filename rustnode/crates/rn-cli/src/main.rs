@@ -147,6 +147,14 @@ fn main() {
     // crate documents `FunctionCallbackArguments::get_isolate` as unsound while
     // a callback scope is open, and one always is during a binding call.
     rn_module_wrap::install_isolate_callbacks(&mut isolate);
+    // V8 reports a rejected promise through one isolate-level callback, and
+    // `internal/process/promises.js` cannot receive a rejection without it:
+    // `setPromiseRejectCallback` only records the JavaScript function. Node
+    // installs `node::task_queue::PromiseRejectCallback` from
+    // `SetIsolateMiscHandlers`, before any JavaScript runs, which is the same
+    // position this takes. A binding cannot do it — the only API takes
+    // `&mut Isolate`.
+    rn_bind_task_queue::install_isolate_callbacks(&mut isolate);
     // `v8.writeHeapSnapshot` needs `take_heap_snapshot`, an `Isolate` method,
     // and a binding callback cannot obtain a `&mut Isolate` soundly. Recording
     // the isolate here is the same arrangement the ESM handlers use.

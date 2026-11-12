@@ -20,6 +20,11 @@ rn-bind-options = { path = "../rn-bind-options" }
 # The check phase is where a worker's exit is reported, and its handle lives
 # there. The hook is additive so neither crate has to know the other.
 rn-bind-timers = { path = "../rn-bind-timers" }
+# A worker's isolate needs the isolate-level promise rejection callback too:
+# `setPromiseRejectCallback` only records the JavaScript function, and without
+# the V8 registration a worker never runs its own `unhandledRejection`
+# listeners.
+rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 # `Worker::New` checks the `worker` scope before it reads any argument, so
 # creating a worker under `--permission` is denied unless it was granted.
 rn-permission = { path = "../rn-permission" }

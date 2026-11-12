@@ -1298,6 +1298,7 @@ dependencies = [
 name = "rn-bind-task-queue"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-v8-sys",
 ]
@@ -1439,6 +1440,7 @@ dependencies = [
  "rn-bind-heap-utils",
  "rn-bind-messaging",
  "rn-bind-options",
+ "rn-bind-task-queue",
  "rn-bind-timers",
  "rn-core",
  "rn-env",
@@ -1674,6 +1676,7 @@ name = "rn-module-wrap"
 version = "0.1.0"
 dependencies = [
  "rn-bind-symbols",
+ "rn-bind-task-queue",
  "rn-core",
  "rn-v8-sys",
 ]

@@ -621,7 +621,12 @@ fn module_evaluate_sync<'s>(
         throw_error(scope, "module evaluation did not return a promise");
         return;
     };
+    // `ThrowIfPromiseRejected` (`src/module_wrap.cc`) withdraws the promise from
+    // unhandled-rejection tracking before it throws, because V8 created this
+    // promise and no handler was ever attached. Without the withdrawal the same
+    // rejection is reported again by `processPromiseRejections`.
     if promise.state() == v8::PromiseState::Rejected {
+        rn_bind_task_queue::mark_promise_handled(scope, promise);
         let exception = promise.result(scope);
         scope.throw_exception(exception);
         return;
@@ -1215,6 +1220,18 @@ fn store_hook(
 }
 
 /// Re-throws when a module's evaluation promise settled as rejected.
+///
+/// `ThrowIfPromiseRejected` in `src/module_wrap.cc` does one thing before the
+/// throw: it reports `kPromiseHandlerAddedAfterReject` for the promise so
+/// `internal/process/promises.js` withdraws it from unhandled-rejection
+/// tracking. V8 creates the evaluation promise, so no embedder handler was ever
+/// attached; without this withdrawal the same rejection is reported twice — once
+/// as the uncaught exception this throws, and again by
+/// `processPromiseRejections` a few ticks later.
+///
+/// The order is part of the contract: the withdrawal must happen before the
+/// exception is thrown, because the throw unwinds through the loader and the
+/// second report would otherwise already be queued.
 fn throw_if_promise_rejected<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -1226,6 +1243,7 @@ fn throw_if_promise_rejected<'s>(
     if promise.state() != v8::PromiseState::Rejected {
         return;
     }
+    rn_bind_task_queue::mark_promise_handled(scope, promise);
     let exception = promise.result(scope);
     scope.throw_exception(exception);
 }
