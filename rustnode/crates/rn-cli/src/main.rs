@@ -45,6 +45,15 @@ fn main() {
     }
     rn_permission::runtime::install_shared(options.permission.clone());
 
+    // The command line's abort decision is recorded once, before any code runs,
+    // because Node sets `EnvironmentOptions::abort_on_uncaught_exception` from
+    // the V8 argument vector at environment creation (`src/node.cc:794`) and
+    // never re-reads it. `v8.setFlagsFromString` is a different mechanism: it
+    // makes V8 itself abort, which is why
+    // `test-process-exception-capture-should-abort-on-uncaught-setflagsfromstring.js`
+    // behaves differently from the command-line form.
+    rn_core::hook_slot::set_abort_on_uncaught_exception(options.abort_on_uncaught_exception);
+
     // `Environment::Initialize` records the IPC channel's descriptor from
     // `NODE_CHANNEL_FD` before any JavaScript runs, so that a later change to the
     // environment cannot change which descriptor counts as the channel. The

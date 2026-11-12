@@ -17,6 +17,8 @@
 //!   drops it deliberately and the JavaScript side destructures only what it
 //!   gets.
 
+use std::cell::Cell;
+
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
@@ -283,9 +285,151 @@ pub fn report_uncaught_rejection(
     report_uncaught(scope, error, true)
 }
 
-/// The shared body of the two public entry points: one `_fatalException` call,
-/// then the print-and-exit path when it declines.
+thread_local! {
+    /// `is_in_uncaught_exception`, from `src/node_errors.cc:198`.
+    ///
+    /// Set while an uncaught exception is being reported, so a handler that
+    /// throws is detected as re-entrant instead of being reported recursively
+    /// until the stack runs out. Thread-local because each isolate reports on its
+    /// own thread, which is how Node's `thread_local` static works too.
+    static REPORTING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether an uncaught exception must abort the process instead of being
+/// reported through `_fatalException`.
+///
+/// Two independent facts, exactly as `src/api/environment.cc:65` combines them:
+///
+/// * the static `--abort-on-uncaught-exception` option, and
+/// * `shouldAbortOnUncaughtToggle[0]`, which
+///   `process.setUncaughtExceptionCaptureCallback(fn)` clears and
+///   `setUncaughtExceptionCaptureCallback(null)` restores
+///   (`lib/internal/process/execution.js:121,133`).
+///
+/// The toggle is the half that makes a capture callback suppress the abort, and
+/// it is why this cannot key on the flag alone:
+/// `test-process-exception-capture-should-abort-on-uncaught.js` passes the flag
+/// and still expects exit 0. A plain `uncaughtException` listener never touches
+/// the toggle, so it does not suppress the abort — which is Node's behaviour and
+/// is automatic here because that listener is called from inside
+/// `_fatalException`, below this check.
+fn aborts_on_uncaught() -> bool {
+    rn_core::hook_slot::abort_on_uncaught_exception()
+        && rn_core::hook_slot::abort_toggle_allows_abort()
+}
+
+/// The text Node prints before `ABORT()`.
+///
+/// V8's own abort path (`Isolate::CreateMessageOrAbort`,
+/// `deps/v8/src/execution/isolate.cc:2739`) prints
+/// `"%s\n\nFROM\n"` with the localized message followed by
+/// `PrintCurrentStackTrace`, which is where the oracle's
+/// `Uncaught Error: x` / `FROM` / frame list comes from. The crate exposes no
+/// `PrintCurrentStackTrace`, so the frames come from the error's own `stack`,
+/// with its header line dropped to avoid printing `Error: x` twice.
+fn fatal_exception_text(scope: &mut v8::PinScope, error: v8::Local<v8::Value>) -> String {
+    let (name, message) = match v8::Local::<v8::Object>::try_from(error) {
+        Ok(object) if error.is_object() => {
+            let read = |key: &str| {
+                v8::String::new(scope, key)
+                    .and_then(|key| object.get(scope, key.into()))
+                    .filter(|value| value.is_string())
+                    .map(|value| value.to_rust_string_lossy(scope))
+            };
+            (
+                read("name").unwrap_or_else(|| "Error".to_string()),
+                read("message").unwrap_or_default(),
+            )
+        }
+        _ => (
+            type_name(error).to_string(),
+            error.to_rust_string_lossy(scope),
+        ),
+    };
+    let header = if message.is_empty() {
+        format!("Uncaught {name}")
+    } else {
+        format!("Uncaught {name}: {message}")
+    };
+    // The frames come from `error.stack`, whose first line repeats the header.
+    let frames = v8::Local::<v8::Object>::try_from(error)
+        .ok()
+        .and_then(|object| {
+            let key = v8::String::new(scope, "stack")?;
+            let stack = object.get(scope, key.into())?;
+            stack.is_string().then(|| stack.to_rust_string_lossy(scope))
+        })
+        .map(|stack| {
+            let mut lines = stack.lines();
+            lines.next();
+            lines.collect::<Vec<_>>().join("\n")
+        })
+        .unwrap_or_default();
+    if frames.is_empty() {
+        format!("{header}\n\nFROM\n")
+    } else {
+        format!("{header}\n\nFROM\n{frames}\n")
+    }
+}
+
 fn report_uncaught(
+    scope: &mut v8::PinScope<'_, '_>,
+    error: v8::Local<v8::Value>,
+    from_promise: bool,
+) -> bool {
+    // `is_in_uncaught_exception` (`src/node_errors.cc:1314`): a handler that
+    // throws while an uncaught exception is already being reported cannot be
+    // reported in turn, because that is the same recursion one level deeper.
+    // Node prints a FATAL ERROR line and aborts.
+    //
+    // This is a guard and not an optimisation. Without it, a
+    // `process.on('uncaughtException')` listener that throws — and a domain
+    // error handler that throws, which reaches the same place — drives the
+    // recursion below until the stack overflows, and a Rust stack overflow is a
+    // `SIGSEGV` with `fatal runtime error: stack overflow` on stderr rather than
+    // the abort Node produces.
+    if REPORTING.with(Cell::get) {
+        let text = format!(
+            "FATAL ERROR: Re-entrant uncaught exception detected.\n\
+             The exception handler threw an error while processing a\n\
+             previous uncaught exception, likely due to an inspector\n\
+             protocol issue. Aborting to prevent infinite recursion.\n{}",
+            fatal_exception_text(scope, error)
+        );
+        rn_core::hook_slot::write_stderr(&text);
+        std::process::abort();
+    }
+    // `TriggerUncaughtException` checks this *above* the `_fatalException`
+    // call (`src/node_errors.cc:1193-1201`) and `ABORT()`s, so on the abort
+    // path no JavaScript handler runs at all: no `uncaughtException` listener,
+    // no `'exit'` handlers, and `_fatalException` is never reached. Printing
+    // first and aborting after is what the ten
+    // `test-domain-no-error-handler-abort-on-uncaught-*` files observe, and
+    // routing the flag through the handler first would let a listener suppress
+    // an abort Node takes.
+    //
+    // Node gates this on two separate facts and so does this: the static
+    // environment option (never re-read, so `v8.setFlagsFromString` cannot
+    // change it — that is the V8-level flag's job) and the byte
+    // `setUncaughtExceptionCaptureCallback` clears. The capture callback must
+    // suppress the abort; a plain `uncaughtException` listener must not, which
+    // is automatic here because the listener lives behind `_fatalException`.
+    if aborts_on_uncaught() {
+        let text = fatal_exception_text(scope, error);
+        rn_core::hook_slot::write_stderr(&text);
+        std::process::abort();
+    }
+    // The RAII `UncaughtExceptionGuard` in `src/node_errors.cc:1327`, scoped to
+    // everything below: `ABORT()` above never reaches the restore, which is
+    // intentional because the process is terminating either way.
+    REPORTING.set(true);
+    let result = report_uncaught_inner(scope, error, from_promise);
+    REPORTING.set(false);
+    result
+}
+
+/// The part of [`report_uncaught`] that runs with the re-entrancy guard set.
+fn report_uncaught_inner(
     scope: &mut v8::PinScope<'_, '_>,
     error: v8::Local<v8::Value>,
     from_promise: bool,
@@ -293,7 +437,50 @@ fn report_uncaught(
     if let Some(handler) = process_fatal_exception_handler(scope) {
         let flag = v8::Boolean::new(scope, from_promise);
         let argv = [error, flag.into()];
+        // `_fatalException` runs user JavaScript, so it can throw. `!maybe_handled
+        // .ToLocal(&handled)` in `src/node_errors.cc:1404` is the case where it
+        // does: Node returns and lets that throw propagate as a fresh uncaught
+        // exception rather than treating the original one as handled.
+        //
+        // That is not a corner case — it is how `domain.js` declines an error it
+        // has no handler for. It uninstalls its capture callback, which sets
+        // `shouldAbortOnUncaughtToggle[0]` back to `1`, and rethrows
+        // (`lib/domain.js:195`: "Throw it to let the C++ side handle the exit
+        // properly (respects --abort-on-uncaught)"). Re-entering this function
+        // with the *rethrown* value is what makes `--abort-on-uncaught-exception`
+        // abort there; leaving it to V8's message handler prints
+        // `node:domain:NNNN: Uncaught Error: …` to stdout and exits 1 instead.
+        // The `-6`/`-7`/`-8` domain files observe exactly that difference.
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let scope = &mut try_catch.init();
         let result = handler.call(scope, v8::undefined(scope).into(), &argv);
+        if scope.has_caught() && !scope.has_terminated() {
+            let rethrown = scope.exception();
+            // The throw is consumed here rather than left pending: the value has
+            // been reported below, inside this `TryCatch`.
+            scope.reset();
+            if let Some(rethrown) = rethrown {
+                // `_fatalException` threw while an uncaught exception was being
+                // reported. Node's `TryCatchScope::CatchMode::kFatal`
+                // (`src/node_errors.cc:747`) reports the *new* error and exits
+                // `kExceptionInFatalExceptionHandler` (7). Reporting it through
+                // this function again would recurse until the stack ran out,
+                // which is what the guard at the top turns into an abort.
+                //
+                // The abort flag still decides the death where it is set: a
+                // domain error handler that throws reaches this with the toggle
+                // back at `1` (`lib/domain.js:195`), and
+                // `test-domain-with-abort-on-uncaught-exception.js` requires a
+                // signal death there.
+                if aborts_on_uncaught() {
+                    let text = fatal_exception_text(scope, rethrown);
+                    rn_core::hook_slot::write_stderr(&text);
+                    std::process::abort();
+                }
+                report(scope, rethrown, from_promise);
+                return false;
+            }
+        }
         // `!handled->IsFalse()` in `src/node_errors.cc`: only a literal `false`
         // means "unhandled". A handler that returns `undefined` — every
         // `process.on('uncaughtException')` listener path — has the runtime's
