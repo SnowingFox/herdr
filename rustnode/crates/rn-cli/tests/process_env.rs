@@ -417,3 +417,97 @@ fn a_variable_from_the_process_environment_is_readable() {
     assert_eq!(stdout.trim(), "visible", "stderr: {stderr}");
     assert_eq!(code, 0, "stderr: {stderr}");
 }
+
+#[test]
+fn a_tz_write_redetects_the_time_zone() {
+    // `DateTimeConfigurationChangeNotification`: V8 caches the detected zone, so
+    // without the notification a `Date` formatted after `process.env.TZ = ...`
+    // keeps the old one. Node calls `tzset()` then notifies the isolate.
+    expect(
+        "process.env.TZ = 'UTC'; \
+         const winter = new Date('2020-01-01T00:00:00Z'); \
+         const utc = winter.getHours(); \
+         process.env.TZ = 'Europe/Amsterdam'; \
+         console.log(utc, winter.getHours());",
+        "0 1",
+    );
+}
+
+#[test]
+fn a_removed_variable_reads_as_absent_under_permission() {
+    // `EnvGetter` returns `Intercepted::kNo` for a variable the startup scrub
+    // removed, so `process.env.X` is `undefined` *and* `'X' in process.env` is
+    // false, even though the scrub is what made it absent. Enforcing a read is
+    // about the value, never about throwing.
+    let source = "console.log(process.env.RN_TEST_SECRET, 'RN_TEST_SECRET' in process.env);";
+
+    // Without the model the launcher's value is visible, so the assertion below
+    // is about the scrub and not about the variable being absent for some other
+    // reason.
+    let plain = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .args(["-e", source])
+        .env("RN_TEST_SECRET", "secret")
+        .output()
+        .expect("rustnode runs");
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout).trim(),
+        "secret true",
+        "stderr: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .args(["--permission", "--no-warnings", "-e", source])
+        .env("RN_TEST_SECRET", "secret")
+        .output()
+        .expect("rustnode runs");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "undefined false",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_read_of_a_scrubbed_variable_is_published_to_the_env_channel() {
+    // `EnvGetter` and `EnvQuery` publish to `node:permission-model:env`, and
+    // `ReportRemovedEnvVar` warns once. The counts are what
+    // `test-permission-env-warning.js` asserts: three publications for two reads
+    // and one membership test, and one warning naming only the removed
+    // variable.
+    let source = r#"
+        const dc = require('diagnostics_channel');
+        const events = [];
+        dc.subscribe('node:permission-model:env', (message) => {
+            events.push([message.permission, message.resource]);
+        });
+        process.env.RN_TEST_SECRET;
+        process.env.RN_TEST_SECRET;
+        ('RN_TEST_SECRET' in process.env);
+        // A variable that was never set is not reported.
+        process.env.RN_TEST_NEVER_SET;
+        console.log(JSON.stringify(events));
+    "#;
+    let out = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .args(["--permission", "-e", source])
+        .env("RN_TEST_SECRET", "secret")
+        .output()
+        .expect("rustnode runs");
+    // The publications are observed by the subscriber in the script, so the
+    // stdout line is the event list itself.
+    assert_eq!(
+        last_line(&String::from_utf8_lossy(&out.stdout)),
+        r#"[["Env","RN_TEST_SECRET"],["Env","RN_TEST_SECRET"],["Env","RN_TEST_SECRET"]]"#,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr
+            .matches("removed the environment variable \"RN_TEST_SECRET\"")
+            .count(),
+        1,
+        "the warning must fire exactly once: {stderr}"
+    );
+}

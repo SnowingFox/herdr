@@ -546,6 +546,65 @@ mod tests {
     }
 
     #[test]
+    fn a_read_of_a_removed_variable_reports_and_warns_once() {
+        // `EnvGetter`/`EnvQuery`'s pair of questions: publish every time, warn
+        // once. `test-permission-env-warning.js` counts three publications for
+        // two reads and one `in` check, and exactly one warning.
+        let model = install_model("/work", PermissionConfig::enforce());
+        model.record_removed_env_vars(["PERMISSION_ENV_SECRET"]);
+
+        assert!(env_read_is_denied("PERMISSION_ENV_SECRET"));
+
+        match inspect_env_read("PERMISSION_ENV_SECRET") {
+            EnvReadReport::Removed { denied, warn } => {
+                assert_eq!(denied.permission(), "Env");
+                assert_eq!(denied.resource(), "PERMISSION_ENV_SECRET");
+                assert!(warn, "the first read warns");
+            }
+            other => panic!("expected Removed, got {other:?}"),
+        }
+        match inspect_env_read("PERMISSION_ENV_SECRET") {
+            EnvReadReport::Removed { warn, .. } => {
+                assert!(!warn, "the second read must not warn again");
+            }
+            other => panic!("expected Removed, got {other:?}"),
+        }
+        // A variable the model does not grant but never removed is not reported:
+        // `ReportRemovedEnvVar` asks `WasRemovedByEnvironmentScrub` first.
+        assert_eq!(inspect_env_read("RN_NEVER_SET"), EnvReadReport::Nothing);
+        assert!(!env_read_is_denied("RN_NEVER_SET"));
+    }
+
+    #[test]
+    fn audit_mode_reports_a_read_but_removes_nothing() {
+        // Audit mode's `AuditEnvVar` reports only names the enforcing model
+        // would have taken away, which is why the CLI has to record them
+        // separately: `record_removed_env_vars` is a no-op in audit mode.
+        install_model("/work", PermissionConfig::audit());
+        record_audited_env_vars(["PERMISSION_ENV_SECRET"]);
+        assert_eq!(
+            inspect_env_read("PERMISSION_ENV_SECRET"),
+            EnvReadReport::Audited {
+                denied: AccessDeniedError::new(AccessDenied::new(
+                    PermissionScope::Env,
+                    "PERMISSION_ENV_SECRET"
+                )),
+            }
+        );
+        // An allowed variable, and one created at runtime, report nothing.
+        assert_eq!(
+            inspect_env_read("PERMISSION_ENV_ALLOWED"),
+            EnvReadReport::Nothing
+        );
+        assert_eq!(
+            inspect_env_read("PERMISSION_ENV_RUNTIME"),
+            EnvReadReport::Nothing
+        );
+        // And nothing is denied: the value must still be readable.
+        assert!(!env_read_is_denied("PERMISSION_ENV_SECRET"));
+    }
+
+    #[test]
     fn an_enforcing_model_denies_and_reports_the_scope() {
         install_model("/work", PermissionConfig::enforce());
         assert!(is_enabled());
