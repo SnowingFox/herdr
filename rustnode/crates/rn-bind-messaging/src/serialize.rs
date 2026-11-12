@@ -135,10 +135,20 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
         // rustnode asks the same two of its own machinery: a port is a handle it
         // knows, and anything else has to be a handle whose kind registered a
         // clone hook, or an object `markTransferMode` stamped.
+        //
+        // `process.env` is a third case, and Node answers it in the same place:
+        // `SerializationContext::WriteHostObject` tests
+        // `env_proxy_ctor_template->HasInstance(object)` and serialises the
+        // variables as a normal object. Without this the proxy is not a host
+        // object at all, V8 copies its enumerable properties, and the copy works
+        // by accident — but `structuredClone(process.env)` inside a worker, where
+        // the proxy's own realm is not the one reading, is the case that has to
+        // be explicit.
         Some(
             crate::port_state_of(scope, object).is_some()
                 || host_object::is_registered(scope, object)
-                || crate::js_marked(scope, object),
+                || crate::js_marked(scope, object)
+                || rn_core::env_proxy::is_proxy(scope, object),
         )
     }
 
@@ -148,6 +158,22 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
         object: v8::Local<'s, v8::Object>,
         serializer: &dyn v8::ValueSerializerHelper,
     ) -> Option<bool> {
+        // `process.env` is not a handle and has no transfer mode; Node converts
+        // it to a normal object and writes that. `kNormalObject` is the sentinel
+        // `src/node_messaging.cc` defines ("Hack to have WriteHostObject inform
+        // ReadHostObject that the value should be treated as a regular JS
+        // object. Used to transfer process.env."), and the delegate on the other
+        // side reads a value instead of looking up an id when it sees it.
+        if rn_core::env_proxy::is_proxy(scope, object) {
+            return match crate::env_pairs_object(scope) {
+                Some(plain) => {
+                    serializer.write_uint32(crate::K_NORMAL_OBJECT);
+                    serializer.write_value(scope.get_current_context(), plain.into())
+                }
+                None => None,
+            };
+        }
+
         // A port is transferable and never cloneable: its payload in the message is
         // the id of its transfer-list slot, and the receiver rebuilds it from the
         // queue the sender gave up.

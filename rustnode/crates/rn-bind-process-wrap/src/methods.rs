@@ -197,17 +197,18 @@ pub fn kill(
 /// `ProcessWrap::GetEnvPairs` — the environment as `['KEY=value', …]`.
 ///
 /// This is what a `spawn()` with no `env` option inherits. Node builds it from
-/// `env->env_vars()->Pairs()`, an interceptor over the live environment block;
-/// rustnode has no `process.env` interceptor yet, so the process' own block is
-/// read directly. The two agree in the case that matters — a child inherits what
-/// the parent started with — and differ only when user code assigned to
-/// `process.env` without passing `options.env`.
+/// `env->env_vars()->Pairs()`, an interceptor over the live environment block,
+/// which is what makes `process.env.RN_PARENT = 'x'` visible in the child. With
+/// `process.env` now an interceptor over that same block, this is the same
+/// question asked directly rather than through V8: `lib/child_process.js`
+/// documents the native pass as the shortcut that avoids one interceptor round
+/// trip and one `getenv()` scan per variable.
 pub fn get_env_pairs(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let pairs = environment_pairs();
+    let pairs = rn_env::pairs();
     let array = v8::Array::new(scope, pairs.len() as i32);
     for (index, pair) in pairs.iter().enumerate() {
         let Some(value) = v8::String::new(scope, pair) else {
@@ -216,41 +217,6 @@ pub fn get_env_pairs(
         array.set_index(scope, index as u32, value.into());
     }
     rv.set(array.into());
-}
-
-/// The process' environment as `KEY=value` strings.
-#[cfg(unix)]
-fn environment_pairs() -> Vec<String> {
-    extern "C" {
-        /// The process' environment block: a NULL-terminated array of
-        /// NUL-terminated `KEY=value` strings.
-        static environ: *const *const c_char;
-    }
-
-    let mut pairs = Vec::new();
-    // SAFETY: `environ` is the C runtime's own environment block, and both it and
-    // its strings are NUL-terminated and live for the process' life.
-    unsafe {
-        if environ.is_null() {
-            return pairs;
-        }
-        let mut entry = environ;
-        while !(*entry).is_null() {
-            if let Ok(text) = std::ffi::CStr::from_ptr(*entry).to_str() {
-                pairs.push(text.to_string());
-            }
-            entry = entry.add(1);
-        }
-    }
-    pairs
-}
-
-/// The process' environment as `KEY=value` strings.
-#[cfg(windows)]
-fn environment_pairs() -> Vec<String> {
-    std::env::vars()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect()
 }
 
 /// Everything `spawn`'s `uv_process_options_t` points at.

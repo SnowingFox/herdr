@@ -80,6 +80,12 @@ pub struct SpawnRequest {
     pub resource_limits: [f64; 4],
     /// `process.argv` entries the worker appends after its own.
     pub argv: Vec<String>,
+    /// The environment the worker's `process.env` starts from.
+    ///
+    /// Node gives each worker its own `KVStore`, so a worker's writes are its own
+    /// while a child process it spawns still inherits them. `SHARE_ENV` is the
+    /// exception: that worker writes the process environment directly.
+    pub env: crate::worker::WorkerEnv,
 }
 
 /// One worker, as the parent thread sees it.

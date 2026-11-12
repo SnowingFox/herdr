@@ -17,6 +17,7 @@
 //! JavaScript layer reaches a Rust namespace, so it is where the binding registry
 //! is consulted.
 
+pub mod process_env;
 pub mod runtime;
 pub mod versions;
 
@@ -1496,14 +1497,12 @@ fn process_object<'s>(
     if let Some(value) = v8::String::new(scope, &exec_path) {
         set(scope, process, "execPath", value.into())?;
     }
-    let env = v8::Object::new(scope);
-    for (key, value) in std::env::vars() {
-        if let (Some(key), Some(value)) =
-            (v8::String::new(scope, &key), v8::String::new(scope, &value))
-        {
-            let _ = env.set(scope, key.into(), value.into());
-        }
-    }
+    // An interceptor over the real environment block, not a snapshot of it.
+    // `std::env::vars()` here used to build a plain object, which made
+    // `process.env.X = 'y'` invisible to a child process and kept a number
+    // assigned to it a number; see `process_env`'s module docs.
+    let env = process_env::create(scope)
+        .ok_or("cannot allocate the process.env proxy template instance")?;
     set(scope, process, "env", env.into())?;
 
     // `process.features` is read at module scope by `lib/internal/crypto/**`,

@@ -111,6 +111,44 @@ pub const DEFERRED: &[(&str, &str)] = &[
 /// `MessagePortData` pointer; this holds the Rust side of the same thing.
 const PORT_FIELD: i32 = 0;
 
+/// `kNormalObject`: the host-object id that means "read a plain value instead".
+///
+/// `src/node_messaging.cc`:
+///
+/// ```text
+/// // Hack to have WriteHostObject inform ReadHostObject that the value
+/// // should be treated as a regular JS object. Used to transfer process.env.
+/// static const uint32_t kNormalObject = static_cast<uint32_t>(-1);
+/// ```
+///
+/// It is not an index into the host-object vector, which is why it can be the
+/// largest `u32`: every real id is a small count.
+pub(crate) const K_NORMAL_OBJECT: u32 = u32::MAX;
+
+/// `process.env` as the ordinary object its serialised form carries.
+///
+/// `SerializationContext::WriteHostObject` builds `Object::New(isolate)` and
+/// fills it with `env_vars()->AssignToObject()`, so the clone holds the variables
+/// as they were at serialisation time. Building it fresh rather than returning
+/// the proxy is what makes the *receiver* get a copy: sending the proxy itself
+/// would make the clone live, and Node's comment notes the prototype difference
+/// as a known wart rather than a behaviour to preserve.
+pub(crate) fn env_pairs_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let object = v8::Object::new(scope);
+    for entry in rn_env::vars() {
+        let (Some(key), Some(value)) = (
+            v8::String::new(scope, &entry.name),
+            v8::String::new(scope, &entry.value),
+        ) else {
+            continue;
+        };
+        object.set(scope, key.into(), value.into());
+    }
+    Some(object)
+}
+
 thread_local! {
     /// The deserializer object-creation callback `js_transferable.js` installs.
     ///

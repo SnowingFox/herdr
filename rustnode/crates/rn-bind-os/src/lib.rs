@@ -199,7 +199,12 @@ fn safe_getenv(
         return;
     }
     // `undefined` when unset, which is what the JavaScript layer checks for.
-    if let Ok(value) = std::env::var(&name) {
+    // The read goes through the same store `process.env` is an interceptor over,
+    // so a variable assigned from JavaScript is visible here: `safeGetenv` is
+    // what `lib/internal/bootstrap/realm.js` and `Module._initPaths` read
+    // `HOME` and `NODE_PATH` with, and a snapshot taken at startup would answer
+    // with the environment the process was launched with instead.
+    if let Some(value) = rn_env::get(&name) {
         set_string(scope, &mut rv, &value);
     }
 }
@@ -212,11 +217,19 @@ fn get_temp_dir(
     if !environment_is_trusted() {
         return;
     }
-    // `TMPDIR`, then `TMP`, then `TEMP`, matching Node.
+    // `TMPDIR`, then `TMP`, then `TEMP`, matching Node. The read is
+    // `GetTempDir`'s own: `src/node_credentials.cc` wraps `SafeGetenv`, whose
+    // value comes from `env->env_vars()->Get()`, so a variable assigned to
+    // `process.env` from JavaScript is what `os.tmpdir()` reports.
+    // `test/parallel/test-os.js` sets all three from JavaScript and checks each
+    // step of the fallback.
     for name in ["TMPDIR", "TMP", "TEMP"] {
-        let Ok(dir) = std::env::var(name) else {
+        let Some(dir) = rn_env::get(name) else {
             continue;
         };
+        // An empty variable is skipped rather than reported as the empty
+        // string, which is `GetTempDir`'s `!dir.empty()` check; `''` then falls
+        // through to the next name and finally to `lib/os.js`'s `|| '/tmp'`.
         if dir.is_empty() {
             continue;
         }
@@ -1264,7 +1277,14 @@ fn get_home_directory(
 }
 
 fn home_directory() -> Option<String> {
-    std::env::var("HOME").ok().filter(|home| !home.is_empty())
+    // `uv_os_homedir` checks `HOME` first and falls back to the passwd entry.
+    // The `HOME` read has to be the live block: `test/parallel/test-os.js`
+    // deletes `process.env.HOME` and asserts that `os.homedir()` still answers
+    // from passwd, then puts it back.
+    if let Some(home) = rn_env::get("HOME").filter(|home| !home.is_empty()) {
+        return Some(home);
+    }
+    passwd_entry().map(|entry| entry.homedir)
 }
 
 fn get_user_info(

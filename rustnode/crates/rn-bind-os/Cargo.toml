@@ -9,6 +9,12 @@ description = "internalBinding('os') for rustnode"
 
 [dependencies]
 rn-core.workspace = true
+# The environment block `os.tmpdir()`, `os.homedir()` and `safeGetenv` read is
+# the same one `process.env` is an interceptor over. A `std::env::var` here would
+# see only the environment the process was launched with, so a variable assigned
+# from JavaScript would be invisible and `test/parallel/test-os.js` would report
+# `/tmp` where Node reports the assigned value.
+rn-env = { path = "../rn-env" }
 rn-v8-sys.workspace = true
 libc.workspace = true
 

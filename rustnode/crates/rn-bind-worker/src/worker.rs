@@ -172,6 +172,7 @@ fn worker_constructor(
 
     let resource_limits = read_resource_limits(scope, args.get(3));
     let exec_argv = read_exec_argv(scope, args.get(2));
+    let env = read_worker_env(scope, args.get(1));
 
     // The channel: one end becomes `this.messagePort`, and the other travels to
     // the worker as a bare queue. `MessageChannel` would build two objects in
@@ -194,6 +195,7 @@ fn worker_constructor(
         // the worker's own bootstrap, from the `LOAD_SCRIPT` message, so the
         // native side does not carry it.
         argv: Vec::new(),
+        env,
     };
     let handle = Rc::new(RefCell::new(WorkerHandle::new(
         request,
@@ -420,6 +422,72 @@ fn read_exec_argv(
         }
     }
     argv
+}
+
+/// The environment a worker's `process.env` starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerEnv {
+    /// A copy of the parent's environment, taken now.
+    ///
+    /// `lib/internal/worker.js` passes `null` when `options.env` was absent, and
+    /// Node reads that as "clone `process.env`". The copy is what makes a
+    /// parent assignment *after* the `Worker` was constructed invisible to it,
+    /// and what makes a worker's own assignment invisible to the parent.
+    Copy(Vec<(String, String)>),
+    /// `options.env`: the environment the caller supplied.
+    Explicit(Vec<(String, String)>),
+    /// `worker_threads.SHARE_ENV`: the worker writes the process environment
+    /// itself, so a parent assignment after construction is visible.
+    Shared,
+}
+
+/// Reads the `env` argument of `new WorkerImpl(...)`.
+///
+/// `src/node_worker.cc` distinguishes the three cases by type, not by value:
+///
+/// ```text
+/// if (args[1]->IsNull()) {          // env_vars = env->env_vars()->Clone()
+/// } else if (args[1]->IsObject()) { // KVStore from the object's entries
+/// } else {                          // env_vars = env->env_vars();  (SHARE_ENV)
+/// }
+/// ```
+///
+/// `lib/internal/worker.js` has already copied an explicit `options.env` object
+/// with its values stringified, so every value here is a string; a non-string is
+/// coerced anyway rather than dropped, because dropping it would make a
+/// variable silently absent instead of wrong.
+fn read_worker_env(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> WorkerEnv {
+    if value.is_null() {
+        return WorkerEnv::Copy(rn_env::snapshot());
+    }
+    let Ok(object) = v8::Local::<v8::Object>::try_from(value) else {
+        return WorkerEnv::Shared;
+    };
+    let Some(names) = object.get_own_property_names(scope, Default::default()) else {
+        return WorkerEnv::Explicit(Vec::new());
+    };
+    let mut entries = Vec::with_capacity(usize::try_from(names.length()).unwrap_or(0));
+    for index in 0..names.length() {
+        let Some(key) = names.get_index(scope, index) else {
+            continue;
+        };
+        let Some(entry) = object.get(scope, key) else {
+            continue;
+        };
+        // `SetEnvironment`/`AssignFromObject` coerce through `ToString`, so a
+        // value that cannot convert is a caller error rather than a skip.
+        let Some(value) = entry.to_string(scope) else {
+            continue;
+        };
+        let name = key
+            .to_string(scope)
+            .map(|name| name.to_rust_string_lossy(scope));
+        let Some(name) = name else {
+            continue;
+        };
+        entries.push((name, value.to_rust_string_lossy(scope)));
+    }
+    WorkerEnv::Explicit(entries)
 }
 
 fn set(

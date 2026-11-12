@@ -856,29 +856,87 @@ fn reset_stdio_for_testing(
     let _ = scope;
 }
 
+/// `process.loadEnvFile(path)` — `src/node_process_methods.cc`'s `LoadEnvFile`.
+///
+/// `Dotenv::SetEnvironment` writes each parsed entry through
+/// `env->env_vars()->Set()`, which is the same interceptor `process.env` is, so
+/// the values land in the process environment block and are then visible to a
+/// child process. Returning an object for the caller to assign would leave them
+/// in a temporary that `lib/internal/process/per_thread.js` never reads.
+///
+/// Two details of `SetEnvironment` are load-bearing here:
+///
+/// * an entry whose name is already set is **skipped**, not overwritten — "the
+///   real environment wins over the file", which is what makes
+///   `--env-file` behave the way `process.loadEnvFile()` does;
+/// * a malformed file throws `ERR_INVALID_ARG_TYPE` rather than silently
+///   succeeding with no entries.
 fn load_env_file(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let Some(path) = args.get(0).to_string(scope) else {
-        rv.set(v8::undefined(scope).into());
-        return;
+    // `loadEnvFile()` with no path reads `.env` in the current directory.
+    let path = match v8::Local::<v8::String>::try_from(args.get(0)) {
+        Ok(text) => text.to_rust_string_lossy(scope),
+        _ => ".env".to_string(),
     };
-    let path = path.to_rust_string_lossy(scope);
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        rv.set(v8::undefined(scope).into());
-        return;
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            // `LoadEnvFile` throws `ThrowUVException(UV_ENOENT, "open", nullptr,
+            // path)` for a file it could not read, which is an `Error` whose
+            // `code` is `ENOENT`, `syscall` is `open` and `path` is what was
+            // asked for. Returning `undefined` instead makes a missing file look
+            // like an empty one, which `test-process-load-env-file.js` asserts
+            // against twice.
+            let code = match error.kind() {
+                std::io::ErrorKind::NotFound => "ENOENT",
+                std::io::ErrorKind::PermissionDenied => "EACCES",
+                _ => "EIO",
+            };
+            throw_file_error(scope, code, &path);
+            return;
+        }
     };
-    let object = v8::Object::new(scope);
     for (key, value) in parse_env_file(&contents) {
-        if let (Some(key), Some(value)) =
-            (v8::String::new(scope, &key), v8::String::new(scope, &value))
-        {
-            object.set(scope, key.into(), value.into());
+        // `env_vars->Get()` first: a variable the process already has keeps its
+        // value, so `loadEnvFile()` cannot overwrite one the parent set.
+        if rn_env::get(&key).is_some() {
+            continue;
+        }
+        let _ = rn_env::set(&key, &value);
+    }
+    rv.set(v8::undefined(scope).into());
+}
+
+/// The `ENOENT`/`EACCES` shape Node's `ThrowUVException` produces for a file.
+///
+/// `message` is `<CODE>: <description>, open '<path>'`, `code` and `syscall` are
+/// strings, and `errno`/`path` are the raw numbers and text. Only the three
+/// properties `test-process-load-env-file.js` inspects are set here, which keeps
+/// the helper honest about what it claims.
+fn throw_file_error(scope: &mut v8::PinScope<'_, '_>, code: &str, path: &str) {
+    let description = match code {
+        "ENOENT" => "no such file or directory",
+        "EACCES" => "permission denied",
+        _ => "i/o error",
+    };
+    let message = format!("{code}: {description}, open '{path}'");
+    let Some(text) = v8::String::new(scope, &message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
+        for (name, value) in [("code", code), ("syscall", "open"), ("path", path)] {
+            if let (Some(key), Some(value)) =
+                (v8::String::new(scope, name), v8::String::new(scope, value))
+            {
+                let _ = object.set(scope, key.into(), value.into());
+            }
         }
     }
-    rv.set(object.into());
+    scope.throw_exception(exception);
 }
 
 /// Parses the `KEY=value` form `--env-file` accepts.

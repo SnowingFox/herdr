@@ -11,6 +11,7 @@ pub mod binding;
 pub mod callback_scope;
 pub mod codec;
 pub mod env;
+pub mod env_proxy;
 pub mod error;
 pub mod finalizer;
 pub mod handle;

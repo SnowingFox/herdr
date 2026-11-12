@@ -405,6 +405,124 @@ pub fn deny_env(name: &str) -> Option<AccessDeniedError> {
     })
 }
 
+/// What reading `name` should report, given the permission model.
+///
+/// This is the pair of questions `EnvGetter` and `EnvQuery` ask before they
+/// answer, and the answer differs by mode:
+///
+/// * **Enforcing** (`Report`): if the startup scrub removed `name`, the read
+///   still answers "absent", but the denial is published to
+///   `node:permission-model:env` and the removal is warned about once.
+/// * **Audit** (`Report`): nothing was removed, so the real value is returned,
+///   and an access to a name enforcing *would* have removed is published
+///   without a warning.
+/// * **Disabled** (`Nothing`): no model, nothing to report.
+///
+/// The caller decides whether to publish, because publishing runs JavaScript
+/// and only the interceptor has a scope to do it in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvReadReport {
+    /// No model, or the model is neither enforcing nor auditing.
+    Nothing,
+    /// The variable was removed at startup and the read must look absent.
+    Removed {
+        denied: AccessDeniedError,
+        /// Whether this read gets the one-time warning.
+        ///
+        /// `ShouldWarnAboutRemovedEnvVar` consumes the warning, so it is
+        /// answered here rather than by the caller: asking twice would consume
+        /// it twice and the second read would never warn.
+        warn: bool,
+    },
+    /// Audit mode: the value is real, but the access is a denial under
+    /// enforcement.
+    Audited { denied: AccessDeniedError },
+}
+
+/// Classifies a read of `name`, as `EnvGetter`/`EnvQuery` do.
+pub fn inspect_env_read(name: &str) -> EnvReadReport {
+    let Some(model) = shared() else {
+        return EnvReadReport::Nothing;
+    };
+    if !model.is_enabled() {
+        return EnvReadReport::Nothing;
+    }
+    let denied = AccessDeniedError::new(AccessDenied::new(PermissionScope::Env, name));
+    if model.is_audit() {
+        // `AuditEnvVar` publishes only for a name that was denied at startup,
+        // which `record_removed_env_vars` did *not* record in audit mode — so
+        // the record is the only thing that can answer, and a name the model
+        // simply does not grant is not reported.
+        return if was_denied_at_startup(name) {
+            EnvReadReport::Audited { denied }
+        } else {
+            EnvReadReport::Nothing
+        };
+    }
+    if model.env_var_was_removed(name) {
+        // `ReportRemovedEnvVar` publishes every time and warns once, and the
+        // warning is what `take_removed_env_var_warning` hands to
+        // `pre_execution.js`'s `warnAboutRemovedProxyEnvVars`.
+        return EnvReadReport::Removed {
+            denied,
+            warn: model.take_removed_env_var_warning(name),
+        };
+    }
+    EnvReadReport::Nothing
+}
+
+/// Whether audit mode recorded `name` as one that enforcing would remove.
+///
+/// `WasDeniedAtStartup` in `permission/env_permission.cc`: true when either the
+/// scrub or the audit pass put the name in `denied`. Unlike
+/// [`PermissionModel::env_var_was_removed`] it therefore answers in audit mode
+/// too, which is the mode it exists for.
+fn was_denied_at_startup(name: &str) -> bool {
+    AUDITED.with(|slot| slot.borrow().as_ref().is_some_and(|set| set.contains(name)))
+}
+
+/// Records the names the audit pass would have removed.
+///
+/// Called by the CLI after `rn_permission::env::record_audited`, which is the
+/// Rust side of `RecordAuditedEnvironmentVariables`.
+pub fn record_audited_env_vars<I, S>(names: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let set: std::collections::BTreeSet<String> = names
+        .into_iter()
+        .map(|name| crate::model::normalize_env_name(name.as_ref()))
+        .collect();
+    AUDITED.with(|slot| {
+        *slot.borrow_mut() = Some(set);
+    });
+}
+
+/// Whether reading `name` is denied by the permission model.
+///
+/// Enforcing a read is not about throwing — `process.env.X` never throws for a
+/// removed variable — it is about the *value*: a removed variable reads as
+/// absent, which is why `EnvGetter` returns `kNo` for it and the ordinary
+/// missing-property path answers `undefined`.
+pub fn env_read_is_denied(name: &str) -> bool {
+    shared().is_some_and(|model| model.is_enabled() && model.env_var_was_removed(name))
+}
+
+/// Publishes a denial to `node:permission-model:env`.
+///
+/// Exposed so the `process.env` interceptor can report a read without knowing
+/// how the channel is reached.
+pub fn publish_env_denial(scope: &mut v8::PinScope<'_, '_>, denied: &AccessDeniedError) {
+    publish(scope, denied);
+}
+
+thread_local! {
+    /// The names the audit pass recorded, from `record_audited_env_vars`.
+    static AUDITED: RefCell<Option<std::collections::BTreeSet<String>>> =
+        const { RefCell::new(None) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
