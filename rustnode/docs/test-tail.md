@@ -33,6 +33,13 @@ current beyond the binary it names, and it does not reconcile figures taken at
 different scopes — a `test/parallel` rate and a seven-suite rate are different
 measurements and are never combined.
 
+**The floor has now been probed from both sides.** The rule can be wrong in two
+directions — a pass that did nothing, and a failure that is not rustnode's — and
+both are measured: "The rule is a floor, not a ceiling" bounds the first with an
+instrumented sample, and "The oracle control" bounds the second by re-running every
+rustnode failure under a real Node 28 built from the pin. The second is the larger
+of the two and it is small: 22 of 5714 files.
+
 **The headline finding, which overturns a premise this project has been working
 from:** the `AssertionError: … strictly equal` tail is **not** an async-propagation
 cluster, and it has **zero** async members today. See the next section.
@@ -80,7 +87,10 @@ by both scope and rule, and the differences do not add up.
 | 3097/5159 (60.0%) | `52f79555` (#51) | `test/parallel` only | exit-code only | **superseded** — post-#51, still counts skips |
 | 2855/5714 (50.0%) | `7af7b306` (pre-#51) | 8 suites, 5714 files | four-marker | **measured here** |
 | 2572/5714 (45.0%) | `52f79555` (#51) | 8 suites, 5714 files | four-marker | **measured here** |
-| **2731/5714 (47.8%)** | **`f0649774`** | **8 suites, 5714 files** | **four-marker** | **last full measurement — quote this one** |
+| 2731/5714 (47.8%) | `f0649774` | 8 suites, 5714 files | four-marker | **measured here** — superseded by the rows below |
+| 2860/5714 (50.1%) | `59d661dc` | 8 suites, 5714 files | four-marker | **measured here** — reproduces the published 2863 figure within 3 files, see below |
+| **2880/5714 (50.4%)** | **`c236ee9c`** | **8 suites, 5714 files** | **four-marker** | **last full measurement — quote this one** |
+| **2880/5692 (50.6%)** | **`c236ee9c`** | **8 suites, 5714 files** | **four-marker, oracle-corrected** | **the honest rate — see "The oracle control"** |
 | 2645/5159 (51.3%) | `7af7b306` (pre-#51) | `test/parallel` only | four-marker | **measured here** |
 | 2393/5159 (46.4%) | `52f79555` (#51) | `test/parallel` only | four-marker | **measured here** — the honest `test/parallel` rate for that tree |
 | 2550/5159 (49.4%) | `368e32ac` | `test/parallel` only | four-marker | **measured here** — the `test/parallel` rate `docs/project-context.md` quotes |
@@ -91,9 +101,10 @@ is a time series**: the trees differ by merges as well as by scope. Read them as
 four independent measurements of four different trees, not as movement.
 
 The two `49.4%` rows are the ones to compare against the `test/parallel` exit-code
-rates above them, because those are also `test/parallel`. The `47.8%` eight-suite
-row is the headline because that is the scope with a complete run over every suite
-the harness selects.
+rates above them, because those are also `test/parallel`. The `50.6%` eight-suite
+oracle-corrected row is the headline: it is the same scope and the same rule as the
+`50.4%` row above it, with only the denominator corrected, so those two are the only
+pair in this table that may be subtracted from each other.
 
 **Do not subtract across scopes, which is what produces a spurious residual.** The
 `test/parallel` and eight-suite skip populations are different numbers — 761 vs 808
@@ -103,6 +114,142 @@ the other leaves a handful of files that look like rounding but are not. (The
 further file, `parallel/test-worker-process-cwd.js`, carries a skip marker and exits
 non-zero, so it is already outside the exit-0 count.) See the decomposition below,
 which closes exactly when both sides come from the same run.
+
+### Reproducing the 2863 figure, and why it is 2860 here
+
+The published headline of `2863/5714 (50.1%)` was measured at `59d661dc`. Re-measured
+here with the current tool and a binary built from that exact commit, it is
+**2860/5714 (50.1%)** — the same rate to one decimal, three files lower.
+
+The three-file difference is **not** attributable to a rule change or to a
+regression, and it is not explained further here: the two runs were taken at
+different times on the same machine, and three files is inside the run-to-run
+variation this document already records for `27d67077` (3733 vs 3735). It is stated
+as an unexplained residue rather than given a cause that was not measured.
+
+Between `59d661dc` and `c236ee9c` the count moves 2860 → 2880, and here the cause
+*is* measured: **zero files pass at `59d661dc` that fail at `c236ee9c`**, and 20 pass
+at `c236ee9c` that fail earlier. All 20 are TLS-adjacent: 17 `test-tls-*`, 1
+`test-crypto-x509-name-non-string.js`, and 2 `test-worker-terminate-*` /
+`test-worker-message-port-transfer-terminate.js`, with no file outside those groups.
+That is the peer-certificate work of #69 (`01912963`, `5a74c6d3`) and the later
+merges, not measurement drift.
+
+### The oracle control
+
+Every figure above shares one blind spot: **a file rustnode fails is not
+necessarily a file that should pass**. Node's own suite contains tests that fail on
+real Node in a given environment, tests Node deliberately expects to fail, and tests
+whose result depends on how the harness captures output. Counting those against
+rustnode understates it. The control is to run exactly the files rustnode fails
+under a real Node built from the same pinned source, and subtract the ones Node
+fails too.
+
+**Setup.** `nodejs/node` at `f344e7f552e3656bd37517151c5dc87d22b33771`
+(reports `v28.0.0-pre`, V8 `15.6.75.33-node.11`, ICU 78.3), `./configure && make -j8`,
+release binary at `out/Release/node`, ~44 min build. This is a real build of the
+pin, not this machine's `node` (`v22.23.4` on `PATH`, which is **not** a valid
+oracle: it fails several of these files for v22's own reasons).
+
+**Method.** Take every file rustnode fails, drop `internet` (see below), and run
+the remainder through `tools/test-tail-map.py` with the same `// Flags:` handling,
+timeout and four-marker rule, with the oracle as `--node`. Then inspect every file
+the oracle did not pass.
+
+**Result, at `c236ee9c`.** 2353 in-scope failures were handed to the oracle. It
+passed 2316 of them; 29 failed or timed out and 8 skipped, so 37 were not passes.
+All 37 are accounted for below, and each row was checked rather than assumed:
+
+| files | oracle outcome | why | counted as an oracle failure? |
+| --- | --- | --- | --- |
+| 19 | fails | `known_issues` suite: Node's own `test/known_issues/testcfg.py` sets `expect_fail = 1`. All 19 of 19 fail under real Node. | yes |
+| 2 | aborts on heap | `test-shadow-realm-gc{,-module}.js` pass `--max-old-space-size=20`; Node's `parallel.status` lists both `SKIP`. | yes |
+| 1 | fails | `test-snapshot-incompatible.js`: Node's `parallel.status` lists it `SKIP`; here it fails with `actual: ''`. | yes |
+| 3 | fails only under a pipe | `test-process-getactiveresources{,-track-active-requests}.js`, `test-listen-fd-ebadf.js` fail when stdout is a pipe and **pass when it is a file**, for both binaries. The harness's capture method, not Node. | no |
+| 4 | **exits 0** | `test-repl.js`, `test-worker-exit-code.js`, `sequential/test-repl-timeout-throw.js`, `test_legacy_uncaught_exception.js` print `Uncaught` as part of their expected output. The oracle says pass; the rule says fail. | no |
+| 8 | skips | `1..0 # Skipped` for debug-only, missing h2load, QUIC, FIPS, addon reasons. A skip measures nothing. | no |
+
+So `oracle_failures = 22`:
+
+```
+2880 / (5714 − 22) = 2880/5692 = 50.60%      # oracle-corrected
+2880 /  5714                    = 50.40%      # raw, same run, same rule
+```
+
+**The correction is +0.19 points, and that is the finding.** The suspected blind
+spot is real but small: 22 of 5714 files (0.4%) are ones real Node does not pass
+either. It is not zero — mostly because `known_issues` is a suite that can never
+pass — but it does not turn 50% into a materially different number. Under the
+strictest definition (count every oracle non-pass, including the four the rule
+misjudges and the three the harness breaks) the figure is 50.66%; if the eight
+oracle skips are also removed from the denominator it is 50.67%. All definitions
+agree to within 0.27 points.
+
+The denominator keeps all 5714 files and subtracts only oracle failures, exactly as
+the formula above says. That is deliberately unkind to rustnode: its own 461 skips
+stay in the denominator (they are not subtracted, only the oracle's are), so this
+figure is a floor in the pessimistic direction as well. Subtracting them would
+raise it, and no such variant is quoted here.
+
+**What the control actually buys: the remaining gap is confirmed real.** 2316 of
+2353 in-scope rustnode failures pass under real Node. The 22 that do not are named
+in the table above. There is no longer an unexplained residual, and no suite is
+blanket-excluded.
+
+**Two harness confounds, found by reading failures and fixed in the tool.**
+Ambient settings in the agent shell were changing outcomes, and un-scrubbed they
+raised the oracle's failure count from 29 to 80:
+
+| setting | effect |
+| --- | --- |
+| `NODE_DISABLE_COMPILE_CACHE=1` | 18 `test-compile-cache-*` files cannot exercise the cache at all |
+| `NO_COLOR=1` / `FORCE_COLOR=0` | colour assertions see plain text (`test-console-tty-colors`, `test-node-output-console`) |
+| `TERM=dumb` | REPL editing tests fail; `TERM=xterm` flips all six to exit 0 |
+
+`tools/test-tail-map.py` now removes the first two and pins `TERM=xterm-256color`
+when `TERM` is `dumb`, for **both** binaries. This is measurement hygiene, not a
+compatibility fix, and it moved rustnode's own count too (2849 → 2880).
+
+**`node-api` needed its fixtures built before it measured anything.** Without the
+compiled addons, 46 `node-api` files fail under both binaries with
+`Cannot find module './build/Release/...'`. `crates/rn-napi/tools/build-node-api-addons.py`
+builds them (36 targets, needs `--js-native-api` and `--uv-include`). With them
+built, 45 of 46 pass under the oracle and 10 of 46 under rustnode — a real 35-file
+gap that the naive control would have excused as "oracle failures".
+
+**Flakiness.** The 29 oracle non-passes were re-run at a 60 s timeout: **0 of 29
+non-deterministic**, so nothing needed splitting between the sides. Nothing is
+excluded here for flakiness.
+
+**`internet` is not evidence.** 20 `internet` failures were excluded from both
+sides. The suite may need network, and a network-dependent result says nothing
+about compatibility in either direction.
+
+**Reproduce.**
+
+```bash
+cd /home/ubuntu/oracle-node && git rev-parse HEAD   # f344e7f5…
+out/Release/node -v                                  # v28.0.0-pre
+
+cd rustnode && export RUSTUP_TOOLCHAIN=1.96.1 CXX=g++ \
+    RUSTFLAGS="-L /usr/lib/gcc/x86_64-linux-gnu/13"
+
+python3 crates/rn-napi/tools/build-node-api-addons.py \
+    --source /home/ubuntu/oracle-node/test/node-api \
+    --output /home/ubuntu/oracle-node/test \
+    --js-native-api /home/ubuntu/oracle-node/test/js-native-api \
+    --uv-include /home/ubuntu/oracle-node/deps/uv/include
+
+python3 tools/test-tail-map.py run --node /tmp/frozen-oracle-control/rustnode \
+    --tests /home/ubuntu/oracle-node/test --out /tmp/rn-full.json --jobs 8 --timeout 30
+python3 tools/test-tail-map.py score /tmp/rn-full.json
+
+# then the same run with the oracle over every file the baseline failed
+python3 tools/test-tail-map.py run --node /home/ubuntu/oracle-node/out/Release/node \
+    --tests /home/ubuntu/oracle-node/test --out /tmp/oracle.json --jobs 8 --timeout 30 \
+    $(sed 's|^|--only |' /tmp/failed.txt)
+python3 tools/test-tail-map.py score /tmp/oracle.json
+```
 
 ### Why 52.6% is superseded
 
@@ -312,11 +459,41 @@ measured at 0 of 51.
 
 ## Sizing, with provenance per row
 
-All rows below are from the **latest full run** (binary `dc9355c765817048`,
-commit `f0649774`, 5714 files, 2498 failing) unless the row says otherwise. A row
+All rows below are from the **`f0649774` full run** (binary `dc9355c765817048`,
+5714 files, 2498 failing) unless the row says otherwise. A row
 marked *counted* was sized by matching a failure signature in the recorded output
 of that run; a row marked *run* was re-run on the binary it names. Sizes are
 distinct files and overlap, so they are not additive.
+
+**These family sizes are older than the pass-rate figures.** The pass-rate table
+above is measured at `c236ee9c`; the per-family counts here are measured at
+`f0649774`, which is a different tree. Do not read a family size here as current
+without re-counting it on the newer run, and do not subtract one from the other.
+
+### Re-counted on `c236ee9c`
+
+Counting the same signatures on the newest full run changes two of the rows below
+materially, so they are recorded here rather than left to be read from the older
+table. Where a count comes from `test-tail-map.py`'s `FAMILIES` predicates it is
+labelled *family*; where it is a plain substring count over stdout+stderr it is
+labelled *signature*, because the two differ (the `strict equal` family additionally
+requires the row to be a failure and reads stderr only).
+
+| files | family / signature | status on `c236ee9c` |
+| --- | --- | --- |
+| 335 | `internalBinding('http2')` has no Rust implementation *(signature)* | **new largest gap**; not sized in the table below at all |
+| 202 | `strict equal` *(family)* | grew from 196; as a raw substring it is 298 |
+| 246 | timeouts *(family)* | grew from 188 |
+| 11 | `--snapshot-blob` *(family)* | unchanged |
+| 72 | `enableSessionCallbacks is not implemented` *(signature)* | tls_wrap member, below |
+| 11 | `setALPNProtocols is not implemented` *(signature)* | tls_wrap member, below |
+| 28 | `fsBinding.cpSyncCopyDir is not a function` *(signature)* | was 28 |
+| ~~646~~ **0** | `internalBinding('tls_wrap')` has no implementation | **closed** — the namespace is now registered (`crates/rn-bind-tls`); 82 files still fail on deferred members rather than the namespace |
+
+Read the `tls_wrap` row carefully: the family did not disappear, it moved from
+"namespace absent" to "three members absent". 82 files is the union of the two
+member signatures, and those files overlap with the strict-equal and timeout
+buckets, so 82 is not additive with anything else on this page.
 
 | files | family | provenance |
 | --- | --- | --- |
@@ -342,21 +519,47 @@ $ ./rustnode -e "require('fs/promises').cp('/etc/hostname','/tmp/x',{recursive:t
 cp ok
 ```
 
-### `tls_wrap` — 640 files, and it is not tail work
+### `http2` — 335 files, now the largest single gap
 
-The contract lists three members (`TLSWrap`, `wrap`, `HAVE_SSL_TRACE`), which makes
-it look tractable. It is not. `TLSWrap` is a `StreamBase` whose `DoWrite`/`DoRead`
-are `SSL_write`/`SSL_read` against an `SSL_CTX` from a `SecureContext`, plus
-`SSL_do_handshake`, the `SSL_get_error` retry machine, session resumption, SNI
-callbacks, ALPN, OCSP and the session-ticket keys. `lib/internal/tls/wrap.js`
+`internalBinding('http2'): the namespace has no Rust implementation yet` appears in
+the output of **335** failing files on `c236ee9c`, which makes it the largest family
+in the suite and the one this document previously did not size at all. It is not in
+the `FAMILIES` table above because that table predates the count; it is measured by
+substring over the recorded run.
+
+It is namespace absence, not a partial implementation: the same message names the
+binding on every file, so this is a whole `http2` rather than a tail patch. Note
+that `nghttp2` is **not** vendored under `rustnode/vendor/` (which holds
+`libnode-js`, `llhttp`, `merve` and `sqlite`) and no crate in the workspace depends
+on it, so building this means adding the implementation of the HTTP/2 protocol
+itself, not only a binding layer over an existing parser. Plan it as a subsystem.
+
+### `tls_wrap` — the namespace landed; 82 files still fail on members
+
+**This section used to describe a 646-file family and is now mostly history.** On
+`c236ee9c` the namespace is registered (`crates/rn-bind-tls`) and **0** files fail
+with `internalBinding('tls_wrap'): the namespace has no Rust implementation yet`.
+What remains is narrower: **82 files** fail on deferred members, 72 on
+`enableSessionCallbacks is not implemented yet` and 11 on
+`setALPNProtocols is not implemented yet` (one file carries both).
+
+That is the predicted shape of a partial TLS stack, and it is worth stating because
+the old text argued the opposite conclusion — that a partial handle would "fail
+deeper and less legibly than the current honest 'no implementation yet'". What is
+measurable here is the second half of that prediction, and it is the reverse: the 82
+remaining files fail with the missing member named in plain text
+(`Error: enableSessionCallbacks is not implemented yet: … (tls_wrap increment 4)`),
+not with an opaque inner error. The namespace is no longer the reason any file fails.
+
+The remaining member work is still OpenSSL surface: `TLSWrap` is a `StreamBase`
+whose `DoWrite`/`DoRead` are `SSL_write`/`SSL_read` against an `SSL_CTX` from a
+`SecureContext`, plus `SSL_do_handshake`, the `SSL_get_error` retry machine, session
+resumption, SNI callbacks, ALPN, OCSP and the session-ticket keys. `lib/internal/tls/wrap.js`
 proxies **16** handle methods (`ref`, `unref`, `hasRef`, `open`, `bind`, `listen`,
 `connect`, `bind6`, `connect6`, `getsockname`, `getpeername`, `setNoDelay`,
 `setKeepAlive`, `setSimultaneousAccepts`, `setBlocking`, `setPendingInstances`) into
-a live SSL object.
-
-This is a TLS stack over OpenSSL and belongs to the crypto workstream. Starting it
-elsewhere would produce a partial handle that fails deeper and less legibly than the
-current honest "no implementation yet".
+a live SSL object. The two named members are the next increment, not the whole
+stack.
 
 ### The strict-equal tail — 196 files, and it is not an async cluster
 
@@ -518,7 +721,8 @@ recorded here so they are not reintroduced from memory.
 | "a strict-equal `AbortSignal` file" | None. `test-abortsignal-cloneable.js` prints three `✖` subtests and then hangs to the 30 s timeout; it is a hang, not a `strictEqual`. |
 | "a strict-equal `AsyncLocalStorage` file" | None. The four ALS failures are 2 timeouts (`http-agent`, `http-multiclients`), `_queryObjects is not a function`, and `assert.ok(storeGCed)` — no `strictEqual` among them. |
 | "a `structuredClone` transfer-list failure" | No file fails on `structuredClone` with a transfer list as its recorded reason. The two files that print `Found invalid value in transferList` are `test-webstreams-clone-unref.js` and `test-whatwg-webstreams-transfer.js`, which exercise the Web Streams transfer path, not `structuredClone`. `test-structuredClone-global.js` fails with `Missing expected exception` and `test-structuredClone-domexception.js` passes. |
-| "638 files — `tls_wrap`" | 646 on the latest full run. The old number was counted against a superseded baseline, so it is replaced rather than carried. |
+| "638 files — `tls_wrap`" | 646 on the `f0649774` run. Superseded again: on `c236ee9c` the namespace is implemented and **0** files fail on namespace absence; 82 fail on two deferred members. |
+| "a partial TLS handle would fail deeper and less legibly than 'no implementation yet'" | The remaining 82 files fail with the missing member named in the message — `Error: enableSessionCallbacks is not implemented yet: … (tls_wrap increment 4)` — rather than an opaque inner error, so the failure is shallow and legible. (The 646 namespace failures were closed by more than this change, so they are not attributed to it here.) |
 | "148 files — strict equal" | 196 on the latest full run (151 on the #51 tree). The bucket grows as real failures stop being hidden. |
 | "116 files — `WorkerImpl`" | 123 on the #51 tree, **0 on `f0649774`** — `worker_threads` works; see the closed-family rows above. |
 | "85 / 94 files — timeouts" | 188 on the latest full run. The old figures were load-, binary- and rule-dependent. |
