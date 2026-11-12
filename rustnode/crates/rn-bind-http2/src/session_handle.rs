@@ -279,10 +279,27 @@ fn destroy(
     // object is intact. Disposing before it left `finishSessionClose` with a dead
     // handle and an unended socket: the loop never drained and every file that
     // reached this path timed out.
-    if let Some(state) = with_state(object, |state| state as *const SessionState) {
-        // SAFETY: as `receive`.
-        let state = unsafe { &*state };
-        crate::session::close(scope, state, code);
+    let disposing_later =
+        if let Some(state) = with_state(object, |state| state as *const SessionState) {
+            // SAFETY: as `receive`.
+            let state = unsafe { &*state };
+            crate::session::close(scope, state, code);
+            state.pending_dispose.get()
+        } else {
+            false
+        };
+    // Destroyed from inside a receive. `call_ondone` runs JavaScript, which tears
+    // down the socket and re-enters nghttp2 — and `detach` frees the session — both
+    // while `mem_recv` is still on the stack. The dispose is deferred to the end of
+    // that receive, and the socket teardown that `ondone` performs is what
+    // `finishSessionClose` also does once the socket closes.
+    if disposing_later {
+        if let Some(state) = with_state(object, |state| state as *const SessionState) {
+            // SAFETY: as `receive`.
+            let state = unsafe { &*state };
+            state.pending_destroy.set(Some(socket_destroyed));
+        }
+        return;
     }
     call_ondone(scope, object);
     if let Some(state) = with_state(object, |state| state as *const SessionState) {

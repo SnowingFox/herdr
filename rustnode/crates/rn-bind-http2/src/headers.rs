@@ -42,6 +42,21 @@ impl HeaderBlock {
         self.entries.len()
     }
 
+    /// The triples this block was built from.
+    pub fn pairs(&self) -> Vec<(&[u8], &[u8], u8)> {
+        self.storage
+            .chunks(2)
+            .enumerate()
+            .map(|(index, _)| {
+                (
+                    self.storage[index * 2].as_slice(),
+                    self.storage[index * 2 + 1].as_slice(),
+                    self.entries[index].flags,
+                )
+            })
+            .collect()
+    }
+
     /// Whether the block holds no pairs, which is what a `SETTINGS`-only submit
     /// looks like.
     pub fn is_empty(&self) -> bool {
@@ -123,6 +138,44 @@ fn read_until_nul(bytes: &[u8], position: &mut usize) -> Option<Vec<u8>> {
     }
     *position = end + 1;
     Some(bytes[start..end].to_vec())
+}
+
+/// Builds a header block from owned `(name, value, flags)` triples.
+///
+/// This is the replay form: a submit recorded while nghttp2 was mid-receive has to
+/// own its bytes, because the JavaScript frame that produced them is gone by the
+/// time the queue is drained. [`nv_from_array`] builds the same array from a live
+/// JS array; both end up here so there is one definition of the `nghttp2_nv` layout
+/// in play.
+pub fn block_from_pairs(pairs: &[(Vec<u8>, Vec<u8>, u8)]) -> HeaderBlock {
+    let mut entries: Vec<ffi::nghttp2_nv> = Vec::with_capacity(pairs.len());
+    let mut storage: Vec<Vec<u8>> = Vec::with_capacity(pairs.len() * 2);
+    for (name, value, _flags) in pairs {
+        storage.push(name.clone());
+        storage.push(value.clone());
+    }
+    for (index, (_name, _value, flags)) in pairs.iter().enumerate() {
+        entries.push(ffi::nghttp2_nv {
+            name: storage[index * 2].as_ptr().cast_mut(),
+            value: storage[index * 2 + 1].as_ptr().cast_mut(),
+            namelen: storage[index * 2].len(),
+            valuelen: storage[index * 2 + 1].len(),
+            flags: *flags,
+        });
+    }
+    HeaderBlock { entries, storage }
+}
+
+/// The `(name, value, flags)` triples behind a block, for a deferred submit.
+///
+/// Reading them back out of the `nghttp2_nv` array is what lets a submit site hand
+/// one representation to both the immediate path and the queue.
+pub fn pairs_of(block: &HeaderBlock) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
+    block
+        .pairs()
+        .iter()
+        .map(|(name, value, flags)| (name.to_vec(), value.to_vec(), *flags))
+        .collect()
 }
 
 #[cfg(test)]

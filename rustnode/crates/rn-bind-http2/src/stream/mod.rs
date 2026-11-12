@@ -266,6 +266,21 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
         let Some(record) = streams.get_mut(&stream_id) else {
             return;
         };
+        // `Http2Stream::Destroy` in `src/node_http2.cc` states this exactly:
+        //
+        //   // Mark destroyed immediately so OnDataChunkReceived stops EmitRead
+        //   // into an already-destroyed JS stream (which would treat the byte
+        //   // count as errno).
+        //
+        // That is not a theoretical hazard here. With the teardown deferred out of
+        // a receive, a stream `core.js` has already destroyed still had reads
+        // emitted into it, and `onStreamRead` read a byte count (7616) out of
+        // `streamBaseState` where a negative errno belongs, throwing
+        // `ERR_OUT_OF_RANGE` from `getSystemErrorName`. Clamping that value would
+        // hide the bug; not emitting is the fix.
+        if record.destroyed {
+            return;
+        }
         record.received_bytes += bytes.len() as u64;
     }
     let payload = bytes.to_vec();
@@ -484,6 +499,18 @@ fn submit_rst(state: &SessionState, stream_id: i32, code: u32) {
     let Some(raw) = crate::session_ptr(state) else {
         return;
     };
+    // Recorded rather than submitted when nghttp2 is mid-receive. `on_stream_close`
+    // and `destroy` both run from a callback, which is inside `mem_recv`. Order is
+    // preserved by the queue, so an RST submitted after a DATA still applies after
+    // it.
+    if state.receiving.get() {
+        state
+            .deferred_submits
+            .borrow_mut()
+            .push(crate::session::DeferredSubmit::RstStream { stream_id, code });
+        crate::session::schedule_write(state);
+        return;
+    }
     // Drain what is already queued *before* the reset. `core.js` submits an RST
     // from `finishCloseStream` as soon as the writable side finishes, while the
     // response's DATA is still sitting behind a deferred flush — so the RST would
@@ -537,6 +564,18 @@ fn submit_headers(
     let id = with_state(args.this(), |handle| handle.id)?;
     let raw = crate::session_ptr(state)?;
     let headers = crate::headers::nv_from_array(scope, args.get(0))?;
+    if state.receiving.get() {
+        state
+            .deferred_submits
+            .borrow_mut()
+            .push(crate::session::DeferredSubmit::Headers {
+                stream_id: id,
+                headers: crate::headers::pairs_of(&headers),
+                flags,
+            });
+        crate::session::schedule_write(state);
+        return Some(0);
+    }
     // SAFETY: `raw` is live and `headers` owns its storage for the call; nghttp2
     // copies the pairs it is given.
     let status = unsafe {
@@ -585,6 +624,18 @@ fn trailers(
         rv.set(v8::Integer::new(scope, ffi::NGHTTP2_ERR_INVALID_ARGUMENT).into());
         return;
     };
+    if state.receiving.get() {
+        state
+            .deferred_submits
+            .borrow_mut()
+            .push(crate::session::DeferredSubmit::Trailer {
+                stream_id: id,
+                headers: crate::headers::pairs_of(&headers),
+            });
+        crate::session::schedule_write(state);
+        rv.set(v8::Integer::new(scope, 0).into());
+        return;
+    }
     // SAFETY: `raw` is live and `headers` owns its storage for the call.
     let status = unsafe { ffi::nghttp2_submit_trailer(raw, id, headers.as_ptr(), headers.len()) };
     crate::session::schedule_write(state);
@@ -614,6 +665,18 @@ fn push_promise(
         rv.set(v8::Integer::new(scope, ffi::NGHTTP2_ERR_INVALID_ARGUMENT).into());
         return;
     };
+    if state.receiving.get() {
+        state
+            .deferred_submits
+            .borrow_mut()
+            .push(crate::session::DeferredSubmit::PushPromise {
+                stream_id: id,
+                headers: crate::headers::pairs_of(&headers),
+            });
+        crate::session::schedule_write(state);
+        rv.set(v8::Integer::new(scope, 0).into());
+        return;
+    }
     // SAFETY: `raw` is live and `headers` owns its storage for the call.
     let promised = unsafe {
         ffi::nghttp2_submit_push_promise(
@@ -660,6 +723,19 @@ fn respond(
     };
     let options = args.get(1).uint32_value(scope).unwrap_or(0) as i32;
     let empty_payload = options & crate::STREAM_OPTION_EMPTY_PAYLOAD != 0;
+    if state.receiving.get() {
+        state
+            .deferred_submits
+            .borrow_mut()
+            .push(crate::session::DeferredSubmit::Response {
+                stream_id: id,
+                headers: crate::headers::pairs_of(&headers),
+                empty_payload,
+            });
+        crate::session::schedule_write(state);
+        rv.set(v8::Integer::new(scope, id).into());
+        return;
+    }
     let provider = provider::Provider::new(state, id, options);
     // `nghttp2_submit_response2` half-closes the outbound stream, which is why
     // `core.js` uses it only for the final response and `info` for anything else.
@@ -767,6 +843,8 @@ fn shutdown(
     if let Some(record) = state.streams.borrow_mut().get_mut(&id) {
         record.ended = true;
     }
+    // `resume_data` is not a submit: it only re-arms the provider nghttp2 already
+    // holds, which is why it is safe here even mid-receive.
     // SAFETY: `raw` is live and `id` is a stream this session owns.
     let status = unsafe { ffi::nghttp2_session_resume_data(raw, id) };
     crate::session::schedule_write(state);

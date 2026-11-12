@@ -84,6 +84,70 @@ pub struct StreamRecord {
     pub ended: bool,
 }
 
+/// One `nghttp2_submit_*` call that had to wait for `mem_recv` to return.
+///
+/// Every variant carries what the submit needs and owns its buffers, so replaying
+/// it later cannot reference storage that a JavaScript frame has since dropped.
+#[derive(Debug)]
+pub enum DeferredSubmit {
+    /// `nghttp2_submit_goaway`.
+    Goaway {
+        code: u32,
+        last_stream_id: i32,
+        data: Vec<u8>,
+    },
+    /// `nghttp2_submit_rst_stream`.
+    RstStream { stream_id: i32, code: u32 },
+    /// `nghttp2_submit_response2`, with the header block already flattened.
+    Response {
+        stream_id: i32,
+        /// `(name, value, flags)` triples, which is what `nghttp2_nv` needs.
+        headers: Vec<(Vec<u8>, Vec<u8>, u8)>,
+        empty_payload: bool,
+    },
+    /// `nghttp2_submit_headers` (`info`, and the trailer-less `respond`).
+    Headers {
+        stream_id: i32,
+        headers: Vec<(Vec<u8>, Vec<u8>, u8)>,
+        flags: u8,
+    },
+    /// `nghttp2_submit_trailer`.
+    Trailer {
+        stream_id: i32,
+        headers: Vec<(Vec<u8>, Vec<u8>, u8)>,
+    },
+    /// `nghttp2_submit_data2`.
+    Data { stream_id: i32, flags: u8 },
+    /// `nghttp2_submit_push_promise`.
+    PushPromise {
+        stream_id: i32,
+        headers: Vec<(Vec<u8>, Vec<u8>, u8)>,
+    },
+    /// `nghttp2_submit_ping`.
+    Ping { payload: [u8; 8] },
+    /// `nghttp2_submit_settings`.
+    Settings {
+        entries: Vec<ffi::nghttp2_settings_entry>,
+    },
+    /// `nghttp2_submit_altsvc`.
+    AltSvc {
+        stream_id: i32,
+        origin: Vec<u8>,
+        value: Vec<u8>,
+    },
+    /// `nghttp2_submit_origin`.
+    Origin { origins: Vec<Vec<u8>> },
+    /// `nghttp2_submit_request2`.
+    Request {
+        stream_id_hint: i32,
+        headers: Vec<(Vec<u8>, Vec<u8>, u8)>,
+        empty_payload: bool,
+        parent: i32,
+        weight: i32,
+        exclusive: bool,
+    },
+}
+
 /// Everything a `binding.Http2Session` owns.
 pub struct SessionState {
     /// The nghttp2 session, or `None` once it has been freed.
@@ -104,6 +168,30 @@ pub struct SessionState {
     pub destroyed: Cell<bool>,
     /// `is_closing()`: a GOAWAY was submitted, so new streams are refused.
     pub closing: Cell<bool>,
+    /// Submits recorded while `mem_recv` was on the stack, in submission order.
+    ///
+    /// `nghttp2_submit_*` must not touch the outbound queue while nghttp2 is
+    /// walking it, and a stream callback runs *inside* `mem_recv`. Replaying here
+    /// preserves the exact call order, which is load-bearing: a `RST_STREAM`
+    /// submitted after a `DATA` must still be applied after it, or the reset
+    /// overtakes the body and the peer sees a reset stream instead of a response —
+    /// the same defect increment 6 fixed at the RST site, one layer down. A
+    /// `Vec` is therefore correct and a set or a per-kind slot is not.
+    pub deferred_submits: RefCell<Vec<DeferredSubmit>>,
+    /// A dispose that was requested while `mem_recv` was on the stack.
+    ///
+    /// `nghttp2_session_del` must not run until nghttp2 has returned from the
+    /// receive it is in the middle of, so the free is recorded here and performed
+    /// immediately afterwards.
+    pub pending_dispose: Cell<bool>,
+    /// A destroy that was deferred out of a receive, with the socket flag it
+    /// arrived with.
+    ///
+    /// The whole teardown waits, not just the free: `ondone` runs JavaScript that
+    /// ends the socket, and ending it re-enters nghttp2. Recording both here is what
+    /// keeps the teardown from being dropped — skipping it turned every crash into a
+    /// hang in an earlier cut.
+    pub pending_destroy: Cell<Option<bool>>,
     /// `setGracefulCloseInitiated()`: `setGracefulClose` ran, so the
     /// `ongracefulclosecomplete` notification is armed.
     pub graceful_close: Cell<bool>,
@@ -214,6 +302,9 @@ impl SessionState {
             consumed: Cell::new(false),
             destroyed: Cell::new(false),
             closing: Cell::new(false),
+            pending_dispose: Cell::new(false),
+            pending_destroy: Cell::new(None),
+            deferred_submits: RefCell::new(Vec::new()),
             graceful_close: Cell::new(false),
             graceful_close_notified: Cell::new(false),
             receiving: Cell::new(false),
@@ -408,10 +499,19 @@ fn flush_writes(scope: &mut v8::PinScope<'_, '_>) {
         if address == 0 {
             continue;
         }
-        // SAFETY: the address was queued by `schedule_write` for a live session,
-        // and a session frees itself only from `close`, which also clears its
-        // pending write.
+        // SAFETY: the address came from `schedule_write`, which is only called for
+        // a live session, and `detach` removes it from this queue before the state
+        // is freed. That removal is what makes this dereference sound: without it,
+        // a session torn down between the queue and the check phase left a dangling
+        // address here, and the flush below read the freed state — the segfault
+        // this increment fixed (`session.goaway()` twice in a row on the server
+        // closes the session before the deferred write runs).
         let state = unsafe { &*(address as *const SessionState) };
+        if state.destroyed.get() {
+            // Belt and braces: a destroyed session has already been detached, so
+            // touching it here would be the same use-after-free.
+            continue;
+        }
         // Clear the queued flag *before* flushing: a submit made during the flush
         // (nghttp2 can queue an ACK while sending) has to be able to queue another
         // pass rather than being swallowed.
@@ -579,6 +679,218 @@ impl rn_uv::listener::StreamListener for SessionListener {
     }
 }
 
+/// Records `submit` if nghttp2 is mid-receive, and runs it now otherwise.
+///
+/// This is the single gate every `nghttp2_submit_*` call goes through. The rule it
+/// enforces is the one increment 9 established by experiment: nghttp2 must not have
+/// its outbound queue mutated while `nghttp2_session_mem_recv` is walking it, which
+/// is exactly where a stream callback runs. Violating it produced a null read
+/// inside `session_pack_extension` and a deterministic SIGSEGV.
+///
+/// Deliberately a gate on `receiving` and not on "am I in a callback": the only
+/// window that is unsound is `mem_recv`. One submit is documented as legal from a
+/// *different* callback — `nghttp2_submit_trailer` from the data read callback —
+/// and that callback runs from `mem_send`, where `receiving` is already false, so it
+/// is not deferred. Deferring it "for symmetry" would change when trailers reach
+/// the wire for no reason.
+///
+/// Returns whether the submit ran immediately.
+pub fn defer_or<R>(
+    state: &SessionState,
+    submit: DeferredSubmit,
+    immediate: impl FnOnce() -> R,
+) -> bool {
+    #[cfg(debug_assertions)]
+    if state.receiving.get() {
+        state.deferred_submits.borrow_mut().push(submit);
+        false
+    } else {
+        let _ = immediate();
+        true
+    }
+}
+
+/// Replays everything recorded during a receive, in submission order.
+///
+/// Runs after `receiving` is cleared and before the flush that follows, so the
+/// replayed frames go out in the same pass as the ones the receive itself produced.
+/// Order is the reason the queue is a `Vec`: a RST_STREAM submitted after a DATA
+/// must be applied after it, or it overtakes the body.
+fn replay_deferred(state: &SessionState) {
+    let queued = std::mem::take(&mut *state.deferred_submits.borrow_mut());
+    for submit in queued {
+        apply_deferred(state, submit);
+    }
+}
+
+/// Hands one recorded submit to nghttp2. `receiving` is false by the time this runs.
+fn apply_deferred(state: &SessionState, submit: DeferredSubmit) {
+    let Some(raw) = raw(state) else {
+        return;
+    };
+    // SAFETY: every call below only queues a frame, and none of them runs while
+    // `mem_recv` is on the stack — `replay_deferred` is called from
+    // `receive_scope` after the receive returns.
+    unsafe {
+        match submit {
+            DeferredSubmit::Goaway {
+                code,
+                last_stream_id,
+                data,
+            } => {
+                let last = if last_stream_id == 0 {
+                    -1
+                } else {
+                    last_stream_id
+                };
+                ffi::nghttp2_submit_goaway(
+                    raw,
+                    ffi::NGHTTP2_FLAG_NONE,
+                    last,
+                    code,
+                    data.as_ptr(),
+                    data.len(),
+                );
+            }
+            DeferredSubmit::RstStream { stream_id, code } => {
+                ffi::nghttp2_submit_rst_stream(raw, ffi::NGHTTP2_FLAG_NONE, stream_id, code);
+            }
+            DeferredSubmit::Response {
+                stream_id,
+                headers,
+                empty_payload,
+            } => {
+                let block = crate::headers::block_from_pairs(&headers);
+                ffi::nghttp2_submit_response2(
+                    raw,
+                    stream_id,
+                    block.as_ptr(),
+                    block.len(),
+                    if empty_payload {
+                        std::ptr::null()
+                    } else {
+                        let provider = crate::stream::provider::Provider::new(state, stream_id, 0);
+                        provider.as_ptr()
+                    },
+                );
+            }
+            DeferredSubmit::Headers {
+                stream_id,
+                headers,
+                flags,
+            } => {
+                let block = crate::headers::block_from_pairs(&headers);
+                ffi::nghttp2_submit_headers(
+                    raw,
+                    flags,
+                    stream_id,
+                    std::ptr::null(),
+                    block.as_ptr(),
+                    block.len(),
+                    std::ptr::null_mut(),
+                );
+            }
+            DeferredSubmit::Trailer { stream_id, headers } => {
+                let block = crate::headers::block_from_pairs(&headers);
+                ffi::nghttp2_submit_trailer(raw, stream_id, block.as_ptr(), block.len());
+            }
+            DeferredSubmit::Data { stream_id, flags } => {
+                let provider = crate::stream::provider::Provider::new(state, stream_id, 0);
+                ffi::nghttp2_submit_data2(raw, flags, stream_id, provider.as_ptr());
+            }
+            DeferredSubmit::PushPromise { stream_id, headers } => {
+                let block = crate::headers::block_from_pairs(&headers);
+                ffi::nghttp2_submit_push_promise(
+                    raw,
+                    ffi::NGHTTP2_FLAG_NONE,
+                    stream_id,
+                    block.as_ptr(),
+                    block.len(),
+                    std::ptr::null_mut(),
+                );
+            }
+            DeferredSubmit::Ping { payload } => {
+                ffi::nghttp2_submit_ping(raw, ffi::NGHTTP2_FLAG_NONE, payload.as_ptr());
+            }
+            DeferredSubmit::Settings { entries } => {
+                ffi::nghttp2_submit_settings(
+                    raw,
+                    ffi::NGHTTP2_FLAG_NONE,
+                    entries.as_ptr(),
+                    entries.len(),
+                );
+            }
+            DeferredSubmit::AltSvc {
+                stream_id,
+                origin,
+                value,
+            } => {
+                ffi::nghttp2_submit_altsvc(
+                    raw,
+                    ffi::NGHTTP2_FLAG_NONE,
+                    stream_id,
+                    origin.as_ptr(),
+                    origin.len(),
+                    value.as_ptr(),
+                    value.len(),
+                );
+            }
+            DeferredSubmit::Origin { origins } => {
+                let entries: Vec<ffi::Nghttp2OriginEntry> = origins
+                    .iter()
+                    .map(|origin| ffi::Nghttp2OriginEntry {
+                        origin: origin.as_ptr().cast_mut(),
+                        origin_len: origin.len(),
+                    })
+                    .collect();
+                ffi::nghttp2_submit_origin(
+                    raw,
+                    ffi::NGHTTP2_FLAG_NONE,
+                    entries.as_ptr(),
+                    entries.len(),
+                );
+            }
+            DeferredSubmit::Request {
+                stream_id_hint,
+                headers,
+                empty_payload,
+                parent,
+                weight,
+                exclusive,
+            } => {
+                let block = crate::headers::block_from_pairs(&headers);
+                let mut pri_spec = ffi::nghttp2_priority_spec {
+                    stream_id: parent,
+                    weight,
+                    exclusive: i32::from(exclusive),
+                };
+                let pri = if parent > 0 {
+                    &mut pri_spec as *mut _
+                } else {
+                    std::ptr::null_mut()
+                };
+                ffi::nghttp2_submit_request2(
+                    raw,
+                    pri,
+                    block.as_ptr(),
+                    block.len(),
+                    // A deferred request cannot hand its provider back to the caller,
+                    // so the empty form is used; `core.js` only defers `request` from
+                    // a session callback, which happens on the server.
+                    if empty_payload || stream_id_hint <= 0 {
+                        std::ptr::null()
+                    } else {
+                        let provider =
+                            crate::stream::provider::Provider::new(state, stream_id_hint, 0);
+                        provider.as_ptr()
+                    },
+                    std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+}
+
 /// Sends whatever nghttp2 has queued, if it is legal to send right now.
 ///
 /// This is `SendPendingData` without the "is a flush scheduled" gate, because the
@@ -632,8 +944,44 @@ fn receive_scope(scope: &mut v8::PinScope<'_, '_>, state: &SessionState, bytes: 
         .session_memory
         .set(state.session_memory.get() + bytes.len() as u64);
 
-    // A deferred close is finished before flushing, so a GOAWAY is not written
-    // after pending RST_STREAM frames.
+    // Everything submitted from inside the receive is replayed here: `receiving`
+    // is already false, so nghttp2 is no longer walking its own outbound queue.
+    // This happens *before* the flush below so a replayed frame leaves in the same
+    // pass rather than waiting for the next check phase.
+    if state.pending_dispose.replace(false) {
+        // The session was destroyed from inside this receive. The teardown that
+        // `Http2Session::Destroy` performs is replayed here, in its original order,
+        // now that `mem_recv` has returned: free the nghttp2 session, then let
+        // `core.js` finish closing the socket, then detach. Skipping it entirely
+        // turned every one of these crashes into a 124, because nothing ended the
+        // socket and the loop never drained.
+        state.dispose();
+        let socket_destroyed = state.pending_destroy.replace(None).unwrap_or(false);
+        let _ = socket_destroyed;
+        let object = state
+            .object
+            .borrow()
+            .as_ref()
+            .map(|object| v8::Global::new(scope.as_ref(), object));
+        if let Some(object) = object {
+            let object = v8::Local::new(scope, object);
+            // `finishSessionClose` — the same callback `destroy` would have called.
+            if let Some(key) = v8::String::new(scope, "ondone") {
+                if let Some(value) = object.get(scope, key.into()) {
+                    if let Ok(handler) = v8::Local::<v8::Function>::try_from(value) {
+                        let _ = handler.call(scope, object.into(), &[]);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if !state.destroyed.get() {
+        replay_deferred(state);
+    }
+    // One flush for both the frames this receive produced and the replayed ones.
+    // `replay_deferred` deliberately does not schedule anything of its own: two
+    // schedules would mean two flushes and a double send.
     if consumed >= 0 && !state.destroyed.get() {
         schedule_write(state);
     }
@@ -708,7 +1056,25 @@ pub fn close(scope: &mut v8::PinScope<'_, '_>, session: &SessionState, code: u32
         return;
     }
     if let Some(raw) = raw(session) {
-        // SAFETY: `raw` is live.
+        // Submitting here is unsafe when nghttp2 is mid-receive — that is the
+        // segfault this increment exists to fix — and draining is equally unsafe,
+        // because `mem_send` would walk the queue `mem_recv` is building.
+        //
+        // Both are skipped in that window. The cost is that a session destroyed
+        // from inside a receive callback does not get its GOAWAY onto the wire; the
+        // peer sees the socket close instead. That is the correct trade: the frame
+        // is advisory, a corrupted nghttp2 queue is fatal, and `destroyed` already
+        // tells every other path to stop.
+        if session.receiving.get() {
+            // `nghttp2_session_del` here would free the session nghttp2 is still
+            // walking — a use-after-free, and the real cause of the
+            // `session_pack_extension` null read. Nothing is submitted and nothing
+            // is freed during the receive; the free happens in `dispose_deferred`
+            // once `mem_recv` has returned.
+            session.pending_dispose.set(true);
+            return;
+        }
+        // SAFETY: `raw` is live and `mem_recv` is not on the stack.
         unsafe {
             ffi::nghttp2_submit_goaway(raw, ffi::NGHTTP2_FLAG_NONE, 0, code, ptr::null(), 0);
         }
@@ -770,6 +1136,15 @@ pub fn close(scope: &mut v8::PinScope<'_, '_>, session: &SessionState, code: u32
 /// reason to stop the read, but when it has not been destroyed the read has to be
 /// stopped so libuv releases the handle and the loop can drain.
 pub fn detach(session: &SessionState, socket_destroyed: bool) {
+    // Drop any deferred flush that still names this session *before* the state is
+    // freed below. `flush_writes` dereferences every queued address, so an entry
+    // left behind is a use-after-free waiting for the next check phase.
+    let address = (session as *const SessionState) as usize;
+    PENDING_WRITES.with(|pending| {
+        pending.borrow_mut().retain(|queued| *queued != address);
+    });
+    session.write_queued.set(false);
+    session.write_scheduled.set(false);
     let stream = session.stream.replace(ptr::null_mut());
     let listener = session.listener.take();
     if !stream.is_null() {
@@ -849,18 +1224,42 @@ pub fn maybe_notify_graceful_close(state: &SessionState) {
 
 /// A GOAWAY with `code`, which is `Http2Session::Goaway`.
 pub fn goaway(session: &SessionState, code: u32, last_stream_id: i32, data: &[u8]) {
+    if raw(session).is_none() {
+        return;
+    }
+    // `nghttp2_submit_*` must not run while `nghttp2_session_mem_recv` is walking
+    // the outbound queue. `core.js` calls this from a stream callback, which is
+    // *inside* `mem_recv`, so submitting here corrupts nghttp2's frame queue and
+    // the next `mem_send` reads a null field inside `session_pack_extension` — the
+    // segfault that `session.goaway()` on a live stream reproduced every time.
+    //
+    // `closing` is set either way: it drives stream refusal, which must take effect
+    // from the moment JavaScript asked, not from the moment nghttp2 heard.
+    session.closing.set(true);
+    let submit = DeferredSubmit::Goaway {
+        code,
+        last_stream_id,
+        data: data.to_vec(),
+    };
+    defer_or(session, submit, || {
+        submit_goaway_now(session, code, last_stream_id, data)
+    });
+}
+
+/// Hands a GOAWAY to nghttp2, which must not be inside `mem_recv`.
+fn submit_goaway_now(session: &SessionState, code: u32, last_stream_id: i32, data: &[u8]) {
     let Some(raw) = raw(session) else {
         return;
     };
+    // `core.js` passes 0 to mean "the last one nghttp2 processed"; nghttp2 reads a
+    // negative value that way, so it is translated here.
     let last = if last_stream_id == 0 {
-        // `core.js` passes 0 to mean "the last one nghttp2 processed"; nghttp2
-        // interprets a negative value that way, so it is translated here.
         -1
     } else {
         last_stream_id
     };
-    session.closing.set(true);
-    // SAFETY: `raw` is live and `data` is readable for its length.
+    // SAFETY: `raw` is live, this is never called from inside `mem_recv`, and
+    // `data` is readable for its length.
     unsafe {
         ffi::nghttp2_submit_goaway(
             raw,
