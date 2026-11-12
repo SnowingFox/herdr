@@ -1,0 +1,23 @@
+{
+  "name": "herdr-ts",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript rewrite of herdr (workspace root). Rust sources under ../src remain the parity oracle.",
+  "packageManager": "pnpm@10.0.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build:native": "pnpm --filter @herdr/native build",
+    "build:native:debug": "pnpm --filter @herdr/native build:debug",
+    "typecheck": "tsc -p packages/core && tsc -p packages/native && tsc -p .",
+    "test": "vitest run",
+    "check": "pnpm build:native:debug && pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.10.5",
+    "@types/node": "^22.20.0",
+    "typescript": "~5.9.3",
+    "vitest": "^3.2.7"
+  }
+}

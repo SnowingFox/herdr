@@ -1,0 +1,26 @@
+{
+  "name": "@herdr/native",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Native (napi-rs) layer for herdr: PTY, terminal emulation via libghostty-vt, process inspection.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "herdr-native",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test:rust": "cargo test"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.10.5"
+  }
+}

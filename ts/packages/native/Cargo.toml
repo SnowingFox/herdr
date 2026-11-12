@@ -1,0 +1,32 @@
+[package]
+name = "herdr-native"
+version = "0.0.0"
+edition = "2021"
+description = "napi-rs native module for the TypeScript port of herdr"
+license = "Apache-2.0"
+publish = false
+
+# Standalone workspace: keeps the Rust binary's root Cargo.lock untouched.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ghostty-vt = { path = "../../../crates/ghostty-vt" }
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+portable-pty = "=0.9.0"
+libc = "0.2"
+tracing = "0.1.44"
+
+[build-dependencies]
+napi-build = "2"
+
+[patch.crates-io]
+portable-pty = { path = "../../../vendor/portable-pty" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
