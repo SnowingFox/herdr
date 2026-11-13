@@ -6,17 +6,20 @@ use rn_realm as bootstrap;
 use rn_v8_sys::v8;
 
 fn main() {
+    rn_core::profile::start();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
+    rn_core::profile::mark("tracing init");
 
     if let Err(message) = rn_v8_sys::check_linked_v8() {
         eprintln!("rustnode: {message}");
         terminate(1);
     }
+    rn_core::profile::mark("v8 link check");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Flags that V8 owns are handed to it before initialization, the way Node's
@@ -44,6 +47,7 @@ fn main() {
         eprintln!("rustnode: warning: {flag} is accepted but not implemented");
     }
     rn_permission::runtime::install_shared(options.permission.clone());
+    rn_core::profile::mark("args parse + permission install");
 
     // The command line's abort decision is recorded once, before any code runs,
     // because Node sets `EnvironmentOptions::abort_on_uncaught_exception` from
@@ -112,6 +116,7 @@ fn main() {
     for namespace in registry.namespaces() {
         env.insert(namespace.clone());
     }
+    rn_core::profile::mark("binding registry");
     // A worker thread runs a second isolate and needs a registry of its own: the
     // object each namespace caches is a V8 handle belonging to one isolate, so
     // sharing this one would hand the worker foreign handles. `rn-bindings` is
@@ -148,8 +153,10 @@ fn main() {
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
+    rn_core::profile::mark("V8::initialize");
 
     let mut isolate = v8::Isolate::new(Default::default());
+    rn_core::profile::mark("Isolate::new");
     // `import.meta` and `import()` are dispatched by V8 through isolate-level
     // handlers rather than `internalBinding()`, so they are installed here,
     // where a `&mut Isolate` exists. A binding callback cannot do it: the v8
@@ -183,6 +190,7 @@ fn main() {
     let scope = &mut scope.init();
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
+    rn_core::profile::mark("Context::new");
 
     // `lib/**` reads option values through `internalBinding('options')`, and
     // that binding can only report them if it is told what the command line
@@ -256,6 +264,7 @@ fn main() {
         eprintln!("rustnode: {message}");
         terminate(1);
     }
+    rn_core::profile::mark("install_globals (bootstrap.js)");
 
     // `process.argv` is `[execPath, scriptPath?, ...scriptArgs]`. Node puts the
     // resolved script path in `argv[1]` and omits that slot for `-e`/`-p`, where
@@ -280,30 +289,42 @@ fn main() {
     let mut realm_require: Option<v8::Global<v8::Function>> = None;
     match bootstrap::bootstrap_realm(scope, &argv_rest, &options.exec_argv) {
         Ok(mut loaders) => {
+            rn_core::profile::mark("realm bootstrap returned");
             if options.expose_internals() {
                 bootstrap::expose_internals(scope, &loaders);
+                rn_core::profile::mark("expose_internals");
             }
             // The internal loader needs the `node:` scheme stripped before it
             // can resolve a specifier; Node's user-land loader does that, and
             // this stands in for it until `contextify` unblocks the real one.
             bootstrap::wrap_require_with_scheme_support(scope, &loaders);
-            // `realm.js` keeps every option-gated builtin in
-            // `builtinModulePolicies` and exposes an entry only when its option
-            // is truthy, which Node applies in
-            // `internal/process/pre_execution.js:488`. rustnode does not run
-            // `pre_execution.js`, so this applies the same call with the same
-            // `getOptionValue`.
+            // The option-gated builtin allow-list (`quic`, `dtls`, `sqlite`,
+            // `bench`, `vfs`, ...) is applied exactly once, by Node's own
+            // `prepareMainThreadExecution` below: `prepareExecution` calls
+            // `setupOptionGatedBuiltins()` at
+            // `internal/process/pre_execution.js:121`, which is
+            // `BuiltinModule.allowOptionGatedBuiltins(getOptionValue)`.
             //
-            // This builds the allow-list; the `require('node:...')` boundary is
-            // what enforces it. That boundary is the vendored CJS loader's
-            // `BuiltinModule.normalizeRequirableId`, which is why
-            // `install_cjs_loader` below must keep the global `require` sending
-            // every `node:` id through the file loader. Routing the scheme
-            // branch to the realm loader instead skipped that check and loaded
-            // `quic`, `dtls` and `bench` even though `canBeRequiredByUsers`
-            // reports false for them.
-            bootstrap::allow_option_gated_builtins(scope, &loaders);
+            // This used to also call `allowOptionGatedBuiltins` here, on the
+            // stated belief that "rustnode does not run `pre_execution.js`". It
+            // does — `prepare_execution` invokes `prepareMainThreadExecution` —
+            // so Node applied the call once and rustnode applied it twice, and
+            // nothing between the two calls needs a gated builtin:
+            // `install_early_globals` reaches only `buffer`, `encoding`,
+            // `worker/js_transferable`, `async_hooks` and `util`, and
+            // `install_cjs_loader` only `modules/cjs/loader`. Both the suite and
+            // the worker path behave identically without it, so the second
+            // application was pure cost and is gone.
+            //
+            // The `require('node:...')` boundary is what *enforces* the list:
+            // the vendored CJS loader's `BuiltinModule.normalizeRequirableId`,
+            // which is why `install_cjs_loader` below must keep the global
+            // `require` sending every `node:` id through the file loader.
+            // Routing the scheme branch to the realm loader instead skipped that
+            // check and loaded `quic`, `dtls` and `bench` even though
+            // `canBeRequiredByUsers` reports false for them.
             bootstrap::install_early_globals(scope, &loaders);
+            rn_core::profile::mark("install_early_globals");
             // The CommonJS loader turns `require` from a builtin lookup into a
             // real module loader, which is what makes `require('./file.js')`
             // work. It is the vendored `lib/internal/modules/cjs/loader.js`,
@@ -320,6 +341,7 @@ fn main() {
                     eprintln!("rustnode: commonjs loader unavailable: {message}");
                 }
             }
+            rn_core::profile::mark("install_cjs_loader");
             // The loop's JavaScript half is installed before the script runs,
             // because a script may call `setTimeout` on its first line. A
             // failure here is reported rather than fatal: a synchronous script
@@ -350,7 +372,9 @@ fn main() {
                     // lazily, and it must reach the same write queue rather than
                     // a second descriptor. See `install_console`.
                     bootstrap::install_console(scope, require);
+                    rn_core::profile::mark("install_stdio + console");
                     bootstrap::prepare_execution(scope, require);
+                    rn_core::profile::mark("prepare_execution");
                     // `node -e` exposes builtins as lazy globals; a script file
                     // does not, which is why this is gated on the source. Node's
                     // own `eval_string.js` makes the same distinction.
@@ -364,7 +388,7 @@ fn main() {
                     eprintln!("rustnode: timers unavailable: the realm bootstrap left no require")
                 }
             }
-            let _ = loaders.internal_binding;
+            rn_core::profile::mark("Runtime::install + eval builtins");
             // Taken last: every step above reads `loaders.require`, and taking it
             // first left `install_early_globals` without a loader, which silently
             // dropped the `Buffer` global.
@@ -379,6 +403,7 @@ fn main() {
     // buffers keep the `clear_async_id_stack` seed and every resource reports
     // `triggerAsyncId() === -1`. See `push_top_level_context`.
     rn_bind_async_wrap::push_top_level_context(scope);
+    rn_core::profile::mark("push_top_level_context");
 
     // A file is loaded through Node's own entry-point path
     // (`internal/modules/run_main.js::executeUserEntryPoint`), which picks the
@@ -449,6 +474,7 @@ fn main() {
             value = evaluate_script(scope, "0").map(|value| v8::Global::new(scope, value));
         }
     }
+    rn_core::profile::mark("user script");
 
     // Only a throw the handler declined is fatal, and then `exit` still has to
     // run: `process._fatalException` overwrote `process.exitCode` with
@@ -557,6 +583,8 @@ fn main() {
 /// is bounded by one in-flight job, not by the queue: see that module's notes on
 /// why this is a drain rather than a wait.
 fn terminate(code: i32) -> ! {
+    rn_core::profile::mark("loop finished");
+    rn_core::profile::report();
     rn_uv::threadpool::drain();
     std::process::exit(code);
 }

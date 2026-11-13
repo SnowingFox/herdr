@@ -147,6 +147,15 @@ pub fn wrap_require_with_scheme_support(scope: &mut v8::PinScope, loaders: &Boot
 }
 
 /// `require(`internal/...`)` from the realm loader.
+///
+/// `#[allow(dead_code)]` and kept deliberately: this is the one-line form of
+/// "reach an internal module through the realm loader", and the option-gated
+/// builtin allow-list used it until it was found to duplicate a call Node
+/// already makes from `prepareExecution`. A future bootstrap step that needs an
+/// internal module before the CJS loader exists will want it again, and
+/// re-deriving it from [`call_require`] is how it got an incorrect receiver the
+/// first time.
+#[allow(dead_code)]
 fn require_internal<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     require: v8::Local<'s, v8::Function>,
@@ -154,80 +163,6 @@ fn require_internal<'s>(
 ) -> Option<v8::Local<'s, v8::Value>> {
     let id = v8::String::new(scope, id)?;
     require.call(scope, v8::undefined(scope).into(), &[id.into()])
-}
-
-/// Exposes the builtins a runtime option gates, exactly as Node does.
-///
-/// `realm.js` keeps `['sqlite', true, '--experimental-sqlite']` (and the rest of
-/// `builtinModulePolicies`) in a map, and exposes an entry only when its option
-/// is truthy. Node applies that in `internal/process/pre_execution.js:488` by
-/// calling `BuiltinModule.allowOptionGatedBuiltins(getOptionValue)`, which reads
-/// every policy in one pass.
-///
-/// rustnode does not run `pre_execution.js`, so the same call is made here with
-/// the vendored `getOptionValue` from `internal/options`. Passing the real
-/// accessor rather than a hand-written list is the point: the decision comes
-/// from the option parser and the policy table, so a future gated builtin is
-/// covered without a second edit, and an option this build defaults to false
-/// stays gated.
-///
-/// The alternative — calling `allowRequireByUsers` for a fixed list of ids —
-/// would expose a builtin whose option is off, which is the divergence this
-/// replaces.
-///
-/// This is the *allow-list* itself, and the reachability that enforces it is a
-/// separate place: every `node:` id a user types goes through the vendored CJS
-/// loader's `BuiltinModule.normalizeRequirableId`, which reports
-/// `ERR_UNKNOWN_BUILTIN_MODULE` for an id this call did not expose. Which
-/// wrapper owns that delegation is described on
-/// [`wrap_cjs_require_with_builtin_fallback`]; before it existed rustnode
-/// handed the scheme branch to the realm's internal loader, which has no
-/// allow-list, and a withheld builtin stayed reachable through `node:`.
-pub fn allow_option_gated_builtins(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
-    let Some(require) = loaders.require.as_ref() else {
-        return;
-    };
-    let require = v8::Local::new(scope, require);
-    // Two `require` calls, written out rather than through a closure: a closure
-    // borrowing `scope` immutably would conflict with the `&mut` the calls need.
-    let Some(realm) = require_internal(scope, require, "internal/bootstrap/realm") else {
-        return;
-    };
-    let Ok(realm) = v8::Local::<v8::Object>::try_from(realm) else {
-        return;
-    };
-    let Some(builtin_module) = get_property(scope, realm.into(), "BuiltinModule") else {
-        return;
-    };
-    let Ok(builtin_module) = v8::Local::<v8::Function>::try_from(builtin_module) else {
-        return;
-    };
-    let Some(allow) = get_property(scope, builtin_module.into(), "allowOptionGatedBuiltins") else {
-        return;
-    };
-    let Ok(allow) = v8::Local::<v8::Function>::try_from(allow) else {
-        return;
-    };
-
-    // The vendored accessor, not a reimplementation: it reads
-    // `internalBinding('options').getCLIOptionsValues()`, which is the parsed
-    // command line this process was started with.
-    let Some(options) = require_internal(scope, require, "internal/options") else {
-        return;
-    };
-    let Ok(options) = v8::Local::<v8::Object>::try_from(options) else {
-        return;
-    };
-    let Some(get_option_value) = get_property(scope, options.into(), "getOptionValue") else {
-        return;
-    };
-    let Ok(get_option_value) = v8::Local::<v8::Function>::try_from(get_option_value) else {
-        return;
-    };
-
-    // `allowOptionGatedBuiltins` takes `getOptionValue` and calls it once per
-    // policy, so it must be invoked with the receiver the loop expects.
-    let _ = allow.call(scope, builtin_module.into(), &[get_option_value.into()]);
 }
 
 /// Installs the globals that only need bindings which already exist.
@@ -1271,6 +1206,7 @@ pub fn bootstrap_realm(
 
     let primordials = v8::Object::new(scope);
     run_per_context(scope, primordials)?;
+    rn_core::profile::mark("primordials");
 
     let process = process_object(scope, script_args, exec_argv)?;
     set_global(scope, global, "process", process.into())?;
@@ -1305,6 +1241,7 @@ pub fn bootstrap_realm(
             .unwrap_or_default();
         return Err(format!("internal/bootstrap/realm threw: {message}"));
     }
+    rn_core::profile::mark("realm.js executed");
 
     // `require` is what user code and the CLI both need, so it becomes a global
     // the same way Node exposes it to a CommonJS module.

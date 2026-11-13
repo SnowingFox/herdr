@@ -120,7 +120,10 @@ thread_local! {
     /// why [`crate::values::cli_values`] can keep falling back to the table
     /// defaults: a caller that never parses a command line has to see exactly
     /// what it saw before this module existed.
-    static PARSED: RefCell<Option<Store>> = const { RefCell::new(None) };
+    ///
+    /// Shared, not owned: see [`store`] for why a clone here cost 5 ms of
+    /// startup.
+    static PARSED: RefCell<Option<std::sync::Arc<Store>>> = const { RefCell::new(None) };
 }
 
 /// Records the process's parsed option values, for every thread.
@@ -136,22 +139,58 @@ thread_local! {
 /// The thread-local is still read first so a test can install its own store
 /// without changing what the rest of the process sees.
 pub fn install(store: Store) {
-    PROCESS_STORE.get_or_init(|| std::sync::Mutex::new(store.clone()));
+    let shared = std::sync::Arc::new(store);
+    PROCESS_STORE.get_or_init(|| std::sync::Mutex::new(std::sync::Arc::clone(&shared)));
     PARSED.with(|parsed| {
-        *parsed.borrow_mut() = Some(store);
+        *parsed.borrow_mut() = Some(shared);
     });
 }
 
 /// The process's store, visible to every thread.
-static PROCESS_STORE: std::sync::OnceLock<std::sync::Mutex<Store>> = std::sync::OnceLock::new();
+static PROCESS_STORE: std::sync::OnceLock<std::sync::Mutex<std::sync::Arc<Store>>> =
+    std::sync::OnceLock::new();
 
 /// The store for this thread: its own if it installed one, else the process's.
-fn store() -> Option<Store> {
-    let installed = PARSED.with(|parsed| parsed.borrow().clone());
-    if installed.is_some() {
-        return installed;
+///
+/// # Why this hands back a shared handle and not a clone
+///
+/// It used to return `Store` by value, which deep-cloned the whole store on
+/// *every* lookup. The store holds **217** entries — the table has 251 options,
+/// but `ParsedValue::default_of` returns `None` for `kNoOp` and `kV8Option`,
+/// which have no field in Node either. [`crate::values::cli_values`] looks up
+/// one option per table entry to build its list, so a single
+/// `getCLIOptionsValues()` call did 251 lookups, each deep-cloning a 217-entry
+/// vector: roughly 54,500 pair clones per call.
+///
+/// A process builds that list twice, and both builds are in Node's own startup
+/// rather than a rustnode duplication. The first read comes from the CommonJS
+/// loader's `initializeCJS` -> `initializeCjsConditions` ->
+/// `getOptionValue('--conditions')`; `prepareExecution` then calls
+/// `refreshRuntimeOptions()`, whose `refreshOptions()` sets `optionsDict =
+/// undefined`, so the next read (`addReadOnlyProcessAlias` from
+/// `patchProcessObject`) rebuilds. Both go through the one memoized
+/// `getCLIOptionsFromBinding`, so this is one module instance with a
+/// deliberately cleared cache, not two instances.
+///
+/// What #26 changed is the cost of a lookup, not its shape: `value_of` was
+/// already a linear scan of the store (`self.values.iter().find(..)`), so a
+/// build was O(lookups x entries) before it and is O(lookups x entries) after.
+/// The clone did not change the asymptotic class — it raised the constant and
+/// added ~54,500 allocations, because each of the 251 lookups newly allocated
+/// and filled a 217-entry vector before doing the same scan it always did. That
+/// extra allocation and copying is the ~5 ms #26 added.
+///
+/// The handle has to be `Arc` and not `Rc` because the process-wide slot lives
+/// in a `static`, which requires `Send + Sync`.
+fn store() -> Option<std::sync::Arc<Store>> {
+    if let Some(installed) = PARSED.with(|parsed| parsed.borrow().clone()) {
+        return Some(installed);
     }
-    PROCESS_STORE.get()?.lock().ok().map(|store| store.clone())
+    PROCESS_STORE
+        .get()?
+        .lock()
+        .ok()
+        .map(|store| std::sync::Arc::clone(&store))
 }
 
 /// One option's parsed value, if the CLI installed a store.
@@ -163,7 +202,7 @@ pub fn value_of(name: &str) -> Option<ParsedValue> {
 /// Every parsed value, in table order, for a caller that wants them all.
 #[must_use]
 pub fn all_values() -> Option<Vec<(String, ParsedValue)>> {
-    store().map(|store| store.values)
+    store().map(|store| store.values.clone())
 }
 
 /// The parsed values for this process.
@@ -200,6 +239,27 @@ impl Store {
             .iter()
             .find(|(option, _)| option == name)
             .map(|(_, value)| value.clone())
+    }
+
+    /// How many entries the store holds.
+    ///
+    /// Not `OPTIONS.len()`: `ParsedValue::default_of` returns `None` for
+    /// `kNoOp` and `kV8Option`, which have no field in Node either, so those
+    /// options never enter the store. The difference is what makes "the table
+    /// has 251 entries" and "the store has 217" both true at once, and getting
+    /// it wrong puts a wrong number in a doc that gets quoted.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Whether the store holds no entries.
+    ///
+    /// Always false for a parsed store — every table option with a default is
+    /// present — but `len` without `is_empty` is not a clippy-clean pair.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
     }
 
     /// Walks `argv` the way `OptionsParser<Options>::Parse` does.
@@ -524,6 +584,16 @@ mod tests {
         Store::parse(&argv(items))
     }
 
+    /// Installs `store` on this thread only, leaving the process-wide slot alone.
+    ///
+    /// [`install`] also seeds `PROCESS_STORE`, which is `OnceLock`: the first
+    /// test to call it would decide what every other test in the crate sees.
+    /// These tests are about the lookup path, so they install just the part the
+    /// lookup reads first.
+    fn install_for_this_thread_only(store: Store) {
+        PARSED.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::new(store)));
+    }
+
     #[test]
     fn an_absent_option_keeps_its_default() {
         let store = parsed(&[]);
@@ -751,6 +821,102 @@ mod tests {
         assert!(!namespace_seen(
             &argv(&["--no-warnings"]),
             OptionNamespace::Bench
+        ));
+    }
+
+    /// Installing must share one store rather than hand out copies.
+    ///
+    /// The lookup used to return `Store` by value, which deep-cloned the whole
+    /// store per call. It holds 217 entries (see the count test below for why
+    /// that is not `OPTIONS.len()`), and `cli_values()` looks one option up per
+    /// table entry, so a single `getCLIOptionsValues()` did 251 lookups each
+    /// cloning 217 entries. Startup builds that list twice — not because of a
+    /// duplicate call, but because `refreshRuntimeOptions()` clears the memo
+    /// between the CJS loader's first read and `patchProcessObject`'s second.
+    /// A clone is also a correctness hazard in its own right: a copy taken
+    /// before a later [`Store::set`] cannot see the correction, so this pins
+    /// identity and not only the cost.
+    ///
+    /// The install here touches only this thread's slot. The rest of this
+    /// module's tests assert what an *uninstalled* process reports, so a test
+    /// that populated the process-wide store would change their answer
+    /// depending on which test ran first.
+    #[test]
+    fn a_lookup_hands_back_a_shared_store_rather_than_a_copy() {
+        install_for_this_thread_only(parsed(&["--experimental-bench"]));
+
+        let first = store().expect("a store was installed");
+        let second = store().expect("the second lookup still finds it");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "two lookups must observe one store, not two deep copies"
+        );
+        assert_eq!(
+            first.value_of("--experimental-bench"),
+            Some(ParsedValue::Bool(true))
+        );
+    }
+
+    /// The store's size is the options that *have* a default, not the table's.
+    ///
+    /// `OPTIONS.len()` is 251, but `ParsedValue::default_of` returns `None` for
+    /// `kNoOp` and `kV8Option` — they have no field in Node either — so a parsed
+    /// store holds 217. Both numbers are correct about different things, and
+    /// confusing them is how "251 clones of 251 entries" got written into a doc.
+    ///
+    /// The expectation is derived from the table rather than written as 217, so
+    /// adding an option keeps this honest instead of requiring an edit here.
+    #[test]
+    fn a_parsed_store_holds_only_the_options_that_have_a_default() {
+        let expected = OPTIONS
+            .iter()
+            .filter(|option| ParsedValue::default_of(option).is_some())
+            .count();
+        let store = parsed(&[]);
+
+        assert_eq!(
+            store.len(),
+            expected,
+            "a parsed store must hold one entry per option that has a default"
+        );
+        assert!(
+            expected < OPTIONS.len(),
+            "the table must still contain options with no default, or this test \
+             is no longer measuring the distinction it exists for"
+        );
+
+        // The same count from the other side: `kNoOp` and `kV8Option` are
+        // exactly the kinds `default_of` skips.
+        let no_default = OPTIONS
+            .iter()
+            .filter(|option| {
+                matches!(option.kind, kind::NO_OP | kind::V8_OPTION)
+                    || matches!(option.default, DefaultValue::Undefined)
+            })
+            .count();
+        assert_eq!(
+            OPTIONS.len() - expected,
+            no_default,
+            "the options missing from the store must be the ones with no field"
+        );
+    }
+
+    /// `all_values` must keep reporting every parsed entry.
+    ///
+    /// Its caller is `getCLIOptionsValues`, whose whole contract is the parsed
+    /// table, so a shared handle that accidentally returned an empty vector
+    /// would pass the identity test above and still be wrong.
+    #[test]
+    fn all_values_still_reports_every_parsed_entry() {
+        let store = parsed(&["--experimental-bench"]);
+        let expected = store.len();
+        assert!(expected > 0, "a parsed store is not empty");
+        install_for_this_thread_only(store);
+
+        let values = all_values().expect("a store was installed");
+        assert_eq!(values.len(), expected);
+        assert!(values.iter().any(
+            |(name, value)| name == "--experimental-bench" && *value == ParsedValue::Bool(true)
         ));
     }
 }
