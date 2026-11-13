@@ -1084,8 +1084,15 @@ d.run(() => {{
 "#
         ),
     );
+    // Order is not asserted. The two calls are independent `uv_queue_work`
+    // jobs of different sizes, so their completions race on the threadpool and
+    // the gate's parallel run flips them under CPU contention; the claim under
+    // test is that *each* class restores the frame, not which finishes first.
+    let mut lines: Vec<&str> = out.lines().collect();
+    lines.sort_unstable();
     assert_eq!(
-        out, "{\"readFile\":true}\n{\"writeFile\":true}",
+        lines,
+        [r#"{"readFile":true}"#, r#"{"writeFile":true}"#],
         "both job classes must deliver inside the caller's async frame"
     );
 }
