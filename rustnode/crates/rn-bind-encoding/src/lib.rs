@@ -109,30 +109,55 @@ fn encode_into(
         record(0, 0);
         return;
     };
-    let text = source.to_rust_string_lossy(scope);
-    let capacity = destination.byte_length();
 
-    // Encode as much as fits, stopping on a character boundary: a partial code
-    // point must never be written, which is what makes `read` meaningful.
-    let mut written = 0;
-    let mut read = 0;
-    for character in text.chars() {
-        let mut buffer = [0u8; 4];
-        let bytes = character.encode_utf8(&mut buffer).as_bytes();
-        if written + bytes.len() > capacity {
-            break;
-        }
-        for (offset, byte) in bytes.iter().enumerate() {
-            destination.set_index(
-                scope,
-                (written + offset) as u32,
-                v8::Integer::new(scope, *byte as i32).into(),
-            );
-        }
-        written += bytes.len();
-        read += character.len_utf16();
-    }
+    // V8 encodes straight into the destination's backing store. It stops before
+    // a code point that would not fit and reports how many UTF-16 code units it
+    // consumed, which is exactly the `{ read, written }` contract, and it
+    // replaces an unpaired surrogate with U+FFFD the way `encode()` does.
+    //
+    // This replaces a byte-at-a-time loop over `destination.set_index(...)`.
+    // Each of those calls allocated a handle for the `Integer` and ran a
+    // typed-array bounds check, so the cost was per *byte* rather than a single
+    // memcpy; `TextEncoder#encodeInto` was orders of magnitude slower than
+    // `node` on the same input while `encode()` was at parity.
+    let mut read = 0usize;
+    let written = with_bytes_mut(&destination, |bytes| {
+        source.write_utf8_v2(
+            scope,
+            bytes,
+            v8::WriteFlags::kReplaceInvalidUtf8,
+            Some(&mut read),
+        )
+    });
     record(read as u32, written as u32);
+}
+
+/// Writes into a typed array's backing store, bypassing the V8 property API.
+///
+/// The callback receives the view's bytes and must not run JavaScript: the
+/// slice borrows a backing store that only stays put because nothing can
+/// detach, resize or collect the buffer while it is held. It gets an empty
+/// slice for a zero-length or detached view, whose pointer V8 leaves null.
+///
+/// `rn-bind-buffer`'s `args::with_view_bytes_mut` is the same function, and
+/// this crate does not reach for it: a binding crate depending on another
+/// binding crate to borrow six lines of `unsafe` would couple two namespaces
+/// that share nothing else, and `rn-bind-fs` and `rn-bind-crypto` already carry
+/// their own copies of this pattern. Lifting it into `rn-core` would be the
+/// real fix, and is worth doing when a fourth copy appears.
+fn with_bytes_mut<T>(view: &v8::Uint8Array, write: impl FnOnce(&mut [u8]) -> T) -> T {
+    let data = view.data().cast::<u8>();
+    let length = view.byte_length();
+    if data.is_null() || length == 0 {
+        return write(&mut []);
+    }
+    // SAFETY: `data()` is the backing store address plus the view's byte
+    // offset, and `byte_length()` bytes are writable from it while the view is
+    // reachable. The view is an argument, so it is reachable for this whole
+    // call, `write` cannot run JavaScript, and this is the only slice over that
+    // range.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data, length) };
+    write(bytes)
 }
 
 fn record(read: u32, written: u32) {
