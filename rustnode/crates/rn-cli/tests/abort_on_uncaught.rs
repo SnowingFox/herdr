@@ -273,24 +273,19 @@ fn a_throw_from_a_timer_callback_aborts() {
 
 /// A throw from an `fs` completion callback aborts.
 ///
-/// **This asserts #77's behaviour, not this branch's**, and that is why it is
-/// `#[ignore]`d. `crates/rn-bind-fs/src/complete.rs` delivers the callback with
-/// `let _ = handler.call(...)`, which leaves the exception pending on the
-/// isolate: V8's default reporter prints `Uncaught …` to *stdout* and the process
-/// exits 0, so nothing reaches the abort check. Fixing that is
-/// `cursor/uv-callback-uncaught-e67e` (#77), which routes every completion sink
-/// through one shared reporter; this branch deliberately carries no `rn-bind-fs`
-/// change, so the merge order is `#77 → #82`.
+/// This depends on #77. `crates/rn-bind-fs/src/complete.rs` used to deliver the
+/// callback with `let _ = handler.call(...)`, which left the exception pending on
+/// the isolate: V8's default reporter printed `Uncaught …` to *stdout* and the
+/// process exited 0, so nothing reached the abort check. #77 routed every
+/// completion sink through one shared reporter, and this assertion now holds.
 ///
-/// Removing this `#[ignore]` is the definition of done for the merge: with #77
-/// in place the assertion holds, which was measured on a scratch branch. Until
-/// then the two `-5`/`-9` domain files that depend on the same fix fail as well,
-/// and `test-domain-abort-on-uncaught.js` fails through its `fsAsync` sub-cases.
+/// It was `#[ignore]`d while #77 was unmerged; that ignore is gone now that the
+/// dependency has landed, which was the stated definition of done for the merge.
 ///
 /// `a_throw_from_a_timer_callback_aborts` above is the working sibling: timers
-/// already report through the funnel, so the flag is observable there today.
+/// already reported through the funnel, so the flag was observable there even
+/// before #77.
 #[test]
-#[ignore = "depends on #77: an fs completion callback still leaves its throw pending"]
 fn a_throw_from_an_fs_callback_aborts() {
     let run = eval_with(
         &["--abort-on-uncaught-exception"],
