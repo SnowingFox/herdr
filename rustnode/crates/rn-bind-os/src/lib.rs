@@ -964,14 +964,33 @@ struct Interface {
 }
 
 /// Enumerates IPv4 and IPv6 addresses with `getifaddrs`.
+///
+/// # Why this mirrors `uv_interface_addresses` rather than "reading the list"
+///
+/// `os.networkInterfaces()` in Node is a thin wrapper over libuv's
+/// `uv_interface_addresses`, so the *filter* is part of the contract, not an
+/// implementation detail. libuv does two passes over one `getifaddrs` list, and
+/// they use different exclusion rules:
+///
+/// * the **address** pass keeps only entries that are `IFF_UP` *and*
+///   `IFF_RUNNING` and have an address, and rejects `PF_PACKET` entries;
+/// * the **physical-address** pass keeps `PF_PACKET` entries deliberately — that
+///   is where the hardware address comes from — and copies their `sll_addr` onto
+///   every interface with a matching name.
+///
+/// Doing the two passes as one loop is what produced three observable bugs:
+/// an `IFF_UP`-only filter admitted `docker0` (up but not running); `mac` was
+/// empty everywhere because the address entry's `sa_family` is `AF_INET`, never
+/// `AF_PACKET`, so the hardware lookup always missed; and `internal` was never
+/// set because nothing checked `IFF_LOOPBACK`.
 fn interface_addresses() -> Vec<Interface> {
-    let mut interfaces = Vec::new();
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: `getifaddrs` fills `list` and returns 0 on success.
     if unsafe { libc::getifaddrs(&mut list) } != 0 {
-        return interfaces;
+        return Vec::new();
     }
 
+    let mut interfaces = Vec::new();
     let mut cursor = list;
     while !cursor.is_null() {
         // SAFETY: `cursor` walks the list `getifaddrs` allocated and is non-null
@@ -984,17 +1003,116 @@ fn interface_addresses() -> Vec<Interface> {
         cursor = entry.ifa_next;
     }
 
+    // The physical-address pass, exactly as `uv_interface_addresses` runs it: one
+    // walk over the packet entries, matched onto every interface by name prefix.
+    // `strncmp` with the shorter name's length plus the `':'` alternative is how
+    // libuv models "alias interfaces share the same physical address".
+    let mut cursor = list;
+    while !cursor.is_null() {
+        // SAFETY: same list, still owned here.
+        let entry = unsafe { &*cursor };
+        if !unsafe { physical_pass_admits(entry) } {
+            cursor = entry.ifa_next;
+            continue;
+        }
+        let name = unsafe { CStr::from_ptr(entry.ifa_name) }.to_string_lossy();
+        let mac = unsafe { packet_hardware_address(entry.ifa_addr) };
+        for iface in &mut interfaces {
+            if names_match(&iface.name, &name) {
+                iface.mac.clone_from(&mac);
+            }
+        }
+        cursor = entry.ifa_next;
+    }
+
     // SAFETY: `list` is the head `getifaddrs` allocated and is still owned here.
     unsafe { libc::freeifaddrs(list) };
     interfaces
 }
 
+/// Whether `iface_name` is the interface `packet_name` carries the MAC for.
+///
+/// `strncmp(address->name, ent->ifa_name, namelen) == 0 && (address->name[namelen]
+/// == 0 || address->name[namelen] == ':')`, with the arguments in libuv's order:
+/// the *packet* name is the prefix and the interface name may extend it with an
+/// alias suffix after a colon.
+fn names_match(iface_name: &str, packet_name: &str) -> bool {
+    let Some(rest) = iface_name.strip_prefix(packet_name) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(':')
+}
+
+/// `uv__ifaddr_exclude(ent, UV__EXCLUDE_IFPHYS)`.
+///
+/// `UV__EXCLUDE_IFPHYS` is `0`, so the `PF_PACKET` branch returns `0` — packet
+/// entries are *not* excluded from this pass, which is the whole point of it.
+unsafe fn physical_pass_admits(entry: &libc::ifaddrs) -> bool {
+    if entry.ifa_addr.is_null() {
+        return false;
+    }
+    if ((entry.ifa_flags as i32) & libc::IFF_UP) == 0
+        || ((entry.ifa_flags as i32) & libc::IFF_RUNNING) == 0
+    {
+        return false;
+    }
+    (*entry.ifa_addr).sa_family as i32 == libc::AF_PACKET
+}
+
+/// The six-byte hardware address from a `sockaddr_ll`, formatted like libuv's
+/// `phys_addr` and Node's `%02x` join.
+///
+/// SAFETY: `addr` must point at a live `sockaddr`, and is only read when its
+/// family is `AF_PACKET`.
+unsafe fn packet_hardware_address(addr: *const libc::sockaddr) -> String {
+    if addr.is_null() || (*addr).sa_family as i32 != libc::AF_PACKET {
+        return String::new();
+    }
+    let link = &*(addr as *const libc::sockaddr_ll);
+    link.sll_addr[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Whether `entry` should appear in the address pass.
+///
+/// `uv__ifaddr_exclude(ent, UV__EXCLUDE_IFADDR)` with
+/// `UV__EXCLUDE_IFADDR == 1`:
+///
+/// ```c
+/// if (!((ent->ifa_flags & IFF_UP) && (ent->ifa_flags & IFF_RUNNING)))
+///   return 1;
+/// if (ent->ifa_addr == NULL)
+///   return 1;
+/// if (ent->ifa_addr->sa_family == PF_PACKET)
+///   return exclude_type;   // 1 here, so packet entries are excluded
+/// return !exclude_type;    // 0, so everything else is kept
+/// ```
+///
+/// The `IFF_RUNNING` half is the one that was missing. `docker0` on a host with
+/// no containers is `IFF_UP` without `IFF_RUNNING` (flags `0x1003` against
+/// `enp0s3`'s `0x11043`), so libuv drops it and Node never reports it, while an
+/// `IFF_UP`-only filter admits it.
+fn address_pass_admits(entry: &libc::ifaddrs) -> bool {
+    let flags = entry.ifa_flags as i32;
+    if (flags & libc::IFF_UP) == 0 || (flags & libc::IFF_RUNNING) == 0 {
+        return false;
+    }
+    if entry.ifa_addr.is_null() {
+        return false;
+    }
+    // SAFETY: `ifa_addr` was just checked for null and comes from `getifaddrs`.
+    unsafe { (*entry.ifa_addr).sa_family as i32 != libc::AF_PACKET }
+}
+
 /// SAFETY: `entry` must be a live `ifaddrs` from `getifaddrs`.
 unsafe fn describe_interface(entry: &libc::ifaddrs) -> Option<Interface> {
-    let addr = entry.ifa_addr;
-    if addr.is_null() {
+    if !address_pass_admits(entry) {
         return None;
     }
+    let addr = entry.ifa_addr;
     let family = (*addr).sa_family as i32;
     let (address, netmask, scope_id) = match family {
         libc::AF_INET => {
@@ -1032,7 +1150,15 @@ unsafe fn describe_interface(entry: &libc::ifaddrs) -> Option<Interface> {
     let name = CStr::from_ptr(entry.ifa_name)
         .to_string_lossy()
         .into_owned();
-    let (mac, internal) = hardware_address(addr);
+    // `address->is_internal = !!(ent->ifa_flags & IFF_LOOPBACK);` — the flag,
+    // not a guess from the address. A loopback interface is `internal` even when
+    // its address does not look like one, and a non-loopback interface is not
+    // internal even when it does.
+    let internal = ((entry.ifa_flags as i32) & libc::IFF_LOOPBACK) != 0;
+    // The physical address is filled in by the second pass, which is the only
+    // pass that sees `AF_PACKET` entries. It starts empty here, and stays empty
+    // for an interface libuv found no packet entry for.
+    let mac = String::new();
 
     Some(Interface {
         name,
@@ -1112,25 +1238,6 @@ fn family_field(family: i32) -> String {
         libc::AF_INET => "IPv4".to_string(),
         libc::AF_INET6 => "IPv6".to_string(),
         _ => "<unknown>".to_string(),
-    }
-}
-
-/// The MAC address and loopback flag for one address.
-///
-/// SAFETY: `addr` must point at a live `sockaddr`.
-unsafe fn hardware_address(addr: *const libc::sockaddr) -> (String, bool) {
-    match (*addr).sa_family as i32 {
-        libc::AF_PACKET => {
-            let link = &*(addr as *const libc::sockaddr_ll);
-            let bytes = &link.sll_addr[..6];
-            let mac = bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<Vec<_>>()
-                .join(":");
-            (mac, false)
-        }
-        _ => (String::new(), false),
     }
 }
 
@@ -1435,5 +1542,163 @@ mod tests {
     fn load_average_is_readable() {
         let load = load_average();
         assert!(load.iter().all(|value| *value >= 0.0));
+    }
+
+    /// `names_match` reproduces libuv's `strncmp` + `:` alias rule.
+    ///
+    /// `uv_interface_addresses` copies a packet entry's hardware address onto an
+    /// interface when the interface name *starts with* the packet name and either
+    /// ends there or continues with `:`. Getting this wrong either drops the MAC
+    /// for an aliased interface or gives one interface another's address.
+    #[test]
+    fn names_match_follows_the_alias_rule() {
+        assert!(names_match("eth0", "eth0"), "an exact name matches");
+        assert!(
+            names_match("eth0:1", "eth0"),
+            "an alias interface matches its base"
+        );
+        assert!(
+            !names_match("eth01", "eth0"),
+            "a longer name that is not an alias must not match"
+        );
+        assert!(
+            !names_match("eth", "eth0"),
+            "a shorter interface name must not match"
+        );
+        assert!(!names_match("lo", "eth0"));
+    }
+
+    /// Every reported interface is up, running, and carries an address.
+    ///
+    /// That is `uv__ifaddr_exclude`'s whole first branch. The bug this pins was an
+    /// `IFF_UP`-only filter, which admitted Docker's bridge: on a host with no
+    /// containers it is up but not running (`0x1003` against an active NIC's
+    /// `0x11043`), and Node does not report it.
+    #[test]
+    fn every_reported_interface_is_up_and_running() {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        // SAFETY: `getifaddrs` fills `list` and returns 0 on success.
+        if unsafe { libc::getifaddrs(&mut list) } != 0 {
+            return;
+        }
+        let mut excluded_but_present = Vec::new();
+        let mut cursor = list;
+        while !cursor.is_null() {
+            // SAFETY: one live node of the list.
+            let entry = unsafe { &*cursor };
+            let admitted = address_pass_admits(entry);
+            let up_and_running = entry.ifa_flags as i32 & libc::IFF_UP != 0
+                && entry.ifa_flags as i32 & libc::IFF_RUNNING != 0;
+            if admitted {
+                assert!(
+                    up_and_running,
+                    "an interface without IFF_UP|IFF_RUNNING was admitted"
+                );
+                assert!(
+                    !entry.ifa_addr.is_null(),
+                    "an addressless entry was admitted"
+                );
+            } else if up_and_running && !entry.ifa_addr.is_null() {
+                // SAFETY: non-null, from getifaddrs.
+                let family = unsafe { (*entry.ifa_addr).sa_family } as i32;
+                assert_eq!(
+                    family,
+                    libc::AF_PACKET,
+                    "only a PF_PACKET entry may be excluded once it is up and addressed"
+                );
+            }
+            if !up_and_running && !entry.ifa_addr.is_null() {
+                let family = unsafe { (*entry.ifa_addr).sa_family } as i32;
+                if family == libc::AF_INET || family == libc::AF_INET6 {
+                    excluded_but_present.push(
+                        unsafe { CStr::from_ptr(entry.ifa_name) }
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+            cursor = entry.ifa_next;
+        }
+        // SAFETY: the head of the list, still owned here.
+        unsafe { libc::freeifaddrs(list) };
+        // Not an assertion about this host: it records that a not-running
+        // interface with an address exists, which is exactly the case the old
+        // filter got wrong.
+        if !excluded_but_present.is_empty() {
+            excluded_but_present.sort();
+            excluded_but_present.dedup();
+            eprintln!("excluded for not being up and running: {excluded_but_present:?}");
+        }
+    }
+
+    /// A loopback interface is `internal`, and a non-loopback one is not.
+    ///
+    /// `is_internal` is `IFF_LOOPBACK`, not a guess from the address text. Before
+    /// this was fixed every interface reported `internal: false`, which is what
+    /// made `test/common/index.js`'s address helpers misclassify loopback.
+    #[test]
+    fn only_loopback_interfaces_are_internal() {
+        let interfaces = interface_addresses();
+        assert!(!interfaces.is_empty(), "some interface must be reported");
+        for iface in &interfaces {
+            if iface.name == "lo" || iface.name.starts_with("lo:") {
+                assert!(
+                    iface.internal,
+                    "{} is loopback and must be internal",
+                    iface.name
+                );
+            }
+            if iface.family == "IPv4" && iface.address.starts_with("127.") {
+                assert!(
+                    iface.internal,
+                    "{} carries a 127/8 address and must be internal",
+                    iface.name
+                );
+            }
+            if iface.family == "IPv6" && iface.address == "::1" {
+                assert!(iface.internal, "::1 must be internal");
+            }
+        }
+    }
+
+    /// A reported MAC is either six colon-separated hex pairs or empty.
+    ///
+    /// The bug this pins returned the empty string for *every* interface, because
+    /// the hardware lookup ran on the address entry (family `AF_INET`) instead of
+    /// the packet entry the second pass uses.
+    #[test]
+    fn mac_addresses_are_six_byte_hex_or_empty() {
+        let interfaces = interface_addresses();
+        for iface in &interfaces {
+            if iface.mac.is_empty() {
+                continue;
+            }
+            let octets: Vec<&str> = iface.mac.split(':').collect();
+            assert_eq!(
+                octets.len(),
+                6,
+                "{} reported a MAC with {} octets: {}",
+                iface.name,
+                octets.len(),
+                iface.mac
+            );
+            for octet in octets {
+                assert_eq!(octet.len(), 2, "{} has a non-byte octet", iface.name);
+                assert!(
+                    octet.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{} has a non-hex octet: {octet}",
+                    iface.name
+                );
+            }
+        }
+        // A loopback interface has no hardware address, and libuv zeroes it rather
+        // than leaving it empty, because it fills `phys_addr` from the packet entry
+        // for `lo` too.
+        if let Some(lo) = interfaces.iter().find(|iface| iface.name == "lo") {
+            assert_eq!(
+                lo.mac, "00:00:00:00:00:00",
+                "loopback's MAC is zeroed, not empty"
+            );
+        }
     }
 }
