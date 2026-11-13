@@ -97,6 +97,9 @@ by both scope and rule, and the differences do not add up.
 | 2731/5714 (47.8%) | `f0649774` | 8 suites, 5714 files | four-marker | **measured here** — superseded by the rows below |
 | 2860/5714 (50.1%) | `59d661dc` | 8 suites, 5714 files | four-marker | **measured here** — reproduces the published 2863 figure within 3 files, see below |
 | 2880/5714 (50.4%) | `c236ee9c` | 8 suites, 5714 files | four-marker | **last full measurement — quote this one** |
+| 2881/5714 (50.4%) | `c236ee9c` + uncaught-exit fix | 8 suites, 5714 files | four-marker | **measured here** — the fix did not lower the rate |
+| 3411/5714 (59.7%) | `c236ee9c` | 8 suites, 5714 files | **exit-code only** | before the fix |
+| 3346/5714 (58.6%) | `c236ee9c` + uncaught-exit fix | 8 suites, 5714 files | **exit-code only** | after; the drop is the fix working, see below |
 | 2879/5714 (50.4%) | `c236ee9c` | 8 suites, 5714 files | four-marker | **same binary, immediate re-run** — the run-to-run noise band is ±1 file |
 | **2880/5692 (50.6%)** | **`c236ee9c`** | **8 suites, 5714 files** | **four-marker, oracle-corrected** | **the honest rate — see "The oracle control"** |
 | 2645/5159 (51.3%) | `7af7b306` (pre-#51) | `test/parallel` only | four-marker | **measured here** |
@@ -372,6 +375,36 @@ exits 0 in those cases, which Node does not do. That is a defect in rustnode's e
 status propagation and is now recorded as such in the failure map. The four files the
 oracle flagged are genuine failures and remain in the 2373-failure population.
 
+### Why the exit-code rate fell when the four-marker rate rose
+
+The uncaught-exit fix moves files from "exit 0 with a failure marker" to "exit 1 with
+the same marker". The four-marker rule already counted those as failures, so it is
+unaffected; an exit-code-only rule counted them as passes, so it loses them:
+
+| rule | before | after | delta |
+| --- | --- | --- | --- |
+| four-marker | 2880/5714 = 50.42% | **2881/5714 = 50.42%** | **+1 file** |
+| exit-code only | 3411/5714 = 59.70% | 3346/5714 = 58.56% | **−65 files** |
+
+The 65 are not regressions, and the arithmetic says so. 69 files stopped exiting 0;
+**66 of them already carried a failure marker**, so the four-marker rule had been
+calling them failures all along and the fix changed nothing about their verdict. The
+remaining 3 were four-marker passes, and all three are pre-existing flaky or hanging
+files that behave identically on the pre-fix binary:
+
+| file | pre-fix | fixed |
+| --- | --- | --- |
+| `parallel/test-stream-pipeline-listeners.js` | 1, 1, 1 over three runs | 0, 1, 1 |
+| `parallel/test-worker-terminate-unrefed.js` | 0, 0, 0 | 0, 0, 0 |
+| `parallel/test-worker-stdio-flush-inflight.js` | times out (124), every run | times out (124) |
+
+So the exit-code-only figure was **overstating compatibility by 65 files** before
+this change, and the drop is that overstatement being removed rather than behaviour
+being lost. Net four-marker movement is +4 gained, −3 noise, = +1.
+
+`test/parallel` and the eight-suite total remain different measurements; nothing here
+subtracts across scopes.
+
 ### Why 52.6% is superseded
 
 Two defects made the harness grade failures as passes, and they are independent:
@@ -640,14 +673,14 @@ $ ./rustnode -e "require('fs/promises').cp('/etc/hostname','/tmp/x',{recursive:t
 cp ok
 ```
 
-### Exit status is lost after a fatal error — 71 files
+### Exit status is lost after a fatal error — 66 of 71 fixed
 
-`71` of the 2373 failures exit **0** while having printed an `Uncaught` line. Under
-the oracle the same files either pass silently or exit non-zero, so this is a
-rustnode defect rather than a test expectation: rustnode prints a fatal error and
-then reports success.
+`71` of the 2373 failures exited **0** while having printed an `Uncaught` line. Under
+the oracle the same files either pass silently or exit non-zero, so this was a
+rustnode defect rather than a test expectation: rustnode printed a fatal error and
+then reported success.
 
-61 of the 71 carry `Uncaught AssertionError`, which means a test's own assertion
+61 of the 71 carried `Uncaught AssertionError`, which meant a test's own assertion
 fired and the process still exited 0:
 
 ```
@@ -659,16 +692,60 @@ $ echo $?
 0
 ```
 
-Under the oracle the same file exits 0 printing neither line. So this is not the
-test being lenient; it is the runtime failing to set an exit status for an
-assertion that already failed. The other 10 are non-assertion text — leaked child
-stderr, or an error in a context whose status never reaches the parent — and are a
-mixture of expected transcript text and real gaps.
+**This is fixed, and all 61 now exit non-zero.** The cause was never one bug: a
+completion that called a JavaScript callback wrote `let _ = function.call(..)`,
+which drops the `Option<Local<Value>>` and with it any thrown exception. V8's
+default handler still printed the error, so the text appeared, but nothing set
+`EXIT_REQUESTED` and the process exited 0. Node's `MakeCallback` installs a
+`TryCatch` and routes a caught exception through `TriggerUncaughtException`, which
+calls `process._fatalException` first and only then prints and sets the exit code.
 
-The map had been crediting these to the `Uncaught` marker without naming the
-underlying defect. It is one bug with 71 files attached, it does not overlap the
-http2 family at all, and it is the largest group in the map that is a behaviour
-defect rather than a missing namespace.
+Seven completion paths dropped it, and each was a separate sink:
+
+| path | where | files moved |
+| --- | --- | --- |
+| threadpool job completion | `crates/rn-bind-fs/src/jobs.rs` | `readFile`/`writeFile` callbacks |
+| generic fs completion | `crates/rn-bind-fs/src/complete.rs` | `readdir`, `stat`, `open`, … |
+| child process `'exit'` | `crates/rn-bind-process-wrap/src/handle.rs` | 31 files |
+| worker `'exit'` | `crates/rn-bind-worker/src/parent.rs` | 8 files |
+| zlib write completion | `crates/rn-bind-zlib/src/handle.rs` | — |
+| DNS microtask delivery | `crates/rn-bind-cares/src/deliver.rs` | — |
+| crypto keygen delivery | `crates/rn-bind-crypto-keys/src/gen.rs` | — |
+| TLS info callbacks | `crates/rn-bind-tls/src/callback.rs` | — |
+
+All of them now go through `rn_errors::report_uncaught_exception`, the runtime's
+single implementation of that order. `rn_uv::callback::call_reporting_uncaught`
+exists for a completion that has no caller left to handle a throw, and its doc
+comment states the failure mode rather than claiming V8's reporting is enough —
+that comment was the bug.
+
+**Five files still exit 0, and each is correct to:**
+
+| file | why exit 0 is right |
+| --- | --- |
+| `parallel/test-inspector-stops-no-file.js` | the `Uncaught` line is the *child's* expected output; the oracle prints the same error and exits 0 |
+| `parallel/test-module-loading-globalpaths.js` | same — `Cannot find module 'foo'` from the child |
+| `parallel/test-module-main-preserve-symlinks-fail.js` | same shape |
+| `parallel/test-worker-error-primitive.js` | the worker serialises `Uncaught string: boom` for the parent; that is the expected transcript |
+| `parallel/test-tls-multiple-cas-as-string.js` | `enableCertCb is not implemented yet` is thrown from a deferred TLS member *inside OpenSSL's callback* and is a real gap, but it is reported by the TLS path rather than an exit status |
+
+### `--abort-on-uncaught-exception` is accepted and ignored — 10 files
+
+Ten `test-domain-no-error-handler-abort-on-uncaught-*` files need the process to die
+by **SIGABRT**, not to exit 1. `--abort-on-uncaught-exception` is listed in
+`IGNORED_WITHOUT_VALUE` in `crates/rn-cli/src/args.rs`, so rustnode accepts it and
+does nothing:
+
+```
+$ rustnode --abort-on-uncaught-exception -e 'throw new Error("x")' ; echo $?
+1                       # Node: dies on signal 5-6, shell reports 133/134
+```
+
+Their assertions are now reported (they no longer exit 0), but the assertion itself
+still fails because `common.childShouldThrowAndAbort` requires a signal. That is a
+separate feature — terminating by signal rather than setting an exit code — and it is
+not part of routing a caught exception through the existing reporter.
+
 
 ### `http2` — 335 files, now the largest single gap
 

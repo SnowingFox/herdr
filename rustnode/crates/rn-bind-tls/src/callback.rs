@@ -317,10 +317,23 @@ fn call_handler<'s>(
         return;
     };
     let receiver: v8::Local<'s, v8::Value> = object.into();
-    // A throw here propagates into OpenSSL's stack, where there is nothing to
-    // catch it. Node has the same behaviour: `MakeCallback` reports the uncaught
-    // exception to the isolate's message listener.
-    let _ = handler.call(scope, receiver, arguments);
+    // A throw here is uncaught: the callback runs from OpenSSL's stack inside a
+    // libuv read completion, so nothing above it can handle one. Node's
+    // `MakeCallback` catches it and routes it through `TriggerUncaughtException`,
+    // which is what prints it under Node's framing and sets a non-zero exit code.
+    // Ignoring the result leaves V8 to print it while the process exits 0.
+    let caught = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
+        let inner = &mut try_catch.init();
+        let _ = handler.call(inner, receiver, arguments);
+        inner
+            .exception()
+            .map(|exception| v8::Global::new(inner, exception))
+    };
+    if let Some(caught) = caught {
+        let exception = v8::Local::new(&*scope, &caught);
+        rn_errors::report_uncaught_exception(scope, exception);
+    }
 }
 
 /// Installs the info callback and the app-data pointer on a fresh `SSL`.

@@ -485,11 +485,23 @@ unsafe extern "C" fn on_event(
             None => v8::null(scope).into(),
         };
         let receiver: v8::Local<'_, v8::Value> = object.into();
-        let _ = callback.call(
-            &*scope,
-            receiver,
-            &[status_value, name_value, filename_value],
-        );
+        // A throw from a watch listener is uncaught: the event arrived inside
+        // `uv_run` and the call that registered the listener is long gone.
+        // `MakeCallback` catches it and routes it through
+        // `TriggerUncaughtException`; ignoring the result prints the error and
+        // still exits 0.
+        let caught = {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
+            let inner = &mut try_catch.init();
+            let _ = callback.call(inner, receiver, &[status_value, name_value, filename_value]);
+            inner
+                .exception()
+                .map(|exception| v8::Global::new(inner, exception))
+        };
+        if let Some(caught) = caught {
+            let exception = v8::Local::new(&*scope, &caught);
+            rn_errors::report_uncaught_exception(scope, exception);
+        }
     });
 }
 

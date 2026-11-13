@@ -9,6 +9,7 @@ description = "The KeyObject family for internalBinding('crypto')"
 
 [dependencies]
 rn-core.workspace = true
+rn-errors.workspace = true
 rn-v8-sys.workspace = true
 # The shared EVP_PKEY ownership, encoding and error layer. Every key encoding
 # question — PEM versus DER, PKCS#1 versus SPKI, what a failed parse means — is

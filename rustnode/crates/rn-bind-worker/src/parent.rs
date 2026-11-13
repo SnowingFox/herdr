@@ -154,7 +154,22 @@ pub fn report_finished(scope: &mut v8::PinScope<'_, '_>) -> bool {
             let code = v8::Integer::new(scope, code);
             let null = v8::null(scope);
             let arguments = [code.into(), null.into(), null.into()];
-            let _ = callback.call(scope, v8::undefined(scope).into(), &arguments);
+            // A throw inside a worker's `'exit'` listener is uncaught: the event
+            // is reported from the check phase, where nothing above it can handle
+            // one. `onexit` runs through `MakeCallback` in Node, so a throw goes
+            // to `TriggerUncaughtException` and sets a non-zero exit code.
+            let caught = {
+                let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
+                let inner = &mut try_catch.init();
+                let _ = callback.call(inner, v8::undefined(inner).into(), &arguments);
+                inner
+                    .exception()
+                    .map(|exception| v8::Global::new(inner, exception))
+            };
+            if let Some(caught) = caught {
+                let exception = v8::Local::new(&*scope, &caught);
+                rn_errors::report_uncaught_exception(scope, exception);
+            }
         }
         // The thread is finished, so its `JoinHandle` returns immediately. It is
         // joined rather than detached so the thread does not outlive its stack.

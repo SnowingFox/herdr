@@ -638,9 +638,30 @@ unsafe extern "C" fn after_work_trampoline<J: FsJob>(
         let arguments = job.deliver(scope, outcome);
         let callback: v8::Local<v8::Function> = v8::Local::new(scope, &ondone);
         let target: v8::Local<v8::Object> = v8::Local::new(scope, &receiver);
-        let _ = callback.call(&*scope, target.into(), &arguments);
+        // A throw here is uncaught in the same sense a timer's is: nothing above
+        // a threadpool completion can handle it. `MakeCallback` wraps the call in
+        // a `TryCatch` and routes a throw through `TriggerUncaughtException`, so
+        // dropping the result would let V8 print the error and still exit 0.
+        let caught = {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+            let inner = &mut try_catch.init();
+            let _ = callback.call(inner, target.into(), &arguments);
+            inner
+                .exception()
+                .map(|exception| v8::Global::new(inner, exception))
+        };
 
+        // The frame is restored before the exception is reported: Node's
+        // `InternalCallbackScope::Close` restores the context frame in its
+        // destructor, which runs as the callback scope unwinds, so a
+        // `uncaughtException` handler must not still observe the frame of the
+        // callback that threw.
         scope.set_continuation_preserved_embedder_data(previous);
+
+        if let Some(caught) = caught {
+            let exception = v8::Local::new(scope, &caught);
+            rn_errors::report_uncaught_exception(scope, exception);
+        }
     });
 }
 

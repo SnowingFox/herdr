@@ -10,6 +10,7 @@ description = "libuv handle plumbing shared by rustnode's socket namespaces"
 [dependencies]
 libuv-sys2.workspace = true
 rn-core.workspace = true
+rn-errors.workspace = true
 rn-v8-sys.workspace = true
 tracing.workspace = true
 

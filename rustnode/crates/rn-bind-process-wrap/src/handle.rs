@@ -312,7 +312,22 @@ pub unsafe extern "C" fn after_exit(
             .map(Into::into)
             .unwrap_or_else(|| v8::undefined(scope).into());
         let receiver: v8::Local<v8::Value> = object.into();
-        let _ = callback.call(scope, receiver, &[status_value, signal_value]);
+        // A throw from `'exit'` is uncaught: the process handle completed inside
+        // `uv_run`, where nothing above it can handle one. `MakeCallback` catches
+        // it and routes it through `TriggerUncaughtException`; ignoring the
+        // result prints the error and still exits 0.
+        let caught = {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
+            let inner = &mut try_catch.init();
+            let _ = callback.call(inner, receiver, &[status_value, signal_value]);
+            inner
+                .exception()
+                .map(|exception| v8::Global::new(inner, exception))
+        };
+        if let Some(caught) = caught {
+            let exception = v8::Local::new(&*scope, &caught);
+            rn_errors::report_uncaught_exception(scope, exception);
+        }
     });
 }
 

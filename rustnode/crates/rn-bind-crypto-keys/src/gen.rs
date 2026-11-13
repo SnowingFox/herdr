@@ -361,7 +361,23 @@ fn deliver<'s, J: Runnable>(
         },
         Err(error) => (error_value(scope, &error), undefined.into()),
     };
-    callback.call(scope, receiver.into(), &[first, second]);
+    // `MakeCallback` wraps the delivery in a `TryCatch` and routes a throw
+    // through `TriggerUncaughtException`. A keygen completion has no caller left
+    // to handle one, so dropping the result would print the error and still exit
+    // 0. This covers both the threadpool path and the synchronous one, which
+    // share this function.
+    let caught = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let inner = &mut try_catch.init();
+        let _ = callback.call(inner, receiver.into(), &[first, second]);
+        inner
+            .exception()
+            .map(|exception| v8::Global::new(inner, exception))
+    };
+    if let Some(caught) = caught {
+        let exception = v8::Local::new(scope, &caught);
+        rn_errors::report_uncaught_exception(scope, exception);
+    }
 }
 
 /// [`deliver`] for the loop's own callback, which has an owned job.

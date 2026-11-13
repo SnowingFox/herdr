@@ -19,6 +19,7 @@ rn-env = { path = "../rn-env" }
 # owned there, not here, so this is the wake token and nothing else.
 rn-uv.workspace = true
 rn-v8-sys.workspace = true
+rn-errors.workspace = true
 v8.workspace = true
 
 [dev-dependencies]

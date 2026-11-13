@@ -101,9 +101,14 @@ pub fn with_context<R>(
 /// Calls `function`, with `receiver` as `this` and `arguments` as its arguments.
 ///
 /// The call happens inside a [`with_context`] scope, which is what makes it
-/// legal from a libuv callback. A thrown exception reaches V8's
-/// uncaught-exception handler: Node lets such an exception propagate out of the
-/// loop, and V8's own reporting is what the CLI prints.
+/// legal from a libuv callback.
+///
+/// **A throw from this call is not reported and does not affect the exit
+/// status.** V8's default handler prints the exception because nothing above a
+/// libuv completion installs one, but no exit code is set, so the process
+/// reports success after a fatal error. Use [`call_reporting_uncaught`] for a
+/// callback whose exception is genuinely uncaught; this entry point remains for
+/// calls whose exceptions are handled by the caller or cannot escape.
 pub fn call(
     function: &v8::Global<v8::Function>,
     receiver: Option<&v8::Global<v8::Object>>,
@@ -121,6 +126,64 @@ pub fn call(
             .collect();
         let _ = function.call(&*scope, receiver, &arguments);
     });
+}
+
+/// Calls `function` and reports a thrown exception the way Node does.
+///
+/// This is the entry point for a completion that has no `TryCatch` above it and
+/// no caller that could handle the throw: a threadpool job finishing, a write
+/// completing, a DNS request resolving. Node's `MakeCallback` installs a
+/// `TryCatch` around the callback and routes a caught exception through
+/// `TriggerUncaughtException`, which calls `process._fatalException`, and only
+/// prints and sets the exit code when that declines.
+///
+/// Dropping the `Option` returned by `Function::call` — as a bare
+/// `let _ = function.call(..)` does — loses exactly that: V8's default handler
+/// still prints the exception, but nothing sets the exit status, so the process
+/// exits 0 after a fatal error. [`rn_errors::report_uncaught_exception`] is the
+/// runtime's single implementation of that order, and this function exists so a
+/// completion does not have to grow a fourth copy of it.
+///
+/// Returns whether the callback completed without throwing.
+pub fn call_reporting_uncaught(
+    function: &v8::Global<v8::Function>,
+    receiver: Option<&v8::Global<v8::Object>>,
+    arguments: &[v8::Global<v8::Value>],
+) -> bool {
+    with_context(|scope| {
+        let function: v8::Local<v8::Function> = v8::Local::new(scope, function);
+        let receiver: v8::Local<v8::Value> = match receiver {
+            Some(object) => v8::Local::new(scope, object).into(),
+            None => v8::undefined(&**scope).into(),
+        };
+        let arguments: Vec<v8::Local<v8::Value>> = arguments
+            .iter()
+            .map(|argument| v8::Local::new(scope, argument))
+            .collect();
+        // The exception is rooted and reported after the `TryCatch` closes,
+        // because reporting runs JavaScript (`process._fatalException`) and the
+        // pinned `TryCatch` scope is a different type from the context scope
+        // that call needs. Rooting keeps the value alive across that boundary,
+        // and the `TryCatch` still consumes the pending exception so it cannot
+        // reach V8's default reporter.
+        let caught = {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+            let inner = &mut try_catch.init();
+            let _ = function.call(inner, receiver, &arguments);
+            inner
+                .exception()
+                .map(|exception| v8::Global::new(inner, exception))
+        };
+        match caught {
+            Some(caught) => {
+                let exception = v8::Local::new(scope, &caught);
+                rn_errors::report_uncaught_exception(scope, exception);
+                false
+            }
+            None => true,
+        }
+    })
+    .unwrap_or(false)
 }
 
 /// Roots a string so it survives the scope that produced it.
@@ -151,6 +214,68 @@ pub unsafe fn free_read_buffer(base: *mut std::ffi::c_char, len: usize) {
         std::alloc::dealloc(
             base.cast(),
             std::alloc::Layout::from_size_align_unchecked(len, 8),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds an isolate whose global has a `process._fatalException` that only
+    /// observes, so a report records the exception and sets the exit flag without
+    /// the test having to stand up the whole runtime.
+    fn with_isolate<R>(body: impl FnOnce(&mut v8::PinScope<'_, '_>) -> R) -> Option<R> {
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+        let mut isolate = v8::Isolate::new(Default::default());
+        let storage = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut storage.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let source = v8::String::new(
+            scope,
+            "globalThis.process = { _fatalException() { return false; } };",
+        )?;
+        let script = v8::Script::compile(scope, source, None)?;
+        script.run(scope)?;
+        Some(body(scope))
+    }
+
+    #[test]
+    fn a_thrown_exception_requests_an_exit() {
+        // The defect this guards: `let _ = function.call(..)` leaves the exit
+        // code at 0, so a fatal error reads as success. Reported through the
+        // shared path, the flag is what makes the process exit non-zero.
+        rn_core::hook_slot::clear_exit_request();
+        let caught = with_isolate(|scope| {
+            let source =
+                v8::String::new(scope, "(function(){ throw new Error('boom'); })").expect("source");
+            let script = v8::Script::compile(scope, source, None).expect("compile");
+            let function = script.run(scope).expect("eval");
+            let function = v8::Local::<v8::Function>::try_from(function).expect("function");
+            let caught = {
+                let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+                let inner = &mut try_catch.init();
+                let _ = function.call(inner, v8::undefined(inner).into(), &[]);
+                inner
+                    .exception()
+                    .map(|exception| v8::Global::new(inner, exception))
+            };
+            if let Some(caught) = caught {
+                let exception = v8::Local::new(scope, &caught);
+                rn_errors::report_uncaught_exception(scope, exception);
+                true
+            } else {
+                false
+            }
+        })
+        .expect("isolate");
+        assert!(caught, "the call must have thrown");
+        assert!(
+            rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED),
+            "a reported uncaught exception must request a non-zero exit"
         );
     }
 }

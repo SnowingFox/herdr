@@ -208,9 +208,23 @@ fn trampoline(
 
     // `this` is the request object, matching `req_wrap->MakeCallback(...)`.
     let receiver: v8::Local<v8::Value> = request.into();
-    // An exception thrown by the callback belongs to the caller's stack; V8
-    // reports it through the microtask machinery, so the result is ignored.
-    let _ = handler.call(scope, receiver, &arguments);
+    // A throw from `oncomplete` is uncaught in the public sense: the microtask
+    // runs after `dns.lookup` returned, so the caller that would have written a
+    // `try` is gone. Node's `MakeCallback` catches it and routes it through
+    // `TriggerUncaughtException`; letting V8 report it alone leaves the process
+    // exiting 0 after a fatal error.
+    let caught = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let inner = &mut try_catch.init();
+        let _ = handler.call(inner, receiver, &arguments);
+        inner
+            .exception()
+            .map(|exception| v8::Global::new(inner, exception))
+    };
+    if let Some(caught) = caught {
+        let exception = v8::Local::new(scope, &caught);
+        rn_errors::report_uncaught_exception(scope, exception);
+    }
 }
 
 #[cfg(test)]

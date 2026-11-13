@@ -11,6 +11,7 @@ description = "internalBinding('tls_wrap') for rustnode"
 rn-core.workspace = true
 rn-uv.workspace = true
 rn-v8-sys.workspace = true
+rn-errors.workspace = true
 # `WriteWrap::Done` / `ShutdownWrap::Done`, which is how R3's "complete the
 # pending write" is actually delivered: the request objects are this crate's, so
 # completing one means calling into it rather than reimplementing `oncomplete`.
