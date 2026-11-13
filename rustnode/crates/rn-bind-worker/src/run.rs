@@ -122,6 +122,11 @@ impl WorkerThread {
         // `import.meta` and `import()` are dispatched through isolate-level
         // handlers, and a worker can `import()` too.
         rn_module_wrap::install_isolate_callbacks(&mut isolate);
+        // The promise rejection callback is per-isolate state, exactly as Node
+        // sets it in `CreateIsolateData` for every isolate a worker creates. A
+        // worker that skipped it would never run its own
+        // `process.on('unhandledRejection')` listeners.
+        rn_bind_task_queue::install_isolate_callbacks(&mut isolate);
         rn_bind_heap_utils::set_snapshot_isolate(&mut isolate);
 
         if let Ok(mut slot) = self.isolate.lock() {

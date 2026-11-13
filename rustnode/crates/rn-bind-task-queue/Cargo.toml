@@ -10,3 +10,9 @@ description = "internalBinding('task_queue') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+# `PromiseRejectCallback` pushes the promise's async context around the
+# JavaScript handler, exactly as `src/node_task_queue.cc` does, so
+# `executionAsyncId()` inside `internal/process/promises.js` answers the
+# promise's id. The id stack is `async_wrap`'s state and nothing else can
+# push onto it.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }

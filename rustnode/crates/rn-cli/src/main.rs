@@ -147,6 +147,14 @@ fn main() {
     // crate documents `FunctionCallbackArguments::get_isolate` as unsound while
     // a callback scope is open, and one always is during a binding call.
     rn_module_wrap::install_isolate_callbacks(&mut isolate);
+    // V8 reports a rejected promise through one isolate-level callback, and
+    // `internal/process/promises.js` cannot receive a rejection without it:
+    // `setPromiseRejectCallback` only records the JavaScript function. Node
+    // installs `node::task_queue::PromiseRejectCallback` from
+    // `SetIsolateMiscHandlers`, before any JavaScript runs, which is the same
+    // position this takes. A binding cannot do it — the only API takes
+    // `&mut Isolate`.
+    rn_bind_task_queue::install_isolate_callbacks(&mut isolate);
     // `v8.writeHeapSnapshot` needs `take_heap_snapshot`, an `Isolate` method,
     // and a binding callback cannot obtain a `&mut Isolate` soundly. Recording
     // the isolate here is the same arrangement the ESM handlers use.
@@ -373,12 +381,14 @@ fn main() {
     // second read would bypass the loader's source handling (and its cache).
     let mut print_result = false;
     let mut entry_promise: Option<v8::Global<v8::Promise>> = None;
-    let (value, caught) = match &options.source {
+    let mut value = None;
+    let mut entry_fatal = false;
+    match &options.source {
         args::Source::File(_) => {
             // The resolved absolute path, not the raw argument: the loader
             // treats its request as a specifier, so a relative one would be
             // resolved against the loader's paths instead of the cwd.
-            let caught = match (realm_require.as_ref(), script_path.as_ref()) {
+            match (realm_require.as_ref(), script_path.as_ref()) {
                 (Some(require), Some(path)) => {
                     let require = v8::Local::new(scope, require);
                     // A top-level await makes the entry point asynchronous: the
@@ -387,43 +397,67 @@ fn main() {
                     let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
                     let scope = &mut try_catch.init();
                     let result = bootstrap::run_main(scope, require, path);
-                    if scope.has_caught() {
-                        scope.exception().map(|exception| {
-                            format!("Uncaught {}", exception.to_rust_string_lossy(scope))
-                        })
-                    } else {
-                        if let Some(promise) =
-                            result.and_then(|value| v8::Local::<v8::Promise>::try_from(value).ok())
-                        {
-                            entry_promise = Some(v8::Global::new(scope, promise));
-                        }
-                        None
+                    if let Some(promise) =
+                        result.and_then(|value| v8::Local::<v8::Promise>::try_from(value).ok())
+                    {
+                        entry_promise = Some(v8::Global::new(scope, promise));
                     }
+                    // The entry point does not print here: `run_main.js` hands
+                    // the error to `triggerUncaughtException`, which is
+                    // `process._fatalException` first and print-and-exit only
+                    // when that declines. The exception is reported while the
+                    // `TryCatch` that caught it is still open, because
+                    // `_fatalException` runs JavaScript and the value has to be
+                    // a live handle; formatting it here instead — the old code —
+                    // was a second uncaught path no listener could intercept.
+                    //
+                    // A terminated isolate reports `has_caught()` with no
+                    // exception and is not a reportable error, so it is skipped
+                    // the way the event loop skips it.
+                    let handled = if scope.has_caught() && !scope.has_terminated() {
+                        match scope.exception() {
+                            Some(exception) => {
+                                rn_errors::report_uncaught_exception(scope, exception)
+                            }
+                            None => true,
+                        }
+                    } else {
+                        true
+                    };
+                    entry_fatal = !handled;
                 }
-                _ => Some("Uncaught the realm bootstrap left no require".to_string()),
-            };
-            (None, caught)
+                _ => {
+                    eprintln!("Uncaught the realm bootstrap left no require");
+                    entry_fatal = true;
+                }
+            }
         }
         args::Source::Eval { code, print } => {
             print_result = *print;
-            evaluate_script(scope, code)
+            value = evaluate_script(scope, code).map(|value| v8::Global::new(scope, value));
         }
-        args::Source::Empty => evaluate_script(scope, "0"),
-    };
+        args::Source::Empty => {
+            value = evaluate_script(scope, "0").map(|value| v8::Global::new(scope, value));
+        }
+    }
 
-    if let Some(message) = caught {
-        eprintln!("{message}");
-        // The status is 1 and `exit` still has to run: Node reports an uncaught
-        // throw through `process._fatalException`, which overwrites
-        // `process.exitCode` with `kGenericUserError` and emits `exit`. Skipping
-        // the emit made `process.on('exit', ...)` fire for every kind of exit
-        // except the most common failure a script has.
+    // Only a throw the handler declined is fatal, and then `exit` still has to
+    // run: `process._fatalException` overwrote `process.exitCode` with
+    // `kGenericUserError` and emitted `exit` inside `onGlobalUncaughtException`.
+    // Skipping the emit made `process.on('exit', ...)` fire for every kind of
+    // exit except the most common failure a script has.
+    //
+    // A throw the handler *accepted* leaves the script running, which is why
+    // this is conditional: Node continues into the event loop, so a timer the
+    // handler scheduled still fires.
+    if entry_fatal {
         let code = rn_realm::runtime::emit_exit_after_failure(scope);
         terminate(if code == 0 { 1 } else { code });
     }
 
     if print_result {
         if let Some(value) = value {
+            let value = v8::Local::new(scope, value);
             println!("{}", value.to_rust_string_lossy(scope));
         }
     }
@@ -444,17 +478,22 @@ fn main() {
     let mut exit_requested = false;
     if let Some(hooks) = runtime.as_ref() {
         hooks.drain(scope);
-        // A rejection here is the module body throwing, which Node reports as an
-        // uncaught exception from the entry point. `triggerUncaughtException`
-        // already ran if the loader routed it through the fatal path; this
-        // catches the case where the promise simply settled rejected.
+        // A rejection here is the module body throwing. Node's
+        // `runEntryPointWithESMLoader` awaits the graph's promise inside a
+        // `try`, so the rejection surfaces in its `catch` and is reported as
+        // `triggerUncaughtException(err, true /* fromPromise */)` — the same
+        // `fromPromise` framing an unhandled rejection gets, which is why this
+        // goes through the rejection entry point rather than printing.
         if let Some(entry) = entry_promise.take() {
             let entry = v8::Local::new(scope, entry);
             if entry.state() == v8::PromiseState::Rejected {
                 let exception = entry.result(scope);
-                eprintln!("Uncaught {}", exception.to_rust_string_lossy(scope));
+                let fatal = !rn_errors::report_uncaught_rejection(scope, exception);
                 hooks.drain(scope);
-                terminate(1);
+                if fatal {
+                    let code = rn_realm::runtime::emit_exit_after_failure(scope);
+                    terminate(if code == 0 { 1 } else { code });
+                }
             }
         }
         match rn_realm::run_loop(scope, hooks) {
@@ -516,12 +555,20 @@ fn terminate(code: i32) -> ! {
 /// Compiles and runs `source` as a bare script and reports the result.
 ///
 /// This is the `-e`/`-p` path, which Node also evaluates as a top-level script
-/// rather than as a CommonJS module. The returned pair is the script's completion
-/// value (for `-p`) and the `Uncaught ...` message when the script threw.
+/// rather than as a CommonJS module. Node reaches the same fatal-exception path
+/// here as for a file entry point — `internal/process/execution.js::evalScript`
+/// runs the script through `runScriptInThisContext`, and the throw surfaces to
+/// the entry point's `triggerUncaughtException` — so a `-e` that throws must
+/// consult `process._fatalException` exactly like a file that throws.
+///
+/// Returns the script's completion value (for `-p`) and whether it threw. A
+/// throw has already been reported through [`rn_errors::report_uncaught_exception`]
+/// by the time this returns; the caller only needs to know whether the fatal
+/// path was taken, which [`rn_core::hook_slot::EXIT_REQUESTED`] answers.
 fn evaluate_script<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     source: &str,
-) -> (Option<v8::Local<'s, v8::Value>>, Option<String>) {
+) -> Option<v8::Local<'s, v8::Value>> {
     let Some(name) = v8::String::new(scope, "evalmachine.<anonymous>") else {
         eprintln!("rustnode: cannot allocate script name");
         terminate(1);
@@ -547,15 +594,22 @@ fn evaluate_script<'s>(
     let scope = &mut try_catch.init();
     let value =
         v8::Script::compile(scope, code, Some(&origin)).and_then(|script| script.run(scope));
-    let caught = if scope.has_caught() {
-        scope.exception().map(|exception| {
-            let text = exception.to_rust_string_lossy(scope);
-            format!("Uncaught {text}")
-        })
+    // The exception is reported while the `TryCatch` is still open, so the
+    // handle is alive for the `_fatalException` call. Reporting after it closes
+    // is what the old code could not do: it formatted the value itself, which is
+    // a second uncaught path that no listener could intercept.
+    //
+    // A terminated isolate reports `has_caught()` with no exception and is not a
+    // reportable error, so it is skipped the way the event loop skips it.
+    let _ = if scope.has_caught() && !scope.has_terminated() {
+        match scope.exception() {
+            Some(exception) => rn_errors::report_uncaught_exception(scope, exception),
+            None => true,
+        }
     } else {
-        None
+        true
     };
-    (value, caught)
+    value
 }
 
 /// Passes the command-line flags that belong to V8 through to it.

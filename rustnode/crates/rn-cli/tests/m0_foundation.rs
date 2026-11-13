@@ -35,9 +35,15 @@ fn console_error_writes_stderr() {
 
 #[test]
 fn thrown_error_exits_nonzero() {
+    // The exit status is the contract. The text is Node's, not `Uncaught ...`:
+    // an unhandled throw is printed by the same fatal path the event loop uses,
+    // which formats the stack and adds the `Error: boom` header rather than the
+    // `Uncaught ` prefix this test used to pin — that prefix came from the CLI
+    // formatting the exception itself, which is the defect
+    // `tests/uncaught_entry.rs` covers.
     let out = rustnode(&["-e", "throw new Error('boom')"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("Uncaught Error: boom"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Error: boom"));
 }
 
 #[test]
