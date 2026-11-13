@@ -9,4 +9,7 @@ description = "internalBinding('permission') and the permission model checks for
 
 [dependencies]
 rn-core.workspace = true
+# The startup `--allow-env` scrub has to remove variables from the block libuv
+# owns, because that is the one `process.env` reads and `spawn()` copies.
+rn-env = { path = "../rn-env" }
 rn-v8-sys.workspace = true

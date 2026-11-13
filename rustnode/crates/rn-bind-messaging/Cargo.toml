@@ -10,6 +10,10 @@ description = "internalBinding('messaging') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-bind-symbols = { path = "../rn-bind-symbols" }
+# `structuredClone(process.env)` and `postMessage(process.env)` serialise the
+# variables as a plain object, so the serializer needs the live environment
+# block. Node reaches the same thing through `env->env_vars()`.
+rn-env = { path = "../rn-env" }
 # A `MessagePort` whose peer is in another isolate must wake that thread's loop,
 # and `uv_async_send` is the only portable way to do it. The handle's life is
 # owned there, not here, so this is the wake token and nothing else.

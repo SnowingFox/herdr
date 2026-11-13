@@ -84,7 +84,13 @@ fn main() {
         }
         if options.permission_config.audit {
             let denied = rn_permission::env::record_audited(&allow_env);
-            options.permission.record_removed_env_vars(denied);
+            // Two records, because they answer different questions:
+            // `record_removed_env_vars` is "the scrub took this away", empty in
+            // audit mode by design, and `record_audited_env_vars` is "enforcing
+            // would have taken this away", which is what an audit-mode read
+            // reports against.
+            options.permission.record_removed_env_vars(denied.clone());
+            rn_permission::runtime::record_audited_env_vars(denied);
         } else {
             let removed = rn_permission::env::scrub(&allow_env);
             options.permission.record_removed_env_vars(removed);

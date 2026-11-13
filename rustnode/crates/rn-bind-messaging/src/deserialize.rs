@@ -72,6 +72,18 @@ impl v8::ValueDeserializerImpl for Lookup<'_> {
         }
         // One id space, so one lookup: the id the payload carries is an index into
         // the vector `rebuild` produced, in the same order the serializer numbered.
+        //
+        // `kNormalObject` is the exception, and it is not an index: the sender
+        // used it to say "the value that follows is a plain object", which is how
+        // `structuredClone(process.env)` and `postMessage(process.env)` carry the
+        // variables rather than a live proxy. Node's `ReadHostObject` reads a
+        // value in that case and returns it.
+        if id == crate::K_NORMAL_OBJECT {
+            return match deserializer.read_value(scope.get_current_context()) {
+                Some(value) => v8::Local::<v8::Object>::try_from(value).ok(),
+                None => None,
+            };
+        }
         let object = self.rebuilt.objects.get(id as usize);
         let Some(object) = object else {
             crate::throw_type_error(scope, "The message referenced an object that was not sent");

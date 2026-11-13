@@ -10,6 +10,10 @@ description = "internalBinding('process_wrap') for rustnode"
 [dependencies]
 libuv-sys2.workspace = true
 rn-core.workspace = true
+# The `getEnvPairs` fast path reads the live environment block, which is the
+# same block `process.env` intercepts. A `std::env::vars()` here would be a
+# second copy taken at a different moment.
+rn-env = { path = "../rn-env" }
 rn-permission = { path = "../rn-permission" }
 rn-uv.workspace = true
 tracing.workspace = true

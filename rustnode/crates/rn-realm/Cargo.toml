@@ -18,7 +18,14 @@ rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-bind-options = { path = "../rn-bind-options" }
 rn-builtins = { path = "../rn-builtins" }
 rn-core = { path = "../rn-core" }
+# `process.env` is an interceptor over the real environment block, so the block
+# itself is shared with `rn-bind-os` (`os.tmpdir`, `os.homedir`) rather than
+# copied into a JavaScript object at startup.
+rn-env = { path = "../rn-env" }
 rn-errors = { path = "../rn-errors" }
+# `tzset()` for the `TZ` redetection a `process.env.TZ` write triggers, which is
+# the call Node makes before notifying the isolate.
+libc.workspace = true
 rn-io = { path = "../rn-io" }
 rn-module-wrap = { path = "../rn-module-wrap" }
 rn-bind-timers = { path = "../rn-bind-timers" }

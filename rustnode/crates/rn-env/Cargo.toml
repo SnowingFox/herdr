@@ -1,0 +1,16 @@
+[package]
+name = "rn-env"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "the process environment block, read and written through libuv"
+
+[dependencies]
+# The environment block is libuv's, not a Rust-side copy: `uv_os_setenv` is what
+# makes a value assigned to `process.env` visible to a child process, and
+# `uv_os_environ` is the key list `Object.keys(process.env)` reports.
+libuv-sys2.workspace = true
+# For the `UV_E*` codes, which are negated errno values on Unix.
+libc.workspace = true

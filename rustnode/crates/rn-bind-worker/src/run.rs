@@ -133,6 +133,23 @@ impl WorkerThread {
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
 
+        // The worker's own environment, before its realm builds `process.env`.
+        // Node gives a worker a `KVStore` of its own (`src/node_worker.cc`:
+        // `env_vars = env->env_vars()->Clone(isolate)` for a null `env`
+        // argument), so a write inside the worker is invisible to the parent
+        // while a child the worker spawns still inherits it. `SHARE_ENV` is the
+        // one case that writes the process environment itself.
+        //
+        // This is per thread, which is what makes it the worker's store and not
+        // the process's: `rn_env` keeps it in a `thread_local`.
+        match &self.request.env {
+            crate::worker::WorkerEnv::Copy(entries)
+            | crate::worker::WorkerEnv::Explicit(entries) => {
+                rn_env::install_map(entries.iter().cloned());
+            }
+            crate::worker::WorkerEnv::Shared => rn_env::install_real(),
+        }
+
         // A terminate that beat the isolate is honoured before any realm work.
         if self.stopping.load(Ordering::SeqCst) {
             teardown();

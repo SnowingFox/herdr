@@ -31,4 +31,7 @@ rn-bind-options = { path = "../rn-bind-options" }
 # clears `allow_native_addons` when a bare `--permission` did not grant `addon`,
 # so the check has to ask the same model the `dlopen` scope check uses.
 rn-permission = { path = "../rn-permission" }
+# `process.loadEnvFile` writes through the real environment block, which is the
+# one `process.env` intercepts and `spawn()` copies.
+rn-env = { path = "../rn-env" }
 libc.workspace = true

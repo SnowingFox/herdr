@@ -26,6 +26,9 @@ rn-permission = { path = "../rn-permission" }
 rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
 rn-module-wrap = { path = "../rn-module-wrap" }
 rn-uv = { path = "../rn-uv" }
+# A worker gets its own environment store rather than the process block, so the
+# thread installs it before its realm builds `process.env`.
+rn-env = { path = "../rn-env" }
 rn-v8-sys.workspace = true
 tracing.workspace = true
 v8.workspace = true

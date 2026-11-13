@@ -192,7 +192,11 @@ pub fn is_valid_pattern(pattern: &str) -> bool {
 /// Sorted, so the list a test or a diagnostic report prints is stable.
 pub fn find_denied(allow: &[String]) -> Vec<String> {
     let mut denied = Vec::new();
-    for (name, _) in std::env::vars() {
+    // The enumeration is libuv's, the same one `Object.keys(process.env)` and
+    // `getEnvPairs()` read, so the scrub takes away exactly the variables the
+    // two observable surfaces would otherwise still show.
+    for entry in rn_env::vars() {
+        let name = entry.name;
         if name.is_empty() {
             continue;
         }
@@ -224,7 +228,11 @@ pub fn scrub(allow: &[String]) -> Vec<String> {
     }
     let removed = find_denied(allow);
     for name in &removed {
-        std::env::remove_var(name);
+        // Through libuv, so the removal is in the block a child process copies
+        // and the one `process.env` answers from. `std::env::remove_var` would
+        // also be correct on Unix, but on Windows it mutates the CRT copy rather
+        // than the block `uv_os_environ` enumerates.
+        let _ = rn_env::unset(name);
     }
     removed
 }
