@@ -27,6 +27,9 @@ repository = "https://github.com/SnowingFox/herdr"
 v8 = "152.2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Candidate-start scanning for `rn_core::codec`'s `Buffer#indexOf`. It is
+# already in the graph (serde_json pulls it in), so naming it adds no artifact.
+memchr = "2"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
