@@ -55,6 +55,14 @@ pub struct Options {
     /// `--allow-env` patterns before the model is installed, and re-parsing the
     /// argv to recover them would be a second interpretation of the same flags.
     pub permission_config: rn_permission::PermissionConfig,
+    /// `--abort-on-uncaught-exception`: abort the process by signal instead of
+    /// reporting an uncaught exception through `process._fatalException`.
+    ///
+    /// Node reads this from its V8 argument vector in `src/node.cc:794` and
+    /// stores it on `EnvironmentOptions`, so it is a real option field rather
+    /// than a flag the CLI re-reads at report time. The behavior itself lives in
+    /// `rn-errors`, which also consults `shouldAbortOnUncaughtToggle[0]`.
+    pub abort_on_uncaught_exception: bool,
 }
 
 impl Options {
@@ -137,7 +145,6 @@ pub enum Source {
 /// values, they change what the runtime permits, and accepting them without
 /// acting on them was the bug this list used to hide.
 const IGNORED_WITHOUT_VALUE: &[&str] = &[
-    "--abort-on-uncaught-exception",
     "--allow-natives-syntax",
     "--disable-proto",
     "--enable-source-maps",
@@ -162,6 +169,22 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
 
 /// Flags whose value is a separate argument (`--flag value`).
 const VALUE_SEPARATE: &[&str] = &["--conditions", "--import", "--loader", "--require", "-r"];
+
+/// `--abort-on-uncaught-exception` in the spellings Node accepts.
+///
+/// Both appear in Node's own test headers. `src/node.cc:794` searches its V8
+/// argument vector for both, so a runtime that accepts only the dashed form
+/// rejects a command line `node` runs.
+const ABORT_ON_UNCAUGHT: &[&str] = &[
+    "--abort-on-uncaught-exception",
+    "--abort_on_uncaught_exception",
+];
+
+/// The negations of [`ABORT_ON_UNCAUGHT`], which clear the option.
+const ABORT_ON_UNCAUGHT_NEGATED: &[&str] = &[
+    "--no-abort-on-uncaught-exception",
+    "--no-abort_on_uncaught_exception",
+];
 
 /// Flags that are `--flag=value` and may also appear bare.
 ///
@@ -358,6 +381,28 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         }
 
         if IGNORED_WITHOUT_VALUE.contains(&argument.as_str()) {
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
+        // `--abort-on-uncaught-exception` is a real option, not an ignored one:
+        // it changes how the process dies. It is parsed here rather than left in
+        // the ignore list because a flag that is accepted and then not acted on
+        // is exactly the failure mode `Options::unimplemented` exists to avoid.
+        //
+        // Node accepts both spellings — `src/node.cc:794` searches its V8
+        // argument vector for the dashed and underscored forms — so both are
+        // taken, and `--no-` clears it the way it does for any V8 option
+        // (`src/bind-options/src/parsed.rs` already models that negation).
+        if ABORT_ON_UNCAUGHT.contains(&argument.as_str()) {
+            options.abort_on_uncaught_exception = true;
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        if ABORT_ON_UNCAUGHT_NEGATED.contains(&argument.as_str()) {
+            options.abort_on_uncaught_exception = false;
             options.exec_argv.push(argument.clone());
             index += 1;
             continue;

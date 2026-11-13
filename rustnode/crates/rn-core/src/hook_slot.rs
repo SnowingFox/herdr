@@ -120,6 +120,55 @@ struct HookState {
     source_maps_enabled: bool,
     exit_requested: bool,
     stderr: Option<StderrWriter>,
+    abort_toggle: Option<crate::AliasedUint8Array>,
+    abort_on_uncaught_exception: bool,
+}
+
+/// Records the `Uint8Array(1)` `internalBinding('util')` publishes as
+/// `shouldAbortOnUncaughtToggle`.
+///
+/// Node keeps this as an `AliasedUint32Array` on the `Environment`
+/// (`env.h:1324`) and initializes it to `1` (`env.cc:1218`), because the
+/// JavaScript layer only ever writes `0` or `1` and the native side reads the
+/// byte. The binding that owns the array calls this so the fatal-exception path
+/// can read the same allocation without depending on `rn-util`.
+pub fn set_abort_toggle(toggle: crate::AliasedUint8Array) {
+    STATE.with(|state| {
+        state.borrow_mut().abort_toggle = Some(toggle);
+    });
+}
+
+/// Whether `shouldAbortOnUncaughtToggle[0]` is non-zero.
+///
+/// `true` when no array is installed, matching Node's initialized-to-`1`
+/// default: a realm that never installed `util` still aborts when the flag says
+/// to. Reading a `None` as "do not abort" would silently disable the flag for
+/// any caller that installs the error reporting path before the util namespace.
+pub fn abort_toggle_allows_abort() -> bool {
+    STATE.with(|state| {
+        state
+            .borrow()
+            .abort_toggle
+            .as_ref()
+            .is_none_or(|toggle| toggle.flag(0))
+    })
+}
+
+/// Records whether `--abort-on-uncaught-exception` was on the command line.
+///
+/// This is `EnvironmentOptions::abort_on_uncaught_exception`, set by
+/// `src/node.cc:794` from the V8 argument vector. Node keeps it on the
+/// environment rather than reading the option layer at report time, so a later
+/// `v8.setFlagsFromString` cannot change it.
+pub fn set_abort_on_uncaught_exception(value: bool) {
+    STATE.with(|state| {
+        state.borrow_mut().abort_on_uncaught_exception = value;
+    });
+}
+
+/// Whether an uncaught exception must abort the process.
+pub fn abort_on_uncaught_exception() -> bool {
+    STATE.with(|state| state.borrow().abort_on_uncaught_exception)
 }
 
 /// Installs a closure that writes to the process's standard error.
@@ -315,6 +364,25 @@ mod tests {
         write_stderr("ignored");
         clear_exit_request();
         assert!(!flag(Hook::ExitRequested));
+    }
+
+    #[test]
+    fn the_abort_option_defaults_to_off() {
+        STATE.with(|state| state.borrow_mut().abort_on_uncaught_exception = false);
+        assert!(!abort_on_uncaught_exception());
+        set_abort_on_uncaught_exception(true);
+        assert!(abort_on_uncaught_exception());
+        set_abort_on_uncaught_exception(false);
+    }
+
+    #[test]
+    fn a_missing_toggle_does_not_suppress_the_abort() {
+        // Node initializes `should_abort_on_uncaught_toggle_[0]` to `1`
+        // (`src/env.cc:1218`), so "no array installed" has to read as "abort
+        // allowed". Reading `None` as `false` would silently disable the flag in
+        // any realm that never installed the `util` namespace.
+        STATE.with(|state| state.borrow_mut().abort_toggle = None);
+        assert!(abort_toggle_allows_abort());
     }
 }
 

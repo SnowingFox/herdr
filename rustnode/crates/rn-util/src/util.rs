@@ -118,11 +118,22 @@ impl BindingModule for Util {
         // (`shouldAbortOnUncaughtToggle[0] = 1`), so a missing one throws
         // `Cannot set properties of undefined` from inside
         // `setUncaughtExceptionCaptureCallback`.
+        //
+        // The value starts at `1`, not `0`: Node initializes it in
+        // `Environment::Initialize` (`src/env.cc:1218`, "By default, always
+        // abort when --abort-on-uncaught-exception was passed"). Only
+        // `setUncaughtExceptionCaptureCallback` and the auxiliary variant clear
+        // it, so a zero initial value would make the abort conditional on
+        // something the user never wrote.
         let abort_toggle = rn_core::AliasedUint8Array::new(scope, 1, rn_core::Element::Byte)?;
+        abort_toggle.set(0, 1);
         let abort_array = abort_toggle.array(scope);
         if let Some(key) = v8::String::new(scope, "shouldAbortOnUncaughtToggle") {
             object.set(scope, key.into(), abort_array);
         }
+        // Hand the allocation to the fatal-exception path, which reads it
+        // without knowing this crate exists.
+        rn_core::hook_slot::set_abort_toggle(abort_toggle);
 
         macro_rules! install {
             ($($name:literal => $callback:expr),* $(,)?) => {
