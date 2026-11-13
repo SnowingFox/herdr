@@ -700,7 +700,6 @@ pub fn defer_or<R>(
     submit: DeferredSubmit,
     immediate: impl FnOnce() -> R,
 ) -> bool {
-    #[cfg(debug_assertions)]
     if state.receiving.get() {
         state.deferred_submits.borrow_mut().push(submit);
         false
