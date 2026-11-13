@@ -61,15 +61,28 @@
   nameinfo('nameinfo_ssh', '127.0.0.1', 22);
   nameinfo('nameinfo_unassigned', '127.0.0.1', 54321);
 
-  // `setImmediate` runs after the loop has drained every completed lookup.
   // Without an event loop the Rust side drives the same list itself, so this
   // scheduling exists only for the `node` half of the recording.
+  //
+  // A single `setImmediate` is not enough. The check phase runs at the end of
+  // one loop turn, and `nonexistent` goes to a real resolver rather than the
+  // hosts file, so its completion can land several turns later. Writing on the
+  // first turn then produced a recording that was missing that entry whenever
+  // the lookup was slow, which made the parity assertion fail intermittently
+  // and non-reproducibly. Wait for every lookup instead, and bound the wait so
+  // a lookup that never completes fails the assertion rather than hanging.
   if (typeof setImmediate === 'function') {
-    setImmediate(() => {
+    const deadline = Date.now() + 10000;
+    const flush = () => {
+      if (outstanding > 0 && Date.now() < deadline) {
+        setImmediate(flush);
+        return;
+      }
       globalThis.__out = JSON.stringify(completions.sort((a, b) => (a[0] < b[0] ? -1 : 1)));
       if (typeof process !== 'undefined' && !globalThis.__cares) {
         process.stdout.write(globalThis.__out);
       }
-    });
+    };
+    setImmediate(flush);
   }
 })();
