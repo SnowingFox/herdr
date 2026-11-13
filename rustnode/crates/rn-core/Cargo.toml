@@ -12,6 +12,9 @@ rn-v8-sys = { path = "../rn-v8-sys" }
 # `codec` uses `v8::simdutf` for exact UTF-8 validation: it is the simdutf copy
 # V8 already links, so this adds no dependency artifact.
 v8.workspace = true
+# The `Buffer#indexOf` search skips to the needle's first byte instead of
+# comparing at every position, which is what `nbytes::FindFirstCharacter` does.
+memchr.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 serde.workspace = true

@@ -755,6 +755,17 @@ pub fn decode_base64_forgiving(src: &[u8], dst: &mut [u8]) -> usize {
 /// `start` is the index the search begins at in the search direction, and
 /// `haystack` is searched up to `search_end` exclusive. Returns `search_end`
 /// when there is no match, which every caller compares against.
+///
+/// # Why the first byte is found on its own
+///
+/// A match can only start where `needle[0]` appears, so `memchr` visits the
+/// candidate starts rather than every byte of the window. This is what
+/// `nbytes::FindFirstCharacter` does, and the difference is not marginal: the
+/// straight "compare the whole needle here" loop costs one failed `memcmp` per
+/// byte of the window, so an *absent* needle — the worst case for every
+/// `Buffer#indexOf` that answers `-1` — ran at roughly one byte per cycle
+/// instead of at memory bandwidth. Only the remainder is compared, because
+/// `memchr` has already established the first byte.
 pub fn search_bytes(
     haystack: &[u8],
     needle: &[u8],
@@ -767,24 +778,34 @@ pub fn search_bytes(
         return search_end;
     }
     let last_start = search_end - needle.len();
+    let first = needle[0];
+    let rest = &needle[1..];
+    let index = start.min(last_start);
     if forward {
-        let mut index = start.min(last_start);
-        while index <= last_start {
-            if haystack[index..index + needle.len()] == *needle {
-                return index;
+        let mut from = index;
+        // `haystack[..=last_start]` is the window of positions a match could
+        // start at: past `last_start` the needle no longer fits.
+        while from <= last_start {
+            let Some(offset) = memchr::memchr(first, &haystack[from..last_start + 1]) else {
+                break;
+            };
+            let at = from + offset;
+            if haystack[at + 1..at + needle.len()] == *rest {
+                return at;
             }
-            index += 1;
+            from = at + 1;
         }
     } else {
-        let mut index = start.min(last_start);
-        loop {
-            if haystack[index..index + needle.len()] == *needle {
-                return index;
-            }
-            if index == 0 {
+        // The window is `haystack[..=index]`, so `end` stays exclusive.
+        let mut end = index + 1;
+        while end > 0 {
+            let Some(at) = memchr::memrchr(first, &haystack[..end]) else {
                 break;
+            };
+            if haystack[at + 1..at + needle.len()] == *rest {
+                return at;
             }
-            index -= 1;
+            end = at;
         }
     }
     search_end
@@ -794,6 +815,14 @@ pub fn search_bytes(
 ///
 /// Positions are returned in *bytes*, because that is what `Buffer#indexOf`
 /// reports; `lib/buffer.js` hands back whatever the binding returns.
+///
+/// Units are not decoded into a `Vec<u16>`. `ucs2` is little-endian on every
+/// platform, so the haystack's byte pairs already *are* the units, and the
+/// candidate skip can run over the bytes directly. Only the higher of the
+/// first unit's two bytes is searched for — `nbytes::FindFirstCharacter` does
+/// the same, because for ASCII-in-UCS-2 text the other byte is `0x00` and
+/// occurs at every unit, which would make the skip useless — and each hit is
+/// aligned down to a unit boundary before the whole unit is verified.
 pub fn search_ucs2(
     haystack: &[u8],
     needle: &[u16],
@@ -801,43 +830,63 @@ pub fn search_ucs2(
     start_units: usize,
     forward: bool,
 ) -> usize {
-    let units = decode_ucs2(&haystack[..search_end.min(haystack.len()) & !1]);
-    let found = search_bytes_units(&units, needle, units.len(), start_units, forward);
-    found * 2
-}
-
-fn search_bytes_units(
-    units: &[u16],
-    needle: &[u16],
-    end: usize,
-    start: usize,
-    forward: bool,
-) -> usize {
-    if needle.is_empty() || needle.len() > end {
-        return end;
+    let units_end = search_end.min(haystack.len()) & !1;
+    let needle_bytes = needle.len().saturating_mul(2);
+    if needle.is_empty() || needle_bytes > units_end {
+        // The answer the previous decode-and-scan gave: the whole search
+        // window, in bytes, is also its "no match" value.
+        return units_end;
     }
-    let last_start = end - needle.len();
-    if forward {
-        let mut index = start.min(last_start);
-        while index <= last_start {
-            if units[index..index + needle.len()] == *needle {
-                return index;
-            }
-            index += 1;
-        }
-    } else {
-        let mut index = start.min(last_start);
-        loop {
-            if units[index..index + needle.len()] == *needle {
-                return index;
-            }
-            if index == 0 {
+    let last_start = units_end - needle_bytes;
+    let first = needle[0].to_le_bytes();
+    let search_byte = first[0].max(first[1]);
+    let index = start_units.saturating_mul(2).min(last_start);
+    let found = if forward {
+        let mut from = index;
+        let mut hit = None;
+        while from <= last_start {
+            // The window ends one byte past `last_start`, not at it: the
+            // matched byte may be the *high* half of the last candidate unit,
+            // and dropping it would lose a match that only that byte gates.
+            let Some(offset) = memchr::memchr(search_byte, &haystack[from..last_start + 2]) else {
+                break;
+            };
+            // `from` and `last_start` are even, so masking down can only step
+            // back into the unit that holds the matched byte.
+            let at = from + (offset & !1);
+            if haystack_matches_needle_at(haystack, at, needle) {
+                hit = Some(at);
                 break;
             }
-            index -= 1;
+            from = at + 2;
         }
-    }
-    end
+        hit
+    } else {
+        let mut end = index + 2;
+        let mut hit = None;
+        while end >= 2 {
+            let Some(at) = memchr::memrchr(search_byte, &haystack[..end]) else {
+                break;
+            };
+            let at = at & !1;
+            if haystack_matches_needle_at(haystack, at, needle) {
+                hit = Some(at);
+                break;
+            }
+            end = at;
+        }
+        hit
+    };
+    found.unwrap_or(units_end)
+}
+
+/// Whether `needle` occupies the whole units starting at byte offset `at`.
+#[inline]
+fn haystack_matches_needle_at(haystack: &[u8], at: usize, needle: &[u16]) -> bool {
+    needle.iter().enumerate().all(|(index, unit)| {
+        let offset = at + index * 2;
+        u16::from_le_bytes([haystack[offset], haystack[offset + 1]]) == *unit
+    })
 }
 
 #[cfg(test)]
@@ -1244,5 +1293,295 @@ mod tests {
         assert_eq!(search_ucs2(&haystack, &[0x0061], 6, 1, true), 4);
         assert_eq!(search_ucs2(&haystack, &[0x0061], 6, 2, false), 4);
         assert_eq!(search_ucs2(&haystack, &[0x007A], 6, 0, true), 6);
+    }
+
+    // -- The differential control -------------------------------------------
+    //
+    // `search_bytes` and `search_ucs2` are public API on a compatibility
+    // runtime, and the candidate-skip rewrite is a change of *how* the answer
+    // is found, not what it is. The two functions below are the previous
+    // implementations, kept verbatim, so "the new one is equivalent" is a
+    // result rather than an assertion. They are deliberately the naive shape:
+    // any cleverness here would be a second thing to be wrong.
+
+    fn naive_search_bytes(
+        haystack: &[u8],
+        needle: &[u8],
+        search_end: usize,
+        start: usize,
+        forward: bool,
+    ) -> usize {
+        let search_end = search_end.min(haystack.len());
+        if needle.is_empty() || needle.len() > search_end {
+            return search_end;
+        }
+        let last_start = search_end - needle.len();
+        if forward {
+            let mut index = start.min(last_start);
+            while index <= last_start {
+                if haystack[index..index + needle.len()] == *needle {
+                    return index;
+                }
+                index += 1;
+            }
+        } else {
+            let mut index = start.min(last_start);
+            loop {
+                if haystack[index..index + needle.len()] == *needle {
+                    return index;
+                }
+                if index == 0 {
+                    break;
+                }
+                index -= 1;
+            }
+        }
+        search_end
+    }
+
+    fn naive_search_ucs2(
+        haystack: &[u8],
+        needle: &[u16],
+        search_end: usize,
+        start_units: usize,
+        forward: bool,
+    ) -> usize {
+        let units = decode_ucs2(&haystack[..search_end.min(haystack.len()) & !1]);
+        let end = units.len();
+        if needle.is_empty() || needle.len() > end {
+            return end * 2;
+        }
+        let last_start = end - needle.len();
+        if forward {
+            let mut index = start_units.min(last_start);
+            while index <= last_start {
+                if units[index..index + needle.len()] == *needle {
+                    return index * 2;
+                }
+                index += 1;
+            }
+        } else {
+            let mut index = start_units.min(last_start);
+            loop {
+                if units[index..index + needle.len()] == *needle {
+                    return index * 2;
+                }
+                if index == 0 {
+                    break;
+                }
+                index -= 1;
+            }
+        }
+        end * 2
+    }
+
+    /// SplitMix64. Deterministic and dependency-free, so a failing case
+    /// reproduces from the seed alone.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        /// A value in `0..bound`; `bound == 0` yields 0.
+        fn below(&mut self, bound: usize) -> usize {
+            if bound == 0 {
+                0
+            } else {
+                (self.next() % bound as u64) as usize
+            }
+        }
+    }
+
+    /// The randomized comparison both directions, over a small alphabet so
+    /// that real matches occur often: an implementation with a candidate-skip
+    /// bug mostly fails on inputs that *do* match.
+    #[test]
+    fn search_bytes_agrees_with_the_naive_implementation() {
+        let mut rng = Rng(0x5EED_1234_ABCD_0001);
+        let mut cases = 0;
+        let mut matches = 0;
+        for _ in 0..4000 {
+            let haystack_len = rng.below(81);
+            let haystack: Vec<u8> = (0..haystack_len)
+                .map(|_| b'a' + rng.below(3) as u8)
+                .collect();
+            let needle_len = rng.below(7);
+            // The needle is drawn from the same alphabet, and half the time
+            // from a slice of the haystack, so both "found" and "absent" are
+            // common rather than one dominating by chance.
+            let needle: Vec<u8> = if needle_len > 1 && !haystack.is_empty() && rng.below(2) == 0 {
+                let at = rng.below(haystack.len());
+                haystack[at..(at + needle_len).min(haystack.len())].to_vec()
+            } else {
+                (0..needle_len).map(|_| b'a' + rng.below(3) as u8).collect()
+            };
+            // `search_end` runs past the haystack on purpose: the clamp is
+            // part of the contract.
+            let search_end = rng.below(haystack_len + 5);
+            let start = rng.below(haystack_len + 5);
+            for forward in [true, false] {
+                let expected = naive_search_bytes(&haystack, &needle, search_end, start, forward);
+                let actual = search_bytes(&haystack, &needle, search_end, start, forward);
+                assert_eq!(
+                    actual, expected,
+                    "haystack={haystack:?} needle={needle:?} search_end={search_end} \
+                     start={start} forward={forward}"
+                );
+                cases += 1;
+                // A match is a position inside the window; every other answer
+                // is the window's own end.
+                if expected < search_end.min(haystack_len) {
+                    matches += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 8000);
+        // Both branches have to be exercised, or "they agree" only says the
+        // no-match path was tested 8000 times.
+        assert!(
+            (1000..=7000).contains(&matches),
+            "the generator produced an unbalanced mix: {matches} matches of {cases}"
+        );
+    }
+
+    #[test]
+    fn search_ucs2_agrees_with_the_naive_implementation() {
+        let mut rng = Rng(0x5EED_1234_ABCD_0002);
+        let mut cases = 0;
+        let mut matches = 0;
+        // The alphabet includes units whose *high* byte is the one worth
+        // searching for (`0x4101` has its `0x41` in the high half), because
+        // that is the case where aligning a hit back down to a unit boundary
+        // and not dropping the last candidate's second byte both matter.
+        let alphabet: [u16; 5] = [0x0061, 0x0062, 0x0063, 0x4101, 0x0161];
+        for _ in 0..4000 {
+            let unit_count = rng.below(41);
+            let units: Vec<u16> = (0..unit_count)
+                .map(|_| alphabet[rng.below(alphabet.len())])
+                .collect();
+            let haystack = encode_ucs2(&units, usize::MAX);
+            let needle_len = rng.below(7);
+            // Half the needles are a slice of the haystack, so genuine matches
+            // are common; the other half are random draws from the alphabet.
+            let needle: Vec<u16> = if needle_len > 1 && !units.is_empty() && rng.below(2) == 0 {
+                let at = rng.below(units.len());
+                units[at..(at + needle_len).min(units.len())].to_vec()
+            } else {
+                (0..needle_len)
+                    .map(|_| alphabet[rng.below(alphabet.len())])
+                    .collect()
+            };
+            let search_end = rng.below(haystack.len() + 5);
+            let start_units = rng.below(haystack.len() + 5);
+            for forward in [true, false] {
+                let expected =
+                    naive_search_ucs2(&haystack, &needle, search_end, start_units, forward);
+                let actual = search_ucs2(&haystack, &needle, search_end, start_units, forward);
+                assert_eq!(
+                    actual, expected,
+                    "haystack={haystack:?} needle={needle:?} search_end={search_end} \
+                     start_units={start_units} forward={forward}"
+                );
+                cases += 1;
+                if expected < search_end.min(haystack.len()) & !1 {
+                    matches += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 8000);
+        assert!(
+            (1000..=7000).contains(&matches),
+            "the generator produced an unbalanced mix: {matches} matches of {cases}"
+        );
+    }
+
+    /// One boundary case: `(haystack, needle, search_end, start, forward)`.
+    type ByteCase<'a> = (&'a [u8], &'a [u8], usize, usize, bool);
+
+    /// One boundary case: `(haystack, needle, search_end, start_units, forward)`.
+    type Ucs2Case<'a> = (&'a [u8], &'a [u16], usize, usize, bool);
+
+    /// The boundaries named one at a time, so a regression says which rule
+    /// broke instead of only which random seed found it.
+    #[test]
+    fn search_boundaries_match_the_naive_implementation() {
+        let cases: [ByteCase; 18] = [
+            // Empty needle: the window, not a position.
+            (b"hello", b"", 5, 0, true),
+            (b"hello", b"", 5, 3, true),
+            (b"hello", b"", 5, 5, false),
+            (b"", b"", 0, 0, true),
+            // Needle equal to the haystack, at both ends of the window.
+            (b"hello", b"hello", 5, 0, true),
+            (b"hello", b"hello", 5, 4, false),
+            // Needle longer than the haystack, and longer than the window.
+            (b"hello", b"hellos", 5, 0, true),
+            (b"hello", b"ell", 3, 0, true),
+            // A match at index 0.
+            (b"aab", b"aa", 3, 0, true),
+            // A match at the last possible start position.
+            (b"aab", b"ab", 3, 0, true),
+            // No match at all, in both directions.
+            (b"aaaa", b"b", 4, 0, true),
+            (b"aaaa", b"b", 4, 3, false),
+            // A real match beyond `search_end` must not be reported.
+            (b"xxneedlexx", b"needle", 6, 0, true),
+            (b"xxneedlexx", b"needle", 8, 9, false),
+            // `start` past `last_start` clamps to it in both directions.
+            (b"abcabc", b"abc", 6, 99, true),
+            (b"abcabc", b"abc", 6, 99, false),
+            // Backward search from 0 sees only position 0.
+            (b"aba", b"a", 3, 0, false),
+            (b"aba", b"b", 3, 0, false),
+        ];
+        for (haystack, needle, search_end, start, forward) in cases {
+            assert_eq!(
+                search_bytes(haystack, needle, search_end, start, forward),
+                naive_search_bytes(haystack, needle, search_end, start, forward),
+                "haystack={haystack:?} needle={needle:?} search_end={search_end} \
+                 start={start} forward={forward}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_ucs2_boundaries_match_the_naive_implementation() {
+        // "abab" in UCS-2 is 61 00 62 00 61 00 62 00.
+        let haystack = [0x61, 0x00, 0x62, 0x00, 0x61, 0x00, 0x62, 0x00];
+        // A unit whose interesting byte is the high half: the candidate scan
+        // has to look at both bytes of the first unit, not only the low one.
+        let high_byte = encode_ucs2(&[0x4101, 0x4102, 0x4101], usize::MAX);
+        let cases: [Ucs2Case; 13] = [
+            (&haystack, &[], 8, 0, true),
+            (&haystack, &[], 8, 2, false),
+            (&haystack, &[0x0061, 0x0062, 0x0061, 0x0062], 8, 0, true),
+            (&haystack, &[0x0061, 0x0062, 0x0061, 0x0062], 8, 3, false),
+            // Longer than the window, and than the haystack.
+            (&haystack, &[0x0061, 0x0062], 3, 0, true),
+            (&haystack, &[0x61, 0x62, 0x61, 0x62, 0x61], 8, 0, true),
+            // Match at 0, and at the last possible unit.
+            (&haystack, &[0x0061], 8, 0, true),
+            (&haystack, &[0x0062], 8, 0, true),
+            // Absent.
+            (&haystack, &[0x007A], 8, 0, true),
+            (&haystack, &[0x007A], 8, 3, false),
+            (&high_byte, &[0x4102], 6, 0, true),
+            (&high_byte, &[0x4102], 6, 2, false),
+            (&high_byte, &[0x4101, 0x4102, 0x4101], 6, 0, true),
+        ];
+        for (haystack, needle, search_end, start_units, forward) in cases {
+            assert_eq!(
+                search_ucs2(haystack, needle, search_end, start_units, forward),
+                naive_search_ucs2(haystack, needle, search_end, start_units, forward),
+                "haystack={haystack:?} needle={needle:?} search_end={search_end} \
+                 start_units={start_units} forward={forward}"
+            );
+        }
     }
 }

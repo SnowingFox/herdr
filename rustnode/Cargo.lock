@@ -1629,6 +1629,7 @@ dependencies = [
 name = "rn-core"
 version = "0.1.0"
 dependencies = [
+ "memchr",
  "parking_lot",
  "rn-v8-sys",
  "serde",
