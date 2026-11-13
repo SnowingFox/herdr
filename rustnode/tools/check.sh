@@ -56,6 +56,36 @@ step "building the workspace and the CLI binary"
 cargo build --workspace
 cargo build -p rn-cli
 
+step "the release profile type-checks"
+# Every build above is the debug profile, so nothing in this gate ever compiled
+# `cfg(not(debug_assertions))`. PR #72 shipped a `defer_or` whose whole body sat
+# behind `#[cfg(debug_assertions)]`: debug returned `bool` as declared, release
+# returned `()` and did not compile at all, and nine consecutive green gates
+# missed it because a debug build never removes that body. The same `cfg` had a
+# worse shape available to it -- had the body been dropped without the type
+# mismatch, every submit deferred during `mem_recv` (GOAWAY included) would have
+# been discarded silently in release builds, with no error at all.
+#
+# This is `check` and not `build` on purpose, and the reason is not only cost.
+# The bug is a type error: with the body gone, `defer_or` declares `-> bool` and
+# drops through to `()`. `cargo check` runs the full type checker over every
+# cfg-selected body, so it reports exactly that error; it does not stop after
+# name resolution. What `check` cannot see is a *codegen* or link-time
+# divergence (a release-only `link`/`#[no_mangle]`/`panic=abort` interaction),
+# so this step raises the floor to "the release profile type-checks" rather than
+# claiming the release profile is proven to build. `cargo build --release
+# --workspace` costs minutes here because `panic = "abort"` and `lto = "thin"`
+# force a full codegen of every crate plus the 198 MB `librusty_v8.a` link; that
+# belongs in CI, not in the per-commit gate.
+#
+# The workspace, not just `rn-cli`, because `cfg` divergence is per-crate: the
+# crate that breaks may be one `rn-cli` merely depends on, as this one was.
+#
+# It runs after the debug build and before everything that execs
+# `target/debug/rustnode`, and it is not `--quick`-gated: warm it costs ~0.2s
+# (measured), which buys the one profile this gate otherwise never type-checks.
+cargo check --release --workspace
+
 step "the per-context globals audit"
 # Every assertion reads the rustnode realm (`primordials`, `DOMException`, the
 # per-context symbol tables), so this needs the binary built above and cannot run
