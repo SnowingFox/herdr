@@ -1,0 +1,32 @@
+[package]
+name = "rn-bind-http2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('http2') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# HTTP/2 runs over a socket, and the state that has to survive a `process.exit()`
+# is libuv's threadpool registration, so the transport half needs the same
+# callback machinery `rn-uv` builds for every other binding.
+rn-uv.workspace = true
+# `StreamBase`'s four write forms report through a `WriteWrap`'s `oncomplete`,
+# which is the request object this namespace has to complete itself because an
+# HTTP/2 stream's write is framed by nghttp2 rather than by libuv.
+rn-bind-stream-wrap = { path = "../rn-bind-stream-wrap" }
+# A stream's `getAsyncId` has to come from the one id sequence the JavaScript side
+# also draws from, or `async_hooks` sees two resources with one id.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
+
+[build-dependencies]
+# Compiles the vendored nghttp2. Node links the same tree as a static library; a
+# system libnghttp2 is a different version on every host and absent on Windows,
+# which would make every protocol behaviour host-dependent.
+cc = "1"
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -33,6 +33,7 @@ rn-bind-fs-event-wrap = { path = "../rn-bind-fs-event-wrap" }
 rn-bind-glob = { path = "../rn-bind-glob" }
 rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
 rn-bind-http-parser = { path = "../rn-bind-http-parser" }
+rn-bind-http2 = { path = "../rn-bind-http2" }
 rn-bind-icu = { path = "../rn-bind-icu" }
 rn-bind-inspector = { path = "../rn-bind-inspector" }
 rn-bind-js-stream = { path = "../rn-bind-js-stream" }
@@ -50,6 +51,7 @@ rn-bind-serdes = { path = "../rn-bind-serdes" }
 rn-bind-signal-wrap = { path = "../rn-bind-signal-wrap" }
 rn-bind-spawn-sync = { path = "../rn-bind-spawn-sync" }
 rn-bind-sqlite = { path = "../rn-bind-sqlite" }
+rn-bind-stream-pipe = { path = "../rn-bind-stream-pipe" }
 rn-bind-stream-wrap = { path = "../rn-bind-stream-wrap" }
 rn-bind-string-decoder = { path = "../rn-bind-string-decoder" }
 rn-bind-symbols = { path = "../rn-bind-symbols" }

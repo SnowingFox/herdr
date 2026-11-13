@@ -303,6 +303,20 @@ fn new(
         (*slot).state.borrow_mut().owner_object = Some(v8::Global::new(scope.as_ref(), object))
     };
 
+    // `StreamBase::FromObject` is how anything that consumes a stream finds its
+    // state, and `rn_uv::streams::attach_state` is the cross-crate spelling of it.
+    // Every other stream binding publishes a `uv_stream_t`, but a `JSStream` has
+    // none — its `StreamState::stream` is null — so it publishes the *state*
+    // instead. Without this, `Http2Session.consume` could not find the stream
+    // behind one and `http2.connect` over a `Duplex` threw "requires a stream
+    // handle", which is the largest single `Uncaught` signature in the
+    // measurement.
+    // SAFETY: `slot` is live, and the stream it names is the slot's own
+    // `StreamState`, which outlives the object through the finalizer above.
+    unsafe {
+        rn_uv::streams::attach_state(scope, object, (*slot).state.as_ptr());
+    }
+
     let address = slot as usize;
     let weak = v8::Weak::with_guaranteed_finalizer(
         scope,

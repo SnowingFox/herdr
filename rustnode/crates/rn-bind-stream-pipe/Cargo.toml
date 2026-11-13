@@ -1,0 +1,18 @@
+[package]
+name = "rn-bind-stream-pipe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('stream_pipe') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# The pipe pushes a listener onto each stream and writes into the sink's libuv
+# handle, so it is entirely `rn_uv`'s listener, stream and handle machinery.
+rn-uv.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

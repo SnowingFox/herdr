@@ -16,7 +16,7 @@
 //!
 //! Two consequences, both deliberate:
 //!
-//! * A component rustnode does not link is **omitted**. `nghttp2` has no
+//! * A component rustnode does not link is **omitted**. `ngtcp2` has no
 //!   implementation here, so it is absent rather than present with Node's
 //!   number. `test/common` never reads those keys, so the omission costs a test
 //!   nothing.
@@ -42,6 +42,15 @@ pub const LLHTTP_VERSION: &str = "9.4.3";
 /// merve, from `vendor/merve/include/merve.h`. This is the CommonJS lexer that
 /// `rn-bind-cjs-lexer` compiles from the vendored source.
 pub const MERVE_VERSION: &str = "1.2.2";
+
+/// nghttp2, from `vendor/nghttp2/lib/includes/nghttp2/nghttp2ver.h`. This is the
+/// HTTP/2 implementation `rn-bind-http2` compiles from the vendored source.
+///
+/// Only a fallback: `table()` reads the number out of the linked library with
+/// `nghttp2_version`, so the published value always names code the binary
+/// contains. This constant exists so a hypothetical link failure cannot drop the
+/// key entirely, and a test asserts the two agree.
+pub const NGHTTP2_VERSION: &str = "1.70.0";
 
 /// acorn, from `var version = "8.19.0"` in the vendored
 /// `vendor/libnode-js/deps/acorn/acorn/dist/acorn.js`. Node reports the JS
@@ -103,7 +112,6 @@ pub const WITHHELD: &[(&str, &str)] = &[
         "rustnode does not link c-ares; `rn-bind-cares` resolves through \
          getaddrinfo/getnameinfo and speaks the DNS wire protocol itself",
     ),
-    ("nghttp2", "no HTTP/2 implementation is linked or built"),
     (
         "ngtcp2",
         "no QUIC stack is linked; OpenSSL here has no QUIC support",
@@ -190,6 +198,14 @@ pub fn table() -> Vec<Entry> {
         Entry {
             key: "node",
             value: NODE_VERSION.to_string(),
+        },
+        Entry {
+            // Read from the linked library rather than from `NGHTTP2_VERSION`:
+            // the constant names the vendored tree, and a re-pin that forgot to
+            // rebuild would leave the two disagreeing. `nghttp2_version` is what
+            // `src/node_metadata.cc` calls too.
+            key: "nghttp2",
+            value: rn_bind_http2::version().unwrap_or_else(|| NGHTTP2_VERSION.to_string()),
         },
         Entry {
             key: "openssl",

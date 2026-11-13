@@ -392,6 +392,180 @@ pub unsafe fn read_start(stream: *mut uv::uv_stream_t, state: *mut StreamState) 
     }
 }
 
+/// Issues a write with no caller-supplied request object.
+///
+/// `StreamPipe` is the only caller: it pumps a source stream's reads into a sink
+/// with no JavaScript write behind them, so there is no `WriteWrap` to complete.
+/// `src/stream_pipe.cc` has the same shape — `sink()->Write(&buffer, 1)` takes a
+/// `StreamWriteResult` and its completion is the pipe's own counter, not a
+/// callback.
+///
+/// `owned` keeps the bytes alive until libuv's completion fires.
+///
+/// Returns libuv's status: `0` when the write was queued, negative otherwise.
+///
+/// # Safety
+///
+/// `stream` must be a live stream and every entry in `buffers` must point into
+/// `owned`, so the storage outlives the completion.
+pub unsafe fn queue_write_unowned(
+    stream: *mut uv::uv_stream_t,
+    mut buffers: Vec<uv::uv_buf_t>,
+    total_bytes: usize,
+    owned: Vec<Box<[u8]>>,
+) -> i32 {
+    if stream.is_null() || buffers.is_empty() {
+        return uv::uv_errno_t_UV_EINVAL;
+    }
+    let completion = Box::new(UnownedWriteCompletion {
+        bytes: total_bytes,
+        // SAFETY: the caller guarantees `stream` is live, and a live stream's
+        // `data` is its `StreamState`.
+        state: unsafe { handle::owner(stream) }.unwrap_or(ptr::null_mut()),
+        #[allow(dead_code)]
+        owned,
+    });
+    let completion = Box::into_raw(completion);
+
+    let storage = Box::into_raw(Box::new(std::mem::MaybeUninit::<uv::uv_write_t>::zeroed()));
+    // SAFETY: `storage` is a live, aligned, zeroed `uv_write_t`.
+    let request = unsafe { (*storage).as_mut_ptr() };
+    // SAFETY: `request` is live and `data` is the slot libuv hands back.
+    unsafe {
+        (*request).data = completion.cast::<c_void>();
+    }
+
+    // SAFETY: the caller guarantees the stream and buffers stay valid.
+    let status = unsafe {
+        uv::uv_write(
+            request,
+            stream,
+            buffers.as_mut_ptr(),
+            buffers.len() as u32,
+            Some(after_unowned_write),
+        )
+    };
+
+    if status != 0 {
+        // SAFETY: libuv took nothing when `uv_write` failed, so both allocations
+        // are still ours.
+        unsafe {
+            drop(Box::from_raw(storage));
+            drop(Box::from_raw(completion));
+        }
+    }
+    status
+}
+
+/// State an unowned write carries to its completion.
+struct UnownedWriteCompletion {
+    bytes: usize,
+    /// The stream the write was queued on, so the completion reaches its
+    /// listener chain rather than JavaScript.
+    state: *mut StreamState,
+    /// Backing storage, freed with this struct.
+    #[allow(dead_code)]
+    owned: Vec<Box<[u8]>>,
+}
+
+/// libuv completion for [`queue_write_unowned`].
+///
+/// # Safety
+///
+/// Called by libuv with the `uv_write_t` `queue_write_unowned` allocated.
+unsafe extern "C" fn after_unowned_write(request: *mut uv::uv_write_t, status: i32) {
+    if request.is_null() {
+        return;
+    }
+    // SAFETY: `queue_write_unowned` stored this pointer in `data` and libuv hands
+    // the same request back exactly once.
+    let completion = unsafe { (*request).data.cast::<UnownedWriteCompletion>() };
+    // SAFETY: the request came from `Box<MaybeUninit<uv_write_t>>` above and libuv
+    // is finished with it.
+    drop(unsafe { Box::from_raw(request.cast::<std::mem::MaybeUninit<uv::uv_write_t>>()) });
+
+    let Some(completion) = (unsafe { reclaim_unowned(completion) }) else {
+        return;
+    };
+
+    callback::with_context(|scope| {
+        let request = v8::Object::new(scope);
+        let bytes = completion.bytes;
+        // `emit_after_write` needs a request to hand the listener, and a pipe has
+        // none. The bare object is the same stand-in `StreamWriteResult` implies:
+        // the pipe's listener ignores it and only reads `status`.
+        let _ = bytes;
+        // SAFETY: the state outlives its handle's completions.
+        unsafe { listener::emit_after_write(completion.state, scope, request, None, status) };
+    });
+}
+
+/// Takes an [`UnownedWriteCompletion`] back out of its raw pointer.
+///
+/// # Safety
+///
+/// `pointer` must have come from `Box::into_raw` on an `UnownedWriteCompletion`
+/// and must not have been reclaimed already.
+unsafe fn reclaim_unowned(
+    pointer: *mut UnownedWriteCompletion,
+) -> Option<Box<UnownedWriteCompletion>> {
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: the caller guarantees the pointer came from `Box::into_raw`.
+    Some(unsafe { Box::from_raw(pointer) })
+}
+
+/// Shuts a stream's writing side down, the way `StreamBase::Shutdown()` does.
+///
+/// `StreamPipe` calls this when its source ends. Node's version is
+/// `ShutdownWrap`-based because a `StreamBase` owns its request; here the sink's
+/// write side is ended with `uv_shutdown`, which is what
+/// `lib/internal/stream_base_commons.js` ends up issuing for a socket.
+///
+/// Returns libuv's status, or `UV_ENOTCONN` when the stream is not connected.
+///
+/// # Safety
+///
+/// `stream` must be a live stream.
+pub unsafe fn end_stream(stream: *mut uv::uv_stream_t) -> i32 {
+    if stream.is_null() {
+        return uv::uv_errno_t_UV_EINVAL;
+    }
+    let storage = Box::into_raw(Box::new(
+        std::mem::MaybeUninit::<uv::uv_shutdown_t>::zeroed(),
+    ));
+    // SAFETY: `storage` is a live, aligned, zeroed `uv_shutdown_t`.
+    let request = unsafe { (*storage).as_mut_ptr() };
+    // SAFETY: `request` is live; `data` stays null, so the completion has nothing
+    // to reclaim and only reports through the listener chain.
+    unsafe {
+        (*request).data = ptr::null_mut();
+    }
+    // SAFETY: the caller guarantees `stream` is live.
+    let status = unsafe { uv::uv_shutdown(request, stream, Some(after_unowned_shutdown)) };
+    if status != 0 {
+        // SAFETY: libuv took nothing when `uv_shutdown` failed.
+        unsafe {
+            drop(Box::from_raw(storage));
+        }
+    }
+    status
+}
+
+/// libuv completion for [`end_stream`].
+///
+/// # Safety
+///
+/// Called by libuv with the `uv_shutdown_t` `end_stream` allocated.
+unsafe extern "C" fn after_unowned_shutdown(request: *mut uv::uv_shutdown_t, _status: i32) {
+    if request.is_null() {
+        return;
+    }
+    // SAFETY: `end_stream` allocated this and libuv is finished with it.
+    drop(unsafe { Box::from_raw(request.cast::<std::mem::MaybeUninit<uv::uv_shutdown_t>>()) });
+}
+
 /// Stops reading. Idempotent, as `uv_read_stop` is.
 ///
 /// # Safety

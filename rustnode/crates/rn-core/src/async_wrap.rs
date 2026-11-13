@@ -32,6 +32,14 @@ pub const PROVIDER_PIPECONNECTWRAP: u32 = 25;
 pub const PROVIDER_PIPESERVERWRAP: u32 = 26;
 /// `PROVIDER_PIPEWRAP`: a connected pipe or an IPC channel.
 pub const PROVIDER_PIPEWRAP: u32 = 27;
+/// `PROVIDER_HTTP2SESSION`: an HTTP/2 session.
+///
+/// The value is the position of `V(HTTP2SESSION)` in `NODE_ASYNC_PROVIDER_TYPES`
+/// (`src/async_wrap.h`), counted from `NONE`. `PROVIDER_TCPWRAP` above is the
+/// check that the counting is right: it is 42 there and 42 here.
+pub const PROVIDER_HTTP2SESSION: u32 = 14;
+/// `PROVIDER_HTTP2STREAM`: one HTTP/2 stream.
+pub const PROVIDER_HTTP2STREAM: u32 = 15;
 
 /// The `AsyncWrap` fields of a wrapped handle.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -663,9 +663,12 @@ record() {
 #
 #   run-node-tests.sh           runs a selection of Node's suite, prints a table
 #   fs-readfile-jobs-measure.sh runs 58 fs test files, prints `PASS=n FAIL=n`
+#   http2-measure.sh            runs the test-http2* family, prints `PASS=n FAIL=n`
 #
-# Both were checked to have no verdict exit of their own: a failing row is counted
-# into the printed total, not into the script's status.
+# All three were checked to have no verdict exit of their own: a failing row is
+# counted into the printed total, not into the script's status. A harness that
+# exited 1 for a failing row would be unusable as a measurement: the point is to
+# report every file's verdict, including when every file fails.
 select_controls() {
   local path base
   for path in "$here"/*.sh; do
@@ -676,7 +679,7 @@ select_controls() {
       # usage header, so the "not referenced by check.sh" rule would otherwise
       # include it by luck rather than by intent.
       check.sh | *.test.sh) continue ;;
-      run-node-tests.sh | fs-readfile-jobs-measure.sh) continue ;;
+      run-node-tests.sh | fs-readfile-jobs-measure.sh | http2-measure.sh) continue ;;
       *control*) printf '%s\n' "$path"; continue ;;
     esac
     if [ -f "$check_sh" ] && ! grep -qF "$base" "$check_sh"; then

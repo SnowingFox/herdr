@@ -25,6 +25,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_glob::register(registry);
     rn_bind_heap_utils::register(registry);
     rn_bind_http_parser::register(registry);
+    rn_bind_http2::register(registry);
     rn_bind_icu::register(registry);
     rn_bind_inspector::register(registry);
     rn_bind_js_stream::register(registry);
@@ -42,6 +43,7 @@ pub fn install_all(registry: &mut BindingRegistry) {
     rn_bind_signal_wrap::register(registry);
     rn_bind_spawn_sync::register(registry);
     rn_bind_sqlite::register(registry);
+    rn_bind_stream_pipe::register(registry);
     rn_bind_stream_wrap::register(registry);
     rn_bind_string_decoder::register(registry);
     rn_bind_symbols::register(registry);

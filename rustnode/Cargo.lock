@@ -1056,6 +1056,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-http2"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "rn-bind-async-wrap",
+ "rn-bind-stream-wrap",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bind-icu"
 version = "0.1.0"
 dependencies = [
@@ -1261,6 +1274,16 @@ dependencies = [
  "cc",
  "rn-core",
  "rn-permission",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
+name = "rn-bind-stream-pipe"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
  "rn-uv",
  "rn-v8-sys",
  "serde_json",
@@ -1492,6 +1515,7 @@ dependencies = [
  "rn-bind-glob",
  "rn-bind-heap-utils",
  "rn-bind-http-parser",
+ "rn-bind-http2",
  "rn-bind-icu",
  "rn-bind-inspector",
  "rn-bind-js-stream",
@@ -1509,6 +1533,7 @@ dependencies = [
  "rn-bind-signal-wrap",
  "rn-bind-spawn-sync",
  "rn-bind-sqlite",
+ "rn-bind-stream-pipe",
  "rn-bind-stream-wrap",
  "rn-bind-string-decoder",
  "rn-bind-symbols",
@@ -1712,6 +1737,7 @@ dependencies = [
  "libc",
  "rn-bind-crypto",
  "rn-bind-heap-utils",
+ "rn-bind-http2",
  "rn-bind-inspector",
  "rn-bind-messaging",
  "rn-bind-options",
