@@ -749,7 +749,56 @@ unsafe fn run_timer_callback() {
         };
         let now = rn_uv::uv_loop::now_ms();
         let argument: v8::Local<v8::Value> = v8::Number::new(scope, now).into();
-        match call_catching(scope, callback, &[argument]) {
+        // Node retries `processTimers` in a `do`/`while` until a call returns
+        // rather than throwing, and that retry — not the absence of a stop — is
+        // what a throwing timer depends on:
+        //
+        // ```text
+        // do {
+        //   TryCatchScope try_catch(env);
+        //   try_catch.SetVerbose(true);
+        //   ret = cb->Call(env->context(), process, 1, &arg);
+        // } while (ret.IsEmpty() && env->can_call_into_js());
+        // if (ret.IsEmpty()) return;   // no re-arm and no stop: the env is going
+        // ```
+        //
+        // The throw is reported from inside the `TryCatchScope`, which hands it to
+        // `process._fatalException`, so a listener that absorbs it has already run
+        // by the time the call returns empty. Node then calls `processTimers`
+        // *again* with the same `now`, with two consequences that the tests here
+        // pin separately: the rest of that expiry's list runs (`setTimeout` beside
+        // a throwing sibling), and the second call's return value is what the
+        // handle is re-armed from — including for a timer the handler itself
+        // scheduled, which is only in `timerListMap` after the handler ran.
+        //
+        // `can_call_into_js()` going false is the only thing that ends Node's
+        // retry, and it is set by `env->Exit()`: the fatal `_fatalException`
+        // answer, and a `process.exit()` the handler itself made. That is the
+        // case where the handle legitimately must not be re-armed, and it is
+        // also the case where stopping it would be wrong: Node returns from
+        // `RunTimers` without touching the handle at all, because there is no
+        // iteration left to need it.
+        //
+        // The second half of the condition is what covers the exit a handler
+        // asks for itself: `_fatalException` returns `true` there — the throw was
+        // handled — but the realm is already going away, and Node's
+        // `reallyExit` has set `can_call_into_js` false by then.
+        //
+        // Node's comment on the loop says an infinite loop is impossible "due to
+        // how the JS-side is structured", and the same holds here: each retry
+        // requires `processTimers` to have thrown, and it throws only by running
+        // a due timer's callback, of which there are finitely many per expiry
+        // until a handler schedules more.
+        let mut result = call_catching(scope, callback, &[argument]);
+        while let Err(exception) = result {
+            let handled = record_uncaught(scope, exception);
+            if !handled || rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED) {
+                // The process is exiting; Node leaves the handle as it found it.
+                return;
+            }
+            result = call_catching(scope, callback, &[argument]);
+        }
+        match result {
             Ok(Some(result)) => {
                 // The return value is the next deadline, using libuv's sign
                 // convention: positive when a ref'd timer is behind it, negative
@@ -761,11 +810,7 @@ unsafe fn run_timer_callback() {
             }
             // A callback that reported nothing is the "function was replaced"
             // case; there is no deadline to arm.
-            Ok(None) => stop_timer(),
-            Err(exception) => {
-                record_uncaught(scope, exception);
-                stop_timer();
-            }
+            _ => stop_timer(),
         }
     });
 }
@@ -870,6 +915,12 @@ unsafe fn run_immediate_callback() {
         let Some(callback) = immediate_callback(scope) else {
             return;
         };
+        // The return value is not consulted, matching `CheckImmediate`: only the
+        // timer handle carries a deadline, and an immediate has none. The report's
+        // answer is not consulted either — a fatal throw ends the process from the
+        // loop's own check, and an absorbed one leaves the queue to drain on the
+        // next iteration, which is why immediates and ticks continue after a throw
+        // while timers used to stop.
         if let Err(exception) = call_catching(scope, callback, &[]) {
             record_uncaught(scope, exception);
         }
@@ -957,9 +1008,14 @@ fn call_catching<'s>(
 /// printed. `write_uncaught` skips them, so this goes through
 /// `report_uncaught_exception`, which calls `process._fatalException` first and
 /// only prints when it declines.
-fn record_uncaught(scope: &mut v8::PinScope, exception: v8::Global<v8::Value>) {
+///
+/// Returns `true` when a handler absorbed the throw, which is the answer Node's
+/// timer loop reads back as `can_call_into_js()`: an absorbed throw leaves the
+/// runtime callable, so `RunTimers` retries `processTimers`; a fatal one means
+/// the environment is exiting and the handle is left untouched.
+fn record_uncaught(scope: &mut v8::PinScope, exception: v8::Global<v8::Value>) -> bool {
     let exception = v8::Local::new(scope, &exception);
-    rn_errors::report_uncaught_exception(scope, exception);
+    rn_errors::report_uncaught_exception(scope, exception)
 }
 
 /// Whether `setupTimers` has been given the callbacks the loop needs.
