@@ -51,6 +51,23 @@ impl KeyFormat {
     pub fn is_raw(self) -> bool {
         matches!(self, Self::RawPublic | Self::RawPrivate | Self::RawSeed)
     }
+
+    /// The `kKeyFormat*` value, for tests that pin the wire numbers.
+    ///
+    /// These are `PKFormatType`'s declaration order plus the three raw formats
+    /// that only newer Node defines, which is why they run 1..=7 rather than
+    /// starting at 0 the way `KeyEncoding` does.
+    pub fn as_raw(self) -> i32 {
+        match self {
+            Self::Der => 1,
+            Self::Pem => 2,
+            Self::Jwk => 3,
+            Self::RawPublic => 4,
+            Self::RawPrivate => 5,
+            Self::RawSeed => 6,
+            Self::Store => 7,
+        }
+    }
 }
 
 /// `ncrypto::EVPKeyPointer::PKEncodingType`.
@@ -68,14 +85,67 @@ pub enum KeyEncoding {
 
 impl KeyEncoding {
     /// The `kKeyEncoding*` value, or `None` for a number Node never sends.
+    ///
+    /// The numbers are the *declaration order* of `PKEncodingType` in
+    /// `deps/ncrypto/ncrypto.h` — `PKCS1, PKCS8, SPKI, SEC1` — not a private
+    /// numbering of this crate's own. `crypto_keys.cc` exports them with
+    /// `static_cast<int>` of that enum, so the four numbers are observable
+    /// through `internalBinding('crypto')` and are what `lib/internal/crypto/
+    /// keys.js` compares against. A shifted table stays self-consistent, which
+    /// is exactly how one survived: every round trip inside this runtime still
+    /// worked while `sec1` silently produced PKCS#8.
     pub fn from_raw(value: i32) -> Option<Self> {
         Some(match value {
-            1 => Self::Pkcs1,
-            2 => Self::Pkcs8,
-            3 => Self::Spki,
-            4 => Self::Sec1,
+            0 => Self::Pkcs1,
+            1 => Self::Pkcs8,
+            2 => Self::Spki,
+            3 => Self::Sec1,
             _ => return None,
         })
+    }
+
+    /// The `kKeyEncoding*` value, for tests that pin the wire numbers.
+    pub fn as_raw(self) -> i32 {
+        match self {
+            Self::Pkcs1 => 0,
+            Self::Pkcs8 => 1,
+            Self::Spki => 2,
+            Self::Sec1 => 3,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_encoding_numbers_are_nodes() {
+        // `crypto_keys.cc` derives these from `PKEncodingType`'s declaration
+        // order, and `node --expose-internals` reports exactly 0 1 2 3.
+        assert_eq!(KeyEncoding::Pkcs1.as_raw(), 0);
+        assert_eq!(KeyEncoding::Pkcs8.as_raw(), 1);
+        assert_eq!(KeyEncoding::Spki.as_raw(), 2);
+        assert_eq!(KeyEncoding::Sec1.as_raw(), 3);
+
+        assert_eq!(KeyEncoding::from_raw(0), Some(KeyEncoding::Pkcs1));
+        assert_eq!(KeyEncoding::from_raw(1), Some(KeyEncoding::Pkcs8));
+        assert_eq!(KeyEncoding::from_raw(2), Some(KeyEncoding::Spki));
+        assert_eq!(KeyEncoding::from_raw(3), Some(KeyEncoding::Sec1));
+        // The numbering is dense with no gap at either end, so the first value
+        // Node never sends is the one past SEC1.
+        assert_eq!(KeyEncoding::from_raw(4), None);
+        assert_eq!(KeyEncoding::from_raw(-1), None);
+    }
+
+    #[test]
+    fn the_format_numbers_are_not_the_encoding_numbers() {
+        // Both are small integers passed in adjacent argument slots. Sharing a
+        // table between them is the easiest way to reintroduce a shift, so the
+        // two are pinned separately.
+        assert_eq!(KeyFormat::from_raw(1), Some(KeyFormat::Der));
+        assert_eq!(KeyFormat::from_raw(2), Some(KeyFormat::Pem));
+        assert_eq!(KeyFormat::from_raw(3), Some(KeyFormat::Jwk));
     }
 }
 

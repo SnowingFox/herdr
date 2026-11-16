@@ -22,6 +22,60 @@ use crate::encode::{KeyEncoding, KeyFormat, PrivateKeyEncoding};
 use crate::error::{clear_error, failure, failure_with_passphrase, ParseResult};
 use crate::pkey::PKey;
 
+/// What the `pem_password_cb` receives as `user_data`.
+struct PassphraseCallbackData<'a> {
+    passphrase: Option<&'a [u8]>,
+}
+
+/// `pem_password_cb`: fills `buf` and returns the length, or -1 when no
+/// passphrase is available.
+///
+/// -1 is Node's `PasswordCallback` and is load-bearing: it makes OpenSSL raise
+/// `PEM_R_BAD_PASSWORD_READ`, which is the marker `TryParsePrivateKey` turns into
+/// `NEED_PASSPHRASE` and therefore `ERR_MISSING_PASSPHRASE`.
+///
+/// The `openssl` crate's own callback wrapper is not used for the same reason: it
+/// returns 0 on a closure error, which reads to OpenSSL as "the passphrase is
+/// zero bytes long" and turns every missing passphrase into `bad decrypt`.
+unsafe extern "C" fn password_callback(
+    buf: *mut std::ffi::c_char,
+    size: std::ffi::c_int,
+    _rwflag: std::ffi::c_int,
+    user_data: *mut std::ffi::c_void,
+) -> std::ffi::c_int {
+    if user_data.is_null() || size <= 0 {
+        return -1;
+    }
+    // SAFETY: `user_data` is the `&PassphraseCallbackData` the reader function
+    // passed in, which outlives this call.
+    let data = unsafe { &*(user_data as *const PassphraseCallbackData<'_>) };
+    let Some(passphrase) = data.passphrase else {
+        return -1;
+    };
+    let size = size as usize;
+    if passphrase.len() > size {
+        return -1;
+    }
+    // SAFETY: `buf` points at `size` writable bytes, and the copy is bounded by
+    // both the passphrase and that size.
+    unsafe {
+        std::ptr::copy_nonoverlapping(passphrase.as_ptr().cast(), buf, passphrase.len());
+    }
+    passphrase.len() as std::ffi::c_int
+}
+
+/// A BIO over a borrowed slice, or `None` if OpenSSL could not allocate one.
+///
+/// A `CString` copy is not needed: `BIO_new_mem_buf` does not require a NUL
+/// terminator, and the explicit length is what prevents reading past the end.
+fn bio_from_bytes(bytes: &[u8]) -> Option<*mut openssl_sys::BIO> {
+    let length = bytes.len().try_into().unwrap_or(0);
+    // SAFETY: `bytes` is live for the whole call and its length is passed with
+    // it; the returned BIO owns a copy and the caller frees it exactly once.
+    let bio = unsafe { openssl_sys::BIO_new_mem_buf(bytes.as_ptr().cast(), length) };
+    (!bio.is_null()).then_some(bio)
+}
+
 /// Parses a private key from PEM, optionally with a passphrase.
 ///
 /// This calls `PEM_read_bio_PrivateKey` directly instead of using
@@ -39,53 +93,11 @@ use crate::pkey::PKey;
 /// It also means no prompt: with a null callback OpenSSL falls back to its default
 /// UI method, which reads stdin.
 pub fn parse_private_key_pem(bytes: &[u8], passphrase: Option<&[u8]>) -> ParseResult<PKey> {
-    /// What the C callback receives as `user_data`.
-    struct CallbackData<'a> {
-        passphrase: Option<&'a [u8]>,
-    }
-
-    /// `pem_password_cb`: fills `buf` and returns the length, or -1 when no
-    /// passphrase is available.
-    unsafe extern "C" fn password_callback(
-        buf: *mut std::ffi::c_char,
-        size: std::ffi::c_int,
-        _rwflag: std::ffi::c_int,
-        user_data: *mut std::ffi::c_void,
-    ) -> std::ffi::c_int {
-        if user_data.is_null() || size <= 0 {
-            return -1;
-        }
-        // SAFETY: `user_data` is the `&CallbackData` `parse_private_key_pem`
-        // passes below, which outlives this call.
-        let data = unsafe { &*(user_data as *const CallbackData<'_>) };
-        let Some(passphrase) = data.passphrase else {
-            return -1;
-        };
-        let size = size as usize;
-        if passphrase.len() > size {
-            return -1;
-        }
-        // SAFETY: `buf` points at `size` writable bytes, and the copy is bounded
-        // by both the passphrase and that size.
-        unsafe {
-            std::ptr::copy_nonoverlapping(passphrase.as_ptr().cast(), buf, passphrase.len());
-        }
-        passphrase.len() as std::ffi::c_int
-    }
-
-    // A `CString` copy is not needed: `BIO_new_mem_buf` does not require a NUL
-    // terminator, and reading past the end of a live slice is what the explicit
-    // length prevents.
-    // SAFETY: `bytes` is live for the whole call and its length is passed with
-    // it; the returned BIO owns a copy and is freed exactly once below.
-    let bio = unsafe {
-        openssl_sys::BIO_new_mem_buf(bytes.as_ptr().cast(), bytes.len().try_into().unwrap_or(0))
-    };
-    if bio.is_null() {
+    let Some(bio) = bio_from_bytes(bytes) else {
         clear_error();
         return Err(failure(false));
-    }
-    let data = CallbackData { passphrase };
+    };
+    let data = PassphraseCallbackData { passphrase };
     // SAFETY: `bio` is live; the callback signature matches `pem_password_cb`,
     // and `data` outlives the call.
     let key = unsafe {
@@ -93,7 +105,9 @@ pub fn parse_private_key_pem(bytes: &[u8], passphrase: Option<&[u8]>) -> ParseRe
             bio,
             std::ptr::null_mut(),
             Some(password_callback),
-            (&data as *const CallbackData<'_>).cast_mut().cast(),
+            (&data as *const PassphraseCallbackData<'_>)
+                .cast_mut()
+                .cast(),
         )
     };
     // SAFETY: `bio` came from `BIO_new_mem_buf` and is owned here; nothing else
@@ -115,30 +129,127 @@ pub fn parse_private_key_pem(bytes: &[u8], passphrase: Option<&[u8]>) -> ParseRe
     Ok(PKey::from_private(key))
 }
 
+/// Whether a DER block is an `EncryptedPrivateKeyInfo`.
+///
+/// `ncrypto`'s `IsEncryptedPrivateKeyInfo`: both it and `PrivateKeyInfo` start
+/// with a `SEQUENCE`, and the two are told apart by the first content byte. A
+/// `PrivateKeyInfo` begins with the `version` INTEGER (`0x02`, always 0); an
+/// `EncryptedPrivateKeyInfo` begins with the `AlgorithmIdentifier` SEQUENCE
+/// (`0x30`). An empty or non-SEQUENCE buffer answers `false`, which lets the
+/// plain PKCS#8 reader produce the error instead of this check inventing one.
+fn is_encrypted_private_key_info(bytes: &[u8]) -> bool {
+    match asn1_sequence(bytes) {
+        Some((offset, length)) => {
+            length >= 1 && bytes.get(offset).is_some_and(|byte| *byte != 0x02)
+        }
+        None => false,
+    }
+}
+
 /// Parses a private key from DER.
-pub fn parse_private_key_der(bytes: &[u8], encoding: KeyEncoding) -> ParseResult<PKey> {
-    let key = match encoding {
-        // SEC1 is EC-only, and `d2i_ECPrivateKey` on an RSA key fails with a
-        // parse error rather than a type error, which is the right outcome.
-        KeyEncoding::Sec1 => OpenSslPKey::private_key_from_der(bytes),
-        // PKCS#1 is RSA-only. `PKey::private_key_from_der` is `d2i_PrivateKey`,
-        // which reads the type-specific form — exactly PKCS#1 for RSA — whereas
-        // `private_key_from_pkcs8` insists on the PKCS#8 wrapper. Using the
-        // PKCS#8 reader for `KeyEncoding::Pkcs1` would reject every PKCS#1 key
-        // `generateKeyPairSync` writes.
-        KeyEncoding::Pkcs1 => OpenSslPKey::private_key_from_der(bytes),
-        // PKCS#8, and also the default when the caller did not name one: Node
-        // treats an unnamed type as PKCS#1 for the generate context and as
-        // PKCS#8 for input, and `d2i_AutoPrivateKey` accepts both.
-        KeyEncoding::Pkcs8 | KeyEncoding::Spki => OpenSslPKey::private_key_from_der(bytes),
-    };
+///
+/// The three encodings Node accepts are three different readers, and which one
+/// runs decides both the accepted bytes and the error reported:
+///
+/// * PKCS#1 and SEC1 are type-specific structures read by `d2i_PrivateKey_bio`,
+///   which is `PKey::private_key_from_der`'s `d2i_AutoPrivateKey` here.
+/// * PKCS#8 is a `PrivateKeyInfo` *wrapper*, and an encrypted one is a different
+///   structure again. `d2i_AutoPrivateKey` reads neither: it reports
+///   `DECODER routines::unsupported` for an `EncryptedPrivateKeyInfo`, which is
+///   exactly the failure that made `createPrivateKey({format: 'der', type:
+///   'pkcs8', passphrase})` throw for a key its own PEM form imported. Node's
+///   `ncrypto::EVPKeyPointer::TryParsePrivateKey` branches on
+///   `IsEncryptedPrivateKeyInfo` and calls `d2i_PKCS8PrivateKey_bio` with the
+///   passphrase callback for the encrypted form, and this mirrors that.
+///
+/// `SPKI` is not a private-key encoding at all, so it reports `Failed` the way
+/// Node's `switch` default does rather than being quietly accepted.
+pub fn parse_private_key_der(
+    bytes: &[u8],
+    encoding: KeyEncoding,
+    passphrase: Option<&[u8]>,
+) -> ParseResult<PKey> {
+    match encoding {
+        // `d2i_PrivateKey_bio` on a type-specific structure. SEC1 is EC-only and
+        // PKCS#1 is RSA-only, but the reader keys off the structure it finds, so
+        // the wrong pairing fails with a parse error rather than a type error —
+        // the outcome Node produces for the same input.
+        KeyEncoding::Pkcs1 | KeyEncoding::Sec1 => {
+            let key = OpenSslPKey::private_key_from_der(bytes);
+            finish_der(key, passphrase)
+        }
+        KeyEncoding::Pkcs8 => {
+            if is_encrypted_private_key_info(bytes) {
+                return parse_encrypted_pkcs8_der(bytes, passphrase);
+            }
+            // The unencrypted form is a `PrivateKeyInfo`, which
+            // `d2i_PKCS8_PRIV_KEY_INFO` reads and `EVP_PKCS82PKEY` unwraps —
+            // both inside this helper. Using `d2i_AutoPrivateKey` here would
+            // also accept a bare SEC1 or PKCS#1 blob under `type: 'pkcs8'`,
+            // which Node rejects with `ERR_OSSL_ASN1_WRONG_TAG`.
+            let key = OpenSslPKey::private_key_from_pkcs8(bytes);
+            finish_der(key, passphrase)
+        }
+        KeyEncoding::Spki => {
+            clear_error();
+            Err(failure(false))
+        }
+    }
+}
+
+/// Classifies a DER read that went through the `openssl` crate's helpers.
+///
+/// Those helpers drain OpenSSL's queue into the returned `ErrorStack`, so the
+/// classification has to come from the stack; `had_passphrase` is what
+/// distinguishes `NEED_PASSPHRASE` from a decrypt failure.
+fn finish_der(
+    key: Result<OpenSslPKey<openssl::pkey::Private>, openssl::error::ErrorStack>,
+    passphrase: Option<&[u8]>,
+) -> ParseResult<PKey> {
     match key {
         Ok(key) => Ok(PKey::from_private(key)),
-        // `PKey::private_key_from_der` drains the queue into its `ErrorStack`, so
-        // the failure is classified from there rather than from the (now empty)
-        // queue. DER carries no passphrase, so `had_passphrase` is false.
-        Err(error) => Err(crate::error::from_error_stack(&error, false)),
+        Err(error) => Err(crate::error::from_error_stack(&error, passphrase.is_some())),
     }
+}
+
+/// `d2i_PKCS8PrivateKey_bio`, with Node's passphrase callback.
+///
+/// The callback is the same one the PEM path uses, so a missing passphrase
+/// raises `PEM_R_BAD_PASSWORD_READ` here too and becomes
+/// `ERR_MISSING_PASSPHRASE` rather than an opaque decoder failure.
+fn parse_encrypted_pkcs8_der(bytes: &[u8], passphrase: Option<&[u8]>) -> ParseResult<PKey> {
+    let Some(bio) = bio_from_bytes(bytes) else {
+        clear_error();
+        return Err(failure(false));
+    };
+    let data = PassphraseCallbackData { passphrase };
+    // SAFETY: `bio` is live, the callback signature matches `pem_password_cb`,
+    // and `data` outlives the call.
+    let key = unsafe {
+        openssl_sys::d2i_PKCS8PrivateKey_bio(
+            bio,
+            std::ptr::null_mut(),
+            Some(password_callback),
+            (&data as *const PassphraseCallbackData<'_>)
+                .cast_mut()
+                .cast(),
+        )
+    };
+    // SAFETY: `bio` came from `BIO_new_mem_buf` and is owned here; nothing else
+    // holds it.
+    unsafe { openssl_sys::BIO_free_all(bio) };
+    if key.is_null() {
+        return Err(failure_with_passphrase(false, passphrase.is_some()));
+    }
+    // SAFETY: `key` is a new reference from `d2i_PKCS8PrivateKey_bio`, adopted
+    // by `from_ptr` exactly once.
+    use foreign_types::ForeignType;
+    let key = unsafe { OpenSslPKey::from_ptr(key) };
+    // A successful read can still leave the "I asked for a passphrase" entries
+    // behind; Node clears them so the next `ThrowCryptoError` does not report an
+    // unrelated reason.
+    clear_error();
+    Ok(PKey::from_private(key))
 }
 
 /// Parses a public key from PEM, reporting `NotRecognized` for a private key.
@@ -244,13 +355,15 @@ pub fn parse_public_or_private_key(
                 // `is_public` branch: `!IsRSAPrivateKey(buffer)`.
                 KeyEncoding::Pkcs1 => {
                     if is_rsa_private_der(bytes) {
-                        parse_private_key_der(bytes, encoding)
+                        parse_private_key_der(bytes, encoding, passphrase)
                     } else {
                         parse_public_key_der(bytes, encoding)
                     }
                 }
                 KeyEncoding::Spki => parse_public_key_der(bytes, encoding),
-                KeyEncoding::Pkcs8 | KeyEncoding::Sec1 => parse_private_key_der(bytes, encoding),
+                KeyEncoding::Pkcs8 | KeyEncoding::Sec1 => {
+                    parse_private_key_der(bytes, encoding, passphrase)
+                }
             }
         }
         _ => Err(failure(true)),
@@ -262,9 +375,11 @@ pub fn parse_private_key(bytes: &[u8], config: &PrivateKeyEncoding) -> ParseResu
     let format = config.format.unwrap_or(KeyFormat::Pem);
     match format {
         KeyFormat::Pem => parse_private_key_pem(bytes, config.passphrase.as_deref()),
-        KeyFormat::Der => {
-            parse_private_key_der(bytes, config.encoding.unwrap_or(KeyEncoding::Pkcs8))
-        }
+        KeyFormat::Der => parse_private_key_der(
+            bytes,
+            config.encoding.unwrap_or(KeyEncoding::Pkcs8),
+            config.passphrase.as_deref(),
+        ),
         _ => Err(failure(true)),
     }
 }
@@ -482,9 +597,110 @@ mod tests {
         assert!(!parse_public_key_der(&spki, KeyEncoding::Spki)
             .expect("SPKI is a public encoding")
             .has_private());
-        assert!(parse_private_key_der(&pkcs8, KeyEncoding::Pkcs8)
+        assert!(parse_private_key_der(&pkcs8, KeyEncoding::Pkcs8, None)
             .expect("PKCS#8 is a private encoding")
             .has_private());
+    }
+
+    #[test]
+    fn pkcs8_der_rejects_a_bare_type_specific_blob() {
+        // Node routes an unencrypted PKCS#8 through `d2i_PKCS8_PRIV_KEY_INFO`,
+        // so a PKCS#1 blob under `type: 'pkcs8'` fails with
+        // `ERR_OSSL_ASN1_WRONG_TAG` instead of being auto-detected. Matching
+        // that matters because it is observable, and because a permissive
+        // reader here would accept the very SEC1 blob that `sec1` used to
+        // mislabel.
+        let key = OpenSslPKey::private_key_from_pem(RSA_PRIVATE_PEM.as_bytes()).expect("fixture");
+        let pkcs1 = key
+            .rsa()
+            .expect("RSA")
+            .private_key_to_der()
+            .expect("exports");
+        let error = parse_private_key_der(&pkcs1, KeyEncoding::Pkcs8, None).expect_err("wrong tag");
+        assert_eq!(error.kind, crate::error::ParseError::Failed);
+    }
+
+    #[test]
+    fn spki_is_not_a_private_key_encoding() {
+        // `TryParsePrivateKey`'s `switch` has no `SPKI` case and falls through
+        // to `FAILED`. Auto-detecting instead would import a public key through
+        // `createPrivateKey({format: 'der', type: 'spki'})`.
+        let key = OpenSslPKey::private_key_from_pem(RSA_PRIVATE_PEM.as_bytes()).expect("fixture");
+        let spki = key.public_key_to_der().expect("exports");
+        let error = parse_private_key_der(&spki, KeyEncoding::Spki, None).expect_err("not private");
+        assert_eq!(error.kind, crate::error::ParseError::Failed);
+    }
+
+    #[test]
+    fn an_encrypted_pkcs8_der_needs_its_passphrase() {
+        // The whole point of the `d2i_PKCS8PrivateKey_bio` branch: this blob is
+        // an `EncryptedPrivateKeyInfo`, and `d2i_AutoPrivateKey` cannot read it
+        // at all, so before this routing change every passphrase produced
+        // `DECODER routines::unsupported`.
+        let key = OpenSslPKey::private_key_from_pem(RSA_PRIVATE_PEM.as_bytes()).expect("fixture");
+        let encrypted = key
+            .private_key_to_pkcs8_passphrase(openssl::symm::Cipher::aes_256_cbc(), b"pw")
+            .expect("encrypts");
+        assert!(
+            is_encrypted_private_key_info(&encrypted),
+            "the fixture must have the shape the branch keys off"
+        );
+
+        let missing =
+            parse_private_key_der(&encrypted, KeyEncoding::Pkcs8, None).expect_err("no passphrase");
+        assert_eq!(
+            missing.kind,
+            crate::error::ParseError::NeedPassphrase,
+            "a missing passphrase is ERR_MISSING_PASSPHRASE, not a decoder failure"
+        );
+
+        let wrong = parse_private_key_der(&encrypted, KeyEncoding::Pkcs8, Some(b"nope"))
+            .expect_err("wrong passphrase");
+        assert_eq!(wrong.kind, crate::error::ParseError::Failed);
+
+        let parsed = parse_private_key_der(&encrypted, KeyEncoding::Pkcs8, Some(b"pw"))
+            .expect("the right passphrase reads it");
+        assert!(parsed.has_private());
+        assert_eq!(parsed.bits(), 2048);
+    }
+
+    #[test]
+    fn an_unencrypted_pkcs8_is_not_mistaken_for_an_encrypted_one() {
+        // `PrivateKeyInfo` starts with the version INTEGER; the check that
+        // routes to the encrypted reader has to answer false for it, or every
+        // plain PKCS#8 key would go through the passphrase path.
+        let key = OpenSslPKey::private_key_from_pem(RSA_PRIVATE_PEM.as_bytes()).expect("fixture");
+        let pkcs8 = key.private_key_to_pkcs8().expect("exports");
+        assert!(!is_encrypted_private_key_info(&pkcs8));
+        // Arbitrary text and an empty buffer are not a SEQUENCE at all.
+        assert!(!is_encrypted_private_key_info(b""));
+        assert!(!is_encrypted_private_key_info(b"not a key"));
+    }
+
+    #[test]
+    fn an_encrypted_pkcs8_der_imports_as_pem_does() {
+        // The regression this whole branch exists for: the PEM form always
+        // worked and the DER form did not, so the two are asserted side by side.
+        let key = OpenSslPKey::private_key_from_pem(RSA_PRIVATE_PEM.as_bytes()).expect("fixture");
+        let der = key
+            .private_key_to_pkcs8_passphrase(openssl::symm::Cipher::aes_256_cbc(), b"pw")
+            .expect("encrypts");
+        let pem = key
+            .private_key_to_pem_pkcs8_passphrase(openssl::symm::Cipher::aes_256_cbc(), b"pw")
+            .expect("encrypts");
+
+        let from_der = parse_private_key_der(&der, KeyEncoding::Pkcs8, Some(b"pw"))
+            .expect("the DER form imports");
+        let from_pem = parse_private_key(
+            &pem,
+            &PrivateKeyEncoding {
+                passphrase: Some(b"pw".to_vec()),
+                ..Default::default()
+            },
+        )
+        .expect("the PEM form imports");
+        assert_eq!(from_der.bits(), from_pem.bits());
+        assert!(from_der.eq(&from_pem) == crate::pkey::EqualResult::Equal);
     }
 
     #[test]
