@@ -1,0 +1,113 @@
+{"name":"descriptor-protocol","value":"get:function set:undefined w:- e:true c:false"}
+{"name":"descriptor-username","value":"get:function set:undefined w:- e:true c:false"}
+{"name":"descriptor-password","value":"get:function set:undefined w:- e:true c:false"}
+{"name":"descriptor-hostname","value":"get:function set:undefined w:- e:true c:false"}
+{"name":"descriptor-port","value":"get:function set:undefined w:- e:true c:false"}
+{"name":"descriptor-pathname","value":"get:function set:undefined w:- e:true c:false"}
+{"name":"descriptor-search","value":"get:function set:undefined w:- e:true c:false"}
+{"name":"descriptor-hash","value":"get:function set:undefined w:- e:true c:false"}
+{"name":"descriptor-hasRegExpGroups","value":"get:function set:undefined w:- e:true c:false"}
+{"name":"prototype-names","value":["protocol","username","password","hostname","port","pathname","search","hash","hasRegExpGroups","exec","test","constructor"]}
+{"name":"prototype-symbols","value":["Symbol(Symbol.toStringTag)"]}
+{"name":"prototype-toStringTag","value":"value:string w:false e:false c:true"}
+{"name":"method-exec","value":"value:function w:true e:true c:true"}
+{"name":"method-test","value":"value:function w:true e:true c:true"}
+{"name":"constructor-length","value":0}
+{"name":"constructor-name","value":"URLPattern"}
+{"name":"constructor-length-prop","value":0}
+{"name":"component-object-form","value":{"protocol":"*","username":"*","password":"*","hostname":"*","port":"*","pathname":"/books/:id","search":"*","hash":"*"}}
+{"name":"component-defaults","value":{"protocol":"*","username":"*","password":"*","hostname":"*","port":"*","pathname":"*","search":"*","hash":"*"}}
+{"name":"component-null-input","value":{"protocol":"*","username":"*","password":"*","hostname":"*","port":"*","pathname":"*","search":"*","hash":"*"}}
+{"name":"component-string-absolute","value":{"protocol":"https","username":"user:pw","password":"*","hostname":"example.com","port":"8080","pathname":"/a","search":"q=1","hash":"h"}}
+{"name":"component-string-no-path","value":{"protocol":"https","username":"*","password":"*","hostname":"example.com","port":"","pathname":"*","search":"*","hash":"*"}}
+{"name":"component-string-empty-search","value":{"protocol":"https","username":"*","password":"*","hostname":"example.com","port":"","pathname":"/a","search":"","hash":"*"}}
+{"name":"component-string-empty-hash","value":{"protocol":"https","username":"*","password":"*","hostname":"example.com","port":"","pathname":"/a","search":"","hash":""}}
+{"name":"component-string-uppercase","value":{"protocol":"https","username":"*","password":"*","hostname":"e.com","port":"","pathname":"/X","search":"*","hash":"*"}}
+{"name":"component-string-dot-segments","value":{"protocol":"https","username":"*","password":"*","hostname":"example.com","port":"","pathname":"/b","search":"*","hash":"*"}}
+{"name":"component-string-space-encodes","value":{"protocol":"https","username":"*","password":"*","hostname":"example.com","port":"","pathname":"/a%20b","search":"*","hash":"*"}}
+{"name":"component-string-default-port","value":{"protocol":"https","username":"*","password":"*","hostname":"example.com","port":"","pathname":"/x","search":"*","hash":"*"}}
+{"name":"component-empty-port","value":{"protocol":"*","username":"*","password":"*","hostname":"*","port":"","pathname":"/a","search":"*","hash":"*"}}
+{"name":"component-empty-search","value":{"protocol":"*","username":"*","password":"*","hostname":"*","port":"*","pathname":"*","search":"","hash":"*"}}
+{"name":"component-empty-hash","value":{"protocol":"*","username":"*","password":"*","hostname":"*","port":"*","pathname":"*","search":"*","hash":""}}
+{"name":"component-hostname-lowercased","value":{"protocol":"*","username":"*","password":"*","hostname":"e.com","port":"*","pathname":"*","search":"*","hash":"*"}}
+{"name":"component-brace-literal","value":{"protocol":"*","username":"*","password":"*","hostname":"*","port":"*","pathname":"/b/x,y","search":"*","hash":"*"}}
+{"name":"component-base-merges-relative","value":{"protocol":"https","username":"*","password":"*","hostname":"example.com","port":"","pathname":"/a/c","search":"*","hash":"*"}}
+{"name":"component-base-absolute-path","value":{"protocol":"https","username":"*","password":"*","hostname":"example.com","port":"","pathname":"/c","search":"*","hash":"*"}}
+{"name":"hasRegExpGroups-plain","value":false}
+{"name":"hasRegExpGroups-regexp","value":true}
+{"name":"hasRegExpGroups-group","value":false}
+{"name":"getter-borrowed-receiver","value":"throw TypeError undefined Illegal invocation"}
+{"name":"getter-on-prototype","value":"throw TypeError undefined Illegal invocation"}
+{"name":"test-borrowed-receiver","value":"throw TypeError undefined Illegal invocation"}
+{"name":"exec-borrowed-receiver","value":"throw TypeError undefined Illegal invocation"}
+{"name":"assign-in-strict","value":"throw TypeError undefined Cannot assign to read only property 'pathname' of object '#<URLPattern>'"}
+{"name":"assign-sloppy","value":"/a"}
+{"name":"call-without-new","value":"throw TypeError ERR_CONSTRUCT_CALL_REQUIRED Cannot call constructor without `new`"}
+{"name":"instance-own-properties","value":[]}
+{"name":"instance-keys","value":[]}
+{"name":"test-literal-true","value":true}
+{"name":"exec-literal-true-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"https","groups":{}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"example.com","groups":{}},"port":{"input":"","groups":{"0":""}},"pathname":{"input":"/a","groups":{}},"search":{"input":"","groups":{"0":""}},"hash":{"input":"","groups":{"0":""}}},"inputs":["https://example.com/a"]}}
+{"name":"test-literal-false","value":false}
+{"name":"exec-literal-false","value":null}
+{"name":"test-wildcard-component","value":true}
+{"name":"exec-wildcard-component-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"https","groups":{"0":"https"}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"example.com","groups":{"0":"example.com"}},"port":{"input":"","groups":{"0":""}},"pathname":{"input":"/a/b","groups":{"0":"/a/b"}},"search":{"input":"","groups":{"0":""}},"hash":{"input":"","groups":{"0":""}}},"inputs":["https://example.com/a/b"]}}
+{"name":"test-named-group","value":true}
+{"name":"exec-named-group-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"https","groups":{"0":"https"}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"example.com","groups":{"0":"example.com"}},"port":{"input":"","groups":{"0":""}},"pathname":{"input":"/b/42","groups":{"id":"42"}},"search":{"input":"","groups":{"0":""}},"hash":{"input":"","groups":{"0":""}}},"inputs":["https://example.com/b/42"]}}
+{"name":"test-named-group-no-match","value":false}
+{"name":"exec-named-group-no-match","value":null}
+{"name":"test-star-middle","value":true}
+{"name":"exec-star-middle-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"https","groups":{"0":"https"}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"example.com","groups":{"0":"example.com"}},"port":{"input":"","groups":{"0":""}},"pathname":{"input":"/b/x/y","groups":{"0":"x/y"}},"search":{"input":"","groups":{"0":""}},"hash":{"input":"","groups":{"0":""}}},"inputs":["https://example.com/b/x/y"]}}
+{"name":"test-star-prefix","value":true}
+{"name":"exec-star-prefix-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"https","groups":{"0":"https"}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"example.com","groups":{"0":"example.com"}},"port":{"input":"","groups":{"0":""}},"pathname":{"input":"/b/xyz","groups":{"0":"yz"}},"search":{"input":"","groups":{"0":""}},"hash":{"input":"","groups":{"0":""}}},"inputs":["https://example.com/b/xyz"]}}
+{"name":"test-regexp-group","value":true}
+{"name":"exec-regexp-group-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"https","groups":{"0":"https"}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"example.com","groups":{"0":"example.com"}},"port":{"input":"","groups":{"0":""}},"pathname":{"input":"/b/42","groups":{"0":"42"}},"search":{"input":"","groups":{"0":""}},"hash":{"input":"","groups":{"0":""}}},"inputs":["https://example.com/b/42"]}}
+{"name":"test-regexp-group-miss","value":false}
+{"name":"exec-regexp-group-miss","value":null}
+{"name":"test-hostname-wildcard","value":true}
+{"name":"exec-hostname-wildcard-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"https","groups":{"0":"https"}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"a.example.com","groups":{"0":"a"}},"port":{"input":"","groups":{"0":""}},"pathname":{"input":"/x","groups":{"0":"/x"}},"search":{"input":"","groups":{"0":""}},"hash":{"input":"","groups":{"0":""}}},"inputs":["https://a.example.com/x"]}}
+{"name":"test-port-empty","value":true}
+{"name":"exec-port-empty-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"https","groups":{"0":"https"}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"example.com","groups":{"0":"example.com"}},"port":{"input":"","groups":{}},"pathname":{"input":"/a","groups":{}},"search":{"input":"","groups":{"0":""}},"hash":{"input":"","groups":{"0":""}}},"inputs":["https://example.com/a"]}}
+{"name":"test-port-empty-rejects","value":false}
+{"name":"exec-port-empty-rejects","value":null}
+{"name":"test-search-literal","value":true}
+{"name":"exec-search-literal-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"https","groups":{"0":"https"}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"example.com","groups":{"0":"example.com"}},"port":{"input":"","groups":{"0":""}},"pathname":{"input":"/a","groups":{}},"search":{"input":"q=1","groups":{}},"hash":{"input":"","groups":{"0":""}}},"inputs":["https://example.com/a?q=1"]}}
+{"name":"test-empty-pathname","value":false}
+{"name":"exec-empty-pathname","value":null}
+{"name":"test-no-arguments","value":true}
+{"name":"exec-no-arguments-result","value":{"prototype":"null","keys":["hash","hostname","inputs","password","pathname","port","protocol","search","username"],"components":{"protocol":{"input":"","groups":{"0":""}},"username":{"input":"","groups":{"0":""}},"password":{"input":"","groups":{"0":""}},"hostname":{"input":"","groups":{"0":""}},"port":{"input":"","groups":{"0":""}},"pathname":{"input":"","groups":{"0":""}},"search":{"input":"","groups":{"0":""}},"hash":{"input":"","groups":{"0":""}}},"inputs":[{}]}}
+{"name":"group-order/:a/:b/:c","value":["c","b","a"]}
+{"name":"group-order/:a/:b/:c/:d","value":["b","d","c","a"]}
+{"name":"group-order/:x/:y/:z","value":["z","y","x"]}
+{"name":"group-order/*/*/*","value":["0","1","2"]}
+{"name":"group-order/*/*","value":["0","1"]}
+{"name":"exec-string-inputs","value":["/c","https://example.com/a/b"]}
+{"name":"exec-object-inputs","value":[{"hostname":"example.com","pathname":"/a","protocol":"https"}]}
+{"name":"error-numeric-input","value":"throw TypeError ERR_INVALID_ARG_TYPE Input must be an object or a string"}
+{"name":"error-relative-without-base","value":"throw TypeError ERR_INVALID_URL_PATTERN Failed to construct URLPattern"}
+{"name":"error-bad-port","value":"throw TypeError ERR_INVALID_URL_PATTERN Failed to construct URLPattern"}
+{"name":"error-port-not-a-number","value":"throw TypeError ERR_INVALID_URL_PATTERN Failed to construct URLPattern"}
+{"name":"error-object-with-base","value":"throw TypeError ERR_INVALID_URL_PATTERN Failed to construct URLPattern"}
+{"name":"error-test-numeric","value":"throw TypeError ERR_INVALID_ARG_TYPE URLPattern input needs to be a string or an object"}
+{"name":"error-test-base-number","value":"throw TypeError ERR_INVALID_ARG_TYPE baseURL must be a string"}
+{"name":"error-test-object-with-base","value":"throw TypeError ERR_OPERATION_FAILED Failed to test URLPattern"}
+{"name":"error-exec-object-with-base","value":"throw TypeError ERR_OPERATION_FAILED Failed to exec URLPattern"}
+{"name":"relative-input-no-base","value":"/a/b"}
+{"name":"relative-input-no-base-components","value":"*"}
+{"name":"empty-input-path","value":""}
+{"name":"empty-input-test","value":false}
+{"name":"caret-path-pattern","value":"/x%5Ey"}
+{"name":"caret-path-match","value":true}
+{"name":"caret-path-input","value":"/x%5Ey"}
+{"name":"caret-opaque-input","value":"/x%5Ey"}
+{"name":"caret-opaque-match","value":true}
+{"name":"ipv6-hostname-rejected","value":"throw TypeError ERR_INVALID_URL_PATTERN Failed to construct URLPattern"}
+{"name":"ipv6-hostname-bare-rejected","value":"throw TypeError ERR_INVALID_URL_PATTERN Failed to construct URLPattern"}
+{"name":"ipv6-string-rejected","value":"throw TypeError ERR_INVALID_URL_PATTERN Failed to construct URLPattern"}
+{"name":"unicode-group-name","value":"/:名前"}
+{"name":"unicode-group-name-test","value":true}
+{"name":"digit-group-name-rejected","value":"throw TypeError ERR_INVALID_URL_PATTERN Failed to construct URLPattern"}
+{"name":"global-typeof","value":"function"}
+{"name":"global-descriptor","value":"value:function w:true e:false c:true"}
+{"name":"global-same-as-require","value":true}
+{"name":"global-constructs","value":"/books/:id"}
+{"name":"global-test","value":true}

@@ -1364,8 +1364,10 @@ dependencies = [
 name = "rn-bind-url-pattern"
 version = "0.1.0"
 dependencies = [
+ "ada-url",
  "rn-core",
  "rn-v8-sys",
+ "unicode-ident",
 ]
 
 [[package]]

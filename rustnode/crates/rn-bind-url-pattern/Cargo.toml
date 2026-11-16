@@ -10,3 +10,20 @@ description = "internalBinding('url_pattern') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+# ada, the library `src/node_url.cc` and `src/node_url_pattern.cc` are both
+# built on. Node's URLPattern never calls a second WHATWG parser: it hands
+# `ada::url_pattern` a `v8::RegExp` and lets ada's own tokenizer, canonicalizers
+# and URL parser do the work. Using the same library here is what makes a
+# `baseURL`, an input URL and a pattern component canonicalise by the same code
+# Node runs — including rules this crate would otherwise have to restate, such as
+# U+005E belonging to the path percent-encode set.
+#
+# `ada-url` compiles the C++ with `ADA_INCLUDE_URL_PATTERN=0` and exposes no
+# pattern API, so the pattern algorithm is still ported in `src/pattern.rs`; only
+# the URL parsing and the percent-encode sets come from ada.
+ada-url = "4.0"
+# `valid_name_code_point` admits Unicode `ID_Start`/`ID_Continue`, not just
+# ASCII, so a pattern may name a group `:名前`. `unicode-ident` carries exactly
+# those two tables; it is already in the graph through `proc-macro2`, so naming
+# it adds no artifact.
+unicode-ident = "1"

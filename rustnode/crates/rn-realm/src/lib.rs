@@ -441,8 +441,17 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
 
     // `URL` and `URLSearchParams` are not lazy in Node: `internal/url` is small
     // and needed by the loader itself.
+    //
+    // `URLPattern` comes from the same module and is published the same way.
+    // Node installs it from `internal/bootstrap/web/exposed-window-or-worker.js`
+    // with `exposeInterface(globalThis, 'URLPattern', URLPattern)`, which is a
+    // plain non-enumerable data property — `exposeInterface`, not
+    // `exposeLazyInterfaces`, because `internal/url` is already loaded by the
+    // time that file runs. `internal/url` is the module that destructures
+    // `URLPattern` from `internalBinding('url_pattern')`, so it is already
+    // resident here for the same reason `URL` is.
     if let Some(url) = call_require(scope, require, "internal/url") {
-        for name in ["URL", "URLSearchParams"] {
+        for name in ["URL", "URLSearchParams", "URLPattern"] {
             if let Some(value) = get_property(scope, url, name) {
                 let _ = set_global(scope, global, name, value);
             }
