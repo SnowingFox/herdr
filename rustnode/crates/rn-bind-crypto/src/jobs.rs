@@ -74,12 +74,39 @@ fn install_class<'s>(
     Ok(())
 }
 
+/// Reports a call without `new` as a catchable `TypeError`.
+///
+/// Returns `true` when the call is a construct call and the constructor should
+/// continue. The message matches `ERR_INVALID_THIS`'s shape rather than
+/// inventing a code: `Class constructor X cannot be invoked without 'new'` is
+/// what a JavaScript `class` throws, and `internal/errors` has no dedicated
+/// template for a native constructor's misuse.
+fn require_new(scope: &mut v8::PinScope<'_, '_>, args: &v8::FunctionCallbackArguments<'_>) -> bool {
+    if args.is_construct_call() {
+        return true;
+    }
+    crate::install::throw_type_error(scope, "Class constructor cannot be invoked without 'new'");
+    false
+}
+
 /// `new RandomBytesJob(mode, buffer, offset, size)`.
 fn random_bytes_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    // A plain call must not reach `set_aligned_pointer_in_internal_field`: for a
+    // call without `new` V8's `This()` is an ordinary object with no internal
+    // fields, and the write is `v8::Object::SetAlignedPointerInInternalField:
+    // Internal field out of bounds`, which *aborts the process* rather than
+    // throwing. Node aborts here too (`CryptoJob`'s constructor is reached
+    // through `CHECK(args.IsConstructCall())`), but the tree's policy after #98
+    // is that a misuse is a catchable `TypeError` instead of a crash, and
+    // `tools/no-new-audit.py` enforces it — this constructor was the single
+    // remaining abort in the whole registry when it landed.
+    if !require_new(scope, &args) {
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let Some(mode) = random_jobs::mode_argument(scope, &args) else {
         return;
@@ -101,6 +128,18 @@ fn random_prime_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    // A plain call must not reach `set_aligned_pointer_in_internal_field`: for a
+    // call without `new` V8's `This()` is an ordinary object with no internal
+    // fields, and the write is `v8::Object::SetAlignedPointerInInternalField:
+    // Internal field out of bounds`, which *aborts the process* rather than
+    // throwing. Node aborts here too (`CryptoJob`'s constructor is reached
+    // through `CHECK(args.IsConstructCall())`), but the tree's policy after #98
+    // is that a misuse is a catchable `TypeError` instead of a crash, and
+    // `tools/no-new-audit.py` enforces it — this constructor was the single
+    // remaining abort in the whole registry when it landed.
+    if !require_new(scope, &args) {
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let Some(mode) = random_jobs::mode_argument(scope, &args) else {
         return;
@@ -118,6 +157,18 @@ fn check_prime_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    // A plain call must not reach `set_aligned_pointer_in_internal_field`: for a
+    // call without `new` V8's `This()` is an ordinary object with no internal
+    // fields, and the write is `v8::Object::SetAlignedPointerInInternalField:
+    // Internal field out of bounds`, which *aborts the process* rather than
+    // throwing. Node aborts here too (`CryptoJob`'s constructor is reached
+    // through `CHECK(args.IsConstructCall())`), but the tree's policy after #98
+    // is that a misuse is a catchable `TypeError` instead of a crash, and
+    // `tools/no-new-audit.py` enforces it — this constructor was the single
+    // remaining abort in the whole registry when it landed.
+    if !require_new(scope, &args) {
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let Some(mode) = random_jobs::mode_argument(scope, &args) else {
         return;
@@ -167,6 +218,18 @@ fn argon2_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    // A plain call must not reach `set_aligned_pointer_in_internal_field`: for a
+    // call without `new` V8's `This()` is an ordinary object with no internal
+    // fields, and the write is `v8::Object::SetAlignedPointerInInternalField:
+    // Internal field out of bounds`, which *aborts the process* rather than
+    // throwing. Node aborts here too (`CryptoJob`'s constructor is reached
+    // through `CHECK(args.IsConstructCall())`), but the tree's policy after #98
+    // is that a misuse is a catchable `TypeError` instead of a crash, and
+    // `tools/no-new-audit.py` enforces it — this constructor was the single
+    // remaining abort in the whole registry when it landed.
+    if !require_new(scope, &args) {
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let Some(mode) = random_jobs::mode_argument(scope, &args) else {
         return;
