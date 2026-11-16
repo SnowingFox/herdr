@@ -205,6 +205,19 @@ step "binding members accept new exactly when node's do"
 # `messaging.DOMException`, ...) are replaced there by the JavaScript layer and
 # judging the native install alone would report them as defects.
 #
+# The prototype half reads `tools/constructible-prototypes.json`, which records
+# every prototype method *and its kind*. It has to: Node installs these with
+# `SetProtoMethod`, i.e. `kThrow`, so a recording filtered to the constructible
+# ones is empty for every class and the comparison runs zero times. That is what
+# this step used to do, and it printed a clean `0 prototype method(s)` for a
+# measurement it had not made. The control below is what keeps that from coming
+# back: it requires the shape of the fixture, a non-zero comparison count, and
+# the audit's refusal to answer when the count would be zero.
+#
+# The control runs first because the audit's own exit status is what the gate
+# enforces; a step that cannot fail is the defect it guards.
+./tools/constructible-audit.test.sh
+
 # A bare statement, so its status is the gate's.
 python3 tools/constructible-audit.py --recorded tools/constructible-members.json
 

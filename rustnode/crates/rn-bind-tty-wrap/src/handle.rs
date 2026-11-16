@@ -135,20 +135,24 @@ pub fn constructor<'s>(
 
     let prototype = template.prototype_template(scope);
 
-    // `HandleWrap`.
-    let close = rn_core::class(methods::close).length(0).build(scope);
+    // `HandleWrap`. Node publishes these with `SetProtoMethod`, i.e.
+    // `ConstructorBehavior::kThrow`, so `new tty.prototype.close()` is a
+    // `TypeError` there.
+    let close = rn_core::method(methods::close).length(0).build(scope);
     prototype.set(crate::key(scope, "close")?.into(), close.into());
-    let reference = rn_core::class(methods::reference).length(0).build(scope);
+    let reference = rn_core::method(methods::reference).length(0).build(scope);
     prototype.set(crate::key(scope, "ref")?.into(), reference.into());
-    let unreference = rn_core::class(methods::unreference).length(0).build(scope);
+    let unreference = rn_core::method(methods::unreference).length(0).build(scope);
     prototype.set(crate::key(scope, "unref")?.into(), unreference.into());
-    let has_reference = rn_core::class(methods::has_reference)
+    let has_reference = rn_core::method(methods::has_reference)
         .length(0)
         .build(scope);
     prototype.set(crate::key(scope, "hasRef")?.into(), has_reference.into());
     // `AsyncWrap`'s id. `tty.WriteStream` inherits from `net.Socket`, and
     // `net.js` reads `this._handle.getAsyncId()` unconditionally.
-    let get_async_id = rn_core::class(methods::get_async_id).length(0).build(scope);
+    let get_async_id = rn_core::method(methods::get_async_id)
+        .length(0)
+        .build(scope);
     prototype.set(crate::key(scope, "getAsyncId")?.into(), get_async_id.into());
 
     // `LibuvStreamWrap` / `StreamBase`.
@@ -222,19 +226,23 @@ pub fn constructor<'s>(
         is_stream_base.into(),
     );
 
-    // `TTYWrap`'s own methods.
-    let get_window_size = rn_core::class(methods::get_window_size)
+    // `TTYWrap`'s own methods. `SetProtoMethod` in Node, so not constructible.
+    let get_window_size = rn_core::method(methods::get_window_size)
         .length(1)
         .build(scope);
     prototype.set(
         crate::key(scope, "getWindowSize")?.into(),
         get_window_size.into(),
     );
-    let set_raw_mode = rn_core::class(methods::set_raw_mode).length(1).build(scope);
+    let set_raw_mode = rn_core::method(methods::set_raw_mode)
+        .length(1)
+        .build(scope);
     prototype.set(crate::key(scope, "setRawMode")?.into(), set_raw_mode.into());
     // `LibuvStreamWrap::SetBlocking`, which `lib/net.js` calls for a stdio fd on
     // Windows; harmless and expected to exist everywhere.
-    let set_blocking = rn_core::class(methods::set_blocking).length(1).build(scope);
+    let set_blocking = rn_core::method(methods::set_blocking)
+        .length(1)
+        .build(scope);
     prototype.set(
         crate::key(scope, "setBlocking")?.into(),
         set_blocking.into(),

@@ -431,7 +431,8 @@ fn install_query_methods<'s>(
     macro_rules! install {
         ($($name:literal => $callback:path),* $(,)?) => {
             $(
-                let method = rn_core::class($callback).build(scope);
+                // `SetProtoMethod` in Node, so `kThrow`: not constructible.
+                let method = rn_core::method($callback).build(scope);
                 let key = v8::String::new(scope, $name)
                     .ok_or_else(|| format!("cannot allocate ChannelWrap.{}", $name))?;
                 prototype.set(key.into(), method.into());

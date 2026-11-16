@@ -30,7 +30,7 @@ Usage:
     tools/constructible-audit.py --recorded <path>    # diff against that fixture
 
 `--recorded` is the form the commit gate uses: it needs no Node binary, only the
-fixture `--record` wrote from the pinned oracle, and it judges rustnode's
+two fixtures `--record` wrote from the pinned oracle, and it judges rustnode's
 *shipping* state — the object `internalBinding()` hands out after the vendored
 `lib/**` bootstrap has run, which is what `lib/**` and user code actually see.
 That distinction matters for six members: the native install leaves
@@ -38,8 +38,18 @@ That distinction matters for six members: the native install leaves
 `DOMException`, and `pre_execution.js` / `per_context` replace them before any
 observation. Judging the native layer alone would report six false failures.
 
+The two fixtures are `<path>` for namespace members and, beside it,
+`constructible-prototypes.json` for prototype methods. The second one records
+every method with the kind the engine reported, *not* only the constructible
+ones: Node builds prototype methods with `SetProtoMethod`, so none of them is
+constructible and a constructible-only recording is empty by construction. That
+is exactly what it used to be, and it made the prototype half of `--recorded`
+compare nothing while reporting a clean result — see
+`count_prototype_comparisons` and the zero-comparison guard in `report`.
+
 Exit status is 0 when every member rustnode installs agrees with Node, 1 when
-one does not, and 2 when the audit could not run.
+one does not, and 2 when the audit could not run — including when it could not
+compare a single prototype method, because "compared nothing" is not a pass.
 """
 
 import argparse
@@ -167,6 +177,37 @@ def namespaces():
     return json.loads(completed.stdout)
 
 
+def prototype_methods(prototypes):
+    """`{(namespace, class)}` -> `{method: kind}` for each recorded class.
+
+    The fixture is keyed `"<namespace>.<Class>"` so it is readable and diffable,
+    which means every consumer has to split that key back apart. Doing it here
+    rather than at each call site is what keeps `--recorded` and the live oracle
+    path from drifting into two different readings of one file.
+    """
+    return {
+        tuple(path.split(".", 1)): dict(members)
+        for path, members in (prototypes or {}).items()
+    }
+
+
+def count_prototype_comparisons(expected, actual):
+    """How many prototype methods the diff can actually judge.
+
+    A method is compared when the oracle's recording names it *and* rustnode's
+    prototype exposes it. This is the number the audit is blind without: the
+    recorded path used to build its expectation from a fixture that carried only
+    constructible methods, of which Node's prototypes have none, so every class
+    arrived empty, every loop ran zero times, and the audit printed a clean line
+    for a comparison it had never made.
+    """
+    total = 0
+    for key, oracle_methods in expected.items():
+        rustnode_methods = actual.get(key, {})
+        total += sum(1 for method in oracle_methods if method in rustnode_methods)
+    return total
+
+
 def constructible(report):
     """`{(namespace, member)}` for every function the engine calls a constructor."""
     found = set()
@@ -215,12 +256,15 @@ def main():
         prototype_path = os.path.join(
             os.path.dirname(os.path.abspath(args.recorded)), "constructible-prototypes.json")
         with open(prototype_path, encoding="utf8") as handle:
-            expected_prototypes = {
-                (path.split(".", 1)[0], path.split(".", 1)[1]): {
-                    method: "constructor" for method in methods
-                }
-                for path, methods in json.load(handle).items()
-            }
+            expected_prototypes = prototype_methods(json.load(handle))
+        # Every class the member fixture names, not only the ones the prototype
+        # fixture happens to hold: a class whose prototype was never recorded has
+        # to show up as a missing comparison rather than quietly not existing.
+        for namespace, members in fixture.items():
+            if namespace in PROTOTYPE_EXEMPT:
+                continue
+            for member in members:
+                expected_prototypes.setdefault((namespace, member), {})
         rustnode_prototypes = enumerate_prototypes(args.rustnode, classes)
         return report(node_constructible, rustnode_report, args.json,
                       expected_prototypes, rustnode_prototypes)
@@ -239,9 +283,12 @@ def main():
             json.dump(rows, handle, indent=2, sort_keys=True)
             handle.write("\n")
         prototypes = enumerate_prototypes(args.oracle, rows)
+        # Every method with its kind, not only the constructible ones. Node's
+        # prototype methods are `SetProtoMethod`, i.e. never constructible, so
+        # filtering on `kind == "constructor"` wrote an empty list for every
+        # class and made the recorded audit a comparison of nothing.
         prototype_rows = {
-            f"{namespace}.{name}": sorted(
-                method for method, kind in members.items() if kind == "constructor")
+            f"{namespace}.{name}": dict(sorted(members.items()))
             for (namespace, name), members in prototypes.items()
         }
         prototype_path = os.path.join(
@@ -251,10 +298,14 @@ def main():
             handle.write("\n")
         total = sum(len(members) for members in rows.values())
         prototype_total = sum(len(members) for members in prototype_rows.values())
+        prototype_constructible = sum(
+            1 for members in prototype_rows.values()
+            for kind in members.values() if kind == "constructor")
         print(f"recorded {total} constructible members across {len(rows)} "
               f"namespaces into {args.record}")
-        print(f"recorded {prototype_total} constructible prototype method(s) across "
-              f"{len(prototype_rows)} class(es) into {prototype_path}")
+        print(f"recorded {prototype_total} prototype method(s) across "
+              f"{len(prototype_rows)} class(es) into {prototype_path}, "
+              f"{prototype_total - prototype_constructible} of them non-constructible")
         return 0
 
     with tempfile.TemporaryDirectory() as workdir:
@@ -346,6 +397,8 @@ def report(node_constructible, rustnode_report, as_json,
     # `kThrow`, so they must not be constructible — even on a class that is.
     prototype_extra = []
     prototype_missing = []
+    prototype_comparisons = count_prototype_comparisons(
+        oracle_prototypes or {}, rustnode_prototypes or {})
     for (namespace, class_name), oracle_methods in (oracle_prototypes or {}).items():
         rustnode_methods = (rustnode_prototypes or {}).get((namespace, class_name), {})
         for method, node_kind in oracle_methods.items():
@@ -357,18 +410,20 @@ def report(node_constructible, rustnode_report, as_json,
             elif node_kind == "constructor" and rustnode_kind != "constructor":
                 prototype_missing.append(f"{namespace}.{class_name}.prototype.{method}")
     for path in prototype_extra:
+        namespace, class_and_method = path.split(".", 1)
         rows.append({
-            "namespace": path.split(".")[0],
-            "member": path,
+            "namespace": namespace,
+            "member": class_and_method,
             "node": "function",
             "rustnode": "constructor",
             "verdict": "bad",
             "reason": "node's prototype method has no [[Construct]]",
         })
     for path in prototype_missing:
+        namespace, class_and_method = path.split(".", 1)
         rows.append({
-            "namespace": path.split(".")[0],
-            "member": path,
+            "namespace": namespace,
+            "member": class_and_method,
             "node": "constructor",
             "rustnode": "function",
             "verdict": "bad",
@@ -380,6 +435,7 @@ def report(node_constructible, rustnode_report, as_json,
                    "deferred": deferred, "undeclared": undeclared,
                    "satisfied": satisfied, "prototype_extra": prototype_extra,
                    "prototype_missing": prototype_missing,
+                   "prototype_comparisons": prototype_comparisons,
                    "rows": rows}, sys.stdout, indent=2)
         print()
     else:
@@ -401,7 +457,21 @@ def report(node_constructible, rustnode_report, as_json,
               f"{len(undeclared)} not installed and undeclared, "
               f"{len(satisfied)} declared but no longer a gap")
         print(f"{len(prototype_extra)} prototype method(s) constructible only under "
-              f"rustnode, {len(prototype_missing)} constructible only under node")
+              f"rustnode, {len(prototype_missing)} constructible only under node, "
+              f"across {prototype_comparisons} prototype method(s) compared")
+
+    # A run that compared nothing is the defect this line exists to forbid. The
+    # recorded path once built its expectation from a fixture of *constructible*
+    # prototype methods, which Node has none of, so every class arrived empty,
+    # every loop ran zero times, and the audit printed `0 prototype method(s)
+    # constructible only under rustnode` — a clean verdict about no measurement
+    # at all. Refusing to answer is the only honest outcome: exit 2 is this
+    # script's documented "could not run", which the gate treats as fatal.
+    if prototype_comparisons == 0:
+        print("the audit compared zero prototype methods, which cannot be a pass: "
+              "the prototype fixture or the class list it is diffed against is empty "
+              "or unreadable", file=sys.stderr)
+        return 2
 
     return 0 if not (extra or unbuildable or undeclared or satisfied
                      or prototype_extra or prototype_missing) else 1
