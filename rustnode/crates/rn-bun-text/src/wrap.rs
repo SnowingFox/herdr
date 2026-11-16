@@ -76,8 +76,8 @@ pub fn wrap(units: &[u16], columns: usize, options: WrapOptions) -> Vec<u16> {
         // exactly one `\n`. Bun maps every `\r` to a break, and callers that map
         // wrapped output back to their input rely on that.
         let mut break_at = None;
-        for at in line_start..units.len() {
-            if units[at] == u16::from(b'\n') || units[at] == u16::from(b'\r') {
+        for (at, unit) in units.iter().enumerate().take(units.len()).skip(line_start) {
+            if *unit == u16::from(b'\n') || *unit == u16::from(b'\r') {
                 break_at = Some(at);
                 break;
             }

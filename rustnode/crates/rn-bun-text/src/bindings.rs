@@ -428,7 +428,9 @@ fn resolve_bounds(start: f64, end: f64, total: usize) -> (usize, usize) {
         return (from as usize, usize::MAX);
     }
     let to = to.min(total as f64);
-    if !(to > from) {
+    // NaN never reaches here: `to` is either finite after `min` or was
+    // returned as infinite above, and `from` was clamped to `>= 0`.
+    if to <= from {
         return (from as usize, from as usize);
     }
     (from as usize, to as usize)

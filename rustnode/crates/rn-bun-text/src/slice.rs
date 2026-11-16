@@ -453,6 +453,11 @@ fn hyperlink_effect(units: &[u16], start: usize, end: usize) -> Option<bool> {
     let mut payload_end = end;
     if payload_end > body {
         let last = units[payload_end - 1];
+        // BEL and the C1 ST both terminate an escape sequence. They are kept as
+        // separate arms rather than one `||` because the two constants are
+        // different standards (§8.3.2 vs §8.3.143) and a reader looking for one
+        // should find it named.
+        #[allow(clippy::if_same_then_else)]
         if last == 0x07 {
             payload_end -= 1;
         } else if last == 0x9C {

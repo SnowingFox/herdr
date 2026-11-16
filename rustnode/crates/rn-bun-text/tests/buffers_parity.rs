@@ -359,14 +359,10 @@ fn sleep_sync_argument_rules() {
     assert!(timers::validate_sleep_sync(Some(f64::NAN)).is_ok());
     assert_eq!(timers::validate_sleep_sync(Some(1.5)).ok(), Some(1));
 
-    let error = timers::validate_sleep_sync(None)
-        .err()
-        .expect("no argument rejects");
+    let error = timers::validate_sleep_sync(None).expect_err("no argument rejects");
     assert_eq!(error.message(), "milliseconds must be a number");
 
-    let error = timers::validate_sleep_sync(Some(-5.0))
-        .err()
-        .expect("a negative rejects");
+    let error = timers::validate_sleep_sync(Some(-5.0)).expect_err("a negative rejects");
     assert_eq!(
         error.message(),
         "argument to sleepSync must not be negative, got -5"

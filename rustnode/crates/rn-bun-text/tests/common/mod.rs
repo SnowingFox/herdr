@@ -40,6 +40,11 @@ pub fn install<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object
 }
 
 /// Installs the members and publishes the object as the global `Bun`.
+///
+/// Only some of this crate's integration tests reach the global-install path, so
+/// the lint fires for the binaries that do not. Per-function, so a real dead
+/// helper still reports.
+#[allow(dead_code)]
 pub fn install_as_global(scope: &mut v8::PinScope<'_, '_>) {
     let bun = install(scope);
     let key = v8::String::new(scope, "Bun").expect("key");
@@ -52,6 +57,12 @@ pub fn install_as_global(scope: &mut v8::PinScope<'_, '_>) {
 
 /// Installs the members as a `__bun` global, for scripts that prefer a private
 /// name over the realm's real `Bun`.
+///
+/// `common` is compiled into every integration test binary in this crate, and
+/// only `buffers_parity` uses this one, so the lint fires for the others. The
+/// allowance is per-function rather than crate-wide so a genuinely unused
+/// helper still reports.
+#[allow(dead_code)]
 pub fn install_as_private_global(scope: &mut v8::PinScope<'_, '_>) {
     let bun = install(scope);
     let key = v8::String::new(scope, "__bun").expect("key");
