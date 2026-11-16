@@ -18,6 +18,7 @@
 use rn_v8_sys::v8;
 use rn_v8_sys::v8::{Local, Object};
 
+use crate::copy_tree::CopyError;
 use crate::error::FsError;
 
 /// Which delivery mode an operation's trailing argument selected.
@@ -187,6 +188,113 @@ pub fn throw_error(scope: &mut v8::PinScope<'_, '_>, error: &FsError) {
     if let Some(value) = error_object(scope, error) {
         scope.throw_exception(value);
     }
+}
+
+/// Builds the exception `cp`'s error variants turn into.
+///
+/// Three distinct shapes are reachable from `fs.cp`, and a caller can tell them
+/// apart from the object it receives:
+///
+/// * [`CopyError::Errno`] is an `ErrnoException`: the message is
+///   `CODE, strerror 'path'`, the leading name is the symbolic errno, `errno` is
+///   positive, and there is no syscall term in the text.
+/// * [`CopyError::Uv`] is a `UVException`: `CODE: uv_strerror, syscall 'path'`
+///   and a negated `errno`.
+/// * the `ERR_FS_CP_*` variants are plain errors with a `code`, an `errno` and
+///   the message the C++ formatted — including the `[CODE]: ` prefix that
+///   `ERR_FS_CP_EEXIST` carries inside its own text.
+///
+/// [`CopyError::Special`] is absent: a socket, FIFO or unknown entry is reported
+/// to the asynchronous caller as a kind and a path so the JavaScript layer builds
+/// the error, and `fs.cpSync` never reports one at all.
+pub fn copy_error_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    error: &CopyError,
+) -> Option<Local<'s, v8::Value>> {
+    match error {
+        CopyError::Errno {
+            errno,
+            syscall,
+            path,
+        } => {
+            let raw = errno.abs().max(1);
+            let errno_text = code_for_code_point(raw);
+            let mut message = String::from(errno_text);
+            message.push_str(", ");
+            message.push_str(description_for_code_point(raw));
+            message.push_str(" '");
+            message.push_str(&String::from_utf8_lossy(path));
+            message.push('\'');
+            let text = v8::String::new(scope, &message)?;
+            let exception = v8::Exception::error(scope, text);
+            let object: Local<v8::Object> = exception.try_into().ok()?;
+            set_ordinal(scope, object, "errno", raw)?;
+            let code = v8::String::new(scope, errno_text)?;
+            set(scope, object, "code", code.into())?;
+            let syscall = v8::String::new(scope, syscall)?;
+            set(scope, object, "syscall", syscall.into())?;
+            let path = v8::String::new(scope, &String::from_utf8_lossy(path))?;
+            set(scope, object, "path", path.into())?;
+            Some(exception)
+        }
+        CopyError::Uv {
+            errno,
+            syscall,
+            path,
+        } => error_object(
+            scope,
+            &FsError::from_errno(syscall, errno.abs()).path(path.clone()),
+        ),
+        CopyError::Einval(message) => {
+            cp_code_error(scope, "ERR_FS_CP_EINVAL", message, libc::EINVAL)
+        }
+        CopyError::SymlinkToSubdirectory(message) => cp_code_error(
+            scope,
+            "ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY",
+            message,
+            libc::EINVAL,
+        ),
+        CopyError::Eexist(message) => {
+            cp_code_error(scope, "ERR_FS_CP_EEXIST", message, libc::EEXIST)
+        }
+        CopyError::Eisdir(message) => cp_code_error(scope, "ERR_FS_EISDIR", message, libc::EISDIR),
+        CopyError::Special { .. } => None,
+    }
+}
+
+/// An `ERR_FS_CP_*` error: `code`, `errno`, and the message already formatted.
+fn cp_code_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    code: &str,
+    message: &str,
+    errno: i32,
+) -> Option<Local<'s, v8::Value>> {
+    let text = v8::String::new(scope, message)?;
+    let exception = v8::Exception::error(scope, text);
+    let object: Local<v8::Object> = exception.try_into().ok()?;
+    let code = v8::String::new(scope, code)?;
+    set(scope, object, "code", code.into())?;
+    set_ordinal(scope, object, "errno", errno)?;
+    Some(exception)
+}
+
+fn set_ordinal<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: Local<v8::Object>,
+    key: &str,
+    value: i32,
+) -> Option<()> {
+    set(scope, object, key, v8::Integer::new(scope, value).into())
+}
+
+/// The symbolic errno name for a positive errno, as `errno_string` renders it.
+fn code_for_code_point(errno: i32) -> &'static str {
+    crate::error::code_for_errno(errno)
+}
+
+/// libuv's `uv_strerror` text for a positive errno.
+fn description_for_code_point(errno: i32) -> &'static str {
+    crate::error::description_for_errno(errno)
 }
 
 #[cfg(test)]

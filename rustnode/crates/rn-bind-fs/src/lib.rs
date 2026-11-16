@@ -22,6 +22,7 @@
 
 pub mod args;
 pub mod complete;
+pub mod copy_tree;
 pub mod cp;
 pub mod dirent;
 pub mod error;

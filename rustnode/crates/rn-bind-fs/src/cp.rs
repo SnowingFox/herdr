@@ -16,7 +16,8 @@
 //!
 //! It does **not** check permissions, handle symlinks beyond the `dereference`
 //! flag, or copy anything; those belong to the JavaScript layer and to
-//! `cpSyncCopyDir`, which is still deferred.
+//! [`crate::copy_tree`], which owns the recursive walk `cpSyncCopyDir` and
+//! `CpDirJob` share.
 //!
 //! # The error shapes are recorded, not guessed
 //!
@@ -89,6 +90,27 @@ pub fn message(error: &CpError, src: &str, dest: &str) -> String {
             format!("Cannot copy {with_separator} to a subdirectory of self {dest}")
         }
     }
+}
+
+/// The `lstat`/`stat` failure for a source that cannot be read.
+///
+/// `CpSyncCheckPaths` stats `src` before comparing anything, so a missing source
+/// is reported as that stat rather than as an identity failure. The syscall name
+/// follows `dereference`, and both the message and `path` carry the operand, so
+/// `fs.cpSync('/nope', d)` prints `ENOENT: no such file or directory, lstat
+/// '/nope'` exactly as the oracle does.
+#[must_use]
+pub fn missing_source(src: &Path, dereference: bool) -> crate::error::FsError {
+    let syscall = if dereference { "stat" } else { "lstat" };
+    let error = if dereference {
+        std::fs::metadata(src)
+    } else {
+        std::fs::symlink_metadata(src)
+    }
+    .expect_err("the caller only asks after a failed stat");
+    let errno = error.raw_os_error().unwrap_or(libc::ENOENT);
+    crate::error::FsError::from_errno(syscall, errno)
+        .path(src.as_os_str().as_encoded_bytes().to_vec())
 }
 
 /// Runs the four checks `CpSyncCheckPaths` performs on a working filesystem.
@@ -205,31 +227,23 @@ fn normalised(path: &Path) -> String {
     out.to_string_lossy().into_owned()
 }
 
-/// Throws the `SystemError` `fs.cpSync` expects.
+/// Throws the error `CpSyncCheckPaths` produces.
+///
+/// The synchronous `fs.cpSync` path goes through `THROW_ERR_FS_CP_*`, whose
+/// expansion is `v8::Exception::type(message)` plus a `code` — nothing else. So
+/// `errno` and `syscall` are *absent* here even though the asynchronous
+/// `fs.cp` rejects with a `SystemError` carrying both. The oracle's own
+/// `Object.getOwnPropertyNames` for these is `["code", "message", "stack"]`, and
+/// a caller that branches on `err.syscall === 'cp'` depends on the difference.
 pub fn throw_cp_error(scope: &mut v8::PinScope<'_, '_>, error: &CpError, src: &str, dest: &str) {
     let Some(text) = v8::String::new(scope, &message(error, src, dest)) else {
         return;
     };
     let exception = v8::Exception::error(scope, text);
     if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
-        for (name, value) in [
-            (
-                "code",
-                v8::String::new(scope, error.code())
-                    .map(|text| text.into())
-                    .unwrap_or_else(|| v8::undefined(scope).into()),
-            ),
-            // `SystemError` always carries these two; `fs.cp`'s tests read
-            // `err.code` and some read `err.syscall`.
-            (
-                "syscall",
-                v8::String::new(scope, "cp")
-                    .map_or_else(|| v8::undefined(scope).into(), |text| text.into()),
-            ),
-            ("errno", v8::Integer::new(scope, -libc::EINVAL).into()),
-        ] {
-            if let Some(key) = v8::String::new(scope, name) {
-                object.set(scope, key.into(), value);
+        if let Some(value) = v8::String::new(scope, error.code()) {
+            if let Some(key) = v8::String::new(scope, "code") {
+                object.set(scope, key.into(), value.into());
             }
         }
     }

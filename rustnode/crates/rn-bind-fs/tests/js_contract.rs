@@ -920,10 +920,12 @@ fn member_list_tracks_node_minus_documented_deferrals() {
     .into_iter()
     .collect();
 
-    // Documented in README.md under "Deliberately deferred".
-    let deferred: std::collections::BTreeSet<&str> = ["cpSyncCopyDir", "cpSyncOverrideFile"]
-        .into_iter()
-        .collect();
+    // Documented in README.md under "Deliberately deferred". `cp`'s three
+    // members used to be here; they are installed now, because `cp-sync.js` and
+    // `cp.js` have no fallback on the plain recursive path, so deferring them was
+    // a `TypeError` on every `fs.cpSync(src, dest, {recursive: true})` rather
+    // than a slower copy.
+    let deferred: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 
     // Not in Node's `SetMethod` list: the request constructor the JS
     // instantiates, and the promise-mode sentinel it forwards.
@@ -936,6 +938,8 @@ fn member_list_tracks_node_minus_documented_deferrals() {
     //
     // * `ReadFileJob`/`WriteFileJob` are constructed unconditionally for
     //   `options.buffer === undefined`, i.e. every ordinary `readFile`.
+    // * `CpDirJob` is constructed by `cp.js`'s `copyDirNative` for every
+    //   destination that does not exist yet.
     // * `FileHandle` is what `fs.promises.open` wraps every descriptor in.
     // * `StatWatcher` is constructed by `watchers.js`'s
     //   `[kFSStatWatcherStart]`, so `fs.watchFile` needs it before any syscall.
@@ -944,6 +948,7 @@ fn member_list_tracks_node_minus_documented_deferrals() {
     let constructor_functions: std::collections::BTreeSet<&str> = [
         "ReadFileJob",
         "WriteFileJob",
+        "CpDirJob",
         "FileHandle",
         "StatWatcher",
         "kFsStatsFieldsNumber",

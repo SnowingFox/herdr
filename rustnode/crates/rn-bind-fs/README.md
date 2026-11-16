@@ -223,7 +223,7 @@ stubbed so a caller gets a clear missing-member failure instead of a wrong answe
 
 | missing | why |
 | --- | --- |
-| `cpSyncCheckPaths`, `cpSyncCopyDir`, `cpSyncOverrideFile`, `CpDirJob` | the `fs.cp` fast paths. `lib/internal/fs/cp/cp-sync.js` only reaches them when no `filter` is supplied; with a `filter` it walks with `opendir`/`stat`/`copyFile`. `opendir` itself needs the `fs_dir` namespace. |
+| `cpSyncCheckPaths`, `cpSyncCopyDir`, `cpSyncOverrideFile`, `CpDirJob` | **implemented.** `cpSyncCheckPaths` answers the four identity questions plus the non-recursive-directory and special-file checks; `cpSyncCopyDir` and `CpDirJob` share one recursive walk in `src/copy_tree.rs`. `cp-sync.js` has no fallback for a plain `{recursive: true}` copy, so deferring these was a `TypeError` on the most common call rather than a slower copy. |
 | `opendir`, and the whole `fs_dir` namespace | `internalBinding('fs_dir')` is a separate binding: it owns `DIR*` handles with async iteration. Out of scope for this crate by namespace, and `Dir` in `lib/internal/fs/dir.js` uses it exclusively. |
 | `internalModuleReadJSON` | read by `lib/internal/modules/helpers.js`, but it has no call site left in this tree, so implementing it would be guesswork. |
 | `scandir` as a public member | there is no such member in Node's namespace; `readdir` *is* the scandir binding. The syscall name `scandir` is still used in error messages, which is what Node reports. |

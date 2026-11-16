@@ -829,17 +829,24 @@ The count rose from 114 to 188, which is the `node:test` fix at work: a file tha
 used to exit 0 while its subtests failed now sometimes hangs instead of exiting,
 and a hang is now recorded as a failure rather than a pass.
 
-### `fs.cp` — 28 files left, from two bugs to one
+### `fs.cp` — closed
 
 | files | failure |
 | --- | --- |
-| 28 | `cpSyncCopyDir is not a function` — `-r` recursion is still declared deferred |
+| ~~28~~ 0 | `cpSyncCopyDir is not a function` — closed by implementing the recursive walk |
 
-The other bug — `Method Promise.prototype.then called on incompatible receiver
-[object BigInt64Array]` in `fs/promises`, 19 files — is **closed**, verified by
-running `fs/promises.cp` successfully on that tree. That one needed no async
-knowledge, only that the promise path stop receiving bigint stat arrays, which is
-why it was flagged here as the best ratio in the tail.
+The recursion now lives in `crates/rn-bind-fs/src/copy_tree.rs`, behind both
+`cpSyncCopyDir` and `CpDirJob`. `cp-sync.js` has no fallback when no `filter` is
+supplied, so the deferral had been a `TypeError` on the most common call rather
+than a slower copy — which is why the count was 28 rather than a performance
+note. `tests/cp_parity.rs` pins the resulting tree, modes, contents, link targets
+and timestamps against the pinned oracle.
+
+The other bug on this page — `Method Promise.prototype.then called on
+incompatible receiver [object BigInt64Array]` in `fs/promises`, 19 files — is
+**closed**, verified by running `fs/promises.cp` successfully on that tree. That
+one needed no async knowledge, only that the promise path stop receiving bigint
+stat arrays, which is why it was flagged here as the best ratio in the tail.
 
 ### `locks` — 17 files
 

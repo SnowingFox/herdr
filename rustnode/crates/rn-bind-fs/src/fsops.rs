@@ -382,11 +382,131 @@ pub fn access(path: &PathBytes, mode: i32) -> Result<(), FsError> {
         .map_err(|error| error.path(path.to_vec()))
 }
 
-/// `copy_file_range`-backed copy, matching `uv_fs_copyfile`.
+/// `utf8_fs_copyfile`: libuv's copy, which stamps the source's times on the
+/// destination before writing.
+///
+/// This is what `fs.copyFile` and `fs.cp`'s threadpool job use, and the stamp is
+/// observable: a source with an old `atime` produces a destination with that same
+/// `atime` and a **new** `mtime`, because libuv calls `futimens` before it writes
+/// the data. `std::filesystem::copy_file`, which the synchronous `fs.cpSync` walk
+/// uses, does no stamping at all — so [`copy_file`] and this deliberately differ,
+/// and the difference is pinned by a test rather than left to chance.
+pub fn uv_copy_file(source: &PathBytes, destination: &PathBytes, mode: i32) -> Result<(), FsError> {
+    use std::io::{Read, Write};
+
+    const UV_FS_COPYFILE_EXCL: i32 = 0x01;
+    const UV_FS_COPYFILE_FICLONE: i32 = 0x02;
+    const UV_FS_COPYFILE_FICLONE_FORCE: i32 = 0x04;
+
+    let excl = mode & UV_FS_COPYFILE_EXCL != 0;
+    let force_clone = mode & UV_FS_COPYFILE_FICLONE_FORCE != 0;
+    let want_clone = mode & (UV_FS_COPYFILE_FICLONE | UV_FS_COPYFILE_FICLONE_FORCE) != 0;
+
+    let source_path = std::path::Path::new(std::ffi::OsStr::from_bytes(source));
+    let destination_path = std::path::Path::new(std::ffi::OsStr::from_bytes(destination));
+
+    let mut open_source = std::fs::File::open(source_path).map_err(|error| {
+        FsError::from_errno("copyfile", error.raw_os_error().unwrap_or(libc::EIO))
+            .path(source.to_vec())
+    })?;
+
+    // libuv opens the destination with the *source's* mode, so the create itself
+    // carries the permissions rather than a later `chmod`.
+    let src_metadata = open_source.metadata().ok();
+    let create_mode = src_metadata
+        .as_ref()
+        .map_or(0o666, std::os::unix::fs::MetadataExt::mode);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if excl {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    let mut open_destination = options.open(destination_path).map_err(|error| {
+        FsError::from_errno("copyfile", error.raw_os_error().unwrap_or(libc::EIO))
+            .path(destination.to_vec())
+    })?;
+
+    if force_clone {
+        let cloned = ioctl_clone(&open_source, &open_destination);
+        if cloned {
+            return Ok(());
+        }
+        if want_clone {
+            return Err(FsError::from_errno("copyfile", libc::ENOTSUP).path(destination.to_vec()));
+        }
+    }
+
+    // The stamp happens before the write, which is why `atime` survives and
+    // `mtime` does not. Doing it after would set both, and skipping it would
+    // leave both at the wall clock; neither matches the oracle.
+    if let Some(metadata) = src_metadata.as_ref() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        let times = [
+            libc::timespec {
+                tv_sec: metadata.atime(),
+                tv_nsec: metadata.atime_nsec(),
+            },
+            libc::timespec {
+                tv_sec: metadata.mtime(),
+                tv_nsec: metadata.mtime_nsec(),
+            },
+        ];
+        // SAFETY: the descriptor is open for the call's duration and `times` is a
+        // valid two-element array the call only reads. libuv ignores this result
+        // — `(void) futimens(dstfd, times)` — because `cp -p` does not treat a
+        // timestamp it cannot set as a copy failure.
+        let _ = unsafe { libc::futimens(open_destination.as_raw_fd(), times.as_ptr()) };
+        // Ownership is best-effort for the same reason; only the mode is checked.
+        let _ =
+            unsafe { libc::fchown(open_destination.as_raw_fd(), metadata.uid(), metadata.gid()) };
+        let rc = unsafe { libc::fchmod(open_destination.as_raw_fd(), metadata.mode() & 0o7777) };
+        if rc != 0 {
+            // SAFETY: `errno` is only meaningful immediately after a failing
+            // libc call on the same thread, which is exactly here.
+            let errno = unsafe { *libc::__errno_location() };
+            // libuv squelches this one on a CIFS/SMB share, where `fchmod` is
+            // meaningless; anything else is a real failure.
+            if errno != libc::EPERM {
+                return Err(FsError::from_errno("copyfile", errno).path(destination.to_vec()));
+            }
+        }
+    }
+    let _ = create_mode;
+
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = open_source.read(&mut buffer).map_err(|error| {
+            FsError::from_errno("copyfile", error.raw_os_error().unwrap_or(libc::EIO))
+                .path(source.to_vec())
+        })?;
+        if read == 0 {
+            break;
+        }
+        open_destination
+            .write_all(&buffer[..read])
+            .map_err(|error| {
+                FsError::from_errno("copyfile", error.raw_os_error().unwrap_or(libc::EIO))
+                    .path(destination.to_vec())
+            })?;
+    }
+
+    Ok(())
+}
+
+/// `std::filesystem::copy_file`, which stamps nothing.
 ///
 /// `mode` carries libuv's `UV_FS_COPYFILE_EXCL` and
 /// `UV_FS_COPYFILE_FICLONE*` bits. FICLONE is treated as a hint: the copy is
 /// still correct when the filesystem cannot reflink.
+///
+/// The absence of any timestamp work is deliberate and observable: a
+/// `fs.cpSync` of a tree leaves the destination files with a wall-clock `atime`,
+/// where `fs.copyFile` and `fs.cp` — which go through [`uv_copy_file`] — carry the
+/// source's. See that function for why.
 pub fn copy_file(source: &PathBytes, destination: &PathBytes, mode: i32) -> Result<(), FsError> {
     use std::io::{Read, Write};
 
@@ -432,6 +552,11 @@ pub fn copy_file(source: &PathBytes, destination: &PathBytes, mode: i32) -> Resu
         }
     }
 
+    // No timestamp or mode work here, deliberately: this is the
+    // `std::filesystem::copy_file` half, and the oracle's `fs.cpSync` leaves the
+    // destination's times at the wall clock where `fs.copyFile` does not. The
+    // mode is applied by the caller from the source's stat, and the stamp lives
+    // in [`uv_copy_file`].
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = open_source.read(&mut buffer).map_err(|error| {
