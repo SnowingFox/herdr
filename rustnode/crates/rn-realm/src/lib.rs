@@ -1575,6 +1575,11 @@ pub fn bootstrap_realm(
     if rn_core::realm::installed().is_none() {
         return Err("no binding registry is installed for this realm".to_string());
     }
+    // A realm that is bootstrapping gets a fresh exit state. A worker already
+    // has one (its thread was just spawned), but this also covers a thread that
+    // bootstraps a second realm, which must not inherit the first one's
+    // `_exiting` or `exitCode` — Node constructs a new `Environment` there.
+    rn_core::exit_state::reset();
     let global = scope.get_current_context().global(scope);
 
     let primordials = v8::Object::new(scope);
@@ -1986,6 +1991,13 @@ fn install_process_state(
 /// exit path reads them through `Object.getOwnPropertyDescriptor` in the tests
 /// below.
 ///
+/// The storage behind the accessors is `rn_core::exit_state`, one set per
+/// environment: a worker's `process.exitCode` and `_exiting` are its own, which
+/// is what Node's `Environment::exit_code()` gives it. Sharing one value across
+/// the process made a worker's exit status the parent's, and tripped the
+/// parent's "the exit sequence already ran" guard so its own `exit` handlers
+/// were suppressed.
+///
 /// `exitCode`'s setter follows Node exactly: `null`/`undefined` clear it, a
 /// finite number stores it, a non-empty numeric *string* is coerced, and
 /// anything else is `ERR_INVALID_ARG_TYPE` from `validateInteger`. The message is
@@ -2109,10 +2121,7 @@ fn exit_state_exiting(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let exiting = exit_field()
-        .exiting
-        .load(std::sync::atomic::Ordering::Relaxed);
-    rv.set(v8::Boolean::new(scope, exiting).into());
+    rv.set(v8::Boolean::new(scope, rn_core::exit_state::exiting()).into());
 }
 
 fn exit_state_set_exiting(
@@ -2121,9 +2130,7 @@ fn exit_state_set_exiting(
     _rv: v8::ReturnValue,
 ) {
     let truthy = args.get(0).boolean_value(scope);
-    exit_field()
-        .exiting
-        .store(truthy, std::sync::atomic::Ordering::Relaxed);
+    rn_core::exit_state::set_exiting(truthy);
 }
 
 fn exit_state_exit_code(
@@ -2131,16 +2138,10 @@ fn exit_state_exit_code(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let field = exit_field();
-    if !field
-        .has_exit_code
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
-        rv.set(v8::undefined(scope).into());
-        return;
+    match rn_core::exit_state::exit_code() {
+        Some(code) => rv.set(v8::Integer::new(scope, code).into()),
+        None => rv.set(v8::undefined(scope).into()),
     }
-    let code = field.exit_code.load(std::sync::atomic::Ordering::Relaxed);
-    rv.set(v8::Integer::new(scope, code).into());
 }
 
 fn exit_state_set_exit_code(
@@ -2151,13 +2152,7 @@ fn exit_state_set_exit_code(
     let Some(code) = args.get(0).number_value(scope) else {
         return;
     };
-    let field = exit_field();
-    field
-        .exit_code
-        .store(code as i32, std::sync::atomic::Ordering::Relaxed);
-    field
-        .has_exit_code
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    rn_core::exit_state::set_exit_code(code as i32);
 }
 
 fn exit_state_clear_exit_code(
@@ -2165,28 +2160,10 @@ fn exit_state_clear_exit_code(
     _args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
 ) {
-    exit_field()
-        .has_exit_code
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    rn_core::exit_state::clear_exit_code();
 }
 
-/// Whether the process is on its way out, as Node's `_exiting` reports it.
-fn exit_field() -> &'static ExitField {
-    static FIELD: std::sync::OnceLock<ExitField> = std::sync::OnceLock::new();
-    FIELD.get_or_init(ExitField::default)
-}
-
-/// The two values Node keeps behind its private symbol.
-///
-/// `has_exit_code` is separate from `exit_code` because Node distinguishes
-/// "absent" from "set to 0": `kHasExitCode` is its own field, and
-/// `process.exitCode` reads `undefined` until it is assigned.
-#[derive(Default)]
-struct ExitField {
-    exiting: std::sync::atomic::AtomicBool,
-    exit_code: std::sync::atomic::AtomicI32,
-    has_exit_code: std::sync::atomic::AtomicBool,
-}
+/// Installs `process.sourceMapsEnabled` and `process.setSourceMapsEnabled`.
 ///
 /// `bootstrap/node.js` reaches `internal/source_map/source_map_cache` through
 /// `require`, and rustnode's `require` does not exist until `realm.js` has run —

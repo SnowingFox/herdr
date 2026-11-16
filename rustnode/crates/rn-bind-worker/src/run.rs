@@ -463,6 +463,19 @@ fn teardown() {
 /// `Uncaught null: null` for a terminate that worked. Node avoids the whole path
 /// by refusing to run JavaScript after `Worker::Exit`; the wrapper is the same
 /// answer at the one place the JS layer asks.
+///
+/// The same condition covers a worker's own `process.exit()`. `per_thread.js`
+/// sets `process._exiting` before calling `reallyExit`, and `reallyExit` then
+/// terminates the isolate so the frame that called it unwinds — that is what
+/// makes a second `process.exit()` unreachable rather than merely ignored, and
+/// what `test-worker-voluntarily-exit-followed-by-addition.js` and
+/// `-followed-by-throw.js` require. The termination surfaces here as a caught
+/// callback, and without this the worker posted an unserializable "error" for an
+/// exit that had already succeeded, which the parent raised as
+/// `Uncaught null: null` / `ERR_UNHANDLED_ERROR`.
+///
+/// Both predicates are native, so the answer is the realm's real state rather
+/// than a flag something has to remember to set.
 fn install_fatal_handler_guard(scope: &mut v8::PinScope<'_, '_>) {
     let source = "(function (process, isStopping) {\n\
                   \x20 const inner = process._fatalException;\n\
@@ -506,13 +519,22 @@ fn install_fatal_handler_guard(scope: &mut v8::PinScope<'_, '_>) {
 }
 
 /// Reports whether this realm is stopping, for the fatal-handler wrapper.
+///
+/// "Stopping" covers two things, both of which mean the worker may not run more
+/// JavaScript: the parent asked for a terminate (`is_stopping`), and this
+/// environment is already exiting — `process._exiting`, which `per_thread.js`
+/// sets before `reallyExit` and which `worker_thread.js`'s own uncaught path
+/// sets before its `process.exit()`. The second is what makes the termination
+/// `reallyExit` raises on the way out land here instead of being reported to the
+/// parent as an unserializable error.
 fn is_stopping_callback(
     _scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
     let scope = _scope;
-    rv.set(v8::Boolean::new(scope, crate::is_stopping()).into());
+    let stopping = crate::is_stopping() || rn_core::exit_state::exiting();
+    rv.set(v8::Boolean::new(scope, stopping).into());
 }
 
 /// Reads `process.exitCode`, as the main thread's exit path does.
