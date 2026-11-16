@@ -103,6 +103,26 @@ thread_local! {
     static DRAIN: Cell<Option<TickDrain>> = const { Cell::new(None) };
 }
 
+/// Runs the checkpoint regardless of the callback depth.
+///
+/// The depth test in [`leave_callback`] protects a JavaScript call that re-entered
+/// a completion, but it also swallows a completion *nested in another native
+/// callback*: a `TLSWrap` runs its whole state machine inside one scope, so an
+/// HTTP/2 session that consumes a TLS socket receives and finishes while that
+/// outer scope is still open, and nothing drains when the inner scope closes.
+///
+/// A caller that has to observe the queue draining — delivering a staged body
+/// only after the tick `core.js` queued for `'response'`, for instance — therefore
+/// asks for it explicitly instead of relying on a scope closing above it.
+///
+/// The failure and re-entrancy guards inside [`checkpoint`] still apply, so this
+/// cannot nest a checkpoint inside itself.
+pub fn checkpoint_now(scope: &mut v8::PinScope<'_, '_>, inside_loop: bool) {
+    if inside_loop {
+        checkpoint(scope);
+    }
+}
+
 /// Publishes [`CHECKPOINT`] once both halves have registered.
 fn publish() {
     let (Some(pending), Some(drain)) = (
