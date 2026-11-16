@@ -29,6 +29,54 @@
 
 use std::process::Command;
 
+/// Runs the built binary with `arguments` and no `NODE_OPTIONS`, returning
+/// status, stdout and stderr.
+///
+/// `NODE_OPTIONS` is removed so a value inherited from whatever ran the tests
+/// cannot change the result; the environment path has its own helpers below.
+///
+/// The child runs in a scratch directory, because some of the flags this file
+/// exercises make V8 write files: `--prof` and `--log-all` drop
+/// `isolate-<address>-<pid>-v8.log` in the current directory, and `--jitless`
+/// plus a tracing flag can drop `jit-<pid>.dump`. Measured on this tree, running
+/// the accepted-flags case from the package root left 22 such files behind, and
+/// they then showed up as untracked files in the repository. A scratch directory
+/// keeps the tree clean whatever the binary decides to write.
+fn run_args(arguments: &[&str]) -> (i32, String, String) {
+    let directory = std::env::temp_dir();
+    let output = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .env_remove("NODE_OPTIONS")
+        .current_dir(&directory)
+        .args(arguments)
+        .output()
+        .expect("rustnode runs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Asserts `--flag` is accepted and that the script still runs.
+///
+/// Running the script is the part that matters: exit 0 alone would also be
+/// reported by a process that accepted the flag and then did nothing, which is
+/// the silent-acceptance shape this whole change exists to remove.
+///
+/// The marker goes to **stderr**, not stdout, because several of these flags are
+/// V8 tracing flags that write to stdout — and `--trace-gc-verbose` interleaves
+/// with a script's own stdout writes *within a line*, so a stdout marker came
+/// back as `[59195ran` spliced into a GC line. V8's tracing never writes to
+/// stderr, so a stderr marker is the one that survives intact.
+fn expect_accepted(flag: &str) {
+    let (code, stdout, stderr) = run_args(&[flag, "-e", "process.stderr.write('script-ran\\n')"]);
+    assert_eq!(code, 0, "{flag} should be accepted, stderr: {stderr}");
+    assert!(
+        stderr.lines().any(|line| line.trim() == "script-ran"),
+        "{flag} must still run the script, stdout: {stdout:?}, stderr: {stderr:?}"
+    );
+}
+
 /// Runs the built binary with `NODE_OPTIONS` set to `options` and `-e` to
 /// `script`, returning status, stdout and stderr.
 ///
@@ -380,6 +428,225 @@ fn the_rejection_is_prefixed_with_the_program_name() {
         stderr.trim_end().starts_with(expected_prefix),
         "stderr {stderr:?} should start with {expected_prefix:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// V8 flags on the command line
+// ---------------------------------------------------------------------------
+//
+// Node keeps no list of V8 flags: `OptionsParser<Options>::Parse` resolves a name
+// through its own option table and pushes everything else onto `v8_args`, which
+// `ProcessGlobalArgsInternal` ends by handing to
+// `V8::SetFlagsFromCommandLine(&argc, argv, true)` (`src/node.cc:827`). Whatever
+// V8 leaves behind is `bad option: <flag>` and the process exits 9
+// (`src/node.cc:833`). rustnode used to run a hand-written allow-list instead,
+// so it rejected 22 of the 24 V8 flags the pinned oracle accepts — which is how
+// a flag sweep measured a process that had exited during argument parsing and
+// reported an apparent 89% win.
+
+/// The 22 V8 flags the allow-list used to reject, all of which the oracle
+/// accepts.
+///
+/// This is the list the defect was measured on. Each is checked for exit 0 *and*
+/// for the script running, because "accepted and then ignored" is exactly the
+/// failure that looks like a pass.
+const ACCEPTED_V8_FLAGS: &[&str] = &[
+    "--max-semi-space-size=1",
+    "--min-semi-space-size=1",
+    "--trace-gc",
+    "--trace-gc-verbose",
+    "--gc-interval=100",
+    "--stress-compaction",
+    "--print-bytecode",
+    "--print-opt-code",
+    "--turbo-stats",
+    "--no-opt",
+    "--jitless",
+    "--single-threaded",
+    "--predictable",
+    "--no-lazy",
+    "--wasm-tier-up",
+    "--max-lazy",
+    "--opt",
+    "--always-sparkplug",
+    "--no-flush-bytecode",
+    "--stress-scavenge=0",
+    "--prof",
+    "--log-all",
+];
+
+#[test]
+fn v8_flags_the_option_table_does_not_declare_are_accepted() {
+    for flag in ACCEPTED_V8_FLAGS {
+        expect_accepted(flag);
+    }
+}
+
+#[test]
+fn a_bogus_flag_is_a_bad_option_with_nodes_message_and_status() {
+    // The oracle prints `<argv[0]>: bad option: --totally-bogus-flag=1` and
+    // exits 9. The message text is part of the contract because Node's own tests
+    // and the harness read it; the prefix is `argv[0]`, so it is compared from
+    // the first colon onward.
+    let (code, stdout, stderr) = run_args(&["--totally-bogus-flag=1", "-e", "console.log(1)"]);
+    assert_eq!(code, 9, "stderr: {stderr}");
+    assert!(
+        stdout.is_empty(),
+        "the script must not run, printed {stdout:?}"
+    );
+    let prefix = format!("{}: ", env!("CARGO_BIN_EXE_rustnode"));
+    assert_eq!(
+        stderr.trim_end(),
+        format!("{prefix}bad option: --totally-bogus-flag=1"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn every_bad_flag_is_reported_not_only_the_first() {
+    // Node's loop over the leftovers prints one line per flag, so two unknown
+    // flags produce two lines rather than stopping at the first.
+    let (code, _, stderr) = run_args(&["--bogus-a", "--bogus-b", "-e", "1"]);
+    assert_eq!(code, 9, "stderr: {stderr}");
+    assert!(stderr.contains("bad option: --bogus-a"), "stderr: {stderr}");
+    assert!(stderr.contains("bad option: --bogus-b"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_declared_flag_rustnode_has_not_implemented_is_not_forwarded() {
+    // The rule `forward_v8_flags` used to state as a comment: a flag the table
+    // declares is Node's, so handing it to V8 would change V8's behaviour behind
+    // rustnode's back. `--max-http-header-size` is declared by the table and not
+    // implemented by the CLI, so it stays a rejection rather than becoming a V8
+    // flag that V8 would also refuse (as a `bad option`) or, worse, accept.
+    let (code, _, stderr) = run_args(&["--max-http-header-size=32768", "-e", "1"]);
+    assert_eq!(code, 9, "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported option '--max-http-header-size=32768'"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn an_expose_gc_flag_installs_v8s_own_gc() {
+    // `--expose-gc` is a `kV8Option` in Node's table, so it is forwarded and V8
+    // installs the real extension. A Rust-side `gc` would not be the function
+    // V8's own tests call, and `gc()` actually collecting is what distinguishes
+    // the real one from a stub that returns.
+    let (code, stdout, stderr) = run_args(&["--expose-gc", "-e", "gc(); console.log(typeof gc)"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "function", "stderr: {stderr}");
+}
+
+#[test]
+fn max_old_space_size_still_moves_the_heap_limit() {
+    // Load-bearing before this change and after it: the limit is what
+    // `v8.getHeapStatistics().heap_size_limit` reports, so a flag that reached
+    // no V8 leaves a constant. The two runs also have to differ from each other,
+    // which a single run against a remembered number cannot show.
+    let script = "console.log(require('v8').getHeapStatistics().heap_size_limit)";
+    let (small_code, small, small_err) = run_args(&["--max-old-space-size=100", "-e", script]);
+    let (large_code, large, large_err) = run_args(&["--max-old-space-size=512", "-e", script]);
+    assert_eq!(small_code, 0, "stderr: {small_err}");
+    assert_eq!(large_code, 0, "stderr: {large_err}");
+    let small: u64 = small.trim().parse().expect("a number");
+    let large: u64 = large.trim().parse().expect("a number");
+    assert!(
+        large > small,
+        "--max-old-space-size=512 ({large}) must raise the limit above =100 ({small})"
+    );
+}
+
+#[test]
+fn allow_natives_syntax_still_parses_natives_intrinsics() {
+    // The intrinsic is a parse error unless V8 has the flag, so this fails at
+    // compile time rather than by a wrong answer.
+    let (code, stdout, stderr) = run_args(&[
+        "--allow-natives-syntax",
+        "-e",
+        "function f() {}; console.log(%GetOptimizationStatus(f) >= 0)",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "true", "stderr: {stderr}");
+}
+
+#[test]
+fn a_v8_flag_is_recorded_in_exec_argv() {
+    // Node pushes the argument onto `exec_args` before looking it up, so
+    // `process.execArgv` carries it in the spelling that was typed.
+    let (code, stdout, stderr) = run_args(&[
+        "--expose_gc",
+        "-e",
+        "console.log(JSON.stringify(process.execArgv))",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        r#"["--expose_gc","-e","console.log(JSON.stringify(process.execArgv))"]"#,
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn an_underscored_v8_flag_reaches_v8_the_same_way_the_dashed_one_does() {
+    // `Parse` replaces `_` with `-` after the leading dashes, so the oracle
+    // treats both spellings as one flag. `--allow_natives_syntax` appears in
+    // Node's own test headers, so a runtime that accepts only the dashed form
+    // rejects a command line `node` runs.
+    let script = "function f() {}; console.log(%GetOptimizationStatus(f) >= 0)";
+    for flag in ["--allow-natives-syntax", "--allow_natives_syntax"] {
+        let (code, stdout, stderr) = run_args(&[flag, "-e", script]);
+        assert_eq!(code, 0, "{flag} stderr: {stderr}");
+        assert_eq!(stdout.trim(), "true", "{flag} stderr: {stderr}");
+    }
+}
+
+#[test]
+fn trace_gc_actually_traces_instead_of_merely_exiting_zero() {
+    // The silent-acceptance check. `--trace-gc` is accepted by V8 or it is not;
+    // what proves it *took effect* is that GC lines appear, and that they stop
+    // appearing without the flag. V8 prints them to stdout, so the assertion is
+    // on stdout in both directions — a check that only looked at stderr would
+    // pass on a build that printed nothing.
+    let script = "for (let i = 0; i < 200; i++) new Array(1000).fill(i)";
+    let (off_code, off, off_err) = run_args(&["-e", script]);
+    let (on_code, on, on_err) = run_args(&["--trace-gc", "-e", script]);
+    assert_eq!(off_code, 0, "stderr: {off_err}");
+    assert_eq!(on_code, 0, "stderr: {on_err}");
+    assert!(
+        !off.contains("Scavenge") && !off.contains("Mark-Compact"),
+        "without the flag there must be no GC trace, stdout: {off}"
+    );
+    assert!(
+        on.contains("Scavenge") || on.contains("Mark-Compact"),
+        "--trace-gc must print GC traces, stdout: {on}"
+    );
+}
+
+#[test]
+fn jitless_actually_disables_the_jit_instead_of_merely_exiting_zero() {
+    // `--jitless` removes executable memory, so WebAssembly is not installed at
+    // all. That is a V8-level effect no Rust-side parsing can fake, and it is
+    // observable in one line.
+    let (on_code, on, on_err) = run_args(&["--jitless", "-e", "console.log(typeof WebAssembly)"]);
+    let (off_code, off, off_err) = run_args(&["-e", "console.log(typeof WebAssembly)"]);
+    assert_eq!(on_code, 0, "stderr: {on_err}");
+    assert_eq!(off_code, 0, "stderr: {off_err}");
+    assert_eq!(off.trim(), "object", "without the flag: {off}");
+    assert_eq!(
+        on.trim(),
+        "undefined",
+        "--jitless must remove WebAssembly: {on}"
+    );
+}
+
+#[test]
+fn a_v8_flag_from_the_variable_uses_the_same_authority() {
+    // The variable's legal V8 flags already went through the option table, so
+    // they reach `v8_args` there rather than here. `--jitless` is one, and it
+    // has to arrive before `V8::initialize` — a flag set after it is ignored,
+    // which would show up as WebAssembly still being present.
+    expect_env("--jitless", "console.log(typeof WebAssembly)", "undefined");
 }
 
 /// A scratch directory unique to one test.
