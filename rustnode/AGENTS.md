@@ -12,16 +12,56 @@ This environment installs a commit hook outside the repository, at
 rules forbid AI co-author lines, so a commit made with plain `git commit` will be
 wrong even though nothing in the repository did it.
 
-Commit with the hooks path neutralised:
+Commit with the hooks path neutralised, **and with the maintainer identity**:
 
 ```bash
-git -c core.hooksPath=/dev/null -c user.name="rustnode" \
-  -c user.email="rustnode@local" commit -m "..."
+git -c core.hooksPath=/dev/null \
+  -c user.name="snowingfox" \
+  -c user.email="26035718+SnowingFox@users.noreply.github.com" \
+  commit --no-verify -m "..."
 ```
 
 `--no-verify` is NOT enough. The hook that adds the trailer is
 `prepare-commit-msg`, which git runs even under `--no-verify`, and it runs again
 on every commit a rebase replays, so a rebase also re-adds it.
+
+The identity is a separate requirement from the trailer, and setting only one of
+them is the mistake this section previously caused. Do not author as
+`rustnode <rustnode@local>` or let it default: with no `-c` and no
+`GIT_AUTHOR_*` variable, the author resolves to whatever the global config says,
+which is not a maintainer identity.
+
+### Verify the author, not the trailer
+
+Before pushing, confirm the commit is authored as the identity above:
+
+```bash
+git log -1 --format='%an <%ae>'
+```
+
+A `grep -c Co-authored-by` returning 0 is **not** sufficient evidence, and reading
+it as a pass is how a wrong author shipped once already. That check measures the
+message, while the defect is in the author line: a commit can carry no trailer and
+still be authored as the wrong person. Check `%an <%ae>`; the trailer count is not
+a substitute for it.
+
+It is also not even a reliable measurement of the message. `grep` matches any line
+containing the text, including prose in the body — the commit that introduced this
+paragraph reports `2`, because it discusses the trailer twice, while
+`git interpret-trailers --parse` shows no trailers at all. If a positive answer is
+ever needed, read the parsed trailers rather than grepping:
+
+```bash
+git log -1 --format=%B | git interpret-trailers --parse
+```
+
+The reason this has to be caught before the push, rather than in review, is that
+a squash merge appends `Co-authored-by:` naming the **branch commits' author**
+whenever that differs from the account doing the merge. So a wrong author does not
+fail loudly — it surfaces only after the merge, as a forbidden AI co-author line
+on the squash commit, which is then in `master` history. The trailer is a faithful
+echo of the author identity, not an independent failure, so the identity is the
+only thing worth checking and the only thing that can be checked early.
 
 If a commit already carries the trailer, rewrite it rather than leaving it. The
 filter-branch invocation is not enough on its own either, because `filter-branch`
