@@ -189,35 +189,103 @@ fn encode_utf8_string(
     }
 }
 
+/// `The "list" argument must be an instance of ...`, verbatim from
+/// `DecodeUTF8`'s `THROW_ERR_INVALID_ARG_TYPE`. The wording is load-bearing:
+/// `assert.throws` matchers in user code compare against it.
+const INVALID_INPUT_MESSAGE: &str = "The \"list\" argument must be an instance of \
+     SharedArrayBuffer, ArrayBuffer or ArrayBufferView.";
+
+/// The UTF-8 byte order mark, which a non-`ignoreBom` decode strips once.
+const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
 fn decode_utf8(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    // `decodeUTF8(bytes, fatal)`. With `fatal`, malformed input throws; without
-    // it, malformed sequences become U+FFFD, which is the WHATWG rule.
-    let Ok(source) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(0)) else {
+    // `decodeUTF8(list, ignoreBom, fatal)`, three positional arguments in this
+    // order. `lib/internal/encoding.js` passes `(input, ignoreBom, kFatal)` and
+    // `lib/internal/crypto/webcrypto.js` passes `(data, false, true)`, so the
+    // second argument is never the fatal flag.
+    //
+    // `args.get(0)` is `undefined` past the end, which is not one of the three
+    // accepted shapes, so a zero-argument call throws instead of returning "".
+    let Some(mut bytes) = input_bytes(args.get(0)) else {
+        throw(scope, "ERR_INVALID_ARG_TYPE", INVALID_INPUT_MESSAGE);
         return;
     };
-    let fatal = args.get(1).boolean_value(scope);
-    let length = source.byte_length();
-    let mut bytes = vec![0u8; length];
-    if source.copy_contents(&mut bytes) != length {
+    let ignore_bom = args.get(1).is_true();
+    let fatal = args.get(2).is_true();
+
+    // A leading BOM is dropped only when the caller did not ask to keep it, and
+    // only on the bytes that actually arrived: `TextDecoder` tracks the BOM
+    // across chunks in JavaScript through `kBOMSeen`, so this function only
+    // ever sees the bytes of one call.
+    if !ignore_bom && bytes.starts_with(BOM) {
+        bytes.drain(..BOM.len());
+    }
+
+    if fatal {
+        // Node validates first and hands the bytes to a non-lossy encode, so a
+        // malformed sequence throws rather than becoming U+FFFD.
+        match std::str::from_utf8(&bytes) {
+            Ok(text) => set_string(scope, &mut rv, text),
+            Err(_) => throw(
+                scope,
+                "ERR_ENCODING_INVALID_ENCODED_DATA",
+                "The encoded data was not valid for encoding utf-8",
+            ),
+        }
         return;
     }
 
-    match String::from_utf8(bytes) {
-        Ok(text) => set_string(scope, &mut rv, &text),
-        Err(error) => {
-            if fatal {
-                throw(scope, "The encoded data was not valid for encoding utf-8");
-                return;
-            }
-            // `from_utf8_lossy` substitutes U+FFFD per malformed sequence,
-            // which is the WHATWG replacement behaviour.
-            let text = String::from_utf8_lossy(error.as_bytes()).into_owned();
-            set_string(scope, &mut rv, &text);
-        }
+    // `from_utf8_lossy` replaces each maximal ill-formed subpart with one
+    // U+FFFD, which is the WHATWG replacement rule `String::NewFromUtf8`
+    // implements in Node's `StringBytes::Encode(..., UTF8)` fallback.
+    let text = String::from_utf8_lossy(&bytes);
+    set_string(scope, &mut rv, &text);
+}
+
+/// The bytes `decodeUTF8` should read out of argument 0, or `None` when the
+/// value is not one of the three shapes Node accepts.
+///
+/// Node reads an `ArrayBuffer`, a `SharedArrayBuffer` or any
+/// `ArrayBufferView`; `ArrayBufferViewContents` takes the whole buffer for the
+/// first two and the view's own `byteOffset`/`byteLength` for the third. Every
+/// shape is copied out here, which is what Node does for a shared buffer to
+/// avoid tearing and is harmless for the others: V8 will not lend a `&[u8]`
+/// over memory JavaScript can still mutate.
+fn input_bytes(value: v8::Local<v8::Value>) -> Option<Vec<u8>> {
+    // A detached buffer reports a zero byte length, so it reads as empty input
+    // rather than as an error. That is Node's behaviour too: the detach check
+    // there only chooses between the null pointer and the stack copy.
+    if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(value) {
+        return Some(copy_backing_store(
+            &buffer.get_backing_store(),
+            buffer.byte_length(),
+        ));
+    }
+    if let Ok(buffer) = v8::Local::<v8::SharedArrayBuffer>::try_from(value) {
+        return Some(copy_backing_store(
+            &buffer.get_backing_store(),
+            buffer.byte_length(),
+        ));
+    }
+    if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
+        let mut bytes = vec![0u8; view.byte_length()];
+        // `copy_contents` reports what it wrote, which is short only when the
+        // view was detached between the length read and the copy.
+        let copied = view.copy_contents(&mut bytes);
+        bytes.truncate(copied);
+        return Some(bytes);
+    }
+    None
+}
+
+fn copy_backing_store(store: &v8::BackingStore, length: usize) -> Vec<u8> {
+    match store.get(..length) {
+        Some(cells) => cells.iter().map(|cell| cell.get()).collect(),
+        None => Vec::new(),
     }
 }
 
@@ -470,11 +538,24 @@ fn set(
     Ok(())
 }
 
-fn throw(scope: &mut v8::PinScope, message: &str) {
+/// Throws a `TypeError` carrying `code`, which is what Node's `THROW_*` macros
+/// build.
+///
+/// Both errors this namespace raises are `TypeError`s in `node_errors.h`, and
+/// the `code` property is what `err.code` and `assert.throws(fn, {code})`
+/// read. The `message` is the same text Node formats.
+fn throw(scope: &mut v8::PinScope, code: &str, message: &str) {
     let Some(message) = v8::String::new(scope, message) else {
         return;
     };
-    let exception = v8::Exception::error(scope, message);
+    let exception = v8::Exception::type_error(scope, message);
+    if let (Ok(object), Some(code_key), Some(code_value)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, "code"),
+        v8::String::new(scope, code),
+    ) {
+        object.set(scope, code_key.into(), code_value.into());
+    }
     scope.throw_exception(exception);
 }
 
