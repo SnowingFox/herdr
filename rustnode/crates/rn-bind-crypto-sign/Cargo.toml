@@ -20,6 +20,12 @@ rn-crypto-openssl = { path = "../rn-crypto-openssl" }
 # key bytes and a format rather than a `KeyObjectHandle`, so the decode lives
 # there and this crate calls it.
 rn-bind-crypto-keys = { path = "../rn-bind-crypto-keys" }
+# `RSACipherJob` is one of the four `PublicKeyCipher::Cipher<operation, cipher>`
+# instantiations `crypto_cipher.cc` installs, and the OAEP operation itself
+# (`EVP_PKEY_encrypt`/`decrypt` with a padding, digest and label) lives there with
+# its `cipher.js` twin. `rsa.js` builds this job for `subtle.encrypt`'s RSA-OAEP
+# path, so the job needs that one operation rather than a second copy of it.
+rn-bind-crypto-cipher = { path = "../rn-bind-crypto-cipher" }
 openssl = { version = "=0.10.82", features = ["vendored"] }
 openssl-sys = { version = "=0.9.118", features = ["vendored"] }
 foreign-types = "0.3"

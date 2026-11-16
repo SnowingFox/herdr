@@ -668,6 +668,26 @@ pub fn buffer_from_public<'s>(
     buffer_from(scope, bytes).ok()
 }
 
+/// An `ArrayBuffer` over a copy of `bytes`.
+///
+/// The WebCrypto jobs publish their result through
+/// `CryptoJob::AfterThreadPoolWork`'s `ToWebCryptoJobResult`, which rewrites a
+/// `Buffer` to its backing `ArrayBuffer` and passes everything else through. A
+/// job that resolved a `Buffer` therefore still reached the caller as an
+/// `ArrayBuffer`, but only because that translation ran — the traditional path
+/// really does want a `Buffer`, so the two cannot share one emitter. This is the
+/// WebCrypto one.
+pub fn array_buffer_public<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: &[u8],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let store = v8::ArrayBuffer::new_backing_store_from_boxed_slice(
+        bytes.to_vec().into_boxed_slice(),
+    )
+    .make_shared();
+    Some(v8::ArrayBuffer::with_backing_store(scope, &store).into())
+}
+
 /// `Buffer.from(arrayBuffer, 0, length)` over a fresh backing store.
 ///
 /// `Buffer.from` rather than `new Buffer(...)`: the latter is deprecated and the

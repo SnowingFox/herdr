@@ -45,6 +45,19 @@ const K_SIG_ENC_DER: i32 = 0;
 const K_SIG_ENC_P1363: i32 = 1;
 /// `kKeyVariantRSA_SSA_PKCS1_v1_5`.
 const K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5: i32 = 0;
+/// `kCryptoJobSync`.
+const K_CRYPTO_JOB_SYNC: i32 = 1;
+/// `kCryptoJobWebCrypto`: `run()` returns a promise the completion settles.
+const K_CRYPTO_JOB_WEB_CRYPTO: i32 = 2;
+
+/// `kWebCryptoCipherEncrypt`, from `WebCryptoCipherMode` in `node_crypto.h`.
+const K_WEBCRYPTO_CIPHER_ENCRYPT: i32 = 0;
+/// `kWebCryptoCipherDecrypt`.
+const K_WEBCRYPTO_CIPHER_DECRYPT: i32 = 1;
+/// `kKeyVariantRSA_OAEP`, the only variant `RSACipherTraits` accepts.
+const K_KEY_VARIANT_RSA_OAEP: i32 = 2;
+/// `RSA_PKCS1_OAEP_PADDING`, from OpenSSL's `rsa.h`.
+const RSA_PKCS1_OAEP_PADDING: i32 = 4;
 
 /// Why a job failed, with the OpenSSL detail when there is any.
 ///
@@ -57,6 +70,9 @@ const K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5: i32 = 0;
 enum JobError {
     /// A cryptographic failure with nothing on the OpenSSL queue.
     Plain(&'static str, &'static str),
+    /// The same shape with an owned message, for a detail that is only known at
+    /// runtime (an OpenSSL-provided argument complaint, for instance).
+    Owned(String, &'static str),
     /// A failure OpenSSL described: the packed error and its parts.
     OpenSsl {
         packed: u64,
@@ -83,6 +99,9 @@ impl JobError {
 enum JobKind {
     /// A one-shot sign or verify over a whole message.
     Sign {
+        /// `kCryptoJob*`: whether `run()` returns the `[err, result]` tuple, a
+        /// promise, or queues for `ondone`.
+        crypto_mode: i32,
         job_mode: i32,
         /// The key, or `None` when the constructor's decode failed. The failure
         /// is recorded rather than thrown so `run()` can report it in the
@@ -100,7 +119,20 @@ enum JobKind {
         context: Option<Vec<u8>>,
     },
     /// The RSA encrypt/decrypt job, which belongs to the cipher slice.
-    RsaCipher { variant: i32 },
+    RsaCipher {
+        /// `kCryptoJob*`, so `run()` knows whether to return a tuple or a promise.
+        crypto_mode: i32,
+        /// `kWebCryptoCipherEncrypt` or `kWebCryptoCipherDecrypt`.
+        cipher_mode: i32,
+        /// The key, decoded from the `KeyObjectHandle` in slot 2.
+        key: Option<PKey>,
+        key_error: Option<(&'static str, &'static str)>,
+        data: Vec<u8>,
+        variant: i32,
+        /// `RSA-OAEP`'s digest and label.
+        digest: Option<String>,
+        label: Option<Vec<u8>>,
+    },
 }
 
 /// Installs `SignJob` and `RSACipherJob`, and the padding constant that
@@ -139,6 +171,7 @@ fn sign_job_constructor<'s>(
         return;
     }
     let this: v8::Local<v8::Object> = args.this();
+    let crypto_mode = int_at(&args, 0).unwrap_or(K_CRYPTO_JOB_SYNC);
     let job_mode = int_at(&args, 1).unwrap_or(K_SIGN_JOB_MODE_SIGN);
     // The state is installed *first*, with no key, so a decode failure below
     // leaves the object runnable instead of with a null internal field. `run()`
@@ -149,6 +182,7 @@ fn sign_job_constructor<'s>(
         scope,
         this,
         JobKind::Sign {
+            crypto_mode,
             job_mode,
             key: None,
             key_error: Some(("the job has no key", "ERR_CRYPTO_INVALID_KEYTYPE")),
@@ -216,6 +250,7 @@ fn sign_job_constructor<'s>(
         scope,
         this,
         JobKind::Sign {
+            crypto_mode,
             job_mode,
             key,
             key_error,
@@ -233,21 +268,73 @@ fn sign_job_constructor<'s>(
 
 /// `new RSACipherJob(mode, cipherMode, key, data, variant, hash, label)`.
 ///
-/// The key is not decoded: RSA encryption needs `EVP_PKEY_encrypt` and the key's
-/// padding variant, which the cipher slice owns. Constructing the job is enough
-/// for `rsa.js` to reach `run()`, where the gap is reported.
+/// `rsa.js` builds this for RSA-OAEP: `rsaOaepCipher` passes
+/// `(kCryptoJobWebCrypto, mode, getCryptoKeyHandle(key), data,
+/// kKeyVariantRSA_OAEP, normalizeHashName(hash.name), algorithm.label)`. The key
+/// is a `KeyObjectHandle`, and the operation is `crypto_cipher.cc`'s
+/// `PublicKeyCipher::Cipher<kPublic, encrypt>` / `<kPrivate, decrypt>` — the same
+/// pair `crypto.publicEncrypt`/`privateDecrypt` expose — so the work delegates to
+/// that crate rather than duplicating the OAEP sequencing.
 fn rsa_cipher_job_constructor<'s>(
-    _scope: &mut v8::PinScope<'s, '_>,
+    scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
     if !args.is_construct_call() {
-        crate::throw_construct_call_required(_scope);
+        crate::throw_construct_call_required(scope);
         return;
     }
     let this: v8::Local<v8::Object> = args.this();
+    let crypto_mode = int_at(&args, 0).unwrap_or(K_CRYPTO_JOB_WEB_CRYPTO);
+    let cipher_mode = int_at(&args, 1).unwrap_or(K_WEBCRYPTO_CIPHER_ENCRYPT);
+    // `CipherJob::New` reads the key as **one** slot:
+    //
+    //     CHECK(args[2]->IsObject());  // KeyObject
+    //     ASSIGN_OR_RETURN_UNWRAP(&key, args[2]);
+    //
+    // and then reads the payload at `args[3]` and the traits' parameters from
+    // `args[4]`. That is not the five-slot `GetPublicOrPrivateKeyFromJs` layout
+    // `crypto.publicEncrypt` uses, so this takes the handle directly rather than
+    // through `read_key_from_js` — doing the latter consumed five slots, put the
+    // payload read at `undefined`, and reported "Invalid key type" for every
+    // RSA-OAEP operation.
+    let key_type = if cipher_mode == K_WEBCRYPTO_CIPHER_DECRYPT {
+        KeyType::Private
+    } else {
+        KeyType::Public
+    };
+    let (key, key_error) = match v8::Local::<v8::Object>::try_from(args.get(2)) {
+        Ok(handle) => match rn_bind_crypto_keys::key_of_handle(scope, handle) {
+            Some(data) if data.asymmetric_key().is_some() => {
+                let data = data.as_type(key_type);
+                (
+                    data.asymmetric_key().cloned(),
+                    None,
+                )
+            }
+            _ => (None, Some(("Invalid key type", "ERR_CRYPTO_INVALID_KEYTYPE"))),
+        },
+        Err(_) => (None, Some(("Invalid key type", "ERR_CRYPTO_INVALID_KEYTYPE"))),
+    };
+    let data = bytes_of(args.get(3)).unwrap_or_default();
+    // `RSACipherTraits::AdditionalConfig(mode, args, 4, cipher_mode, &params)`.
     let variant = int_at(&args, 4).unwrap_or(K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5);
-    install_state(_scope, this, JobKind::RsaCipher { variant });
+    let digest = string_of(scope, args.get(5));
+    let label = bytes_of(args.get(6));
+    install_state(
+        scope,
+        this,
+        JobKind::RsaCipher {
+            crypto_mode,
+            cipher_mode,
+            key,
+            key_error,
+            data,
+            variant,
+            digest,
+            label,
+        },
+    );
     rv.set(this.into());
 }
 
@@ -274,8 +361,8 @@ fn run(
         return;
     };
 
-    let outcome = match &state {
-        JobKind::Sign {
+    match &state {
+        JobKind::Sign {            crypto_mode,
             job_mode,
             key,
             key_error,
@@ -287,53 +374,236 @@ fn run(
             signature,
             context,
         } => {
-            if let Some((message, code)) = key_error {
-                emit_pair(scope, &mut rv, Err(JobError::Plain(message, code)));
-                return;
-            }
-            let Some(key) = key else {
-                emit_pair(
-                    scope,
-                    &mut rv,
-                    Err(JobError::Plain(
-                        "the job has no key",
-                        "ERR_CRYPTO_INVALID_KEYTYPE",
-                    )),
-                );
-                return;
-            };
-            run_sign(
-                key,
-                *job_mode,
-                data,
-                algorithm.as_deref(),
-                *salt_length,
-                *padding,
-                *dsa_encoding,
-                signature.as_deref(),
-                context.as_deref(),
-            )
-        }
-        JobKind::RsaCipher { variant } => {
-            // Reported rather than half-implemented: a job that returned its
-            // input would look like a pass to a caller that does not compare
-            // bytes, and `rsa.js`'s OAEP path is the cipher slice's work.
-            let message = if *variant == 2 {
-                "RSA-OAEP is not implemented yet"
+            let outcome = if let Some((message, code)) = key_error {
+                Err(JobError::Plain(message, code))
+            } else if let Some(key) = key {
+                run_sign(
+                    key,
+                    *job_mode,
+                    data,
+                    algorithm.as_deref(),
+                    *salt_length,
+                    *padding,
+                    *dsa_encoding,
+                    signature.as_deref(),
+                    context.as_deref(),
+                )
             } else {
-                "RSACipherJob is not implemented yet"
+                Err(JobError::Plain(
+                    "the job has no key",
+                    "ERR_CRYPTO_INVALID_KEYTYPE",
+                ))
             };
-            Err(JobError::Plain(message, "ERR_CRYPTO_OPERATION_FAILED"))
+            // `CryptoJob<SignTraits>::Run`: `kCryptoJobWebCrypto` creates a
+            // resolver, returns the promise and queues the work, so `jobPromise`
+            // gets something to await. The sync form destructures the tuple
+            // instead, and a thrown error here would surface from the wrong
+            // place. Both are the same computed outcome.
+            let converted = outcome.map(|outcome| match outcome {
+                JobOutcome::Signature(bytes) => BytesOrBool::Bytes(bytes),
+                JobOutcome::Verified(value) => BytesOrBool::Bool(value),
+            });
+            if *crypto_mode == K_CRYPTO_JOB_WEB_CRYPTO {
+                emit_promise(scope, &mut rv, converted);
+            } else {
+                emit_pair(scope, &mut rv, converted);
+            }
+            return;
+        }
+        JobKind::RsaCipher {
+            crypto_mode,
+            cipher_mode,
+            key,
+            key_error,
+            data,
+            variant,
+            digest,
+            label,
+        } => {
+            let outcome = rsa_cipher(
+                *cipher_mode,
+                key.as_ref(),
+                *key_error,
+                data,
+                *variant,
+                digest.as_deref(),
+                label.as_deref(),
+            );
+            if *crypto_mode == K_CRYPTO_JOB_WEB_CRYPTO {
+                emit_promise(scope, &mut rv, outcome);
+            } else {
+                emit_pair(scope, &mut rv, outcome);
+            }
+            return;
         }
     };
+}
 
-    match outcome {
-        Ok(JobOutcome::Signature(bytes)) => {
-            emit_pair(scope, &mut rv, Ok(BytesOrBool::Bytes(bytes)))
-        }
-        Ok(JobOutcome::Verified(value)) => emit_pair(scope, &mut rv, Ok(BytesOrBool::Bool(value))),
-        Err(error) => emit_pair(scope, &mut rv, Err(error)),
+/// Runs the WebCrypto RSA-OAEP operation.
+///
+/// `RSACipherTraits::AdditionalConfig` accepts only `kKeyVariantRSA_OAEP`, and
+/// `RSACipherTraits::Cipher` is a `PublicKeyCipher` over the key's padding. The
+/// OAEP digest and label come from the algorithm dictionary; `params->padding`
+/// starts as `RSA_PKCS1_OAEP_PADDING` and nothing changes it.
+#[allow(clippy::too_many_arguments)]
+fn rsa_cipher(
+    cipher_mode: i32,
+    key: Option<&PKey>,
+    key_error: Option<(&'static str, &'static str)>,
+    data: &[u8],
+    variant: i32,
+    digest: Option<&str>,
+    label: Option<&[u8]>,
+) -> Result<BytesOrBool, JobError> {
+    if let Some((message, code)) = key_error {
+        return Err(JobError::Plain(message, code));
     }
+    let Some(key) = key else {
+        return Err(JobError::Plain(
+            "the job has no key",
+            "ERR_CRYPTO_INVALID_KEYTYPE",
+        ));
+    };
+    if variant != K_KEY_VARIANT_RSA_OAEP {
+        // `RSACipherTraits::AdditionalConfig`'s `default:` arm.
+        return Err(JobError::Plain(
+            "Invalid key type",
+            "ERR_CRYPTO_INVALID_KEYTYPE",
+        ));
+    }
+    let operation = if cipher_mode == K_WEBCRYPTO_CIPHER_DECRYPT {
+        rn_bind_crypto_cipher::public_key::Cipher::Decrypt
+    } else {
+        rn_bind_crypto_cipher::public_key::Cipher::Encrypt
+    };
+    let result = rn_bind_crypto_cipher::public_key::operate(
+        key,
+        operation,
+        RSA_PKCS1_OAEP_PADDING,
+        digest,
+        label,
+        digest,
+        data,
+    );
+    match result {
+        Ok(bytes) => Ok(BytesOrBool::Bytes(bytes)),
+        Err(failure) => Err(cipher_failure_to_job_error(failure)),
+    }
+}
+
+/// Maps the cipher crate's failure onto this crate's `JobError`.
+fn cipher_failure_to_job_error(failure: rn_bind_crypto_cipher::public_key::CryptoFailure) -> JobError {
+    use rn_bind_crypto_cipher::public_key::CryptoFailure;
+    match failure {
+        // The decode already threw, so the run reports the same code the
+        // synchronous path would have thrown.
+        CryptoFailure::Thrown => {
+            JobError::Plain("Failed to read key", "ERR_CRYPTO_INVALID_KEYTYPE")
+        }
+        CryptoFailure::OpenSsl(packed) => match rn_crypto_openssl::openssl_error_for(packed) {
+            Some(detail) => JobError::OpenSsl {
+                packed,
+                library: detail.library_display,
+                reason: detail.reason,
+            },
+            None => JobError::Plain("error", "ERR_CRYPTO_OPERATION_FAILED"),
+        },
+        CryptoFailure::InvalidArgument(message) | CryptoFailure::Message(message) => {
+            JobError::Owned(message, "ERR_CRYPTO_OPERATION_FAILED")
+        }
+        CryptoFailure::InvalidDigest => JobError::Plain("Invalid digest", "ERR_CRYPTO_INVALID_DIGEST"),
+    }
+}
+///
+/// This is `CryptoJob<SignTraits>::Run`'s WebCrypto branch plus
+/// `ToWebCryptoJobResult`: `run()` returns a promise, the result is an
+/// `ArrayBuffer` for a sign and a boolean for a verify, and a failure rejects
+/// with the job's error directly — `settleJobPromise` in
+/// `lib/internal/crypto/util.js` passes a rejection straight through, which is
+/// how `subtle.sign` reports `ERR_CRYPTO_INVALID_DIGEST` rather than wrapping it
+/// in an `OperationError` twice.
+fn emit_promise(scope: &mut v8::PinScope<'_, '_>, rv: &mut v8::ReturnValue, outcome: Result<BytesOrBool, JobError>) {
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        return;
+    };
+    let promise = resolver.get_promise(scope);
+    match outcome {
+        Ok(value) => {
+            let converted: Option<v8::Local<'_, v8::Value>> = match value {
+                BytesOrBool::Bytes(bytes) => array_buffer(scope, &bytes),
+                BytesOrBool::Bool(value) => Some(v8::Boolean::new(scope, value).into()),
+            };
+            match converted {
+                Some(value) => {
+                    resolver.resolve(scope, value);
+                }
+                None => {
+                    let error = JobError::Plain(
+                        "cannot allocate the result",
+                        "ERR_CRYPTO_OPERATION_FAILED",
+                    );
+                    let value = job_error_value(scope, &error);
+                    resolver.reject(scope, value);
+                }
+            }
+        }
+        Err(error) => {
+            let value = job_error_value(scope, &error);
+            resolver.reject(scope, value);
+        }
+    }
+    rv.set(promise.into());
+}
+
+/// Builds the JavaScript error object a [`JobError`] corresponds to.
+fn job_error_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    error: &JobError,
+) -> v8::Local<'s, v8::Value> {
+    let (message, code) = match error {
+        JobError::Plain(message, code) => ((*message).to_string(), (*code).to_string()),
+        JobError::Owned(message, code) => (message.clone(), (*code).to_string()),
+        JobError::OpenSsl {
+            packed,
+            library,
+            reason,
+        } => (
+            rn_crypto_openssl::openssl_error_for(*packed)
+                .map(|detail| detail.message)
+                .unwrap_or_else(|| format!("error:{packed:X}:{library}::{reason}")),
+            rn_crypto_openssl::openssl_error_for(*packed)
+                .map(|detail| detail.code())
+                .unwrap_or_else(|| "ERR_CRYPTO_OPERATION_FAILED".to_string()),
+        ),
+    };
+    let Some(text) = v8::String::new(scope, &message) else {
+        return v8::undefined(scope).into();
+    };
+    let exception = v8::Exception::error(scope, text);
+    if let (Ok(object), Some(key), Some(value)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, "code"),
+        v8::String::new(scope, &code),
+    ) {
+        object.set(scope, key.into(), value.into());
+    }
+    exception
+}
+
+/// An `ArrayBuffer` over a copy of `bytes`.
+///
+/// `ToWebCryptoJobResult` passes an `ArrayBuffer` through unchanged and rewrites
+/// a `Buffer` to its backing store, so both would reach the caller as an
+/// `ArrayBuffer`; building one directly is what the WebCrypto shape actually is.
+fn array_buffer<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: &[u8],
+) -> Option<v8::Local<'s, v8::Value>> {
+    let store = v8::ArrayBuffer::new_backing_store_from_boxed_slice(
+        bytes.to_vec().into_boxed_slice(),
+    )
+    .make_shared();
+    Some(v8::ArrayBuffer::with_backing_store(scope, &store).into())
 }
 
 /// What a successful job produced.
@@ -1034,6 +1304,7 @@ fn emit_pair(
             // and the test then reads `.code` off it.
             let (message, code) = match &error {
                 JobError::Plain(message, code) => ((*message).to_string(), (*code).to_string()),
+                JobError::Owned(message, code) => (message.clone(), (*code).to_string()),
                 JobError::OpenSsl {
                     packed,
                     library,
@@ -1057,14 +1328,14 @@ fn emit_pair(
                         "library",
                         match &error {
                             JobError::OpenSsl { library, .. } => library.clone(),
-                            JobError::Plain(..) => String::new(),
+                            JobError::Plain(..) | JobError::Owned(..) => String::new(),
                         },
                     ),
                     (
                         "reason",
                         match &error {
                             JobError::OpenSsl { reason, .. } => reason.clone(),
-                            JobError::Plain(..) => String::new(),
+                            JobError::Plain(..) | JobError::Owned(..) => String::new(),
                         },
                     ),
                 ] {

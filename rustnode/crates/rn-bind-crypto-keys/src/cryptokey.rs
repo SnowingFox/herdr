@@ -87,7 +87,6 @@ pub fn create_crypto_key_class<'s>(
         throw_type_error(scope, "createCryptoKeyClass needs a callback");
         return;
     };
-
     let template = match TEMPLATE.with(|slot| slot.borrow().clone()) {
         Some(template) => v8::Local::new(scope, &template),
         None => {
@@ -125,7 +124,109 @@ pub fn create_crypto_key_class<'s>(
     let Some(result) = callback.call(scope, receiver, &[constructor.into()]) else {
         return;
     };
+    // Node stores the second element — `InternalCryptoKey` — on the
+    // `Environment` (`crypto_internal_cryptokey_constructor`) and `NativeCryptoKey::Create`
+    // constructs keys through it. `keys.js` returns `[CryptoKey,
+    // InternalCryptoKey]` from this callback, and only `InternalCryptoKey` sets
+    // the slot array the getters read (`this.#slots`), so building a key from
+    // the base `NativeCryptoKey` alone would produce an object that brands as a
+    // CryptoKey and has no slots. The WebCrypto jobs need to build keys without
+    // a JavaScript caller, so the constructor is recorded here.
+    if let Ok(array) = v8::Local::<v8::Array>::try_from(result) {
+        if let Some(internal) = array.get_index(scope, 1) {
+            if let Ok(internal) = v8::Local::<v8::Function>::try_from(internal) {
+                let global = v8::Global::new(scope.as_ref(), internal);
+                INTERNAL_CRYPTO_KEY_CTOR.with(|slot| *slot.borrow_mut() = Some(global));
+            }
+        }
+    }
     rv.set(result);
+}
+
+thread_local! {
+    /// The `InternalCryptoKey` constructor `keys.js` handed back, which is the
+    /// `crypto_internal_cryptokey_constructor` Node keeps on the `Environment`.
+    ///
+    /// Set only by [`create_crypto_key_class`], so a worker isolate gets its own
+    /// (each context runs `keys.js` once), and read only by
+    /// [`create_crypto_key`], which is the WebCrypto keygen result path.
+    static INTERNAL_CRYPTO_KEY_CTOR: RefCell<Option<v8::Global<v8::Function>>> =
+        const { RefCell::new(None) };
+}
+
+/// Loads `internal/crypto/keys` so it publishes its classes.
+///
+/// This is `env->builtin_module_require()` in `NativeCryptoKey::Create`: the
+/// module runs `createCryptoKeyClass` at module scope, which is what stores the
+/// constructor [`create_crypto_key`] needs. Calling it is idempotent because the
+/// module cache returns the instance `require('crypto')` already built.
+fn load_keys_module(scope: &mut v8::PinScope<'_, '_>) -> Option<()> {
+    let require = rn_core::hook_slot::require(scope)?;
+    let id = v8::String::new(scope, "internal/crypto/keys")?;
+    let receiver = v8::undefined(scope).into();
+    require.call(scope, receiver, &[id.into()])?;
+    Some(())
+}
+
+/// `NativeCryptoKey::Create`: builds an `InternalCryptoKey`.
+///
+/// The four required slots are `keys.js`'s `InternalCryptoKey(handle, algorithm,
+/// usagesMask, extractable)`, and the two optional ones are the Hybrid KEM
+/// secondary handle and seed data. Node reaches this from C++ with
+/// `cryptokey_ctor->NewInstance`, and so does this: the JavaScript class does the
+/// slot packing, the `CryptoKey` prototype swap and the `#slots` initialisation,
+/// none of which the binding can reproduce.
+///
+/// Returns `None` with a pending exception when the JavaScript has not built its
+/// classes yet, which only happens if `internal/crypto/keys.js` never loaded.
+pub fn create_crypto_key<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    handle: v8::Local<'s, v8::Object>,
+    algorithm: v8::Local<'s, v8::Value>,
+    usages_mask: u32,
+    extractable: bool,
+    secondary_handle: Option<v8::Local<'s, v8::Value>>,
+    seed_data: Option<v8::Local<'s, v8::Value>>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    // `NativeCryptoKey::Create` loads `internal/crypto/keys` on demand:
+    //
+    //     if (env->crypto_internal_cryptokey_constructor().IsEmpty()) {
+    //       Local<Value> arg = env->internal_crypto_keys_string();
+    //       env->builtin_module_require()->Call(context, Null(isolate), 1, &arg)
+    //     }
+    //
+    // which is what makes `subtle.generateKey` work before any user code has
+    // touched `require('crypto')`, and what makes it work from a context whose
+    // `keys.js` has not run yet. Without this the lazy path left the constructor
+    // unset and the job reported "InternalCryptoKey is unavailable" for a
+    // namespace that was otherwise entirely reachable.
+    let mut constructor = INTERNAL_CRYPTO_KEY_CTOR.with(|slot| slot.borrow().clone());
+    if constructor.is_none() && load_keys_module(scope).is_some() {
+        constructor = INTERNAL_CRYPTO_KEY_CTOR.with(|slot| slot.borrow().clone());
+    }
+    let Some(constructor) = constructor else {
+        throw_type_error(
+            scope,
+            "InternalCryptoKey is unavailable: internal/crypto/keys.js did not load",
+        );
+        return None;
+    };
+    let constructor: v8::Local<v8::Function> = v8::Local::new(scope, &constructor);
+    let mask = v8::Integer::new_from_unsigned(scope, usages_mask);
+    let flag = v8::Boolean::new(scope, extractable);
+    let mut args: Vec<v8::Local<'s, v8::Value>> = vec![
+        handle.into(),
+        algorithm,
+        mask.into(),
+        flag.into(),
+    ];
+    if let Some(secondary) = secondary_handle {
+        args.push(secondary);
+    }
+    if let Some(seed) = seed_data {
+        args.push(seed);
+    }
+    constructor.new_instance(scope, &args).map(v8::Local::into)
 }
 
 /// `new NativeCryptoKey(handle, algorithm, usagesMask, extractable[,

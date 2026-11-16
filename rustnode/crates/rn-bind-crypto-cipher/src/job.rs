@@ -105,7 +105,7 @@ pub fn run_job<'s, J: CryptoJob>(
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
     match result {
-        Ok(bytes) => match super::evp_binding::buffer_from_public(scope, &bytes) {
+        Ok(bytes) => match super::evp_binding::array_buffer_public(scope, &bytes) {
             Some(value) => {
                 resolver.resolve(scope, value);
             }

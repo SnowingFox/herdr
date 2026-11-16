@@ -132,6 +132,30 @@ pub const MEMBERS: &[&str] = &[
     "kKeyVariantRSA_SSA_PKCS1_v1_5",
     "kKeyVariantRSA_PSS",
     "kKeyVariantRSA_OAEP",
+    // The WebCrypto AES key variants. `crypto_aes.h` expands `VARIANTS` as CTR,
+    // CBC and GCM at 128/192/256 then the three KW variants, followed by the OCB
+    // block, and `crypto_aes.cc` publishes each as
+    // `static_cast<int>(AESKeyVariant::name)`. `lib/internal/crypto/aes.js` reads
+    // one by name and passes it to `AESCipherJob`, so a missing property is not a
+    // missing constant: `aes.js` passes `undefined`, the job reads index 0, and
+    // every AES variant silently becomes AES-CTR. These were in `DEFERRED` with
+    // the reason "deferred with the WebCrypto surface", which was wrong in both
+    // directions — the surface is what needed them.
+    "kKeyVariantAES_CTR_128",
+    "kKeyVariantAES_CTR_192",
+    "kKeyVariantAES_CTR_256",
+    "kKeyVariantAES_CBC_128",
+    "kKeyVariantAES_CBC_192",
+    "kKeyVariantAES_CBC_256",
+    "kKeyVariantAES_GCM_128",
+    "kKeyVariantAES_GCM_192",
+    "kKeyVariantAES_GCM_256",
+    "kKeyVariantAES_KW_128",
+    "kKeyVariantAES_KW_192",
+    "kKeyVariantAES_KW_256",
+    "kKeyVariantAES_OCB_128",
+    "kKeyVariantAES_OCB_192",
+    "kKeyVariantAES_OCB_256",
     // Random. `randomFillSync` is the synchronous fill; the three job classes
     // are the asynchronous path `random.js` builds whenever a callback was
     // supplied, which is every `randomBytes`/`randomFill`/`randomInt`/
@@ -327,66 +351,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "ML-KEM encapsulation mode flag; the KEM jobs it selects are deferred.",
     ),
     (
-        "kKeyVariantAES_CBC_128",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_CBC_192",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_CBC_256",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_CTR_128",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_CTR_192",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_CTR_256",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_GCM_128",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_GCM_192",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_GCM_256",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_KW_128",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_KW_192",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_KW_256",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_OCB_128",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_OCB_192",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
-        "kKeyVariantAES_OCB_256",
-        "WebCrypto AES key variants, deferred with the WebCrypto surface.",
-    ),
-    (
         "setFipsCrypto",
         "FIPS mode needs a validated provider; `getFipsCrypto` reports false truthfully and \
          turning it on cannot succeed.",
@@ -508,6 +472,48 @@ mod constants {
     pub const K_WEBCRYPTO_KEY_FORMAT_SPKI: i32 = 2;
     /// `kWebCryptoKeyFormatJWK`.
     pub const K_WEBCRYPTO_KEY_FORMAT_JWK: i32 = 3;
+
+    /// `kKeyVariantAES_CTR_128`, from `AESKeyVariant` in `crypto_aes.h`.
+    ///
+    /// `crypto_aes.h` expands `VARIANTS` as `VARIANTS_COMMON` — CTR, CBC and GCM
+    /// at 128/192/256, then the three KW variants — followed by `VARIANTS_OCB`.
+    /// `crypto_aes.cc` publishes each as
+    /// `static_cast<int>(AESKeyVariant::name)`, so the numbers are that
+    /// declaration order. `lib/internal/crypto/aes.js` picks one by name and
+    /// passes it to `AESCipherJob`, so a member that is missing here is not a
+    /// missing constant: the property reads `undefined`, `aes.js` hands
+    /// `undefined` to the job, and the job reads index 0 — AES-CTR — for every
+    /// AES variant. That is why `subtle.encrypt` with AES-GCM failed with
+    /// "Invalid counter" before these were published.
+    pub const K_KEY_VARIANT_AES_CTR_128: i32 = 0;
+    /// `kKeyVariantAES_CTR_192`.
+    pub const K_KEY_VARIANT_AES_CTR_192: i32 = 1;
+    /// `kKeyVariantAES_CTR_256`.
+    pub const K_KEY_VARIANT_AES_CTR_256: i32 = 2;
+    /// `kKeyVariantAES_CBC_128`.
+    pub const K_KEY_VARIANT_AES_CBC_128: i32 = 3;
+    /// `kKeyVariantAES_CBC_192`.
+    pub const K_KEY_VARIANT_AES_CBC_192: i32 = 4;
+    /// `kKeyVariantAES_CBC_256`.
+    pub const K_KEY_VARIANT_AES_CBC_256: i32 = 5;
+    /// `kKeyVariantAES_GCM_128`.
+    pub const K_KEY_VARIANT_AES_GCM_128: i32 = 6;
+    /// `kKeyVariantAES_GCM_192`.
+    pub const K_KEY_VARIANT_AES_GCM_192: i32 = 7;
+    /// `kKeyVariantAES_GCM_256`.
+    pub const K_KEY_VARIANT_AES_GCM_256: i32 = 8;
+    /// `kKeyVariantAES_KW_128`.
+    pub const K_KEY_VARIANT_AES_KW_128: i32 = 9;
+    /// `kKeyVariantAES_KW_192`.
+    pub const K_KEY_VARIANT_AES_KW_192: i32 = 10;
+    /// `kKeyVariantAES_KW_256`.
+    pub const K_KEY_VARIANT_AES_KW_256: i32 = 11;
+    /// `kKeyVariantAES_OCB_128`.
+    pub const K_KEY_VARIANT_AES_OCB_128: i32 = 12;
+    /// `kKeyVariantAES_OCB_192`.
+    pub const K_KEY_VARIANT_AES_OCB_192: i32 = 13;
+    /// `kKeyVariantAES_OCB_256`.
+    pub const K_KEY_VARIANT_AES_OCB_256: i32 = 14;
 
     /// `RSA_PKCS1_PSS_PADDING`, from OpenSSL's `rsa.h`.
     pub const RSA_PKCS1_PSS_PADDING: i32 = 6;
@@ -762,12 +768,71 @@ impl BindingModule for Crypto {
                 "kWebCryptoKeyFormatJWK",
                 constants::K_WEBCRYPTO_KEY_FORMAT_JWK,
             ),
-            (
-                "kKeyVariantRSA_SSA_PKCS1_v1_5",
+            ("kKeyVariantRSA_SSA_PKCS1_v1_5",
                 constants::K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5,
             ),
             ("kKeyVariantRSA_PSS", constants::K_KEY_VARIANT_RSA_PSS),
             ("kKeyVariantRSA_OAEP", constants::K_KEY_VARIANT_RSA_OAEP),
+            (
+                "kKeyVariantAES_CTR_128",
+                constants::K_KEY_VARIANT_AES_CTR_128,
+            ),
+            (
+                "kKeyVariantAES_CTR_192",
+                constants::K_KEY_VARIANT_AES_CTR_192,
+            ),
+            (
+                "kKeyVariantAES_CTR_256",
+                constants::K_KEY_VARIANT_AES_CTR_256,
+            ),
+            (
+                "kKeyVariantAES_CBC_128",
+                constants::K_KEY_VARIANT_AES_CBC_128,
+            ),
+            (
+                "kKeyVariantAES_CBC_192",
+                constants::K_KEY_VARIANT_AES_CBC_192,
+            ),
+            (
+                "kKeyVariantAES_CBC_256",
+                constants::K_KEY_VARIANT_AES_CBC_256,
+            ),
+            (
+                "kKeyVariantAES_GCM_128",
+                constants::K_KEY_VARIANT_AES_GCM_128,
+            ),
+            (
+                "kKeyVariantAES_GCM_192",
+                constants::K_KEY_VARIANT_AES_GCM_192,
+            ),
+            (
+                "kKeyVariantAES_GCM_256",
+                constants::K_KEY_VARIANT_AES_GCM_256,
+            ),
+            (
+                "kKeyVariantAES_KW_128",
+                constants::K_KEY_VARIANT_AES_KW_128,
+            ),
+            (
+                "kKeyVariantAES_KW_192",
+                constants::K_KEY_VARIANT_AES_KW_192,
+            ),
+            (
+                "kKeyVariantAES_KW_256",
+                constants::K_KEY_VARIANT_AES_KW_256,
+            ),
+            (
+                "kKeyVariantAES_OCB_128",
+                constants::K_KEY_VARIANT_AES_OCB_128,
+            ),
+            (
+                "kKeyVariantAES_OCB_192",
+                constants::K_KEY_VARIANT_AES_OCB_192,
+            ),
+            (
+                "kKeyVariantAES_OCB_256",
+                constants::K_KEY_VARIANT_AES_OCB_256,
+            ),
             ("RSA_PKCS1_PSS_PADDING", constants::RSA_PKCS1_PSS_PADDING),
             ("OPENSSL_EC_NAMED_CURVE", constants::OPENSSL_EC_NAMED_CURVE),
             (
@@ -1575,28 +1640,35 @@ fn hash_job<'s>(
 
 /// `HmacJob` for the WebCrypto HMAC path.
 ///
-/// Same shape as [`hash_job`]; `lib/internal/crypto/mac.js` builds it as
-/// `new HmacJob(mode, algorithm, key, data)`.
+/// `lib/internal/crypto/mac.js` builds it as
+/// `new HmacJob(kCryptoJobWebCrypto, signMode, digest, keyHandle, data[, signature])`,
+/// and `crypto_hmac.cc`'s `HmacTraits::AdditionalConfig` reads exactly those five
+/// after the mode: the sign mode as a `Uint32`, the digest name as a string, the
+/// key as a `KeyObjectHandle`, then the data and an optional signature. The key is
+/// a *handle*, not raw bytes — the previous layout read the mode as the algorithm
+/// name and the digest as the key, so `subtle.sign('HMAC', ...)` could not work
+/// whatever the key was.
 fn hmac_job<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
     let this: v8::Local<v8::Object> = args.this();
-    let Some(algorithm) = string_argument(scope, &args, 1) else {
-        throw(scope, "The algorithm argument must be a string");
+    let mode = args.get(1).uint32_value(scope).unwrap_or(0);
+    let Some(algorithm) = string_argument(scope, &args, 2) else {
+        throw(scope, "The digest must be a string");
         return;
     };
-    let key = args.get(2);
-    let data = args.get(3);
-    let Some(key_bytes) = string_or_view_bytes(scope, key) else {
-        throw_type_error(scope, "The key must be a string or an ArrayBufferView");
+    let Some(key_bytes) = secret_key_bytes(scope, args.get(3)) else {
         return;
     };
-    let Some(data_bytes) = string_or_view_bytes(scope, data) else {
+    let Some(data_bytes) = string_or_view_bytes(scope, args.get(4)) else {
         throw_type_error(scope, "The data must be a string or an ArrayBufferView");
         return;
     };
+    // `If (!args[offset + 4]->IsUndefined())` reads a signature for the verify
+    // branch only; absent means sign.
+    let signature = string_or_view_bytes(scope, args.get(5));
     install_job_state(
         scope,
         this,
@@ -1604,9 +1676,43 @@ fn hmac_job<'s>(
             algorithm,
             key: key_bytes,
             data: data_bytes,
+            verify: mode == constants::K_SIGN_JOB_MODE_VERIFY as u32,
+            signature,
         },
     );
     rv.set(this.into());
+}
+
+/// Reads the raw bytes out of a `KeyObjectHandle` for a secret key.
+///
+/// `HmacTraits::AdditionalConfig` unwraps the handle and keeps
+/// `key->Data().addRef()`, then signs with `GetSymmetricKey()`. The bytes are the
+/// same thing `handle.export()` returns for a secret key, which is what
+/// `importSecretKey` in `keys.js` built it from.
+fn secret_key_bytes(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<Vec<u8>> {
+    let Ok(handle) = v8::Local::<v8::Object>::try_from(value) else {
+        throw_type_error(scope, "The key must be a KeyObjectHandle");
+        return None;
+    };
+    let Some(name) = v8::String::new(scope, "getKeyType") else {
+        return None;
+    };
+    let function = handle.get(scope, name.into())?;
+    let function = v8::Local::<v8::Function>::try_from(function).ok()?;
+    let key_type = function.call(scope, handle.into(), &[])?;
+    // `kKeyTypeSecret` is 0.
+    if key_type.int32_value(scope) != Some(0) {
+        throw_type_error(scope, "The key must be a secret KeyObject");
+        return None;
+    }
+    let export = v8::String::new(scope, "export")?;
+    let export = handle.get(scope, export.into())?;
+    let export = v8::Local::<v8::Function>::try_from(export).ok()?;
+    let exported = export.call(scope, handle.into(), &[])?;
+    string_or_view_bytes(scope, exported)
 }
 
 /// The work a job handle will run.
@@ -1620,6 +1726,10 @@ enum JobState {
         algorithm: String,
         key: Vec<u8>,
         data: Vec<u8>,
+        /// `HmacConfig::mode == SignConfiguration::Mode::Verify`.
+        verify: bool,
+        /// The expected signature, for the verify branch only.
+        signature: Option<Vec<u8>>,
     },
 }
 
@@ -1680,18 +1790,38 @@ fn job_run(
             output_length,
         } => match output_length {
             Some(length) => {
-                Digest::new_with_output_length(algorithm, Some(*length)).and_then(|mut digest| {
-                    digest.update(data)?;
-                    digest.finish()
-                })
+                match Digest::new_with_output_length(algorithm, Some(*length)).and_then(
+                    |mut digest| {
+                        digest.update(data)?;
+                        digest.finish()
+                    },
+                ) {
+                    Ok(bytes) => Ok(HmacOutcome::Digest(bytes)),
+                    Err(error) => Err(error),
+                }
             }
-            None => engine::digest_once(algorithm, data),
+            None => engine::digest_once(algorithm, data).map(HmacOutcome::Digest),
         },
         JobState::Hmac {
             algorithm,
             key,
             data,
-        } => engine::hmac_once(algorithm, key, data),
+            verify,
+            signature,
+        } => {
+            // `HmacTraits::EncodeOutput`: sign resolves the digest, verify
+            // answers a boolean after `CRYPTO_memcmp`, so the two have different
+            // result types and the job cannot just return the digest either way.
+            match engine::hmac_once(algorithm, key, data) {
+                Ok(bytes) if *verify => Ok(HmacOutcome::Verified(matches!(
+                    signature.as_deref(),
+                    Some(expected) if expected.len() == bytes.len()
+                        && expected == bytes.as_slice()
+                ))),
+                Ok(bytes) => Ok(HmacOutcome::Digest(bytes)),
+                Err(error) => Err(error),
+            }
+        }
     });
 
     let Some(computed) = computed else {
@@ -1699,13 +1829,17 @@ fn job_run(
         return;
     };
     let promise = match computed {
-        Ok(bytes) => match encoding::array_buffer(scope, &bytes) {
+        // `out->ToArrayBuffer` for a digest, and a boolean for a verify.
+        Ok(HmacOutcome::Digest(bytes)) => match encoding::array_buffer(scope, &bytes) {
             Some(buffer) => resolve_promise(scope, buffer.into()),
             None => {
                 throw(scope, "cannot allocate the job result");
                 return;
             }
         },
+        Ok(HmacOutcome::Verified(verified)) => {
+            resolve_promise(scope, v8::Boolean::new(scope, verified).into())
+        }
         Err(error) => {
             let Some(text) = v8::String::new(scope, &error.to_string()) else {
                 return;
@@ -1717,6 +1851,17 @@ fn job_run(
     if let Some(promise) = promise {
         rv.set(promise.into());
     }
+}
+
+/// What a `HashJob`/`HmacJob` run produced.
+///
+/// `HmacTraits::EncodeOutput` has two result types depending on
+/// `SignConfiguration::Mode`: a digest `ArrayBuffer` for sign, and a `Boolean`
+/// for verify. A single `Vec<u8>` cannot express the second, and returning an
+/// empty digest would read as a successful signature.
+enum HmacOutcome {
+    Digest(Vec<u8>),
+    Verified(bool),
 }
 
 /// Installs a job constructor with `run()` on its prototype.

@@ -151,6 +151,7 @@ pub fn install_classes<'s>(
     }
 
     crate::jobs::install_classes(scope, target)?;
+    crate::dhbits::install_classes(scope, target)?;
     Ok(())
 }
 

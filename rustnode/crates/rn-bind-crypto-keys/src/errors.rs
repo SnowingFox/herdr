@@ -175,6 +175,76 @@ pub fn throw(scope: &mut v8::PinScope<'_, '_>, error: &KeyError) {
     scope.throw_exception(exception);
 }
 
+/// The same error as a [`rn_crypto_job::CryptoJobError`].
+///
+/// The key-generation jobs now run through the shared `CryptoJob` machinery,
+/// whose error type is the one that knows how the three modes differ — a tuple
+/// slot, an `ondone` argument, or a rejected `OperationError` promise. This is
+/// the one crossing point, so every code, message, constructor and OpenSSL
+/// detail a key job reports is the same string `throw` would have produced
+/// synchronously.
+pub fn job_error(error: &KeyError) -> rn_crypto_job::CryptoJobError {
+    use rn_crypto_job::CryptoJobError;
+    match error {
+        // `ThrowCryptoError`: `rn_crypto_job` builds `library`/`reason`/`code`
+        // from the packed value itself, so passing it through keeps one source of
+        // truth for the unpacking.
+        KeyError::OpenSsl { packed, message } if *packed != 0 => {
+            match rn_crypto_openssl::openssl_error_for(*packed) {
+                Some(detail) => CryptoJobError::OpenSsl(rn_crypto_job::OpenSslDetail {
+                    packed: *packed,
+                    code: detail.code(),
+                    library: detail.library_display.clone(),
+                    reason: detail.reason.clone(),
+                    message: detail.message.clone(),
+                }),
+                None => CryptoJobError::operation_failed(message),
+            }
+        }
+        _ => {
+            // Every other variant is a `THROW_ERR_*` with a static code, or an
+            // uncoded `Error`. `CryptoJobError`'s two shapes cover both, and the
+            // `type_error` flag decides the constructor the same way
+            // `is_type_error` does.
+            let message = error.message();
+            match error.code() {
+                Some(code) => CryptoJobError::Node {
+                    code: code_static(code),
+                    message,
+                    type_error: error.is_type_error(),
+                },
+                None => CryptoJobError::operation_failed(&message),
+            }
+        }
+    }
+}
+
+/// The `&'static str` form of a code this crate's variants name.
+///
+/// `CryptoJobError::Node` stores a `&'static str` because `internal/errors`'
+/// templates are compile-time; every code [`KeyError::code`] can return is one of
+/// these literals, so the mapping is exhaustive over the variants rather than a
+/// leak of the caller's string.
+fn code_static(code: &str) -> &'static str {
+    match code {
+        "ERR_CRYPTO_INVALID_KEYTYPE" => "ERR_CRYPTO_INVALID_KEYTYPE",
+        "ERR_CRYPTO_INVALID_KEYLEN" => "ERR_CRYPTO_INVALID_KEYLEN",
+        "ERR_CRYPTO_INVALID_CURVE" => "ERR_CRYPTO_INVALID_CURVE",
+        "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS" => "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS",
+        "ERR_CRYPTO_INVALID_JWK" => "ERR_CRYPTO_INVALID_JWK",
+        "ERR_MISSING_PASSPHRASE" => "ERR_MISSING_PASSPHRASE",
+        "ERR_CRYPTO_OPERATION_FAILED" => "ERR_CRYPTO_OPERATION_FAILED",
+        "ERR_INVALID_THIS" => "ERR_INVALID_THIS",
+        "ERR_CONSTRUCT_CALL_REQUIRED" => "ERR_CONSTRUCT_CALL_REQUIRED",
+        "ERR_CRYPTO_UNSUPPORTED_OPERATION" => "ERR_CRYPTO_UNSUPPORTED_OPERATION",
+        "ERR_INVALID_ARG_VALUE" => "ERR_INVALID_ARG_VALUE",
+        // Unreachable for the variants above, but a wrong guess here would be a
+        // silently wrong `code` on a user-visible error, so the fallback names
+        // the operation rather than returning an empty string.
+        _ => "ERR_CRYPTO_OPERATION_FAILED",
+    }
+}
+
 /// Attaches the `library`, `reason` and `code` fields `ThrowCryptoError` builds
 /// from a packed OpenSSL error.
 ///
