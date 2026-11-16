@@ -28,6 +28,7 @@ use rn_v8_sys::v8::Local;
 use crate::args::Encoding;
 use crate::complete::{deliver_to_callback, deliver_to_promise, Completion, Failure, Payload};
 use crate::error::FsError;
+use crate::filehandle;
 use crate::fsops::{self, TimeSpec};
 use crate::request::{classify, install_sentinel, throw_error, Delivery};
 use crate::stats::{Follow, StatFields, StatFsFields};
@@ -140,7 +141,6 @@ impl BindingModule for Fs {
 /// member is neither installed nor listed here.
 pub const DEFERRED: &[(&str, &str)] = &[
     ("CpDirJob", "cp -r recursion lives in the lib/ JS layer; the C++ job wrapper is not needed until the copy fast path lands"),
-    ("FileHandle", "native FileHandle wrapper; lib/ uses the JS FileHandle over numeric fds for now"),
     ("StatWatcher", "fs.watchFile polling handle, needs the timer loop"),
     ("bigintStatFsValues", "bigint view of statfs fields, follows the BigInt stat surface"),
     ("bigintStatValues", "bigint view of stat fields, follows the BigInt stat surface"),
@@ -149,7 +149,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     ("getFormatOfExtensionlessFile", "ESM format sniffing for extensionless files, owned by the ESM loader"),
     ("kFsStatsFieldsNumber", "internal field-count constant used only by the native stats layout"),
     ("legacyMainResolve", "deprecated main resolution kept for compatibility, owned by the CJS loader"),
-    ("openFileHandle", "native FileHandle construction, same blocker as FileHandle"),
     ("statFsValues", "statfs field layout, lands with the statfs member"),
     ("statValues", "stat field layout, lands with the native stats layout"),
 ];
@@ -207,6 +206,9 @@ pub const MEMBERS: &[&str] = &[
     "handleToFd",
     // Request constructor.
     "FSReqCallback",
+    // Descriptor handles and their opener.
+    "FileHandle",
+    "openFileHandle",
     // One-shot open+read+close / open+write+close jobs.
     "ReadFileJob",
     "WriteFileJob",
@@ -222,6 +224,7 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
     fn install_all(&mut self) -> Result<(), String> {
         mkfn!(self, "cpSyncCheckPaths", cp_sync_check_paths_binding);
         mkfn!(self, "open", open_binding);
+        mkfn!(self, "openFileHandle", open_file_handle_binding);
         mkfn!(self, "close", close_binding);
         mkfn!(self, "read", read_binding);
         mkfn!(self, "readBuffers", read_buffers_binding);
@@ -265,6 +268,11 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
         mkfn!(self, "handleToFd", handle_to_fd_binding);
         self.fs_req_callback()?;
         self.file_jobs()?;
+        // `fs.promises.open()` constructs a `FileHandle` unconditionally, so the
+        // constructor has to exist as a member in its own right as well as being
+        // what `openFileHandle` resolves.
+        let handle = crate::filehandle::constructor(self.scope)?;
+        self.define("FileHandle", handle)?;
         Ok(())
     }
 
@@ -607,6 +615,58 @@ fn open_binding<'a, 's, 'i>(
         Some(denied) => Completion::denied(denied),
         None => match fsops::open(&path, flags, mode) {
             Ok(fd) => Completion::value(v8::Number::new(scope, f64::from(fd)).into()),
+            Err(error) => Completion::failed(error),
+        },
+    };
+    conclude!(scope, args, rv, completion);
+}
+
+/// `openFileHandle(path, flags, mode, [req])`.
+///
+/// This is `OpenFileHandle` in `src/node_file.cc`: the same `uv_fs_open` as
+/// `open`, resolving a `FileHandle` over the descriptor instead of the number.
+/// `lib/internal/fs/promises.js` calls it as
+///
+/// ```js
+/// binding.openFileHandle(path, flagsNumber, mode, kUsePromises)
+/// ```
+///
+/// so the promise form is the only one that matters in practice; the callback
+/// form is implemented too because the binding is public through
+/// `process.binding` and a caller there can pass an `FSReqCallback`.
+pub fn open_file_handle_binding<'a, 's, 'i>(
+    scope: &'a mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let flags = crate::args::int32(scope, args.get(1)).unwrap_or(0);
+    let mode = crate::args::uint32(scope, args.get(2)).unwrap_or(0o666);
+    let Some(path) = required_path(scope, &args, 0, "open") else {
+        return;
+    };
+    let completion = match crate::permission::deny_open(&path, flags) {
+        Some(denied) => Completion::denied(denied),
+        None => match fsops::open(&path, flags, mode) {
+            Ok(fd) => match filehandle::constructor(scope) {
+                Ok(constructor) => {
+                    let constructor = Local::<v8::Function>::try_from(constructor);
+                    match constructor.ok().and_then(|function| {
+                        function.new_instance(scope, &[v8::Integer::new(scope, fd).into()])
+                    }) {
+                        Some(handle) => Completion::value(handle.into()),
+                        None => {
+                            // The constructor failed, so the descriptor would
+                            // otherwise be leaked.
+                            let _ = fsops::close(fd);
+                            Completion::failed(FsError::from_errno("open", libc::ENOMEM))
+                        }
+                    }
+                }
+                Err(_) => {
+                    let _ = fsops::close(fd);
+                    Completion::failed(FsError::from_errno("open", libc::ENOMEM))
+                }
+            },
             Err(error) => Completion::failed(error),
         },
     };

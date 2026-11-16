@@ -699,15 +699,102 @@ fn install_process_methods<'s>(
         }
     }
 
-    // The uncaught-exception hooks and `_fatalException`, which
-    // `internal/bootstrap/node.js` installs from `internal/process/execution`:
+    // `internal/bootstrap/node.js:157-167` — the members taken straight from
+    // `rawMethods`. Each one is assigned onto `process` with no wrapper.
     //
-    // ```js
-    // process._fatalException = onGlobalUncaughtException;
-    // process.setUncaughtExceptionCaptureCallback = setUncaughtExceptionCaptureCallback;
-    // process.addUncaughtExceptionCaptureCallback = addUncaughtExceptionCaptureCallback;
-    // process.hasUncaughtExceptionCaptureCallback = hasUncaughtExceptionCaptureCallback;
-    // ```
+    //   process.dlopen = rawMethods.dlopen;
+    //   process.uptime = rawMethods.uptime;
+    //   process._getActiveRequests = rawMethods._getActiveRequests;
+    //   process._getActiveHandles = rawMethods._getActiveHandles;
+    //   process.getActiveResourcesInfo = rawMethods.getActiveResourcesInfo;
+    //   process.reallyExit = rawMethods.reallyExit;
+    //   process._kill = rawMethods._kill;
+    //
+    // `_kill` is load-bearing: `internal/process/per_thread.js`'s `kill()` is
+    // the whole body of `process.kill()`, and both of its branches call
+    // `process._kill(pid, sig)`. It was missing here, so `process.kill()` threw
+    // `TypeError: process._kill is not a function` — including for the
+    // `process.kill(pid, 0)` liveness probe.
+    for name in [
+        "dlopen",
+        "uptime",
+        "_getActiveRequests",
+        "_getActiveHandles",
+        "getActiveResourcesInfo",
+        "reallyExit",
+        "_kill",
+    ] {
+        if let Some(value) = get_property(scope, binding, name) {
+            let _ = set(scope, process, name, value);
+        }
+    }
+
+    // `internal/bootstrap/node.js:170-181` — the members the per-thread wrapper
+    // supplies, plus the three `node.js` takes straight from `rawMethods` inside
+    // the same block.
+    //
+    //   process.loadEnvFile = wrapped.loadEnvFile;      ...through...
+    //   process.execve = wrapped.execve;
+    //   process.constrainedMemory = rawMethods.constrainedMemory;
+    //   process.availableMemory = rawMethods.availableMemory;
+    //   process.ref = perThreadSetup.ref;
+    //   process.unref = perThreadSetup.unref;
+    for name in [
+        "memoryUsage",
+        "cpuUsage",
+        "threadCpuUsage",
+        "resourceUsage",
+        "loadEnvFile",
+        "_rawDebug",
+        "kill",
+        "execve",
+    ] {
+        if let Some(value) = get_property(scope, wrapped, name) {
+            let _ = set(scope, process, name, value);
+        }
+    }
+    for name in ["constrainedMemory", "availableMemory", "reallyExit"] {
+        if let Some(value) = get_property(scope, binding, name) {
+            let _ = set(scope, process, name, value);
+        }
+    }
+    // `ref` and `unref` come from `per_thread`'s module exports, not from the
+    // wrapper, and they act on the process' own handle rather than on a stream.
+    for name in ["ref", "unref"] {
+        if let Some(value) = get_property(scope, per_thread, name) {
+            let _ = set(scope, process, name, value);
+        }
+    }
+
+    // `internal/bootstrap/node.js:204,207` — `hrtime` is assigned, and
+    // `openStdin` is defined on `process` as a function that resumes stdin and
+    // returns it.
+    //
+    //   process.hrtime = perThreadSetup.hrtime;
+    //   process.hrtime.bigint = perThreadSetup.hrtimeBigInt;
+    //   process.openStdin = function() { process.stdin.resume(); return process.stdin; };
+    if let Some(hrtime) = get_property(scope, per_thread, "hrtime") {
+        let _ = set(scope, process, "hrtime", hrtime);
+        // `hrtime.bigint` is a property *of the function*, not of `process`.
+        if let (Some(function), Some(bigint)) = (
+            v8::Local::<v8::Function>::try_from(hrtime).ok(),
+            get_property(scope, per_thread, "hrtimeBigInt"),
+        ) {
+            if let Some(key) = v8::String::new(scope, "bigint") {
+                function.set(scope, key.into(), bigint);
+            }
+        }
+    }
+    install_open_stdin(scope, process);
+
+    // The uncaught-exception hooks and `_fatalException`, which
+    // `internal/bootstrap/node.js:325-330` installs from
+    // `internal/process/execution`:
+    //
+    //   process._fatalException = onGlobalUncaughtException;
+    //   process.setUncaughtExceptionCaptureCallback = setUncaughtExceptionCaptureCallback;
+    //   process.addUncaughtExceptionCaptureCallback = addUncaughtExceptionCaptureCallback;
+    //   process.hasUncaughtExceptionCaptureCallback = hasUncaughtExceptionCaptureCallback;
     //
     // `lib/domain.js` calls `setUncaughtExceptionCaptureCallback` and
     // `internal/errors.js` names it in a message, so a missing one is a
@@ -732,29 +819,29 @@ fn install_process_methods<'s>(
         }
     }
 
-    for name in [
-        "memoryUsage",
-        "cpuUsage",
-        "threadCpuUsage",
-        "resourceUsage",
-        "loadEnvFile",
-        "_rawDebug",
-        "kill",
-        "execve",
-    ] {
-        if let Some(value) = get_property(scope, wrapped, name) {
-            let _ = set(scope, process, name, value);
+    // `internal/bootstrap/node.js:356` — `process.emitWarning`.
+    if let Some(warning) = call_require(scope, require, "internal/process/warning") {
+        if let Some(value) = get_property(scope, warning, "emitWarning") {
+            let _ = set(scope, process, "emitWarning", value);
         }
     }
 
-    // `internal/bootstrap/node.js` assigns `process.dlopen = rawMethods.dlopen`
-    // straight from the binding rather than through `wrapProcessMethods` — which
-    // is why it is not in the loop above: `wrapped` does not carry it. That
-    // bootstrap module cannot run here, so the one assignment it makes for this
-    // member is made directly.
-    if let Some(value) = get_property(scope, binding, "dlopen") {
-        let _ = set(scope, process, "dlopen", value);
+    // `internal/bootstrap/node.js:419` — `process.getBuiltinModule`, which
+    // `lib/internal/modules/helpers.js` is the source of.
+    if let Some(helpers) = call_require(scope, require, "internal/modules/helpers") {
+        if let Some(value) = get_property(scope, helpers, "getBuiltinModule") {
+            let _ = set(scope, process, "getBuiltinModule", value);
+        }
     }
+
+    // `internal/bootstrap/node.js:245-263` — `process.allowedNodeEnvironmentFlags`
+    // is an accessor whose getter memoises `perThreadSetup.buildAllowedFlags()`.
+    // The value is a `Set`, which `--help` and `test/common` both iterate.
+    install_allowed_node_environment_flags(scope, process, per_thread);
+
+    // `internal/bootstrap/node.js:185-202` — `process.finalization`, an accessor
+    // that lazily requires `internal/process/finalization` and memoises it.
+    install_finalization(scope, process, require);
 
     // `process.exit` is `process.reallyExit` behind a check, and the wrapper's
     // version is used here. The comment that used to sit here said `exit` stayed
@@ -808,6 +895,208 @@ fn install_process_methods<'s>(
 /// thing `BuiltinLoader::CompileAndCall` does for a bootstrap script.
 fn install_process_state_switch<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<String> {
     run_bootstrap_script(scope, "internal/bootstrap/switches/does_own_process_state")
+}
+
+/// `process.openStdin`, from `internal/bootstrap/node.js:207`.
+///
+/// ```js
+/// process.openStdin = function() {
+///   process.stdin.resume();
+///   return process.stdin;
+/// };
+/// ```
+///
+/// The function object is built in JavaScript so its `length` and `name` match
+/// Node's, and so it refers to `process.stdin` at call time rather than capturing
+/// a handle that replacement could leave stale.
+fn install_open_stdin<'s>(scope: &mut v8::PinScope<'s, '_>, process: v8::Local<'s, v8::Object>) {
+    let Some(function) = run_expression(
+        scope,
+        "process.openStdin = function openStdin() { \
+           process.stdin.resume(); \
+           return process.stdin; \
+         };",
+    ) else {
+        return;
+    };
+    let _ = set(scope, process, "openStdin", function);
+}
+
+/// `process.allowedNodeEnvironmentFlags`, from `internal/bootstrap/node.js:245`.
+///
+/// Node installs an accessor whose getter calls
+/// `perThreadSetup.buildAllowedFlags()` on first read and then replaces the
+/// accessor with the resulting `Set`, so a program that never touches the
+/// property never pays to build it. Node's accessor also has a setter that
+/// replaces itself with a plain data property.
+///
+/// The flags are built here and captured in a real closure, because the getter
+/// has to see them after this function returns. `buildAllowedFlags` reads no
+/// `this`, so calling it with `undefined` is equivalent to
+/// `perThreadSetup.buildAllowedFlags()`.
+fn install_allowed_node_environment_flags<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    process: v8::Local<'s, v8::Object>,
+    per_thread: v8::Local<'s, v8::Value>,
+) {
+    let Some(build) = get_property(scope, per_thread, "buildAllowedFlags")
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+    else {
+        return;
+    };
+    let Some(flags) = build.call(scope, v8::undefined(scope).into(), &[]) else {
+        return;
+    };
+
+    // Bind the built set as a closure variable so the getter still has it after
+    // this call returns, and have the getter replace itself with a data property
+    // on first read — that is what Node's `get() { ...; process.allowedNodeEnvironmentFlags = flags; }`
+    // does, and it is observable through `getOwnPropertyDescriptor`.
+    let global = scope.get_current_context().global(scope);
+    let Some(slot) = v8::String::new(scope, "__rustnodeAllowedFlags") else {
+        return;
+    };
+    let _ = global.set(scope, slot.into(), flags);
+    let getter = run_expression(
+        scope,
+        "(function (flags) {\n\
+           return {\n\
+             get: function get() {\n\
+               Object.defineProperty(process, 'allowedNodeEnvironmentFlags', {\n\
+                 __proto__: null, value: flags, configurable: true,\n\
+                 enumerable: true, writable: true,\n\
+               });\n\
+               return flags;\n\
+             },\n\
+             set: function set(value) {\n\
+               Object.defineProperty(process, 'allowedNodeEnvironmentFlags', {\n\
+                 __proto__: null, value, configurable: true,\n\
+                 enumerable: true, writable: true,\n\
+               });\n\
+             },\n\
+           };\n\
+         })(globalThis.__rustnodeAllowedFlags)",
+    );
+    let _ = global.delete(scope, slot.into());
+    let Some(pair) = getter.and_then(|value| v8::Local::<v8::Object>::try_from(value).ok()) else {
+        return;
+    };
+    let (Some(get), Some(set)) = (
+        get_property(scope, pair.into(), "get"),
+        get_property(scope, pair.into(), "set"),
+    ) else {
+        return;
+    };
+    let Some(descriptor) = property_descriptor(scope, &[("get", get), ("set", set)], true) else {
+        return;
+    };
+    let Some(key) = v8::String::new(scope, "allowedNodeEnvironmentFlags") else {
+        return;
+    };
+    define_property_on(scope, process, key.into(), descriptor);
+}
+/// `process.finalization`, from `internal/bootstrap/node.js:185-202`.
+///
+/// A lazily-required module behind an accessor with both a getter and a setter.
+/// Node memoises it in a closure variable, and the setter replaces that variable
+/// rather than the property, so a test can stub `process.finalization` before
+/// anything reads it and the accessor itself survives.
+fn install_finalization<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    process: v8::Local<'s, v8::Object>,
+    require: v8::Local<'s, v8::Function>,
+) {
+    let Some(module) = call_require(scope, require, "internal/process/finalization") else {
+        return;
+    };
+    let Some(create) = get_property(scope, module, "createFinalization")
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok())
+    else {
+        return;
+    };
+    let Some(value) = create.call(scope, v8::undefined(scope).into(), &[]) else {
+        return;
+    };
+
+    // The accessor pair is built in JavaScript so the `finalizationMod` local
+    // that Node memoises is a real closure variable rather than a global slot.
+    let global = scope.get_current_context().global(scope);
+    let Some(slot) = v8::String::new(scope, "__rustnodeFinalization") else {
+        return;
+    };
+    let _ = global.set(scope, slot.into(), value);
+    let pair = run_expression(
+        scope,
+        "(function (initial) {\n\
+           let finalizationMod = initial;\n\
+           return {\n\
+             get: function get() { return finalizationMod; },\n\
+             set: function set(value) { finalizationMod = value; },\n\
+           };\n\
+         })(globalThis.__rustnodeFinalization)",
+    );
+    let _ = global.delete(scope, slot.into());
+    let Some(pair) = pair.and_then(|value| v8::Local::<v8::Object>::try_from(value).ok()) else {
+        return;
+    };
+    let (Some(get), Some(set)) = (
+        get_property(scope, pair.into(), "get"),
+        get_property(scope, pair.into(), "set"),
+    ) else {
+        return;
+    };
+    let Some(descriptor) = property_descriptor(scope, &[("get", get), ("set", set)], true) else {
+        return;
+    };
+    let Some(key) = v8::String::new(scope, "finalization") else {
+        return;
+    };
+    define_property_on(scope, process, key.into(), descriptor);
+}
+
+/// Evaluates `source` in the current context and returns its completion value.
+fn run_expression<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    source: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let source = v8::String::new(scope, source)?;
+    let script = v8::Script::compile(scope, source, None)?;
+    script.run(scope)
+}
+
+/// Builds a property descriptor object from `(key, value)` pairs.
+fn property_descriptor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    entries: &[(&str, v8::Local<'s, v8::Value>)],
+    enumerable: bool,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let descriptor = v8::Object::new(scope);
+    for (name, value) in entries {
+        let key = v8::String::new(scope, name)?;
+        descriptor.set(scope, key.into(), *value);
+    }
+    for (name, flag) in [("enumerable", enumerable), ("configurable", true)] {
+        let key = v8::String::new(scope, name)?;
+        descriptor.set(scope, key.into(), v8::Boolean::new(scope, flag).into());
+    }
+    Some(descriptor)
+}
+
+/// `Object.defineProperty(target, key, descriptor)` through the real intrinsic.
+fn define_property_on<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    target: v8::Local<'s, v8::Object>,
+    key: v8::Local<'s, v8::Value>,
+    descriptor: v8::Local<'s, v8::Object>,
+) {
+    let Some(define) = object_define_property(scope) else {
+        return;
+    };
+    let _ = define.call(
+        scope,
+        v8::undefined(scope).into(),
+        &[target.into(), key, descriptor.into()],
+    );
 }
 
 /// Runs one `internal/main/**` script with the parameters its kind declares.

@@ -463,6 +463,120 @@ fn callback_mode_reports_errors_as_first_argument() {
 }
 
 #[test]
+fn open_file_handle_returns_a_promise_for_a_handle() {
+    // `lib/internal/fs/promises.js`'s `open()` is exactly
+    // `new FileHandle(await binding.openFileHandle(path, flags, mode, kUsePromises))`,
+    // with no fallback, so a missing member made every `fs.promises.open` throw.
+    let dir = TempDir::new("open-file-handle");
+    let file = dir.joined("h.txt");
+    std::fs::write(&file, b"handled").expect("write");
+
+    let out = run(&format!(
+        r#"
+        const promise = fsBinding.openFileHandle('{file}', 0, 0o666, fsBinding.kUsePromises);
+        globalThis.__out = 'pending';
+        promise.then(
+          (handle) => {{
+            const info = {{
+              isPromise: promise instanceof Promise,
+              fdNumber: typeof handle.fd,
+              fdNonNegative: handle.fd >= 0,
+              asyncIdNumber: typeof handle.getAsyncId(),
+              closeIsFunction: typeof handle.close,
+              closeSyncIsFunction: typeof handle.closeSync,
+            }};
+            handle.close().then(() => {{
+              info.fdAfterClose = handle.fd;
+              globalThis.__out = JSON.stringify(info);
+            }});
+          }},
+          (err) => {{ globalThis.__out = 'rejected:' + err.code; }},
+        );
+        "#,
+        file = js_path(&file)
+    ));
+    assert_eq!(
+        out,
+        r#"{"isPromise":true,"fdNumber":"number","fdNonNegative":true,"asyncIdNumber":"number","closeIsFunction":"function","closeSyncIsFunction":"function","fdAfterClose":-1}"#
+    );
+}
+
+#[test]
+fn open_file_handle_rejects_for_a_missing_path() {
+    let out = run(r#"
+        globalThis.__out = 'pending';
+        fsBinding.openFileHandle('/definitely/not/here/xyzzy', 0, 0o666, fsBinding.kUsePromises)
+          .then(
+            () => { globalThis.__out = 'resolved'; },
+            (err) => { globalThis.__out = JSON.stringify({ code: err.code, syscall: err.syscall }); },
+          );
+        "#);
+    assert_eq!(out, r#"{"code":"ENOENT","syscall":"open"}"#);
+}
+
+/// `closeSync` has to release the descriptor exactly once and leave it at `-1`.
+#[test]
+fn file_handle_close_sync_releases_the_descriptor() {
+    let dir = TempDir::new("close-sync");
+    let file = dir.joined("c.txt");
+    std::fs::write(&file, b"x").expect("write");
+
+    let out = run(&format!(
+        r#"
+        globalThis.__out = 'pending';
+        fsBinding.openFileHandle('{file}', 0, 0o666, fsBinding.kUsePromises).then((handle) => {{
+          const before = handle.fd;
+          handle.closeSync();
+          const after = handle.fd;
+          // A second close is a no-op rather than an EBADF for a descriptor the
+          // process may have since reused.
+          handle.closeSync();
+          globalThis.__out = JSON.stringify({{
+            beforeNonNegative: before >= 0, after,
+            closedTwice: handle.fd,
+          }});
+        }});
+        "#,
+        file = js_path(&file)
+    ));
+    assert_eq!(
+        out,
+        r#"{"beforeNonNegative":true,"after":-1,"closedTwice":-1}"#
+    );
+}
+
+/// `fs.promises.open` end to end through the real JavaScript layer, which is the
+/// path that was entirely unreachable while the members were deferred.
+#[test]
+fn fs_promises_open_reads_and_closes() {
+    let dir = TempDir::new("promises-open");
+    std::fs::write(dir.joined("p.txt"), b"promise-open").expect("write");
+    let file = js_path(&dir.joined("p.txt"));
+
+    let out = run_in_binary(
+        "promises-open",
+        &format!(
+            r#"
+const fs = require('fs');
+(async () => {{
+  const fh = await fs.promises.open('{file}', 'r');
+  const buffer = Buffer.alloc(12);
+  const {{ bytesRead }} = await fh.read(buffer, 0, 12, 0);
+  const stats = await fh.stat();
+  const fd = fh.fd;
+  await fh.close();
+  console.log(JSON.stringify({{ bytesRead, text: buffer.toString(), size: stats.size, fdNumber: typeof fd, fdAfterClose: fh.fd }}));
+}})();
+"#
+        ),
+    );
+    assert_eq!(
+        out,
+        r#"{"bytesRead":12,"text":"promise-open","size":12,"fdNumber":"number","fdAfterClose":-1}"#
+    );
+}
+
+#[test]
 fn promise_mode_resolves_and_rejects() {
     let dir = TempDir::new("promise");
     let file = dir.joined("p.txt");
@@ -805,10 +919,9 @@ fn member_list_tracks_node_minus_documented_deferrals() {
     .collect();
 
     // Documented in README.md under "Deliberately deferred".
-    let deferred: std::collections::BTreeSet<&str> =
-        ["cpSyncCopyDir", "cpSyncOverrideFile", "openFileHandle"]
-            .into_iter()
-            .collect();
+    let deferred: std::collections::BTreeSet<&str> = ["cpSyncCopyDir", "cpSyncOverrideFile"]
+        .into_iter()
+        .collect();
 
     // Not in Node's `fs` namespace: the request constructor the JS instantiates,
     // and the promise-mode sentinel it forwards.
@@ -817,10 +930,13 @@ fn member_list_tracks_node_minus_documented_deferrals() {
 
     // Constructed by `lib/fs.js`, but registered with `SetConstructorFunction`
     // rather than `SetMethod`, so they are not in the `SetMethod` list above.
-    // Both are load-bearing: `fs.readFile` and `fs.writeFile` construct them
-    // unconditionally for `options.buffer === undefined`.
+    // All three are load-bearing: `fs.readFile` and `fs.writeFile` construct the
+    // jobs unconditionally for `options.buffer === undefined`, and
+    // `fs.promises.open` wraps every descriptor in a `FileHandle`.
     let job_classes: std::collections::BTreeSet<&str> =
-        ["ReadFileJob", "WriteFileJob"].into_iter().collect();
+        ["ReadFileJob", "WriteFileJob", "FileHandle"]
+            .into_iter()
+            .collect();
 
     let ours: std::collections::BTreeSet<&str> = Fs.members().iter().copied().collect();
     let expected: std::collections::BTreeSet<&str> = node

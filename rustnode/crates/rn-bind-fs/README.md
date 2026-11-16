@@ -223,8 +223,6 @@ stubbed so a caller gets a clear missing-member failure instead of a wrong answe
 
 | missing | why |
 | --- | --- |
-| `FileHandle` constructor and class | `lib/internal/fs/promises.js` builds `FileHandle` as an `AsyncWrap` with `StreamBase` behaviour, reference counting, `close` promises and structured-clone transfer. That is a handle-lifecycle feature shared with `net`/`http2`, not a filesystem call. `fs.promises.open()` needs it; plain `fs` does not. |
-| `openFileHandle` | returns a `FileHandle`; blocked on the item above. |
 | `cpSyncCheckPaths`, `cpSyncCopyDir`, `cpSyncOverrideFile`, `CpDirJob` | the `fs.cp` fast paths. `lib/internal/fs/cp/cp-sync.js` only reaches them when no `filter` is supplied; with a `filter` it walks with `opendir`/`stat`/`copyFile`. `opendir` itself needs the `fs_dir` namespace. |
 | `opendir`, and the whole `fs_dir` namespace | `internalBinding('fs_dir')` is a separate binding: it owns `DIR*` handles with async iteration. Out of scope for this crate by namespace, and `Dir` in `lib/internal/fs/dir.js` uses it exclusively. |
 | `StatWatcher` | requires an inotify-backed poller and the double-width stats buffer (`kFsStatsBufferLength`). Watch mode belongs with the event loop. The buffer width is still pinned by a test so the layout cannot drift. |
@@ -239,6 +237,22 @@ It tests `options.buffer === undefined` and then constructs the job directly, so
 the deferral cost a `TypeError` on every ordinary `fs.readFile` and
 `fs.writeFile` instead of costing performance. Both are real `uv_queue_work`
 jobs in `jobs.rs` now.
+
+`FileHandle` and `openFileHandle` used to be on this list too, with the reason
+"`lib/` uses the JS FileHandle over numeric fds for now". That was also wrong:
+`lib/internal/fs/promises.js` has no fallback. `open()` is
+`new FileHandle(await binding.openFileHandle(...))` and nothing else, so
+`fs.promises.open()` and every `fh.read`/`fh.write`/`fh.stat`/`fh.close` behind
+it threw `TypeError: binding.openFileHandle is not a function`. The callbacks
+work because they pass numeric descriptors around; the promise API is built on
+this handle.
+
+`FileHandle` here is not a port of Node's class. Reads and writes already go
+through `binding.read` and `binding.writeBuffer` with the plain descriptor, so
+the native side owns only what `promises.js` actually calls: `fd`,
+`getAsyncId()`, `close()` and `closeSync()`. The reference counting, the close
+promise chain, the transfer machinery and the `EventEmitter` are all in the
+vendored JavaScript and needed no change. See `src/filehandle.rs`.
 
 ## The one-shot file jobs
 
