@@ -82,9 +82,15 @@ fn readonly(
     let Some(key) = v8::String::new(scope, name) else {
         return;
     };
-    // `define_property` with a value-only descriptor leaves a later attribute
-    // default in place, which is exactly `READONLY_PROPERTY`.
-    let descriptor = v8::PropertyDescriptor::new_from_value_writable(value, false);
+    // `READONLY_PROPERTY` is `ReadOnly | DontDelete` inverted: enumerable and
+    // configurable. `new_from_value_writable` leaves `enumerable` and
+    // `configurable` at V8's `PropertyDescriptor` default of false, so both have
+    // to be set, or `Object.keys(constants)` is empty and
+    // `JSON.stringify(constants.measureMemory)` is `{}` where Node reports two
+    // enum objects.
+    let mut descriptor = v8::PropertyDescriptor::new_from_value_writable(value, false);
+    descriptor.set_enumerable(true);
+    descriptor.set_configurable(true);
     object.define_property(scope, key.into(), &descriptor);
 }
 
@@ -102,5 +108,59 @@ mod tests {
         assert_eq!(MODE_DETAILED, 1);
         assert_eq!(EXECUTION_DEFAULT, 0);
         assert_eq!(EXECUTION_EAGER, 1);
+    }
+
+    #[test]
+    fn the_constants_are_enumerable_and_configurable_like_readonly_property() {
+        // `READONLY_PROPERTY` in Node is `ReadOnly | DontDelete` inverted, so the
+        // property is enumerable and configurable. `Object.keys` and
+        // `JSON.stringify` both observe it: `vm.js` reads these through a
+        // destructure that works either way, which is exactly why a wrong
+        // attribute here is invisible until something enumerates the object.
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+
+        let mut isolate = v8::Isolate::new(Default::default());
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let constants = value(scope);
+        let constants =
+            v8::Local::<v8::Object>::try_from(constants).expect("constants is an object");
+        let measure_memory_key = v8::String::new(scope, "measureMemory").expect("key");
+        let attributes = constants
+            .get_property_attributes(scope, measure_memory_key.into())
+            .expect("measureMemory is an own property");
+        assert!(
+            attributes.is_read_only(),
+            "measureMemory is non-writable like READONLY_PROPERTY"
+        );
+        assert!(
+            !attributes.is_dont_enum(),
+            "measureMemory must be enumerable: Object.keys(constants) has it in Node"
+        );
+        assert!(
+            !attributes.is_dont_delete(),
+            "measureMemory must be configurable"
+        );
+
+        let measure_memory = constants
+            .get(scope, measure_memory_key.into())
+            .expect("measureMemory reads back");
+        let measure_memory =
+            v8::Local::<v8::Object>::try_from(measure_memory).expect("it is an object");
+        for name in ["mode", "execution"] {
+            let name_key = v8::String::new(scope, name).expect("key");
+            let attributes = measure_memory
+                .get_property_attributes(scope, name_key.into())
+                .expect("nested property");
+            assert!(
+                !attributes.is_dont_enum(),
+                "{name} must be enumerable or JSON.stringify drops it"
+            );
+        }
     }
 }
