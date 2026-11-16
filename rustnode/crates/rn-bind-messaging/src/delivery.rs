@@ -180,6 +180,19 @@ pub fn deliver<'s>(scope: &mut v8::PinScope<'s, '_>, port: &Rc<PortInner>) -> bo
         let Some(object) = port.object(scope) else {
             return delivered;
         };
+        // `ReceiveMessage`'s `wants_message` gate: a port that is not receiving
+        // consumes a queued entry only when the front is a close marker. Anything
+        // else stays in the queue for `receiveMessageOnPort`, which is how Node
+        // lets a listener-less port hold its messages — `port1.postMessage(x)`
+        // with no listener on `port2`, then `receiveMessageOnPort(port2)` later,
+        // returns the message on Node and returned `undefined` here.
+        //
+        // The close marker is exempt because Node's condition is
+        // `!wants_message && !front->IsCloseMessage()`: a port whose peer went away
+        // must notice even with no listener.
+        if !port.receiving.get() && port.data.front_is_close() != Some(true) {
+            return delivered;
+        }
         let Some(message) = port.data.dequeue() else {
             return delivered;
         };

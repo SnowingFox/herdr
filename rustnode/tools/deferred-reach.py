@@ -23,6 +23,11 @@ on at least six of them:
     crypto.CheckPrimeJob               internal/crypto/random.js:685
     crypto.RandomPrimeJob              internal/crypto/random.js:581
 
+`messaging.broadcastChannel` (`internal/worker/io.js:383`) was in this list and is
+not any more: the member is installed, so the reach is not at risk. It is left out
+of the list above because that list is the evidence for the depth rule, and a fixed
+member is not evidence of anything.
+
 The wasm one is the clearest illustration. `translators.js` destructures both
 wasm cache members at module scope (harmless, as the old docstring correctly
 said), then calls `getWasmCompileCacheEntry` inside the `wasm` translator:
@@ -173,7 +178,6 @@ KNOWN_UNGUARDED = {
     "fs.cpSyncOverrideFile",
     "fs.getFormatOfExtensionlessFile",
     "fs.legacyMainResolve",
-    "messaging.broadcastChannel",
     "performance.Histogram",
     "performance.SlidingWindowHistogram",
     "v8.startCpuProfile",

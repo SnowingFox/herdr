@@ -17,6 +17,11 @@
 //! * `MessageChannel` builds a real entangled pair, and posting on one port
 //!   delivers to the other's `message` event, `onmessage` handler or
 //!   `receiveMessageOnPort` call, on this thread.
+//! * `broadcastChannel` joins the process-wide group of that name, so posting
+//!   reaches every other channel on the name — in one thread or across two, with
+//!   no fixed number of members — and never reaches the poster.
+//! * `moveMessagePortToContext` re-homes a port into a `vm` realm, moving its
+//!   queue and leaving the old handle inert.
 //! * `receiveMessageOnPort`, `drainMessagePort` and `stopMessagePort` read and
 //!   control that same queue.
 //! * Transferring an `ArrayBuffer` detaches it on the sender; transferring a
@@ -24,10 +29,13 @@
 //!
 //! # What is deferred, and why
 //!
-//! `moveMessagePortToContext` needs the `vm` context a port is retargeted at, and
-//! `broadcastChannel` needs a named sibling group whose members sit in more than
-//! one thread. Both are listed in [`DEFERRED`] with the reason, and
-//! `tools/deferred-reach.py` confirms neither is called while a module loads.
+//! Nothing. [`DEFERRED`] is empty because every member of
+//! `contracts/messaging.json` is installed. Two were listed here and both reasons
+//! were false on this tree: `broadcastChannel` claimed a second thread was needed
+//! for a channel to have a peer — Node delivers between two channels on one name
+//! inside a single thread — and `moveMessagePortToContext` claimed the
+//! sandbox-to-realm table was unreachable without a dependency cycle, which
+//! `rn-core::hook_slot` removes.
 //!
 //! # Why the template has to be exactly this shape
 //!
@@ -58,7 +66,7 @@ use std::sync::Arc;
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
-use crate::port::{MessagePortData, PortInner};
+use crate::port::{Dispatch, MessagePortData, PortInner};
 
 pub use crate::delivery::{
     emit_message_installed, has_delivery_pending, install_emit_message, run as run_message_ports,
@@ -85,8 +93,10 @@ pub const MEMBERS: &[&str] = &[
     "MessageChannel",
     "MessagePort",
     "QuotaExceededError",
+    "broadcastChannel",
     "drainMessagePort",
     "exposeLazyDOMExceptionProperty",
+    "moveMessagePortToContext",
     "receiveMessageOnPort",
     "setDeserializerCreateObjectFunction",
     "stopMessagePort",
@@ -94,18 +104,14 @@ pub const MEMBERS: &[&str] = &[
 ];
 
 /// Members this build does not install yet.
-pub const DEFERRED: &[(&str, &str)] = &[
-    (
-        "broadcastChannel",
-        "needs a process-wide named sibling group whose participants can live in \
-         more than one thread; with no Worker there is no second participant, and a \
-         channel that could never receive would hang rather than fail at use",
-    ),
-    (
-        "moveMessagePortToContext",
-        "needs contextify to supply the target vm context a port is moved into",
-    ),
-];
+///
+/// Empty, and honestly so: every member of `contracts/messaging.json` is
+/// installed. Two were listed here and both reasons turned out to be false on this
+/// tree — `broadcastChannel` claimed a second thread was needed for a channel to
+/// have a peer (Node delivers between two channels on one name in one thread), and
+/// `moveMessagePortToContext` claimed the sandbox-to-realm table was unreachable
+/// without a dependency cycle (contextify publishes it through `rn_core::hook_slot`).
+pub const DEFERRED: &[(&str, &str)] = &[];
 
 /// Internal field holding the `*mut PortSlot` a `MessagePort` owns.
 ///
@@ -212,7 +218,7 @@ impl BindingModule for Messaging {
         let message_port = install_message_port(scope)?;
         let message_channel = install_message_channel(scope)?;
 
-        let values: [(&str, v8::Local<v8::Value>); 10] = [
+        let values: [(&str, v8::Local<v8::Value>); 12] = [
             // `DOMException` and `QuotaExceededError` are Node's per-context
             // scripts' exports, not classes built here. Node's own
             // `CreatePerContextProperties` reads both off
@@ -225,6 +231,10 @@ impl BindingModule for Messaging {
             ("MessagePort", message_port),
             ("QuotaExceededError", quota_exceeded_error(scope)),
             (
+                "broadcastChannel",
+                function(scope, "broadcastChannel", broadcast_channel)?,
+            ),
+            (
                 "drainMessagePort",
                 function(scope, "drainMessagePort", drain_message_port)?,
             ),
@@ -234,6 +244,14 @@ impl BindingModule for Messaging {
                     scope,
                     "exposeLazyDOMExceptionProperty",
                     expose_lazy_dom_exception_property,
+                )?,
+            ),
+            (
+                "moveMessagePortToContext",
+                function(
+                    scope,
+                    "moveMessagePortToContext",
+                    move_message_port_to_context,
                 )?,
             ),
             (
@@ -605,6 +623,126 @@ fn message_channel_constructor(
     rv.set(this.into());
 }
 
+/// `broadcastChannel(name)`: a port in the process-wide group called `name`.
+///
+/// `MessagePort::New(env, env->context(), {}, SiblingGroup::Get(*name))`. Two
+/// consequences are the whole feature and both are observable:
+///
+/// * the group is *named*, so it is shared by every `BroadcastChannel` on that
+///   name in the process, on any thread, with no upper bound on members —
+///   `lib/internal/worker/io.js:383` calls this from the constructor, which is
+///   why two channels on one name deliver to each other in a single thread and
+///   need no `Worker` to have a second participant;
+/// * the group is *not* anonymous, so losing a member does not close the
+///   survivors. `SiblingGroup::Disentangle` only closes a last peer when
+///   `name_.empty()`.
+///
+/// Node `CHECK`s `args[0]->IsString()` and aborts otherwise, because the only
+/// caller is `io.js`, which stringifies the name first (`` `${name}` ``). Aborting
+/// a process because internal JavaScript passed a non-string is not worth
+/// reproducing — this project has already decided that class of divergence is
+/// worse than the crash it copies — so a non-string is coerced, which is what
+/// `io.js` does anyway. Unreachable from `BroadcastChannel`.
+fn broadcast_channel(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let name = args.get(0).to_rust_string_lossy(scope);
+
+    let data = MessagePortData::new();
+    data.join_named(&name);
+
+    let Ok(port) = new_port_object(scope, data) else {
+        throw_type_error(scope, "broadcastChannel: cannot allocate a MessagePort");
+        return;
+    };
+    rv.set(port.into());
+}
+
+/// `moveMessagePortToContext(port, sandbox)`: re-home a port into a `vm` realm.
+///
+/// `MessagePort::MoveToContext` (`src/node_messaging.cc:1180`) in three steps:
+///
+/// 1. it must be a `MessagePort` and not closing, else `ERR_INVALID_ARG_TYPE` or
+///    `ERR_CLOSED_MESSAGE_PORT`;
+/// 2. `ContextifyContext::ContextFromContextifiedSandbox(env, sandbox)`, else
+///    `ERR_INVALID_ARG_TYPE` with "Invalid context argument";
+/// 3. under `Context::Scope` for that realm, `MessagePort::New(env, context,
+///    std::move(data))` — which detaches the old port and builds the new object
+///    from *that realm's* instance template, so the result's prototype is the
+///    target realm's `MessagePort.prototype`, not this one's.
+///
+/// Step 2 goes through `rn_core::hook_slot`, which is where `rn-bind-contextify`
+/// publishes the lookup. Node reads a static table; this reads the same table
+/// through a slot, so the two crates keep their existing order and neither gains
+/// a dependency edge.
+fn move_message_port_to_context<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let port = v8::Local::<v8::Object>::try_from(args.get(0))
+        .ok()
+        .and_then(|object| port_state_of(scope, object));
+    let Some(state) = port else {
+        throw_type_error_with_code(
+            scope,
+            "ERR_INVALID_ARG_TYPE",
+            "The \"port\" argument must be a MessagePort instance",
+        );
+        return;
+    };
+    if state.closing.get() {
+        // `THROW_ERR_CLOSED_MESSAGE_PORT`, whose message is the one `postMessage`
+        // uses for a closed port.
+        throw_error_with_code(
+            scope,
+            "ERR_CLOSED_MESSAGE_PORT",
+            "Cannot send data on closed MessagePort",
+        );
+        return;
+    }
+
+    let Some(context) = rn_core::hook_slot::sandbox_context(scope, args.get(1)) else {
+        throw_type_error_with_code(scope, "ERR_INVALID_ARG_TYPE", "Invalid context argument");
+        return;
+    };
+
+    // `port->Detach()`: the queue moves to the new object and the old one is left
+    // with no `data_`. It is not a transfer, so no close marker is queued for a
+    // peer and no `close` event is owed — the port is inert, not closed.
+    state.detach_for_move();
+    let data = Arc::clone(&state.data);
+
+    // `Context::Scope context_scope(context_wrapper->context())` around
+    // `MessagePort::New`. Everything below allocates in the target realm, which is
+    // what makes the result's prototype that realm's.
+    let mut context_scope = std::pin::pin!(v8::ContextScope::new(&mut **scope, context));
+    let scope = &mut *context_scope;
+    match new_port_object(scope, data) {
+        Ok(port) => rv.set(port.into()),
+        Err(message) => throw_type_error(scope, &message),
+    }
+}
+
+/// Throws `new Error(message)` carrying `code`, Node's `THROW_ERR_*` for the codes
+/// whose class is `Error` rather than `TypeError`.
+fn throw_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: &str) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    if let (Ok(object), Some(key), Some(value)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, "code"),
+        v8::String::new(scope, code),
+    ) {
+        let _ = object.set(scope, key.into(), value.into());
+    }
+    scope.throw_exception(exception);
+}
+
 fn handle_wrap_constructor(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -676,25 +814,53 @@ fn post_message<'s>(
         return;
     }
 
-    // Node's `PostMessage` dispatches into the group, whose members are reached
-    // through the sender's `MessagePortData`.
-    let dispatched = state.data.dispatch(&message);
-    if !dispatched {
-        // `MessagePortData::Dispatch` returns `Nothing<bool>()` for an
-        // unentangled port, which `PostMessage` turns into no return value at
-        // all, and the "is not entangled" text becomes a process warning rather
-        // than an exception.
-        rv.set(v8::undefined(scope).into());
+    // The same `data_ == nullptr` case for a port moved into another realm: it is
+    // not closing, but it no longer owns a queue. `MessagePort::PostMessage`
+    // returns without dispatching here, which is what makes the old handle inert
+    // rather than a second live end of the same channel.
+    if state.is_detached() {
+        rv.set(v8::Boolean::new(scope, true).into());
         return;
     }
 
-    // Wake every port that now has something to read.
-    for peer in state.data.peers() {
-        if let Some(owner) = peer.owner() {
-            owner.schedule();
+    // Node's `PostMessage` dispatches into the group, whose members are reached
+    // through the sender's `MessagePortData`.
+    match state.data.dispatch(&message) {
+        Dispatch::Delivered => {
+            // Wake every port that now has something to read. `dispatch` only
+            // enqueues; the scheduling is what makes a port on this thread run.
+            for peer in state.data.peers() {
+                if let Some(owner) = peer.owner() {
+                    owner.schedule();
+                }
+            }
+            rv.set(v8::Boolean::new(scope, true).into());
+        }
+        // `Just(false)`: the group has no member other than the sender. `io.js`'s
+        // `BroadcastChannel.postMessage` turns this into
+        // `DOMException('Message could not be posted.')`.
+        Dispatch::NoDestinations => {
+            rv.set(v8::Boolean::new(scope, false).into());
+        }
+        // `Nothing()`. `MessagePortData::Dispatch` returns it for an unentangled
+        // port, which `PostMessage` turns into no return value at all — and the
+        // "is not entangled" text becomes a process warning, not an exception.
+        Dispatch::NotEntangled => {
+            rv.set(v8::undefined(scope).into());
+        }
+        // `Nothing()` for a group with more room than a transfer list can honour.
+        // Node reports the reason through its `error` out-parameter; the reply is
+        // the same `undefined`.
+        Dispatch::TransferablesMultipleDestinations => {
+            rv.set(v8::undefined(scope).into());
+        }
+        // `Just(true)` plus a warning: the target was itself transferred, so the
+        // post reaches nobody. The script keeps running and the loss is reported.
+        Dispatch::DeliveredWithWarning(text) => {
+            rn_core::hook_slot::emit_warning(scope, text);
+            rv.set(v8::Boolean::new(scope, true).into());
         }
     }
-    rv.set(v8::Boolean::new(scope, true).into());
 }
 
 fn start(
@@ -721,9 +887,10 @@ fn handle_wrap_ref(
     if let Some(state) = port_state_of(scope, this) {
         // `HandleWrap::Ref` is `if (IsAlive(wrap)) uv_ref(...)`, so a port past
         // its close callback stays unref'd however often `ref()` is called.
-        if !state.closed.get() {
-            state.refed.set(true);
-        }
+        //
+        // `set_ref` also takes this thread's wake handle ref, which is what makes a
+        // foreign thread's post run this thread's loop — see `PortInner::hold_wake`.
+        state.set_ref();
     }
 }
 
@@ -734,7 +901,7 @@ fn handle_wrap_unref(
 ) {
     let this = args.this();
     if let Some(state) = port_state_of(scope, this) {
-        state.refed.set(false);
+        state.clear_ref();
     }
 }
 

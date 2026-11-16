@@ -55,6 +55,114 @@ thread_local! {
     /// needs `require` to run a user script, so they have to outlive the call
     /// that stored them.
     static LOADERS: RefCell<Loaders> = const { RefCell::new((None, None)) };
+
+    /// The `emitWarningSync` function the process bootstrap installed.
+    ///
+    /// Node keeps this on `Environment` as `process_emit_warning_sync_`, and
+    /// `ProcessEmitWarning` is what every native warning goes through. It lives
+    /// here rather than only in `rn-bind-process-methods` because a binding crate
+    /// that must warn cannot depend on that crate — the messaging namespace's
+    /// "posted to itself" case is one — and reaching into another crate's private
+    /// thread-local would make that crate's implementation another's contract.
+    static WARNING_SINK: RefCell<Option<v8::Global<v8::Function>>> = const { RefCell::new(None) };
+
+    /// The sandbox-to-`v8::Context` lookup `rn-bind-contextify` owns.
+    ///
+    /// Node's `ContextifyContext::ContextFromContextifiedSandbox`, which any native
+    /// code holding a `vm` sandbox can call. A callback here for the same reason as
+    /// [`WARNING_SINK`]: `moveMessagePortToContext` needs it, the table it reads
+    /// belongs to `rn-bind-contextify`, and depending on that crate from messaging
+    /// would invert the registration order rather than express a real dependency.
+    static SANDBOX_CONTEXT: RefCell<Option<SandboxContextLookup>> = const { RefCell::new(None) };
+}
+
+/// A function that resolves a `vm` sandbox to the realm it contextifies.
+///
+/// Higher-ranked over the scope's local lifetime alone, like every other callback
+/// this crate stores: the `Local<Context>` it returns is owned by the caller's
+/// scope, and the table it reads is `rn-bind-contextify`'s thread-local, which is
+/// why this is a `fn` pointer rather than a closure over that crate's internals.
+pub type SandboxContextLookup = for<'s> fn(
+    &mut v8::PinScope<'s, '_>,
+    v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Context>>;
+
+/// Records the process's synchronous warning emitter.
+///
+/// Called by `setEmitWarningSync`, which `lib/internal/bootstrap/node.js` invokes
+/// once per realm. One slot per thread, replaced rather than accumulated: a
+/// worker's realm installs its own, and a warning must reach the emitter of the
+/// thread that produced it.
+pub fn set_warning_sink(callback: v8::Global<v8::Function>) {
+    WARNING_SINK.with(|slot| *slot.borrow_mut() = Some(callback));
+}
+
+/// Records the sandbox-to-context lookup.
+///
+/// Called once by `rn-bind-contextify`'s `install`, which is the only place that
+/// can answer the question.
+pub fn set_sandbox_context_lookup(lookup: SandboxContextLookup) {
+    SANDBOX_CONTEXT.with(|slot| *slot.borrow_mut() = Some(lookup));
+}
+
+/// Resolves a `vm` sandbox to its realm, if contextify has installed the lookup.
+///
+/// `None` means either that the value is not a contextified sandbox or that no
+/// `contextify` namespace has been installed on this thread, which is the same
+/// answer `ContextFromContextifiedSandbox` gives for a non-sandbox: the caller
+/// reports an invalid context argument.
+pub fn sandbox_context<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Context>> {
+    let lookup = SANDBOX_CONTEXT.with(|slot| *slot.borrow())?;
+    lookup(scope, value)
+}
+
+/// Emits a process warning through the installed emitter.
+///
+/// Node's `ProcessEmitWarning`. It returns `bool` because a Rust caller cannot
+/// `CHECK`: before the bootstrap installs the emitter Node aborts, and a warning
+/// that could not be delivered is better reported than silently dropped.
+///
+/// # The `process.emitWarning` fallback
+///
+/// `setEmitWarningSync` has exactly one caller in `lib/**` — line 357 of
+/// `internal/bootstrap/node.js` — and this build does not run that file (it cannot
+/// yet; see `rn-realm`'s `install_web_globals`). So the slot is empty on this
+/// build, and a binding's warning would vanish. `process.emitWarning` is installed
+/// and works, so that is the fallback: the warning is queued on `nextTick` rather
+/// than printed synchronously, which is a difference in timing rather than in
+/// whether the user sees it.
+pub fn emit_warning(scope: &mut v8::PinScope<'_, '_>, message: &str) -> bool {
+    let callback = WARNING_SINK.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|callback| v8::Local::new(scope, callback))
+    });
+    let callback = callback.or_else(|| process_emit_warning(scope));
+    let Some(callback) = callback else {
+        return false;
+    };
+    let Some(message) = v8::String::new(scope, message) else {
+        return false;
+    };
+    callback
+        .call(scope, v8::undefined(scope).into(), &[message.into()])
+        .is_some()
+}
+
+/// `process.emitWarning`, when the realm has one.
+fn process_emit_warning<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let global = scope.get_current_context().global(scope);
+    let process_key = v8::String::new(scope, "process")?;
+    let process = global.get(scope, process_key.into())?;
+    let process = v8::Local::<v8::Object>::try_from(process).ok()?;
+    let method_key = v8::String::new(scope, "emitWarning")?;
+    let method = process.get(scope, method_key.into())?;
+    v8::Local::<v8::Function>::try_from(method).ok()
 }
 
 /// Records the loaders `realm.js` installed.
