@@ -85,6 +85,15 @@ pub const DEFERRED: &[(&str, &str)] = &[(
 
 /// `bob::STATUS_EOS`: the reader reached the end.
 const STATUS_EOS: i32 = 0;
+/// `bob::STATUS_CONTINUE`: this pull produced bytes and more may follow.
+///
+/// The status is not a length and must not be confused with one.
+/// `internal/blob.js` treats `0` as end-of-stream, a negative value as a read
+/// error, `2` (`STATUS_BLOCK`) as "no data yet, wait for the wakeup", and any
+/// other value as "this response carried bytes, pull again". Returning the
+/// chunk length therefore happens to work for every length except `0` and `2`,
+/// where it silently reports end-of-stream or a blocked read instead of data.
+const STATUS_CONTINUE: i32 = 1;
 
 /// Names of the private properties that carry a handle's state.
 ///
@@ -514,6 +523,10 @@ fn handle_get_reader(
 /// part is memory-resident, so there is never a reason to defer. The status is
 /// also returned, which matches Node's contract even though `internal/blob.js`
 /// ignores the return value and uses the callback.
+///
+/// Node's `Pull` answers `STATUS_CONTINUE` for a chunk and `STATUS_EOS` at the
+/// end; the status is a `bob::Status`, not a byte count. See
+/// [`STATUS_CONTINUE`] for what returning a length breaks.
 fn reader_pull(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -547,7 +560,7 @@ fn reader_pull(
                         let _ = object.set_private(scope, key, next.into());
                     }
                 }
-                (chunk.len() as i32, buffer.into())
+                (pull_status(remaining), buffer.into())
             }
             None => {
                 throw_type_error(scope, "cannot allocate a read buffer");
@@ -563,6 +576,26 @@ fn reader_pull(
         &[status_value.into(), buffer],
     );
     rv.set(status_value.into());
+}
+
+/// The `bob::Status` a pull reports for a chunk with `remaining` bytes left.
+///
+/// This is a `bob::Status`, not a byte count. `internal/blob.js` switches on it:
+/// `0` closes the stream, a negative value rejects, `2` (`STATUS_BLOCK`) waits
+/// for a wakeup that a memory-resident reader never sends, and anything else
+/// means "this response carried bytes, pull again".
+///
+/// Returning `remaining` here — which is what this crate used to do — is
+/// therefore right for every length except `0` and `2`: a two-byte chunk
+/// reports `STATUS_BLOCK` and stalls the read forever, and an empty one reports
+/// end-of-stream. `Blob#arrayBuffer()`, `.bytes()`, `.text()` and
+/// `new Response(blob)` all go through this, so a two-byte blob body hung.
+fn pull_status(remaining: usize) -> i32 {
+    if remaining == 0 {
+        STATUS_EOS
+    } else {
+        STATUS_CONTINUE
+    }
 }
 
 /// `reader.setWakeup(callback)`, or `setWakeup(undefined)` to clear it.
@@ -883,5 +916,37 @@ mod tests {
             let clamped = (offset.max(0.0) as usize).min(length);
             assert!(clamped <= length, "offset {offset} escaped the range");
         }
+    }
+
+    #[test]
+    fn the_pull_status_is_a_bob_status_and_not_a_length() {
+        // `internal/blob.js` switches on the status: `0` is end-of-stream, a
+        // negative value is a read error, `2` is "no data yet, wait for the
+        // wakeup", and anything else means "this response carried bytes".
+        //
+        // Returning the chunk length therefore reads as end-of-stream for an
+        // empty chunk and as a blocked read for a two-byte one, which is why
+        // `Blob#text()` and `new Response(blob).text()` used to hang on a
+        // two-byte body and work on every other length.
+        assert_eq!(STATUS_EOS, 0);
+        assert_eq!(STATUS_CONTINUE, 1);
+        assert_ne!(
+            STATUS_CONTINUE, 2,
+            "2 is STATUS_BLOCK, which blob.js answers with a wakeup instead of the bytes"
+        );
+
+        // The status depends on whether bytes are left, never on how many.
+        assert_eq!(pull_status(0), STATUS_EOS);
+        for remaining in [1usize, 2, 3, 4, 4096, 1 << 20] {
+            assert_eq!(
+                pull_status(remaining),
+                STATUS_CONTINUE,
+                "{remaining} bytes left must report STATUS_CONTINUE, not {remaining}"
+            );
+        }
+
+        // The exact shape of the old defect: `2` used to be both a legal status
+        // and a legal length.
+        assert_ne!(pull_status(2), 2);
     }
 }
