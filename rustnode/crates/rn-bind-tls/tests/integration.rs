@@ -1765,3 +1765,149 @@ fn a_tls_wrap_is_an_async_wrap() {
         "the wrap must carry a stable async id and PROVIDER_TLSWRAP; stderr: {stderr}"
     );
 }
+
+/// An **EC** certificate's public point is encoded through
+/// `EC_POINT_point2buf`, whose fifth parameter is an optional `BN_CTX`, not an
+/// out-parameter for the length.
+///
+/// It was declared `*mut usize` and called with `&mut length`, so OpenSSL
+/// received a pointer to an unused stack `usize` where a `BN_CTX` belongs and
+/// pushed bignum stack frames through it. Every EC certificate therefore read
+/// uninitialised stack memory as a bignum context: the release build crashed with
+/// SIGSEGV inside `BN_CTX_start`, writing through a reused PEM buffer that read
+/// as `"LICKEY"`, while the debug build happened to win the memory lottery.
+/// `getPeerCertificate` is where it surfaced, which is the first thing an HTTPS
+/// client does.
+///
+/// # Why this asserts on `valgrind` and not on a crash
+///
+/// Whether the corruption *crashes* depends entirely on what happens to be at
+/// that stack address, so a plain run of this script passes on the unfixed code —
+/// I measured it: an EC certificate read locally on the unfixed release binary
+/// prints `bits: 256` and exits 0. Asserting "it did not crash" would therefore
+/// be a check that cannot fail, which is the exact defect class this project
+/// keeps finding.
+///
+/// Valgrind sees the defect deterministically. On the unfixed code it reports 16
+/// errors, the first being
+/// `Conditional jump or move depends on uninitialised value(s)` at
+/// `BN_CTX_start (bn_ctx.c:189)`, with
+/// `Uninitialised value was created by a stack allocation at
+/// rn_bind_crypto_x509::legacy::ec_public_point`. After the fix it reports 0
+/// errors from 0 contexts.
+///
+/// The existing fixture is RSA and an RSA key never reaches that function, which
+/// is why this went unnoticed; the certificate here must be EC.
+///
+/// Skipped with a message when `valgrind` is absent, rather than passing silently.
+#[test]
+fn an_ec_peer_certificate_can_be_read() {
+    let dir = std::env::temp_dir().join(format!("rn-bind-tls-ec-{}", std::process::id()));
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!("skipping: cannot create a temp dir");
+        return;
+    }
+    let key = dir.join("ec-key.pem");
+    let cert = dir.join("ec-cert.pem");
+    let generated = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-keyout",
+            key.to_str().unwrap_or_default(),
+            "-out",
+            cert.to_str().unwrap_or_default(),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=localhost",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if !matches!(generated, Ok(status) if status.success()) {
+        eprintln!("skipping: openssl could not generate an EC certificate");
+        return;
+    }
+    if Command::new("valgrind")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        eprintln!(
+            "skipping: valgrind is not installed; it is what makes this test able to fail, \
+             because the corruption only crashes an optimised build when the stack happens \
+             to hold a bad pointer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+
+    let script = format!(
+        "\
+        const tls = require('tls'); \
+        const fs = require('fs'); \
+        const opts = {{ \
+          key: fs.readFileSync({key:?}), \
+          cert: fs.readFileSync({cert:?}), \
+        }}; \
+        const server = tls.createServer(opts, (sock) => sock.end('x')); \
+        server.listen(0, '127.0.0.1', () => {{ \
+          const c = tls.connect( \
+            {{ port: server.address().port, host: '127.0.0.1', rejectUnauthorized: false }}); \
+          c.on('secureConnect', () => {{ \
+            const p = c.getPeerCertificate(); \
+            console.log([typeof p, p && p.bits].join(',')); \
+            c.end(); \
+            server.close(() => process.exit(0)); \
+          }}); \
+          c.on('error', (e) => {{ console.log('C:ERR ' + e.message); process.exit(1); }}); \
+        }});",
+        key = key.display().to_string(),
+        cert = cert.display().to_string(),
+    );
+
+    let output = Command::new("timeout")
+        .arg("300")
+        .arg("valgrind")
+        .args([
+            "--error-exitcode=99",
+            "--leak-check=no",
+            "--errors-for-leak-kinds=none",
+        ])
+        .arg(binary())
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .expect("valgrind runs the rustnode binary");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stdout.contains("object,256"),
+        "the EC key must report its real size; stdout: {stdout}"
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(99),
+        "reading an EC peer certificate must not touch uninitialised memory; \
+         valgrind: {stderr}"
+    );
+    assert!(
+        !stderr.contains("BN_CTX_start"),
+        "no uninitialised value may reach a bignum context; valgrind: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the script must exit cleanly; stderr: {stderr}"
+    );
+}
