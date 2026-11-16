@@ -44,7 +44,7 @@ impl BindingModule for AsyncContextFrame {
             ),
             (
                 "setContinuationPreservedEmbedderData",
-                function(scope, "setContinuationPreservedEmbedderData", set_data)?,
+                extras_function(scope, "setContinuationPreservedEmbedderData", 1, set_data)?,
             ),
         ];
         for (name, value) in values {
@@ -85,6 +85,23 @@ fn function<'s>(
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     Ok(rn_core::named_method(scope, name, callback)?.into())
+}
+
+/// The setter Node copies off V8's extras binding, so its length is V8's.
+///
+/// `CreatePerContextProperties` (`src/async_context_frame.cc`) reads both
+/// members from `context->GetExtrasBindingObject()`, and V8 installed them with
+/// `SimpleInstallFunction(isolate, extras_binding,
+/// "setContinuationPreservedEmbedderData", Builtin::kSetContinuationPreservedEmbedderData,
+/// 1, kAdapt)` (`deps/v8/src/init/bootstrapper.cc`), which records the 1.
+/// The getter's `len` is 0, so it stays on `named_method`.
+fn extras_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    length: i32,
+    callback: impl v8::MapFnTo<v8::FunctionCallback>,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    Ok(rn_core::extras_method(scope, name, length, callback)?.into())
 }
 
 fn set(

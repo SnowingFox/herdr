@@ -24,7 +24,8 @@ use crate::stmt;
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(construct).length(1).build(scope);
+    // Node: `NewFunctionTemplate` + `SetConstructorFunction`, i.e. length 0.
+    let template = rn_core::class(construct).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(db::INTERNAL_FIELDS);
@@ -44,45 +45,33 @@ pub fn constructor<'s>(
     let prototype = template.prototype_template(scope);
     // The full surface `Initialize` installs, in its order. `SetProtoMethod`
     // makes every one non-constructible, which `method` handles.
-    let methods: [(&str, i32, v8::Local<'_, v8::FunctionTemplate>); 17] = [
-        ("open", 0, method(scope, 0, open)),
-        ("close", 0, method(scope, 0, close)),
-        ("prepare", 1, method(scope, 1, prepare)),
-        ("exec", 1, method(scope, 1, exec)),
-        (
-            "function",
-            2,
-            method(scope, 2, crate::sqlfn::register_scalar),
-        ),
-        ("createTagStore", 0, method(scope, 0, create_tag_store)),
-        ("location", 0, method(scope, 0, location)),
-        (
-            "aggregate",
-            2,
-            method(scope, 2, crate::sqlfn::register_aggregate),
-        ),
-        ("createSession", 0, method(scope, 0, crate::session::create)),
-        ("applyChangeset", 1, method(scope, 1, apply_changeset)),
-        (
-            "enableLoadExtension",
-            1,
-            method(scope, 1, enable_load_extension),
-        ),
-        ("enableDefensive", 1, method(scope, 1, enable_defensive)),
-        ("loadExtension", 1, method(scope, 1, load_extension)),
-        ("serialize", 0, method(scope, 0, serialize)),
-        ("deserialize", 1, method(scope, 1, deserialize)),
-        ("setAuthorizer", 1, method(scope, 1, set_authorizer)),
-        ("createModule", 2, method(scope, 2, create_module)),
+    let methods: [(&str, v8::Local<'_, v8::FunctionTemplate>); 17] = [
+        ("open", method(scope, open)),
+        ("close", method(scope, close)),
+        ("prepare", method(scope, prepare)),
+        ("exec", method(scope, exec)),
+        ("function", method(scope, crate::sqlfn::register_scalar)),
+        ("createTagStore", method(scope, create_tag_store)),
+        ("location", method(scope, location)),
+        ("aggregate", method(scope, crate::sqlfn::register_aggregate)),
+        ("createSession", method(scope, crate::session::create)),
+        ("applyChangeset", method(scope, apply_changeset)),
+        ("enableLoadExtension", method(scope, enable_load_extension)),
+        ("enableDefensive", method(scope, enable_defensive)),
+        ("loadExtension", method(scope, load_extension)),
+        ("serialize", method(scope, serialize)),
+        ("deserialize", method(scope, deserialize)),
+        ("setAuthorizer", method(scope, set_authorizer)),
+        ("createModule", method(scope, create_module)),
     ];
-    for (name, _length, template) in methods {
+    for (name, template) in methods {
         let key = v8::String::new(scope, name).ok_or("cannot allocate a method name")?;
         prototype.set(key.into(), template.into());
     }
 
     // `SetProtoDispose` installs `Symbol.dispose`, which is what makes
     // `using db = new Database(...)` close the connection at block exit.
-    let dispose = rn_core::class(dispose).length(0).build(scope);
+    let dispose = rn_core::class(dispose).build(scope);
     if let Some(name) = v8::String::new(scope, "dispose") {
         dispose.set_class_name(name);
     }
@@ -228,7 +217,6 @@ pub(crate) fn side_effect_free_getter<'s>(
     // what `SetSideEffectFreeGetter` asks for; naming it here keeps the crate on
     // the one chokepoint #121 introduced instead of repeating the builder call.
     let getter = rn_core::method(callback)
-        .length(0)
         .signature(signature)
         .side_effect_type(v8::SideEffectType::HasNoSideEffect)
         .build(scope);
@@ -245,12 +233,15 @@ pub(crate) fn side_effect_free_getter<'s>(
 }
 
 /// One non-constructible method, matching `SetProtoMethod`.
+///
+/// No arity parameter: `SetProtoMethod` builds through `NewFunctionTemplate`,
+/// so every method here reports `length` 0 on Node however many arguments the
+/// JavaScript layer passes.
 pub fn method<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    length: i32,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::Local<'s, v8::FunctionTemplate> {
-    rn_core::method(callback).length(length).build(scope)
+    rn_core::method(callback).build(scope)
 }
 
 /// `new Database(path[, options])`.

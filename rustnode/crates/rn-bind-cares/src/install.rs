@@ -1041,9 +1041,7 @@ fn request_wrap<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(request_wrap_constructor)
-        .length(0)
-        .build(scope);
+    let template = rn_core::class(request_wrap_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(0);
@@ -1091,7 +1089,7 @@ fn method<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::method(callback).length(0).build(scope);
+    let template = rn_core::method(callback).build(scope);
     let function = template
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate cares_wrap.{name}"))?;

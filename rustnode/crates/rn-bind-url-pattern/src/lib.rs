@@ -166,7 +166,6 @@ fn constructor_template<'s>(
     macro_rules! install_component {
         ($name:literal, $getter:path) => {{
             let getter = rn_core::method($getter)
-                .length(0)
                 .side_effect_type(v8::SideEffectType::HasNoSideEffect)
                 .build(scope);
             let key = v8::String::new(scope, $name).ok_or("cannot name a component")?;
@@ -189,11 +188,9 @@ fn constructor_template<'s>(
     // `test` and `exec` are ordinary prototype methods: writable, enumerable
     // and configurable, which is `SetProtoMethodNoSideEffect`'s shape.
     let exec = rn_core::method(exec_pattern)
-        .length(0)
         .side_effect_type(v8::SideEffectType::HasNoSideEffect)
         .build(scope);
     let test = rn_core::method(test_pattern)
-        .length(0)
         .side_effect_type(v8::SideEffectType::HasNoSideEffect)
         .build(scope);
     for (name, function) in [("exec", exec), ("test", test)] {

@@ -398,7 +398,9 @@ fn eld_pointer(object: v8::Local<'_, v8::Object>) -> *mut RefCell<EldState> {
 pub(crate) fn create_function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::method(create).length(5).build(scope);
+    // `SetMethod` builds through `NewFunctionTemplate`, i.e. length 0, not the
+    // five arguments the JavaScript side passes.
+    let template = rn_core::method(create).build(scope);
     template.remove_prototype();
     // `SetMethod` names this after the property it is published under. The
     // template still has to be shaped first (`remove_prototype`), so this is
@@ -568,7 +570,7 @@ pub(crate) fn register_template(scope: &mut v8::PinScope<'_, '_>) -> Result<(), 
     // `new_instance` abort inside V8. The handle itself is never reachable
     // through `new` from JavaScript: `createELDHistogram` is the only way to get
     // one, and it is published as a method.
-    let template = rn_core::class(noop_constructor).length(0).build(scope);
+    let template = rn_core::class(noop_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(2);
@@ -582,12 +584,11 @@ pub(crate) fn register_template(scope: &mut v8::PinScope<'_, '_>) -> Result<(), 
     histogram_binding::add_histogram_methods(scope, template)?;
 
     let prototype = template.prototype_template(scope);
-    for (name, length, callback) in [
-        ("start", 1, histogram_binding::method(scope, 1, start)),
-        ("stop", 0, histogram_binding::method(scope, 0, stop)),
+    for (name, callback) in [
+        ("start", histogram_binding::method(scope, start)),
+        ("stop", histogram_binding::method(scope, stop)),
     ] {
         let key = v8::String::new(scope, name).ok_or("cannot allocate a method name")?;
-        let _ = length;
         prototype.set(key.into(), callback.into());
     }
 

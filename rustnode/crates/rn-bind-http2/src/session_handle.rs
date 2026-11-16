@@ -46,7 +46,6 @@ pub fn constructor<'s>(
         ($($method_name:literal => $method:expr),* $(,)?) => {
             $(
                 let method_template = rn_core::method($method)
-                    .length(0)
                     .build(scope);
                 let key = v8::String::new(scope, $method_name)
                     .ok_or_else(|| format!("cannot allocate Http2Session.{}", $method_name))?;

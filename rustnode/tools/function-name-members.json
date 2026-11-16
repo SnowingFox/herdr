@@ -1,683 +1,2348 @@
 {
   "async_context_frame": {
-    "getContinuationPreservedEmbedderData": "getContinuationPreservedEmbedderData",
-    "setContinuationPreservedEmbedderData": "setContinuationPreservedEmbedderData"
+    "getContinuationPreservedEmbedderData": {
+      "length": 0,
+      "name": "getContinuationPreservedEmbedderData"
+    },
+    "setContinuationPreservedEmbedderData": {
+      "length": 1,
+      "name": "setContinuationPreservedEmbedderData"
+    }
   },
   "async_wrap": {
-    "clearAsyncIdStack": "clearAsyncIdStack",
-    "executionAsyncResource": "executionAsyncResource",
-    "getPromiseHooks": "getPromiseHooks",
-    "popAsyncContext": "popAsyncContext",
-    "pushAsyncContext": "pushAsyncContext",
-    "queueDestroyAsyncId": "queueDestroyAsyncId",
-    "registerDestroyHook": "registerDestroyHook",
-    "setCallbackTrampoline": "setCallbackTrampoline",
-    "setPromiseHooks": "setPromiseHooks",
-    "setupHooks": "setupHooks"
+    "clearAsyncIdStack": {
+      "length": 0,
+      "name": "clearAsyncIdStack"
+    },
+    "executionAsyncResource": {
+      "length": 0,
+      "name": "executionAsyncResource"
+    },
+    "getPromiseHooks": {
+      "length": 0,
+      "name": "getPromiseHooks"
+    },
+    "popAsyncContext": {
+      "length": 0,
+      "name": "popAsyncContext"
+    },
+    "pushAsyncContext": {
+      "length": 0,
+      "name": "pushAsyncContext"
+    },
+    "queueDestroyAsyncId": {
+      "length": 0,
+      "name": "queueDestroyAsyncId"
+    },
+    "registerDestroyHook": {
+      "length": 0,
+      "name": "registerDestroyHook"
+    },
+    "setCallbackTrampoline": {
+      "length": 0,
+      "name": "setCallbackTrampoline"
+    },
+    "setPromiseHooks": {
+      "length": 0,
+      "name": "setPromiseHooks"
+    },
+    "setupHooks": {
+      "length": 0,
+      "name": "setupHooks"
+    }
   },
   "blob": {
-    "concat": "concat",
-    "createBlob": "createBlob",
-    "createBlobFromFilePath": "createBlobFromFilePath",
-    "getDataObject": "getDataObject",
-    "revokeObjectURL": "revokeObjectURL",
-    "storeDataObject": "storeDataObject"
+    "concat": {
+      "length": 0,
+      "name": "concat"
+    },
+    "createBlob": {
+      "length": 0,
+      "name": "createBlob"
+    },
+    "createBlobFromFilePath": {
+      "length": 0,
+      "name": "createBlobFromFilePath"
+    },
+    "getDataObject": {
+      "length": 0,
+      "name": "getDataObject"
+    },
+    "revokeObjectURL": {
+      "length": 0,
+      "name": "revokeObjectURL"
+    },
+    "storeDataObject": {
+      "length": 0,
+      "name": "storeDataObject"
+    }
   },
   "block_list": {
-    "BlockList": "BlockList",
-    "SocketAddress": "SocketAddress"
+    "BlockList": {
+      "length": 0,
+      "name": "BlockList"
+    },
+    "SocketAddress": {
+      "length": 0,
+      "name": "SocketAddress"
+    }
   },
   "buffer": {
-    "arrayBufferAlignedOffset": "arrayBufferAlignedOffset",
-    "asciiSlice": "asciiSlice",
-    "asciiWriteStatic": "",
-    "atob": "atob",
-    "base64Slice": "base64Slice",
-    "base64Write": "base64Write",
-    "base64urlSlice": "base64urlSlice",
-    "base64urlWrite": "base64urlWrite",
-    "btoa": "btoa",
-    "byteLengthUtf8": "byteLengthUtf8",
-    "byteLengthUtf8Fast": "",
-    "compare": "",
-    "compareOffset": "compareOffset",
-    "copy": "",
-    "copyArrayBuffer": "",
-    "createUnsafeArrayBuffer": "createUnsafeArrayBuffer",
-    "fill": "fill",
-    "hexSlice": "hexSlice",
-    "hexWrite": "hexWrite",
-    "indexOfBuffer": "indexOfBuffer",
-    "indexOfNumber": "",
-    "indexOfString": "indexOfString",
-    "isAscii": "",
-    "isLatin1": "",
-    "isUtf8": "",
-    "latin1Slice": "latin1Slice",
-    "latin1WriteStatic": "",
-    "mask": "",
-    "setDetachKey": "setDetachKey",
-    "stringLengthUtf8": "",
-    "swap16": "",
-    "swap32": "",
-    "swap64": "",
-    "ucs2Slice": "ucs2Slice",
-    "ucs2Write": "ucs2Write",
-    "utf8Slice": "utf8Slice",
-    "utf8WriteStatic": ""
+    "arrayBufferAlignedOffset": {
+      "length": 0,
+      "name": "arrayBufferAlignedOffset"
+    },
+    "asciiSlice": {
+      "length": 0,
+      "name": "asciiSlice"
+    },
+    "asciiWriteStatic": {
+      "length": 0,
+      "name": ""
+    },
+    "atob": {
+      "length": 0,
+      "name": "atob"
+    },
+    "base64Slice": {
+      "length": 0,
+      "name": "base64Slice"
+    },
+    "base64Write": {
+      "length": 0,
+      "name": "base64Write"
+    },
+    "base64urlSlice": {
+      "length": 0,
+      "name": "base64urlSlice"
+    },
+    "base64urlWrite": {
+      "length": 0,
+      "name": "base64urlWrite"
+    },
+    "btoa": {
+      "length": 0,
+      "name": "btoa"
+    },
+    "byteLengthUtf8": {
+      "length": 0,
+      "name": "byteLengthUtf8"
+    },
+    "byteLengthUtf8Fast": {
+      "length": 0,
+      "name": ""
+    },
+    "compare": {
+      "length": 0,
+      "name": ""
+    },
+    "compareOffset": {
+      "length": 0,
+      "name": "compareOffset"
+    },
+    "copy": {
+      "length": 0,
+      "name": ""
+    },
+    "copyArrayBuffer": {
+      "length": 0,
+      "name": ""
+    },
+    "createUnsafeArrayBuffer": {
+      "length": 0,
+      "name": "createUnsafeArrayBuffer"
+    },
+    "fill": {
+      "length": 0,
+      "name": "fill"
+    },
+    "hexSlice": {
+      "length": 0,
+      "name": "hexSlice"
+    },
+    "hexWrite": {
+      "length": 0,
+      "name": "hexWrite"
+    },
+    "indexOfBuffer": {
+      "length": 0,
+      "name": "indexOfBuffer"
+    },
+    "indexOfNumber": {
+      "length": 0,
+      "name": ""
+    },
+    "indexOfString": {
+      "length": 0,
+      "name": "indexOfString"
+    },
+    "isAscii": {
+      "length": 0,
+      "name": ""
+    },
+    "isLatin1": {
+      "length": 0,
+      "name": ""
+    },
+    "isUtf8": {
+      "length": 0,
+      "name": ""
+    },
+    "latin1Slice": {
+      "length": 0,
+      "name": "latin1Slice"
+    },
+    "latin1WriteStatic": {
+      "length": 0,
+      "name": ""
+    },
+    "mask": {
+      "length": 0,
+      "name": ""
+    },
+    "setDetachKey": {
+      "length": 0,
+      "name": "setDetachKey"
+    },
+    "stringLengthUtf8": {
+      "length": 0,
+      "name": ""
+    },
+    "swap16": {
+      "length": 0,
+      "name": ""
+    },
+    "swap32": {
+      "length": 0,
+      "name": ""
+    },
+    "swap64": {
+      "length": 0,
+      "name": ""
+    },
+    "ucs2Slice": {
+      "length": 0,
+      "name": "ucs2Slice"
+    },
+    "ucs2Write": {
+      "length": 0,
+      "name": "ucs2Write"
+    },
+    "utf8Slice": {
+      "length": 0,
+      "name": "utf8Slice"
+    },
+    "utf8WriteStatic": {
+      "length": 0,
+      "name": ""
+    }
   },
   "builtins": {
-    "compileFunction": "compileFunction",
-    "getCacheUsage": "getCacheUsage",
-    "hasCachedBuiltins": "hasCachedBuiltins",
-    "importBuiltinSourceTextModule": "importBuiltinSourceTextModule",
-    "setInternalLoaders": "setInternalLoaders"
+    "compileFunction": {
+      "length": 0,
+      "name": "compileFunction"
+    },
+    "getCacheUsage": {
+      "length": 0,
+      "name": "getCacheUsage"
+    },
+    "hasCachedBuiltins": {
+      "length": 0,
+      "name": "hasCachedBuiltins"
+    },
+    "importBuiltinSourceTextModule": {
+      "length": 0,
+      "name": "importBuiltinSourceTextModule"
+    },
+    "setInternalLoaders": {
+      "length": 0,
+      "name": "setInternalLoaders"
+    }
   },
   "cares_wrap": {
-    "ChannelWrap": "ChannelWrap",
-    "GetAddrInfoReqWrap": "GetAddrInfoReqWrap",
-    "GetNameInfoReqWrap": "GetNameInfoReqWrap",
-    "QueryReqWrap": "QueryReqWrap",
-    "canonicalizeIP": "canonicalizeIP",
-    "convertIpv6StringToBuffer": "convertIpv6StringToBuffer",
-    "getaddrinfo": "getaddrinfo",
-    "getnameinfo": "getnameinfo",
-    "strerror": "strerror"
+    "ChannelWrap": {
+      "length": 0,
+      "name": "ChannelWrap"
+    },
+    "GetAddrInfoReqWrap": {
+      "length": 0,
+      "name": "GetAddrInfoReqWrap"
+    },
+    "GetNameInfoReqWrap": {
+      "length": 0,
+      "name": "GetNameInfoReqWrap"
+    },
+    "QueryReqWrap": {
+      "length": 0,
+      "name": "QueryReqWrap"
+    },
+    "canonicalizeIP": {
+      "length": 0,
+      "name": "canonicalizeIP"
+    },
+    "convertIpv6StringToBuffer": {
+      "length": 0,
+      "name": "convertIpv6StringToBuffer"
+    },
+    "getaddrinfo": {
+      "length": 0,
+      "name": "getaddrinfo"
+    },
+    "getnameinfo": {
+      "length": 0,
+      "name": "getnameinfo"
+    },
+    "strerror": {
+      "length": 0,
+      "name": "strerror"
+    }
   },
   "cjs_lexer": {
-    "parse": "parse"
+    "parse": {
+      "length": 0,
+      "name": "parse"
+    }
   },
   "config": {
-    "getDefaultLocale": "getDefaultLocale"
+    "getDefaultLocale": {
+      "length": 0,
+      "name": "getDefaultLocale"
+    }
   },
   "constants": {},
   "contextify": {
-    "ContextifyScript": "ContextifyScript",
-    "compileFunction": "compileFunction",
-    "compileFunctionForCJSLoader": "compileFunctionForCJSLoader",
-    "containsModuleSyntax": "containsModuleSyntax",
-    "makeContext": "makeContext",
-    "measureMemory": "measureMemory",
-    "runInterruptible": "runInterruptible"
+    "ContextifyScript": {
+      "length": 0,
+      "name": "ContextifyScript"
+    },
+    "compileFunction": {
+      "length": 0,
+      "name": "compileFunction"
+    },
+    "compileFunctionForCJSLoader": {
+      "length": 0,
+      "name": "compileFunctionForCJSLoader"
+    },
+    "containsModuleSyntax": {
+      "length": 0,
+      "name": "containsModuleSyntax"
+    },
+    "makeContext": {
+      "length": 0,
+      "name": "makeContext"
+    },
+    "measureMemory": {
+      "length": 0,
+      "name": "measureMemory"
+    },
+    "runInterruptible": {
+      "length": 0,
+      "name": "runInterruptible"
+    }
   },
   "credentials": {
-    "getTempDir": "getTempDir",
-    "getegid": "getegid",
-    "geteuid": "geteuid",
-    "getgid": "getgid",
-    "getgroups": "getgroups",
-    "getuid": "getuid",
-    "initgroups": "initgroups",
-    "safeGetenv": "safeGetenv",
-    "setegid": "setegid",
-    "seteuid": "seteuid",
-    "setgid": "setgid",
-    "setgroups": "setgroups",
-    "setuid": "setuid"
+    "getTempDir": {
+      "length": 0,
+      "name": "getTempDir"
+    },
+    "getegid": {
+      "length": 0,
+      "name": "getegid"
+    },
+    "geteuid": {
+      "length": 0,
+      "name": "geteuid"
+    },
+    "getgid": {
+      "length": 0,
+      "name": "getgid"
+    },
+    "getgroups": {
+      "length": 0,
+      "name": "getgroups"
+    },
+    "getuid": {
+      "length": 0,
+      "name": "getuid"
+    },
+    "initgroups": {
+      "length": 0,
+      "name": "initgroups"
+    },
+    "safeGetenv": {
+      "length": 0,
+      "name": "safeGetenv"
+    },
+    "setegid": {
+      "length": 0,
+      "name": "setegid"
+    },
+    "seteuid": {
+      "length": 0,
+      "name": "seteuid"
+    },
+    "setgid": {
+      "length": 0,
+      "name": "setgid"
+    },
+    "setgroups": {
+      "length": 0,
+      "name": "setgroups"
+    },
+    "setuid": {
+      "length": 0,
+      "name": "setuid"
+    }
   },
   "crypto": {
-    "AESCipherJob": "AESCipherJob",
-    "Argon2Job": "Argon2Job",
-    "ChaCha20Poly1305CipherJob": "ChaCha20Poly1305CipherJob",
-    "CheckPrimeJob": "CheckPrimeJob",
-    "CipherBase": "CipherBase",
-    "DHBitsJob": "DHBitsJob",
-    "DhKeyPairGenJob": "DhKeyPairGenJob",
-    "DiffieHellman": "DiffieHellman",
-    "DiffieHellmanGroup": "DiffieHellmanGroup",
-    "DsaKeyPairGenJob": "DsaKeyPairGenJob",
-    "ECDH": "ECDH",
-    "ECDHConvertKey": "ECDHConvertKey",
-    "EcKeyPairGenJob": "EcKeyPairGenJob",
-    "HKDFJob": "HKDFJob",
-    "Hash": "Hash",
-    "HashJob": "HashJob",
-    "Hmac": "Hmac",
-    "HmacJob": "HmacJob",
-    "KEMDecapsulateJob": "KEMDecapsulateJob",
-    "KEMEncapsulateJob": "KEMEncapsulateJob",
-    "KangarooTwelveJob": "KangarooTwelveJob",
-    "KeyObjectHandle": "",
-    "KmacJob": "KmacJob",
-    "Mac": "Mac",
-    "NamedKeyPairGenJob": "NamedKeyPairGenJob",
-    "PBKDF2Job": "PBKDF2Job",
-    "RSACipherJob": "RSACipherJob",
-    "RandomBytesJob": "RandomBytesJob",
-    "RandomPrimeJob": "RandomPrimeJob",
-    "RsaKeyPairGenJob": "RsaKeyPairGenJob",
-    "ScryptJob": "ScryptJob",
-    "SecretKeyGenJob": "SecretKeyGenJob",
-    "SecureContext": "SecureContext",
-    "Sign": "Sign",
-    "SignJob": "SignJob",
-    "TurboShakeJob": "TurboShakeJob",
-    "Verify": "Verify",
-    "certExportChallenge": "certExportChallenge",
-    "certExportPublicKey": "certExportPublicKey",
-    "certVerifySpkac": "certVerifySpkac",
-    "createCryptoKeyClass": "createCryptoKeyClass",
-    "createNativeKeyObjectClass": "createNativeKeyObjectClass",
-    "createX509CertificateClass": "createX509CertificateClass",
-    "getBundledRootCertificates": "getBundledRootCertificates",
-    "getCachedAliases": "getCachedAliases",
-    "getCachedMacAliases": "getCachedMacAliases",
-    "getCertificateCompressionAlgorithms": "getCertificateCompressionAlgorithms",
-    "getCipherInfo": "getCipherInfo",
-    "getCiphers": "getCiphers",
-    "getCryptoKeySlots": "getCryptoKeySlots",
-    "getCurves": "getCurves",
-    "getExtraCACertificates": "getExtraCACertificates",
-    "getFipsCrypto": "getFipsCrypto",
-    "getFipsCryptoGeneration": "getFipsCryptoGeneration",
-    "getHashes": "getHashes",
-    "getKeyObjectSlots": "getKeyObjectSlots",
-    "getMacs": "getMacs",
-    "getOpenSSLSecLevelCrypto": "getOpenSSLSecLevelCrypto",
-    "getSSLCiphers": "getSSLCiphers",
-    "getSystemCACertificates": "getSystemCACertificates",
-    "getUserRootCertificates": "getUserRootCertificates",
-    "getX509CertificateSnapshot": "getX509CertificateSnapshot",
-    "isCryptoKey": "isCryptoKey",
-    "isKeyAlgorithmAvailable": "isKeyAlgorithmAvailable",
-    "isKeyObject": "isKeyObject",
-    "isX509Certificate": "isX509Certificate",
-    "oneShotDigest": "oneShotDigest",
-    "parsePKCS12": "parsePKCS12",
-    "parseX509": "parseX509",
-    "parseX509Snapshot": "parseX509Snapshot",
-    "privateDecrypt": "privateDecrypt",
-    "privateEncrypt": "privateEncrypt",
-    "publicDecrypt": "publicDecrypt",
-    "publicEncrypt": "publicEncrypt",
-    "randomFillSync": "randomFillSync",
-    "resetRootCertStore": "resetRootCertStore",
-    "secureBuffer": "secureBuffer",
-    "secureHeapUsed": "secureHeapUsed",
-    "setFipsCrypto": "setFipsCrypto",
-    "setupFipsIndicatorChannel": "setupFipsIndicatorChannel",
-    "startLoadingCertificatesOffThread": "startLoadingCertificatesOffThread",
-    "testFipsCrypto": "testFipsCrypto",
-    "timingSafeEqual": ""
+    "AESCipherJob": {
+      "length": 0,
+      "name": "AESCipherJob"
+    },
+    "Argon2Job": {
+      "length": 0,
+      "name": "Argon2Job"
+    },
+    "ChaCha20Poly1305CipherJob": {
+      "length": 0,
+      "name": "ChaCha20Poly1305CipherJob"
+    },
+    "CheckPrimeJob": {
+      "length": 0,
+      "name": "CheckPrimeJob"
+    },
+    "CipherBase": {
+      "length": 0,
+      "name": "CipherBase"
+    },
+    "DHBitsJob": {
+      "length": 0,
+      "name": "DHBitsJob"
+    },
+    "DhKeyPairGenJob": {
+      "length": 0,
+      "name": "DhKeyPairGenJob"
+    },
+    "DiffieHellman": {
+      "length": 0,
+      "name": "DiffieHellman"
+    },
+    "DiffieHellmanGroup": {
+      "length": 0,
+      "name": "DiffieHellmanGroup"
+    },
+    "DsaKeyPairGenJob": {
+      "length": 0,
+      "name": "DsaKeyPairGenJob"
+    },
+    "ECDH": {
+      "length": 0,
+      "name": "ECDH"
+    },
+    "ECDHConvertKey": {
+      "length": 0,
+      "name": "ECDHConvertKey"
+    },
+    "EcKeyPairGenJob": {
+      "length": 0,
+      "name": "EcKeyPairGenJob"
+    },
+    "HKDFJob": {
+      "length": 0,
+      "name": "HKDFJob"
+    },
+    "Hash": {
+      "length": 0,
+      "name": "Hash"
+    },
+    "HashJob": {
+      "length": 0,
+      "name": "HashJob"
+    },
+    "Hmac": {
+      "length": 0,
+      "name": "Hmac"
+    },
+    "HmacJob": {
+      "length": 0,
+      "name": "HmacJob"
+    },
+    "KEMDecapsulateJob": {
+      "length": 0,
+      "name": "KEMDecapsulateJob"
+    },
+    "KEMEncapsulateJob": {
+      "length": 0,
+      "name": "KEMEncapsulateJob"
+    },
+    "KangarooTwelveJob": {
+      "length": 0,
+      "name": "KangarooTwelveJob"
+    },
+    "KeyObjectHandle": {
+      "length": 0,
+      "name": ""
+    },
+    "KmacJob": {
+      "length": 0,
+      "name": "KmacJob"
+    },
+    "Mac": {
+      "length": 0,
+      "name": "Mac"
+    },
+    "NamedKeyPairGenJob": {
+      "length": 0,
+      "name": "NamedKeyPairGenJob"
+    },
+    "PBKDF2Job": {
+      "length": 0,
+      "name": "PBKDF2Job"
+    },
+    "RSACipherJob": {
+      "length": 0,
+      "name": "RSACipherJob"
+    },
+    "RandomBytesJob": {
+      "length": 0,
+      "name": "RandomBytesJob"
+    },
+    "RandomPrimeJob": {
+      "length": 0,
+      "name": "RandomPrimeJob"
+    },
+    "RsaKeyPairGenJob": {
+      "length": 0,
+      "name": "RsaKeyPairGenJob"
+    },
+    "ScryptJob": {
+      "length": 0,
+      "name": "ScryptJob"
+    },
+    "SecretKeyGenJob": {
+      "length": 0,
+      "name": "SecretKeyGenJob"
+    },
+    "SecureContext": {
+      "length": 0,
+      "name": "SecureContext"
+    },
+    "Sign": {
+      "length": 0,
+      "name": "Sign"
+    },
+    "SignJob": {
+      "length": 0,
+      "name": "SignJob"
+    },
+    "TurboShakeJob": {
+      "length": 0,
+      "name": "TurboShakeJob"
+    },
+    "Verify": {
+      "length": 0,
+      "name": "Verify"
+    },
+    "certExportChallenge": {
+      "length": 0,
+      "name": "certExportChallenge"
+    },
+    "certExportPublicKey": {
+      "length": 0,
+      "name": "certExportPublicKey"
+    },
+    "certVerifySpkac": {
+      "length": 0,
+      "name": "certVerifySpkac"
+    },
+    "createCryptoKeyClass": {
+      "length": 0,
+      "name": "createCryptoKeyClass"
+    },
+    "createNativeKeyObjectClass": {
+      "length": 0,
+      "name": "createNativeKeyObjectClass"
+    },
+    "createX509CertificateClass": {
+      "length": 0,
+      "name": "createX509CertificateClass"
+    },
+    "getBundledRootCertificates": {
+      "length": 0,
+      "name": "getBundledRootCertificates"
+    },
+    "getCachedAliases": {
+      "length": 0,
+      "name": "getCachedAliases"
+    },
+    "getCachedMacAliases": {
+      "length": 0,
+      "name": "getCachedMacAliases"
+    },
+    "getCertificateCompressionAlgorithms": {
+      "length": 0,
+      "name": "getCertificateCompressionAlgorithms"
+    },
+    "getCipherInfo": {
+      "length": 0,
+      "name": "getCipherInfo"
+    },
+    "getCiphers": {
+      "length": 0,
+      "name": "getCiphers"
+    },
+    "getCryptoKeySlots": {
+      "length": 0,
+      "name": "getCryptoKeySlots"
+    },
+    "getCurves": {
+      "length": 0,
+      "name": "getCurves"
+    },
+    "getExtraCACertificates": {
+      "length": 0,
+      "name": "getExtraCACertificates"
+    },
+    "getFipsCrypto": {
+      "length": 0,
+      "name": "getFipsCrypto"
+    },
+    "getFipsCryptoGeneration": {
+      "length": 0,
+      "name": "getFipsCryptoGeneration"
+    },
+    "getHashes": {
+      "length": 0,
+      "name": "getHashes"
+    },
+    "getKeyObjectSlots": {
+      "length": 0,
+      "name": "getKeyObjectSlots"
+    },
+    "getMacs": {
+      "length": 0,
+      "name": "getMacs"
+    },
+    "getOpenSSLSecLevelCrypto": {
+      "length": 0,
+      "name": "getOpenSSLSecLevelCrypto"
+    },
+    "getSSLCiphers": {
+      "length": 0,
+      "name": "getSSLCiphers"
+    },
+    "getSystemCACertificates": {
+      "length": 0,
+      "name": "getSystemCACertificates"
+    },
+    "getUserRootCertificates": {
+      "length": 0,
+      "name": "getUserRootCertificates"
+    },
+    "getX509CertificateSnapshot": {
+      "length": 0,
+      "name": "getX509CertificateSnapshot"
+    },
+    "isCryptoKey": {
+      "length": 0,
+      "name": "isCryptoKey"
+    },
+    "isKeyAlgorithmAvailable": {
+      "length": 0,
+      "name": "isKeyAlgorithmAvailable"
+    },
+    "isKeyObject": {
+      "length": 0,
+      "name": "isKeyObject"
+    },
+    "isX509Certificate": {
+      "length": 0,
+      "name": "isX509Certificate"
+    },
+    "oneShotDigest": {
+      "length": 0,
+      "name": "oneShotDigest"
+    },
+    "parsePKCS12": {
+      "length": 0,
+      "name": "parsePKCS12"
+    },
+    "parseX509": {
+      "length": 0,
+      "name": "parseX509"
+    },
+    "parseX509Snapshot": {
+      "length": 0,
+      "name": "parseX509Snapshot"
+    },
+    "privateDecrypt": {
+      "length": 0,
+      "name": "privateDecrypt"
+    },
+    "privateEncrypt": {
+      "length": 0,
+      "name": "privateEncrypt"
+    },
+    "publicDecrypt": {
+      "length": 0,
+      "name": "publicDecrypt"
+    },
+    "publicEncrypt": {
+      "length": 0,
+      "name": "publicEncrypt"
+    },
+    "randomFillSync": {
+      "length": 0,
+      "name": "randomFillSync"
+    },
+    "resetRootCertStore": {
+      "length": 0,
+      "name": "resetRootCertStore"
+    },
+    "secureBuffer": {
+      "length": 0,
+      "name": "secureBuffer"
+    },
+    "secureHeapUsed": {
+      "length": 0,
+      "name": "secureHeapUsed"
+    },
+    "setFipsCrypto": {
+      "length": 0,
+      "name": "setFipsCrypto"
+    },
+    "setupFipsIndicatorChannel": {
+      "length": 0,
+      "name": "setupFipsIndicatorChannel"
+    },
+    "startLoadingCertificatesOffThread": {
+      "length": 0,
+      "name": "startLoadingCertificatesOffThread"
+    },
+    "testFipsCrypto": {
+      "length": 0,
+      "name": "testFipsCrypto"
+    },
+    "timingSafeEqual": {
+      "length": 0,
+      "name": ""
+    }
   },
   "diagnostics_channel": {
-    "linkNativeChannel": "linkNativeChannel",
-    "notifyChannelActive": "notifyChannelActive",
-    "notifyChannelInactive": "notifyChannelInactive"
+    "linkNativeChannel": {
+      "length": 0,
+      "name": "linkNativeChannel"
+    },
+    "notifyChannelActive": {
+      "length": 0,
+      "name": "notifyChannelActive"
+    },
+    "notifyChannelInactive": {
+      "length": 0,
+      "name": "notifyChannelInactive"
+    }
   },
   "encoding_binding": {
-    "decodeUTF8": "decodeUTF8",
-    "encodeInto": "encodeInto",
-    "encodeUtf8String": "encodeUtf8String",
-    "toASCII": "toASCII",
-    "toUnicode": "toUnicode"
+    "decodeUTF8": {
+      "length": 0,
+      "name": "decodeUTF8"
+    },
+    "encodeInto": {
+      "length": 0,
+      "name": "encodeInto"
+    },
+    "encodeUtf8String": {
+      "length": 0,
+      "name": "encodeUtf8String"
+    },
+    "toASCII": {
+      "length": 0,
+      "name": "toASCII"
+    },
+    "toUnicode": {
+      "length": 0,
+      "name": "toUnicode"
+    }
   },
   "errors": {
-    "getErrorSourcePositions": "getErrorSourcePositions",
-    "noSideEffectsToString": "noSideEffectsToString",
-    "setEnhanceStackForFatalException": "setEnhanceStackForFatalException",
-    "setGetSourceMapErrorSource": "setGetSourceMapErrorSource",
-    "setMaybeCacheGeneratedSourceMap": "setMaybeCacheGeneratedSourceMap",
-    "setPrepareStackTraceCallback": "setPrepareStackTraceCallback",
-    "setSourceMapsEnabled": "setSourceMapsEnabled",
-    "triggerUncaughtException": "triggerUncaughtException"
+    "getErrorSourcePositions": {
+      "length": 0,
+      "name": "getErrorSourcePositions"
+    },
+    "noSideEffectsToString": {
+      "length": 0,
+      "name": "noSideEffectsToString"
+    },
+    "setEnhanceStackForFatalException": {
+      "length": 0,
+      "name": "setEnhanceStackForFatalException"
+    },
+    "setGetSourceMapErrorSource": {
+      "length": 0,
+      "name": "setGetSourceMapErrorSource"
+    },
+    "setMaybeCacheGeneratedSourceMap": {
+      "length": 0,
+      "name": "setMaybeCacheGeneratedSourceMap"
+    },
+    "setPrepareStackTraceCallback": {
+      "length": 0,
+      "name": "setPrepareStackTraceCallback"
+    },
+    "setSourceMapsEnabled": {
+      "length": 0,
+      "name": "setSourceMapsEnabled"
+    },
+    "triggerUncaughtException": {
+      "length": 0,
+      "name": "triggerUncaughtException"
+    }
   },
   "fs": {
-    "CpDirJob": "CpDirJob",
-    "FSReqCallback": "FSReqCallback",
-    "FileHandle": "FileHandle",
-    "ReadFileJob": "ReadFileJob",
-    "StatWatcher": "StatWatcher",
-    "WriteFileJob": "WriteFileJob",
-    "access": "access",
-    "chmod": "chmod",
-    "chown": "chown",
-    "close": "close",
-    "copyFile": "copyFile",
-    "cpSyncCheckPaths": "cpSyncCheckPaths",
-    "cpSyncCopyDir": "cpSyncCopyDir",
-    "cpSyncOverrideFile": "cpSyncOverrideFile",
-    "existsSync": "existsSync",
-    "fchmod": "fchmod",
-    "fchown": "fchown",
-    "fdatasync": "fdatasync",
-    "fstat": "fstat",
-    "fsync": "fsync",
-    "ftruncate": "ftruncate",
-    "futimes": "futimes",
-    "getFormatOfExtensionlessFile": "getFormatOfExtensionlessFile",
-    "internalModuleStat": "internalModuleStat",
-    "lchown": "lchown",
-    "legacyMainResolve": "legacyMainResolve",
-    "link": "link",
-    "lstat": "lstat",
-    "lutimes": "lutimes",
-    "mkdir": "mkdir",
-    "mkdtemp": "mkdtemp",
-    "mkstemp": "mkstemp",
-    "open": "open",
-    "openFileHandle": "openFileHandle",
-    "read": "read",
-    "readBuffers": "readBuffers",
-    "readFileUtf8": "readFileUtf8",
-    "readdir": "readdir",
-    "readdirRecursive": "readdirRecursive",
-    "readlink": "readlink",
-    "realpath": "realpath",
-    "rename": "rename",
-    "rmSync": "rmSync",
-    "rmdir": "rmdir",
-    "stat": "stat",
-    "statfs": "statfs",
-    "symlink": "symlink",
-    "unlink": "unlink",
-    "utimes": "utimes",
-    "writeBuffer": "writeBuffer",
-    "writeBuffers": "writeBuffers",
-    "writeFileUtf8": "writeFileUtf8",
-    "writeString": "writeString"
+    "CpDirJob": {
+      "length": 0,
+      "name": "CpDirJob"
+    },
+    "FSReqCallback": {
+      "length": 0,
+      "name": "FSReqCallback"
+    },
+    "FileHandle": {
+      "length": 0,
+      "name": "FileHandle"
+    },
+    "ReadFileJob": {
+      "length": 0,
+      "name": "ReadFileJob"
+    },
+    "StatWatcher": {
+      "length": 0,
+      "name": "StatWatcher"
+    },
+    "WriteFileJob": {
+      "length": 0,
+      "name": "WriteFileJob"
+    },
+    "access": {
+      "length": 0,
+      "name": "access"
+    },
+    "chmod": {
+      "length": 0,
+      "name": "chmod"
+    },
+    "chown": {
+      "length": 0,
+      "name": "chown"
+    },
+    "close": {
+      "length": 0,
+      "name": "close"
+    },
+    "copyFile": {
+      "length": 0,
+      "name": "copyFile"
+    },
+    "cpSyncCheckPaths": {
+      "length": 0,
+      "name": "cpSyncCheckPaths"
+    },
+    "cpSyncCopyDir": {
+      "length": 0,
+      "name": "cpSyncCopyDir"
+    },
+    "cpSyncOverrideFile": {
+      "length": 0,
+      "name": "cpSyncOverrideFile"
+    },
+    "existsSync": {
+      "length": 0,
+      "name": "existsSync"
+    },
+    "fchmod": {
+      "length": 0,
+      "name": "fchmod"
+    },
+    "fchown": {
+      "length": 0,
+      "name": "fchown"
+    },
+    "fdatasync": {
+      "length": 0,
+      "name": "fdatasync"
+    },
+    "fstat": {
+      "length": 0,
+      "name": "fstat"
+    },
+    "fsync": {
+      "length": 0,
+      "name": "fsync"
+    },
+    "ftruncate": {
+      "length": 0,
+      "name": "ftruncate"
+    },
+    "futimes": {
+      "length": 0,
+      "name": "futimes"
+    },
+    "getFormatOfExtensionlessFile": {
+      "length": 0,
+      "name": "getFormatOfExtensionlessFile"
+    },
+    "internalModuleStat": {
+      "length": 0,
+      "name": "internalModuleStat"
+    },
+    "lchown": {
+      "length": 0,
+      "name": "lchown"
+    },
+    "legacyMainResolve": {
+      "length": 0,
+      "name": "legacyMainResolve"
+    },
+    "link": {
+      "length": 0,
+      "name": "link"
+    },
+    "lstat": {
+      "length": 0,
+      "name": "lstat"
+    },
+    "lutimes": {
+      "length": 0,
+      "name": "lutimes"
+    },
+    "mkdir": {
+      "length": 0,
+      "name": "mkdir"
+    },
+    "mkdtemp": {
+      "length": 0,
+      "name": "mkdtemp"
+    },
+    "mkstemp": {
+      "length": 0,
+      "name": "mkstemp"
+    },
+    "open": {
+      "length": 0,
+      "name": "open"
+    },
+    "openFileHandle": {
+      "length": 0,
+      "name": "openFileHandle"
+    },
+    "read": {
+      "length": 0,
+      "name": "read"
+    },
+    "readBuffers": {
+      "length": 0,
+      "name": "readBuffers"
+    },
+    "readFileUtf8": {
+      "length": 0,
+      "name": "readFileUtf8"
+    },
+    "readdir": {
+      "length": 0,
+      "name": "readdir"
+    },
+    "readdirRecursive": {
+      "length": 0,
+      "name": "readdirRecursive"
+    },
+    "readlink": {
+      "length": 0,
+      "name": "readlink"
+    },
+    "realpath": {
+      "length": 0,
+      "name": "realpath"
+    },
+    "rename": {
+      "length": 0,
+      "name": "rename"
+    },
+    "rmSync": {
+      "length": 0,
+      "name": "rmSync"
+    },
+    "rmdir": {
+      "length": 0,
+      "name": "rmdir"
+    },
+    "stat": {
+      "length": 0,
+      "name": "stat"
+    },
+    "statfs": {
+      "length": 0,
+      "name": "statfs"
+    },
+    "symlink": {
+      "length": 0,
+      "name": "symlink"
+    },
+    "unlink": {
+      "length": 0,
+      "name": "unlink"
+    },
+    "utimes": {
+      "length": 0,
+      "name": "utimes"
+    },
+    "writeBuffer": {
+      "length": 0,
+      "name": "writeBuffer"
+    },
+    "writeBuffers": {
+      "length": 0,
+      "name": "writeBuffers"
+    },
+    "writeFileUtf8": {
+      "length": 0,
+      "name": "writeFileUtf8"
+    },
+    "writeString": {
+      "length": 0,
+      "name": "writeString"
+    }
   },
   "fs_dir": {
-    "DirHandle": "DirHandle",
-    "opendir": "opendir",
-    "opendirSync": "opendirSync"
+    "DirHandle": {
+      "length": 0,
+      "name": "DirHandle"
+    },
+    "opendir": {
+      "length": 0,
+      "name": "opendir"
+    },
+    "opendirSync": {
+      "length": 0,
+      "name": "opendirSync"
+    }
   },
   "fs_event_wrap": {
-    "FSEvent": "FSEvent"
+    "FSEvent": {
+      "length": 0,
+      "name": "FSEvent"
+    }
   },
   "glob": {
-    "globStart": "globStart",
-    "globSync": "globSync",
-    "hasMagic": "hasMagic",
-    "matchesGlob": "matchesGlob"
+    "globStart": {
+      "length": 0,
+      "name": "globStart"
+    },
+    "globSync": {
+      "length": 0,
+      "name": "globSync"
+    },
+    "hasMagic": {
+      "length": 0,
+      "name": "hasMagic"
+    },
+    "matchesGlob": {
+      "length": 0,
+      "name": "matchesGlob"
+    }
   },
   "heap_utils": {
-    "buildEmbedderGraph": "buildEmbedderGraph",
-    "createHeapSnapshotStream": "createHeapSnapshotStream",
-    "triggerHeapSnapshot": "triggerHeapSnapshot"
+    "buildEmbedderGraph": {
+      "length": 0,
+      "name": "buildEmbedderGraph"
+    },
+    "createHeapSnapshotStream": {
+      "length": 0,
+      "name": "createHeapSnapshotStream"
+    },
+    "triggerHeapSnapshot": {
+      "length": 0,
+      "name": "triggerHeapSnapshot"
+    }
   },
   "http2": {
-    "Http2Session": "Http2Session",
-    "Http2Stream": "Http2Stream",
-    "nghttp2ErrorString": "nghttp2ErrorString",
-    "packSettings": "packSettings",
-    "refreshDefaultSettings": "refreshDefaultSettings",
-    "setCallbackFunctions": "setCallbackFunctions"
+    "Http2Session": {
+      "length": 0,
+      "name": "Http2Session"
+    },
+    "Http2Stream": {
+      "length": 0,
+      "name": "Http2Stream"
+    },
+    "nghttp2ErrorString": {
+      "length": 0,
+      "name": "nghttp2ErrorString"
+    },
+    "packSettings": {
+      "length": 0,
+      "name": "packSettings"
+    },
+    "refreshDefaultSettings": {
+      "length": 0,
+      "name": "refreshDefaultSettings"
+    },
+    "setCallbackFunctions": {
+      "length": 0,
+      "name": "setCallbackFunctions"
+    }
   },
   "http_parser": {
-    "ConnectionsList": "ConnectionsList",
-    "HTTPParser": "HTTPParser"
+    "ConnectionsList": {
+      "length": 0,
+      "name": "ConnectionsList"
+    },
+    "HTTPParser": {
+      "length": 0,
+      "name": "HTTPParser"
+    }
   },
   "icu": {
-    "decode": "decode",
-    "getConverter": "getConverter",
-    "getStringWidth": "getStringWidth",
-    "hasConverter": "hasConverter",
-    "icuErrName": "icuErrName",
-    "transcode": "transcode"
+    "decode": {
+      "length": 0,
+      "name": "decode"
+    },
+    "getConverter": {
+      "length": 0,
+      "name": "getConverter"
+    },
+    "getStringWidth": {
+      "length": 0,
+      "name": "getStringWidth"
+    },
+    "hasConverter": {
+      "length": 0,
+      "name": "hasConverter"
+    },
+    "icuErrName": {
+      "length": 0,
+      "name": "icuErrName"
+    },
+    "transcode": {
+      "length": 0,
+      "name": "transcode"
+    }
   },
   "inspector": {
-    "Connection": "Connection",
-    "MainThreadConnection": "MainThreadConnection",
-    "asyncTaskCanceled": "asyncTaskCanceled",
-    "asyncTaskFinished": "asyncTaskFinished",
-    "asyncTaskScheduled": "asyncTaskScheduled",
-    "asyncTaskStarted": "asyncTaskStarted",
-    "callAndPauseOnStart": "callAndPauseOnStart",
-    "consoleCall": "consoleCall",
-    "emitProtocolEvent": "emitProtocolEvent",
-    "isEnabled": "isEnabled",
-    "open": "open",
-    "putNetworkResource": "putNetworkResource",
-    "registerAsyncHook": "registerAsyncHook",
-    "setConsoleExtensionInstaller": "setConsoleExtensionInstaller",
-    "setupNetworkTracking": "setupNetworkTracking",
-    "url": "url",
-    "waitForDebugger": "waitForDebugger"
+    "Connection": {
+      "length": 0,
+      "name": "Connection"
+    },
+    "MainThreadConnection": {
+      "length": 0,
+      "name": "MainThreadConnection"
+    },
+    "asyncTaskCanceled": {
+      "length": 0,
+      "name": "asyncTaskCanceled"
+    },
+    "asyncTaskFinished": {
+      "length": 0,
+      "name": "asyncTaskFinished"
+    },
+    "asyncTaskScheduled": {
+      "length": 0,
+      "name": "asyncTaskScheduled"
+    },
+    "asyncTaskStarted": {
+      "length": 0,
+      "name": "asyncTaskStarted"
+    },
+    "callAndPauseOnStart": {
+      "length": 0,
+      "name": "callAndPauseOnStart"
+    },
+    "consoleCall": {
+      "length": 0,
+      "name": "consoleCall"
+    },
+    "emitProtocolEvent": {
+      "length": 0,
+      "name": "emitProtocolEvent"
+    },
+    "isEnabled": {
+      "length": 0,
+      "name": "isEnabled"
+    },
+    "open": {
+      "length": 0,
+      "name": "open"
+    },
+    "putNetworkResource": {
+      "length": 0,
+      "name": "putNetworkResource"
+    },
+    "registerAsyncHook": {
+      "length": 0,
+      "name": "registerAsyncHook"
+    },
+    "setConsoleExtensionInstaller": {
+      "length": 0,
+      "name": "setConsoleExtensionInstaller"
+    },
+    "setupNetworkTracking": {
+      "length": 0,
+      "name": "setupNetworkTracking"
+    },
+    "url": {
+      "length": 0,
+      "name": "url"
+    },
+    "waitForDebugger": {
+      "length": 0,
+      "name": "waitForDebugger"
+    }
   },
   "ipc_serdes": {
-    "deserialize": "deserialize",
-    "serialize": "serialize"
+    "deserialize": {
+      "length": 0,
+      "name": "deserialize"
+    },
+    "serialize": {
+      "length": 0,
+      "name": "serialize"
+    }
   },
   "js_stream": {
-    "JSStream": "JSStream"
+    "JSStream": {
+      "length": 0,
+      "name": "JSStream"
+    }
   },
   "messaging": {
-    "DOMException": "DOMException",
-    "MessageChannel": "MessageChannel",
-    "MessagePort": "MessagePort",
-    "QuotaExceededError": "QuotaExceededError",
-    "broadcastChannel": "broadcastChannel",
-    "drainMessagePort": "drainMessagePort",
-    "exposeLazyDOMExceptionProperty": "exposeLazyDOMExceptionProperty",
-    "moveMessagePortToContext": "moveMessagePortToContext",
-    "receiveMessageOnPort": "receiveMessageOnPort",
-    "setDeserializerCreateObjectFunction": "setDeserializerCreateObjectFunction",
-    "stopMessagePort": "stopMessagePort",
-    "structuredClone": "structuredClone"
+    "DOMException": {
+      "length": 0,
+      "name": "DOMException"
+    },
+    "MessageChannel": {
+      "length": 0,
+      "name": "MessageChannel"
+    },
+    "MessagePort": {
+      "length": 0,
+      "name": "MessagePort"
+    },
+    "QuotaExceededError": {
+      "length": 0,
+      "name": "QuotaExceededError"
+    },
+    "broadcastChannel": {
+      "length": 0,
+      "name": "broadcastChannel"
+    },
+    "drainMessagePort": {
+      "length": 0,
+      "name": "drainMessagePort"
+    },
+    "exposeLazyDOMExceptionProperty": {
+      "length": 0,
+      "name": "exposeLazyDOMExceptionProperty"
+    },
+    "moveMessagePortToContext": {
+      "length": 0,
+      "name": "moveMessagePortToContext"
+    },
+    "receiveMessageOnPort": {
+      "length": 0,
+      "name": "receiveMessageOnPort"
+    },
+    "setDeserializerCreateObjectFunction": {
+      "length": 0,
+      "name": "setDeserializerCreateObjectFunction"
+    },
+    "stopMessagePort": {
+      "length": 0,
+      "name": "stopMessagePort"
+    },
+    "structuredClone": {
+      "length": 0,
+      "name": "structuredClone"
+    }
   },
   "mksnapshot": {
-    "compileSerializeMain": "compileSerializeMain",
-    "runEmbedderPreload": "runEmbedderPreload",
-    "setDeserializeCallback": "setDeserializeCallback",
-    "setDeserializeMainFunction": "setDeserializeMainFunction",
-    "setSerializeCallback": "setSerializeCallback"
+    "compileSerializeMain": {
+      "length": 0,
+      "name": "compileSerializeMain"
+    },
+    "runEmbedderPreload": {
+      "length": 0,
+      "name": "runEmbedderPreload"
+    },
+    "setDeserializeCallback": {
+      "length": 0,
+      "name": "setDeserializeCallback"
+    },
+    "setDeserializeMainFunction": {
+      "length": 0,
+      "name": "setDeserializeMainFunction"
+    },
+    "setSerializeCallback": {
+      "length": 0,
+      "name": "setSerializeCallback"
+    }
   },
   "module_wrap": {
-    "ModuleWrap": "ModuleWrap",
-    "createRequiredModuleFacade": "createRequiredModuleFacade",
-    "setImportMetaResolveInitializer": "setImportMetaResolveInitializer",
-    "setImportModuleDynamicallyCallback": "setImportModuleDynamicallyCallback",
-    "setInitializeImportMetaObjectCallback": "setInitializeImportMetaObjectCallback",
-    "throwIfPromiseRejected": "throwIfPromiseRejected"
+    "ModuleWrap": {
+      "length": 0,
+      "name": "ModuleWrap"
+    },
+    "createRequiredModuleFacade": {
+      "length": 0,
+      "name": "createRequiredModuleFacade"
+    },
+    "setImportMetaResolveInitializer": {
+      "length": 0,
+      "name": "setImportMetaResolveInitializer"
+    },
+    "setImportModuleDynamicallyCallback": {
+      "length": 0,
+      "name": "setImportModuleDynamicallyCallback"
+    },
+    "setInitializeImportMetaObjectCallback": {
+      "length": 0,
+      "name": "setInitializeImportMetaObjectCallback"
+    },
+    "throwIfPromiseRejected": {
+      "length": 0,
+      "name": "throwIfPromiseRejected"
+    }
   },
   "modules": {
-    "enableCompileCache": "enableCompileCache",
-    "flushCompileCache": "flushCompileCache",
-    "getCompileCacheDir": "getCompileCacheDir",
-    "getCompileCacheEntry": "getCompileCacheEntry",
-    "getNearestParentPackageJSON": "getNearestParentPackageJSON",
-    "getNearestParentPackageJSONType": "getNearestParentPackageJSONType",
-    "getPackageScopeConfig": "getPackageScopeConfig",
-    "getPackageType": "getPackageType",
-    "getRootPackageJSON": "getRootPackageJSON",
-    "getWasmCompileCacheEntry": "getWasmCompileCacheEntry",
-    "parsePackageJSON": "parsePackageJSON",
-    "readPackageJSON": "readPackageJSON",
-    "saveCompileCacheEntry": "saveCompileCacheEntry",
-    "saveWasmCompileCacheEntry": "saveWasmCompileCacheEntry"
+    "enableCompileCache": {
+      "length": 0,
+      "name": "enableCompileCache"
+    },
+    "flushCompileCache": {
+      "length": 0,
+      "name": "flushCompileCache"
+    },
+    "getCompileCacheDir": {
+      "length": 0,
+      "name": "getCompileCacheDir"
+    },
+    "getCompileCacheEntry": {
+      "length": 0,
+      "name": "getCompileCacheEntry"
+    },
+    "getNearestParentPackageJSON": {
+      "length": 0,
+      "name": "getNearestParentPackageJSON"
+    },
+    "getNearestParentPackageJSONType": {
+      "length": 0,
+      "name": "getNearestParentPackageJSONType"
+    },
+    "getPackageScopeConfig": {
+      "length": 0,
+      "name": "getPackageScopeConfig"
+    },
+    "getPackageType": {
+      "length": 0,
+      "name": "getPackageType"
+    },
+    "getRootPackageJSON": {
+      "length": 0,
+      "name": "getRootPackageJSON"
+    },
+    "getWasmCompileCacheEntry": {
+      "length": 0,
+      "name": "getWasmCompileCacheEntry"
+    },
+    "parsePackageJSON": {
+      "length": 0,
+      "name": "parsePackageJSON"
+    },
+    "readPackageJSON": {
+      "length": 0,
+      "name": "readPackageJSON"
+    },
+    "saveCompileCacheEntry": {
+      "length": 0,
+      "name": "saveCompileCacheEntry"
+    },
+    "saveWasmCompileCacheEntry": {
+      "length": 0,
+      "name": "saveWasmCompileCacheEntry"
+    }
   },
   "options": {
-    "getCLIOptionsInfo": "getCLIOptionsInfo",
-    "getCLIOptionsValues": "getCLIOptionsValues",
-    "getEmbedderOptions": "getEmbedderOptions",
-    "getEnvOptionsInputType": "getEnvOptionsInputType",
-    "getNamespaceOptionsInputType": "getNamespaceOptionsInputType",
-    "getOptionsAsFlags": "getOptionsAsFlags",
-    "parseNodeOptionsEnvVar": "parseNodeOptionsEnvVar"
+    "getCLIOptionsInfo": {
+      "length": 0,
+      "name": "getCLIOptionsInfo"
+    },
+    "getCLIOptionsValues": {
+      "length": 0,
+      "name": "getCLIOptionsValues"
+    },
+    "getEmbedderOptions": {
+      "length": 0,
+      "name": "getEmbedderOptions"
+    },
+    "getEnvOptionsInputType": {
+      "length": 0,
+      "name": "getEnvOptionsInputType"
+    },
+    "getNamespaceOptionsInputType": {
+      "length": 0,
+      "name": "getNamespaceOptionsInputType"
+    },
+    "getOptionsAsFlags": {
+      "length": 0,
+      "name": "getOptionsAsFlags"
+    },
+    "parseNodeOptionsEnvVar": {
+      "length": 0,
+      "name": "parseNodeOptionsEnvVar"
+    }
   },
   "os": {
-    "getAvailableParallelism": "",
-    "getCPUs": "getCPUs",
-    "getFreeMem": "",
-    "getHomeDirectory": "getHomeDirectory",
-    "getHostname": "getHostname",
-    "getInterfaceAddresses": "getInterfaceAddresses",
-    "getLoadAvg": "getLoadAvg",
-    "getOSInformation": "getOSInformation",
-    "getPriority": "getPriority",
-    "getTotalMem": "",
-    "getUptime": "getUptime",
-    "getUserInfo": "getUserInfo",
-    "setPriority": "setPriority"
+    "getAvailableParallelism": {
+      "length": 0,
+      "name": ""
+    },
+    "getCPUs": {
+      "length": 0,
+      "name": "getCPUs"
+    },
+    "getFreeMem": {
+      "length": 0,
+      "name": ""
+    },
+    "getHomeDirectory": {
+      "length": 0,
+      "name": "getHomeDirectory"
+    },
+    "getHostname": {
+      "length": 0,
+      "name": "getHostname"
+    },
+    "getInterfaceAddresses": {
+      "length": 0,
+      "name": "getInterfaceAddresses"
+    },
+    "getLoadAvg": {
+      "length": 0,
+      "name": "getLoadAvg"
+    },
+    "getOSInformation": {
+      "length": 0,
+      "name": "getOSInformation"
+    },
+    "getPriority": {
+      "length": 0,
+      "name": "getPriority"
+    },
+    "getTotalMem": {
+      "length": 0,
+      "name": ""
+    },
+    "getUptime": {
+      "length": 0,
+      "name": "getUptime"
+    },
+    "getUserInfo": {
+      "length": 0,
+      "name": "getUserInfo"
+    },
+    "setPriority": {
+      "length": 0,
+      "name": "setPriority"
+    }
   },
   "performance": {
-    "Histogram": "Histogram",
-    "SlidingWindowHistogram": "SlidingWindowHistogram",
-    "createELDHistogram": "createELDHistogram",
-    "loopIdleTime": "loopIdleTime",
-    "markBootstrapComplete": "markBootstrapComplete",
-    "notify": "notify",
-    "now": "now",
-    "setupObservers": "setupObservers",
-    "updateGarbageCollectionTracking": "updateGarbageCollectionTracking",
-    "uvMetricsInfo": "uvMetricsInfo"
+    "Histogram": {
+      "length": 0,
+      "name": "Histogram"
+    },
+    "SlidingWindowHistogram": {
+      "length": 0,
+      "name": "SlidingWindowHistogram"
+    },
+    "createELDHistogram": {
+      "length": 0,
+      "name": "createELDHistogram"
+    },
+    "loopIdleTime": {
+      "length": 0,
+      "name": "loopIdleTime"
+    },
+    "markBootstrapComplete": {
+      "length": 0,
+      "name": "markBootstrapComplete"
+    },
+    "notify": {
+      "length": 0,
+      "name": "notify"
+    },
+    "now": {
+      "length": 0,
+      "name": "now"
+    },
+    "setupObservers": {
+      "length": 0,
+      "name": "setupObservers"
+    },
+    "updateGarbageCollectionTracking": {
+      "length": 0,
+      "name": "updateGarbageCollectionTracking"
+    },
+    "uvMetricsInfo": {
+      "length": 0,
+      "name": "uvMetricsInfo"
+    }
   },
   "permission": {
-    "drop": "drop",
-    "has": "",
-    "takeRemovedEnvVarWarning": "takeRemovedEnvVarWarning"
+    "drop": {
+      "length": 0,
+      "name": "drop"
+    },
+    "has": {
+      "length": 0,
+      "name": ""
+    },
+    "takeRemovedEnvVarWarning": {
+      "length": 0,
+      "name": "takeRemovedEnvVarWarning"
+    }
   },
   "pipe_wrap": {
-    "Pipe": "Pipe",
-    "PipeConnectWrap": "PipeConnectWrap"
+    "Pipe": {
+      "length": 0,
+      "name": "Pipe"
+    },
+    "PipeConnectWrap": {
+      "length": 0,
+      "name": "PipeConnectWrap"
+    }
   },
   "process_methods": {
-    "_debugEnd": "_debugEnd",
-    "_debugProcess": "_debugProcess",
-    "_getActiveHandles": "_getActiveHandles",
-    "_getActiveRequests": "_getActiveRequests",
-    "_kill": "_kill",
-    "_rawDebug": "_rawDebug",
-    "abort": "abort",
-    "availableMemory": "availableMemory",
-    "causeSegfault": "causeSegfault",
-    "chdir": "chdir",
-    "constrainedMemory": "constrainedMemory",
-    "cpuUsage": "cpuUsage",
-    "cwd": "cwd",
-    "dlopen": "dlopen",
-    "dlopenBinary": "dlopenBinary",
-    "execve": "execve",
-    "getActiveResourcesInfo": "getActiveResourcesInfo",
-    "hrtime": "hrtime",
-    "hrtimeBigInt": "hrtimeBigInt",
-    "loadEnvFile": "loadEnvFile",
-    "memoryUsage": "memoryUsage",
-    "patchProcessObject": "patchProcessObject",
-    "reallyExit": "reallyExit",
-    "resetStdioForTesting": "",
-    "resourceUsage": "resourceUsage",
-    "rss": "rss",
-    "setEmitWarningSync": "setEmitWarningSync",
-    "threadCpuUsage": "threadCpuUsage",
-    "umask": "umask",
-    "uptime": "uptime"
+    "_debugEnd": {
+      "length": 0,
+      "name": "_debugEnd"
+    },
+    "_debugProcess": {
+      "length": 0,
+      "name": "_debugProcess"
+    },
+    "_getActiveHandles": {
+      "length": 0,
+      "name": "_getActiveHandles"
+    },
+    "_getActiveRequests": {
+      "length": 0,
+      "name": "_getActiveRequests"
+    },
+    "_kill": {
+      "length": 0,
+      "name": "_kill"
+    },
+    "_rawDebug": {
+      "length": 0,
+      "name": "_rawDebug"
+    },
+    "abort": {
+      "length": 0,
+      "name": "abort"
+    },
+    "availableMemory": {
+      "length": 0,
+      "name": "availableMemory"
+    },
+    "causeSegfault": {
+      "length": 0,
+      "name": "causeSegfault"
+    },
+    "chdir": {
+      "length": 0,
+      "name": "chdir"
+    },
+    "constrainedMemory": {
+      "length": 0,
+      "name": "constrainedMemory"
+    },
+    "cpuUsage": {
+      "length": 0,
+      "name": "cpuUsage"
+    },
+    "cwd": {
+      "length": 0,
+      "name": "cwd"
+    },
+    "dlopen": {
+      "length": 0,
+      "name": "dlopen"
+    },
+    "dlopenBinary": {
+      "length": 0,
+      "name": "dlopenBinary"
+    },
+    "execve": {
+      "length": 0,
+      "name": "execve"
+    },
+    "getActiveResourcesInfo": {
+      "length": 0,
+      "name": "getActiveResourcesInfo"
+    },
+    "hrtime": {
+      "length": 0,
+      "name": "hrtime"
+    },
+    "hrtimeBigInt": {
+      "length": 0,
+      "name": "hrtimeBigInt"
+    },
+    "loadEnvFile": {
+      "length": 0,
+      "name": "loadEnvFile"
+    },
+    "memoryUsage": {
+      "length": 0,
+      "name": "memoryUsage"
+    },
+    "patchProcessObject": {
+      "length": 0,
+      "name": "patchProcessObject"
+    },
+    "reallyExit": {
+      "length": 0,
+      "name": "reallyExit"
+    },
+    "resetStdioForTesting": {
+      "length": 0,
+      "name": ""
+    },
+    "resourceUsage": {
+      "length": 0,
+      "name": "resourceUsage"
+    },
+    "rss": {
+      "length": 0,
+      "name": "rss"
+    },
+    "setEmitWarningSync": {
+      "length": 0,
+      "name": "setEmitWarningSync"
+    },
+    "threadCpuUsage": {
+      "length": 0,
+      "name": "threadCpuUsage"
+    },
+    "umask": {
+      "length": 0,
+      "name": "umask"
+    },
+    "uptime": {
+      "length": 0,
+      "name": "uptime"
+    }
   },
   "process_wrap": {
-    "Process": "Process",
-    "getEnvPairs": "getEnvPairs"
+    "Process": {
+      "length": 0,
+      "name": "Process"
+    },
+    "getEnvPairs": {
+      "length": 0,
+      "name": "getEnvPairs"
+    }
   },
   "profiler": {
-    "endCoverage": "endCoverage",
-    "setCoverageDirectory": "setCoverageDirectory",
-    "setSourceMapCacheGetter": "setSourceMapCacheGetter",
-    "startCoverage": "startCoverage",
-    "stopCoverage": "stopCoverage",
-    "takeCoverage": "takeCoverage"
+    "endCoverage": {
+      "length": 0,
+      "name": "endCoverage"
+    },
+    "setCoverageDirectory": {
+      "length": 0,
+      "name": "setCoverageDirectory"
+    },
+    "setSourceMapCacheGetter": {
+      "length": 0,
+      "name": "setSourceMapCacheGetter"
+    },
+    "startCoverage": {
+      "length": 0,
+      "name": "startCoverage"
+    },
+    "stopCoverage": {
+      "length": 0,
+      "name": "stopCoverage"
+    },
+    "takeCoverage": {
+      "length": 0,
+      "name": "takeCoverage"
+    }
   },
   "report": {
-    "getCompact": "getCompact",
-    "getDirectory": "getDirectory",
-    "getExcludeEnv": "getExcludeEnv",
-    "getExcludeNetwork": "getExcludeNetwork",
-    "getFilename": "getFilename",
-    "getReport": "getReport",
-    "getSignal": "getSignal",
-    "setCompact": "setCompact",
-    "setDirectory": "setDirectory",
-    "setExcludeEnv": "setExcludeEnv",
-    "setExcludeNetwork": "setExcludeNetwork",
-    "setFilename": "setFilename",
-    "setReportOnFatalError": "setReportOnFatalError",
-    "setReportOnSignal": "setReportOnSignal",
-    "setReportOnUncaughtException": "setReportOnUncaughtException",
-    "setSignal": "setSignal",
-    "shouldReportOnFatalError": "shouldReportOnFatalError",
-    "shouldReportOnSignal": "shouldReportOnSignal",
-    "shouldReportOnUncaughtException": "shouldReportOnUncaughtException",
-    "writeReport": "writeReport"
+    "getCompact": {
+      "length": 0,
+      "name": "getCompact"
+    },
+    "getDirectory": {
+      "length": 0,
+      "name": "getDirectory"
+    },
+    "getExcludeEnv": {
+      "length": 0,
+      "name": "getExcludeEnv"
+    },
+    "getExcludeNetwork": {
+      "length": 0,
+      "name": "getExcludeNetwork"
+    },
+    "getFilename": {
+      "length": 0,
+      "name": "getFilename"
+    },
+    "getReport": {
+      "length": 0,
+      "name": "getReport"
+    },
+    "getSignal": {
+      "length": 0,
+      "name": "getSignal"
+    },
+    "setCompact": {
+      "length": 0,
+      "name": "setCompact"
+    },
+    "setDirectory": {
+      "length": 0,
+      "name": "setDirectory"
+    },
+    "setExcludeEnv": {
+      "length": 0,
+      "name": "setExcludeEnv"
+    },
+    "setExcludeNetwork": {
+      "length": 0,
+      "name": "setExcludeNetwork"
+    },
+    "setFilename": {
+      "length": 0,
+      "name": "setFilename"
+    },
+    "setReportOnFatalError": {
+      "length": 0,
+      "name": "setReportOnFatalError"
+    },
+    "setReportOnSignal": {
+      "length": 0,
+      "name": "setReportOnSignal"
+    },
+    "setReportOnUncaughtException": {
+      "length": 0,
+      "name": "setReportOnUncaughtException"
+    },
+    "setSignal": {
+      "length": 0,
+      "name": "setSignal"
+    },
+    "shouldReportOnFatalError": {
+      "length": 0,
+      "name": "shouldReportOnFatalError"
+    },
+    "shouldReportOnSignal": {
+      "length": 0,
+      "name": "shouldReportOnSignal"
+    },
+    "shouldReportOnUncaughtException": {
+      "length": 0,
+      "name": "shouldReportOnUncaughtException"
+    },
+    "writeReport": {
+      "length": 0,
+      "name": "writeReport"
+    }
   },
   "serdes": {
-    "Deserializer": "Deserializer",
-    "Serializer": "Serializer"
+    "Deserializer": {
+      "length": 1,
+      "name": "Deserializer"
+    },
+    "Serializer": {
+      "length": 0,
+      "name": "Serializer"
+    }
   },
   "signal_wrap": {
-    "Signal": "Signal"
+    "Signal": {
+      "length": 0,
+      "name": "Signal"
+    }
   },
   "spawn_sync": {
-    "spawn": "spawn"
+    "spawn": {
+      "length": 0,
+      "name": "spawn"
+    }
   },
   "sqlite": {
-    "Database": "Database",
-    "Session": "Session",
-    "Statement": "Statement",
-    "backup": "backup"
+    "Database": {
+      "length": 0,
+      "name": "Database"
+    },
+    "Session": {
+      "length": 0,
+      "name": "Session"
+    },
+    "Statement": {
+      "length": 0,
+      "name": "Statement"
+    },
+    "backup": {
+      "length": 2,
+      "name": "backup"
+    }
   },
   "stream_pipe": {
-    "StreamPipe": "StreamPipe"
+    "StreamPipe": {
+      "length": 0,
+      "name": "StreamPipe"
+    }
   },
   "stream_wrap": {
-    "ShutdownWrap": "ShutdownWrap",
-    "WriteWrap": "WriteWrap"
+    "ShutdownWrap": {
+      "length": 0,
+      "name": "ShutdownWrap"
+    },
+    "WriteWrap": {
+      "length": 0,
+      "name": "WriteWrap"
+    }
   },
   "string_decoder": {
-    "decode": "decode",
-    "flush": "flush"
+    "decode": {
+      "length": 0,
+      "name": "decode"
+    },
+    "flush": {
+      "length": 0,
+      "name": "flush"
+    }
   },
   "symbols": {},
   "task_queue": {
-    "enqueueMicrotask": "enqueueMicrotask",
-    "runMicrotasks": "runMicrotasks",
-    "setPromiseRejectCallback": "setPromiseRejectCallback",
-    "setTickCallback": "setTickCallback"
+    "enqueueMicrotask": {
+      "length": 0,
+      "name": "enqueueMicrotask"
+    },
+    "runMicrotasks": {
+      "length": 0,
+      "name": "runMicrotasks"
+    },
+    "setPromiseRejectCallback": {
+      "length": 0,
+      "name": "setPromiseRejectCallback"
+    },
+    "setTickCallback": {
+      "length": 0,
+      "name": "setTickCallback"
+    }
   },
   "tcp_wrap": {
-    "TCP": "TCP",
-    "TCPConnectWrap": "TCPConnectWrap"
+    "TCP": {
+      "length": 0,
+      "name": "TCP"
+    },
+    "TCPConnectWrap": {
+      "length": 0,
+      "name": "TCPConnectWrap"
+    }
   },
   "timers": {
-    "getLibuvNow": "getLibuvNow",
-    "scheduleTimer": "scheduleTimer",
-    "setupTimers": "setupTimers",
-    "toggleImmediateRef": "toggleImmediateRef",
-    "toggleTimerRef": "toggleTimerRef"
+    "getLibuvNow": {
+      "length": 0,
+      "name": "getLibuvNow"
+    },
+    "scheduleTimer": {
+      "length": 0,
+      "name": "scheduleTimer"
+    },
+    "setupTimers": {
+      "length": 0,
+      "name": "setupTimers"
+    },
+    "toggleImmediateRef": {
+      "length": 0,
+      "name": "toggleImmediateRef"
+    },
+    "toggleTimerRef": {
+      "length": 0,
+      "name": "toggleTimerRef"
+    }
   },
   "tls_wrap": {
-    "TLSWrap": "TLSWrap",
-    "hasOpenSSLErrorForTesting": "hasOpenSSLErrorForTesting",
-    "injectOpenSSLErrorForTesting": "injectOpenSSLErrorForTesting",
-    "wrap": "wrap"
+    "TLSWrap": {
+      "length": 0,
+      "name": "TLSWrap"
+    },
+    "hasOpenSSLErrorForTesting": {
+      "length": 0,
+      "name": "hasOpenSSLErrorForTesting"
+    },
+    "injectOpenSSLErrorForTesting": {
+      "length": 0,
+      "name": "injectOpenSSLErrorForTesting"
+    },
+    "wrap": {
+      "length": 0,
+      "name": "wrap"
+    }
   },
   "trace_events": {
-    "CategorySet": "CategorySet",
-    "getCategoryEnabledBuffer": "getCategoryEnabledBuffer",
-    "getEnabledCategories": "getEnabledCategories",
-    "hasAgent": "hasAgent",
-    "isTraceCategoryEnabled": "isTraceCategoryEnabled",
-    "setTraceCategoryStateUpdateHandler": "setTraceCategoryStateUpdateHandler",
-    "trace": "trace"
+    "CategorySet": {
+      "length": 0,
+      "name": "CategorySet"
+    },
+    "getCategoryEnabledBuffer": {
+      "length": 0,
+      "name": "getCategoryEnabledBuffer"
+    },
+    "getEnabledCategories": {
+      "length": 0,
+      "name": "getEnabledCategories"
+    },
+    "hasAgent": {
+      "length": 0,
+      "name": "hasAgent"
+    },
+    "isTraceCategoryEnabled": {
+      "length": 1,
+      "name": "isTraceCategoryEnabled"
+    },
+    "setTraceCategoryStateUpdateHandler": {
+      "length": 0,
+      "name": "setTraceCategoryStateUpdateHandler"
+    },
+    "trace": {
+      "length": 5,
+      "name": "trace"
+    }
   },
   "tty_wrap": {
-    "TTY": "TTY",
-    "isTTY": "isTTY"
+    "TTY": {
+      "length": 0,
+      "name": "TTY"
+    },
+    "isTTY": {
+      "length": 0,
+      "name": "isTTY"
+    }
   },
   "types": {
-    "isAnyArrayBuffer": "",
-    "isArgumentsObject": "",
-    "isArrayBuffer": "",
-    "isAsyncFunction": "",
-    "isBigIntObject": "",
-    "isBooleanObject": "",
-    "isBoxedPrimitive": "",
-    "isDate": "",
-    "isExternal": "",
-    "isGeneratorFunction": "",
-    "isGeneratorObject": "",
-    "isMap": "",
-    "isMapIterator": "",
-    "isModuleNamespaceObject": "",
-    "isNativeError": "",
-    "isNumberObject": "",
-    "isPromise": "",
-    "isProxy": "",
-    "isRegExp": "",
-    "isSet": "",
-    "isSetIterator": "",
-    "isSharedArrayBuffer": "",
-    "isStringObject": "",
-    "isSymbolObject": "",
-    "isWeakMap": "",
-    "isWeakSet": ""
+    "isAnyArrayBuffer": {
+      "length": 0,
+      "name": ""
+    },
+    "isArgumentsObject": {
+      "length": 0,
+      "name": ""
+    },
+    "isArrayBuffer": {
+      "length": 0,
+      "name": ""
+    },
+    "isAsyncFunction": {
+      "length": 0,
+      "name": ""
+    },
+    "isBigIntObject": {
+      "length": 0,
+      "name": ""
+    },
+    "isBooleanObject": {
+      "length": 0,
+      "name": ""
+    },
+    "isBoxedPrimitive": {
+      "length": 0,
+      "name": ""
+    },
+    "isDate": {
+      "length": 0,
+      "name": ""
+    },
+    "isExternal": {
+      "length": 0,
+      "name": ""
+    },
+    "isGeneratorFunction": {
+      "length": 0,
+      "name": ""
+    },
+    "isGeneratorObject": {
+      "length": 0,
+      "name": ""
+    },
+    "isMap": {
+      "length": 0,
+      "name": ""
+    },
+    "isMapIterator": {
+      "length": 0,
+      "name": ""
+    },
+    "isModuleNamespaceObject": {
+      "length": 0,
+      "name": ""
+    },
+    "isNativeError": {
+      "length": 0,
+      "name": ""
+    },
+    "isNumberObject": {
+      "length": 0,
+      "name": ""
+    },
+    "isPromise": {
+      "length": 0,
+      "name": ""
+    },
+    "isProxy": {
+      "length": 0,
+      "name": ""
+    },
+    "isRegExp": {
+      "length": 0,
+      "name": ""
+    },
+    "isSet": {
+      "length": 0,
+      "name": ""
+    },
+    "isSetIterator": {
+      "length": 0,
+      "name": ""
+    },
+    "isSharedArrayBuffer": {
+      "length": 0,
+      "name": ""
+    },
+    "isStringObject": {
+      "length": 0,
+      "name": ""
+    },
+    "isSymbolObject": {
+      "length": 0,
+      "name": ""
+    },
+    "isWeakMap": {
+      "length": 0,
+      "name": ""
+    },
+    "isWeakSet": {
+      "length": 0,
+      "name": ""
+    }
   },
   "udp_wrap": {
-    "SendWrap": "SendWrap",
-    "UDP": "UDP"
+    "SendWrap": {
+      "length": 0,
+      "name": "SendWrap"
+    },
+    "UDP": {
+      "length": 0,
+      "name": "UDP"
+    }
   },
   "url": {
-    "canParse": "canParse",
-    "domainToASCII": "domainToASCII",
-    "domainToUnicode": "domainToUnicode",
-    "format": "format",
-    "getOrigin": "getOrigin",
-    "parse": "parse",
-    "pathToFileURL": "pathToFileURL",
-    "update": "update"
+    "canParse": {
+      "length": 0,
+      "name": "canParse"
+    },
+    "domainToASCII": {
+      "length": 0,
+      "name": "domainToASCII"
+    },
+    "domainToUnicode": {
+      "length": 0,
+      "name": "domainToUnicode"
+    },
+    "format": {
+      "length": 0,
+      "name": "format"
+    },
+    "getOrigin": {
+      "length": 0,
+      "name": "getOrigin"
+    },
+    "parse": {
+      "length": 0,
+      "name": "parse"
+    },
+    "pathToFileURL": {
+      "length": 0,
+      "name": "pathToFileURL"
+    },
+    "update": {
+      "length": 0,
+      "name": "update"
+    }
   },
   "url_pattern": {
-    "URLPattern": "URLPattern"
+    "URLPattern": {
+      "length": 0,
+      "name": "URLPattern"
+    }
   },
   "util": {
-    "arrayBufferViewHasBuffer": "arrayBufferViewHasBuffer",
-    "constructSharedArrayBuffer": "constructSharedArrayBuffer",
-    "defineLazyProperties": "defineLazyProperties",
-    "getCallSites": "getCallSites",
-    "getCallerLocation": "getCallerLocation",
-    "getConstructorName": "getConstructorName",
-    "getExternalValue": "getExternalValue",
-    "getOwnNonIndexProperties": "getOwnNonIndexProperties",
-    "getPromiseDetails": "getPromiseDetails",
-    "getProxyDetails": "getProxyDetails",
-    "getSharedArrayBufferGrowable": "get growable",
-    "guessHandleType": "",
-    "isAnyArrayBuffer": "",
-    "isArrayBuffer": "",
-    "isArrayBufferView": "isView",
-    "isAsyncFunction": "",
-    "isDataView": "isDataView",
-    "isDate": "",
-    "isExternal": "",
-    "isInsideNodeModules": "isInsideNodeModules",
-    "isMap": "",
-    "isMapIterator": "",
-    "isNativeError": "",
-    "isPromise": "",
-    "isRegExp": "",
-    "isSet": "",
-    "isSetIterator": "",
-    "isTypedArray": "isTypedArray",
-    "isUint8Array": "isUint8Array",
-    "markPromiseAsHandled": "markPromiseAsHandled",
-    "parseEnv": "parseEnv",
-    "previewEntries": "previewEntries",
-    "sleep": "sleep"
+    "arrayBufferViewHasBuffer": {
+      "length": 0,
+      "name": "arrayBufferViewHasBuffer"
+    },
+    "constructSharedArrayBuffer": {
+      "length": 0,
+      "name": "constructSharedArrayBuffer"
+    },
+    "defineLazyProperties": {
+      "length": 0,
+      "name": "defineLazyProperties"
+    },
+    "getCallSites": {
+      "length": 0,
+      "name": "getCallSites"
+    },
+    "getCallerLocation": {
+      "length": 0,
+      "name": "getCallerLocation"
+    },
+    "getConstructorName": {
+      "length": 0,
+      "name": "getConstructorName"
+    },
+    "getExternalValue": {
+      "length": 0,
+      "name": "getExternalValue"
+    },
+    "getOwnNonIndexProperties": {
+      "length": 0,
+      "name": "getOwnNonIndexProperties"
+    },
+    "getPromiseDetails": {
+      "length": 0,
+      "name": "getPromiseDetails"
+    },
+    "getProxyDetails": {
+      "length": 0,
+      "name": "getProxyDetails"
+    },
+    "getSharedArrayBufferGrowable": {
+      "length": 0,
+      "name": "get growable"
+    },
+    "guessHandleType": {
+      "length": 0,
+      "name": ""
+    },
+    "isAnyArrayBuffer": {
+      "length": 0,
+      "name": ""
+    },
+    "isArrayBuffer": {
+      "length": 0,
+      "name": ""
+    },
+    "isArrayBufferView": {
+      "length": 1,
+      "name": "isView"
+    },
+    "isAsyncFunction": {
+      "length": 0,
+      "name": ""
+    },
+    "isDataView": {
+      "length": 1,
+      "name": "isDataView"
+    },
+    "isDate": {
+      "length": 0,
+      "name": ""
+    },
+    "isExternal": {
+      "length": 0,
+      "name": ""
+    },
+    "isInsideNodeModules": {
+      "length": 0,
+      "name": "isInsideNodeModules"
+    },
+    "isMap": {
+      "length": 0,
+      "name": ""
+    },
+    "isMapIterator": {
+      "length": 0,
+      "name": ""
+    },
+    "isNativeError": {
+      "length": 0,
+      "name": ""
+    },
+    "isPromise": {
+      "length": 0,
+      "name": ""
+    },
+    "isRegExp": {
+      "length": 0,
+      "name": ""
+    },
+    "isSet": {
+      "length": 0,
+      "name": ""
+    },
+    "isSetIterator": {
+      "length": 0,
+      "name": ""
+    },
+    "isTypedArray": {
+      "length": 1,
+      "name": "isTypedArray"
+    },
+    "isUint8Array": {
+      "length": 1,
+      "name": "isUint8Array"
+    },
+    "markPromiseAsHandled": {
+      "length": 0,
+      "name": "markPromiseAsHandled"
+    },
+    "parseEnv": {
+      "length": 0,
+      "name": "parseEnv"
+    },
+    "previewEntries": {
+      "length": 0,
+      "name": "previewEntries"
+    },
+    "sleep": {
+      "length": 0,
+      "name": "sleep"
+    }
   },
   "uv": {
-    "errname": "errname",
-    "getErrorMap": "getErrorMap",
-    "getErrorMessage": "getErrorMessage"
+    "errname": {
+      "length": 0,
+      "name": "errname"
+    },
+    "getErrorMap": {
+      "length": 0,
+      "name": "getErrorMap"
+    },
+    "getErrorMessage": {
+      "length": 0,
+      "name": "getErrorMessage"
+    }
   },
   "v8": {
-    "GCProfiler": "GCProfiler",
-    "cachedDataVersionTag": "cachedDataVersionTag",
-    "getCppHeapStatistics": "getCppHeapStatistics",
-    "getHashSeed": "getHashSeed",
-    "isStringOneByteRepresentation": "",
-    "setFlagsFromString": "setFlagsFromString",
-    "setHeapProfileNearHeapLimit": "setHeapProfileNearHeapLimit",
-    "setHeapSnapshotNearHeapLimit": "setHeapSnapshotNearHeapLimit",
-    "startCpuProfile": "startCpuProfile",
-    "startHeapProfile": "startHeapProfile",
-    "stopCpuProfile": "stopCpuProfile",
-    "stopHeapProfile": "stopHeapProfile",
-    "updateHeapCodeStatisticsBuffer": "updateHeapCodeStatisticsBuffer",
-    "updateHeapSpaceStatisticsBuffer": "updateHeapSpaceStatisticsBuffer",
-    "updateHeapStatisticsBuffer": "updateHeapStatisticsBuffer"
+    "GCProfiler": {
+      "length": 0,
+      "name": "GCProfiler"
+    },
+    "cachedDataVersionTag": {
+      "length": 0,
+      "name": "cachedDataVersionTag"
+    },
+    "getCppHeapStatistics": {
+      "length": 0,
+      "name": "getCppHeapStatistics"
+    },
+    "getHashSeed": {
+      "length": 0,
+      "name": "getHashSeed"
+    },
+    "isStringOneByteRepresentation": {
+      "length": 0,
+      "name": ""
+    },
+    "setFlagsFromString": {
+      "length": 0,
+      "name": "setFlagsFromString"
+    },
+    "setHeapProfileNearHeapLimit": {
+      "length": 0,
+      "name": "setHeapProfileNearHeapLimit"
+    },
+    "setHeapSnapshotNearHeapLimit": {
+      "length": 0,
+      "name": "setHeapSnapshotNearHeapLimit"
+    },
+    "startCpuProfile": {
+      "length": 0,
+      "name": "startCpuProfile"
+    },
+    "startHeapProfile": {
+      "length": 0,
+      "name": "startHeapProfile"
+    },
+    "stopCpuProfile": {
+      "length": 0,
+      "name": "stopCpuProfile"
+    },
+    "stopHeapProfile": {
+      "length": 0,
+      "name": "stopHeapProfile"
+    },
+    "updateHeapCodeStatisticsBuffer": {
+      "length": 0,
+      "name": "updateHeapCodeStatisticsBuffer"
+    },
+    "updateHeapSpaceStatisticsBuffer": {
+      "length": 0,
+      "name": "updateHeapSpaceStatisticsBuffer"
+    },
+    "updateHeapStatisticsBuffer": {
+      "length": 0,
+      "name": "updateHeapStatisticsBuffer"
+    }
   },
   "wasm_web_api": {
-    "setImplementation": "setImplementation"
+    "setImplementation": {
+      "length": 0,
+      "name": "setImplementation"
+    }
   },
   "worker": {
-    "Worker": "Worker",
-    "getEnvMessagePort": "getEnvMessagePort"
+    "Worker": {
+      "length": 0,
+      "name": "Worker"
+    },
+    "getEnvMessagePort": {
+      "length": 0,
+      "name": "getEnvMessagePort"
+    }
   },
   "zlib": {
-    "BrotliDecoder": "BrotliDecoder",
-    "BrotliEncoder": "BrotliEncoder",
-    "Zlib": "Zlib",
-    "ZstdCompress": "ZstdCompress",
-    "ZstdDecompress": "ZstdDecompress",
-    "crc32": "",
-    "crc32c": ""
+    "BrotliDecoder": {
+      "length": 0,
+      "name": "BrotliDecoder"
+    },
+    "BrotliEncoder": {
+      "length": 0,
+      "name": "BrotliEncoder"
+    },
+    "Zlib": {
+      "length": 0,
+      "name": "Zlib"
+    },
+    "ZstdCompress": {
+      "length": 0,
+      "name": "ZstdCompress"
+    },
+    "ZstdDecompress": {
+      "length": 0,
+      "name": "ZstdDecompress"
+    },
+    "crc32": {
+      "length": 0,
+      "name": ""
+    },
+    "crc32c": {
+      "length": 0,
+      "name": ""
+    }
   }
 }

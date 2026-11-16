@@ -533,7 +533,9 @@ fn sandbox_enumerate_index<'s>(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(script_new).length(2).build(scope);
+    // Node: `NewFunctionTemplate` into `target->Set`, i.e. length 0, not the
+    // two arguments the JavaScript side passes.
+    let template = rn_core::class(script_new).build(scope);
     let class_name =
         v8::String::new(scope, "ContextifyScript").ok_or("cannot allocate the class name")?;
     template.set_class_name(class_name);

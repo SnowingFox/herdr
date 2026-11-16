@@ -122,7 +122,8 @@ pub fn with_handle<R>(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(new).length(1).build(scope);
+    // Node: `NewFunctionTemplate` + `SetConstructorFunction`, i.e. length 0.
+    let template = rn_core::class(new).build(scope);
 
     // `src/pipe_wrap.cc` pre-creates no fields on `Pipe` itself (unlike `TCP`),
     // but `lib/net.js` assigns `owner_symbol`, `onread` and `onconnection` the
@@ -140,37 +141,26 @@ pub fn constructor<'s>(
     // `HandleWrap`.
     prototype.set(
         key(scope, "close")?.into(),
-        rn_core::method(crate::methods::close)
-            .length(0)
-            .build(scope)
-            .into(),
+        rn_core::method(crate::methods::close).build(scope).into(),
     );
     for (name, template) in [
         (
             "ref",
-            rn_core::method(crate::methods::reference)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::reference).build(scope),
         ),
         (
             "unref",
-            rn_core::method(crate::methods::unreference)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::unreference).build(scope),
         ),
         (
             "hasRef",
-            rn_core::method(crate::methods::has_reference)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::has_reference).build(scope),
         ),
         // `AsyncWrap`'s id. `lib/net.js` reads it for every socket it builds,
         // and a pipe is one (a Unix socket or the stdio of a child process).
         (
             "getAsyncId",
-            rn_core::method(crate::methods::get_async_id)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_async_id).build(scope),
         ),
     ] {
         prototype.set(key(scope, name)?.into(), template.into());
@@ -180,86 +170,57 @@ pub fn constructor<'s>(
     for (name, template) in [
         (
             "readStart",
-            rn_core::method(crate::methods::read_start)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::read_start).build(scope),
         ),
         (
             "readStop",
-            rn_core::method(crate::methods::read_stop)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::read_stop).build(scope),
         ),
         (
             "shutdown",
-            rn_core::method(crate::methods::shutdown)
-                .length(1)
-                .build(scope),
+            rn_core::method(crate::methods::shutdown).build(scope),
         ),
         (
             "writeBuffer",
-            rn_core::method(crate::methods::write_buffer)
-                .length(2)
-                .build(scope),
+            rn_core::method(crate::methods::write_buffer).build(scope),
         ),
         (
             "writev",
-            rn_core::method(crate::methods::writev)
-                .length(3)
-                .build(scope),
+            rn_core::method(crate::methods::writev).build(scope),
         ),
         (
             "writeUtf8String",
-            rn_core::method(crate::methods::write_utf8)
-                .length(2)
-                .build(scope),
+            rn_core::method(crate::methods::write_utf8).build(scope),
         ),
         (
             "writeAsciiString",
-            rn_core::method(crate::methods::write_ascii)
-                .length(2)
-                .build(scope),
+            rn_core::method(crate::methods::write_ascii).build(scope),
         ),
         (
             "writeLatin1String",
-            rn_core::method(crate::methods::write_latin1)
-                .length(2)
-                .build(scope),
+            rn_core::method(crate::methods::write_latin1).build(scope),
         ),
         (
             "writeUcs2String",
-            rn_core::method(crate::methods::write_ucs2)
-                .length(2)
-                .build(scope),
+            rn_core::method(crate::methods::write_ucs2).build(scope),
         ),
     ] {
         prototype.set(key(scope, name)?.into(), template.into());
     }
 
     for (name, getter) in [
-        (
-            "fd",
-            rn_core::method(crate::methods::get_fd)
-                .length(0)
-                .build(scope),
-        ),
+        ("fd", rn_core::method(crate::methods::get_fd).build(scope)),
         (
             "bytesRead",
-            rn_core::method(crate::methods::get_bytes_read)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_bytes_read).build(scope),
         ),
         (
             "bytesWritten",
-            rn_core::method(crate::methods::get_bytes_written)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_bytes_written).build(scope),
         ),
         (
             "writeQueueSize",
-            rn_core::method(crate::methods::get_write_queue_size)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_write_queue_size).build(scope),
         ),
     ] {
         prototype.set_accessor_property(
@@ -275,31 +236,19 @@ pub fn constructor<'s>(
 
     // `PipeWrap`'s own methods.
     for (name, template) in [
-        (
-            "bind",
-            rn_core::method(crate::methods::bind).length(1).build(scope),
-        ),
+        ("bind", rn_core::method(crate::methods::bind).build(scope)),
         (
             "listen",
-            rn_core::method(crate::methods::listen)
-                .length(1)
-                .build(scope),
+            rn_core::method(crate::methods::listen).build(scope),
         ),
         (
             "connect",
-            rn_core::method(crate::methods::connect)
-                .length(2)
-                .build(scope),
+            rn_core::method(crate::methods::connect).build(scope),
         ),
-        (
-            "open",
-            rn_core::method(crate::methods::open).length(1).build(scope),
-        ),
+        ("open", rn_core::method(crate::methods::open).build(scope)),
         (
             "fchmod",
-            rn_core::method(crate::methods::fchmod)
-                .length(1)
-                .build(scope),
+            rn_core::method(crate::methods::fchmod).build(scope),
         ),
     ] {
         prototype.set(key(scope, name)?.into(), template.into());

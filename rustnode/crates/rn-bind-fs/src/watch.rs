@@ -182,7 +182,6 @@ pub fn constructor<'s>(
     let prototype = template.prototype_template(scope);
     // `SetProtoMethod(isolate, t, "start", StatWatcher::Start)`.
     let start = v8::FunctionTemplate::builder(start)
-        .length(0)
         .constructor_behavior(v8::ConstructorBehavior::Throw)
         .build(scope);
     let key = v8::String::new(scope, "start").ok_or("cannot allocate start")?;
@@ -195,7 +194,6 @@ pub fn constructor<'s>(
         ($($method_name:literal => $method:expr),* $(,)?) => {
             $(
                 let method_template = v8::FunctionTemplate::builder($method)
-                    .length(0)
                     .constructor_behavior(v8::ConstructorBehavior::Throw)
                     .build(scope);
                 let key = v8::String::new(scope, $method_name)

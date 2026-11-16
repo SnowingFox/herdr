@@ -119,7 +119,7 @@ pub fn with_handle<R>(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(new).length(0).build(scope);
+    let template = rn_core::class(new).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -127,22 +127,20 @@ pub fn constructor<'s>(
     let prototype = template.prototype_template(scope);
 
     // `SetProtoMethod(isolate, constructor, "spawn", Spawn)` and `"kill"`.
-    let spawn = rn_core::method(crate::methods::spawn)
-        .length(8)
-        .build(scope);
+    let spawn = rn_core::method(crate::methods::spawn).build(scope);
     prototype.set(crate::key(scope, "spawn")?.into(), spawn.into());
-    let kill = rn_core::method(crate::methods::kill).length(1).build(scope);
+    let kill = rn_core::method(crate::methods::kill).build(scope);
     prototype.set(crate::key(scope, "kill")?.into(), kill.into());
 
-    // `HandleWrap`: `close`, `ref`, `unref`, `hasRef`.
-    for (name, arity) in [("close", 0), ("ref", 0), ("unref", 0), ("hasRef", 0)] {
-        let template = match name {
-            "close" => rn_core::method(crate::methods::close),
-            "ref" => rn_core::method(crate::methods::reference),
-            "unref" => rn_core::method(crate::methods::unreference),
-            _ => rn_core::method(crate::methods::has_reference),
-        };
-        let template = template.length(arity).build(scope);
+    // `HandleWrap`: `close`, `ref`, `unref`, `hasRef`. `SetProtoMethod` builds
+    // through `NewFunctionTemplate`, so all four report `length` 0.
+    for (name, template) in [
+        ("close", rn_core::method(crate::methods::close)),
+        ("ref", rn_core::method(crate::methods::reference)),
+        ("unref", rn_core::method(crate::methods::unreference)),
+        ("hasRef", rn_core::method(crate::methods::has_reference)),
+    ] {
+        let template = template.build(scope);
         prototype.set(crate::key(scope, name)?.into(), template.into());
     }
 

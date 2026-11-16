@@ -180,7 +180,8 @@ pub fn park_accept(handle: Box<TcpHandle>) {
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(new).length(1).build(scope);
+    // Node: `NewFunctionTemplate` + `SetConstructorFunction`, i.e. length 0.
+    let template = rn_core::class(new).build(scope);
 
     // `src/tcp_wrap.cc` pre-creates these so instances stay monomorphic and
     // `lib/net.js` assigns them through the fast path:
@@ -202,37 +203,24 @@ pub fn constructor<'s>(
 
     // `HandleWrap`.
     for (name, template) in [
-        (
-            "close",
-            rn_core::method(crate::methods::close)
-                .length(0)
-                .build(scope),
-        ),
+        ("close", rn_core::method(crate::methods::close).build(scope)),
         (
             "ref",
-            rn_core::method(crate::methods::reference)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::reference).build(scope),
         ),
         (
             "unref",
-            rn_core::method(crate::methods::unreference)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::unreference).build(scope),
         ),
         (
             "hasRef",
-            rn_core::method(crate::methods::has_reference)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::has_reference).build(scope),
         ),
         // `AsyncWrap`'s id, which `lib/net.js` reads as
         // `this._handle.getAsyncId()` on both the connect and the server paths.
         (
             "getAsyncId",
-            rn_core::method(crate::methods::get_async_id)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_async_id).build(scope),
         ),
         // `AsyncWrap::AsyncReset` and `AsyncWrap::GetProviderType`, which
         // `lib/internal/http/agent.js::asyncResetHandle` needs before it will
@@ -246,15 +234,11 @@ pub fn constructor<'s>(
         // request's id and `socket[async_id_symbol]` stays `-1`.
         (
             "asyncReset",
-            rn_core::method(crate::methods::async_reset)
-                .length(1)
-                .build(scope),
+            rn_core::method(crate::methods::async_reset).build(scope),
         ),
         (
             "getProviderType",
-            rn_core::method(crate::methods::get_provider_type)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_provider_type).build(scope),
         ),
     ] {
         prototype.set(key(scope, name)?.into(), template.into());
@@ -264,60 +248,42 @@ pub fn constructor<'s>(
     for (name, template) in [
         (
             "readStart",
-            rn_core::method(crate::methods::read_start)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::read_start).build(scope),
         ),
         (
             "readStop",
-            rn_core::method(crate::methods::read_stop)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::read_stop).build(scope),
         ),
         (
             "shutdown",
-            rn_core::method(crate::methods::shutdown)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::shutdown).build(scope),
         ),
         (
             "writeBuffer",
-            rn_core::method(crate::methods::write_buffer)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::write_buffer).build(scope),
         ),
         (
             "writev",
-            rn_core::method(crate::methods::writev)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::writev).build(scope),
         ),
         (
             "writeUtf8String",
-            rn_core::method(crate::methods::write_utf8)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::write_utf8).build(scope),
         ),
         // The other three string encodings exist for direct users of the handle;
         // `stream_base_commons` reaches them only when a caller bypasses
         // `writeGeneric`, which converts non-UTF-8 strings to a `Buffer` first.
         (
             "writeAsciiString",
-            rn_core::method(crate::methods::write_utf8)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::write_utf8).build(scope),
         ),
         (
             "writeLatin1String",
-            rn_core::method(crate::methods::write_utf8)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::write_utf8).build(scope),
         ),
         (
             "writeUcs2String",
-            rn_core::method(crate::methods::write_utf8)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::write_utf8).build(scope),
         ),
     ] {
         prototype.set(key(scope, name)?.into(), template.into());
@@ -325,29 +291,18 @@ pub fn constructor<'s>(
 
     // The accessor properties `StreamBase::AddMethods` installs.
     for (name, getter) in [
-        (
-            "fd",
-            rn_core::method(crate::methods::get_fd)
-                .length(0)
-                .build(scope),
-        ),
+        ("fd", rn_core::method(crate::methods::get_fd).build(scope)),
         (
             "bytesRead",
-            rn_core::method(crate::methods::get_bytes_read)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_bytes_read).build(scope),
         ),
         (
             "bytesWritten",
-            rn_core::method(crate::methods::get_bytes_written)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_bytes_written).build(scope),
         ),
         (
             "writeQueueSize",
-            rn_core::method(crate::methods::get_write_queue_size)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_write_queue_size).build(scope),
         ),
     ] {
         prototype.set_accessor_property(
@@ -366,80 +321,46 @@ pub fn constructor<'s>(
 
     // `TCPWrap`'s own methods.
     for (name, template) in [
-        (
-            "open",
-            rn_core::method(crate::methods::open).length(0).build(scope),
-        ),
-        (
-            "bind",
-            rn_core::method(crate::methods::bind).length(1).build(scope),
-        ),
-        (
-            "bind6",
-            rn_core::method(crate::methods::bind6)
-                .length(1)
-                .build(scope),
-        ),
+        ("open", rn_core::method(crate::methods::open).build(scope)),
+        ("bind", rn_core::method(crate::methods::bind).build(scope)),
+        ("bind6", rn_core::method(crate::methods::bind6).build(scope)),
         (
             "listen",
-            rn_core::method(crate::methods::listen)
-                .length(1)
-                .build(scope),
+            rn_core::method(crate::methods::listen).build(scope),
         ),
         (
             "connect",
-            rn_core::method(crate::methods::connect)
-                .length(3)
-                .build(scope),
+            rn_core::method(crate::methods::connect).build(scope),
         ),
         (
             "connect6",
-            rn_core::method(crate::methods::connect6)
-                .length(3)
-                .build(scope),
+            rn_core::method(crate::methods::connect6).build(scope),
         ),
         (
             "getsockname",
-            rn_core::method(crate::methods::getsockname)
-                .length(1)
-                .build(scope),
+            rn_core::method(crate::methods::getsockname).build(scope),
         ),
         (
             "getpeername",
-            rn_core::method(crate::methods::getpeername)
-                .length(1)
-                .build(scope),
+            rn_core::method(crate::methods::getpeername).build(scope),
         ),
         (
             "setNoDelay",
-            rn_core::method(crate::methods::set_no_delay)
-                .length(1)
-                .build(scope),
+            rn_core::method(crate::methods::set_no_delay).build(scope),
         ),
         (
             "setKeepAlive",
-            rn_core::method(crate::methods::set_keep_alive)
-                .length(2)
-                .build(scope),
+            rn_core::method(crate::methods::set_keep_alive).build(scope),
         ),
         (
             "setTypeOfService",
-            rn_core::method(crate::methods::set_type_of_service)
-                .length(1)
-                .build(scope),
+            rn_core::method(crate::methods::set_type_of_service).build(scope),
         ),
         (
             "getTypeOfService",
-            rn_core::method(crate::methods::get_type_of_service)
-                .length(0)
-                .build(scope),
+            rn_core::method(crate::methods::get_type_of_service).build(scope),
         ),
-        (
-            "reset",
-            rn_core::method(crate::methods::reset)
-                .length(0)
-                .build(scope),
-        ),
+        ("reset", rn_core::method(crate::methods::reset).build(scope)),
     ] {
         prototype.set(key(scope, name)?.into(), template.into());
     }

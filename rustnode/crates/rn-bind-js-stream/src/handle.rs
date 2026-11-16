@@ -179,21 +179,23 @@ pub fn constructor<'s>(
     let prototype = template.prototype_template(scope);
 
     // The four methods `JSStream::Initialize` installs, in its order.
+    //
+    // No arity: `SetProtoMethod` and `SetInstanceMethod` both build through
+    // `NewFunctionTemplate`, so Node reports `length` 0 for every one of these
+    // however many arguments the JavaScript side passes.
     macro_rules! install_method {
-        ($($method_name:literal => $method:expr => $length:expr),* $(,)?) => {
+        ($($method_name:literal => $method:expr),* $(,)?) => {
             $(
-                let method_template = rn_core::method($method)
-                    .length($length)
-                    .build(scope);
+                let method_template = rn_core::method($method).build(scope);
                 prototype.set(crate::key(scope, $method_name)?.into(), method_template.into());
             )*
         };
     }
     install_method! {
-        "finishWrite" => methods::finish_write => 2,
-        "finishShutdown" => methods::finish_shutdown => 2,
-        "readBuffer" => methods::read_buffer => 1,
-        "emitEOF" => methods::emit_eof => 0,
+        "finishWrite" => methods::finish_write,
+        "finishShutdown" => methods::finish_shutdown,
+        "readBuffer" => methods::read_buffer,
+        "emitEOF" => methods::emit_eof,
     }
 
     // `StreamBase::AddMethods`, in its order. `AddMethod` installs the four
@@ -212,7 +214,7 @@ pub fn constructor<'s>(
             "bytesRead" => rn_core::method(methods::get_bytes_read),
             _ => rn_core::method(methods::get_bytes_written),
         };
-        let template = template.length(0).build(scope);
+        let template = template.build(scope);
         prototype.set_accessor_property(
             crate::key(scope, name)?.into(),
             Some(template),
@@ -222,16 +224,16 @@ pub fn constructor<'s>(
     }
 
     install_method! {
-        "readStart" => methods::read_start => 0,
-        "readStop" => methods::read_stop => 0,
-        "shutdown" => methods::shutdown => 1,
-        "useUserBuffer" => methods::use_user_buffer => 1,
-        "writev" => methods::writev => 3,
-        "writeBuffer" => methods::write_buffer => 2,
-        "writeAsciiString" => methods::write_ascii => 2,
-        "writeUtf8String" => methods::write_utf8 => 2,
-        "writeUcs2String" => methods::write_ucs2 => 2,
-        "writeLatin1String" => methods::write_latin1 => 2,
+        "readStart" => methods::read_start,
+        "readStop" => methods::read_stop,
+        "shutdown" => methods::shutdown,
+        "useUserBuffer" => methods::use_user_buffer,
+        "writev" => methods::writev,
+        "writeBuffer" => methods::write_buffer,
+        "writeAsciiString" => methods::write_ascii,
+        "writeUtf8String" => methods::write_utf8,
+        "writeUcs2String" => methods::write_ucs2,
+        "writeLatin1String" => methods::write_latin1,
     }
 
     // `t->PrototypeTemplate()->Set("isStreamBase", True(isolate))`.
@@ -246,8 +248,8 @@ pub fn constructor<'s>(
     // JavaScript is readable by native code that has no property lookup handy.
     // The observable contract is only that assigning and reading agree, which a
     // plain property keeps.
-    let onread = rn_core::method(methods::get_onread).length(0).build(scope);
-    let onread_setter = rn_core::method(methods::set_onread).length(1).build(scope);
+    let onread = rn_core::method(methods::get_onread).build(scope);
+    let onread_setter = rn_core::method(methods::set_onread).build(scope);
     prototype.set_accessor_property(
         crate::key(scope, "onread")?.into(),
         Some(onread),

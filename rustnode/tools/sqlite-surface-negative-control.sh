@@ -261,14 +261,14 @@ start = source.index("/// Allocates an iterator instance from the class's object
 end = source.index("fn illegal_constructor<'s>(")
 reverted = source[:start] + """/// Allocates an iterator instance from a throwaway object template.
 fn allocate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
-    let template = rn_core::class(illegal_constructor).length(0).build(scope);
+    let template = rn_core::class(illegal_constructor).build(scope);
     let instance = template.instance_template(scope);
     instance.set_internal_field_count(INTERNAL_FIELDS);
     let instance = instance.new_instance(scope)?;
     let prototype = template.prototype_template(scope);
     for (name, method) in [
-        ("next", crate::database::method(scope, 0, next)),
-        ("return", crate::database::method(scope, 0, ret)),
+        ("next", crate::database::method(scope, next)),
+        ("return", crate::database::method(scope, ret)),
     ] {
         let key = v8::String::new(scope, name)?;
         prototype.set(key.into(), method.into());

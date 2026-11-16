@@ -46,7 +46,7 @@ pub fn install_accessor<'s>(
             // `set_accessor_property` takes `FunctionTemplate`s, not `Function`s,
             // because it installs the accessor on a *template* rather than on an
             // existing object.
-            let function = rn_core::method($callback).length(0).build(scope);
+            let function = rn_core::method($callback).build(scope);
             prototype.set_accessor_property(
                 crate::wrap::key(scope, name)?.into(),
                 Some(function),

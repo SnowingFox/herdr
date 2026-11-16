@@ -366,7 +366,7 @@ fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Fu
         return Some(v8::Local::new(scope, template));
     }
 
-    let template = rn_core::class(illegal_constructor).length(0).build(scope);
+    let template = rn_core::class(illegal_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELDS);
@@ -374,18 +374,15 @@ fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Fu
     for (name, method) in [
         (
             "changeset",
-            crate::database::method(scope, 0, changeset_method),
+            crate::database::method(scope, changeset_method),
         ),
-        (
-            "patchset",
-            crate::database::method(scope, 0, patchset_method),
-        ),
-        ("close", crate::database::method(scope, 0, close_method)),
+        ("patchset", crate::database::method(scope, patchset_method)),
+        ("close", crate::database::method(scope, close_method)),
     ] {
         let key = v8::String::new(scope, name)?;
         prototype.set(key.into(), method.into());
     }
-    let dispose = crate::database::method(scope, 0, dispose_method);
+    let dispose = crate::database::method(scope, dispose_method);
     let dispose_key: v8::Local<'_, v8::Name> =
         match v8::Local::<v8::Symbol>::try_from(crate::database::well_known_dispose(scope)) {
             Ok(symbol) => symbol.into(),

@@ -242,7 +242,8 @@ impl BindingModule for ModuleWrapBinding {
 fn module_wrap_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
-    let template = rn_core::class(module_wrap_new).length(5).build(scope);
+    // Node: `NewFunctionTemplate` + `SetConstructorFunction`, i.e. length 0.
+    let template = rn_core::class(module_wrap_new).build(scope);
     // `SetConstructorFunction(…, SET_CLASS_NAME)`: the class name is what V8
     // reports as `f.name`, so it has to be the property Node publishes it under.
     let class_name =

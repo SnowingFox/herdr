@@ -93,7 +93,6 @@ pub fn constructor<'s>(
         ($($name:literal => $method:expr),* $(,)?) => {
             $(
                 let method_template = rn_core::method($method)
-                    .length(0)
                     .build(scope);
                 let key = v8::String::new(scope, $name)
                     .ok_or_else(|| format!("cannot allocate Http2Stream.{}", $name))?;

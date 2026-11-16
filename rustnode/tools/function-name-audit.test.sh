@@ -82,8 +82,18 @@ with open(members_path, encoding="utf8") as handle:
 with open(prototypes_path, encoding="utf8") as handle:
     prototypes = json.load(handle)
 
-total = sum(len(names) for names in members.values())
-named = sum(1 for names in members.values() for name in names.values() if name)
+def pairs(rows):
+    """`(name, length)` for one recorded function, tolerating the old shape."""
+    if isinstance(rows, str):
+        return rows, None
+    return rows.get("name", ""), rows.get("length")
+
+
+total = sum(len(rows) for rows in members.values())
+named = sum(1 for rows in members.values() for row in rows.values()
+            if pairs(row)[0])
+measured = sum(1 for rows in members.values() for row in rows.values()
+               if pairs(row)[1] is not None)
 if total == 0:
     print("the member fixture records no functions at all", file=sys.stderr)
     sys.exit(1)
@@ -91,29 +101,53 @@ if named == 0:
     print("the member fixture records no names, which is the shape a blind "
           "recording would write", file=sys.stderr)
     sys.exit(1)
+# A fixture that keeps the names but drops the lengths is the same blindness one
+# field over: the name half would still compare and report a clean run about the
+# invariant that had gone blind.
+if measured != total:
+    print(f"the member fixture records a length for {measured} of {total} "
+          "function(s); the length half would compare the rest zero times",
+          file=sys.stderr)
+    sys.exit(1)
 
 # The exemptions are the reason this fixture stores names rather than a
 # "should be named" boolean: Node itself leaves 65 of these empty, and two of them
 # carry a name that is not their property name. A boolean cannot express either.
-empty = sum(1 for names in members.values() for name in names.values() if not name)
+empty = sum(1 for rows in members.values() for row in rows.values()
+            if not pairs(row)[0])
 renamed = sorted(
-    f"{namespace}.{member}={name!r}"
-    for namespace, names in members.items()
-    for member, name in names.items()
-    if name and name != member
+    f"{namespace}.{member}={pairs(row)[0]!r}"
+    for namespace, rows in members.items()
+    for member, row in rows.items()
+    if pairs(row)[0] and pairs(row)[0] != member
 )
 if empty == 0:
     print("the member fixture records no unnamed functions; SetFastMethod members "
           "are unnamed on Node too, so a recording with none is not Node's",
           file=sys.stderr)
     sys.exit(1)
-print(f"{total} function name(s) recorded, {named} named, {empty} unnamed, "
-      f"{len(renamed)} with a name that is not the property name")
+# Lengths are the other half. Node records 0 for almost every `SetMethod` member
+# and a handful of non-zero ones (`trace_events.trace` is 5), so a fixture with
+# only zeros is not Node's either.
+nonzero = sorted(
+    f"{namespace}.{member}={pairs(row)[1]}"
+    for namespace, rows in members.items()
+    for member, row in rows.items()
+    if pairs(row)[1]
+)
+if not nonzero:
+    print("the member fixture records no non-zero lengths; V8's "
+          "SimpleInstallFunction really does record them, so a recording with "
+          "none is not Node's", file=sys.stderr)
+    sys.exit(1)
+print(f"{total} function(s) recorded, {named} named, {empty} unnamed, "
+      f"{len(renamed)} with a name that is not the property name; "
+      f"{measured} with a length, {len(nonzero)} non-zero")
 PY
 then
-  pass "the committed member fixture carries real names, both directions"
+  pass "the committed member fixture carries real names and lengths"
 else
-  fail "the committed member fixture carries real names, both directions"
+  fail "the committed member fixture carries real names and lengths"
 fi
 
 # Shape 2: a class the member fixture names but the prototype fixture does not is
@@ -195,10 +229,10 @@ with open(source, encoding="utf8") as handle:
     recorded = json.load(handle)
 # A member that is `SetMethod` in Node, so its name has to be its property name.
 target = ("fs", "open")
-if recorded.get(target[0], {}).get(target[1]) != target[1]:
+if recorded.get(target[0], {}).get(target[1], {}).get("name") != target[1]:
     print(f"the fixture does not record fs.open as named", file=sys.stderr)
     sys.exit(1)
-recorded[target[0]][target[1]] = ""
+recorded[target[0]][target[1]]["name"] = ""
 with open(destination, "w", encoding="utf8") as handle:
     json.dump(recorded, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -238,11 +272,11 @@ with open(source, encoding="utf8") as handle:
     recorded = json.load(handle)
 # The accessor Node republishes keeps V8's own name, which is not the property.
 target = ("util", "getSharedArrayBufferGrowable")
-if recorded.get(target[0], {}).get(target[1]) != "get growable":
+if recorded.get(target[0], {}).get(target[1], {}).get("name") != "get growable":
     print("the fixture does not record getSharedArrayBufferGrowable as "
           "'get growable'", file=sys.stderr)
     sys.exit(1)
-recorded[target[0]][target[1]] = "getSharedArrayBufferGrowable"
+recorded[target[0]][target[1]]["name"] = "getSharedArrayBufferGrowable"
 with open(destination, "w", encoding="utf8") as handle:
     json.dump(recorded, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -264,6 +298,120 @@ case "$output" in
     ;;
   *)
     fail "the blanket-rename failure did not name the member: ${output:0:400}"
+    ;;
+esac
+
+# Shape 6: the length half, re-created in the fixture. `trace_events.trace` is 5
+# on Node because V8's `SimpleInstallFunction` recorded it, so recording it as 0
+# contradicts rustnode's now-correct value and the audit must say so.
+wrong_length="$work/wrong-length"
+mkdir -p "$wrong_length"
+cp "$prototypes" "$wrong_length/function-name-prototypes.json"
+python3 - "$members" "$wrong_length/function-name-members.json" <<'PY'
+import json
+import sys
+
+source, destination = sys.argv[1], sys.argv[2]
+with open(source, encoding="utf8") as handle:
+    recorded = json.load(handle)
+target = ("trace_events", "trace")
+if recorded.get(target[0], {}).get(target[1], {}).get("length") != 5:
+    print("the fixture does not record trace_events.trace with length 5",
+          file=sys.stderr)
+    sys.exit(1)
+recorded[target[0]][target[1]]["length"] = 0
+with open(destination, "w", encoding="utf8") as handle:
+    json.dump(recorded, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+
+set +e
+output="$(python3 "$audit" --recorded "$wrong_length/function-name-members.json" \
+  --rustnode "$binary" --json 2>&1)"
+status=$?
+set -e
+if [ "$status" -eq 1 ]; then
+  pass "a member recorded with the wrong length fails the audit"
+else
+  fail "a member recorded with the wrong length exited $status, expected 1"
+fi
+case "$output" in
+  *'"field": "length"'*'"member": "trace"'*|*'"member": "trace"'*'"field": "length"'*)
+    pass "the wrong-length failure names the member and the field"
+    ;;
+  *)
+    fail "the wrong-length failure did not name the member: ${output:0:400}"
+    ;;
+esac
+
+# Shape 7: a fixture that drops `length` from every entry must not read as a
+# clean run about the invariant it stopped measuring. The name half would still
+# compare 524 members, so this is exactly the shape that reported `0
+# disagreements` once already, one field over.
+no_lengths="$work/no-lengths"
+mkdir -p "$no_lengths"
+cp "$prototypes" "$no_lengths/function-name-prototypes.json"
+python3 - "$members" "$no_lengths/function-name-members.json" <<'PY'
+import json
+import sys
+
+source, destination = sys.argv[1], sys.argv[2]
+with open(source, encoding="utf8") as handle:
+    recorded = json.load(handle)
+for rows in recorded.values():
+    for row in rows.values():
+        row.pop("length", None)
+with open(destination, "w", encoding="utf8") as handle:
+    json.dump(recorded, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+
+set +e
+output="$(python3 "$audit" --recorded "$no_lengths/function-name-members.json" \
+  --rustnode "$binary" 2>&1)"
+status=$?
+set -e
+if [ "$status" -eq 2 ]; then
+  pass "a fixture with no lengths exits 2"
+else
+  fail "a fixture with no lengths exited $status, expected 2"
+fi
+case "$output" in
+  *"compared zero member lengths"*)
+    pass "a fixture with no lengths names the zero comparison"
+    ;;
+  *)
+    fail "a fixture with no lengths did not name it: ${output:0:400}"
+    ;;
+esac
+
+# Shape 8: the arithmetic has to be visible. The summary must print the recorded,
+# compared and skipped counts, so a member that silently stopped being installed
+# cannot hide inside a shrinking number nobody reads.
+set +e
+output="$(python3 "$audit" --recorded "$members" --rustnode "$binary" 2>&1)"
+status=$?
+set -e
+if [ "$status" -eq 0 ]; then
+  pass "the committed fixtures agree with the built binary on name and length"
+else
+  fail "the committed fixtures disagree with the binary (exit $status)"
+fi
+case "$output" in
+  *"recorded "*"compared "*"skipped because deferred "*"skipped for no declared reason"*)
+    pass "the summary prints recorded, compared, deferred and unexplained counts"
+    ;;
+  *)
+    fail "the summary did not print the skip accounting: ${output:0:600}"
+    ;;
+esac
+case "$output" in
+  *"skipped because deferred 0"*)
+    fail "the summary reports zero deferred skips; the fixture holds members that"\
+" are declared deferred on this build"
+    ;;
+  *)
+    pass "the deferred skip count is non-zero, as the fixture requires"
     ;;
 esac
 

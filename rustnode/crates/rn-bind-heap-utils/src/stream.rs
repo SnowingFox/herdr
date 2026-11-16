@@ -195,7 +195,7 @@ pub fn constructor<'s>(
         ("bytesRead", rn_core::method(get_bytes_read)),
         ("bytesWritten", rn_core::method(get_bytes_written)),
     ] {
-        let accessor = accessor.length(0).build(scope);
+        let accessor = accessor.build(scope);
         let key = v8::String::new(scope, key).ok_or("cannot allocate an accessor name")?;
         prototype.set_accessor_property(
             key.into(),
@@ -209,7 +209,7 @@ pub fn constructor<'s>(
         ("readStart", rn_core::method(read_start)),
         ("readStop", rn_core::method(read_stop)),
     ] {
-        let method = method.length(0).build(scope);
+        let method = method.build(scope);
         let key = v8::String::new(scope, key).ok_or("cannot allocate a method name")?;
         prototype.set(key.into(), method.into());
     }
@@ -223,8 +223,8 @@ pub fn constructor<'s>(
     // The attributes are part of the surface: `Object.keys(handle)` is empty in
     // Node because every accessor is non-enumerable, and a data property here
     // would make `onread` show up in an inspection of the handle.
-    let getter = rn_core::method(get_onread).length(0).build(scope);
-    let setter = rn_core::method(set_onread).length(1).build(scope);
+    let getter = rn_core::method(get_onread).build(scope);
+    let setter = rn_core::method(set_onread).build(scope);
     let key = v8::String::new(scope, "onread").ok_or("cannot allocate onread")?;
     prototype.set_accessor_property(
         key.into(),
