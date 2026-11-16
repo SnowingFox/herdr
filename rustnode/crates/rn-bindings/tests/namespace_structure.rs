@@ -104,23 +104,18 @@ const KNOWN_FINDINGS: &[&str] = &[
     "icu.decode:claimed-and-deferred",
     "icu.getConverter:claimed-and-deferred",
     "icu.hasConverter:claimed-and-deferred",
-    // `performance.Histogram`, `performance.SlidingWindowHistogram` — same shape.
-    // These two MOVED CATEGORY, they were not fixed: they were previously recorded
-    // as `wrong-kind` (installed as `undefined`) and upstream later added them to
-    // `DEFERRED` as well as `MEMBERS`, so they now report as `claimed-and-deferred`.
-    // The underlying defect is unchanged and still live:
-    // `perf_hooks.createHistogram()` throws `_Histogram is not a constructor`,
-    // because deferring a member does not implement it. Tracked separately — do not
-    // treat this entry's presence, or the unchanged total, as evidence it was
-    // addressed.
-    "performance.Histogram:claimed-and-deferred",
-    "performance.SlidingWindowHistogram:claimed-and-deferred",
     // `process_methods.{causeSegfault,dlopenBinary,execve,setEmitWarningSync}` —
     // same shape.
     "process_methods.causeSegfault:claimed-and-deferred",
     "process_methods.dlopenBinary:claimed-and-deferred",
     "process_methods.execve:claimed-and-deferred",
     "process_methods.setEmitWarningSync:claimed-and-deferred",
+    // (`performance.Histogram` and `performance.SlidingWindowHistogram` were here.
+    // Both are installed now, so `perf_hooks.createHistogram()` works and the
+    // entries are gone rather than reclassified. The evidence is
+    // `crates/rn-bind-performance/tests/differential.rs`, which compares every
+    // accessor against the pinned oracle.)
+    //
     // (`sqlite.backup` was here. PR #99 removed it from `MEMBERS` and left it in
     // `DEFERRED` with an accurate reason, so the contradiction is gone and the gap
     // is honestly declared. `backup` itself is still unimplemented — Node's is a
@@ -142,16 +137,19 @@ const KNOWN_FINDINGS: &[&str] = &[
 /// `namespace.member:not-implemented`.
 ///
 /// Same contract as [`KNOWN_FINDINGS`]: each is a real defect owned by its crate,
-/// and a fix deletes its line. `performance.createELDHistogram` is the one with a
-/// live user-visible consequence — `require('perf_hooks').monitorEventLoopDelay()`
-/// throws it today.
+/// and a fix deletes its line. `performance.createELDHistogram` used to be the one
+/// with a live user-visible consequence, because
+/// `require('perf_hooks').monitorEventLoopDelay()` threw through it; it is
+/// implemented now and its line is gone.
 const KNOWN_STUBS: &[&str] = &[
     "builtins.importBuiltinSourceTextModule:not-implemented",
     // `fs.handleToFd` is a Windows-only member (`internal/fs/streams.js` calls it on
     // that path) installed unconditionally here and then hardcoded to `ENOSYS`.
     "fs.handleToFd:not-implemented",
     "mksnapshot.compileSerializeMain:not-implemented",
-    "performance.createELDHistogram:not-implemented",
+    // (`performance.createELDHistogram` was here; it builds a real ELD histogram
+    // now, and `monitorEventLoopDelay()` records intervals. Covered by
+    // `rn-bind-performance/tests/binding.rs` and the differential test.)
 ];
 
 /// What one installed member turned out to be, read from its property descriptor
@@ -974,9 +972,9 @@ fn canary_matches(canary: Canary, probe: &Probe) -> bool {
 /// This is the achievable half of "a member that throws on first use counts as
 /// absent". It finds members that are installed and are deliberate stubs, and
 /// requires them to be declared in `DEFERRED` with a reason instead of sitting on
-/// the namespace object. `fs.handleToFd` returning a hardcoded `ENOSYS` and
-/// `performance.createELDHistogram` reporting that the loop it measures does not
-/// exist are exactly this class.
+/// the namespace object. `fs.handleToFd` returning a hardcoded `ENOSYS` is exactly
+/// this class; `performance.createELDHistogram` used to be the other example and
+/// is implemented now.
 ///
 /// It is deliberately *not* the broader "does calling with no arguments throw
 /// something that looks like a real failure" classifier, because measurement says
@@ -1398,14 +1396,14 @@ mod rule_tests {
         // fix lands, its line and this number change in the same commit.
         assert_eq!(
             KNOWN_FINDINGS.len(),
-            15,
+            13,
             "KNOWN_FINDINGS holds the structural debt; update this count when a fix \
              removes an entry: {:?}",
             KNOWN_FINDINGS
         );
         assert_eq!(
             KNOWN_STUBS.len(),
-            4,
+            3,
             "KNOWN_STUBS holds the stub debt; update this count when a fix removes an \
              entry: {:?}",
             KNOWN_STUBS

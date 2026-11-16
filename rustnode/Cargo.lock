@@ -1104,7 +1104,10 @@ name = "rn-bind-performance"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "libuv-sys2",
  "rn-core",
+ "rn-node-oracle",
+ "rn-uv",
  "rn-v8-sys",
 ]
 
