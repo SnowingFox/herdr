@@ -267,6 +267,14 @@ pub fn report_uncaught_exception(
     scope: &mut v8::PinScope<'_, '_>,
     error: v8::Local<v8::Value>,
 ) -> bool {
+    // `InternalMakeCallback` calls `scope.MarkAsFailed()` when the callback
+    // threw, and `InternalCallbackScope::Close` then returns at
+    // `if (failed_) return;` — so the tick and microtask checkpoint is skipped
+    // for a callback that threw, and the uncaught report wins the race. This is
+    // the one function every completion path's catch block goes through, so
+    // recording it here keeps that rule in one place instead of in twenty
+    // callback bodies.
+    rn_core::task_queue::note_callback_failed();
     report_uncaught(scope, error, false)
 }
 

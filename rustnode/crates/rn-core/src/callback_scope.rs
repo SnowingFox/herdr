@@ -46,10 +46,13 @@
 //!
 //! This module gets that order for free rather than by checking for it: the
 //! report happens inside [`with_scope`], which runs inside the libuv callback,
-//! and the microtask checkpoint is the loop's drain *between* iterations
-//! (`rn_io::Loop::tick`). A future change that drained microtasks here instead
-//! would have to move the report after it to keep this order, and the ordering
-//! test is what would notice.
+//! and the microtask checkpoint is `rn_core::task_queue`'s, run by
+//! `rn_uv::callback::with_context` as the callback returns. `with_scope` reports
+//! through `rn_errors::report_uncaught_exception`, which records the failure the
+//! checkpoint reads, so the queue a throwing callback left does not run before
+//! the report. A future change that drained microtasks here instead would have to
+//! move the report after it to keep this order, and the ordering test is what
+//! would notice.
 //!
 //! # Why the frame is passed in rather than looked up
 //!
