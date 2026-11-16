@@ -325,6 +325,35 @@ pub fn encode_utf8(units: &[u16], max: usize) -> Vec<u8> {
     out
 }
 
+/// `StringBytes::Write` for the `utf8` encoding, writing straight from the V8
+/// string into a byte buffer.
+///
+/// Node's `StringBytes::Write` (`src/string_bytes.cc:304`) calls
+/// `str->WriteUtf8V2(isolate, buf, buflen, kReplaceInvalidUtf8)` for a
+/// two-byte string of at most 32 units, and simdutf for a one-byte one. Both
+/// write into the destination buffer once and neither materialises the UTF-16
+/// code units first.
+///
+/// [`encode_utf8`] does materialise them, because its caller
+/// (`rn_uv::stream_base::write_string`) builds a `Vec<u16>` through
+/// `string_units` first and then encodes it scalar by scalar. On the HTTP
+/// response path that measured 4615 instructions per request — the largest
+/// rustnode-only cost in the whole HTTP profile, and one Node does not pay at
+/// all.
+///
+/// The output is the same bytes and the same truncation rule: `WriteUtf8V2`
+/// stops at a character boundary when the buffer is full, and
+/// `kReplaceInvalidUtf8` turns an unpaired surrogate into U+FFFD exactly as
+/// `encode_utf8`'s scalar loop does.
+pub fn write_utf8_string(scope: &v8::Isolate, text: &v8::String, max: usize) -> Vec<u8> {
+    // `StringBytes::StorageSize`'s utf8 figure, which is what the caller has
+    // always reserved: three bytes per code unit bounds any encoding of it.
+    let mut out = vec![0u8; max];
+    let written = text.write_utf8_v2(scope, &mut out, v8::WriteFlags::kReplaceInvalidUtf8, None);
+    out.truncate(written);
+    out
+}
+
 /// `StringBytes::Size` for `utf8`: the UTF-8 byte length of `units`, counted
 /// without producing the bytes.
 ///

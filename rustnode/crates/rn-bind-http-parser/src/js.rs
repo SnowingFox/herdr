@@ -70,7 +70,7 @@ pub struct HeadersCompleteArgs<'a> {
     pub version_major: c_int,
     pub version_minor: c_int,
     /// `None` when `kOnHeaders` already delivered them.
-    pub headers: Option<&'a [(Vec<u8>, Vec<u8>)]>,
+    pub headers: Option<&'a [(&'a [u8], &'a [u8])]>,
     /// The numeric method, request parsers only.
     pub method: Option<c_int>,
     /// The URL, request parsers on the fast path only.
@@ -186,7 +186,11 @@ pub fn call_no_args(parser: &mut Parser, slot: Slot) {
 ///
 /// Returns whether the call succeeded; on failure the exception is pending and
 /// the caller stops.
-pub fn call_headers(parser: &mut Parser, pairs: &[(Vec<u8>, Vec<u8>)], url: Option<&[u8]>) -> bool {
+pub fn call_headers<'a>(
+    parser: &mut Parser,
+    pairs: &[(&'a [u8], &'a [u8])],
+    url: Option<&[u8]>,
+) -> bool {
     let outcome = with_scope(parser, |parser, scope| {
         let Some(callback) = callback(scope, parser, Slot::Headers) else {
             return true;
@@ -333,20 +337,27 @@ pub fn call_headers_complete(
 
 /// Builds the flat `[name, value, ...]` array Node hands to JavaScript.
 ///
-/// Copies, as `Buffer::Copy` does: the accumulator's bytes are cleared as soon
-/// as the call returns, so a view over them would dangle.
-fn headers_array<'s>(
+/// Filled by `Array::New_with_elements`, which is Node's
+/// `Array::New(isolate, argv, argc)`: one allocation for a packed array of the
+/// exact length. Building it with `Array::new` plus `set_index` per element
+/// instead takes V8's generic element-store path — `AddDataElement`,
+/// `LookupIterator` and `AddDataProperty` per entry, with a growable backing
+/// store — which measured as a quarter of the whole parse (see
+/// `internal/fix-http-perf.md` in the project store).
+fn headers_array<'s, N, V>(
     scope: &v8::PinScope<'s, '_>,
-    pairs: &[(Vec<u8>, Vec<u8>)],
-) -> Option<v8::Local<'s, v8::Array>> {
-    let array = v8::Array::new(scope, (pairs.len() * 2) as i32);
-    for (index, (name, value)) in pairs.iter().enumerate() {
-        let name = one_byte_string(scope, name)?;
-        let value = one_byte_string(scope, value)?;
-        array.set_index(scope, (index * 2) as u32, name.into())?;
-        array.set_index(scope, (index * 2 + 1) as u32, value.into())?;
+    pairs: &[(N, V)],
+) -> Option<v8::Local<'s, v8::Array>>
+where
+    N: AsRef<[u8]>,
+    V: AsRef<[u8]>,
+{
+    let mut elements: Vec<v8::Local<'s, v8::Value>> = Vec::with_capacity(pairs.len() * 2);
+    for (name, value) in pairs {
+        elements.push(one_byte_string(scope, name.as_ref())?.into());
+        elements.push(one_byte_string(scope, value.as_ref())?.into());
     }
-    Some(array)
+    Some(v8::Array::new_with_elements(scope, &elements))
 }
 
 /// A one-byte string, which is what Node builds for header bytes.

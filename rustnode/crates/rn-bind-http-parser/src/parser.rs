@@ -829,12 +829,20 @@ impl Parser {
         // The batch is full: hand it to `kOnHeaders` and keep the name that
         // triggered this as the start of the next one.
         //
-        // The URL is read *before* the flush, because `flush_batch` clears it:
-        // `Flush()` in the C++ passes `url_` and then calls `url_.Reset()`, so
-        // the first call carries it and later ones carry an empty string.
+        // The URL is read *before* the flush, because the batch accessor retires
+        // it: `Flush()` in the C++ passes `url_` and then calls `url_.Reset()`,
+        // so the first call carries it and later ones carry an empty string.
         let url = self.accumulator.url().bytes().to_vec();
-        let batch = self.accumulator.flush_batch();
-        if js::call_headers(self, &batch, Some(&url)) {
+        // Taken out so `self` is free to be borrowed mutably by the callback,
+        // and so the pairs borrow the accumulator without copying. The spans go
+        // back through `retire_batch`, which is also what clears the URL.
+        let mut accumulator = std::mem::take(&mut self.accumulator);
+        let batch = accumulator.pairs();
+        let called = js::call_headers(self, &batch, Some(&url));
+        drop(batch);
+        accumulator.retire_batch();
+        self.accumulator = accumulator;
+        if called {
             self.accumulator.mark_flushed();
         }
         0
@@ -864,40 +872,49 @@ impl Parser {
         // `have_flushed_` means `kOnHeaders` already has the batch that was
         // accumulating, so the remaining pairs have to go the same way rather
         // than through this callback's third argument.
-        let headers = if self.accumulator.flushed() {
+        // `headers` borrows the accumulator, so the pairs are not copied here:
+        // `js::headers_array` builds the JavaScript strings straight from these
+        // spans, and `clear_pairs` runs only after the callback returned. Node's
+        // `CreateHeaders` also builds its array from the live `StringPtr`s
+        // without an intermediate copy. Collecting owned `Vec<u8>` pairs first
+        // measured as three `RawVec` allocations per request.
+        //
+        // The accumulator is moved out for the duration of the callback rather
+        // than borrowed, because `call_headers_complete` needs `&mut self` and
+        // the spans point into the accumulator's own buffers. Moving it keeps
+        // the borrow checker honest without copying: the `Vec`s move, so the
+        // bytes stay where they are.
+        let mut accumulator = std::mem::take(&mut self.accumulator);
+        let headers = if accumulator.flushed() {
             // The first `kOnHeaders` already carried the URL and `flush_batch`
             // cleared it, so this call sends an empty one — which is what
             // `url_.Reset()` at the end of `Flush()` produces.
-            let url = self.accumulator.url().bytes().to_vec();
-            let batch = self.accumulator.flush_batch();
-            if js::call_headers(self, &batch, Some(&url)) {
-                self.accumulator.mark_flushed();
+            let url = accumulator.url().bytes().to_vec();
+            let batch = accumulator.pairs();
+            let called = js::call_headers(self, &batch, Some(&url));
+            drop(batch);
+            accumulator.retire_batch();
+            if called {
+                accumulator.mark_flushed();
             }
             None
         } else {
-            Some(
-                self.accumulator
-                    .pairs()
-                    .into_iter()
-                    .map(|(name, value)| (name.to_vec(), value.to_vec()))
-                    .collect::<Vec<_>>(),
-            )
+            Some(accumulator.pairs())
         };
 
         // The URL is only passed here on the fast path; after a flush the
         // `kOnHeaders` call above already carried it.
         let url = match (&headers, is_request) {
-            (Some(_), true) => Some(self.accumulator.url().bytes().to_vec()),
+            (Some(_), true) => Some(accumulator.url().bytes()),
             _ => None,
         };
         let status_message = if is_request {
             None
         } else {
-            Some(self.accumulator.status_message().bytes().to_vec())
+            Some(accumulator.status_message().bytes())
         };
 
         self.header_pairs = 0;
-        self.accumulator.clear_pairs();
 
         // SAFETY: `llhttp` is live and mid-parse, so its fields describe the
         // message being reported.
@@ -912,20 +929,25 @@ impl Parser {
         };
         let keep_alive = self.should_keep_alive();
 
-        let decision = js::call_headers_complete(
-            self,
-            js::HeadersCompleteArgs {
-                version_major,
-                version_minor,
-                headers: headers.as_deref(),
-                method: if is_request { Some(method) } else { None },
-                url: url.as_deref(),
-                status_code: if is_request { None } else { Some(status_code) },
-                status_message: status_message.as_deref(),
-                upgrade: upgrade != 0,
-                keep_alive,
-            },
-        );
+        let args = js::HeadersCompleteArgs {
+            version_major,
+            version_minor,
+            headers: headers.as_deref(),
+            method: if is_request { Some(method) } else { None },
+            url,
+            status_code: if is_request { None } else { Some(status_code) },
+            status_message,
+            upgrade: upgrade != 0,
+            keep_alive,
+        };
+        // `headers`, `url` and `status_message` borrow `accumulator`, which is
+        // not `self`'s field right now, so `self` is free to be borrowed
+        // mutably for the call. The accumulator goes back either way.
+        let decision = js::call_headers_complete(self, args);
+        // Matches `on_headers_complete`'s effect in Node: the pairs are handed
+        // over exactly once, whatever the callback decided.
+        accumulator.clear_pairs();
+        self.accumulator = accumulator;
         match decision {
             js::HeadersComplete::Instruction(instruction) => instruction,
             // No function installed is llhttp's default: carry on.
@@ -983,9 +1005,14 @@ impl Parser {
 
         // Trailing headers go through `kOnHeaders`, as in Node.
         if !self.accumulator.is_empty() {
-            let batch = self.accumulator.flush_batch();
             let url = self.accumulator.url().bytes().to_vec();
-            if js::call_headers(self, &batch, Some(&url)) {
+            let mut accumulator = std::mem::take(&mut self.accumulator);
+            let batch = accumulator.pairs();
+            let called = js::call_headers(self, &batch, Some(&url));
+            drop(batch);
+            accumulator.retire_batch();
+            self.accumulator = accumulator;
+            if called {
                 self.accumulator.mark_flushed();
             }
         }
