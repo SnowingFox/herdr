@@ -508,9 +508,14 @@ fn copy_prefix(allocation: &Allocation, count: usize) -> Option<Allocation> {
 /// isStreamBase, onread
 /// ```
 ///
-/// `close`, `closeSync` and `releaseFD` are installed by
-/// [`crate::filehandle::constructor`] because `FileHandle::Initialize` does them
-/// itself; everything from `fd` onward is installed here.
+/// **This function owns everything from `fd` onward and nothing before it.**
+/// `close`, `closeSync` and `releaseFD` belong to
+/// [`crate::filehandle::constructor`], because `FileHandle::Initialize`
+/// (`src/node_file.cc:5827`) installs them itself, immediately before it calls
+/// `AddMethods`. `AddMethods` does not know those three exist, so installing any
+/// of them here would make the two halves disagree about who owns the surface:
+/// they would be set twice, and whichever ran last would silently win. It stayed
+/// benign only while both copies were identical.
 ///
 /// `_externalStream` is deliberately absent. It exists only for
 /// `node_wasm_web_api.cc`'s external-memory-backed stream, and nothing on the
@@ -567,14 +572,6 @@ pub fn install_stream_base(
         "writeUtf8String" => write_utf8,
         "writeUcs2String" => write_ucs2,
         "writeLatin1String" => write_latin1,
-        // `FileHandle::Initialize` installs `releaseFD` alongside `close` and
-        // `closeSync`, before `StreamBase::AddMethods` runs. `core.js`'s
-        // `onFileUnpipe` calls it on the `!stream.ownsFd` path — the
-        // `respondWithFD` family — where the descriptor belongs to the caller and
-        // must not be closed. Without it those five files die with
-        // `this.source.releaseFD is not a function` instead of exercising their
-        // subject.
-        "releaseFD" => release_fd,
     }
 
     // `t->PrototypeTemplate()->Set("isStreamBase", True(isolate))`. `lib/net.js`
