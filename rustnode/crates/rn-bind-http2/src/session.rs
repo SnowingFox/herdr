@@ -67,8 +67,23 @@ pub struct StreamRecord {
     pub peer_reset: bool,
     /// The `streamOptions` the stream was created with.
     pub options: i32,
-    /// Whether the JS side asked for trailers, from `STREAM_OPTION_GET_TRAILERS`.
-    pub want_trailers: bool,
+    /// `has_trailers()`: the JS side asked for trailers, from
+    /// `STREAM_OPTION_GET_TRAILERS`.
+    ///
+    /// This is the flag the DATA provider reads at EOF to decide whether it may
+    /// end the stream. It is set once when the stream is created — by `respond()`
+    /// or `request()` — and cleared by `OnTrailers`, exactly as
+    /// `Http2Stream::set_has_trailers` is.
+    ///
+    /// `STREAM_OPTION_AUTO_EMPTY_TRAILERS` is deliberately *not* mirrored here.
+    /// It only chooses between Node's native empty-trailer submit and the
+    /// JavaScript one, and the two produce the same frame: `SubmitTrailers` with
+    /// an empty header block calls `SubmitEmptyTrailers`, which is exactly what
+    /// `sendTrailers({})` reaches through `finishSendTrailers`. Taking the
+    /// JavaScript path is also the safer of the two here, because `sendTrailers`
+    /// defers the submit to `setImmediate` while the native path submits from
+    /// inside the provider's read callback.
+    pub has_trailers: bool,
     /// `stats_`'s `received_bytes`, for `stream.stats` if it is ever asked for.
     pub received_bytes: u64,
     /// `stats_`'s `sent_bytes`.
@@ -111,7 +126,8 @@ pub enum DeferredSubmit {
         headers: Vec<(Vec<u8>, Vec<u8>, u8)>,
         flags: u8,
     },
-    /// `nghttp2_submit_trailer`.
+    /// `SubmitTrailers`: a trailer HEADERS frame, or `SubmitEmptyTrailers`'s empty
+    /// DATA frame when the header block is empty.
     Trailer {
         stream_id: i32,
         headers: Vec<(Vec<u8>, Vec<u8>, u8)>,
@@ -853,7 +869,10 @@ fn apply_deferred(state: &SessionState, submit: DeferredSubmit) {
             }
             DeferredSubmit::Trailer { stream_id, headers } => {
                 let block = crate::headers::block_from_pairs(&headers);
-                ffi::nghttp2_submit_trailer(raw, stream_id, block.as_ptr(), block.len());
+                // The same helper the direct path uses, so the deferred and direct
+                // forms cannot disagree about an empty block becoming an empty
+                // DATA frame rather than a HEADERS frame.
+                crate::stream::submit_trailers(raw, stream_id, &block);
             }
             DeferredSubmit::Data { stream_id, flags } => {
                 let provider = crate::stream::provider::Provider::new(state, stream_id, 0);

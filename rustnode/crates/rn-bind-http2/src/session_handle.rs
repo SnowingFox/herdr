@@ -428,6 +428,10 @@ fn request(
             id: stream_id,
             category: crate::ffi::NGHTTP2_HCAT_REQUEST,
             options,
+            // `Http2Stream::Http2Stream` sets this from the same option
+            // (`src/node_http2.cc:2329`), so a client request with
+            // `waitForTrailers` gets `wantTrailers` and can `sendTrailers`.
+            has_trailers: options & crate::STREAM_OPTION_GET_TRAILERS != 0,
             ..Default::default()
         },
     );

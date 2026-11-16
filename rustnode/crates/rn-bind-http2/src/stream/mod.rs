@@ -477,6 +477,33 @@ fn get_id(
     rv.set(v8::Integer::new(scope, id).into());
 }
 
+/// `Http2Stream::EmitWantTrailers`: tell `core.js` the body is done and it may
+/// send trailers.
+///
+/// The receiver is the stream handle, because `core.js`'s `onStreamTrailers`
+/// starts with `this[kOwner]` (`lib/internal/http2/core.js:513`) and `kOwner` is
+/// set on the handle at `:2316`. [`call_stream_callback`] is what supplies that
+/// receiver and the stream's async scope, both of which Node gets from
+/// `MakeCallback`.
+///
+/// Called from the DATA provider's read callback, on nghttp2's own stack, which
+/// is where Node calls it too. That is safe because `core.js` runs
+/// `sendTrailers` through `setImmediate` (`:2612`, "Send the trailers in
+/// setImmediate so we don't do it on nghttp2 stack"), so nothing submits a frame
+/// re-entrantly. A `wantTrailers` listener is the one place user code can run
+/// here, and Node gives it the same reach.
+pub fn emit_want_trailers(session: &SessionState, stream_id: i32) {
+    let _ = rn_uv::callback::with_context(|scope| {
+        call_stream_callback(
+            scope,
+            session,
+            stream_id,
+            |callbacks| callbacks.stream_trailers.clone(),
+            &[],
+        );
+    });
+}
+
 /// `Http2Stream::Destroy`.
 fn destroy(
     _scope: &mut v8::PinScope<'_, '_>,
@@ -556,17 +583,17 @@ fn priority(
 /// `Http2Stream::DisableAutoTrailers`.
 fn disable_auto_trailers(
     _scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+    _args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_>,
 ) {
-    if let (Some(state), Some(id)) = (
-        session_of(args.this()),
-        with_state(args.this(), |handle| handle.id),
-    ) {
-        if let Some(record) = state.streams.borrow_mut().get_mut(&id) {
-            record.want_trailers = true;
-        }
-    }
+    // Node's `DisableAutoTrailers` only clears `auto_empty_trailers`
+    // (`src/node_http2.cc:3224`). That flag chooses between Node's *native*
+    // empty-trailer submit at EOF and its JavaScript one, and this crate always
+    // takes the JavaScript path (see `StreamRecord::has_trailers`), so there is no
+    // state to clear: `has_trailers` stays set either way, the EOF withholds
+    // `END_STREAM`, and `core.js` sends whatever `addTrailers` collected. Clearing
+    // `has_trailers` here would instead suppress the notification that
+    // `addTrailers` is waiting for.
 }
 
 /// Submits a header block for `id` with `flags`, returning nghttp2's status.
@@ -621,6 +648,15 @@ fn info(
 }
 
 /// `Http2Stream::Trailers`.
+///
+/// `SubmitTrailers` splits on an empty header block: a non-empty one is a trailer
+/// HEADERS frame (`nghttp2_submit_trailer`, which sets `END_STREAM`), while an
+/// empty one goes to `SubmitEmptyTrailers` (`src/node_http2.cc:2584`), which
+/// submits an *empty DATA frame* carrying `END_STREAM` instead. The difference is
+/// visible to the peer: a zero-length DATA frame is not a headers block, so the
+/// client emits no `'trailers'` event. `sendTrailers({})` and the compat layer's
+/// no-registered-trailers case both take this branch, so treating an empty block
+/// as a HEADERS frame would invent a `trailers` event Node never emits.
 fn trailers(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -651,10 +687,35 @@ fn trailers(
         rv.set(v8::Integer::new(scope, 0).into());
         return;
     }
-    // SAFETY: `raw` is live and `headers` owns its storage for the call.
-    let status = unsafe { ffi::nghttp2_submit_trailer(raw, id, headers.as_ptr(), headers.len()) };
+    let status = submit_trailers(raw, id, &headers);
     crate::session::schedule_write(state);
     rv.set(v8::Integer::new(scope, status).into());
+}
+
+/// `SubmitTrailers`'s two branches, shared with the deferred replay.
+pub(crate) fn submit_trailers(
+    raw: *mut ffi::nghttp2_session,
+    stream_id: i32,
+    block: &crate::headers::HeaderBlock,
+) -> i32 {
+    if block.is_empty() {
+        // `SubmitEmptyTrailers`: an empty DATA frame with `END_STREAM`. The
+        // provider reports EOF with no bytes, which is what makes the frame zero
+        // length rather than merely empty.
+        let provider = provider::Provider::end_stream();
+        // SAFETY: `raw` is live, `provider` outlives the call, and nghttp2 copies
+        // the provider it is given.
+        return unsafe {
+            ffi::nghttp2_submit_data2(
+                raw,
+                ffi::NGHTTP2_FLAG_END_STREAM,
+                stream_id,
+                provider.as_ptr(),
+            )
+        };
+    }
+    // SAFETY: `raw` is live and `block` owns its storage for the call.
+    unsafe { ffi::nghttp2_submit_trailer(raw, stream_id, block.as_ptr(), block.len()) }
 }
 
 /// `Http2Stream::PushPromise`.
@@ -738,6 +799,14 @@ fn respond(
     };
     let options = args.get(1).uint32_value(scope).unwrap_or(0) as i32;
     let empty_payload = options & crate::STREAM_OPTION_EMPTY_PAYLOAD != 0;
+    // `SubmitResponse` sets `has_trailers` from `STREAM_OPTION_GET_TRAILERS`
+    // before handing the provider to nghttp2 (`src/node_http2.cc:2497`), which is
+    // what the read callback consults at EOF.
+    if let Some(record) = state.streams.borrow_mut().get_mut(&id) {
+        if options & crate::STREAM_OPTION_GET_TRAILERS != 0 {
+            record.has_trailers = true;
+        }
+    }
     if state.receiving.get() {
         state
             .deferred_submits
