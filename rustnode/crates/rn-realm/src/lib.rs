@@ -178,6 +178,24 @@ fn require_internal<'s>(
 /// installed, so a module that starts working later is picked up automatically
 /// and one that does not leaves no broken global behind.
 pub fn install_early_globals(scope: &mut v8::PinScope, loaders: &Bootstrapped) {
+    // `Bun` first, and before the `require` early-return below.
+    //
+    // It is not gated on a loader because assembling it needs no Node builtin:
+    // a worker whose `require` failed should still see the global, and a script
+    // written for Bun may read `Bun.version` on its first line. It is here rather
+    // than in `install_globals` (the `bootstrap.js` hand-off) because that runs
+    // before `realm.js` and deletes its `__`-prefixed names on the way out, so a
+    // global defined there would have to be redefined afterwards anyway.
+    //
+    // A failure is reported, not fatal. Every reason it can fail is a build-time
+    // mistake in a contribution crate rather than a condition the user caused, and
+    // refusing to start would turn one missing member into an unusable runtime;
+    // the message names the member and the crate.
+    if let Err(message) = rn_bun::install(scope) {
+        eprintln!("rustnode: Bun is unavailable: {message}");
+    }
+    rn_core::profile::mark("install_bun");
+
     let Some(require) = loaders.require.as_ref() else {
         return;
     };

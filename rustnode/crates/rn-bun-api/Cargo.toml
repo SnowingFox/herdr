@@ -1,0 +1,16 @@
+[package]
+name = "rn-bun-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The contract a Bun.* contribution crate implements"
+
+[dependencies]
+# `set_method`/`set_class` are the publication primitives, and they live in the
+# kernel because the same two rules (`kThrow`, `length` 0) apply to every
+# published function in this tree. A second copy here would be a second chance to
+# get them wrong.
+rn-core.workspace = true
+rn-v8-sys.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "rn-bun"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Bun global: one object many crates contribute members to"
+
+[dependencies]
+rn-bun-api = { path = "../rn-bun-api" }
+# The global this crate installs is assembled from the contribution crates, so
+# this is the only place that has to know they all exist.
+rn-bun-members = { path = "../rn-bun-members" }
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+
+[dev-dependencies]
+# The gate's structure test and the differential probe both need a real isolate;
+# `rn-realm` is the crate that owns the bootstrap order, so the test builds the
+# same way the runtime does rather than hand-rolling a second one.
+libc.workspace = true

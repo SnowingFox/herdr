@@ -50,6 +50,16 @@ step "every opt-in control still has a verdict to report"
 step "regenerating the binding registry"
 ./tools/regen-bindings.sh
 
+step "regenerating the Bun contribution registry"
+# The same directory-driven scheme one surface over: a crate joins by declaring its
+# entry point, so no worker edits a shared member list. The matcher is a copy of the
+# one above (the two differ only in the signature they look for), so a copied-in
+# regression is real; `tools/regen-bun-contributions.test.sh` pins it, including the
+# byte-for-byte ratchet against the committed `install_all.rs`. That test compiles a
+# probe crate, so it stays opt-in; what runs here is the regeneration the build
+# below depends on.
+./tools/regen-bun-contributions.sh
+
 step "the pinned Node oracle is present"
 # Differential tests compare rustnode against a real Node, and that Node has to
 # be the one `tools/node-pin.toml` pins. Without this step they inherit whatever
@@ -298,6 +308,45 @@ step "binding functions are named as node names them, with node's length"
 ./tools/function-name-audit.test.sh
 
 python3 tools/function-name-audit.py --recorded tools/function-name-members.json
+
+step "the Bun contribution registry still refuses a collision or a contradiction"
+# `Bun` is one flat property space six workers add to at once, so the two ways a
+# member can go wrong there are silent: two crates claiming one name (the second
+# wins, the first disappears) and a crate installing a name it never declared
+# (nothing in the tree can see it, because no contract covers a global). Both are
+# refused by `rn-bun-api`'s registry rather than by a lint, so this pins that they
+# are, on a plain `BunRegistry` with no isolate.
+#
+# The mechanism test — a synthetic crate that needs no edit to `rn-bun` — compiles
+# a crate, so it stays opt-in: `./tools/regen-bun-contributions.test.sh`. What runs
+# here is the part every commit can afford.
+cargo test -p rn-bun-api -p rn-bun --tests
+
+step "the Bun surface matches its declarations and Bun 1.4.4"
+# Three sets compared: Bun 1.4.4's `Object.getOwnPropertyNames(Bun)` (recorded in
+# `tools/bun-surface.json`), the contribution registry's declarations, and the
+# shipping object on the built runtime. Four failure modes, each proven by
+# `tools/bun-surface-guard.test.sh` below rather than assumed:
+#
+#   * zero comparisons exit 2 — an empty installed or oracle set is not a pass;
+#   * declared but not installed fails — the `namespace_structure` check for this
+#     surface;
+#   * installed but not declared fails — the direction nothing else in this tree
+#     covers, since no contract describes a global;
+#   * declared but not in Bun 1.4.4 fails — a fabricated member.
+#
+# Absent members are reported with a per-tier count, not failed: every Tier-1,
+# Tier-2 and Tier-3 member not yet implemented is absent by design while the
+# surface is filled in. The tier-1 number is the remaining work.
+#
+# The test runs first, because a guard whose blindness is untested is the defect it
+# guards: it feeds the guard each defect as data and requires the exit status and
+# the diagnostic, so a guard that always printed "ok" fails here. `--live` also
+# runs the real comparison against the built binary and the recorded Bun surface, so
+# the fixtures the cases use are shown to be the shapes the real inputs have.
+./tools/bun-surface-guard.test.sh --live
+
+./tools/bun-surface-guard.py
 
 step "the cipher control still reports a void run as a void run"
 # The control's exit contract — 3 for "the build failed, so there is no
