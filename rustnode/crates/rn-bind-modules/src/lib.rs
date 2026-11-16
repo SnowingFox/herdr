@@ -57,12 +57,20 @@ mod tests;
 
 pub use install::{Modules, DEFERRED, MEMBERS};
 
-/// V8 version this runtime is pinned to, from `tools/node-pin.toml`.
+/// V8 version this runtime is **linked against**, as the engine itself reports it.
 ///
-/// Used to derive the compile cache's version tag, so a cache written by a
-/// different V8 lands in a different directory instead of being misread as
-/// compatible.
-pub const V8_VERSION: &str = "15.6.75";
+/// This is not a constant because a constant was wrong: it said `"15.6.75"`,
+/// which is the version Node's pin names, while the linked engine reports
+/// `15.2.124.1-rusty`. Its only consumer is the compile cache's version tag, and
+/// that tag exists to stop two runtimes with different engines sharing a cache
+/// directory — so a value transcribed from a different engine defeats the
+/// property it is there to provide.
+///
+/// Read from V8 rather than restated, the way `HEAP_SPACES` now comes from the
+/// isolate instead of a table.
+pub fn v8_version() -> &'static str {
+    rn_v8_sys::v8::V8::get_version()
+}
 
 /// Registers the `modules` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
