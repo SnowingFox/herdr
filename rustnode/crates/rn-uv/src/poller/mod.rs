@@ -61,6 +61,33 @@ mod uring;
 
 use libuv_sys2 as uv;
 
+/// Whether the kernel will grant an `io_uring` ring at all.
+///
+/// This is a *capability* probe, not a statement about which backend a loop
+/// installed: it asks `io_uring_setup(2)` once and closes what it gets. It
+/// exists so a test can tell "this kernel has no io_uring" from "the request was
+/// ignored", which are otherwise indistinguishable from the outside and are very
+/// different defects. A machine with an old kernel, a seccomp policy or
+/// `kernel.io_uring_disabled` answers `false` here and is fine; a machine that
+/// answers `true` here and still reports `Epoll` after being asked for io_uring
+/// has a bug in this crate.
+///
+/// It is deliberately not `Readiness::install`: installing would put a ring in
+/// the registry for a loop the caller has not created, and the probe's answer
+/// would then depend on what the caller did earlier.
+pub fn kernel_supports_io_uring() -> bool {
+    #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+    {
+        uring::Ring::new().is_ok()
+    }
+    #[cfg(not(all(target_os = "linux", not(target_arch = "wasm32"))))]
+    {
+        // io_uring is Linux-only, and the non-Linux builds of this crate do not
+        // link the syscall at all.
+        false
+    }
+}
+
 /// Which readiness backend a loop waits with.
 ///
 /// `Epoll` is what every loop uses unless `HERDR_URING=1` asked for io_uring and

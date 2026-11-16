@@ -10,10 +10,21 @@
 //!
 //! `HERDR_URING` is read once per loop, and the loop is process-global, so a test
 //! cannot switch backends after the first one is created. Instead, each test
-//! asserts on what `Readiness::poller()` reports and skips itself when the
-//! environment asked for the other backend. The suite is run twice — once without
-//! the variable and once with it — so both paths are covered by the same
-//! assertions rather than by two tests that could drift apart.
+//! asserts on what `Readiness::install` actually installed and skips itself when
+//! the environment asked for the other backend. The suite is run twice — once
+//! without the variable and once with it — so both paths are covered by the same
+//! assertions rather than by two tests that could drift apart. That second run is
+//! `tools/check.sh`'s io_uring step; before it existed the header said "run twice"
+//! and nothing ran it twice.
+//!
+//! # What "installed" has to mean here
+//!
+//! [`installed_poller`] reads `rn_uv::poller::installed_backend()`, which records
+//! what `Installed::install` produced, and never `Poller::from_env()`, which
+//! reports what `HERDR_URING` *requested*. The distinction only matters when a
+//! ring cannot be created — which is exactly the path the io_uring backend is
+//! most likely to be wrong on — so a test that asked `from_env()` would compare
+//! the request against itself and pass through the fallback it exists to catch.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -34,11 +45,6 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
     // A panic while the lock is held would otherwise poison it and turn every
     // later test into a second, unrelated failure.
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// Whether this process was started asking for io_uring.
-fn wants_uring() -> bool {
-    rn_uv::poller::Poller::from_env() == rn_uv::poller::Poller::IoUring
 }
 
 /// Ensures a readiness backend has been installed for this thread's loop.
@@ -158,12 +164,46 @@ fn the_requested_backend_is_the_installed_one() {
             rn_uv::poller::Poller::Epoll,
             "epoll must be the backend when nothing asked for io_uring"
         );
+        return;
     }
-    if wants_uring() {
-        // Either the ring was granted or the kernel refused it; both are
-        // supported, and this records which one this host is.
-        eprintln!("HERDR_URING=1 installed the {} backend", installed.name());
+
+    // io_uring was requested, and `installed_poller()` now reports what
+    // `Readiness::install` really produced rather than what was asked for. That
+    // fixes the self-comparison, but on its own it still accepts either outcome:
+    // "the kernel refused a ring" and "the request was ignored" both leave epoll
+    // installed, and the second is a defect while the first is a host capability.
+    //
+    // `kernel_supports_io_uring` is what separates them. It probes
+    // `io_uring_setup(2)` directly and closes the ring, so it answers a question
+    // about this kernel rather than about what this crate decided. Without this
+    // assertion the gate step that runs the suite with `HERDR_URING=1` could pass
+    // on a build where `install` discarded the request outright: measured on such
+    // a build, the rest of the suite passes 5/5 because every other test only
+    // needs *a* working backend.
+    //
+    // A host that refuses a ring still passes, and says so; making the gate depend
+    // on a kernel feature would fail machines for a reason they cannot fix.
+    if !rn_uv::poller::kernel_supports_io_uring() {
+        assert_eq!(
+            installed,
+            rn_uv::poller::Poller::Epoll,
+            "a kernel that refuses a ring must report the epoll fallback, not io_uring"
+        );
+        eprintln!(
+            "HERDR_URING=1 asked for io_uring, but this kernel refused a ring \
+             (old kernel, seccomp, or kernel.io_uring_disabled); epoll was installed \
+             as documented. The io_uring path was NOT measured on this host."
+        );
+        return;
     }
+
+    assert_eq!(
+        installed,
+        rn_uv::poller::Poller::IoUring,
+        "this kernel grants io_uring rings and HERDR_URING=1 asked for one, so epoll \
+         being installed means the request was ignored"
+    );
+    eprintln!("HERDR_URING=1 installed the {} backend", installed.name());
 }
 
 #[test]

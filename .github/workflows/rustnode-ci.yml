@@ -205,6 +205,17 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # `tools/check.sh` runs the options drift check, but this job never invokes
+      # the gate as a whole (`cargo test --workspace` above is its own step), so
+      # without this the check would exist and not run in CI either. The Node
+      # source is fetched rather than assumed: a missing tree must not read as a
+      # pass, which is the defect the step itself exists to close.
+      - name: Options table matches the pinned Node sources
+        run: |
+          ./tools/check-options-drift.py --self-test
+          source_dir=$(./tools/fetch-node-src.sh)
+          ./tools/check-options-drift.py --node-src "$source_dir"
+
       # `--baseline` is the coverage ratchet, and this step is the only place CI
       # can enforce it. Without it the check tolerates every unregistered
       # namespace, so a namespace that used to cover its contract could drop to

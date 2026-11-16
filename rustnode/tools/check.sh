@@ -173,22 +173,37 @@ step "the per-context globals still behave as Node's do"
 # nothing after the self-test noticed.
 ./tools/per-context-control.sh
 
-step "calling a binding constructor without new never aborts the process"
+step "calling a binding constructor without new matches Node's answer"
 # `SecureContext()` aborted with `SetAlignedPointerInInternalField: Internal
 # field out of bounds` at 100 of 100 runs before its `new.target` guard, and the
 # same shape existed in a dozen other constructors. The audit walks every
 # constructor the registry installs, one child process per case, because an
 # abort in-process would take the runner with it and silently skip the rest.
 #
-# `--no-oracle` is the half of the rule that needs no Node binary: a plain call
-# may throw or return `undefined`, but it may not kill the process. The other
-# half -- whether returning at all is right -- needs Node to answer `[[Construct]]`
-# and lives in `tools/no-new-negative-control.sh`, which is opt-in because it
-# rebuilds twice.
+# This step judges the *value*, not only the crash. Its earlier form was
+# `--no-oracle`, and that mode could only ask "did the process survive?": a
+# plain call may throw or return `undefined` and both read as `ok` there.
+# `tls_wrap.TLSWrap` returning `undefined` where Node aborts, and `uv.errname`
+# returning `undefined` where Node returns a string, were both invisible to it.
+# Measured both ways on a build with `errname` mutated to return `undefined`:
+# the old mode printed `ok` for all 486 members, the current one prints
+# `BAD: return type: node string, rustnode undefined` and exits 1.
+#
+# It now reads the oracle's answers from `tools/no-new-expectations.json` (the
+# `--no-oracle` half) *and* re-derives them from the live pinned oracle in the
+# same run, which is what keeps the recording from rotting into a statement
+# about rustnode. The oracle is guaranteed by the step earlier in this script.
+#
+# What is still not covered, stated here because the difference matters: a
+# constructor rustnode installs that the oracle does not is judged for crashes
+# only, since there is no Node answer to compare the call against. There are
+# 407 of those today, and the summary line above prints that count so it cannot
+# be mistaken for full coverage. `namespace_structure` owns whether they should
+# be constructible at all.
 #
 # It runs after the build because it execs the binary, and before the cipher
 # self-test for the same mode-bit reason as the two controls above.
-python3 tools/no-new-audit.py --no-oracle
+python3 tools/no-new-audit.py
 
 step "binding members accept new exactly when node's do"
 # Node builds every `SetMethod`/`SetProtoMethod` function with
@@ -259,6 +274,59 @@ fi
 if [ "$quick" -eq 0 ]; then
   step "running the workspace tests"
   cargo test --workspace
+fi
+
+step "the io_uring readiness backend is exercised, not just requested"
+# `crates/rn-uv/tests/readiness_backends.rs` says in its own header that "the
+# suite is run twice — once without the variable and once with it". Nothing ran
+# it the second time: no gate step and no workflow ever set `HERDR_URING`, so
+# `cargo test --workspace` above covers only the epoll path, and `README.md`
+# advertises io_uring as an opt-in a user can turn on. The claim was documented
+# and unmeasured (CLA-234).
+#
+# The suite is also what makes the second run meaningful, and it now takes both
+# halves of that. #130 gave the helper `rn_uv::poller::installed_backend()`, which
+# records what `Installed::install` really produced, so it no longer compares
+# `Poller::from_env()` — the request — against itself. That makes a silent
+# fallback to epoll *visible*. It does not make it *fail*: a kernel that refuses
+# a ring and a request that was ignored both leave epoll installed, and the
+# assertion accepted either.
+#
+# So `the_requested_backend_is_the_installed_one` also probes
+# `rn_uv::poller::kernel_supports_io_uring()`, which asks `io_uring_setup(2)`
+# directly. With `HERDR_URING=1` and a kernel that grants rings, an epoll
+# installation is a defect and fails. Measured on a build whose `install`
+# discards the request: #130's assertion alone passes 5/5 (it prints "installed
+# the epoll backend" and accepts it); with the probe it fails on the exact
+# member, `Epoll` vs `IoUring`.
+#
+# Three outcomes are distinguished, and the distinction is the point:
+#
+#   * the second run passes and installed io_uring — the backend is covered;
+#   * the kernel refuses a ring (old kernel, seccomp, `io_uring_disabled`) — the
+#     test says so, this step reports it, and the gate does NOT fail: making the
+#     gate depend on a kernel feature would fail machines for a reason they
+#     cannot fix, and is exactly how a step gets switched off;
+#   * the kernel grants rings and the request was ignored — the test fails, and
+#     so does this step.
+#
+# A silent skip would recreate the defect, so the middle case is printed loudly
+# and the marker it prints is what this step keys on. If the suite stops printing
+# either marker the step fails, because then it can no longer say which case it
+# was in.
+uring_log="$(mktemp)"
+trap 'rm -f "$uring_log"' EXIT
+HERDR_URING=1 cargo test -p rn-uv --test readiness_backends -- --nocapture 2>&1 | tee "$uring_log"
+if grep -q "installed the io_uring backend" "$uring_log"; then
+  echo "io_uring backend: installed and exercised by the suite above"
+elif grep -q "this kernel refused a ring" "$uring_log"; then
+  echo "io_uring backend: NOT MEASURED on this host — the kernel refused a ring,"
+  echo "io_uring backend: and the suite verified the documented epoll fallback instead."
+  echo "io_uring backend: this is a host capability, not a code defect, so the gate passes."
+else
+  echo "io_uring backend: the suite reported neither an installed ring nor a refused one," >&2
+  echo "io_uring backend: so it cannot say which backend it measured. Failing." >&2
+  exit 1
 fi
 
 step "formatting"
@@ -373,5 +441,31 @@ step "the vendored certdata.txt is the one this was generated from"
 # changed trust store that was regenerated from would pass `--check` and still
 # be a different set of roots from the one Node ships.
 python3 tools/verify-certdata.py
+
+step "the options table is what the pinned Node sources generate"
+# `gen-options.py --check` has always existed and no gate step ran it, so the
+# table could fall arbitrarily far behind `src/node_options.cc` while every
+# check stayed green; it was two entries stale when this step was added
+# (CLA-213). The generator needs a Node source tree, so this fetch brings one in
+# (cached, `src/`-shaped, pinned by `tools/node-pin.toml`) rather than skipping.
+#
+# The two entries that differ today are a recorded decision, not a bug: making
+# the committed table match the generator would change `getCLIOptionsValues`
+# and `process.features`, which belongs to its own change. They are named
+# individually in `tools/check-options-drift.py` with the exact fields and
+# values that may differ, and that entry list ratchets: a third entry drifting,
+# a named entry drifting in another field, or a named entry that stops
+# differing all fail. The self-test runs first, because an allowance mechanism
+# that cannot reject drift is the same defect one layer up.
+python3 tools/check-options-drift.py --self-test
+options_node_src="${NODE_SRC:-}"
+if [ -z "$options_node_src" ]; then
+  # Not `|| true`: a fetch failure here means the table cannot be compared, and
+  # silently continuing would be the exact defect this step closes. The fetcher's
+  # message says to set NODE_SRC, which is the way out on a machine with no
+  # network and a checkout elsewhere.
+  options_node_src="$(./tools/fetch-node-src.sh)"
+fi
+python3 tools/check-options-drift.py --node-src "$options_node_src"
 
 printf '\nall checks passed\n'

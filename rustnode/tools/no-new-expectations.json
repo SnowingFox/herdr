@@ -1,0 +1,319 @@
+{
+  "_comment": "The pinned oracle's answer to `call this constructor without new`, recorded by `tools/no-new-audit.py --record`. `--no-oracle` judges against this; every live-oracle run re-derives it and fails on a mismatch, so it cannot drift into a permanent excuse.",
+  "constructors": {
+    "block_list.BlockList": {
+      "kind": "aborted"
+    },
+    "block_list.SocketAddress": {
+      "kind": "aborted"
+    },
+    "cares_wrap.ChannelWrap": {
+      "kind": "aborted"
+    },
+    "cares_wrap.GetAddrInfoReqWrap": {
+      "kind": "aborted"
+    },
+    "cares_wrap.GetNameInfoReqWrap": {
+      "kind": "aborted"
+    },
+    "cares_wrap.QueryReqWrap": {
+      "kind": "aborted"
+    },
+    "contextify.ContextifyScript": {
+      "kind": "aborted"
+    },
+    "crypto.AESCipherJob": {
+      "kind": "aborted"
+    },
+    "crypto.Argon2Job": {
+      "kind": "aborted"
+    },
+    "crypto.ChaCha20Poly1305CipherJob": {
+      "kind": "aborted"
+    },
+    "crypto.CheckPrimeJob": {
+      "kind": "aborted"
+    },
+    "crypto.CipherBase": {
+      "kind": "aborted"
+    },
+    "crypto.DHBitsJob": {
+      "kind": "aborted"
+    },
+    "crypto.DhKeyPairGenJob": {
+      "kind": "aborted"
+    },
+    "crypto.DiffieHellman": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "crypto.DiffieHellmanGroup": {
+      "kind": "aborted"
+    },
+    "crypto.DsaKeyPairGenJob": {
+      "kind": "aborted"
+    },
+    "crypto.ECDH": {
+      "kind": "aborted"
+    },
+    "crypto.EcKeyPairGenJob": {
+      "kind": "aborted"
+    },
+    "crypto.HKDFJob": {
+      "kind": "aborted"
+    },
+    "crypto.Hash": {
+      "kind": "aborted"
+    },
+    "crypto.HashJob": {
+      "kind": "aborted"
+    },
+    "crypto.Hmac": {
+      "kind": "aborted"
+    },
+    "crypto.HmacJob": {
+      "kind": "aborted"
+    },
+    "crypto.KEMDecapsulateJob": {
+      "kind": "aborted"
+    },
+    "crypto.KEMEncapsulateJob": {
+      "kind": "aborted"
+    },
+    "crypto.KangarooTwelveJob": {
+      "kind": "aborted"
+    },
+    "crypto.KeyObjectHandle": {
+      "kind": "aborted"
+    },
+    "crypto.KmacJob": {
+      "kind": "aborted"
+    },
+    "crypto.Mac": {
+      "kind": "aborted"
+    },
+    "crypto.NamedKeyPairGenJob": {
+      "kind": "aborted"
+    },
+    "crypto.PBKDF2Job": {
+      "kind": "aborted"
+    },
+    "crypto.RSACipherJob": {
+      "kind": "aborted"
+    },
+    "crypto.RandomBytesJob": {
+      "kind": "aborted"
+    },
+    "crypto.RandomPrimeJob": {
+      "kind": "aborted"
+    },
+    "crypto.RsaKeyPairGenJob": {
+      "kind": "aborted"
+    },
+    "crypto.ScryptJob": {
+      "kind": "aborted"
+    },
+    "crypto.SecretKeyGenJob": {
+      "kind": "aborted"
+    },
+    "crypto.SecureContext": {
+      "kind": "aborted"
+    },
+    "crypto.Sign": {
+      "kind": "aborted"
+    },
+    "crypto.SignJob": {
+      "kind": "aborted"
+    },
+    "crypto.TurboShakeJob": {
+      "kind": "aborted"
+    },
+    "crypto.Verify": {
+      "kind": "aborted"
+    },
+    "fs.CpDirJob": {
+      "kind": "aborted"
+    },
+    "fs.FSReqCallback": {
+      "kind": "aborted"
+    },
+    "fs.FileHandle": {
+      "kind": "aborted"
+    },
+    "fs.ReadFileJob": {
+      "kind": "aborted"
+    },
+    "fs.StatWatcher": {
+      "kind": "aborted"
+    },
+    "fs.WriteFileJob": {
+      "kind": "aborted"
+    },
+    "fs_dir.DirHandle": {
+      "kind": "aborted"
+    },
+    "fs_event_wrap.FSEvent": {
+      "kind": "aborted"
+    },
+    "http2.Http2Session": {
+      "kind": "aborted"
+    },
+    "http2.Http2Stream": {
+      "kind": "return",
+      "returned": "object"
+    },
+    "http_parser.ConnectionsList": {
+      "kind": "aborted"
+    },
+    "http_parser.HTTPParser": {
+      "kind": "aborted"
+    },
+    "inspector.Connection": {
+      "kind": "aborted"
+    },
+    "inspector.MainThreadConnection": {
+      "kind": "aborted"
+    },
+    "js_stream.JSStream": {
+      "kind": "aborted"
+    },
+    "messaging.DOMException": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "messaging.MessageChannel": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "messaging.MessagePort": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "messaging.QuotaExceededError": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "module_wrap.ModuleWrap": {
+      "kind": "aborted"
+    },
+    "performance.Histogram": {
+      "kind": "aborted"
+    },
+    "performance.SlidingWindowHistogram": {
+      "kind": "aborted"
+    },
+    "pipe_wrap.Pipe": {
+      "kind": "aborted"
+    },
+    "pipe_wrap.PipeConnectWrap": {
+      "kind": "aborted"
+    },
+    "process_methods.resetStdioForTesting": {
+      "kind": "return",
+      "returned": "undefined"
+    },
+    "process_wrap.Process": {
+      "kind": "aborted"
+    },
+    "serdes.Deserializer": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "serdes.Serializer": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "signal_wrap.Signal": {
+      "kind": "aborted"
+    },
+    "sqlite.Database": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "sqlite.Session": {
+      "errorName": "Error",
+      "kind": "throw"
+    },
+    "sqlite.Statement": {
+      "errorName": "Error",
+      "kind": "throw"
+    },
+    "sqlite.backup": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "stream_pipe.StreamPipe": {
+      "kind": "aborted"
+    },
+    "stream_wrap.ShutdownWrap": {
+      "kind": "aborted"
+    },
+    "stream_wrap.WriteWrap": {
+      "kind": "aborted"
+    },
+    "tcp_wrap.TCP": {
+      "kind": "aborted"
+    },
+    "tcp_wrap.TCPConnectWrap": {
+      "kind": "aborted"
+    },
+    "tls_wrap.TLSWrap": {
+      "kind": "aborted"
+    },
+    "trace_events.CategorySet": {
+      "kind": "aborted"
+    },
+    "tty_wrap.TTY": {
+      "kind": "aborted"
+    },
+    "udp_wrap.SendWrap": {
+      "kind": "aborted"
+    },
+    "udp_wrap.UDP": {
+      "kind": "aborted"
+    },
+    "url_pattern.URLPattern": {
+      "errorName": "TypeError",
+      "kind": "throw"
+    },
+    "util.isDataView": {
+      "kind": "return",
+      "returned": "boolean"
+    },
+    "util.isTypedArray": {
+      "kind": "return",
+      "returned": "boolean"
+    },
+    "util.isUint8Array": {
+      "kind": "return",
+      "returned": "boolean"
+    },
+    "uv.errname": {
+      "kind": "return",
+      "returned": "string"
+    },
+    "v8.GCProfiler": {
+      "kind": "aborted"
+    },
+    "worker.Worker": {
+      "kind": "aborted"
+    },
+    "zlib.BrotliDecoder": {
+      "kind": "aborted"
+    },
+    "zlib.BrotliEncoder": {
+      "kind": "aborted"
+    },
+    "zlib.Zlib": {
+      "kind": "aborted"
+    },
+    "zlib.ZstdCompress": {
+      "kind": "aborted"
+    },
+    "zlib.ZstdDecompress": {
+      "kind": "aborted"
+    }
+  },
+  "oracle": "/tmp/oracle-dl/node-v28.0.0-nightly20261111e8c1160d20-linux-x64/bin/node",
+  "oracle_version": "v28.0.0-nightly20261111e8c1160d20"
+}
