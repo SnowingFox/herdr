@@ -12,6 +12,7 @@
 
 use crate::db::OpenConfiguration;
 use crate::value::{IntMode, Value, MAX_SAFE_INTEGER};
+use rn_v8_sys::v8;
 
 #[test]
 fn open_configuration_defaults_match_node_not_sqlite() {
@@ -156,21 +157,50 @@ fn url_classification_separates_the_three_failure_modes() {
 }
 
 #[test]
-fn the_namespace_members_match_the_contract() {
-    // `contracts/sqlite.json` records exactly these five. `lib/sqlite.js`
-    // destructures all five at module scope, so a missing one leaves it
-    // `undefined` at export time.
+fn install_produces_exactly_the_declared_members() {
+    // `rn-compat` compares `MEMBERS` against the *contract*, never against the
+    // object `install()` built, so a member that is claimed but not installed is
+    // invisible to it. `backup` was exactly that: listed in `MEMBERS` and in
+    // `DEFERRED`, never set by `install()`, and the contract check still called
+    // the namespace complete. This test is the missing reconciliation.
+    let mut installed = installed_keys();
+    installed.sort();
+    let mut declared: Vec<String> = crate::MEMBERS.iter().map(|name| name.to_string()).collect();
+    declared.sort();
     assert_eq!(
-        crate::MEMBERS,
-        &["Database", "Session", "Statement", "backup", "constants"]
+        installed, declared,
+        "install() must produce exactly MEMBERS; a claimed-but-absent member \
+         passes the contract check because MEMBERS is what it reads"
     );
 }
 
+/// The own property names `install()` puts on the namespace object.
+fn installed_keys() -> Vec<String> {
+    crate::testsupport::with_context(|scope| {
+        let mut async_ids = rn_core::AsyncIds::new();
+        let mut ctx = rn_core::InstallCtx {
+            async_ids: &mut async_ids,
+        };
+        let object =
+            <crate::Sqlite as rn_core::BindingModule>::install(&crate::Sqlite, scope, &mut ctx)
+                .expect("install the sqlite namespace");
+        let names = object
+            .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
+            .expect("own property names");
+        (0..names.length())
+            .filter_map(|index| names.get_index(scope, index))
+            .filter_map(|value| v8::Local::<v8::String>::try_from(value).ok())
+            .map(|name| name.to_rust_string_lossy(scope))
+            .collect()
+    })
+}
+
 #[test]
-fn backup_is_declared_deferred_with_a_reason() {
-    // The contract check treats a declared deferral as satisfied, which is
-    // honest only if the declaration is real. This pins that `backup` is the one
-    // gap and that it carries a reason rather than an empty string.
+fn backup_is_declared_deferred_and_not_claimed_installed() {
+    // The contract check treats a declared deferral as satisfied, which is honest
+    // only if the declaration is real. `backup` is the one gap, it carries a
+    // reason rather than an empty string, and it must not also appear in
+    // `MEMBERS` — that double claim is what hid its absence.
     assert_eq!(crate::DEFERRED.len(), 1);
     let (member, reason) = crate::DEFERRED[0];
     assert_eq!(member, "backup");
@@ -178,12 +208,12 @@ fn backup_is_declared_deferred_with_a_reason() {
         reason.len() > 40,
         "a deferral needs a real reason, not a placeholder"
     );
-    // Every declared member must be installed or deferred, never both, and the
-    // two sets together must cover the contract exactly.
+    assert!(
+        !crate::MEMBERS.contains(&"backup"),
+        "a member that is both claimed installed and deferred is only ever checked as a claim"
+    );
+    // Every installed member must be genuinely installed, never deferred.
     for member in crate::MEMBERS {
-        if *member == "backup" {
-            continue;
-        }
         assert!(
             !crate::DEFERRED
                 .iter()
