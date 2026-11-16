@@ -162,6 +162,41 @@ fn cases() -> Vec<Case> {
             expected: "all-present",
         },
         Case {
+            name: "the key encoding constants are node's numbers",
+            // These four are `static_cast<int>(PKEncodingType)` in
+            // `crypto_keys.cc`, and `keys.js` compares against them, so the
+            // numbers are observable through `node --expose-internals`:
+            // `console.log(b.kKeyEncodingPKCS1, ...)` prints `0 1 2 3`.
+            //
+            // A shifted table is invisible to a round trip inside one runtime —
+            // exporting and re-importing agree with each other — which is how
+            // the previous numbering survived. Only the absolute values catch
+            // it, so that is what this asserts.
+            source: r#"
+                return [binding.kKeyEncodingPKCS1, binding.kKeyEncodingPKCS8,
+                        binding.kKeyEncodingSPKI, binding.kKeyEncodingSEC1].join(' ');
+            "#,
+            expected: "0 1 2 3",
+        },
+        Case {
+            name: "the key format and key type constants are on the namespace",
+            // NOT an assertion that they equal Node's numbers. Both tables are
+            // shifted from `PKFormatType`/`KeyType` in this build (DER is 1 here
+            // and 0 in Node, `kKeyTypeSecret` is 1 here and 0 in Node), which is
+            // the same class of defect as the encoding table fixed alongside
+            // this case — but it is a different pair of tables and a separate
+            // change, so this pins only that they are installed and integral
+            // rather than freezing the current values as correct.
+            source: r#"
+                const values = [binding.kKeyFormatDER, binding.kKeyFormatPEM,
+                                binding.kKeyFormatJWK, binding.kKeyTypeSecret,
+                                binding.kKeyTypePublic, binding.kKeyTypePrivate];
+                return values.every((value) => Number.isInteger(value)) ? 'integral'
+                  : 'not-integral: ' + values.join(',');
+            "#,
+            expected: "integral",
+        },
+        Case {
             name: "SHA-256 of \"abc\" is the FIPS 180-4 value",
             source: r#"
                 const handle = new binding.Hash('sha256', undefined, -1, {});

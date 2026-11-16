@@ -301,10 +301,11 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rn_crypto_openssl::EcPointForm;
 
     #[test]
     fn a_pem_input_reads_format_and_a_null_type() {
-        let values = Values::new(vec![Value::Int32(2), Value::Null]);
+        let values = Values::new(vec![Value::Int32(KeyFormat::Pem.as_raw()), Value::Null]);
         let mut offset = 0;
         let read = read_format_and_type(&values, &mut offset, EncodingContext::Input)
             .expect("a PEM input is legal");
@@ -316,7 +317,10 @@ mod tests {
 
     #[test]
     fn a_der_export_reads_its_type() {
-        let values = Values::new(vec![Value::Int32(1), Value::Int32(3)]);
+        let values = Values::new(vec![
+            Value::Int32(KeyFormat::Der.as_raw()),
+            Value::Int32(KeyEncoding::Spki.as_raw()),
+        ]);
         let mut offset = 0;
         let read = read_format_and_type(&values, &mut offset, EncodingContext::Export)
             .expect("DER with SPKI is legal");
@@ -356,7 +360,10 @@ mod tests {
     #[test]
     fn a_half_specified_encoding_is_rejected() {
         // Format present, type `undefined`: Node's two CHECKs both fail.
-        let values = Values::new(vec![Value::Int32(2), Value::Undefined]);
+        let values = Values::new(vec![
+            Value::Int32(KeyFormat::Pem.as_raw()),
+            Value::Undefined,
+        ]);
         let mut offset = 0;
         assert_eq!(
             read_format_and_type(&values, &mut offset, EncodingContext::Generate).err(),
@@ -372,7 +379,10 @@ mod tests {
             read_format_and_type(&values, &mut offset, EncodingContext::Input).err(),
             Some(EncodingError::UnknownFormat)
         );
-        let values = Values::new(vec![Value::Int32(1), Value::Int32(99)]);
+        let values = Values::new(vec![
+            Value::Int32(KeyFormat::Der.as_raw()),
+            Value::Int32(99),
+        ]);
         let mut offset = 0;
         assert_eq!(
             read_format_and_type(&values, &mut offset, EncodingContext::Export).err(),
@@ -384,7 +394,7 @@ mod tests {
     fn an_export_without_a_type_is_rejected() {
         // A DER export must name SPKI, PKCS#8, PKCS#1 or SEC1; there is nothing
         // to infer it from.
-        let values = Values::new(vec![Value::Int32(1), Value::Null]);
+        let values = Values::new(vec![Value::Int32(KeyFormat::Der.as_raw()), Value::Null]);
         let mut offset = 0;
         assert_eq!(
             read_format_and_type(&values, &mut offset, EncodingContext::Export).err(),
@@ -394,7 +404,12 @@ mod tests {
 
     #[test]
     fn a_raw_format_reads_the_point_form_from_the_type_slot() {
-        let values = Values::new(vec![Value::Int32(4), Value::Int32(2)]);
+        // `point_conversion_form_t` numbers, which are OpenSSL's and are a
+        // different table from `kKeyEncoding*`.
+        let values = Values::new(vec![
+            Value::Int32(KeyFormat::RawPublic.as_raw()),
+            Value::Int32(EcPointForm::Compressed.as_raw()),
+        ]);
         let mut offset = 0;
         let read = read_format_and_type(&values, &mut offset, EncodingContext::Export)
             .expect("a raw public export is legal");
@@ -405,7 +420,10 @@ mod tests {
 
     #[test]
     fn a_raw_format_accepts_a_null_point_form() {
-        let values = Values::new(vec![Value::Int32(5), Value::Null]);
+        let values = Values::new(vec![
+            Value::Int32(KeyFormat::RawPrivate.as_raw()),
+            Value::Null,
+        ]);
         let mut offset = 0;
         let read = read_format_and_type(&values, &mut offset, EncodingContext::Export)
             .expect("raw-private has no point form");
@@ -416,8 +434,8 @@ mod tests {
     #[test]
     fn an_export_reads_its_cipher_and_passphrase() {
         let values = Values::new(vec![
-            Value::Int32(2),
-            Value::Int32(2),
+            Value::Int32(KeyFormat::Pem.as_raw()),
+            Value::Int32(KeyEncoding::Pkcs8.as_raw()),
             Value::String("aes-256-cbc".to_string()),
             Value::Bytes(b"secret".to_vec()),
         ]);
@@ -444,7 +462,7 @@ mod tests {
         // all, because whether the key is encrypted is a fact in its own PEM
         // header rather than something the caller chooses.
         let values = Values::new(vec![
-            Value::Int32(2),
+            Value::Int32(KeyFormat::Pem.as_raw()),
             Value::Null,
             Value::Bytes(b"secret".to_vec()),
         ]);
@@ -467,8 +485,8 @@ mod tests {
     #[test]
     fn a_passphrase_without_a_cipher_is_rejected_on_export() {
         let values = Values::new(vec![
-            Value::Int32(2),
-            Value::Int32(2),
+            Value::Int32(KeyFormat::Pem.as_raw()),
+            Value::Int32(KeyEncoding::Pkcs8.as_raw()),
             Value::Null,
             Value::Bytes(b"secret".to_vec()),
         ]);
@@ -492,8 +510,8 @@ mod tests {
     #[test]
     fn a_cipher_without_a_passphrase_is_rejected() {
         let values = Values::new(vec![
-            Value::Int32(2),
-            Value::Int32(2),
+            Value::Int32(KeyFormat::Pem.as_raw()),
+            Value::Int32(KeyEncoding::Pkcs8.as_raw()),
             Value::String("aes-128-cbc".to_string()),
             Value::Null,
         ]);
@@ -516,7 +534,7 @@ mod tests {
     #[test]
     fn a_raw_format_rejects_a_cipher() {
         let values = Values::new(vec![
-            Value::Int32(5),
+            Value::Int32(KeyFormat::RawPrivate.as_raw()),
             Value::Null,
             Value::String("aes-128-cbc".to_string()),
             Value::Null,
@@ -560,7 +578,7 @@ mod tests {
         // Node's `args[i]` is `undefined` past the end, and the walk relies on
         // that: a short list has to fail the same CHECK a wrong one does, not
         // index out of bounds.
-        let values = Values::new(vec![Value::Int32(2)]);
+        let values = Values::new(vec![Value::Int32(KeyFormat::Pem.as_raw())]);
         let mut offset = 0;
         let read = read_format_and_type(&values, &mut offset, EncodingContext::Input)
             .expect("a null type past the end is undefined");

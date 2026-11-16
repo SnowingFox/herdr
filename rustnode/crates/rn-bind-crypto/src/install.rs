@@ -423,13 +423,20 @@ mod constants {
     pub const K_CRYPTO_JOB_WEB_CRYPTO: i32 = 2;
 
     /// `kKeyEncodingPKCS1`.
-    pub const K_KEY_ENCODING_PKCS1: i32 = 1;
+    ///
+    /// `crypto_keys.cc` derives these four from `EVPKeyPointer::PKEncodingType`
+    /// with `static_cast<int>`, so they are that enum's declaration order in
+    /// `deps/ncrypto/ncrypto.h`: `PKCS1, PKCS8, SPKI, SEC1`. They are observable
+    /// through `internalBinding('crypto')` and are the values `keys.js` compares
+    /// against, so they have to match even though nothing outside this crate and
+    /// that JavaScript is meant to read them.
+    pub const K_KEY_ENCODING_PKCS1: i32 = 0;
     /// `kKeyEncodingPKCS8`.
-    pub const K_KEY_ENCODING_PKCS8: i32 = 2;
+    pub const K_KEY_ENCODING_PKCS8: i32 = 1;
     /// `kKeyEncodingSEC1`.
     pub const K_KEY_ENCODING_SEC1: i32 = 3;
     /// `kKeyEncodingSPKI`.
-    pub const K_KEY_ENCODING_SPKI: i32 = 4;
+    pub const K_KEY_ENCODING_SPKI: i32 = 2;
 
     /// `kKeyFormatDER`.
     pub const K_KEY_FORMAT_DER: i32 = 1;
