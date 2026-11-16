@@ -511,10 +511,10 @@ console.log(JSON.stringify(out));
 /// find any of this: a well-formed corpus cannot expose a decoding divergence.
 #[test]
 fn legacy_main_resolve_decodes_invalid_utf8_like_the_cpp_not_like_js() {
-    if !node_available() {
-        eprintln!("skipping: no `node` on PATH");
+    let Some(oracle) = oracle() else {
+        eprintln!("skipping: no pinned Node oracle");
         return;
-    }
+    };
 
     let dir = TempDir::new("legacy-main-utf8");
     std::fs::create_dir_all(dir.path.join("pkg")).expect("mkdir");
@@ -552,14 +552,16 @@ const capture = (fn) => {
     let script_path = dir.path.join("utf8.js");
     std::fs::write(&script_path, &node_script).expect("write the script");
 
-    let node_out = Command::new("node")
+    let node_out = oracle
+        .command()
         .arg("--expose-internals")
         .arg(&script_path)
         .output()
-        .expect("node runs");
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
     assert!(
         node_out.status.success(),
-        "node failed: {}",
+        "{} failed: {}",
+        oracle.describe(),
         String::from_utf8_lossy(&node_out.stderr)
     );
     let expected: Vec<String> = String::from_utf8_lossy(&node_out.stdout)
