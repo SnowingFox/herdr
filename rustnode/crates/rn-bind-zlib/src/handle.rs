@@ -34,6 +34,30 @@
 //!    the callback never runs inside `write()`, so `processCallback`'s "output
 //!    buffer full, call `this.write()` again" path re-enters through the
 //!    microtask queue instead of growing the native stack.
+//!
+//! # The oracle is nondeterministic on this exact ordering
+//!
+//! On the pinned Node 28 oracle the `params()`-inside-a-flush-callback ordering
+//! does **not** produce a stable answer, so a single oracle run is not evidence
+//! about what rustnode should do. Node reaches the state its own comment at
+//! `lib/zlib.js:788-791` calls unsupported ("the call to the native `params()`
+//! function should not happen while a write is currently in progress on the
+//! threadpool"), and then `deflateParams()` runs on the main thread while a
+//! `Z_FINISH` `deflate()` is still executing on a libuv worker thread against
+//! the same `z_stream`. Depending on which side wins, the oracle prints `OK`,
+//! reports `Z_STREAM_ERROR`, reports `Z_OK`/"buffer error", spins, or
+//! **segfaults**. Measured on this nightly, idle, 100 runs: 77 `OK`, 12
+//! `Z_STREAM_ERROR`, 6 segfault, 5 `Z_OK`. Loading the machine or shrinking
+//! `UV_THREADPOOL_SIZE` moves it a long way — at `UV_THREADPOOL_SIZE=1` it was
+//! 53/60 `Z_STREAM_ERROR` — which is the signature of a race and not of a
+//! stream-state rule.
+//!
+//! rustnode takes the majority outcome (the step stays queued, `params()`
+//! succeeds, the stream round-trips) **deliberately**. That is not a divergence
+//! to fix: reproducing the crash would mean reproducing a data race. If you
+//! diff a single oracle run against this crate and see `Z_STREAM_ERROR` or a
+//! segfault, that is the oracle, not this code — re-run it, and see
+//! `docs/compat-status.md` ("`params()` after a flush is racy on the oracle").
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -90,6 +114,14 @@ pub(crate) struct HandleState {
     /// already queued — and Node answers it against the stream state *before*
     /// that queued write. Reproducing the window is what makes `deflateParams`
     /// succeed through the async path.
+    ///
+    /// Node itself does not reliably succeed here, because "inside that
+    /// window" is a race it loses on some runs: `params()` on the main thread
+    /// can overlap the queued `deflate()` on a pool thread. Its comment at
+    /// `lib/zlib.js:788-791` says that must not happen; it happens anyway.
+    /// rustnode makes the window deterministic and therefore always takes the
+    /// majority outcome. Read the "oracle is nondeterministic" note at the top
+    /// of this module before treating one oracle run as the expected answer.
     pending_step: Option<DeferredStep>,
     /// `pending_close_`: a `close()` that arrived while a step was queued.
     ///
