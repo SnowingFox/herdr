@@ -155,11 +155,40 @@ pub(crate) fn pick_global(
     crate::with_callbacks(chooser)
 }
 
+/// `GetFrameID` (`src/node_http2.cc:1055-1059`): the stream a frame belongs to.
+///
+/// A PUSH_PROMISE's own `hd.stream_id` is the *associated* stream — the client's
+/// request the server is pushing for — not the stream the promise reserves. Every
+/// other frame names its stream directly. Node funnels this through one helper so
+/// the header callbacks, the frame callback and `HandleHeadersFrame` cannot
+/// disagree about which stream a header block belongs to; the same is done here.
+///
+/// # Safety
+///
+/// `frame` must be a live frame, and `hd.type_` must be the type nghttp2
+/// delivered for it, since that is what selects the active union member.
+unsafe fn frame_id(frame: *const ffi::nghttp2_frame) -> i32 {
+    // SAFETY: `frame` is live and its header is the one member valid for any
+    // frame type.
+    let hd = unsafe { (*frame).hd };
+    if hd.type_ == ffi::NGHTTP2_PUSH_PROMISE {
+        // SAFETY: `hd.type_` says the `push_promise` member is the live variant.
+        unsafe { (*frame).push_promise.promised_stream_id }
+    } else {
+        hd.stream_id
+    }
+}
+
 /// `OnBeginHeadersCallback`: a HEADERS block started for `frame`'s stream.
 ///
 /// Creates the stream record if this is a new stream, so the header callback that
 /// follows has somewhere to put its pairs. Trailers reuse the existing record,
 /// which is what `StartHeaders` does.
+///
+/// A PUSH_PROMISE starts a block for the *promised* stream, so the record it
+/// creates is that new stream's. That is what makes the promise visible to
+/// `core.js` before the pushed response arrives: the `'stream'` event comes from
+/// this frame, and the later HEADERS then finds a known id and emits `'push'`.
 unsafe extern "C" fn on_begin_headers(
     _session: *mut ffi::nghttp2_session,
     frame: *const ffi::nghttp2_frame,
@@ -173,21 +202,27 @@ unsafe extern "C" fn on_begin_headers(
     if frame.is_null() {
         return CALLBACK_FAILURE;
     }
-    // SAFETY: `frame` is a live frame of type HEADERS for this callback.
-    let hd = unsafe { (*frame).hd };
+    // SAFETY: `frame` is a live frame that starts a header block, so its header
+    // is valid; `frame_id` only reads further for the type it checks.
+    let stream_id = unsafe { frame_id(frame) };
     let category = unsafe { (*frame).headers.cat };
 
     if state.closing.get() {
         // Node refuses a new stream while closing, because the JS wrapper would
         // never get an `onread` and the DATA frames that follow would arrive with
         // nowhere to go.
+        //
+        // The reset goes to `stream_id`, which for a PUSH_PROMISE is the promised
+        // stream: `nghttp2_on_begin_headers_callback` requires the promised id
+        // there, and resetting the associated request would kill a stream the
+        // caller is still using.
         if let Some(raw) = crate::session_ptr(state) {
             // SAFETY: `raw` is a live nghttp2 session.
             unsafe {
                 ffi::nghttp2_submit_rst_stream(
                     raw,
                     ffi::NGHTTP2_FLAG_NONE,
-                    hd.stream_id,
+                    stream_id,
                     ffi::NGHTTP2_REFUSED_STREAM_CODE,
                 );
             }
@@ -196,7 +231,7 @@ unsafe extern "C" fn on_begin_headers(
     }
 
     let mut streams = state.streams.borrow_mut();
-    match streams.get_mut(&hd.stream_id) {
+    match streams.get_mut(&stream_id) {
         Some(record) => {
             // Trailers: reuse the record, as `StartHeaders` does.
             record.category = category;
@@ -204,9 +239,9 @@ unsafe extern "C" fn on_begin_headers(
         }
         None => {
             streams.insert(
-                hd.stream_id,
+                stream_id,
                 crate::session::StreamRecord {
-                    id: hd.stream_id,
+                    id: stream_id,
                     category,
                     ..Default::default()
                 },
@@ -232,9 +267,9 @@ unsafe extern "C" fn on_header(
     if frame.is_null() {
         return CALLBACK_FAILURE;
     }
-    // SAFETY: `frame` is live and `name`/`value` are rcbufs nghttp2 owns for the
-    // duration of this callback.
-    let stream_id = unsafe { (*frame).hd.stream_id };
+    // SAFETY: `frame` is live, and `frame_id` is the same lookup
+    // `on_begin_headers` used to place the record.
+    let stream_id = unsafe { frame_id(frame) };
     // SAFETY: `nghttp2_rcbuf_get_buf` only reads the rcbuf it is given.
     let name_bytes = unsafe { ffi::nghttp2_rcbuf_get_buf(name) };
     // SAFETY: as above.
@@ -292,7 +327,12 @@ unsafe extern "C" fn on_frame_recv(
     // SAFETY: `frame` is live for this callback.
     let hd = unsafe { (*frame).hd };
     match hd.type_ {
-        ffi::NGHTTP2_HEADERS => handle_headers_frame(state, frame),
+        // `OnFrameReceive` treats a PUSH_PROMISE exactly like a HEADERS frame
+        // (`src/node_http2.cc:1152-1155`, an intentional fall-through). That is
+        // what dispatches the promise's header block to `onSessionHeaders`, so
+        // `core.js` creates the promised stream and emits `'stream'` for it
+        // before the pushed response arrives.
+        ffi::NGHTTP2_PUSH_PROMISE | ffi::NGHTTP2_HEADERS => handle_headers_frame(state, frame),
         ffi::NGHTTP2_DATA => handle_data_frame(state, frame),
         ffi::NGHTTP2_SETTINGS => {
             // Only a non-ACK SETTINGS frame reports new remote settings; an ACK is
@@ -349,15 +389,29 @@ unsafe extern "C" fn on_frame_recv(
 }
 
 /// `HandleHeadersFrame`: hand the collected header block to `onSessionHeaders`.
+///
+/// Reached for both `HEADERS` and `PUSH_PROMISE`, as Node's `OnFrameReceive`
+/// fall-through does. Those two frames disagree about which id is the stream the
+/// block belongs to, so every use of the id here goes through [`frame_id`].
 fn handle_headers_frame(
     state: &SessionState,
     frame: *const ffi::nghttp2_frame,
 ) -> std::os::raw::c_int {
-    // SAFETY: `frame` is a HEADERS frame for this callback.
+    // SAFETY: `frame` is a HEADERS or PUSH_PROMISE frame for this callback, and
+    // `frame_id` reads the member the type selects.
+    let stream_id = unsafe { frame_id(frame) };
+    // `frame->headers.cat` is read unconditionally, as `HandleHeadersFrame` does
+    // (`src/node_http2.cc:1576`). For a PUSH_PROMISE that is a field of an
+    // inactive union member, so the value is effectively whatever the buffer
+    // held. It is deliberately not normalised: `core.js`'s new-stream branch
+    // never consults the category, only the known-stream branch does, and that
+    // one is reached by the pushed response with a real `HCAT_PUSH_RESPONSE`.
+    // Substituting a made-up category would diverge from Node in a way no reader
+    // could tell was intentional.
     let (hd, category) = unsafe { ((*frame).hd, (*frame).headers.cat) };
     let (headers, options) = {
         let streams = state.streams.borrow();
-        match streams.get(&hd.stream_id) {
+        match streams.get(&stream_id) {
             Some(record) => (record.headers.clone(), record.options),
             None => return 0,
         }
@@ -367,7 +421,7 @@ fn handle_headers_frame(
     // `ServerHttp2Stream`/`ClientHttp2Stream` around it. The handle is created
     // lazily by `crate::stream::handle_for`, which needs the session object.
     let outcome = rn_uv::callback::with_context(|scope| {
-        let Some(handle) = crate::stream::handle_for(scope, state, hd.stream_id, category, options)
+        let Some(handle) = crate::stream::handle_for(scope, state, stream_id, category, options)
         else {
             return false;
         };
@@ -377,7 +431,7 @@ fn handle_headers_frame(
         let sensitive = v8::Array::new(scope, 0);
         let args = [
             handle.into(),
-            v8::Integer::new(scope, hd.stream_id).into(),
+            v8::Integer::new(scope, stream_id).into(),
             v8::Integer::new(scope, category).into(),
             v8::Integer::new(scope, i32::from(hd.flags)).into(),
             headers_array.into(),
@@ -389,7 +443,7 @@ fn handle_headers_frame(
 
     if outcome {
         // The block has been delivered; a trailer block starts empty.
-        if let Some(record) = state.streams.borrow_mut().get_mut(&hd.stream_id) {
+        if let Some(record) = state.streams.borrow_mut().get_mut(&stream_id) {
             record.headers.clear();
         }
         0
