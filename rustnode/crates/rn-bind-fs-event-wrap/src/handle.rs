@@ -6,7 +6,7 @@
 //! `External`, and a guaranteed finalizer closes the handle if `close()` never
 //! ran — the same lifecycle as `rn-bind-pipe-wrap`'s `PipeHandle`.
 //!
-//! # `initialized` is `!IsHandleClosing()`
+//! # `initialized` is `!IsHandleClosing()`, and false until `start`
 //!
 //! This is the subtle part. `lib/internal/fs/watchers.js`'s `kFSWatchStart`
 //! returns early when `this._handle.initialized` is true:
@@ -17,11 +17,15 @@
 //! }
 //! ```
 //!
-//! so reporting "watching has begun" would make the *first* watch a no-op. Node's
-//! `MarkAsUninitialized` only clears a separate internal flag used by
-//! `HandleWrap::Close`; the accessor itself asks libuv whether the handle is
-//! closing, which for a fresh handle is false. That is what this reproduces: the
-//! flag means "still open", and it stays true until `close()`.
+//! `FSEventWrap`'s constructor calls `MarkAsUninitialized()`, which sets
+//! `state_ = kClosed`, so a fresh handle reports `false`. `Start` calls
+//! `MarkAsInitialized()` only after `uv_fs_event_start` succeeds. The flag
+//! therefore means "watching has begun", which is exactly the meaning
+//! `kFSWatchStart` gives it.
+//!
+//! Reporting `true` for a fresh handle — the intuitive reading of "the uv handle
+//! exists" — makes the first `[kFSWatchStart]` a silent no-op, so `fs.watch()`
+//! never creates an inotify descriptor and no event is ever delivered.
 
 use std::ffi::c_void;
 
@@ -37,8 +41,16 @@ const HANDLE_FIELD: i32 = 0;
 pub struct EventHandle {
     /// The libuv handle, boxed because libuv requires it not to move.
     pub event: Box<uv::uv_fs_event_t>,
-    /// The lifecycle flag behind the `initialized` accessor.
+    /// The `uv_close` lifecycle, mirroring `HandleWrap::state_`.
     pub state: HandleState,
+    /// Whether `uv_fs_event_start` has succeeded, which is what Node's
+    /// `initialized` accessor actually reports.
+    ///
+    /// This is a second flag because the libuv handle here is created in
+    /// `EventHandle::new`, whereas Node's `FSEventWrap` leaves `uv_fs_event_init`
+    /// to `Start`. [`get_initialized`] therefore cannot read `state` alone: it
+    /// has to distinguish "the uv handle exists" from "watching has begun".
+    pub started: bool,
     /// The object this handle belongs to, rooted for the `onchange` callback.
     pub owner_object: Option<v8::Global<v8::Object>>,
     /// Parks the finalizer registration so dropping it cannot cancel it.
@@ -67,6 +79,9 @@ impl EventHandle {
         Some(Box::new(Self {
             event,
             state: HandleState::Initialized,
+            // `FSEventWrap`'s constructor calls `MarkAsUninitialized()`, so a
+            // fresh handle reports `initialized === false` until `start` runs.
+            started: false,
             owner_object: None,
             weak: None,
         }))
@@ -275,8 +290,12 @@ fn start(
         let status =
             unsafe { uv::uv_fs_event_start(raw, Some(on_event), terminated.as_ptr(), flags) };
         if status != 0 {
+            // `Start` closes the handle and reports the error, so a failed watch
+            // is not "started".
             return status;
         }
+        // `MarkAsInitialized()` — this is what flips `initialized` to true.
+        event.started = true;
         if !persistent {
             // SAFETY: the handle is live, so unref is valid.
             unsafe { uv::uv_unref(handle::as_handle(raw)) };
@@ -289,15 +308,31 @@ fn start(
 }
 
 /// The `initialized` accessor: `!IsHandleClosing()`.
+///
+/// This is *not* "watching has begun". `FSEventWrap::FSEventWrap` calls
+/// `MarkAsUninitialized()`, which sets `state_ = kClosed`, so a freshly
+/// constructed handle reports `false`; `Start` calls `MarkAsInitialized()` once
+/// `uv_fs_event_start` has run. `lib/internal/fs/watchers.js`'s `kFSWatchStart`
+/// reads the flag as "already started" and returns early when it is true, so
+/// reporting `true` for a fresh handle made every `fs.watch()` a silent no-op
+/// that never delivered an event.
 fn get_initialized(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    // Node's `GetInitialized` is `!wrap->IsHandleClosing()`, so a fresh handle
-    // reports `true` and stays `true` until `close()` moves the state.
-    let alive =
-        with_handle(args.this(), |event| event.state == HandleState::Initialized).unwrap_or(false);
+    // Node's `GetInitialized` is `!wrap->IsHandleClosing()`, and `FSEventWrap`'s
+    // constructor runs `MarkAsUninitialized()` so a fresh handle reports false.
+    // `MarkAsInitialized()` runs in `Start` after `uv_fs_event_start` succeeds.
+    //
+    // `lib/internal/fs/watchers.js`'s `kFSWatchStart` reads this as "already
+    // started" and returns early when it is true. Reporting true for a fresh
+    // handle made every `fs.watch()` a silent no-op: no inotify descriptor was
+    // created and no event was ever delivered.
+    let alive = with_handle(args.this(), |event| {
+        event.state == HandleState::Initialized && event.started
+    })
+    .unwrap_or(false);
     rv.set(v8::Boolean::new(scope, alive).into());
 }
 

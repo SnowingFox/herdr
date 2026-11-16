@@ -524,20 +524,33 @@ pub fn mkdir(path: &PathBytes, mode: u32, recursive: bool) -> Result<Option<Vec<
     Ok(first_created)
 }
 
-/// Creates a unique directory from a template ending in `XXXXXX`.
+/// The placeholder `mkdtemp()` and `mkstemp()` replace.
+///
+/// `src/node_file.cc`'s `AppendTemplateSuffix` appends this to whatever the
+/// caller passed; it never asks the caller to supply it. `fs.mkdtempSync('/tmp/pre-')`
+/// is the documented and overwhelmingly common form, so requiring the suffix
+/// here made every such call fail with `EINVAL`.
+const TEMPLATE_SUFFIX: &[u8] = b"XXXXXX";
+
+/// Appends [`TEMPLATE_SUFFIX`] to a caller's template.
+///
+/// This is `src/node_file.cc`'s `AppendTemplateSuffix`. A template that already
+/// ends in `XXXXXX` still gets a second one, which is what Node does: the
+/// caller's `X` characters are literal text there, and `lib/internal/fs/utils.js`
+/// warns about exactly that case rather than treating it specially.
+fn with_template_suffix(template: &[u8]) -> Vec<u8> {
+    let mut owned = Vec::with_capacity(template.len() + TEMPLATE_SUFFIX.len() + 1);
+    owned.extend_from_slice(template);
+    owned.extend_from_slice(TEMPLATE_SUFFIX);
+    owned
+}
+
+/// Creates a unique directory from a template.
+///
+/// The template is a prefix, not a pattern: the six `X` characters `mkdtemp(3)`
+/// needs are appended here, matching `src/node_file.cc`'s `Mkdtemp`.
 pub fn mkdtemp(template: &PathBytes, mode: u32) -> Result<Vec<u8>, FsError> {
-    if !template.ends_with(b"XXXXXX") {
-        // `mkdtemp(3)` itself returns EINVAL, but reporting the same code with
-        // a clear path is friendlier and matches what Node surfaces.
-        return Err(FsError::from_errno("mkdtemp", libc::EINVAL).path(template.to_vec()));
-    }
-    let mut buffer = template.to_vec();
-    // SAFETY: `buffer` is NUL-terminated after `CString::new` below and ends
-    // with the six `X` characters `mkdtemp` requires.
-    let c_buffer = c_path(&buffer, "mkdtemp")?;
-    buffer = c_buffer.as_bytes().to_vec();
-    buffer.truncate(buffer.len());
-    let mut owned = buffer.clone();
+    let mut owned = with_template_suffix(template);
     owned.push(0);
     // SAFETY: `owned` ends with `XXXXXX\0` and is writable for its whole
     // length, which is `mkdtemp`'s contract. `mkdir` mode is applied below.
@@ -558,13 +571,12 @@ pub fn mkdtemp(template: &PathBytes, mode: u32) -> Result<Vec<u8>, FsError> {
     Ok(created)
 }
 
-/// Creates a unique file from a template ending in `XXXXXX`, returning its path
-/// and descriptor.
+/// Creates a unique file from a template, returning its path and descriptor.
+///
+/// Like [`mkdtemp`], the caller passes a prefix: `AppendTemplateSuffix` in
+/// `src/node_file.cc` appends the `X` placeholder that `mkstemp(3)` replaces.
 pub fn mkstemp(template: &PathBytes) -> Result<(Vec<u8>, i32), FsError> {
-    if !template.ends_with(b"XXXXXX") {
-        return Err(FsError::from_errno("mkstemp", libc::EINVAL).path(template.to_vec()));
-    }
-    let mut owned = template.to_vec();
+    let mut owned = with_template_suffix(template);
     owned.push(0);
     // SAFETY: `owned` ends with `XXXXXX\0` and is writable, which is what
     // `mkstemp` requires. The returned descriptor is owned by the caller.
@@ -1272,7 +1284,7 @@ mod tests {
     fn mkdtemp_creates_a_unique_directory() {
         let dir = TempDir::new("mkdtemp");
         let mut template = dir.bytes().to_vec();
-        template.extend_from_slice(b"/tmp-XXXXXX");
+        template.extend_from_slice(b"/tmp-");
 
         let first = mkdtemp(&template, 0o700).expect("mkdtemp");
         let second = mkdtemp(&template, 0o700).expect("mkdtemp");
@@ -1282,16 +1294,27 @@ mod tests {
     }
 
     #[test]
-    fn mkdtemp_without_template_suffix_reports_einval() {
-        let error = mkdtemp(b"/tmp/no-template", 0o700).expect_err("fail");
-        assert_eq!(error.code(), "EINVAL");
+    fn mkdtemp_appends_the_suffix_the_caller_did_not_supply() {
+        // `fs.mkdtempSync('/tmp/pre-')` is the documented form and the one every
+        // caller uses. Node's `AppendTemplateSuffix` is what makes it work, so a
+        // template without `XXXXXX` must succeed rather than report EINVAL.
+        let dir = TempDir::new("mkdtemp-prefix");
+        let mut template = dir.bytes().to_vec();
+        template.extend_from_slice(b"/pre-");
+
+        let created = mkdtemp(&template, 0o700).expect("mkdtemp on a bare prefix");
+        assert!(std::path::Path::new(std::ffi::OsStr::from_bytes(&created)).is_dir());
+        // The created name is the prefix plus six random characters.
+        let name = String::from_utf8_lossy(&created[dir.bytes().len()..]).into_owned();
+        assert!(name.starts_with("/pre-"), "created {name}");
+        assert_eq!(name.len(), "/pre-".len() + 6, "created {name}");
     }
 
     #[test]
     fn mkstemp_creates_a_unique_file_and_descriptor() {
         let dir = TempDir::new("mkstemp");
         let mut template = dir.bytes().to_vec();
-        template.extend_from_slice(b"/file-XXXXXX");
+        template.extend_from_slice(b"/file-");
 
         let (path, fd) = mkstemp(&template).expect("mkstemp");
         assert!(fd >= 0);

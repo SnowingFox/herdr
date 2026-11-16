@@ -453,13 +453,40 @@ fn name_value<'s>(
     encoding: Encoding,
 ) -> Option<Local<'s, v8::Value>> {
     if encoding == Encoding::Buffer {
-        let buffer = v8::ArrayBuffer::new_backing_store_from_vec(name.to_vec()).make_shared();
-        let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &buffer);
-        let view = v8::Uint8Array::new(scope, array_buffer, 0, name.len())?;
-        return Some(view.into());
+        return buffer_from(scope, name);
     }
     let string = v8::String::new_from_utf8(scope, name, v8::NewStringType::Normal)?;
     Some(string.into())
+}
+
+/// Builds a real `Buffer` over `bytes`.
+///
+/// `fs.readdirSync(dir, 'buffer')` returns an array of `Buffer`s, and
+/// `lib/internal/fs/utils.js`'s `join` branches on `isUint8Array(path) &&
+/// isUint8Array(name)` before concatenating. A bare `Uint8Array` is not a
+/// `Buffer`: `Buffer.isBuffer` is false and `Buffer.concat` rejects it, so the
+/// names have to be built through the global `Buffer` the same way
+/// `rn-bind-http2`'s `Pack` is.
+fn buffer_from<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: &[u8]) -> Option<Local<'s, v8::Value>> {
+    let store =
+        v8::ArrayBuffer::new_backing_store_from_boxed_slice(bytes.to_vec().into_boxed_slice())
+            .make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "Buffer")?;
+    let buffer = Local::<v8::Object>::try_from(global.get(scope, key.into())?).ok()?;
+    let from_key = v8::String::new(scope, "from")?;
+    let from = buffer.get(scope, from_key.into())?;
+    let from = Local::<v8::Function>::try_from(from).ok()?;
+    let start = v8::Integer::new(scope, 0);
+    let length = v8::Integer::new(scope, i32::try_from(bytes.len()).ok()?);
+    let called = from.call(
+        scope,
+        buffer.into(),
+        &[array_buffer.into(), start.into(), length.into()],
+    )?;
+    called.is_object().then_some(called)
 }
 
 /// Builds the `[names, types]` pair `getDirents` destructures.
@@ -1416,23 +1443,26 @@ fn fchown_binding<'a, 's, 'i>(
     conclude!(scope, args, rv, completion);
 }
 
-/// Reads a `[seconds, nanoseconds]` timestamp argument.
+/// Reads a timestamp argument, which is a number of seconds.
 ///
-/// `fs.utimes` normalises `Date` and numeric forms in JS before calling, so both
-/// entries are always numbers here.
+/// `lib/fs.js` calls `toUnixTimestamp(atime)` before reaching the binding, so
+/// the binding's second and third arguments are plain numbers of seconds and
+/// `src/node_file.cc` reads them with `args[1]->IsNumber()`. They are never an
+/// array: treating them as one silently left every timestamp at the epoch,
+/// because `Local::<Array>::try_from` failed and the zero default was used.
+///
+/// The fractional part carries the sub-second precision, and it is floored into
+/// whole nanoseconds the way `uv_fs_utime` does.
 fn time_spec(scope: &mut v8::PinScope<'_, '_>, value: Local<v8::Value>) -> TimeSpec {
-    let Ok(array) = Local::<v8::Array>::try_from(value) else {
+    let Some(seconds) = value.number_value(scope) else {
         return TimeSpec::new(0, 0);
     };
-    let seconds = array
-        .get_index(scope, 0)
-        .and_then(|value| crate::args::int64(scope, value))
-        .unwrap_or(0);
-    let nanos = array
-        .get_index(scope, 1)
-        .and_then(|value| crate::args::int64(scope, value))
-        .unwrap_or(0);
-    TimeSpec::new(seconds, nanos)
+    if !seconds.is_finite() {
+        return TimeSpec::new(0, 0);
+    }
+    let whole = seconds.trunc();
+    let nanos = ((seconds - whole) * 1e9) as i64;
+    TimeSpec::new(whole as i64, nanos)
 }
 
 /// `utimes(path, atime, mtime, [req])`.

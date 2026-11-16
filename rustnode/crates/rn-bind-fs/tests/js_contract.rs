@@ -22,6 +22,27 @@ fn initialize_once() {
     });
 }
 
+/// A `Buffer` stand-in for the test harness.
+///
+/// The real runtime gets `Buffer` from `internal/bootstrap/node.js`, which this
+/// harness does not bootstrap. `name_value` builds its results through the global
+/// `Buffer` so they are real `Buffer`s rather than bare `Uint8Array`s, so the
+/// harness needs one for the buffer-encoding cases to reach that path at all.
+///
+/// It subclasses `Uint8Array` with the same `(buffer, byteOffset, length)`
+/// allocation `Buffer.from(arrayBuffer, offset, length)` performs, which is the
+/// property those cases assert on.
+const BUFFER_SHIM: &str = r#"
+globalThis.Buffer = class Buffer extends Uint8Array {
+  static from(source, byteOffset, length) {
+    return new Buffer(source, byteOffset, length);
+  }
+  static isBuffer(value) {
+    return value instanceof Buffer;
+  }
+};
+"#;
+
 /// Installs the namespace, runs `source`, drains microtasks, returns `__out`.
 fn run(source: &str) -> String {
     initialize_once();
@@ -39,6 +60,10 @@ fn run(source: &str) -> String {
     let namespace = Fs.install(scope, &mut ctx).expect("install fs namespace");
 
     let global = scope.get_current_context().global(scope);
+    let shim = v8::String::new(scope, BUFFER_SHIM).expect("shim source");
+    let shim = v8::Script::compile(scope, shim, None).expect("shim compiles");
+    shim.run(scope).expect("shim runs");
+
     let key = v8::String::new(scope, "fsBinding").expect("key");
     global
         .set(scope, key.into(), namespace.into())
@@ -269,7 +294,7 @@ fn readdir_with_file_types_returns_names_and_types() {
 }
 
 #[test]
-fn readdir_buffer_encoding_returns_byte_views() {
+fn readdir_buffer_encoding_returns_buffers() {
     let dir = TempDir::new("readdir-buffer");
     std::fs::write(dir.joined("one"), b"").expect("write");
 
@@ -278,6 +303,7 @@ fn readdir_buffer_encoding_returns_byte_views() {
         const names = fsBinding.readdir('{}', 'buffer', false);
         const first = names[0];
         globalThis.__out = JSON.stringify({{
+          isBuffer: Buffer.isBuffer(first),
           isView: ArrayBuffer.isView(first),
           length: first.length,
           text: String.fromCharCode(...first),
@@ -285,7 +311,37 @@ fn readdir_buffer_encoding_returns_byte_views() {
         "#,
         js_path(&dir.path)
     ));
-    assert_eq!(out, r#"{"isView":true,"length":3,"text":"one"}"#);
+    // A bare `Uint8Array` is not a `Buffer`: `lib/internal/fs/utils.js`'s `join`
+    // tests `isUint8Array(path) && isUint8Array(name)` and then concatenates with
+    // `Buffer.concat`, which rejects a non-Buffer view.
+    assert_eq!(
+        out,
+        r#"{"isBuffer":true,"isView":true,"length":3,"text":"one"}"#
+    );
+}
+
+#[test]
+fn utimes_applies_the_timestamps_it_is_given() {
+    let dir = TempDir::new("utimes");
+    std::fs::write(dir.joined("file"), b"").expect("write");
+
+    // `lib/fs.js` calls `toUnixTimestamp()` first, so the binding's second and
+    // third arguments are plain numbers of seconds — never a `[sec, nsec]` pair.
+    // Reading them as an array left every timestamp at the epoch while still
+    // reporting success.
+    let out = run(&format!(
+        r#"
+        fsBinding.utimes('{}', 1000, 2000);
+        const stats = fsBinding.stat('{}', false);
+        globalThis.__out = JSON.stringify({{
+          atime: Math.round(stats[10]),
+          mtime: Math.round(stats[12]),
+        }});
+        "#,
+        js_path(&dir.joined("file")),
+        js_path(&dir.joined("file"))
+    ));
+    assert_eq!(out, r#"{"atime":1000,"mtime":2000}"#);
 }
 
 #[test]
