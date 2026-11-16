@@ -48,6 +48,23 @@
 //! `undefined` and every test that compares it against
 //! `UNABLE_TO_VERIFY_LEAF_SIGNATURE` fails with no error at all — which is
 //! defect 1 in this increment's brief, measured as `client err: undefined`.
+//!
+//! # `SSL_set1_verify_cert_store` is a macro, and lives in `ffi_extra`
+//!
+//! `ssl.h.in:1440` is `SSL_ctrl(s, SSL_CTRL_SET_VERIFY_CERT_STORE, 1, (char *)(st))`
+//! and the vendored OpenSSL 3.6.3 exports no symbol under that name — nor under
+//! `SSL_CTX_set1_verify_cert_store`, which is the same kind of macro at `:1410`.
+//! The per-`SSL` form was declared in this file's `extern "C"` block and linked
+//! only because [`set_ca_certs`] was never called, so the SNI-CA behaviour it
+//! documented was dead code rather than broken code; referencing it at all fails
+//! with `undefined symbol: SSL_set1_verify_cert_store`. The control is performed
+//! by [`crate::ffi_extra::ssl_set1_verify_cert_store`] instead, so the
+//! declaration is now correct rather than merely unexercised.
+//!
+//! `crypto_tls.cc:1589` is Node's `TLSWrap::SetCACerts`, and it is the body here:
+//! the store assignment plus a duplicated client-CA list. Node calls it from both
+//! SNI paths, `CertCbDone` (`:1775`) and `SetKeyCert` (`:1856`), so the behaviour
+//! is wanted and not a leftover.
 
 use std::os::raw::{c_int, c_long};
 
@@ -71,23 +88,19 @@ extern "C" {
     /// `_get_version` but not this one.
     fn SSL_CIPHER_get_auth_nid(cipher: *const ffi::SSL_CIPHER) -> c_int;
 
-    /// `int SSL_SESSION_get0_ticket(const SSL_SESSION *s, const unsigned char **tick,
-    /// size_t *len);` — `ssl.h`.
+    /// `void SSL_SESSION_get0_ticket(const SSL_SESSION *s, const unsigned char **tick,
+    /// size_t *len);` — `ssl.h:1783`.
+    ///
+    /// It returns **void**, and there is no success flag to test: an absent
+    /// ticket is reported by `*tick` staying null. Node reads it exactly that way
+    /// (`crypto_tls.cc:2228` calls it, then checks only `ticket != nullptr`). This
+    /// was declared `-> c_int` and its result compared to `1`, so the comparison
+    /// read whatever the callee happened to leave in `eax` rather than a status.
     fn SSL_SESSION_get0_ticket(
         session: *const ffi::SSL_SESSION,
         ticket: *mut *const std::ffi::c_uchar,
         length: *mut usize,
-    ) -> c_int;
-
-    /// `int SSL_set1_verify_cert_store(SSL *s, X509_STORE *st);` — `ssl.h`.
-    ///
-    /// `SetCACerts` calls it so a per-`SSL` context's trust store reaches the
-    /// connection; that is the "is the server's CA store from addCACert reached"
-    /// half of defect 2.
-    pub(crate) fn SSL_set1_verify_cert_store(
-        ssl: *mut ffi::SSL,
-        store: *mut ffi::X509_STORE,
-    ) -> c_int;
+    );
 
     /// `STACK_OF(X509_NAME) *SSL_CTX_get_client_CA_list(const SSL_CTX *ctx);`
     fn SSL_CTX_get_client_CA_list(ctx: *const ffi::SSL_CTX) -> *mut ffi::stack_st_X509_NAME;
@@ -264,12 +277,16 @@ pub fn local_certificate(ssl: *mut ffi::SSL) -> Option<Vec<u8>> {
 
 /// The `X509_STORE` a per-`SSL` context installed, for `SetCACerts`.
 ///
-/// Returns whether `SSL_set1_verify_cert_store` accepted it. A server that
-/// installed a client-CA list on its `SSL_CTX` did **not** install the store on
-/// the per-`SSL` object when `CertCbDone` swapped the context, so this is the
-/// call that makes an SNI context's `ca` reach verification. Without it a
-/// connection whose context came from `SNICallback` verifies against the
-/// default context's store, which is defect 2's second half.
+/// Returns whether the control accepted it. A server that installed a client-CA
+/// list on its `SSL_CTX` did **not** install the store on the per-`SSL` object
+/// when `CertCbDone` swapped the context, so this is the call that makes an SNI
+/// context's `ca` reach verification. Without it a connection whose context came
+/// from `SNICallback` verifies against the default context's store.
+///
+/// `crypto_tls.cc:1589` is `TLSWrap::SetCACerts` and this is its body: the
+/// per-`SSL` store assignment, then a duplicated client-CA list. Node calls it
+/// from both SNI paths, `CertCbDone` (`:1775`) and `SetKeyCert` (`:1856`), and a
+/// failure there is fatal to the callback.
 ///
 /// # Safety
 ///
@@ -280,10 +297,11 @@ pub unsafe fn set_ca_certs(ssl: *mut ffi::SSL, ctx: *mut ffi::SSL_CTX) -> bool {
         return false;
     }
     // SAFETY: both pointers are live per the caller's contract; the store is
-    // owned by the context and only associated with the SSL.
+    // owned by the context, and `SSL_ctrl` up-refs it through
+    // `ssl_cert_set_cert_store`'s `ref == 1`.
     unsafe {
         let store = ffi::SSL_CTX_get_cert_store(ctx);
-        if SSL_set1_verify_cert_store(ssl, store) != 1 {
+        if crate::ffi_extra::ssl_set1_verify_cert_store(ssl, store) != 1 {
             return false;
         }
         // `SetCACerts` also duplicates the client-CA list, which is what tells a
@@ -976,9 +994,9 @@ pub fn get_tls_ticket<'s>(
             }
             let mut data: *const std::ffi::c_uchar = std::ptr::null();
             let mut length: usize = 0;
-            if SSL_SESSION_get0_ticket(session, &mut data, &mut length) != 1 {
-                return None;
-            }
+            // `SSL_SESSION_get0_ticket` returns void; a session with no ticket
+            // leaves `data` null. Node tests exactly that (`crypto_tls.cc:2244`).
+            SSL_SESSION_get0_ticket(session, &mut data, &mut length);
             if data.is_null() || length == 0 {
                 return None;
             }

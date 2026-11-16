@@ -118,6 +118,28 @@ step "building the workspace and the CLI binary"
 cargo build --workspace
 cargo build -p rn-cli
 
+step "every hand-declared OpenSSL symbol matches the vendored header"
+# `EC_POINT_point2buf` was declared with a length out-parameter where C takes an
+# optional `BN_CTX`, and an arity comparison reported this tree `ok` because only
+# the *types* differed. The audit therefore compares types and pointer depth, with
+# gcc as the oracle: it translates each `extern "C"` declaration back to C, takes
+# the symbol's address through that type, and reads the incompatibility
+# diagnostics. A macro-only name is reported as `NOPROTO`, which is how
+# `SSL_set1_verify_cert_store` was found.
+#
+# It runs after the build because the headers and the generated `openssl-conf.h`
+# come from `openssl-src`'s build. The self-test first, because an audit that
+# cannot fail over the defects it exists for is the defect one layer up.
+python3 tools/audit-ffi-types.py --self-test
+python3 tools/audit-ffi-types.py
+
+step "the per-SSL verify-cert-store control is a macro, not a symbol"
+# The declaration that used to be in `peer_cert.rs` linked only because nothing
+# referenced it. This measures that the symbol does not exist, that referencing it
+# fails to link, and that the `SSL_ctrl` form the crate now uses does link.
+./tools/link-control-verify-cert-store.sh
+./tools/link-control-verify-cert-store.sh --self-test
+
 step "the release profile type-checks"
 # Every build above is the debug profile, so nothing in this gate ever compiled
 # `cfg(not(debug_assertions))`. PR #72 shipped a `defer_or` whose whole body sat

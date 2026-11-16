@@ -1,16 +1,19 @@
 //! The handful of OpenSSL calls this crate needs that `openssl-sys 0.9.118` does
 //! not declare.
 //!
-//! Each is a real exported symbol in the vendored OpenSSL 3.6.3, checked with
-//! `nm -g --defined-only libssl.a libcrypto.a`, so a declaration that is wrong
-//! fails at link time rather than silently doing the wrong thing at runtime. Two
-//! of the four are **macros** in the headers rather than functions, and those are
-//! expanded here the way `ssl.h` expands them — which is why they are Rust
-//! functions with a `SSL_ctrl` call inside rather than `extern "C"` items.
+//! Every `extern` item below is a real exported symbol in the vendored OpenSSL
+//! 3.6.3, checked with `nm -g --defined-only libssl.a libcrypto.a`; a declaration
+//! whose *type* is wrong is not caught by the linker, which is why
+//! `tools/audit-ffi-types.py` compares each one against the headers instead. The
+//! macro-only entries are expanded here the way `ssl.h` expands them — which is
+//! why they are Rust functions with an `SSL_ctrl` call inside rather than
+//! `extern "C"` items.
 //!
 //! | need | why `openssl-sys` lacks it | form |
 //! | --- | --- | --- |
 //! | `SSL_set_mode` | a macro over `SSL_ctrl(SSL_CTRL_MODE)` | wrapper below |
+//! | `SSL_set_max_send_fragment` | a macro over `SSL_ctrl` | wrapper below |
+//! | `SSL_set1_verify_cert_store` | a macro over `SSL_ctrl(SSL_CTRL_SET_VERIFY_CERT_STORE)`; no such symbol exists | wrapper below |
 //! | `SSL_get_servername` | declared in the crate only under `ossl111`'s const-pointer cfg for the argument, and not at all in 0.9.118 | `extern` |
 //! | `SSL_get_shared_sigalgs` | not declared | `extern` |
 //! | `BIO_set_shutdown` | `BIO_get_shutdown` is declared, this one is not | `extern` |
@@ -21,7 +24,7 @@
 //! a second *version* would mean a second `openssl-src` build. Adding the symbols
 //! locally costs four lines each and cannot perturb that.
 
-use std::os::raw::{c_char, c_int, c_long};
+use std::os::raw::{c_char, c_int, c_long, c_uchar};
 
 use openssl_sys as ffi;
 
@@ -33,6 +36,9 @@ pub const SSL_CB_HANDSHAKE_DONE: c_int = 0x20;
 /// `#define SSL_CTRL_MODE 33` in `ssl.h:1302`.
 pub const SSL_CTRL_MODE: c_int = 33;
 
+/// `#define SSL_CTRL_SET_VERIFY_CERT_STORE 106` in `ssl.h:1317`.
+pub const SSL_CTRL_SET_VERIFY_CERT_STORE: c_int = 106;
+
 extern "C" {
     /// `const char *SSL_get_servername(const SSL *s, const int tlsext_typename);`
     /// — `tls1.h:281`.
@@ -42,19 +48,29 @@ extern "C" {
     pub fn SSL_get_servername(ssl: *const ffi::SSL, type_: c_int) -> *const c_char;
 
     /// `int SSL_get_shared_sigalgs(SSL *s, int idx, int *psign, int *phash,
-    /// int *psignhash, const unsigned char **rsig, const unsigned char **rhash);`
-    /// — `tls1.h:286`.
+    /// int *psignhash, unsigned char *rsig, unsigned char *rhash);`
+    /// — `tls1.h:286`, defined at `t1_lib.c:3693`.
     ///
     /// With `idx == 0` it returns the count; with `0 < idx <= count` it fills the
     /// out-parameters for that entry.
+    ///
+    /// **The last two arguments are `unsigned char *`, and the function writes one
+    /// byte through each**: `*rsig = (unsigned char)(shsigalgs->sigalg & 0xff)` at
+    /// `t1_lib.c:3717`. Declaring them `*mut *const c_char` says the callee writes
+    /// a whole pointer, so a caller that passed a one-byte buffer would have
+    /// `size_of::<*const c_char>()` bytes written over the memory around it. Both
+    /// call sites pass null, which is the only reason that never fired — and
+    /// `getSharedSigalgs` is reachable from JavaScript through
+    /// `TLSSocket.prototype` (`lib/internal/tls/wrap.js:1324`), so a caller asking
+    /// for raw signature bytes would have reached it.
     pub fn SSL_get_shared_sigalgs(
         ssl: *mut ffi::SSL,
         index: c_int,
         sign: *mut c_int,
         hash: *mut c_int,
         sign_hash: *mut c_int,
-        raw_sign: *mut *const c_char,
-        raw_hash: *mut *const c_char,
+        raw_sign: *mut c_uchar,
+        raw_hash: *mut c_uchar,
     ) -> c_int;
 
     /// `void BIO_set_shutdown(BIO *a, int shut);` — `bio.h:738`.
@@ -135,6 +151,38 @@ pub unsafe fn set_max_send_fragment(ssl: *mut ffi::SSL, value: i32) -> i32 {
             std::ptr::null_mut(),
         ) as i32
     }
+}
+
+/// `SSL_set1_verify_cert_store(ssl, store)`, a **macro**, not a function.
+///
+/// `ssl.h.in:1440` is:
+///
+/// ```c
+/// #define SSL_set1_verify_cert_store(s, st) \
+///     SSL_ctrl(s, SSL_CTRL_SET_VERIFY_CERT_STORE, 1, (char *)(st))
+/// ```
+///
+/// There is no `SSL_set1_verify_cert_store` symbol in the vendored OpenSSL 3.6.3
+/// to link against; the only definition is that macro, which reaches
+/// `ssl_cert_set_cert_store(sc->cert, parg, 0, larg)` at `s3_lib.c:4300` with
+/// `larg == 1` meaning "up-ref the store". `SSL_CTX_set1_verify_cert_store` *is*
+/// a real symbol, which is what makes the per-`SSL` form easy to get wrong: the
+/// `SSL_CTX_` spelling links and this one does not.
+///
+/// The `1` is the up-ref flag and is load-bearing. `SSL_set0_verify_cert_store`
+/// is the same control with `0`, which would make the `cert` own a store it does
+/// not hold a reference to — so the store must outlive the `SSL` either way, but
+/// only `set1` keeps it alive if the context is freed first.
+///
+/// # Safety
+///
+/// `ssl` must be live, and `store` must be a live `X509_STORE`.
+pub unsafe fn ssl_set1_verify_cert_store(ssl: *mut ffi::SSL, store: *mut ffi::X509_STORE) -> c_int {
+    if ssl.is_null() || store.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller guarantees both pointers are live.
+    unsafe { ffi::SSL_ctrl(ssl, SSL_CTRL_SET_VERIFY_CERT_STORE, 1, store.cast()) as c_int }
 }
 
 #[cfg(test)]
