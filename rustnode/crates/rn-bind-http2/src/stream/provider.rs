@@ -125,6 +125,15 @@ unsafe extern "C" fn read_callback(
             unsafe { report_eof(state, stream_id, data_flags) };
             return 0;
         }
+        // `amount == 0 && stream->is_writable()`: the stream has nothing queued but
+        // can still be written to, so `Http2Stream::OnRead` emits
+        // `EmitWantsWrite(length)` before deferring (`src/node_http2.cc:2877`).
+        // That is the only signal that resumes a `StreamPipe` over this stream, so
+        // it is recorded here and delivered by `settle_writes` — a V8 call is not
+        // legal inside `mem_send`.
+        if let Some(record) = state.streams.borrow_mut().get_mut(&stream_id) {
+            record.wants_write = true;
+        }
         return ERR_DEFERRED;
     }
     let count = bytes.len().min(length);

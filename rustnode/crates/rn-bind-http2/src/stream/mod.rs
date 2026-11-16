@@ -26,6 +26,7 @@
 //! deferred in `rn-bind-fs`, and nothing else in `lib/**` reaches for it.
 
 pub mod provider;
+pub mod stream_base;
 
 use std::cell::{Cell, RefCell};
 use std::ptr;
@@ -74,6 +75,14 @@ pub struct StreamHandleState {
     /// `undefined` inside a stream callback even though `executionAsyncId()` is
     /// right.
     pub context_frame: Option<v8::Global<v8::Value>>,
+    /// The `StreamBase` half.
+    ///
+    /// `Http2Stream` is `AsyncWrap + StreamBase` in Node, and this is what makes
+    /// the handle usable as either end of a `StreamPipe` — `lib/internal/http2`'s
+    /// `sendFile` path and the tests that pipe a stream into another stream both
+    /// depend on it. The `StreamState` is kept here rather than beside the box so
+    /// the allocation that the ops' owner pointer names is this one.
+    pub stream: crate::stream::stream_base::StreamHalf,
 }
 
 /// Builds the `Http2Stream` constructor and its prototype.
@@ -125,6 +134,18 @@ pub fn constructor<'s>(
         "bytesWritten" => get_bytes_written,
         "getAsyncId" => get_async_id,
     }
+
+    // `t->PrototypeTemplate()->Set("isStreamBase", True(isolate))`, which
+    // `StreamBase::AddMethods` installs. `lib/internal/http2/core.js` tests it
+    // before treating a handle as a stream (`core.js:1385`), and `StreamPipe`'s
+    // constructor is the other reader: without it the handle cannot be a pipe end.
+    let is_stream_base = v8::Boolean::new(scope, true);
+    prototype.set(
+        v8::String::new(scope, "isStreamBase")
+            .ok_or("cannot allocate the isStreamBase name")?
+            .into(),
+        is_stream_base.into(),
+    );
 
     template
         .get_function(scope)
@@ -214,8 +235,23 @@ pub fn handle_for<'s>(
             trigger_async_id: current_trigger_async_id(),
             provider: rn_core::async_wrap::PROVIDER_HTTP2STREAM,
         },
+        stream: stream_base::StreamHalf::new(),
     }));
     object.set_aligned_pointer_in_internal_field(STREAM_FIELD, state.cast::<std::ffi::c_void>(), 0);
+
+    // The `StreamBase` half. `Http2Stream` is `AsyncWrap + StreamBase` in Node,
+    // so this is what lets the handle be an end of a `StreamPipe` — and the
+    // `owner_object` is what the default listener delivers a read to.
+    // SAFETY: `state` is the live allocation just made, and its `stream` field is
+    // in that same allocation so it outlives the state.
+    unsafe {
+        (*state).stream.install_owner(state);
+        let pointer = (*state).stream.state_pointer();
+        (*pointer).owner_object = Some(v8::Global::new(scope.as_ref(), object));
+        // `StreamBase::FromObject` is how `StreamPipe` finds a stream. An HTTP/2
+        // stream has no `uv_stream_t`, so the *state* is published.
+        rn_uv::streams::attach_state(scope, object, pointer);
+    }
 
     let address = state as usize;
     let weak = v8::Weak::with_guaranteed_finalizer(
@@ -250,6 +286,26 @@ pub fn object_for<'s>(
         .map(|handle| v8::Local::new(scope, handle))
 }
 
+/// The `StreamBase` state behind a stream handle object.
+///
+/// Used by [`settle_writes`], which has the object but needs the state the
+/// listener layer takes.
+pub fn state_pointer_of(
+    object: v8::Local<'_, v8::Object>,
+) -> Option<*mut rn_uv::handle::StreamState> {
+    with_state(object, |state| state.stream.state_pointer())
+}
+
+/// The rooted handle for `stream_id`, as a `Global`.
+///
+/// [`settle_writes`] runs from a libuv completion, where no local handle exists.
+pub fn object_for_anywhere(
+    session: &SessionState,
+    stream_id: i32,
+) -> Option<v8::Global<v8::Object>> {
+    session.handles.borrow().get(&stream_id).cloned()
+}
+
 /// Delivers `bytes` to `stream_id`'s readable side through its `onread`.
 ///
 /// `stream_base_commons.js`'s `onStreamRead` does not take the byte count as an
@@ -266,6 +322,15 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
+    // Whether the readable side is flowing, mirrored on the record so the data
+    // path can see it without a V8 scope. `readStart`/`readStop` are the only
+    // writers, and `OnDataChunkReceived` is what reads it.
+    let reading = session
+        .streams
+        .borrow()
+        .get(&stream_id)
+        .map(|record| record.reading)
+        .unwrap_or(false);
     {
         let mut streams = session.streams.borrow_mut();
         let Some(record) = streams.get_mut(&stream_id) else {
@@ -287,13 +352,59 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
             return;
         }
         record.received_bytes += bytes.len() as u64;
+        // `OnDataChunkReceived`: consume immediately when the owner is reading,
+        // otherwise remember the credit for `ReadStart` to hand back. A paused
+        // stream that never accounts for the bytes never reopens its window.
+        if !reading {
+            record.paused_unconsumed += bytes.len();
+        }
     }
     let payload = bytes.to_vec();
     let _ = rn_uv::callback::with_context(|scope| {
         // Without a handle there is nothing to deliver to, and `in_stream_scope`
         // below would find nothing anyway.
-        if object_for(scope, session, stream_id).is_none() {
+        let Some(object) = object_for(scope, session, stream_id) else {
             return;
+        };
+        // A listener may be attached — a `StreamPipe` pushing onto this stream as
+        // its source, or a `TLSWrap`. `StreamResource::EmitRead` delivers to that
+        // listener first and only falls through to `onread` when the chain is
+        // empty, which is the whole reason a pipe can read from an HTTP/2 stream.
+        // Delivering straight to `onread` made every attached listener invisible.
+        if let Some(state) = state_pointer_of(object) {
+            let listening = {
+                // SAFETY: the state lives as long as the object, which is alive
+                // for this call.
+                unsafe { rn_uv::listener::listener_count(state) > 0 }
+            };
+            if listening {
+                // The bytes are copied into an `Allocation`, which `emit_read`
+                // hands to the listener and the listener releases. `streamBaseState`
+                // is published by the default listener, not here, so a listener
+                // that consumes the bytes never sees a stale count.
+                let Some(mut allocation) = rn_uv::handle::Allocation::new(payload.len()) else {
+                    return;
+                };
+                // SAFETY: `allocation` holds `payload.len()` writable bytes and
+                // `payload` is a distinct live buffer of that length.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        payload.as_ptr(),
+                        allocation.base(),
+                        payload.len(),
+                    )
+                };
+                // SAFETY: the state is live, and `emit_read` holds no reference to
+                // it across the listener call.
+                unsafe {
+                    rn_uv::listener::emit_read(
+                        state,
+                        payload.len() as isize,
+                        rn_uv::listener::ReadBuffer::Allocated(allocation),
+                    )
+                };
+                return;
+            }
         }
         // `streamBaseState[kReadBytesOrError] = nread`, without which `onStreamRead`
         // sees a stale count and pushes the wrong slice.
@@ -345,8 +456,36 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
 /// peer actually ended the stream.
 pub fn emit_eof(session: &SessionState, stream_id: i32) {
     let _ = rn_uv::callback::with_context(|scope| {
-        if object_for(scope, session, stream_id).is_none() {
+        let Some(object) = object_for(scope, session, stream_id) else {
             return;
+        };
+        // `EmitRead(UV_EOF)` on the stream's own `StreamBase`, so an attached
+        // listener sees the end before JavaScript does. A `StreamPipe` reading
+        // from this stream as its source stops and shuts its sink down in
+        // `OnStreamRead`'s `nread <= 0` branch, and delivering straight to
+        // `onread` left that listener invisible — the pipe then never finished and
+        // the sink's writable side stayed open.
+        if let Some(state) = state_pointer_of(object) {
+            let listening = {
+                // SAFETY: the state lives as long as the object, which is alive
+                // for this call.
+                unsafe { rn_uv::listener::listener_count(state) > 0 }
+            };
+            if listening {
+                // SAFETY: the state is live, and `emit_read` holds no reference to
+                // it across the listener call.
+                unsafe {
+                    rn_uv::listener::emit_read(
+                        state,
+                        EOF as isize,
+                        rn_uv::listener::ReadBuffer::Listener(rn_uv::sys::uv_buf_t {
+                            base: std::ptr::null_mut(),
+                            len: 0,
+                        }),
+                    )
+                };
+                return;
+            }
         }
         rn_uv::stream::with_state(|state| {
             state.set(rn_uv::handle::K_READ_BYTES_OR_ERROR, EOF as u32)
@@ -437,7 +576,45 @@ pub fn take_pending(
     let take = record.pending.len().min(limit);
     let bytes = record.pending.drain(..take).collect::<Vec<u8>>();
     record.sent_bytes += take as u64;
+    // The provider is being asked for data, so the "wants more" hint it raised is
+    // now satisfied; `settle_writes` will re-raise it if the queue empties again.
+    record.wants_write = false;
     Some((bytes, record.ended && record.pending.is_empty()))
+}
+
+/// Raises `OnStreamWantsWrite` when the stream is waiting for more data.
+///
+/// `Http2Stream::OnRead` calls `EmitWantsWrite(length)` from the provider when it
+/// has drained its queue and is still writable (`src/node_http2.cc:2877`). That is
+/// the *only* thing that resumes a `StreamPipe` over an HTTP/2 sink, because
+/// `HasWantsWrite()` is true and the pipe therefore never resumes its source
+/// itself.
+///
+/// The provider runs inside `nghttp2_session_mem_send`, where a V8 call is not
+/// legal, so the fact is recorded there and delivered here, on the loop thread
+/// with a scope.
+pub fn settle_writes(session: &SessionState, stream_id: i32) {
+    let wants = {
+        let streams = session.streams.borrow();
+        match streams.get(&stream_id) {
+            Some(record) => record.wants_write,
+            None => return,
+        }
+    };
+    if !wants {
+        return;
+    }
+    let Some(object) = crate::stream::object_for_anywhere(session, stream_id) else {
+        return;
+    };
+    let _ = rn_uv::callback::with_context(|scope| {
+        let object: v8::Local<v8::Object> = v8::Local::new(scope, &object);
+        if let Some(state) = crate::stream::state_pointer_of(object) {
+            // SAFETY: the stream state lives as long as the object, and
+            // `emit_wants_write` holds no reference to it across the call.
+            unsafe { rn_uv::listener::emit_wants_write(state, 65_536) };
+        }
+    });
 }
 
 /// Calls a per-stream callback with the stream handle as the receiver.
@@ -885,21 +1062,35 @@ fn refresh_state(
 }
 
 /// `StreamBase::ReadStart`.
+///
+/// Routed through the ops so the record's mirrored `reading` flag and the paused
+/// flow-control credit are updated together — the data path reads that flag from
+/// `mem_recv`, where the handle's own `Cell` is not reachable.
 fn read_start(
     _scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_>,
+    mut rv: v8::ReturnValue<'_>,
 ) {
-    with_state(args.this(), |state| state.reading.set(true));
+    let Some(state) = state_pointer_of(args.this()) else {
+        return;
+    };
+    // SAFETY: the state lives as long as the object, which is this call.
+    let status = unsafe { (*state).ops.read_start(state) };
+    rv.set(v8::Integer::new(_scope, status).into());
 }
 
 /// `StreamBase::ReadStop`.
 fn read_stop(
-    _scope: &mut v8::PinScope<'_, '_>,
+    scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_>,
+    mut rv: v8::ReturnValue<'_>,
 ) {
-    with_state(args.this(), |state| state.reading.set(false));
+    let Some(state) = state_pointer_of(args.this()) else {
+        return;
+    };
+    // SAFETY: as above.
+    let status = unsafe { (*state).ops.read_stop(state) };
+    rv.set(v8::Integer::new(scope, status).into());
 }
 
 /// `StreamBase::Shutdown`: end this stream's writable side.
