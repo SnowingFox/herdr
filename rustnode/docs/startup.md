@@ -161,7 +161,162 @@ The regression section below describes a ~5 ms cost added afterwards, so the
 "remaining 15 ms" here is not the current split; re-run the phase report for
 that.
 
+### What a snapshot is now worth, and why it still cannot be built
+
+Node's own control prices the lever: `node --no-node-snapshot -e 'void 0'` is
+**46.40 ms against 18.52 ms** (median of 30, interleaved), so 27.9 ms of Node's
+startup is work its snapshot removes. That is the whole gap to rustnode and more,
+and it is the only lever here that is worth more than a couple of milliseconds.
+
+`CLA-191`/`CLA-192` recorded this as blocked because a serializer-enabled
+creator isolate has no `Float16Array`, so `primordials.js` throws before
+anything can be serialised. That is still true of the intrinsic, but the wall is
+narrower than "no snapshot is reachable", and both halves are now measured:
+
+**The build gets past `primordials` if a stand-in is installed first.** Defining
+`globalThis.Float16Array = class Float16Array extends Float32Array {}` in the
+creator before running the vendored `primordials.js` completes it, and
+`create_blob` then succeeds: a 527 KB blob from a realm carrying real
+primordials. So the "cannot build at all" half of the blocker is a one-line
+workaround in a build-only path, not a wall.
+
+**The stand-in is why that is not a fix.** It survives the round trip and
+`primordials.Float16Array` ends up bound to it, not to the intrinsic: after
+`Context::from_snapshot`, `globalThis.__captured.BYTES_PER_ELEMENT` is **4**
+(inherited from `Float32Array`) where the real intrinsic reports **2**. A
+snapshot built this way would hand every `lib/**` module that destructures
+`primordials.Float16Array` a constructor with the wrong element size, and nothing
+would fail loudly until some code allocated one. That is a silent semantic error
+in the shared library, so it is not shippable.
+
+The honest remaining options, in order of cost:
+
+1. Build the `v8` crate against V8 15.6, where `Float16Array` moved into
+   `TYPED_ARRAYS_BASE` and a creator isolate has it. The newest published `v8`
+   is 152.2.0 (V8 15.2), so this means a local v8 build.
+2. Teach the build path to install the real intrinsic before `primordials.js`
+   runs. A binding cannot synthesise it — `v8::Float16Array::new` needs the
+   intrinsic to exist — so this is not a small patch either.
+
+Until one of those lands, a snapshot is **not** reachable, and the correct
+statement is "the blocker is a V8 version skew with a known workaround that is
+not semantically safe", not "blocked with no path".
+
+
+## The current phase budget (re-measured at `e8a7c1b0`)
+
+The tables above record the code-cache work at its own tree. This one is a fresh
+budget of the current startup, and it is the table to read before proposing a
+startup change: it says where the 21-28 ms actually goes now, rather than where
+it went when the cache landed.
+
+Measured with `RN_PROFILE_PHASES=1`, release build, median of 60 runs, each run
+in its own process, on an idle machine (load average 1.7). Deltas are the
+per-phase cost; cumulative is measured from `main`.
+
+| phase | cumulative | delta | p25-p75 |
+| --- | --- | --- | --- |
+| tracing init | 0.04 | 0.04 | 0.03-0.04 |
+| v8 link check | 0.04 | 0.01 | 0.01-0.01 |
+| `uv_setup_args` | 0.05 | 0.01 | 0.01-0.01 |
+| args parse + permission install | 0.10 | 0.05 | 0.05-0.06 |
+| binding registry | 0.41 | 0.31 | 0.29-0.36 |
+| `V8::initialize` | 1.01 | 0.59 | 0.56-0.66 |
+| `Isolate::new` | 2.38 | 1.35 | 1.27-1.53 |
+| `Context::new` | 2.78 | 0.41 | 0.38-0.45 |
+| `install_globals` (bootstrap.js) | 3.12 | 0.33 | 0.31-0.37 |
+| primordials | 6.52 | 3.38 | 3.18-3.70 |
+| `realm.js` executed | 9.24 | 2.62 | 2.42-2.92 |
+| **process source maps** | 13.68 | **4.40** | 4.10-4.66 |
+| install_early_globals | 17.37 | 3.71 | 3.49-3.88 |
+| install_cjs_loader | 18.70 | 1.27 | 1.19-1.41 |
+| install_stdio + console | 20.20 | 1.48 | 1.36-1.83 |
+| prepare_execution | 21.45 | 1.23 | 1.19-1.38 |
+| Runtime::install + eval builtins | 21.58 | 0.12 | 0.12-0.14 |
+| push_top_level_context | 21.58 | 0.00 | — |
+| user script | 21.60 | 0.01 | 0.01-0.01 |
+| loop finished | 21.65 | 0.04 | 0.04-0.05 |
+
+Three things this table changes about the older account:
+
+**`process source maps` is the largest single phase, and it is one `require`.**
+`install_process_source_maps` calls `require('internal/source_map/source_map_cache')`
+to install two `process` accessors. That module reads `fs` at module scope, so
+the load drags in `fs` (2.1 ms) and `buffer` (2.5 ms) — 4.4 ms of bootstrap for
+two accessors that an empty script never calls. Node does not pay this: it ships
+that module inside its startup snapshot.
+
+**`realm.js` is no longer 9.8 ms.** The code cache plus `#26`'s fix moved it to
+2.6 ms. `primordials` (3.4 ms) is now larger than `realm.js`.
+
+**V8 bring-up is 2.8 ms of ~22 ms.** `V8::initialize` + `Isolate::new` +
+`Context::new` is 2.8 ms; the JavaScript bootstrap is ~18.5 ms. Any proposal that
+targets V8 initialisation is aiming at an eighth of the problem.
+
+### The unmeasured 5 ms: process entry and dynamic loading
+
+The table starts at `main`, and the wall clock does not. Median wall time for
+`-e 'void 0'` is 26-28 ms against a last-mark of ~21.7 ms, and the gap is real
+work that no in-process timer can see:
+
+| segment | cost | how measured |
+| --- | --- | --- |
+| `fork` + `execve` + `ld.so` startup, before any Rust code | ~1.2 ms | a 440 KB Rust binary that only exits, same harness |
+| relocation of rustnode's 95,333 `R_X86_64_RELATIVE` entries | ~0.2-0.4 ms | `LD_DEBUG=statistics`, 528k-374k cycles in the loader, 84-87% of it relocation |
+| libc + V8 static initialisers, `.init_array` to `main` | ~0.1 ms | an `.init_array` constructor stamping `Instant::now()` |
+
+Node's equivalent relocation count is 1,017, and its loader total is 327k
+cycles. Packing the 95,333 relocations into a DT_RELR table
+(`-Wl,-z,pack-relative-relocs`) collapses them to 23 KB, but measured against an
+interleaved control it is **not a speedup**: 27.26 → 27.78 ms median at n=100 on
+an idle box, and CPU time unchanged. The loader statistics exaggerate the cost
+because `LD_DEBUG` timing includes its own accounting; wall clock is the
+authority and it says relocation is not worth a linker flag.
+
+### Levers that were measured and did not help
+
+Each of these was measured against an interleaved control in the same batch, on
+an idle machine, at n=30-80. The A/A noise floor on this box — two binaries from
+the same source, interleaved — is **1.9-2.7%**, so anything inside that band is
+not a result. Recording them because they are the obvious ideas and each one
+would otherwise be tried again.
+
+| lever | measured | verdict |
+| --- | --- | --- |
+| V8 `--single-threaded` | +59% | much worse; it forces a single-threaded platform |
+| V8 `--no-opt`, `--lite-mode`, `--jitless` | +54-58% | much worse; the bootstrap needs the optimising tiers |
+| V8 `--no-lazy` | +96% | much worse; eager compilation of everything |
+| V8 `--no-compilation-cache` | +56% | confirms the builtin code cache is load-bearing |
+| V8 `--no-expose-wasm`, `--predictable`, `--no-harmony` | +1.0 to +2.7% | neutral or worse |
+| `--max-semi-space-size=1`, `--stress-scavenge=0` | -2.2 to -2.4% | inside the noise floor |
+| `--no-concurrent-marking`, `--no-parallel-scavenge`, `--single-threaded-gc` | +1.3 to +2.8% | neutral or worse |
+| platform thread pool 1/2/4 instead of auto | +9.5 to +11.3% | wrong direction; the pool is not the cost |
+| deferring the `source_map_cache` require | -3.6 ms in its own phase, **+3.6% wall** | the cost moves to `install_early_globals`; net negative |
+| DT_RELR packed relocations | 27.26 → 27.78 ms | inside noise, CPU unchanged |
+| stripping 19 MB of symbols from the binary | 26.20 → 27.74 ms | inside noise |
+| skipping the libuv threadpool drain at exit | +0.3 ms (worse) | teardown is not a cost |
+| `_exit` to skip `atexit`/`.fini_array` | -0.19 ms | inside noise; teardown is not a cost |
+
+Two of these are worth understanding rather than just recording:
+
+**Deferring `source_map_cache` moves work instead of removing it.** The phase
+that loads it drops from 4.40 to 0.62 ms, and `install_early_globals` rises from
+3.71 to 6.76 ms, because `internal/encoding` loads `internal/buffer` and the
+`globalThis` walk in `install_web_globals` loads `internal/event_target`, so the
+same modules are compiled slightly later. Process CPU time is
+unchanged (30.5 vs 31.0 ms), and wall clock gets worse by 3.6%, once outside the
+noise floor and reproducible across three batches. The lesson generalises: in
+this bootstrap, a phase-table delta is not a saving until CPU time agrees.
+
+**V8 flags cannot be measured through the CLI at all.** `rn-cli` rejects every
+V8 flag with `rustnode: unsupported option '--no-opt'` before V8 sees it, so a
+flag sweep that passes the flag on the command line measures a process that
+exited during argument parsing — 2.6 ms, an apparent 89% win. Anything measured
+this way must be checked for a zero exit status first. The table above was taken
+by injecting the flag before `V8::initialize` instead.
+
 ## Measuring it again
+
 
 Set `RN_PROFILE_PHASES=1` and every phase reports to stderr at exit, with the
 same boundaries the table above uses plus the ones the realm bootstrap added:
