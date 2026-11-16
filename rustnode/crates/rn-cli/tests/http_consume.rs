@@ -49,6 +49,18 @@ struct Run {
     elapsed: Duration,
 }
 
+/// The oracle this test binary compares against, resolved and announced once.
+///
+/// The reference binary is the one `tools/node-pin.toml` pins, not whatever
+/// `node` `PATH` resolves to; see [`rn_node_oracle`]. A missing oracle skips
+/// loudly and a wrong-version one fails, so a green run always names its engine.
+fn oracle() -> Option<&'static rn_node_oracle::Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<rn_node_oracle::Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-cli http consume"))
+        .as_ref()
+}
+
 /// Runs `script` under `binary`, killing it if it outlives `limit`.
 fn run(binary: &str, script: &str, limit: Duration) -> Run {
     let started = Instant::now();
@@ -94,8 +106,8 @@ fn run(binary: &str, script: &str, limit: Duration) -> Run {
 ///
 /// `node` runs first: if the reference disagrees, the expectation in this test is
 /// wrong and saying so is more useful than blaming rustnode.
-fn same_output_as_node(script: &str, expected: &str) {
-    let reference = run("node", script, Duration::from_secs(20));
+fn same_output_as_node(oracle: &rn_node_oracle::Oracle, script: &str, expected: &str) {
+    let reference = run(oracle.reference_path(), script, Duration::from_secs(20));
     assert!(
         reference.success,
         "`node` failed on {script:?}; stderr: {}",
@@ -131,10 +143,14 @@ fn same_output_as_node(script: &str, expected: &str) {
 
 #[test]
 fn a_keep_alive_request_does_not_report_consume_as_unavailable() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The reported symptom, minus the hang: `consume` is reached on every server
     // connection, so a throwing `consume` surfaced here as an uncaught error
     // printed after the response had already been served.
     same_output_as_node(
+        oracle,
         "const http = require('http');\n\
          const s = http.createServer((req, res) => res.end('ok'));\n\
          s.listen(0, () => {\n\
@@ -150,11 +166,15 @@ fn a_keep_alive_request_does_not_report_consume_as_unavailable() {
 
 #[test]
 fn the_server_handle_is_marked_consumed_and_the_parser_agrees() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The bookkeeping `consume` exists to establish. `lib/internal/http/server.js`
     // sets both flags itself before the call, so a `consume` that threw would
     // still leave them set while aborting the rest of the connection setup; that
     // is why this is checked together with real traffic rather than alone.
     same_output_as_node(
+        oracle,
         "const http = require('http');\n\
          const s = http.createServer((req, res) => res.end('ok'));\n\
          s.on('connection', (socket) => {\n\
@@ -175,6 +195,9 @@ fn the_server_handle_is_marked_consumed_and_the_parser_agrees() {
 
 #[test]
 fn a_consumed_socket_still_delivers_every_pipelined_request() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The contract a silent no-op would break first. `lib/internal/http/server.js`
     // replaces `socket.on` with a wrapper that calls `unconsume` when anyone adds
     // a `'data'` or `'readable'` listener, so a `consume` that did not record the
@@ -182,6 +205,7 @@ fn a_consumed_socket_still_delivers_every_pipelined_request() {
     // requests written in one `write()` only all arrive if the parser kept
     // ownership of the stream.
     same_output_as_node(
+        oracle,
         "const http = require('http');\n\
          const net = require('net');\n\
          const seen = [];\n\
@@ -208,10 +232,14 @@ fn a_consumed_socket_still_delivers_every_pipelined_request() {
 
 #[test]
 fn a_request_with_a_body_is_parsed_after_consume() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // A body spans multiple `execute` calls, so it only works if the same parser
     // stays attached across reads. This is the shape `test-async-hooks-http-agent`
     // uses (a `POST` whose body arrives after the headers).
     same_output_as_node(
+        oracle,
         "const http = require('http');\n\
          const s = http.createServer((req, res) => {\n\
            const chunks = [];\n\

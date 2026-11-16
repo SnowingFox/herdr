@@ -62,6 +62,18 @@ struct Run {
     elapsed: Duration,
 }
 
+/// The oracle this test binary compares against, resolved and announced once.
+///
+/// The reference binary is the one `tools/node-pin.toml` pins, not whatever
+/// `node` `PATH` resolves to; see [`rn_node_oracle`]. A missing oracle skips
+/// loudly and a wrong-version one fails, so a green run always names its engine.
+fn oracle() -> Option<&'static rn_node_oracle::Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<rn_node_oracle::Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-cli unref timer"))
+        .as_ref()
+}
+
 /// Runs `script` under `binary`, killing it if it outlives `limit`.
 fn run(binary: &str, script: &str, limit: Duration) -> Run {
     let started = Instant::now();
@@ -156,11 +168,14 @@ fn condition_b() -> String {
 
 #[test]
 fn an_unrefed_deadline_fires_alone_and_with_a_refed_timer_pending() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // Both conditions, because the bug lived exactly in the difference between
     // them: a fix that only made B work would leave the HTTP timeouts broken, and
     // B already worked before any change.
     for (name, script) in [("A", condition_a()), ("B", condition_b())] {
-        let reference = run("node", &script, Duration::from_secs(10));
+        let reference = run(oracle.reference_path(), &script, Duration::from_secs(10));
         assert!(
             reference.stdout.contains("FIRED"),
             "`node` did not fire the 800ms unref'd timer in condition {name}; \
@@ -208,11 +223,18 @@ fn a_lone_unrefed_deadline_still_gets_the_event_loop_running() {
 
 #[test]
 fn an_unrefed_timer_fires_at_every_delay_under_node() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The reference. `node` is the specification for what these scripts mean, so
     // a failure here would be a broken environment rather than a rustnode bug,
     // and it has to be reported as such instead of as a parity difference.
     for &delay in DELAYS_MS {
-        let reference = run("node", &script(delay), Duration::from_secs(10));
+        let reference = run(
+            oracle.reference_path(),
+            &script(delay),
+            Duration::from_secs(10),
+        );
         assert!(
             reference.success,
             "`node` did not fire an unref'd {delay}ms timer ({}); \
@@ -276,11 +298,14 @@ fn the_timer_does_not_fire_early() {
 
 #[test]
 fn an_unrefed_timer_alone_does_not_keep_the_process_alive() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The other half of `unref`'s contract, which the re-arm could break: a
     // re-armed handle left ref'd would keep the process open for a deadline the
     // caller explicitly excluded. `node` exits immediately here without firing.
     let script = "setTimeout(() => console.log('FIRED'), 5000).unref();";
-    let reference = run("node", script, Duration::from_secs(10));
+    let reference = run(oracle.reference_path(), script, Duration::from_secs(10));
     assert!(reference.success, "`node` did not exit on an unref'd timer");
     assert_eq!(reference.stdout, "", "`node` fired a cancelled deadline");
 

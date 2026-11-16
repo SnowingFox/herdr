@@ -21,4 +21,5 @@ rn-uv.workspace = true
 cc = "1"
 
 [dev-dependencies]
+rn-node-oracle = { path = "../../tools/node-oracle" }
 serde_json.workspace = true

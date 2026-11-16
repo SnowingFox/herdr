@@ -17,16 +17,37 @@
 
 use std::process::Command;
 
-/// `node`'s result for `script`, if the reference binary is available.
-fn node(script: &str) -> String {
-    let output = Command::new("node")
+use rn_node_oracle::Oracle;
+
+/// The oracle this test binary compares against, resolved and announced once.
+///
+/// [`rn_node_oracle::require_oracle`] panics when a `node` exists but is not the
+/// pinned build, so a wrong engine can never produce a green run here. It
+/// returns `None` only when there is no oracle at all, which every test turns
+/// into an explicit skip.
+///
+/// The announcement is a single line per test binary rather than one per test:
+/// `cargo test` runs these in parallel threads and thirty identical lines would
+/// bury the verdict.
+fn oracle() -> Option<&'static Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-cli event loop"))
+        .as_ref()
+}
+
+/// The oracle's result for `script`.
+fn node(oracle: &Oracle, script: &str) -> String {
+    let output = oracle
+        .command()
         .arg("-e")
         .arg(script)
         .output()
-        .expect("node must be on PATH to record the reference output");
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
     assert!(
         output.status.success(),
-        "node failed on {script:?}: {}",
+        "{} failed on {script:?}: {}",
+        oracle.describe(),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n")
@@ -47,19 +68,28 @@ fn rustnode(script: &str) -> String {
     String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n")
 }
 
-/// Asserts `rustnode` prints exactly what `node` prints.
-fn same_as_node(script: &str) -> String {
-    let expected = node(script);
+/// Asserts `rustnode` prints exactly what the oracle prints.
+fn same_as_node(oracle: &Oracle, script: &str) -> String {
+    let expected = node(oracle, script);
     let actual = rustnode(script);
-    assert_eq!(actual, expected, "script was: {script}");
+    assert_eq!(
+        actual,
+        expected,
+        "script was: {script}\nagainst {}",
+        oracle.describe()
+    );
     actual
 }
 
 #[test]
 fn a_zero_timer_reports_after_a_microtask_and_before_exit() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The ordering the issue names: the timer callback runs after the
     // microtask, and the process does not exit until it has run.
     let printed = same_as_node(
+        oracle,
         "setTimeout(() => console.log('timeout'), 0);\n\
          queueMicrotask(() => console.log('microtask'));\n\
          console.log('sync');",
@@ -69,9 +99,13 @@ fn a_zero_timer_reports_after_a_microtask_and_before_exit() {
 
 #[test]
 fn a_then_callback_from_the_script_body_runs_before_the_process_exits() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // No timer and no tick here: if the loop did not drain V8's microtask queue
     // after the script, `resolved 1` would never appear.
     let printed = same_as_node(
+        oracle,
         "Promise.resolve(1).then(v => console.log('resolved', v));\n\
          console.log('sync');",
     );
@@ -80,11 +114,15 @@ fn a_then_callback_from_the_script_body_runs_before_the_process_exits() {
 
 #[test]
 fn next_tick_runs_before_a_promise_and_before_a_timer() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // Node's documented order: the tick queue drains to exhaustion, then V8's
     // microtask queue, then the loop's timer phase. This is the case that a
     // default V8 microtask policy gets wrong, because it drains promises as soon
     // as the script's call depth drops.
     let printed = same_as_node(
+        oracle,
         "setTimeout(() => console.log('timer'), 0);\n\
          queueMicrotask(() => console.log('microtask'));\n\
          process.nextTick(() => console.log('tick'));\n\
@@ -96,9 +134,13 @@ fn next_tick_runs_before_a_promise_and_before_a_timer() {
 
 #[test]
 fn a_nested_timer_runs_after_the_sibling_scheduled_before_it() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `a` schedules `c` while the 0ms list is being drained, so `c` cannot run in
     // the same pass: `b`, already in the list, must come first.
     let printed = same_as_node(
+        oracle,
         "setTimeout(() => { console.log('a'); setTimeout(() => console.log('c'), 0); }, 0);\n\
          setTimeout(() => console.log('b'), 0);",
     );
@@ -107,7 +149,11 @@ fn a_nested_timer_runs_after_the_sibling_scheduled_before_it() {
 
 #[test]
 fn an_interval_runs_until_it_clears_itself() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let printed = same_as_node(
+        oracle,
         "let n = 0;\n\
          const id = setInterval(() => { console.log('tick', ++n); if (n === 3) clearInterval(id); }, 1);",
     );
@@ -116,10 +162,14 @@ fn an_interval_runs_until_it_clears_itself() {
 
 #[test]
 fn an_immediate_runs_after_the_poll_phase_and_before_a_later_timer() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The immediate is queued for the check phase, which follows poll; the 20ms
     // timer is not due until the loop has waited, so the immediate wins even
     // though the timer was scheduled first.
     let printed = same_as_node(
+        oracle,
         "setTimeout(() => console.log('timeout'), 20);\n\
          setImmediate(() => console.log('immediate'));",
     );
@@ -128,9 +178,13 @@ fn an_immediate_runs_after_the_poll_phase_and_before_a_later_timer() {
 
 #[test]
 fn an_unrefed_timer_alone_does_not_keep_the_process_alive() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `unref()` is the promise that a pending timer will not delay exit. The
     // process must exit without ever calling the callback.
     let printed = same_as_node(
+        oracle,
         "setTimeout(() => console.log('never'), 1).unref();\n\
          console.log('done');",
     );
@@ -139,6 +193,9 @@ fn an_unrefed_timer_alone_does_not_keep_the_process_alive() {
 
 #[test]
 fn an_unrefed_deadline_still_fires_while_refed_work_keeps_the_loop_turning() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The deadline is already due by the time the immediate finishes, so the
     // timer phase at the top of the next turn runs it. This is the other half of
     // `unref()`: it means "do not wait for me", not "never run me".
@@ -156,7 +213,7 @@ fn an_unrefed_deadline_still_fires_while_refed_work_keeps_the_loop_turning() {
     // on. It flaked under `cargo test --workspace` for that reason.
     let script = "setTimeout(() => console.log('timer'), 0).unref();\n\
                   setImmediate(() => console.log('immediate'));";
-    let mut expected: Vec<String> = node(script).lines().map(str::to_string).collect();
+    let mut expected: Vec<String> = node(oracle, script).lines().map(str::to_string).collect();
     let mut actual: Vec<String> = rustnode(script).lines().map(str::to_string).collect();
     expected.sort_unstable();
     actual.sort_unstable();
@@ -173,12 +230,16 @@ fn an_unrefed_deadline_still_fires_while_refed_work_keeps_the_loop_turning() {
 
 #[test]
 fn an_unrefed_timer_that_is_not_due_before_the_last_turn_never_runs() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // With a 50ms deadline and one immediate, the loop has nothing left after the
     // immediate, so it must stop rather than wait the remaining milliseconds.
     // The margin is 50ms rather than 5ms on purpose: real `node` fires a 4ms
     // unref'd deadline next to an immediate and skips a 5ms one, so a small
     // timer here would be measuring scheduler latency rather than the rule.
     let printed = same_as_node(
+        oracle,
         "setTimeout(() => console.log('timer'), 50).unref();\n\
          setImmediate(() => console.log('immediate'));",
     );
@@ -187,7 +248,11 @@ fn an_unrefed_timer_that_is_not_due_before_the_last_turn_never_runs() {
 
 #[test]
 fn an_unrefed_interval_runs_only_while_other_work_keeps_the_loop_alive() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let printed = same_as_node(
+        oracle,
         "let n = 0;\n\
          const id = setInterval(() => { if (++n < 3) console.log('tick', n); }, 1).unref();\n\
          setTimeout(() => console.log('ref done'), 10);",
@@ -197,7 +262,11 @@ fn an_unrefed_interval_runs_only_while_other_work_keeps_the_loop_alive() {
 
 #[test]
 fn an_interval_that_is_cleared_before_it_fires_does_not_keep_the_process_alive() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let printed = same_as_node(
+        oracle,
         "const id = setInterval(() => console.log('nope'), 1);\n\
          clearInterval(id);\n\
          console.log('cleared');",
@@ -207,7 +276,11 @@ fn an_interval_that_is_cleared_before_it_fires_does_not_keep_the_process_alive()
 
 #[test]
 fn an_immediate_that_is_cleared_does_not_keep_the_process_alive() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let printed = same_as_node(
+        oracle,
         "const id = setImmediate(() => console.log('nope'));\n\
          clearImmediate(id);\n\
          console.log('cleared');",
@@ -217,14 +290,23 @@ fn an_immediate_that_is_cleared_does_not_keep_the_process_alive() {
 
 #[test]
 fn timer_arguments_are_forwarded_to_the_callback() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `setTimeout(f, ms, ...args)` is how `lib/**` passes a callback's context,
     // and `internal/timers.js` stores `_timerArgs` for it. The two are asserted
     // separately because a 1ms timer and a queued immediate race, and which runs
     // first is not a rule either implementation promises.
-    let printed = same_as_node("setTimeout((a, b) => console.log(a, b), 1, 'one', 2);");
+    let printed = same_as_node(
+        oracle,
+        "setTimeout((a, b) => console.log(a, b), 1, 'one', 2);",
+    );
     assert_eq!(printed, "one 2\n");
 
-    let printed = same_as_node("setImmediate((a) => console.log('immediate', a), 'arg');");
+    let printed = same_as_node(
+        oracle,
+        "setImmediate((a) => console.log('immediate', a), 'arg');",
+    );
     assert_eq!(printed, "immediate arg\n");
 }
 
@@ -264,9 +346,13 @@ fn a_timer_measuring_its_own_delay_sees_at_least_what_it_asked_for() {
 
 #[test]
 fn the_timer_globals_are_the_timers_module_exports() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `lib/net.js` and `timers/promises` compare the global against the module
     // export, so they have to be the same function objects.
     let printed = same_as_node(
+        oracle,
         "console.log(\n\
            setTimeout === require('timers').setTimeout,\n\
            setInterval === require('timers').setInterval,\n\
@@ -280,10 +366,14 @@ fn the_timer_globals_are_the_timers_module_exports() {
 
 #[test]
 fn a_timer_id_can_be_passed_to_clear_timeout() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `Timeout`'s `SymbolToPrimitive` registers the id in `knownTimersById`, so a
     // numeric id clears the timer. That path runs entirely through the binding's
     // `asyncId`, which is why it is worth pinning.
     let printed = same_as_node(
+        oracle,
         "const id = setTimeout(() => console.log('nope'), 1);\n\
          clearTimeout(id[Symbol.toPrimitive]());\n\
          console.log('cleared');",
@@ -293,9 +383,13 @@ fn a_timer_id_can_be_passed_to_clear_timeout() {
 
 #[test]
 fn next_tick_is_a_function_and_survives_a_timer_boundary() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `dns.lookup` calls `process.nextTick` from inside a lookup callback, so a
     // tick queued from a timer must still run.
     let printed = same_as_node(
+        oracle,
         "console.log(typeof process.nextTick);\n\
          setTimeout(() => process.nextTick(() => console.log('tick from timer')), 1);",
     );
@@ -304,10 +398,14 @@ fn next_tick_is_a_function_and_survives_a_timer_boundary() {
 
 #[test]
 fn a_dns_lookup_callback_reaches_the_tick_queue() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `dns.lookup` for a literal address resolves through `process.nextTick`,
     // which is the exact failure this loop had to fix: the lookup threw
     // `process.nextTick is not a function` before the task queue was installed.
     let printed = same_as_node(
+        oracle,
         "const dns = require('dns');\n\
          dns.lookup('127.0.0.1', (error, address) => console.log(error ? 'error' : address));\n\
          console.log('scheduled');",
@@ -317,9 +415,13 @@ fn a_dns_lookup_callback_reaches_the_tick_queue() {
 
 #[test]
 fn two_dns_lookups_both_report() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // Two lookups in one script is the case that failed while the first one
     // worked: the second needs the tick queue to still be alive.
     let printed = same_as_node(
+        oracle,
         "const dns = require('dns');\n\
          dns.lookup('::1', (error, address) => console.log('one', error ? 'error' : address));\n\
          dns.lookup('127.0.0.1', (error, address) => console.log('two', error ? 'error' : address));",
@@ -343,10 +445,14 @@ fn a_script_that_sets_process_exit_code_still_exits_with_it() {
 
 #[test]
 fn a_timer_created_inside_a_tick_runs_and_its_promise_drains() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The tick drains to exhaustion first, so the timer it creates is scheduled
     // after the script's own promise. The promise inside the timer then drains
     // before the loop looks for more work.
     let printed = same_as_node(
+        oracle,
         "process.nextTick(() => {\n\
            console.log('tick');\n\
            setTimeout(() => {\n\
@@ -365,9 +471,13 @@ fn a_timer_created_inside_a_tick_runs_and_its_promise_drains() {
 
 #[test]
 fn an_interval_that_unrefs_itself_stops_keeping_the_process_alive() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `unref()` from inside the callback must take effect for the next turn: the
     // process exits after the tick that unref'd, not after the following one.
     let printed = same_as_node(
+        oracle,
         "let n = 0;\n\
          const id = setInterval(() => {\n\
            console.log('tick', ++n);\n\
@@ -379,6 +489,9 @@ fn an_interval_that_unrefs_itself_stops_keeping_the_process_alive() {
 
 #[test]
 fn all_five_queues_drain_in_node_order_from_one_script() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // Ticks, promises, `queueMicrotask` callbacks, immediates and timers queued
     // in one script body: the microtask queues drain before the loop starts, then
     // the check phase, then the timer phase.
@@ -389,6 +502,7 @@ fn all_five_queues_drain_in_node_order_from_one_script() {
     // would be a flaky test rather than a stricter one. At 20ms the timer cannot
     // be the first phase, which is the ordering this test is about.
     let printed = same_as_node(
+        oracle,
         "console.log('a');\n\
          setTimeout(() => console.log('timer'), 20);\n\
          setImmediate(() => console.log('imm'));\n\
@@ -402,12 +516,16 @@ fn all_five_queues_drain_in_node_order_from_one_script() {
 
 #[test]
 fn a_tcp_echo_round_trip_completes() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The regression the libuv loop exists for. A `TCP` handle lives on libuv's
     // loop, so nothing about it works unless that loop is the one being pumped:
     // `listen()` reported a port because it is synchronous enough, but no accept
     // and no connect ever happened. Measured against real `node`, which prints
     // `got hi`.
     let printed = same_as_node(
+        oracle,
         "const s=require('net').createServer(c=>{c.end('hi'); s.close()});\n\
          s.listen(0,()=>{const p=s.address().port;\n\
            const c=net.connect(p,()=>{});\n\
@@ -418,10 +536,14 @@ fn a_tcp_echo_round_trip_completes() {
 
 #[test]
 fn a_udp_datagram_reaches_its_own_socket() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `dgram` is the second handle family: `send()` called back because the send
     // completion was already runnable, while `on('message')` never fired because
     // the receive side needed the loop pumped.
     let printed = same_as_node(
+        oracle,
         "const d=require('dgram'); const s=d.createSocket('udp4');\n\
          s.on('message',m=>{console.log('RECV',m.toString()); s.close()});\n\
          s.bind(0,'127.0.0.1',()=>s.send('ping',s.address().port,'127.0.0.1'))",
@@ -431,10 +553,14 @@ fn a_udp_datagram_reaches_its_own_socket() {
 
 #[test]
 fn a_spawned_child_reports_its_exit_event() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `process_wrap`'s exit callback is a libuv one, so the `exit` event is the
     // third handle family that only fires on the pumped loop. A pid came back
     // from `spawn()` before, which made the missing event easy to miss.
     let printed = same_as_node(
+        oracle,
         "require('child_process').spawn('sh',['-c','exit 7']).on('exit',c=>console.log('exit',c))",
     );
     assert_eq!(printed, "exit 7\n");
@@ -442,12 +568,16 @@ fn a_spawned_child_reports_its_exit_event() {
 
 #[test]
 fn a_natural_exit_runs_the_exit_handlers() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The loop settling is the ordinary way a process ends, and `exit` has to be
     // emitted for it just as it is for an explicit `process.exit()`. It was not:
     // the CLI read `process.exitCode` and called `std::process::exit` directly, so
     // every `process.on('exit', ...)` in `test/common` and `lib/**` was silently
     // skipped. That is what let a failing `node:test` file exit 0.
     let printed = same_as_node(
+        oracle,
         "process.on('exit', (code) => console.log('EXIT EVENT', code));\n\
          console.log('body');",
     );
@@ -456,6 +586,9 @@ fn a_natural_exit_runs_the_exit_handlers() {
 
 #[test]
 fn a_natural_exit_emit_is_guarded_by_exiting() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // A listener that calls `process.exit()` must not make the event fire a
     // second time: the exit sequence sets `process._exiting` before emitting, the
     // same flag `per_thread.js` checks. The event is counted rather than printed
@@ -465,6 +598,7 @@ fn a_natural_exit_emit_is_guarded_by_exiting() {
     // terminates inside the first listener, so the second never runs. The check
     // is that rustnode agrees on that, and on the status.
     let printed = same_as_node(
+        oracle,
         "let n = 0;\n\
          process.on('exit', () => { n++; process.exit(); });\n\
          process.on('exit', () => console.log('sees', n));",
@@ -474,7 +608,11 @@ fn a_natural_exit_emit_is_guarded_by_exiting() {
 
 #[test]
 fn before_exit_is_emitted_before_exit() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let printed = same_as_node(
+        oracle,
         "process.on('beforeExit', (code) => console.log('BEFORE', code));\n\
          process.on('exit', (code) => console.log('EXIT', code));",
     );
@@ -483,12 +621,16 @@ fn before_exit_is_emitted_before_exit() {
 
 #[test]
 fn work_scheduled_from_before_exit_prevents_the_exit() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // This is the documented contract, not an edge case: `beforeExit` may
     // schedule work, and the process then keeps running. `internal/test_runner`'s
     // `harness.js` is built on it — its `exitHandler` waits for pending subtests
     // there — so getting it wrong is what made a failing `node:test` file exit 0
     // even though the failure itself was reported.
     let printed = same_as_node(
+        oracle,
         "let n = 0;\n\
          process.on('beforeExit', () => {\n\
            console.log('BE', ++n);\n\
@@ -500,11 +642,15 @@ fn work_scheduled_from_before_exit_prevents_the_exit() {
 
 #[test]
 fn a_tick_from_before_exit_does_not_prevent_the_exit() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The counterpart to the test above: `nextTick` and microtasks are drained
     // during the emit's own checkpoint and do not keep the loop alive, so the
     // process still exits. Node's `test-process-beforeexit.js` pins the same
     // asymmetry.
     let printed = same_as_node(
+        oracle,
         "process.on('beforeExit', () => {\n\
            console.log('BE');\n\
            process.nextTick(() => console.log('tick'));\n\

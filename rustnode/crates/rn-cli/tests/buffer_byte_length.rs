@@ -66,6 +66,17 @@ const CASES: &[&str] = &[
     "'\\u00e9'",
 ];
 
+/// The oracle this test binary compares against, resolved and announced once.
+///
+/// The reference binary is the one `tools/node-pin.toml` pins, not whatever
+/// `node` `PATH` resolves to; see [`rn_node_oracle`].
+fn oracle() -> Option<&'static rn_node_oracle::Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<rn_node_oracle::Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-cli buffer byte length"))
+        .as_ref()
+}
+
 /// Runs `script` under `binary` and returns its stdout.
 fn run(binary: &str, script: &str) -> String {
     let output = Command::new(binary)
@@ -128,8 +139,16 @@ fn byte_length_agrees_with_from_for_every_case() {
 /// agreement with Node and not two implementations sharing one mistake.
 #[test]
 fn byte_length_matches_node() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let script = comparison_script();
-    let expected = run("node", &script);
+    let expected = run(oracle.reference_path(), &script);
     let actual = run(env!("CARGO_BIN_EXE_rustnode"), &script);
-    assert_eq!(actual, expected, "byte length table differs from node");
+    assert_eq!(
+        actual,
+        expected,
+        "byte length table differs from {}",
+        oracle.describe()
+    );
 }

@@ -10,3 +10,8 @@ description = "internalBinding('encoding_binding') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+
+[dev-dependencies]
+# The differential test compares against the pinned Node oracle, not whatever
+# `node` `PATH` resolves to; see `tools/node-pin.toml` and `rn-node-oracle`.
+rn-node-oracle = { path = "../../tools/node-oracle" }

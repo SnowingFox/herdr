@@ -138,6 +138,24 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The differential tests compare rustnode against a real Node, and that
+      # Node has to be the one `tools/node-pin.toml` pins. `ubuntu-latest` ships
+      # Node 22 on `PATH` while the pin is Node 28, and the two disagree about
+      # the crypto surface, so `rn-bind-crypto/tests/differential.rs` failed here
+      # and passed locally against the right binary. Supplying the oracle through
+      # `RN_NODE_ORACLE` is what makes this job measure the engine rustnode
+      # actually targets; a test that cannot find it now fails rather than
+      # silently skipping or comparing against `PATH`.
+      - name: Fetch the pinned Node oracle
+        id: oracle
+        run: |
+          ./tools/fetch-node-oracle.sh
+          dir=$(sed -n 's/^oracle *= *"\(.*\)"/\1/p' tools/node-pin.toml | head -1)
+          test -n "$dir" || { echo "no [node] oracle in tools/node-pin.toml" >&2; exit 1; }
+          test -x "$dir/bin/node" || { echo "no oracle binary at $dir/bin/node" >&2; exit 1; }
+          echo "RN_NODE_ORACLE=$dir/bin/node" >> "$GITHUB_ENV"
+          "$dir/bin/node" --version
+
       - name: Test
         run: cargo test --workspace
 

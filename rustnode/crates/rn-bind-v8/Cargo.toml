@@ -12,4 +12,5 @@ rn-core.workspace = true
 rn-v8-sys.workspace = true
 
 [dev-dependencies]
+rn-node-oracle = { path = "../../tools/node-oracle" }
 serde_json.workspace = true

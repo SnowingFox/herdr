@@ -1,41 +1,49 @@
-//! Cross-checks the binding against a real `node` binary.
+//! Cross-checks the binding against the pinned Node oracle.
 //!
 //! Everything here is derived from observing Node itself rather than from
 //! re-reading Node's source, so a mistake in my reading of `node_file.cc` shows
 //! up as a test failure instead of as a silently different runtime.
 //!
-//! The tests skip themselves when no `node` is on `PATH`, because the gate for
-//! this crate must not depend on an external binary being installed. When `node`
-//! is present, every assertion runs.
+//! The oracle is the binary `tools/node-pin.toml` pins, not whatever `node` is
+//! on `PATH`; see [`rn_node_oracle`]. A machine with no oracle skips loudly, and
+//! one with a *different* Node fails rather than comparing against the wrong
+//! engine.
 
 use std::os::unix::ffi::OsStrExt;
-use std::process::Command;
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
 use rn_bind_fs::Fs;
+use rn_node_oracle::Oracle;
 
-fn node_available() -> bool {
-    Command::new("node")
-        .arg("-e")
-        .arg("0")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+/// The oracle this test binary compares against, resolved and announced once.
+///
+/// This used to be a bare `Command::new("node")` probe, which meant "whatever
+/// `PATH` resolves to". A CI image ships a different Node than
+/// `tools/node-pin.toml` pins, so the comparison silently measured the wrong
+/// engine. [`rn_node_oracle::require_oracle`] panics on a wrong-version binary
+/// and returns `None` only when there is no oracle at all.
+fn oracle() -> Option<&'static Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-bind-fs node parity"))
+        .as_ref()
 }
 
 /// Runs `node -p <expr>` in `dir` and returns trimmed stdout.
-fn node_print(dir: &std::path::Path, expr: &str) -> String {
-    let out = Command::new("node")
+fn node_print(oracle: &Oracle, dir: &std::path::Path, expr: &str) -> String {
+    let out = oracle
+        .command()
         .arg("-p")
         .arg(expr)
         .current_dir(dir)
         .output()
-        .expect("node runs");
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
     assert!(
         out.status.success(),
-        "node failed: {}",
+        "{} failed: {}",
+        oracle.describe(),
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -111,12 +119,16 @@ fn js_path(path: &std::path::Path) -> String {
 
 #[test]
 fn stat_matches_node_for_size_mode_and_link_count() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let dir = TempDir::new("stat");
     let file = dir.path.join("x");
     std::fs::write(&file, b"hello").expect("write");
 
     // Reference answer straight from Node.
     let expected = node_print(
+        oracle,
         &dir.path,
         "(() => { const s = require('fs').statSync('x'); \
          return JSON.stringify({size: s.size, isFile: s.isFile(), \
@@ -141,13 +153,20 @@ fn stat_matches_node_for_size_mode_and_link_count() {
 
 #[test]
 fn readdir_order_matches_node() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let dir = TempDir::new("readdir");
     for name in ["zebra", "alpha", "Mike", "bravo", "0123"] {
         std::fs::write(dir.path.join(name), b"").expect("write");
     }
     std::fs::create_dir_all(dir.path.join("sub")).expect("mkdir");
 
-    let expected = node_print(&dir.path, "JSON.stringify(require('fs').readdirSync('.'))");
+    let expected = node_print(
+        oracle,
+        &dir.path,
+        "JSON.stringify(require('fs').readdirSync('.'))",
+    );
     // Absolute path because `eval` does not run with the temp dir as its cwd.
     let actual = eval(&format!(
         r#"
@@ -161,6 +180,9 @@ fn readdir_order_matches_node() {
 
 #[test]
 fn recursive_readdir_order_matches_node() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let dir = TempDir::new("recursive");
     std::fs::create_dir_all(dir.path.join("a/b")).expect("mkdir");
     std::fs::create_dir_all(dir.path.join("sub")).expect("mkdir");
@@ -168,6 +190,7 @@ fn recursive_readdir_order_matches_node() {
     std::fs::write(dir.path.join("sub/inner.txt"), b"").expect("write");
 
     let expected = node_print(
+        oracle,
         &dir.path,
         "JSON.stringify(require('fs').readdirSync('.', {recursive: true}))",
     );
@@ -184,9 +207,13 @@ fn recursive_readdir_order_matches_node() {
 
 #[test]
 fn error_message_and_code_match_node() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let dir = TempDir::new("errors");
 
     let expected = node_print(
+        oracle,
         &dir.path,
         "(() => { try { require('fs').statSync('/definitely/not/here/xyzzy'); } \
          catch (e) { return JSON.stringify({code: e.code, errno: e.errno, \
@@ -210,11 +237,15 @@ fn error_message_and_code_match_node() {
 
 #[test]
 fn mkdir_recursive_return_matches_node() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // Node and the binding both create `p/q/r`, so each gets its own tree:
     // whichever runs first would otherwise make the other see an existing path
     // and return `undefined`.
     let for_node = TempDir::new("mkdir-node");
     let expected = node_print(
+        oracle,
         &for_node.path,
         "JSON.stringify(require('fs').mkdirSync('p/q/r', {recursive: true}))",
     );
@@ -239,12 +270,16 @@ fn mkdir_recursive_return_matches_node() {
 
 #[test]
 fn readlink_and_realpath_match_node() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let dir = TempDir::new("links");
     let target = dir.path.join("target");
     std::fs::write(&target, b"").expect("write");
     std::os::unix::fs::symlink(&target, dir.path.join("link")).expect("symlink");
 
     let expected = node_print(
+        oracle,
         &dir.path,
         "JSON.stringify([require('fs').readlinkSync('link'), \
          require('fs').realpathSync('link')])",
@@ -264,6 +299,9 @@ fn readlink_and_realpath_match_node() {
 
 #[test]
 fn internal_module_stat_matches_node_semantics() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let dir = TempDir::new("imstat");
     std::fs::write(dir.path.join("file.js"), b"x").expect("write");
     std::fs::create_dir_all(dir.path.join("dir")).expect("mkdir");
@@ -287,6 +325,7 @@ fn internal_module_stat_matches_node_semantics() {
     // The same tri-state is what Node's loader relies on; cross-check that the
     // underlying stat agrees about the file/directory split.
     let expected = node_print(
+        oracle,
         &dir.path,
         "JSON.stringify([require('fs').statSync('file.js').isFile(), \
          require('fs').statSync('dir').isDirectory()])",
@@ -294,14 +333,24 @@ fn internal_module_stat_matches_node_semantics() {
     assert_eq!(expected, "[true,true]");
 }
 
-/// The whole point of the comparison: skip loudly rather than silently when the
-/// reference binary is unavailable, so a green run is never a false positive.
+/// The whole point of the comparison: name the reference binary rather than
+/// letting a green run leave it ambiguous.
+///
+/// This used to assert only that *some* `node` answered, which a completely
+/// different Node would satisfy. It now proves the binary is the one
+/// `tools/node-pin.toml` pins, so a run that reached `PATH` by mistake is
+/// reported here even if the other tests happened to agree with it.
 #[test]
 fn node_reference_is_reachable() {
-    if !node_available() {
-        eprintln!("skipping: no `node` on PATH");
+    let Some(oracle) = oracle() else {
         return;
-    }
-    let version = node_print(std::env::temp_dir().as_path(), "process.version");
-    assert!(version.starts_with('v'), "unexpected version {version}");
+    };
+    let version = node_print(oracle, std::env::temp_dir().as_path(), "process.version");
+    assert_eq!(
+        version,
+        oracle.pin.expected_version(),
+        "the oracle answered with {version}, but the pin records {}",
+        oracle.pin.expected_version()
+    );
+    assert!(oracle.is_pinned_version(), "{}", oracle.describe());
 }

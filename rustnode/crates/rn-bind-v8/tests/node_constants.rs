@@ -10,18 +10,21 @@
 //! which is the only supported way to see a raw internal binding from
 //! JavaScript.
 //!
-//! # When Node is not there
+//! # Which Node
 //!
-//! The test is skipped, not failed, when `node` is absent or too old to have the
-//! binding: a machine without a Node binary still has to be able to run
-//! `cargo test`. When the binary *is* there, every number has to match — a
-//! mismatch is either a mistake here or a Node release that renumbered a field,
-//! and both are things to find out about.
+//! The reference is the binary `tools/node-pin.toml` pins, resolved by
+//! [`rn_node_oracle`], not whatever `node` is on `PATH`. That distinction is not
+//! cosmetic here: `kHeapSpaces` gained `shared_trusted_space` and
+//! `shared_trusted_large_object_space` between Node 22 and Node 28, so a `PATH`
+//! Node answers with a different list than the engine this crate targets. A
+//! wrong-version reference now fails rather than passing on a coincidence.
 //!
-//! Set `RUSTNODE_PARITY_NODE` to point at a specific binary; otherwise `node` on
-//! `PATH` is used.
+//! When there is no oracle at all the test skips loudly: a machine without a
+//! Node binary still has to be able to run `cargo test`. When the binary *is*
+//! there, every number has to match — a mismatch is either a mistake here or a
+//! Node release that renumbered a field, and both are things to find out about.
 
-use std::process::Command;
+use rn_node_oracle::Oracle;
 
 /// Collects the numbers and buffer shapes from a real Node binary.
 const PROBE: &str = r#"
@@ -52,60 +55,56 @@ process.stdout.write(JSON.stringify({
 }));
 "#;
 
-fn node_binary() -> Option<String> {
-    let candidate = std::env::var("RUSTNODE_PARITY_NODE").unwrap_or_else(|_| "node".to_string());
-    let output = Command::new(&candidate).arg("--version").output().ok()?;
-    output.status.success().then_some(candidate)
+/// The oracle this test binary compares against, resolved and announced once.
+fn oracle() -> Option<&'static Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-bind-v8 node constants"))
+        .as_ref()
 }
 
-/// The recorded values, or `None` when there is no usable Node binary.
+/// The recorded values, or `None` when there is no oracle at all.
+///
+/// A binary that cannot expose `internalBinding('v8')` is a failure, not a
+/// skip: it means the reference is not the build the pin describes, and
+/// treating that as "nothing to compare" would hide a broken oracle behind a
+/// green run.
 fn recorded() -> Option<serde_json::Value> {
-    let binary = node_binary()?;
-    let output = Command::new(binary)
+    let oracle = oracle()?;
+    let output = oracle
+        .command()
         .arg("--expose-internals")
         .arg("-e")
         .arg(PROBE)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        // A Node too old to have `internal/test/binding`, or one built without
-        // the namespace: there is nothing to compare against, so skip rather
-        // than fail on an environment difference.
-        eprintln!(
-            "skipping: node could not expose internalBinding('v8'): {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        return None;
-    }
-    serde_json::from_slice(&output.stdout).ok()
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
+    assert!(
+        output.status.success(),
+        "{} could not expose internalBinding('v8'): {}",
+        oracle.describe(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Some(
+        serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("the v8 probe produced invalid JSON: {error}")),
+    )
 }
 
 /// The Node version the recording came from, for the diagnostics below.
 fn recording_version() -> String {
-    let Some(binary) = node_binary() else {
+    let Some(oracle) = oracle() else {
         return "unknown".to_string();
     };
-    Command::new(binary)
-        .arg("--version")
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    oracle.version.clone()
 }
 
 /// The V8 version the recording came from, because the heap statistics fields
 /// are V8's, not Node's.
 fn recording_v8_version() -> String {
-    let Some(binary) = node_binary() else {
+    let Some(oracle) = oracle() else {
         return "unknown".to_string();
     };
-    Command::new(binary)
-        .arg("-p")
-        .arg("process.versions.v8")
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    oracle.eval("process.versions.v8")
 }
 
 /// Asserts `name` is `expected` in the recording.

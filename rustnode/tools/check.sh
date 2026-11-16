@@ -50,6 +50,58 @@ step "every opt-in control still has a verdict to report"
 step "regenerating the binding registry"
 ./tools/regen-bindings.sh
 
+step "the pinned Node oracle is present"
+# Differential tests compare rustnode against a real Node, and that Node has to
+# be the one `tools/node-pin.toml` pins. Without this step they inherit whatever
+# `node` is on `PATH`: on GitHub's ubuntu-latest that is Node 22 while the pin is
+# Node 28, and the two disagree about the crypto surface, so
+# `rn-bind-crypto/tests/differential.rs` failed on CI and passed locally against
+# the right binary. Neither log said which engine it had measured.
+#
+# `RN_NODE_ORACLE` is exported rather than relying on the pin's recorded
+# directory, so the binary this gate uses is explicit in the environment of
+# every step below and appears in the log line this prints. A failure here is
+# fatal: the gate must not quietly run a weaker set of tests.
+oracle_dir="$(sed -n 's/^oracle *= *"\(.*\)"/\1/p' tools/node-pin.toml | head -1)"
+expected_oracle_version="$(sed -n 's/^oracle_version *= *"\(.*\)"/\1/p' tools/node-pin.toml | head -1)"
+# Everything the resolver would consider, in its order, for the failure message.
+# The tests enumerate the same list when they skip; doing it here means a gate
+# failure names every candidate rather than only the one that was attempted.
+searched_oracle_paths() {
+  [ -n "${RN_NODE_ORACLE:-}" ] && printf ' %s (from RN_NODE_ORACLE)' "$RN_NODE_ORACLE"
+  [ -n "$oracle_dir" ] && printf ' %s/bin/node ([node] oracle in tools/node-pin.toml)' "$oracle_dir"
+  local dir
+  local rest="${PATH:-}"
+  # `${rest#*:}` returns `rest` unchanged when no colon remains, so the loop is
+  # advanced by assigning the remainder each time rather than by a substring.
+  while [ -n "$rest" ]; do
+    case "$rest" in
+      *:*) dir="${rest%%:*}"; rest="${rest#*:}" ;;
+      *) dir="$rest"; rest="" ;;
+    esac
+    [ -n "$dir" ] && printf ' %s/node (PATH)' "$dir"
+  done
+}
+if [ -n "${RN_NODE_ORACLE:-}" ] && [ -x "${RN_NODE_ORACLE}" ]; then
+  : # an explicit oracle already in the environment wins
+elif ! ./tools/fetch-node-oracle.sh; then
+  {
+    echo "check: no pinned Node oracle, and the differential tests must not fall back to PATH."
+    echo "check: expected Node ${expected_oracle_version:-$oracle_dir}."
+    echo "check: searched:$(searched_oracle_paths)"
+    echo "check: set RN_NODE_ORACLE to a pinned binary, or allow the download above."
+  } >&2
+  exit 1
+fi
+export RN_NODE_ORACLE="${RN_NODE_ORACLE:-${oracle_dir}/bin/node}"
+actual_oracle_version="$("$RN_NODE_ORACLE" --version)"
+if [ -n "$expected_oracle_version" ] && [ "$actual_oracle_version" != "$expected_oracle_version" ]; then
+  echo "check: $RN_NODE_ORACLE reports $actual_oracle_version," >&2
+  echo "check: but tools/node-pin.toml records $expected_oracle_version" >&2
+  exit 1
+fi
+echo "check: differential tests will use $RN_NODE_ORACLE ($actual_oracle_version)"
+
 step "building the workspace and the CLI binary"
 # The CLI binary is built explicitly: integration tests that spawn it read
 # `target/debug/rustnode`, and `cargo test -p <crate>` does not rebuild it.

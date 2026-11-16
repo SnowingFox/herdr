@@ -1,4 +1,4 @@
-//! Parity with a real `node` binary on real files.
+//! Parity with the pinned Node oracle on real files.
 //!
 //! `node_expected.json` is a recording of what `node --expose-internals` answers
 //! for the fixture tree in this file, captured with
@@ -16,13 +16,15 @@
 //! serialized array (Node 28 added a seventh `private` slot), so the comparison
 //! only reads the six slots that exist in both.
 //!
-//! When `node` is on `PATH` the recording is regenerated and compared as well,
-//! so the fixture answers are not allowed to drift from the binary either.
+//! The live half compares against the binary `tools/node-pin.toml` pins, not
+//! whatever `node` is on `PATH`; see [`rn_node_oracle`]. With no oracle the live
+//! half skips loudly, and with a *different* Node it fails rather than comparing
+//! against the wrong engine.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use rn_core::{BindingModule, InstallCtx};
+use rn_node_oracle::Oracle;
 use rn_v8_sys::v8;
 
 use rn_bind_modules::Modules;
@@ -208,13 +210,21 @@ fn scrub_root(value: &serde_json::Value, dir: &TempDir) -> serde_json::Value {
     serde_json::from_str(&text).expect("scrubbing preserves JSON")
 }
 
-/// The same probe, run against a real `node`.
-fn probe_with_node(dir: &TempDir) -> Option<serde_json::Value> {
+/// The same probe, run against the pinned oracle.
+///
+/// A probe script that is missing or a Node that cannot run it is a defect in
+/// this test rather than a missing oracle, so both panic instead of turning into
+/// a silent pass: the previous version returned `None` for either, which made a
+/// broken probe indistinguishable from "no Node here".
+fn probe_with_node(oracle: &Oracle, dir: &TempDir) -> serde_json::Value {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/node_probe.js");
-    if !script.is_file() {
-        return None;
-    }
-    let out = Command::new("node")
+    assert!(
+        script.is_file(),
+        "the Node-side probe {} is missing",
+        script.display()
+    );
+    let out = oracle
+        .command()
         .arg("--expose-internals")
         .arg("--no-warnings")
         .arg(&script)
@@ -222,11 +232,19 @@ fn probe_with_node(dir: &TempDir) -> Option<serde_json::Value> {
         // the same spelling the Rust probe uses.
         .current_dir(&dir.0)
         .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
+    assert!(
+        out.status.success(),
+        "{} failed on the modules probe: {}",
+        oracle.describe(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{} produced output that is not JSON ({error})",
+            oracle.describe()
+        )
+    })
 }
 
 #[test]
@@ -259,19 +277,20 @@ fn package_type_detection_matches_the_recording() {
 
 #[test]
 fn the_recording_still_matches_a_live_node() {
-    // Skipped when no `node` is installed, because the gate for this crate must
-    // not depend on an external binary. When it is, this proves the recording
-    // is not stale.
+    // Skipped only when there is no oracle at all; a wrong-version Node fails,
+    // because a recording checked against a different engine proves nothing
+    // about the pinned one.
     let dir = fixture();
-    let Some(live) = probe_with_node(&dir) else {
+    let Some(oracle) = rn_node_oracle::require_oracle("rn-bind-modules parity") else {
         return;
     };
+    let live = probe_with_node(&oracle, &dir);
     let recorded: serde_json::Value = serde_json::from_str(RECORDED).expect("the recording parses");
     // `nearest_type_none` and the malformed paths embed absolute paths, so both
     // sides are scrubbed to `<root>` before comparing.
     assert_eq!(
         scrub_root(&recorded, &dir),
         scrub_root(&live, &dir),
-        "the recorded Node answers no longer match the installed node"
+        "the recorded Node answers no longer match the pinned oracle"
     );
 }

@@ -1,0 +1,13 @@
+[package]
+name = "rn-node-oracle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Resolves the pinned Node binary the differential tests compare against"
+
+# Dev-only: this crate is a test helper, never a runtime dependency. It lives
+# under `tools/` rather than `crates/` because it exports no binding, and
+# `tools/regen-bindings.sh` scans `crates/*` for namespace providers.
+[dependencies]
