@@ -1,0 +1,4692 @@
+{
+ "deepEquals": [
+  [
+   {
+    "k": "number",
+    "v": 1
+   },
+   {
+    "k": "number",
+    "v": 1
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "number",
+    "v": 1
+   },
+   {
+    "k": "number",
+    "v": 1
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "number",
+    "v": 1
+   },
+   {
+    "k": "number",
+    "v": 2
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "number",
+    "v": 1
+   },
+   {
+    "k": "number",
+    "v": 2
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "string",
+    "v": "1"
+   },
+   {
+    "k": "number",
+    "v": 1
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "string",
+    "v": "1"
+   },
+   {
+    "k": "number",
+    "v": 1
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "number",
+    "v": "NaN"
+   },
+   {
+    "k": "number",
+    "v": "NaN"
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "number",
+    "v": "NaN"
+   },
+   {
+    "k": "number",
+    "v": "NaN"
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "number",
+    "v": "-0"
+   },
+   {
+    "k": "number",
+    "v": 0
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "number",
+    "v": "-0"
+   },
+   {
+    "k": "number",
+    "v": 0
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "number",
+    "v": 0
+   },
+   {
+    "k": "number",
+    "v": "-0"
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "number",
+    "v": 0
+   },
+   {
+    "k": "number",
+    "v": "-0"
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "null"
+   },
+   {
+    "k": "undefined"
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "null"
+   },
+   {
+    "k": "undefined"
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "null"
+   },
+   {
+    "k": "null"
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "null"
+   },
+   {
+    "k": "null"
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "undefined"
+   },
+   {
+    "k": "undefined"
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "undefined"
+   },
+   {
+    "k": "undefined"
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "number",
+    "v": "Infinity"
+   },
+   {
+    "k": "number",
+    "v": "Infinity"
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "number",
+    "v": "Infinity"
+   },
+   {
+    "k": "number",
+    "v": "Infinity"
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "bigint",
+    "v": "1"
+   },
+   {
+    "k": "bigint",
+    "v": "1"
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "bigint",
+    "v": "1"
+   },
+   {
+    "k": "bigint",
+    "v": "1"
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "bigint",
+    "v": "1"
+   },
+   {
+    "k": "number",
+    "v": 1
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "bigint",
+    "v": "1"
+   },
+   {
+    "k": "number",
+    "v": 1
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "symbol",
+    "v": "a",
+    "global": true
+   },
+   {
+    "k": "symbol",
+    "v": "a",
+    "global": true
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "symbol",
+    "v": "a",
+    "global": true
+   },
+   {
+    "k": "symbol",
+    "v": "a",
+    "global": true
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "symbol",
+    "v": "a",
+    "global": true
+   },
+   {
+    "k": "symbol",
+    "v": "b",
+    "global": true
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "symbol",
+    "v": "a",
+    "global": true
+   },
+   {
+    "k": "symbol",
+    "v": "b",
+    "global": true
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "array",
+       "v": [
+        {
+         "k": "number",
+         "v": 1
+        },
+        {
+         "k": "number",
+         "v": 2
+        }
+       ]
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "array",
+       "v": [
+        {
+         "k": "number",
+         "v": 1
+        },
+        {
+         "k": "number",
+         "v": 2
+        }
+       ]
+      }
+     ]
+    ],
+    "proto": null
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "array",
+       "v": [
+        {
+         "k": "number",
+         "v": 1
+        },
+        {
+         "k": "number",
+         "v": 2
+        }
+       ]
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "array",
+       "v": [
+        {
+         "k": "number",
+         "v": 1
+        },
+        {
+         "k": "number",
+         "v": 2
+        }
+       ]
+      }
+     ]
+    ],
+    "proto": null
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "b",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ],
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "b",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ],
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "undefined"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "undefined"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "0",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "1",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ],
+     [
+      "length",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ],
+    "proto": null
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "0",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "1",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ],
+     [
+      "length",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ],
+    "proto": null
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "undefined"
+     }
+    ]
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "undefined"
+     }
+    ]
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     },
+     {
+      "k": "number",
+      "v": 3
+     }
+    ]
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     },
+     {
+      "k": "number",
+      "v": 3
+     }
+    ]
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "point"
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "point"
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "point"
+   },
+   {
+    "k": "point"
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "point"
+   },
+   {
+    "k": "point"
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "date",
+    "v": 0
+   },
+   {
+    "k": "date",
+    "v": 0
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "date",
+    "v": 0
+   },
+   {
+    "k": "date",
+    "v": 0
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "date",
+    "v": 0
+   },
+   {
+    "k": "number",
+    "v": 0
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "date",
+    "v": 0
+   },
+   {
+    "k": "number",
+    "v": 0
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "date",
+    "v": 0
+   },
+   {
+    "k": "date",
+    "v": 1000
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "date",
+    "v": 0
+   },
+   {
+    "k": "date",
+    "v": 1000
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ]
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ]
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      {
+       "k": "string",
+       "v": "b"
+      },
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ]
+   },
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "b"
+      },
+      {
+       "k": "number",
+       "v": 2
+      }
+     ],
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      {
+       "k": "string",
+       "v": "b"
+      },
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ]
+   },
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "b"
+      },
+      {
+       "k": "number",
+       "v": 2
+      }
+     ],
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 2
+     },
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 2
+     },
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1,
+     2
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1,
+     2
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1,
+     2
+    ]
+   },
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1,
+     2
+    ]
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1,
+     2
+    ]
+   },
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1,
+     2
+    ]
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1
+    ]
+   },
+   {
+    "k": "typedarray",
+    "ctor": "Int8Array",
+    "v": [
+     1
+    ]
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1
+    ]
+   },
+   {
+    "k": "typedarray",
+    "ctor": "Int8Array",
+    "v": [
+     1
+    ]
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "arraybuffer",
+    "v": [
+     1
+    ]
+   },
+   {
+    "k": "arraybuffer",
+    "v": [
+     1
+    ]
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "arraybuffer",
+    "v": [
+     1
+    ]
+   },
+   {
+    "k": "arraybuffer",
+    "v": [
+     1
+    ]
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "regexp",
+    "v": "a",
+    "flags": "g"
+   },
+   {
+    "k": "regexp",
+    "v": "a",
+    "flags": "g"
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "regexp",
+    "v": "a",
+    "flags": "g"
+   },
+   {
+    "k": "regexp",
+    "v": "a",
+    "flags": "g"
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "regexp",
+    "v": "a",
+    "flags": "g"
+   },
+   {
+    "k": "regexp",
+    "v": "a",
+    "flags": "i"
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "regexp",
+    "v": "a",
+    "flags": "g"
+   },
+   {
+    "k": "regexp",
+    "v": "a",
+    "flags": "i"
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "x"
+   },
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "x"
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "x"
+   },
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "x"
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "x"
+   },
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "y"
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "x"
+   },
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "y"
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "error",
+    "name": "TypeError",
+    "v": "x"
+   },
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "x"
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "error",
+    "name": "TypeError",
+    "v": "x"
+   },
+   {
+    "k": "error",
+    "name": "Error",
+    "v": "x"
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "boxednumber",
+    "v": 1
+   },
+   {
+    "k": "boxednumber",
+    "v": 1
+   },
+   null,
+   true
+  ],
+  [
+   {
+    "k": "boxednumber",
+    "v": 1
+   },
+   {
+    "k": "boxednumber",
+    "v": 1
+   },
+   true,
+   true
+  ],
+  [
+   {
+    "k": "boxedstring",
+    "v": "a"
+   },
+   {
+    "k": "string",
+    "v": "a"
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "boxedstring",
+    "v": "a"
+   },
+   {
+    "k": "string",
+    "v": "a"
+   },
+   true,
+   false
+  ],
+  [
+   {
+    "k": "function",
+    "v": "",
+    "isClass": false
+   },
+   {
+    "k": "function",
+    "v": "",
+    "isClass": false
+   },
+   null,
+   false
+  ],
+  [
+   {
+    "k": "function",
+    "v": "",
+    "isClass": false
+   },
+   {
+    "k": "function",
+    "v": "",
+    "isClass": false
+   },
+   true,
+   false
+  ]
+ ],
+ "deepMatch": [
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "object",
+       "v": [
+        [
+         "b",
+         {
+          "k": "number",
+          "v": 1
+         }
+        ]
+       ],
+       "proto": null
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "object",
+       "v": [
+        [
+         "b",
+         {
+          "k": "number",
+          "v": 1
+         }
+        ],
+        [
+         "c",
+         {
+          "k": "number",
+          "v": 2
+         }
+        ]
+       ],
+       "proto": null
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "object",
+       "v": [
+        [
+         "b",
+         {
+          "k": "number",
+          "v": 1
+         }
+        ]
+       ],
+       "proto": null
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "object",
+       "v": [],
+       "proto": null
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     },
+     {
+      "k": "number",
+      "v": 3
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     },
+     {
+      "k": "number",
+      "v": 3
+     }
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "0",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "undefined"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "undefined"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "undefined"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "null"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "null"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "null"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "undefined"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": "NaN"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": "NaN"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": "-0"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 0
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "string",
+       "v": "1"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "regexp",
+       "v": "x",
+       "flags": ""
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "regexp",
+       "v": "x",
+       "flags": ""
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ]
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      {
+       "k": "string",
+       "v": "b"
+      },
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ]
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "b"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ]
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 3
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "date",
+    "v": 0
+   },
+   {
+    "k": "date",
+    "v": 1000
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "date",
+    "v": 0
+   },
+   {
+    "k": "number",
+    "v": 0
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "Expected 2 objects to match"
+   }
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1
+    ]
+   },
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1
+    ]
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1
+    ]
+   },
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1,
+     2
+    ]
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1
+    ]
+   },
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     2
+    ]
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1
+    ]
+   },
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1
+    ]
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "array",
+       "v": [
+        {
+         "k": "object",
+         "v": [
+          [
+           "b",
+           {
+            "k": "number",
+            "v": 1
+           }
+          ]
+         ],
+         "proto": null
+        }
+       ]
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "array",
+       "v": [
+        {
+         "k": "object",
+         "v": [
+          [
+           "b",
+           {
+            "k": "number",
+            "v": 1
+           }
+          ],
+          [
+           "c",
+           {
+            "k": "number",
+            "v": 2
+           }
+          ]
+         ],
+         "proto": null
+        }
+       ]
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "array",
+       "v": [
+        {
+         "k": "object",
+         "v": [
+          [
+           "b",
+           {
+            "k": "number",
+            "v": 1
+           }
+          ]
+         ],
+         "proto": null
+        }
+       ]
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "array",
+       "v": [
+        {
+         "k": "object",
+         "v": [
+          [
+           "b",
+           {
+            "k": "number",
+            "v": 2
+           }
+          ]
+         ],
+         "proto": null
+        }
+       ]
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": false
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": true
+   }
+  ]
+ ],
+ "inspect": [
+  [
+   {
+    "k": "number",
+    "v": 42
+   },
+   {
+    "ok": true,
+    "value": "42"
+   }
+  ],
+  [
+   {
+    "k": "number",
+    "v": -1
+   },
+   {
+    "ok": true,
+    "value": "-1"
+   }
+  ],
+  [
+   {
+    "k": "number",
+    "v": 1.5
+   },
+   {
+    "ok": true,
+    "value": "1.5"
+   }
+  ],
+  [
+   {
+    "k": "number",
+    "v": "-0"
+   },
+   {
+    "ok": true,
+    "value": "-0"
+   }
+  ],
+  [
+   {
+    "k": "number",
+    "v": "Infinity"
+   },
+   {
+    "ok": true,
+    "value": "Infinity"
+   }
+  ],
+  [
+   {
+    "k": "number",
+    "v": "NaN"
+   },
+   {
+    "ok": true,
+    "value": "NaN"
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": "hi"
+   },
+   {
+    "ok": true,
+    "value": "\"hi\""
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": "a\"b"
+   },
+   {
+    "ok": true,
+    "value": "\"a\\\"b\""
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": "it's"
+   },
+   {
+    "ok": true,
+    "value": "\"it's\""
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": ""
+   },
+   {
+    "ok": true,
+    "value": "\"\""
+   }
+  ],
+  [
+   {
+    "k": "boolean",
+    "v": true
+   },
+   {
+    "ok": true,
+    "value": "true"
+   }
+  ],
+  [
+   {
+    "k": "null"
+   },
+   {
+    "ok": true,
+    "value": "null"
+   }
+  ],
+  [
+   {
+    "k": "undefined"
+   },
+   {
+    "ok": true,
+    "value": "undefined"
+   }
+  ],
+  [
+   {
+    "k": "bigint",
+    "v": "10"
+   },
+   {
+    "ok": true,
+    "value": "10n"
+   }
+  ],
+  [
+   {
+    "k": "symbol",
+    "v": "x",
+    "global": false
+   },
+   {
+    "ok": true,
+    "value": "Symbol(x)"
+   }
+  ],
+  [
+   {
+    "k": "symbol",
+    "v": "s",
+    "global": true
+   },
+   {
+    "ok": true,
+    "value": "Symbol(s)"
+   }
+  ],
+  [
+   {
+    "k": "symbol",
+    "global": false
+   },
+   {
+    "ok": true,
+    "value": "Symbol()"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": []
+   },
+   {
+    "ok": true,
+    "value": "[]"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[ 1 ]"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "string",
+      "v": "a"
+     },
+     {
+      "k": "null"
+     },
+     {
+      "k": "undefined"
+     },
+     {
+      "k": "boolean",
+      "v": true
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[ 1, \"a\", null, undefined, true ]"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "array",
+      "v": [
+       {
+        "k": "number",
+        "v": 1
+       },
+       {
+        "k": "number",
+        "v": 2
+       }
+      ]
+     },
+     {
+      "k": "array",
+      "v": [
+       {
+        "k": "number",
+        "v": 3
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[\n  [ 1, 2 ], [ 3 ]\n]"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "object",
+      "v": [
+       [
+        "a",
+        {
+         "k": "number",
+         "v": 1
+        }
+       ]
+      ],
+      "proto": null
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[\n  {\n    a: 1,\n  }\n]"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: 1,\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "string",
+       "v": "x"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: \"x\",\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "object",
+       "v": [
+        [
+         "b",
+         {
+          "k": "number",
+          "v": 1
+         }
+        ]
+       ],
+       "proto": null
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: {\n    b: 1,\n  },\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ],
+     [
+      "c",
+      {
+       "k": "number",
+       "v": 3
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: 1,\n  b: 2,\n  c: 3,\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "array",
+       "v": [
+        {
+         "k": "number",
+         "v": 1
+        },
+        {
+         "k": "number",
+         "v": 2
+        }
+       ]
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: [ 1, 2 ],\n}"
+   }
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      {
+       "k": "string",
+       "v": "b"
+      },
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ]
+   },
+   {
+    "ok": true,
+    "value": "Map(2) {\n  \"a\": 1,\n  \"b\": 2,\n}"
+   }
+  ],
+  [
+   {
+    "k": "map",
+    "v": [
+     [
+      {
+       "k": "string",
+       "v": "a"
+      },
+      {
+       "k": "object",
+       "v": [
+        [
+         "x",
+         {
+          "k": "number",
+          "v": 1
+         }
+        ]
+       ],
+       "proto": null
+      }
+     ]
+    ]
+   },
+   {
+    "ok": true,
+    "value": "Map(1) {\n  \"a\": {\n    x: 1,\n  },\n}"
+   }
+  ],
+  [
+   {
+    "k": "map",
+    "v": []
+   },
+   {
+    "ok": true,
+    "value": "Map {}"
+   }
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "Set(2) {\n  1,\n  2,\n}"
+   }
+  ],
+  [
+   {
+    "k": "set",
+    "v": [
+     {
+      "k": "object",
+      "v": [
+       [
+        "x",
+        {
+         "k": "number",
+         "v": 1
+        }
+       ]
+      ],
+      "proto": null
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "Set(1) {\n  {\n    x: 1,\n  },\n}"
+   }
+  ],
+  [
+   {
+    "k": "set",
+    "v": []
+   },
+   {
+    "ok": true,
+    "value": "Set {}"
+   }
+  ],
+  [
+   {
+    "k": "date",
+    "v": 0
+   },
+   {
+    "ok": true,
+    "value": "1970-01-01T00:00:00.000Z"
+   }
+  ],
+  [
+   {
+    "k": "date",
+    "v": "NaN"
+   },
+   {
+    "ok": true,
+    "value": "Invalid Date"
+   }
+  ],
+  [
+   {
+    "k": "regexp",
+    "v": "a",
+    "flags": "gi"
+   },
+   {
+    "ok": true,
+    "value": "/a/gi"
+   }
+  ],
+  [
+   {
+    "k": "function",
+    "v": "foo",
+    "isClass": false
+   },
+   {
+    "ok": true,
+    "value": "[Function: foo]"
+   }
+  ],
+  [
+   {
+    "k": "function",
+    "v": "",
+    "isClass": false
+   },
+   {
+    "ok": true,
+    "value": "[Function]"
+   }
+  ],
+  [
+   {
+    "k": "function",
+    "v": "",
+    "isClass": false
+   },
+   {
+    "ok": true,
+    "value": "[Function]"
+   }
+  ],
+  [
+   {
+    "k": "function",
+    "v": "X",
+    "isClass": true
+   },
+   {
+    "ok": true,
+    "value": "[class X]"
+   }
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": [
+     1,
+     2
+    ]
+   },
+   {
+    "ok": true,
+    "value": "Uint8Array(2) [ 1, 2 ]"
+   }
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Uint8Array",
+    "v": []
+   },
+   {
+    "ok": true,
+    "value": "Uint8Array(0) []"
+   }
+  ],
+  [
+   {
+    "k": "typedarray",
+    "ctor": "Float64Array",
+    "v": [
+     1.5
+    ]
+   },
+   {
+    "ok": true,
+    "value": "Float64Array(1) [ 1.5 ]"
+   }
+  ],
+  [
+   {
+    "k": "arraybuffer",
+    "v": [
+     0,
+     0,
+     0,
+     0
+    ]
+   },
+   {
+    "ok": true,
+    "value": "ArrayBuffer(4) [ 0, 0, 0, 0 ]"
+   }
+  ],
+  [
+   {
+    "k": "weakmap"
+   },
+   {
+    "ok": true,
+    "value": "WeakMap {}"
+   }
+  ],
+  [
+   {
+    "k": "weakset"
+   },
+   {
+    "ok": true,
+    "value": "WeakSet {}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [],
+    "nullProto": true
+   },
+   {
+    "ok": true,
+    "value": "[Object: null prototype] {}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "getter"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: [Getter],\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "setter"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: [Setter],\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "gettersetter"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: [Getter/Setter],\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "b",
+      {
+       "k": "getter"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: 1,\n  b: [Getter],\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a-b",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "c d",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  \"a-b\": 1,\n  \"c d\": 2,\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "0",
+      {
+       "k": "string",
+       "v": "a"
+      }
+     ],
+     [
+      "1",
+      {
+       "k": "string",
+       "v": "b"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  \"0\": \"a\",\n  \"1\": \"b\",\n}"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "symbol",
+      "v": "x",
+      "global": false
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[ Symbol(x) ]"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "f",
+      {
+       "k": "function",
+       "v": "f",
+       "isClass": false
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  f: [Function: f],\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "f",
+      {
+       "k": "function",
+       "v": "g",
+       "isClass": false
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  f: [Function: g],\n}"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "C",
+      {
+       "k": "function",
+       "v": "Y",
+       "isClass": true
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  C: [class Y],\n}"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": []
+   },
+   {
+    "ok": true,
+    "value": "[]"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{}"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "array",
+      "v": [
+       {
+        "k": "array",
+        "v": [
+         {
+          "k": "array",
+          "v": [
+           {
+            "k": "number",
+            "v": 1
+           }
+          ]
+         }
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[\n  [\n    [\n      [ 1 ]\n    ]\n  ]\n]"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     },
+     {
+      "k": "number",
+      "v": 3
+     },
+     {
+      "k": "number",
+      "v": 4
+     },
+     {
+      "k": "number",
+      "v": 5
+     },
+     {
+      "k": "number",
+      "v": 6
+     },
+     {
+      "k": "number",
+      "v": 7
+     },
+     {
+      "k": "number",
+      "v": 8
+     },
+     {
+      "k": "number",
+      "v": 9
+     },
+     {
+      "k": "number",
+      "v": 10
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 ]"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     },
+     {
+      "k": "number",
+      "v": 3
+     },
+     {
+      "k": "number",
+      "v": 4
+     },
+     {
+      "k": "number",
+      "v": 5
+     },
+     {
+      "k": "number",
+      "v": 6
+     },
+     {
+      "k": "number",
+      "v": 7
+     },
+     {
+      "k": "number",
+      "v": 8
+     },
+     {
+      "k": "number",
+      "v": 9
+     },
+     {
+      "k": "number",
+      "v": 10
+     },
+     {
+      "k": "number",
+      "v": 11
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[\n  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11\n]"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "number",
+      "v": 2
+     },
+     {
+      "k": "number",
+      "v": 3
+     },
+     {
+      "k": "number",
+      "v": 4
+     },
+     {
+      "k": "number",
+      "v": 5
+     },
+     {
+      "k": "number",
+      "v": 6
+     },
+     {
+      "k": "number",
+      "v": 7
+     },
+     {
+      "k": "number",
+      "v": 8
+     },
+     {
+      "k": "number",
+      "v": 9
+     },
+     {
+      "k": "number",
+      "v": 10
+     },
+     {
+      "k": "number",
+      "v": 11
+     },
+     {
+      "k": "number",
+      "v": 12
+     },
+     {
+      "k": "number",
+      "v": 13
+     },
+     {
+      "k": "number",
+      "v": 14
+     },
+     {
+      "k": "number",
+      "v": 15
+     },
+     {
+      "k": "number",
+      "v": 16
+     },
+     {
+      "k": "number",
+      "v": 17
+     },
+     {
+      "k": "number",
+      "v": 18
+     },
+     {
+      "k": "number",
+      "v": 19
+     },
+     {
+      "k": "number",
+      "v": 20
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[\n  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20\n]"
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": "a\tb\r\nc"
+   },
+   {
+    "ok": true,
+    "value": "\"a\\tb\\r\\nc\""
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": "a\u0001b"
+   },
+   {
+    "ok": true,
+    "value": "\"a\\u0001b\""
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": "日本語"
+   },
+   {
+    "ok": true,
+    "value": "\"日本語\""
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+   },
+   {
+    "ok": true,
+    "value": "\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\""
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "a",
+      {
+       "k": "undefined"
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": true,
+    "value": "{\n  a: undefined,\n}"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "undefined"
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[ undefined ]"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "number",
+      "v": 1
+     },
+     {
+      "k": "hole"
+     },
+     {
+      "k": "number",
+      "v": 3
+     }
+    ]
+   },
+   {
+    "ok": true,
+    "value": "[ 1, empty item, 3 ]"
+   }
+  ]
+ ],
+ "inspectTable": [
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "object",
+      "v": [
+       [
+        "a",
+        {
+         "k": "number",
+         "v": 1
+        }
+       ],
+       [
+        "b",
+        {
+         "k": "number",
+         "v": 2
+        }
+       ]
+      ],
+      "proto": null
+     }
+    ]
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "object",
+      "v": [
+       [
+        "a",
+        {
+         "k": "number",
+         "v": 1
+        }
+       ]
+      ],
+      "proto": null
+     },
+     {
+      "k": "object",
+      "v": [
+       [
+        "a",
+        {
+         "k": "number",
+         "v": 2
+        }
+       ]
+      ],
+      "proto": null
+     }
+    ]
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "object",
+      "v": [
+       [
+        "a",
+        {
+         "k": "number",
+         "v": 1
+        }
+       ],
+       [
+        "b",
+        {
+         "k": "number",
+         "v": 22
+        }
+       ]
+      ],
+      "proto": null
+     },
+     {
+      "k": "object",
+      "v": [
+       [
+        "a",
+        {
+         "k": "number",
+         "v": 333
+        }
+       ],
+       [
+        "b",
+        {
+         "k": "number",
+         "v": 4
+        }
+       ]
+      ],
+      "proto": null
+     }
+    ]
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": []
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "string",
+      "v": "ab"
+     }
+    ]
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "array",
+      "v": [
+       {
+        "k": "number",
+        "v": 1
+       },
+       {
+        "k": "number",
+        "v": 2
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "number",
+    "v": 5
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "object",
+    "v": [
+     [
+      "x",
+      {
+       "k": "number",
+       "v": 1
+      }
+     ],
+     [
+      "y",
+      {
+       "k": "number",
+       "v": 2
+      }
+     ]
+    ],
+    "proto": null
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "object",
+      "v": [
+       [
+        "a",
+        {
+         "k": "object",
+         "v": [
+          [
+           "b",
+           {
+            "k": "number",
+            "v": 1
+           }
+          ]
+         ],
+         "proto": null
+        }
+       ]
+      ],
+      "proto": null
+     }
+    ]
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "object",
+      "v": [
+       [
+        "x y",
+        {
+         "k": "number",
+         "v": 1
+        }
+       ]
+      ],
+      "proto": null
+     }
+    ]
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "object",
+      "v": [
+       [
+        "a",
+        {
+         "k": "number",
+         "v": 1
+        }
+       ],
+       [
+        "b",
+        {
+         "k": "undefined"
+        }
+       ]
+      ],
+      "proto": null
+     }
+    ]
+   },
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "message": "B.inspectTable is not a function. (In 'B.inspectTable(rows)', 'B.inspectTable' is undefined)"
+   }
+  ]
+ ],
+ "concatArrayBuffers": [
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "array",
+      "v": [
+       {
+        "k": "number",
+        "v": 1
+       },
+       {
+        "k": "number",
+        "v": 2
+       }
+      ]
+     },
+     {
+      "k": "array",
+      "v": [
+       {
+        "k": "number",
+        "v": 3
+       },
+       {
+        "k": "number",
+        "v": 4
+       }
+      ]
+     }
+    ]
+   },
+   null,
+   {
+    "ok": true,
+    "value": {
+     "ctor": "ArrayBuffer",
+     "byteLength": 4,
+     "hex": "01020304"
+    }
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": [
+     {
+      "k": "array",
+      "v": [
+       {
+        "k": "number",
+        "v": 1
+       },
+       {
+        "k": "number",
+        "v": 2
+       }
+      ]
+     },
+     {
+      "k": "array",
+      "v": [
+       {
+        "k": "number",
+        "v": 3
+       },
+       {
+        "k": "number",
+        "v": 4
+       }
+      ]
+     }
+    ]
+   },
+   4,
+   {
+    "ok": true,
+    "value": {
+     "ctor": "ArrayBuffer",
+     "byteLength": 4,
+     "hex": "01020304"
+    }
+   }
+  ],
+  [
+   {
+    "k": "array",
+    "v": []
+   },
+   null,
+   {
+    "ok": true,
+    "value": {
+     "ctor": "ArrayBuffer",
+     "byteLength": 0,
+     "hex": ""
+    }
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": "buffers"
+   },
+   null,
+   {
+    "ok": true,
+    "value": {
+     "ctor": "ArrayBuffer",
+     "byteLength": 2,
+     "hex": "0102"
+    }
+   }
+  ],
+  [
+   {
+    "k": "string",
+    "v": "mixed"
+   },
+   null,
+   {
+    "ok": true,
+    "value": {
+     "ctor": "ArrayBuffer",
+     "byteLength": 2,
+     "hex": "0102"
+    }
+   }
+  ]
+ ],
+ "allocUnsafe": [
+  [
+   -1,
+   {
+    "ok": false,
+    "ctor": "RangeError",
+    "code": "ERR_OUT_OF_RANGE",
+    "message": "The value of \"size\" is out of range. It must be >= 0 && <= 4294967295. Received -1"
+   }
+  ],
+  [
+   null,
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"size\" argument must be of type number. Received undefined"
+   }
+  ],
+  [
+   "8",
+   {
+    "ok": false,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"size\" argument must be of type number. Received type string ('8')"
+   }
+  ],
+  [
+   1.5,
+   {
+    "ok": false,
+    "ctor": "RangeError",
+    "code": "ERR_OUT_OF_RANGE",
+    "message": "The value of \"size\" is out of range. It must be an integer. Received 1.5"
+   }
+  ],
+  [
+   0,
+   {
+    "ok": true,
+    "value": {
+     "ctor": "Uint8Array",
+     "length": 0,
+     "isUint8Array": true,
+     "isBuffer": false,
+     "byteLength": 0
+    }
+   }
+  ],
+  [
+   16,
+   {
+    "ok": true,
+    "value": {
+     "ctor": "Uint8Array",
+     "length": 16,
+     "isUint8Array": true,
+     "isBuffer": false,
+     "byteLength": 16
+    }
+   }
+  ]
+ ],
+ "indexOfLine": [
+  [
+   "abc\ndef\nghi",
+   0,
+   {
+    "ok": true,
+    "value": 3
+   }
+  ],
+  [
+   "abc\ndef\nghi",
+   4,
+   {
+    "ok": true,
+    "value": 7
+   }
+  ],
+  [
+   "abcdef",
+   0,
+   {
+    "ok": true,
+    "value": -1
+   }
+  ],
+  [
+   "",
+   0,
+   {
+    "ok": true,
+    "value": -1
+   }
+  ],
+  [
+   "a\nb",
+   null,
+   {
+    "ok": true,
+    "value": 1
+   }
+  ],
+  [
+   "abc\r\ndef",
+   0,
+   {
+    "ok": true,
+    "value": 4
+   }
+  ],
+  [
+   "a\nb",
+   100,
+   {
+    "ok": true,
+    "value": -1
+   }
+  ]
+ ],
+ "allocUnsafePooled": false,
+ "indexOfLineView": {
+  "ok": true,
+  "value": 1
+ },
+ "indexOfLineString": {
+  "ok": false,
+  "ctor": "TypeError",
+  "code": "ERR_INVALID_ARG_TYPE",
+  "message": "buffer must be an ArrayBuffer or ArrayBufferView"
+ }
+}

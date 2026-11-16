@@ -1611,7 +1611,20 @@ dependencies = [
  "rn-bun-api",
  "rn-bun-compression",
  "rn-bun-hash",
+ "rn-bun-text",
  "rn-bun-time",
+]
+
+[[package]]
+name = "rn-bun-text"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-bun-api",
+ "rn-core",
+ "rn-node-oracle",
+ "rn-v8-sys",
+ "serde_json",
 ]
 
 [[package]]
