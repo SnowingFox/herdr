@@ -1579,10 +1579,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bun-hash"
+version = "0.1.0"
+dependencies = [
+ "openssl",
+ "openssl-sys",
+ "rn-bun-api",
+ "rn-core",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bun-members"
 version = "0.1.0"
 dependencies = [
  "rn-bun-api",
+ "rn-bun-hash",
  "rn-bun-time",
 ]
 

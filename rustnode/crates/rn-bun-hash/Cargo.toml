@@ -1,0 +1,28 @@
+[package]
+name = "rn-bun-hash"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bun.hash, the SHA/MD digest classes and Bun.CryptoHasher for rustnode"
+
+[dependencies]
+# The contribution contract: `BunModule`, `BunRegistry`, and the staging-object
+# comparison that refuses a member declared-and-not-installed or the reverse.
+rn-bun-api = { path = "../rn-bun-api" }
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# The same OpenSSL `rn-bind-crypto` builds and links. `openssl-src` is one
+# artifact in the dependency graph, so this is a new edge onto the library
+# rustnode already ships, not a second copy of it.
+#
+# The digests have to be OpenSSL's and not a RustCrypto reimplementation for the
+# same reason `rn-bind-crypto` gives: the premise of the compatibility surface is
+# that a digest cannot disagree with Bun's except through a bug in the glue, which
+# is only true if both run the same code.
+openssl = { version = "=0.10.82", features = ["vendored"] }
+openssl-sys = { version = "=0.9.118", features = ["vendored"] }
+
+[dev-dependencies]
+serde_json.workspace = true
