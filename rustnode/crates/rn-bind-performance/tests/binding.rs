@@ -144,8 +144,13 @@ fn the_constants_cover_gc_types_flags_entry_types_and_milestones() {
         console.log(C.NODE_PERFORMANCE_GC_MAJOR, C.NODE_PERFORMANCE_GC_FLAGS_FORCED,
                     C.NODE_PERFORMANCE_ENTRY_TYPE_GC, C.NODE_PERFORMANCE_MILESTONE_TIME_ORIGIN);"
     ));
-    // The enum positions, which `perf_hooks` compares against.
-    assert_eq!(output, "2 2 0 1");
+    // The GC kinds are `v8::GCType` enumerators, so `MAJOR` is
+    // `kGCTypeMarkSweepCompact` (4) and `MINOR_MARK_SWEEP` is
+    // `kGCTypeMinorMarkSweep` (2). This expectation used to say `2 2 0 1`,
+    // which pinned the swapped pair as correct; `perf_hooks.constants` reports
+    // `4 2 0 1` under the oracle and a consumer filtering `detail.kind` on
+    // `MAJOR` would otherwise see scavenges.
+    assert_eq!(output, "4 2 0 1");
 }
 
 #[test]

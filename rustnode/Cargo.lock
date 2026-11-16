@@ -1216,7 +1216,14 @@ name = "rn-bind-report"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "libuv-sys2",
+ "rn-bind-crypto",
+ "rn-bind-http2",
+ "rn-bind-sqlite",
+ "rn-bind-zlib",
  "rn-core",
+ "rn-napi",
+ "rn-uv",
  "rn-v8-sys",
  "serde",
  "serde_json",
@@ -1384,6 +1391,7 @@ version = "0.1.0"
 dependencies = [
  "rn-core",
  "rn-v8-sys",
+ "tracing",
 ]
 
 [[package]]

@@ -1,17 +1,16 @@
 //! `internalBinding('report')` for rustnode.
 //!
 //! `lib/internal/process/report.js` wraps this into `process.report`. Two
-//! distinct things live here and they have very different value:
+//! distinct things live here:
 //!
 //! * The **configuration surface** — eighteen getters and setters for the
 //!   directory, filename, compact flag, signal and the three "should I report"
-//!   predicates. This is fully implementable and is what tests exercise.
-//! * The **report document** — a large JSON blob of diagnostics. Node's
-//!   `node_report.cc` is a thousand lines of schema. rustnode produces the
-//!   sections it can fill honestly (header, resource usage, environment,
-//!   process state) and leaves out the ones that need subsystems which do not
-//!   exist yet (the libuv handle table, worker list, shared objects). A report
-//!   missing a section is useful; a report inventing one is not.
+//!   predicates.
+//! * The **report document** — the diagnostics blob defined by
+//!   `src/node_report.cc`. [`document`] reproduces its schema: the same
+//!   `reportVersion`, the same eleven sections in the same order, and the same
+//!   header fields. A report a consumer cannot parse with the schema its version
+//!   claims is worse than no report.
 //!
 //! # Why the settings are process-wide
 //!
@@ -19,10 +18,17 @@
 //! signal handler sees whatever `process.report.directory = …` last set. They
 //! live in a `Mutex` here for the same reason: a signal handler reads them.
 
+pub mod document;
+pub mod json;
+pub mod versions;
+
+use std::cell::RefCell;
 use std::sync::{Mutex, OnceLock};
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
+
+use crate::document::{ErrorDetails, HeapSpace, HeapStats, ReportInput, ThreadIdentity};
 
 /// Members exposed on the namespace object, matching `contracts/report.json`.
 pub const MEMBERS: &[&str] = &[
@@ -85,6 +91,20 @@ fn options() -> &'static Mutex<ReportOptions> {
     OPTIONS.get_or_init(|| Mutex::new(ReportOptions::default()))
 }
 
+thread_local! {
+    /// The isolate the report is being built in, recorded at install time.
+    ///
+    /// `PrintGCStatistics` needs `Isolate::GetHeapStatistics`, and the isolate is
+    /// only reachable as a raw pointer because a `v8::Isolate` cannot be rooted.
+    /// The pointer is valid while the isolate is alive, and a report is always
+    /// built from inside a callback on that isolate's thread.
+    static ISOLATE: RefCell<Option<v8::UnsafeRawIsolatePtr>> = const { RefCell::new(None) };
+
+    /// `DiagnosticFilename`'s `seq`, which distinguishes two reports written in
+    /// the same second.
+    static SEQUENCE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 pub struct Report;
 
 impl BindingModule for Report {
@@ -101,6 +121,12 @@ impl BindingModule for Report {
         scope: &mut v8::PinScope<'s, '_>,
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
+        let isolate: &v8::Isolate = scope.as_ref();
+        // SAFETY: the isolate outlives every scope taken from it, so keeping a
+        // pointer to it is sound for the process' life.
+        let pointer = unsafe { isolate.as_raw_isolate_ptr() };
+        ISOLATE.with(|slot| *slot.borrow_mut() = Some(pointer));
+
         let object = v8::Object::new(scope);
         let values: [(&str, v8::Local<v8::Value>); 20] = [
             ("getCompact", function(scope, "getCompact", get_compact)?),
@@ -369,448 +395,261 @@ fn set_report_on_uncaught_exception(
     with_options(|options| options.on_uncaught_exception = value);
 }
 
+/// `getReport(error)`: the document as a string, built but not written.
 fn get_report(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    // `getReport([error])` returns the report as a string. The error, when
-    // given, becomes the report's `javascriptStack.message`.
-    //
-    // The argument is optional, so it must be checked before any conversion: an
-    // absent argument is `undefined`, and converting that to an object throws.
-    let value = args.get(0);
-    let message = if value.is_undefined() || value.is_null() {
-        None
-    } else {
-        value
-            .to_object(scope)
-            .and_then(|object| {
-                let key = v8::String::new(scope, "message")?;
-                object.get(scope, key.into())
-            })
-            .and_then(|message| message.to_string(scope))
-            .map(|text| text.to_rust_string_lossy(scope))
-    };
-    let document = build_report(message.as_deref(), "JavaScript API");
+    // `TriggerNodeReport` passes `"JavaScript API"` as the event and
+    // `__func__` — which is `GetReport` — as the trigger.
+    let document = build(scope, args.get(0), "JavaScript API", "GetReport", None);
     set_string(scope, &mut rv, &document);
 }
 
+/// `writeReport(message, trigger, filename, error)`.
 fn write_report(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    // `writeReport(message, trigger, filename, error)` returns the path it
-    // wrote, or an empty string when the write failed.
     let message = args
         .get(0)
         .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope));
+        .map(|text| text.to_rust_string_lossy(scope))
+        .unwrap_or_default();
     let trigger = args
         .get(1)
         .to_string(scope)
         .map(|text| text.to_rust_string_lossy(scope))
         .unwrap_or_default();
-    let requested = args
-        .get(2)
-        .to_string(scope)
+    // `if (info[2]->IsString()) filename = ...`: a missing filename arrives as
+    // `undefined` from `lib/internal/process/report.js`, and coercing that would
+    // produce the literal name "undefined" and write a file by that name.
+    let requested = v8::Local::<v8::String>::try_from(args.get(2))
         .map(|text| text.to_rust_string_lossy(scope))
         .unwrap_or_default();
 
-    let document = build_report(message.as_deref(), &trigger);
-    match write_document(&document, &requested, message.as_deref()) {
-        Some(path) => set_string(scope, &mut rv, &path),
+    // Node's filename precedence, in `TriggerNodeReport`: the caller's name, then
+    // the configured one, then a generated diagnostic name. A name of `"stdout"`,
+    // `"stderr"` or `"<stdout>"` selects that stream and writes no file.
+    let (configured_directory, configured_filename) =
+        with_options(|options| (options.directory.clone(), options.filename.clone()));
+    let filename = if !requested.is_empty() {
+        requested
+    } else if !configured_filename.is_empty() {
+        configured_filename
+    } else {
+        diagnostic_filename(0, "report", "json")
+    };
+
+    let written = match filename.as_str() {
+        "stdout" => {
+            let document = build(scope, args.get(3), &message, &trigger, Some("stdout"));
+            print!("{document}");
+            Some(filename)
+        }
+        "stderr" => {
+            let document = build(scope, args.get(3), &message, &trigger, Some("stderr"));
+            eprint!("{document}");
+            Some(filename)
+        }
+        _ => {
+            let path = if configured_directory.is_empty() {
+                std::path::PathBuf::from(&filename)
+            } else {
+                std::path::PathBuf::from(&configured_directory).join(&filename)
+            };
+            let document = build(scope, args.get(3), &message, &trigger, Some(&filename));
+            // The banner goes to stderr before the file is opened, which is the
+            // order a wrapper that greps for it expects.
+            eprintln!("\nWriting Node.js report to file: {filename}");
+            match std::fs::write(&path, document.as_bytes()) {
+                Ok(()) => {
+                    // Node suppresses the completion line only for `stderr`,
+                    // where mixing prose into the document would corrupt it.
+                    eprintln!("Node.js report completed");
+                    Some(filename)
+                }
+                Err(error) => {
+                    eprintln!("Failed to open Node.js report file: {filename} ({error})");
+                    None
+                }
+            }
+        }
+    };
+
+    match written {
+        Some(name) => set_string(scope, &mut rv, &name),
         None => set_string(scope, &mut rv, ""),
     }
 }
 
-/// Chooses the report's path and writes it, returning the path on success.
-fn write_document(document: &str, requested: &str, message: Option<&str>) -> Option<String> {
-    let (directory, filename) =
-        with_options(|options| (options.directory.clone(), options.filename.clone()));
-
-    // Node's precedence: the caller's filename, then the configured one, then a
-    // generated name containing the date, pid and trigger.
-    let path = if !requested.is_empty() {
-        std::path::PathBuf::from(requested)
-    } else {
-        let name = if !filename.is_empty() {
-            filename
-        } else {
-            let trigger = message.unwrap_or("report");
-            format!(
-                "report.{}.{}.{}.json",
-                timestamp_for_filename(),
-                std::process::id(),
-                sanitize(trigger)
-            )
-        };
-        let base = if directory.is_empty() {
-            std::env::current_dir().ok()?
-        } else {
-            std::path::PathBuf::from(directory)
-        };
-        base.join(name)
-    };
-
-    std::fs::write(&path, document).ok()?;
-    Some(path.to_string_lossy().into_owned())
+/// Builds the document for one call.
+fn build(
+    scope: &mut v8::PinScope<'_, '_>,
+    error: v8::Local<v8::Value>,
+    event: &str,
+    trigger: &str,
+    filename: Option<&str>,
+) -> String {
+    let (compact, exclude_env, exclude_network) = with_options(|options| {
+        (
+            options.compact,
+            options.exclude_env,
+            options.exclude_network,
+        )
+    });
+    let mut input = ReportInput::new(event, trigger);
+    input.compact = compact;
+    input.exclude_env = exclude_env;
+    input.exclude_network = exclude_network;
+    input.filename = filename;
+    input.error = describe_error(scope, error);
+    input.component_versions = versions::component_versions();
+    input.release = versions::release();
+    let heap = heap_stats(scope);
+    let thread = ThreadIdentity { thread_id: 0 };
+    document::render(&input, heap.as_ref(), &thread)
 }
 
-/// A filename-safe form of a trigger string, the way Node sanitises it.
-fn sanitize(trigger: &str) -> String {
-    trigger
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
-                character
-            } else {
-                '_'
+/// `PrintJavaScriptErrorStack`'s inputs, taken from the live error object.
+///
+/// `ErrorToString` prefers `error.stack` when it is a string, which is what the
+/// first line and the remaining lines are split from; the properties are the
+/// error's own enumerable keys other than `stack` and `message`, stringified.
+fn describe_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    error: v8::Local<v8::Value>,
+) -> Option<ErrorDetails> {
+    if error.is_undefined() || error.is_null() {
+        return None;
+    }
+    let object = error.to_object(scope)?;
+    let stack_key = v8::String::new(scope, "stack")?;
+    let stack = object.get(scope, stack_key.into());
+    let rendered = stack
+        .and_then(|value| value.to_string(scope))
+        .map(|text| text.to_rust_string_lossy(scope))?;
+
+    let mut lines = rendered.split('\n');
+    let message = lines.next().unwrap_or_default().to_string();
+    let stack_lines: Vec<String> = lines
+        .map(|line| line.trim_start().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    let mut properties = Vec::new();
+    if let Some(keys) = object.get_own_property_names(scope, Default::default()) {
+        for index in 0..keys.length() {
+            let Some(key) = keys.get_index(scope, index) else {
+                continue;
+            };
+            let Some(key) = key.to_string(scope) else {
+                continue;
+            };
+            let key = key.to_rust_string_lossy(scope);
+            if key == "stack" || key == "message" {
+                continue;
             }
-        })
-        .collect()
+            let Some(name) = v8::String::new(scope, &key) else {
+                continue;
+            };
+            let Some(value) = object.get(scope, name.into()) else {
+                continue;
+            };
+            let Some(text) = value.to_string(scope) else {
+                continue;
+            };
+            properties.push((key, text.to_rust_string_lossy(scope)));
+        }
+    }
+
+    Some(ErrorDetails {
+        message,
+        stack: stack_lines,
+        properties,
+    })
 }
 
-fn timestamp_for_filename() -> String {
-    // SAFETY: `time` and `gmtime_r` take and fill plain-old-data structs.
+/// `PrintGCStatistics`'s inputs from the live isolate.
+fn heap_stats(scope: &mut v8::PinScope<'_, '_>) -> Option<HeapStats> {
+    let pointer = ISOLATE.with(|slot| *slot.borrow())?;
+    if pointer.is_null() {
+        return None;
+    }
+    let mut raw = pointer;
+    // SAFETY: the pointer was recorded from a live isolate at install time and
+    // this callback runs inside that isolate's own scope, so it is still alive
+    // and not otherwise borrowed on this thread.
+    let isolate = unsafe { v8::Isolate::ref_from_raw_isolate_ptr_mut(&mut raw) };
+    let statistics = isolate.get_heap_statistics();
+    let spaces = isolate.number_of_heap_spaces();
+    let mut heap_spaces = Vec::with_capacity(spaces);
+    for index in 0..spaces {
+        let Some(space) = isolate.get_heap_space_statistics(index) else {
+            continue;
+        };
+        heap_spaces.push(HeapSpace {
+            name: space.space_name().to_string_lossy().into_owned(),
+            size: space.space_size(),
+            physical_size: space.physical_space_size(),
+            used_size: space.space_used_size(),
+            available_size: space.space_available_size(),
+        });
+    }
+    let _ = scope;
+    Some(HeapStats {
+        total_heap_size: statistics.total_heap_size(),
+        total_heap_size_executable: statistics.total_heap_size_executable(),
+        total_physical_size: statistics.total_physical_size(),
+        total_available_size: statistics.total_available_size(),
+        total_global_handles_size: statistics.total_global_handles_size(),
+        used_global_handles_size: statistics.used_global_handles_size(),
+        used_heap_size: statistics.used_heap_size(),
+        heap_size_limit: statistics.heap_size_limit(),
+        malloced_memory: statistics.malloced_memory(),
+        external_memory: statistics.external_memory(),
+        peak_malloced_memory: statistics.peak_malloced_memory(),
+        number_of_native_contexts: statistics.number_of_native_contexts(),
+        number_of_detached_contexts: statistics.number_of_detached_contexts(),
+        does_zap_garbage: statistics.does_zap_garbage(),
+        spaces: heap_spaces,
+    })
+}
+
+/// `DiagnosticFilename::MakeFilename`.
+///
+/// `report.YYYYMMDD.HHMMSS.pid.threadId.NNN.ext`, with `threadId` and `NNN` from
+/// the counter Node increments per report.
+fn diagnostic_filename(thread_id: u32, prefix: &str, extension: &str) -> String {
+    let sequence = SEQUENCE.with(|cell| {
+        let next = cell.get() + 1;
+        cell.set(next);
+        next
+    });
+    // SAFETY: `time` takes a writable `time_t`.
     let mut now: libc::time_t = 0;
     unsafe { libc::time(&mut now) };
+    // SAFETY: `tm` is plain-old-data and `localtime_r` fills it.
     let mut broken: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: `broken` is a valid, writable `tm`.
-    if unsafe { libc::gmtime_r(&now, &mut broken) }.is_null() {
-        return "0".to_string();
+    // SAFETY: `broken` is a valid writable `tm`.
+    if unsafe { libc::localtime_r(&now, &mut broken) }.is_null() {
+        return format!(
+            "{prefix}.{}.{thread_id}.{sequence:03}.{extension}",
+            std::process::id()
+        );
     }
     format!(
-        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        "{prefix}.{:04}{:02}{:02}.{:02}{:02}{:02}.{}.{thread_id}.{sequence:03}.{extension}",
         broken.tm_year + 1900,
         broken.tm_mon + 1,
         broken.tm_mday,
         broken.tm_hour,
         broken.tm_min,
-        broken.tm_sec
+        broken.tm_sec,
+        std::process::id()
     )
-}
-
-/// Builds the report document.
-///
-/// Only sections this build can fill truthfully appear. Node's report also has
-/// a libuv handle table, a worker list and a shared-object list; those need
-/// subsystems that do not exist, and an empty array there would claim "none"
-/// rather than "not measured".
-fn build_report(message: Option<&str>, trigger: &str) -> String {
-    let (exclude_env, exclude_network, compact) = with_options(|options| {
-        (
-            options.exclude_env,
-            options.exclude_network,
-            options.compact,
-        )
-    });
-
-    let mut header = serde_json::json!({
-        "reportVersion": 3,
-        "event": message.unwrap_or(&format!("{trigger} report")),
-        "trigger": trigger,
-        "filename": "",
-        "dumpEventTime": timestamp_for_filename(),
-        "dumpEventTimeStamp": timestamp_millis(),
-        "processId": std::process::id(),
-        "threadId": 0,
-        "cwd": std::env::current_dir()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        "commandLine": std::env::args().collect::<Vec<_>>(),
-        "nodejsVersion": "28.0.0",
-        "wordSize": if cfg!(target_pointer_width = "64") { 8 } else { 4 },
-        "arch": std::env::consts::ARCH,
-        "platform": std::env::consts::OS,
-        "release": release(),
-        "cpus": cpu_summary(),
-        "userLimits": user_limits(),
-    });
-
-    if let Some(object) = header.as_object_mut() {
-        // Each of these is omitted rather than emptied when excluded, because an
-        // empty list would claim "there are none" instead of "not collected".
-        if !exclude_network {
-            object.insert("networkInterfaces".to_string(), network_interfaces());
-        }
-        if !exclude_env {
-            object.insert("environmentVariables".to_string(), environment_variables());
-        }
-    }
-
-    let mut resource_usage = serde_json::json!({});
-    if let Some(usage) = resource_usage_section() {
-        resource_usage = usage;
-    }
-
-    let document = serde_json::json!({
-        "header": header,
-        "javascriptStack": {
-            "message": message.unwrap_or(""),
-            "stack": Vec::<String>::new(),
-        },
-        "nativeStack": Vec::<String>::new(),
-        "javascriptHeap": heap_section(),
-        "resourceUsage": resource_usage,
-        "process": process_section(),
-    });
-
-    if compact {
-        serde_json::to_string(&document).unwrap_or_else(|_| "{}".to_string())
-    } else {
-        serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".to_string())
-    }
-}
-
-fn timestamp_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn release() -> String {
-    // SAFETY: `utsname` is plain-old-data and `uname` fully writes it.
-    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
-    // SAFETY: `uts` is a valid, writable `utsname`.
-    if unsafe { libc::uname(&mut uts) } != 0 {
-        return String::new();
-    }
-    // SAFETY: `uname` null-terminates the release array.
-    unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) }
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn cpu_summary() -> Vec<serde_json::Value> {
-    let count = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1);
-    (0..count)
-        .map(|_| serde_json::json!({ "model": std::env::consts::ARCH }))
-        .collect()
-}
-
-fn user_limits() -> serde_json::Value {
-    // The three limits Node reports; each is a soft/hard pair from `getrlimit`.
-    let read = |resource: libc::__rlimit_resource_t| -> serde_json::Value {
-        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
-        // SAFETY: `limit` is a valid, writable `rlimit`.
-        if unsafe { libc::getrlimit(resource, &mut limit) } != 0 {
-            return serde_json::json!({ "soft": 0, "hard": 0 });
-        }
-        let render = |value: libc::rlim_t| -> serde_json::Value {
-            if value == libc::RLIM_INFINITY {
-                serde_json::Value::String("unlimited".to_string())
-            } else {
-                serde_json::json!(value)
-            }
-        };
-        serde_json::json!({ "soft": render(limit.rlim_cur), "hard": render(limit.rlim_max) })
-    };
-    serde_json::json!({
-        "openFiles": read(libc::RLIMIT_NOFILE),
-        "stack": read(libc::RLIMIT_STACK),
-        "coreFileSize": read(libc::RLIMIT_CORE),
-    })
-}
-
-fn environment_variables() -> serde_json::Value {
-    // Node redacts values whose key looks like a secret and sorts the rest, so a
-    // report pasted into a bug tracker does not leak both names and values of
-    // credentials.
-    let mut map = serde_json::Map::new();
-    for (key, value) in std::env::vars() {
-        let upper = key.to_uppercase();
-        let is_secret = ["KEY", "SECRET", "TOKEN", "PASSWORD", "CREDENTIAL", "AUTH"]
-            .iter()
-            .any(|needle| upper.contains(needle));
-        map.insert(
-            key,
-            serde_json::Value::String(if is_secret {
-                "<redacted>".to_string()
-            } else {
-                value
-            }),
-        );
-    }
-    serde_json::Value::Object(map)
-}
-
-fn resource_usage_section() -> Option<serde_json::Value> {
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    // SAFETY: `usage` is a valid, writable `rusage`.
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
-        return None;
-    }
-    let micros = |value: libc::timeval| value.tv_sec as f64 + value.tv_usec as f64 / 1e6;
-    Some(serde_json::json!({
-        "userCpuSeconds": micros(usage.ru_utime),
-        "kernelCpuSeconds": micros(usage.ru_stime),
-        "cpuConsumptionPercent": 0.0,
-        "maxRss": usage.ru_maxrss,
-        "pageFaults": {
-            "IORequired": usage.ru_majflt,
-            "IONotRequired": usage.ru_minflt,
-        },
-        "fsActivity": {
-            "reads": usage.ru_inblock,
-            "writes": usage.ru_oublock,
-        },
-    }))
-}
-
-fn heap_section() -> serde_json::Value {
-    serde_json::json!({
-        "totalMemory": 0,
-        "executableMemory": 0,
-        "totalCommittedMemory": 0,
-        "availableMemory": 0,
-        "totalGlobalHandlesMemory": 0,
-        "usedGlobalHandlesMemory": 0,
-        "usedMemory": 0,
-        "memoryAllocatorWaste": 0,
-        "mallocedMemory": 0,
-        "externalMemory": 0,
-        "peakMallocedMemory": 0,
-        "nativeContextCount": 1,
-        "detachedContextCount": 0,
-    })
-}
-
-fn process_section() -> serde_json::Value {
-    serde_json::json!({
-        "pid": std::process::id(),
-        "ppid": parent_pid(),
-        "argv": std::env::args().collect::<Vec<_>>(),
-        "execArgv": Vec::<String>::new(),
-    })
-}
-
-fn parent_pid() -> i32 {
-    // SAFETY: no arguments, cannot fail.
-    unsafe { libc::getppid() }
-}
-
-/// The `networkInterfaces` section, in the shape Node's report uses.
-///
-/// Node's report lists the addresses it can see because a network bug is often
-/// about which interface the process was actually bound to. The section is
-/// omitted entirely when `--report-exclude-network` is set, since interface
-/// addresses can identify a machine.
-fn network_interfaces() -> serde_json::Value {
-    // SAFETY: `getifaddrs` fills the list and returns 0 on success.
-    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut list) } != 0 {
-        return serde_json::Value::Object(serde_json::Map::new());
-    }
-
-    let mut interfaces = serde_json::Map::new();
-    let mut cursor = list;
-    while !cursor.is_null() {
-        // SAFETY: `cursor` walks the list `getifaddrs` allocated.
-        let entry = unsafe { &*cursor };
-        let name = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) }
-            .to_string_lossy()
-            .into_owned();
-        if let Some(address) = entry_address(entry) {
-            let slot = interfaces
-                .entry(name.clone())
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-            if let serde_json::Value::Array(list) = slot {
-                list.push(address);
-            }
-        }
-        cursor = entry.ifa_next;
-    }
-
-    // SAFETY: `list` is the head `getifaddrs` allocated and is still owned here.
-    unsafe { libc::freeifaddrs(list) };
-    serde_json::Value::Object(interfaces)
-}
-
-/// One interface address as a report entry, or `None` for a non-IP entry.
-///
-/// SAFETY: `entry` must be a live `ifaddrs` from `getifaddrs`.
-fn entry_address(entry: &libc::ifaddrs) -> Option<serde_json::Value> {
-    let address = entry.ifa_addr;
-    if address.is_null() {
-        return None;
-    }
-    // SAFETY: `address` is the entry's own sockaddr, which `getifaddrs` filled.
-    let family = unsafe { (*address).sa_family } as i32;
-    let (family_name, text) = match family {
-        libc::AF_INET => (
-            "IPv4",
-            // SAFETY: the sockaddr is an `AF_INET`, so the cast is exact.
-            ipv4(unsafe { (*(address as *const libc::sockaddr_in)).sin_addr.s_addr }),
-        ),
-        libc::AF_INET6 => (
-            "IPv6",
-            ipv6(
-                // SAFETY: as above, for `AF_INET6`.
-                &unsafe { (*(address as *const libc::sockaddr_in6)).sin6_addr.s6_addr },
-            ),
-        ),
-        _ => return None,
-    };
-    let internal = text.starts_with("127.") || text == "::1";
-    Some(serde_json::json!({
-        "address": text,
-        "family": family_name,
-        "internal": internal,
-    }))
-}
-
-fn ipv4(raw: u32) -> String {
-    let bytes = raw.to_ne_bytes();
-    format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
-}
-
-/// Formats an IPv6 address the way `inet_ntop` does, compressing the longest run
-/// of zero groups.
-fn ipv6(bytes: &[u8; 16]) -> String {
-    let groups: Vec<u16> = (0..8)
-        .map(|index| u16::from_be_bytes([bytes[index * 2], bytes[index * 2 + 1]]))
-        .collect();
-    let mut best: Option<(usize, usize)> = None;
-    let mut start = None;
-    for (index, group) in groups.iter().enumerate() {
-        if *group == 0 {
-            let from = *start.get_or_insert(index);
-            let length = index - from + 1;
-            if best.is_none_or(|(_, best_length)| length > best_length) {
-                best = Some((from, length));
-            }
-        } else {
-            start = None;
-        }
-    }
-    let (zero_start, zero_length) = match best {
-        Some((from, length)) if length > 1 => (from, length),
-        _ => (usize::MAX, 0),
-    };
-
-    let mut text = String::new();
-    let mut index = 0;
-    while index < 8 {
-        if index == zero_start {
-            text.push_str("::");
-            index += zero_length;
-            if index == 8 {
-                break;
-            }
-            continue;
-        }
-        if !text.is_empty() && !text.ends_with(':') {
-            text.push(':');
-        }
-        text.push_str(&format!("{:x}", groups[index]));
-        index += 1;
-    }
-    text
 }
 
 fn set_string(scope: &mut v8::PinScope, rv: &mut v8::ReturnValue, value: &str) {
@@ -860,44 +699,37 @@ mod tests {
     }
 
     #[test]
-    fn the_report_is_valid_json_with_the_sections_it_claims() {
-        let document = build_report(Some("a test report"), "test");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&document).expect("the report must be valid JSON");
-        for section in [
-            "header",
-            "javascriptStack",
-            "nativeStack",
-            "javascriptHeap",
-            "resourceUsage",
-            "process",
-        ] {
-            assert!(
-                parsed.get(section).is_some(),
-                "the report must have a {section} section"
-            );
+    fn a_diagnostic_filename_follows_nodes_shape() {
+        // `report.YYYYMMDD.HHMMSS.pid.threadId.NNN.json`, with the sequence
+        // counting up so two reports in the same second do not overwrite.
+        let first = diagnostic_filename(0, "report", "json");
+        let second = diagnostic_filename(0, "report", "json");
+        assert!(first.ends_with(".json"));
+        assert_ne!(first, second, "the sequence must advance");
+        let fields: Vec<&str> = first.split('.').collect();
+        assert_eq!(fields.len(), 7, "{first}");
+        assert_eq!(fields[0], "report");
+        assert_eq!(fields[1].len(), 8, "a YYYYMMDD date");
+        assert_eq!(fields[2].len(), 6, "a HHMMSS time");
+        assert_eq!(fields[3], std::process::id().to_string());
+        assert_eq!(fields[4], "0", "the main thread's id");
+        assert_eq!(fields[5].len(), 3, "a zero-padded sequence");
+        assert_eq!(fields[6], "json");
+    }
+
+    #[test]
+    fn a_secret_shaped_name_is_redacted_and_a_plain_one_is_not() {
+        assert_eq!(redacted_for_test("MY_API_KEY", "v"), "<redacted>");
+        assert_eq!(redacted_for_test("HOME", "/home/u"), "/home/u");
+    }
+
+    /// `document::render` redacts through the same predicate; this keeps the
+    /// rule visible from the crate's top-level tests.
+    fn redacted_for_test(key: &str, value: &str) -> String {
+        if document::redacts(key) {
+            "<redacted>".to_string()
+        } else {
+            value.to_string()
         }
-        assert_eq!(parsed["header"]["trigger"], "test");
-        assert_eq!(parsed["process"]["pid"], std::process::id());
-    }
-
-    #[test]
-    fn environment_values_that_look_secret_are_redacted() {
-        // A report is meant to be pasted into a bug report, so a token name must
-        // not come with its value.
-        std::env::set_var("RUSTNODE_TEST_API_KEY", "super-secret-value");
-        let variables = environment_variables();
-        assert_eq!(
-            variables["RUSTNODE_TEST_API_KEY"], "<redacted>",
-            "a key-shaped variable must not leak its value"
-        );
-        std::env::remove_var("RUSTNODE_TEST_API_KEY");
-    }
-
-    #[test]
-    fn a_trigger_becomes_a_filename_safe_fragment() {
-        assert_eq!(sanitize("uncaught exception"), "uncaught_exception");
-        assert_eq!(sanitize("a/b\\c:d"), "a_b_c_d");
-        assert_eq!(sanitize("already-safe_1"), "already-safe_1");
     }
 }
