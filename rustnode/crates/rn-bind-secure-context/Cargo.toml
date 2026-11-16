@@ -21,3 +21,10 @@ openssl-sys = { version = "=0.9.118", features = ["vendored"] }
 # graph: `openssl` already depends on exactly this version and does not
 # re-export it.
 foreign-types = "0.3"
+# The bundled root store, so `addRootCerts` installs the same trust anchors Node
+# does. The edge is one way: `rn-bind-crypto-x509` depends on neither this crate
+# nor anything above it, so there is no cycle.
+rn-bind-crypto-x509 = { path = "../rn-bind-crypto-x509" }
+# `--use-system-ca` and `--use-openssl-ca`, which decide whether the system
+# store joins the bundle. Same one-way edge as above.
+rn-bind-options = { path = "../rn-bind-options" }

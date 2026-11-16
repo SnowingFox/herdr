@@ -10,23 +10,29 @@
 //! | `getUserRootCertificates()` | the PEM of what `resetRootCertStore` set |
 //! | `resetRootCertStore(array)` | replaces the user list |
 //!
-//! # The bundled list is empty here, and that is a real answer
+//! # The bundled list is Node's own
 //!
-//! Node compiles `node_root_certs.h` into the binary: roughly 130 root
-//! certificates as a generated C array, 200 KB of text. rustnode has no such
-//! generated blob, and inventing one — or worse, substituting this machine's
-//! `/etc/ssl/certs` and calling it "bundled" — would make
-//! `tls.getCACertificates('bundled')` report a trust store that is not the one a
-//! Node release ships. An empty list is what this build actually bundles, and the
-//! `tls` tests that need the real list (`test-tls-get-ca-certificates-bundled.js`)
-//! are slice S4/S6's to make pass, with the generator that produces the blob.
+//! Node compiles `node_root_certs.h` into the binary: 118 root certificates as
+//! a generated C array, about 190 KB of text, produced from `tools/certdata.txt`
+//! by `tools/mk-ca-bundle.pl`. `src/root_certs.rs` holds the same values, in the
+//! same order, generated from the same trust store by a port of that Perl
+//! script: `tools/gen-root-certs.py` in this crate, documented there and
+//! committed so a build stays offline.
 //!
-//! `getSystemCACertificates` and `getExtraCACertificates` **are** real: they read
-//! files, and a wrong answer there would be a lie about what the process trusts.
+//! Substituting this machine's `/etc/ssl/certs` and calling it "bundled" would
+//! make `tls.getCACertificates('bundled')` report a trust store that is not the
+//! one a Node release ships, which is why the system store has its own accessor
+//! ([`system`]) and is never merged into this one here.
+//!
+//! `getSystemCACertificates` and `getExtraCACertificates` **are** real too: they
+//! read files, and a wrong answer there would be a lie about what the process
+//! trusts.
 
 use std::sync::{Mutex, OnceLock};
 
 use openssl::x509::X509;
+
+use crate::root_certs::BUNDLED_ROOTS;
 
 /// `NODE_EXTRA_CA_CERTS`, read once per process.
 ///
@@ -44,11 +50,19 @@ fn user_roots() -> &'static Mutex<Vec<String>> {
     USER.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// `getBundledRootCertificates()`: what this build compiles in, which is nothing.
+/// `getBundledRootCertificates()`: what this build compiles in.
 ///
-/// See the module docs: this is deliberately empty rather than a substitute.
+/// The strings are `src/node_root_certs.h`'s `root_certs` array, already PEM
+/// with no trailing newline. They are returned as they are, not re-encoded,
+/// because `tls.rootCertificates` is compared to Node's own list by content and
+/// a parse-and-re-emit round trip would be an opportunity to differ.
+///
+/// Allocated per call: `lib/tls.js` caches the result in
+/// `bundledRootCertificates` at module scope and never calls twice, so a
+/// process-lifetime copy would only add 118 `String`s that the JavaScript heap
+/// already holds.
 pub fn bundled() -> Vec<String> {
-    Vec::new()
+    BUNDLED_ROOTS.iter().map(|pem| (*pem).to_string()).collect()
 }
 
 /// `getExtraCACertificates()`: the certificates in `NODE_EXTRA_CA_CERTS`.
@@ -221,11 +235,41 @@ mod tests {
     }
 
     #[test]
-    fn the_bundled_store_is_empty_because_this_build_bundles_nothing() {
-        // Not a placeholder: the generator that produces `node_root_certs.h` has
-        // not been ported, and an empty list is the honest answer. When it is
-        // ported this assertion becomes a count.
-        assert!(bundled().is_empty());
+    fn the_bundled_store_is_node_root_certs_h() {
+        // The count is Node's `arraysize(root_certs)` at the pinned revision.
+        // A generator that dropped or duplicated a root would change it, and the
+        // per-certificate comparison against the oracle is what proves the
+        // *contents*; this pins the shape so that test cannot go vacuous.
+        let bundled = bundled();
+        assert_eq!(bundled.len(), crate::root_certs::ROOT_CERT_COUNT);
+        assert_eq!(bundled.len(), 118);
+        assert!(
+            bundled
+                .iter()
+                .all(|pem| pem.starts_with("-----BEGIN CERTIFICATE-----")),
+            "every entry must be PEM"
+        );
+    }
+
+    #[test]
+    fn the_input_trust_store_is_still_the_one_this_was_generated_from() {
+        // `CERTDATA_SHA256` is the pin the module docs describe. Regenerating
+        // from a changed `vendor/certdata/certdata.txt` would produce a
+        // different set of roots, and nothing else would notice: the count can
+        // stay 118 while the certificates change. Reading the file here is
+        // cheap (1.3 MB, once) and is the only way the pin is checked by a
+        // build rather than by a command someone has to remember.
+        use crate::root_certs::{CERTDATA_SHA256, NODE_REVISION};
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/certdata/certdata.txt");
+        let bytes = std::fs::read(&path).expect("vendor/certdata/certdata.txt");
+        let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), &bytes)
+            .expect("sha256")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(digest, CERTDATA_SHA256);
+        assert_eq!(NODE_REVISION, "f344e7f552e3656bd37517151c5dc87d22b33771");
     }
 
     #[test]
@@ -256,5 +300,56 @@ mod tests {
         let mut bundle = self_signed("one");
         bundle.extend_from_slice(&self_signed("two"));
         assert_eq!(pem_certificates(&bundle).expect("parses").len(), 2);
+    }
+
+    #[test]
+    fn every_bundled_root_parses_as_a_certificate() {
+        // `InitializeBundledRootCertificates` calls `CHECK(x509)` on each
+        // `PEM_read_bio_X509` result, so a PEM entry that does not parse aborts
+        // a Node process rather than being skipped. The same has to hold here:
+        // the store is only a trust store if every string in it is a
+        // certificate.
+        for (position, pem) in bundled().iter().enumerate() {
+            let certificate = X509::from_pem(pem.as_bytes())
+                .unwrap_or_else(|error| panic!("root {position} does not parse: {error}"));
+            assert!(
+                certificate.subject_name().entries().next().is_some(),
+                "root {position} has an empty subject"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupted_bundled_root_does_not_round_trip_to_the_same_der() {
+        // The control for the test above: PEM parsing must not accept anything,
+        // or "every root parses" would be vacuous. The corruption is applied to
+        // the middle of the base64 body rather than to its first character,
+        // because the first character is the DER SEQUENCE tag and flipping that
+        // only proves the tag is checked. A middle byte exercises the length and
+        // structure checks the real parse depends on.
+        //
+        // The assertion is "fails to parse *or* decodes to different DER", not
+        // "fails": a byte inside the signature still parses, because PEM parsing
+        // does not verify the signature. What must never happen is the same
+        // certificate coming back.
+        let pem = bundled().into_iter().next().expect("at least one root");
+        let original = X509::from_pem(pem.as_bytes()).expect("root parses");
+
+        let body_start = pem.find('\n').expect("header line") + 1;
+        let body_end = pem.rfind('\n').expect("footer line");
+        let midpoint = body_start + (body_end - body_start) / 2;
+        let byte = pem.as_bytes()[midpoint];
+        let replacement = if byte == b'A' { "B" } else { "A" };
+        let mut corrupted = pem.clone();
+        corrupted.replace_range(midpoint..midpoint + 1, replacement);
+
+        match X509::from_pem(corrupted.as_bytes()) {
+            Err(_) => {}
+            Ok(parsed) => assert_ne!(
+                parsed.to_der().expect("DER"),
+                original.to_der().expect("DER"),
+                "a corrupted root decoded to the original certificate"
+            ),
+        }
     }
 }

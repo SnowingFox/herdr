@@ -124,35 +124,44 @@ pub const STUBS: &[(&str, &str)] = &[
 /// surface. They are listed rather than installed because installing a throwing
 /// one would make `lib/tls.js` fail at module scope — it destructures
 /// `getCertificateCompressionAlgorithms` there — while a missing member only
-/// fails a caller that asks for it. `rn-bind-crypto`'s `DEFERRED` list already
-/// names most of them; the coordinator's `install.rs` edit is where they stay
-/// declared rather than here.
+/// fails a caller that asks for it.
+///
+/// They are installed, by `rn-bind-crypto-x509`: `crypto_context.cc` owns them
+/// but the X.509 slice owns the certificates they hand out. This list is what
+/// keeps them off `SecureContext.prototype`, where the first version of this
+/// crate wrongly put one of them; the test below asserts the absence.
 pub const NAMESPACE_STUBS: &[(&str, &str)] = &[
     (
         "getBundledRootCertificates",
-        "Needs the bundled root blob, which is not in this tree; only the system \
-         store is loaded by addRootCerts.",
+        "A namespace function on internalBinding('crypto'), installed by \
+         rn-bind-crypto-x509 from the generated bundled root blob. Not a \
+         SecureContext prototype method.",
     ),
     (
         "getSystemCACertificates",
-        "Same root-store surface as getBundledRootCertificates.",
+        "Same root-store surface as getBundledRootCertificates: a namespace \
+         function, not a prototype method.",
     ),
     (
         "getExtraCACertificates",
-        "Same root-store surface as getBundledRootCertificates.",
+        "Same root-store surface as getBundledRootCertificates: a namespace \
+         function, not a prototype method.",
     ),
     (
         "resetRootCertStore",
-        "Same root-store surface as getBundledRootCertificates.",
+        "Same root-store surface as getBundledRootCertificates: a namespace \
+         function, not a prototype method.",
     ),
     (
         "getUserRootCertificates",
-        "Same root-store surface as getBundledRootCertificates.",
+        "Same root-store surface as getBundledRootCertificates: a namespace \
+         function, not a prototype method.",
     ),
     (
         "startLoadingCertificatesOffThread",
-        "Needs a threadpool and the bundled root blob; the keys/x509 slices own \
-         the asynchronous certificate loading.",
+        "A namespace function installed by rn-bind-crypto as an honest no-op: \
+         this build loads the root store synchronously, so there is no \
+         background load to start.",
     ),
 ];
 

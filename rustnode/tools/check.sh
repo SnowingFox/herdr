@@ -233,4 +233,20 @@ step "the vendored SQLite is unchanged"
 # system library happens to be.
 ./tools/verify-sqlite.sh
 
+step "the bundled root certificates match their input trust store"
+# `src/root_certs.rs` is generated, and a generated file that nobody checks is
+# free to drift from both the generator and the trust store it came from. This
+# regenerates it into memory and compares, the same shape as
+# `gen-options.py --check`. It is a bare statement so its status is the gate's:
+# a stale blob fails here rather than shipping 118 roots that are not the ones
+# the generator says they are.
+python3 crates/rn-bind-crypto-x509/tools/gen-root-certs.py --check
+
+step "the vendored certdata.txt is the one this was generated from"
+# Separate from the step above because they can disagree: `--check` proves the
+# module matches *this* file, and this proves the file is the pinned one. A
+# changed trust store that was regenerated from would pass `--check` and still
+# be a different set of roots from the one Node ships.
+python3 tools/verify-certdata.py
+
 printf '\nall checks passed\n'
