@@ -22,10 +22,29 @@ fn main() {
     rn_core::profile::mark("v8 link check");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `NODE_OPTIONS` is parsed before the command line, the way
+    // `InitializeNodeWithArgsInternal` does it (`src/node.cc:1054`), and a
+    // rejected variable stops the process there. The message is printed against
+    // `argv[0]` because that is what Node prints, which is what makes the stderr
+    // byte-identical rather than merely similar.
+    let env_options = match args::read_node_options_with_store() {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("{}: {}", args::program_name(), error.message());
+            terminate(9);
+        }
+    };
     // Flags that V8 owns are handed to it before initialization, the way Node's
     // `V8::Initialize` path does. `--max-old-space-size` is the one observable
     // through `v8.getHeapStatistics().heap_size_limit`, so ignoring it made that
     // field a fixed 1.5 GB no matter what the command line said.
+    //
+    // Both sources are forwarded, in Node's order: the variable's flags first,
+    // then the command line's, so a command-line `--max-old-space-size`
+    // overrides the one the variable set.
+    if let Some((env, _)) = env_options.as_ref() {
+        forward_env_v8_flags(&env.v8_args);
+    }
     forward_v8_flags(&args);
 
     // The command line is parsed before anything is built, because the
@@ -34,12 +53,18 @@ fn main() {
     // around whatever model is already there, and the `fs`, `child_process` and
     // `worker` checks read the same one. Parsing later would leave the binding
     // holding a disabled model while the CLI held an enforcing one.
-    let options = match args::parse(&args) {
+    let options = match args::parse_with_env(&args, env_options) {
         Ok(options) => options,
-        Err(message) => {
-            eprintln!("rustnode: {message}");
-            terminate(9);
-        }
+        Err(error) => match error {
+            args::ParseError::Cli(message) => {
+                eprintln!("rustnode: {message}");
+                terminate(9);
+            }
+            args::ParseError::NodeOptions(message) => {
+                eprintln!("{}: {message}", args::program_name());
+                terminate(9);
+            }
+        },
     };
     // A flag whose feature has not landed must not pass silently, or a test
     // that needed it looks like it exercised something it did not.
@@ -143,13 +168,6 @@ fn main() {
     // JavaScript keeps working instead of crashing inside V8's `CHECK`.
     v8::V8::set_flags_from_string("--no-freeze-flags-after-init");
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // Flags that V8 owns are handed to it before initialization, the way Node's
-    // `V8::Initialize` path does. `--max-old-space-size` is the one observable
-    // through `v8.getHeapStatistics().heap_size_limit`, so ignoring it made that
-    // field a fixed 1.5 GB no matter what the command line said.
-    forward_v8_flags(&args);
-
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
@@ -233,7 +251,7 @@ fn main() {
     // Node's does for a rejected startup flag; `test-permission-inspector-brk.js`
     // asserts the exit status and the `Access to this API has been restricted`
     // text on stderr.
-    if let Some(request) = options.inspect.as_ref() {
+    if options.inspect_enabled {
         // `Agent::Start`/`StartIoThread` check the `inspector` scope, so an
         // `--inspect` under `--permission` without `--allow-inspector` is refused
         // before the endpoint opens. There is no JavaScript frame to throw into at
@@ -245,11 +263,12 @@ fn main() {
             eprintln!("Error: {}", denied.message());
             std::process::exit(1);
         }
+        let request = &options.debug_port;
         match rn_bind_inspector::start_server(request.host.as_str(), request.port) {
             Ok(url) => {
                 eprintln!("Debugger listening on {url}");
                 eprintln!("For help, see: https://nodejs.org/learn/getting-started/debugging");
-                if request.wait && !rn_bind_inspector::wait_for_client() {
+                if options.inspect_wait && !rn_bind_inspector::wait_for_client() {
                     eprintln!("rustnode: --inspect-brk found no client; running without waiting");
                 }
             }
@@ -649,7 +668,19 @@ fn evaluate_script<'s>(
     value
 }
 
-/// Passes the command-line flags that belong to V8 through to it.
+/// Passes the V8 flags `NODE_OPTIONS` named through to V8.
+///
+/// These need no allow-list: `rn_bind_options::env::parse` already established
+/// that each is a table entry of kind `kV8Option` (or `--stack-trace-limit`)
+/// that Node permits in the variable, so "forward it" is the same decision Node
+/// makes when it pushes the argument onto `v8_args`. Anything it did not accept
+/// never reaches here — the parse fails first, with Node's message.
+fn forward_env_v8_flags(args: &[String]) {
+    for argument in args {
+        v8::V8::set_flags_from_string(argument);
+    }
+}
+
 ///
 /// Node splits its arguments into its own and V8's, and hands the V8 half over
 /// before `V8::Initialize`. rustnode accepts the same flags, so the ones that
@@ -668,7 +699,11 @@ fn forward_v8_flags(args: &[String]) {
     /// is what makes V8 install the `gc()` global, and a hand-written `gc` would
     /// not be the same function V8's tests call. Node lists it as a `V8Option`
     /// in `node_options.cc`, so this is the faithful place for it.
-    const FORWARDED: &[&str] = &["--max-old-space-size=", "--stack-size="];
+    const FORWARDED: &[&str] = &[
+        "--max-old-space-size=",
+        "--stack-size=",
+        "--stack-trace-limit=",
+    ];
     /// V8 flags spelled with no value.
     ///
     /// Both spellings appear in Node's test headers — `--expose-gc` and

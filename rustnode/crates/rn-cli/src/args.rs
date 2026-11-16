@@ -17,8 +17,31 @@
 
 use std::collections::BTreeSet;
 
+/// Why the process may not start.
+///
+/// The two sources print differently, and the difference is Node's, not
+/// cosmetic:
+///
+/// * a bad command-line flag is `rustnode: <message>` (Node prints
+///   `<program>: bad option: <flag>`, which this parser's own message shape has
+///   never matched — see F16 in the loader review);
+/// * a bad `NODE_OPTIONS` is `<program>: <message>`, because
+///   `StartInternal` prints every collected error as
+///   `"%s: %s\n", result->args().at(0), error` and the message is Node's own
+///   text. The program name is `argv[0]` verbatim, which is what makes the
+///   output byte-identical rather than merely similar.
+///
+/// Both exit 9 (`ExitCode::kInvalidCommandLineArgument`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// A rejected command-line flag.
+    Cli(String),
+    /// A rejected `NODE_OPTIONS` value, already in Node's wording.
+    NodeOptions(String),
+}
+
 /// What the command line asked for.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Options {
     /// `-e`/`--eval`, `-p`/`--print`, or a script path.
     pub source: Source,
@@ -36,13 +59,6 @@ pub struct Options {
     /// this, `lib/internal/bootstrap/realm.js` sees `false` and leaves
     /// `node:bench` unrequireable no matter what the command line said.
     pub parsed: rn_bind_options::Store,
-    /// The inspector endpoint `--inspect` asked for, if any.
-    ///
-    /// `Some` starts the server before user code runs, which is what makes
-    /// `node --inspect` print its `ws://` URL and accept a client. `None` leaves the
-    /// inspector off, which is the default for the same reason it is in Node: a
-    /// listening debug port is an attack surface.
-    pub inspect: Option<InspectRequest>,
     /// The permission model the flags asked for.
     ///
     /// Built by [`finish`] from the same `exec_argv` the parser recorded, and
@@ -63,9 +79,72 @@ pub struct Options {
     /// than a flag the CLI re-reads at report time. The behavior itself lives in
     /// `rn-errors`, which also consults `shouldAbortOnUncaughtToggle[0]`.
     pub abort_on_uncaught_exception: bool,
+    /// The `NODE_OPTIONS` value, already tokenized and accepted.
+    ///
+    /// `None` when the variable was unset or empty. Kept because the flags have
+    /// to reach two places the command line does not: V8 (before it initialises,
+    /// so `main` forwards `env_v8_args`) and the option store
+    /// (`options.parsed` is the environment's values with the command line
+    /// applied on top, which is Node's two-pass order).
+    ///
+    /// They deliberately do **not** reach `exec_argv`: `process.execArgv`
+    /// contains only the command line, and passing the environment's flags on
+    /// would make a child process inherit them twice.
+    pub env_options: Option<rn_bind_options::EnvOptions>,
+    /// The V8 flags `NODE_OPTIONS` named, for forwarding before
+    /// `V8::initialize`.
+    ///
+    /// A copy rather than a borrow of `env_options`, because `main` forwards
+    /// these before the isolate exists and the options struct is moved past
+    /// that point.
+    pub env_v8_args: Vec<String>,
+    /// The flags `NODE_OPTIONS` named, for the parsers that read a list rather
+    /// than a single value (the permission model).
+    pub env_argv: Vec<String>,
+    /// `--inspect`, `--inspect-brk` or `--inspect-wait` was given, in either
+    /// source: the endpoint has to be opened.
+    ///
+    /// Separate from [`Self::inspect`] because `--inspect-port` sets where to
+    /// listen without asking to listen at all. Conflating the two made
+    /// `rustnode --inspect-port=9339` open a debug socket that Node does not,
+    /// and `NODE_OPTIONS=--inspect-port=9339` would have done the same.
+    pub inspect_enabled: bool,
+    /// `--inspect-brk`: block until a client attaches before running user code.
+    pub inspect_wait: bool,
+    /// Where the inspector would listen: `--inspect-port`'s value, or
+    /// `--inspect`'s when it carried one, or the default.
+    ///
+    /// This is `process.debugPort` and it is reported whether or not the
+    /// endpoint is enabled, which is what makes `--inspect-port` observable
+    /// without a socket.
+    pub debug_port: InspectRequest,
 }
 
 impl Options {
+    /// A process that was given no arguments.
+    fn new() -> Self {
+        Self {
+            source: Source::Empty,
+            script_args: Vec::new(),
+            exec_argv: Vec::new(),
+            unimplemented: Vec::new(),
+            // The table's defaults, which is what a process with no flags
+            // reports. `Store::default()` would be empty, and an empty store
+            // makes `getCLIOptionsValues` report `undefined` for every option
+            // instead of its default.
+            parsed: rn_bind_options::Store::parse(&[]),
+            permission: rn_permission::PermissionShared::default(),
+            permission_config: rn_permission::PermissionConfig::default(),
+            abort_on_uncaught_exception: false,
+            env_options: None,
+            env_v8_args: Vec::new(),
+            env_argv: Vec::new(),
+            inspect_enabled: false,
+            inspect_wait: false,
+            debug_port: InspectRequest::default_endpoint(),
+        }
+    }
+
     /// Whether `--expose-internals` was passed, which makes `internal/*`
     /// builtins requireable from user code. Node's own tests rely on it.
     pub fn expose_internals(&self) -> bool {
@@ -87,35 +166,115 @@ pub struct InspectRequest {
 }
 
 impl InspectRequest {
-    /// Parses the value of `--inspect`, `--inspect-brk` or `--inspect-port`.
+    /// The default endpoint: loopback on the inspector's default port.
+    fn default_endpoint() -> Self {
+        Self {
+            port: 9229,
+            host: "127.0.0.1".to_string(),
+            wait: false,
+        }
+    }
+
+    /// Parses one `--inspect*` value, keeping `previous_host` when it names no
+    /// host.
     ///
-    /// Node accepts `[host:]port` in every spelling, and a bare flag with no value
-    /// (which the parser turns into `None` here). A host containing a colon is
-    /// bracketed, so `--inspect=[::1]:9229` splits on the *last* colon rather than the
-    /// first.
+    /// This is `SplitHostPort` plus `ParseAndValidatePort`
+    /// (`src/node_options.cc:1854-1896`), and every branch is observable:
     ///
-    /// Returns `Err` for a port that is not a number or does not fit in 16 bits,
-    /// because Node rejects those at startup rather than silently using 9229.
-    pub fn parse(value: Option<&str>, wait: bool) -> Result<Self, String> {
+    /// * no value means "keep the current address", which is why
+    ///   `NODE_OPTIONS=--inspect-port=9339` plus `--inspect` listens on 9339
+    ///   rather than falling back to 9229;
+    /// * a bare all-digit value is a port and keeps the current host;
+    /// * any other colon-free value is a host name and keeps port 9229;
+    /// * `[::1]:9339` splits on the last colon and strips the brackets from the
+    ///   host half, while a fully bracketed value never splits at all;
+    /// * a port that is not a number becomes 0 — `std::from_chars` reports
+    ///   `invalid_argument` and leaves the output untouched, which is not one of
+    ///   the conditions `ParseAndValidatePort` errors on;
+    /// * a port that overflows 16 bits, or that is non-zero below 1024, is
+    ///   rejected with Node's exact sentence.
+    pub fn parse_with_host(
+        value: Option<&str>,
+        previous_host: &str,
+        wait: bool,
+    ) -> Result<Self, String> {
+        const BAD_PORT: &str = "must be 0 or in range 1024 to 65535.";
+
         let Some(value) = value.filter(|value| !value.is_empty()) else {
             return Ok(Self {
                 port: 9229,
-                host: "127.0.0.1".to_string(),
+                host: previous_host.to_string(),
                 wait,
             });
         };
+
+        // A pair wrapping the whole value is stripped first and never splits,
+        // so `[::1]` is a host and `[::1]:9339` goes on to the colon branch.
+        if let Some(host) = value
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            return Ok(Self {
+                port: 9229,
+                host: host.to_string(),
+                wait,
+            });
+        }
+
         let (host, port) = match value.rsplit_once(':') {
-            Some((host, port)) => (host.trim_start_matches('[').trim_end_matches(']'), port),
-            None => ("127.0.0.1", value),
+            Some((host, port)) => {
+                let host = host
+                    .strip_prefix('[')
+                    .and_then(|rest| rest.strip_suffix(']'))
+                    .unwrap_or(host);
+                (host, port)
+            }
+            None => {
+                // No colon: a port when every character is a digit, a host name
+                // otherwise.
+                if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Ok(Self {
+                        port: 9229,
+                        host: value.to_string(),
+                        wait,
+                    });
+                }
+                ("", value)
+            }
         };
-        let port: u16 = port
-            .parse()
-            .map_err(|_| format!("--inspect: '{value}' is not a valid port"))?;
+
+        let port = parse_inspect_port(port, BAD_PORT)?;
         Ok(Self {
             port,
-            host: if host.is_empty() { "127.0.0.1" } else { host }.to_string(),
+            host: if host.is_empty() {
+                previous_host.to_string()
+            } else {
+                host.to_string()
+            },
             wait,
         })
+    }
+}
+
+/// `ParseAndValidatePort`: a `uint16_t` from `std::from_chars`.
+///
+/// Junk is 0 rather than an error, because `from_chars` reports
+/// `invalid_argument` and `ParseAndValidatePort` only checks
+/// `result_out_of_range` and the reserved-port rule. A value above 65535 is an
+/// error, and so is one in `1..1024`.
+fn parse_inspect_port(port: &str, message: &str) -> Result<u16, String> {
+    match port.parse::<u32>() {
+        Ok(number) => {
+            if number > u32::from(u16::MAX) || (number != 0 && number < 1024) {
+                Err(message.to_string())
+            } else {
+                Ok(number as u16)
+            }
+        }
+        Err(error) if *error.kind() == std::num::IntErrorKind::PosOverflow => {
+            Err(message.to_string())
+        }
+        Err(_) => Ok(0),
     }
 }
 
@@ -332,9 +491,125 @@ const IMPLEMENTED_EXPERIMENTAL: &[&str] = &[
     "--experimental-sqlite",
 ];
 
-/// Parses the command line, or returns the message to print on a bad flag.
-pub fn parse(args: &[String]) -> Result<Options, String> {
-    let mut options = Options::default();
+/// Parses the `NODE_OPTIONS` environment variable, with Node's rules.
+///
+/// `src/node.cc:1056` calls `credentials::SafeGetenv("NODE_OPTIONS", ...)` and
+/// parses the result before the command line. An unset or empty variable is
+/// `None`, and the distinction matters: `NODE_OPTIONS=""` parses to no
+/// arguments, so the two behave the same, but keeping `None` makes
+/// `Options::env_options` mean "the variable was there".
+///
+/// # Errors
+///
+/// Returns the error `StartInternal` would print, already in Node's wording. The
+/// caller prints it against `argv[0]` and exits 9.
+/// Reads `NODE_OPTIONS` and returns both the flags and the values they set.
+///
+/// The values are the base [`parse_with_env`] applies the command line to, so a
+/// caller that drops them loses the whole point of parsing the variable.
+pub fn read_node_options_with_store(
+) -> Result<Option<(rn_bind_options::EnvOptions, rn_bind_options::Store)>, rn_bind_options::EnvError>
+{
+    parse_node_options_value(std::env::var_os("NODE_OPTIONS"))
+}
+
+/// The body of [`read_node_options_with_store`], over an explicit value so it is
+/// testable.
+///
+/// The two conversions are deliberately different:
+///
+/// * `std::env::var` refuses a value that is not valid Unicode, which would let a
+///   malformed `NODE_OPTIONS` silently disable the whole variable. Node's
+///   `SafeGetenv` copies bytes into a `std::string` and the tokenizer walks
+///   them, so the lossy conversion is the closer model — a replacement
+///   character is far more likely to produce a visible "not allowed" error than
+///   a silent no-op.
+/// * An empty value is `None` rather than `Some` with no flags. The observable
+///   behaviour is identical (`NODE_OPTIONS=""` sets nothing) and it keeps
+///   `Options::env_options` meaning "the variable was present and useful".
+fn parse_node_options_value(
+    value: Option<std::ffi::OsString>,
+) -> Result<Option<(rn_bind_options::EnvOptions, rn_bind_options::Store)>, rn_bind_options::EnvError>
+{
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let text = value.to_string_lossy();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let (options, store) = rn_bind_options::parse_env(&text)?;
+    Ok(Some((options, store)))
+}
+
+/// The program name Node prints a startup-error prefix with.
+///
+/// `StartInternal` uses `result->args().at(0)`, which is `argv[0]` exactly as the
+/// OS supplied it — the full path when a test invokes the binary by path, and a
+/// bare name when it is found on `PATH`. Reproducing that rather than printing a
+/// fixed `"rustnode"` is what makes `rustnode --version`-style comparisons against
+/// Node's stderr possible at all.
+pub fn program_name() -> String {
+    std::env::args()
+        .next()
+        .unwrap_or_else(|| "rustnode".to_string())
+}
+
+/// Parses `NODE_OPTIONS` and then the command line, in Node's order.
+///
+/// `src/node.cc:1058` calls `Parse` on the environment's argv and then again on
+/// the real one, into the same `PerProcessOptions`. Everything that makes the
+/// two compose follows from that single fact, and reproducing it here rather
+/// than merging the two `Vec`s by hand is what keeps them composing:
+///
+/// * a scalar given in both places takes the command line's value, because it
+///   is parsed second;
+/// * a list (`--require`, `--import`, `--conditions`) keeps both, with the
+///   environment's entries first;
+/// * `Implies` from either source has already been applied by the time either
+///   walk finishes, so `NODE_OPTIONS=--inspect-brk` implies `--inspect` even
+///   when the command line says nothing.
+///
+/// `env` is `None` when the variable was unset or empty. A rejected
+/// `NODE_OPTIONS` is [`ParseError::NodeOptions`] and stops the process before
+/// the command line is examined at all, which is what Node does: its
+/// environment parse returns `kInvalidCommandLineArgument` before reaching the
+/// command-line parse below it.
+pub fn parse_with_env(
+    args: &[String],
+    env: Option<(rn_bind_options::EnvOptions, rn_bind_options::Store)>,
+) -> Result<Options, ParseError> {
+    let mut options = Options::new();
+
+    if let Some((env, env_store)) = env {
+        // The inspector and the abort decision are the two pieces of CLI state
+        // that are not plain option values: `lib/**` cannot start a listening
+        // socket or change how a throw terminates, so the CLI has to read them
+        // itself. Every other flag in the variable is already in the store,
+        // which is where `getOptionValue` reads it.
+        //
+        // The flags are re-walked rather than read out of the store because
+        // `--inspect-port` and `--inspect-brk` are separate fields that combine,
+        // and walking them in order is the only way to get
+        // `NODE_OPTIONS="--inspect-port=9339"` plus `--inspect` and the reverse
+        // both right.
+        for argument in &env.argv {
+            if let Err(message) = apply_inspect(argument, &mut options) {
+                // Node rejects a bad inspector address while parsing
+                // `NODE_OPTIONS`, before the command line is looked at, and
+                // prints it like any other rejected value.
+                return Err(ParseError::NodeOptions(message));
+            }
+            apply_abort(argument, &mut options);
+        }
+        options.env_v8_args.clone_from(&env.v8_args);
+        options.env_argv.clone_from(&env.argv);
+        // The environment's values become the base the command line is applied
+        // to, which is Node's two-pass order rather than a merge of two lists.
+        options.parsed = env_store;
+        options.env_options = Some(env);
+    }
+
     let mut unimplemented = BTreeSet::new();
     let mut index = 0;
 
@@ -343,7 +618,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
 
         if argument == "-e" || argument == "--eval" || argument == "-p" || argument == "--print" {
             let Some(code) = args.get(index + 1) else {
-                return Err(format!("{argument} requires an argument"));
+                return Err(ParseError::Cli(format!("{argument} requires an argument")));
             };
             options.source = Source::Eval {
                 code: code.clone(),
@@ -405,14 +680,12 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         // argument vector for the dashed and underscored forms — so both are
         // taken, and `--no-` clears it the way it does for any V8 option
         // (`src/bind-options/src/parsed.rs` already models that negation).
-        if ABORT_ON_UNCAUGHT.contains(&argument.as_str()) {
-            options.abort_on_uncaught_exception = true;
-            options.exec_argv.push(argument.clone());
-            index += 1;
-            continue;
-        }
-        if ABORT_ON_UNCAUGHT_NEGATED.contains(&argument.as_str()) {
-            options.abort_on_uncaught_exception = false;
+        // `apply_abort` is the same function the environment's flags go
+        // through, so a `--no-` here clears what the variable set.
+        if ABORT_ON_UNCAUGHT.contains(&argument.as_str())
+            || ABORT_ON_UNCAUGHT_NEGATED.contains(&argument.as_str())
+        {
+            apply_abort(argument, &mut options);
             options.exec_argv.push(argument.clone());
             index += 1;
             continue;
@@ -437,7 +710,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         // and its value treated as the script path.
         if PERMISSION_VALUE_FLAGS.contains(&argument.as_str()) {
             let Some(value) = args.get(index + 1) else {
-                return Err(format!("{argument} requires an argument"));
+                return Err(ParseError::Cli(format!("{argument} requires an argument")));
             };
             options.exec_argv.push(format!("{argument}={value}"));
             index += 2;
@@ -455,7 +728,7 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
 
         if VALUE_SEPARATE.contains(&argument.as_str()) {
             let Some(value) = args.get(index + 1) else {
-                return Err(format!("{argument} requires an argument"));
+                return Err(ParseError::Cli(format!("{argument} requires an argument")));
             };
             options.exec_argv.push(format!("{argument}={value}"));
             index += 2;
@@ -482,16 +755,13 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         // These are parsed here rather than left in the generic prefix branch because
         // the value decides whether the process opens a socket, and a flag recorded
         // but not acted on would look implemented.
-        if let Some(request) = parse_inspect_flag(argument) {
-            match request {
-                Ok(request) => {
-                    options.inspect = Some(request);
-                    options.exec_argv.push(argument.clone());
-                    index += 1;
-                    continue;
-                }
-                Err(message) => return Err(message),
+        if is_inspect_flag(argument) {
+            if let Err(message) = apply_inspect(argument, &mut options) {
+                return Err(ParseError::Cli(message));
             }
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
         }
 
         if VALUE_INLINE_PREFIXES
@@ -510,27 +780,94 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         }
 
         // `-v`, `--version` and `--help` are handled before parsing.
-        return Err(format!("unsupported option '{argument}'"));
+        return Err(ParseError::Cli(format!("unsupported option '{argument}'")));
     }
 
     Ok(finish(options, unimplemented))
 }
 
-/// Parses one `--inspect*` argument, or `None` when it is not one.
+/// Whether `argument` is `--inspect`, `--inspect-port`, `--inspect-brk`,
+/// `--inspect-wait` or one of their `=value` forms.
+fn is_inspect_flag(argument: &str) -> bool {
+    let name = argument.split_once('=').map_or(argument, |(name, _)| name);
+    matches!(
+        name,
+        "--inspect" | "--inspect-port" | "--inspect-brk" | "--inspect-wait"
+    )
+}
+
+/// Records one `--inspect*` argument's effect on `options`.
 ///
-/// `--inspect-port` sets the port without starting the server in Node, and is
-/// accepted here for the same reason: `lib/internal/bench_runner/cli.js` checks
-/// `process.debugPort` and passes it on to a child, so a runner that rejects the flag
-/// cannot spawn anything.
-fn parse_inspect_flag(argument: &str) -> Option<Result<InspectRequest, String>> {
+/// These four flags combine in a way that only walking them in order gets
+/// right, which is why this is called once per argument from both sources
+/// rather than reducing them to a single value:
+///
+/// * `--inspect-port` sets the host and port and does **not** open a socket.
+///   Node's own `--inspect-port=9339` alone leaves the inspector off while
+///   `process.debugPort` still reports 9339.
+/// * `--inspect` opens it, at the already-configured port when it carries no
+///   value, so `NODE_OPTIONS=--inspect-port=9339` and `--inspect` on the command
+///   line listen on 9339.
+/// * `--inspect-brk` does the same and also waits for a client.
+/// * A later `--inspect-port` still moves the port of an inspector that has
+///   already been asked for, which is `NODE_OPTIONS=--inspect` plus
+///   `--inspect-port=9338`.
+///
+/// Verified against the oracle for all four combinations; see
+/// `rn-cli/tests/node_options.rs`.
+fn apply_inspect(argument: &str, options: &mut Options) -> Result<(), String> {
     let (name, value) = match argument.split_once('=') {
         Some((name, value)) => (name, Some(value)),
         None => (argument, None),
     };
+    // The name is checked before the value is read. A `match` alone is not
+    // enough: parsing the value first would read `--stack-trace-limit=42` as an
+    // inspector port and reject it for being below 1024.
+    if !is_inspect_flag(name) {
+        return Ok(());
+    }
+    // A bare `--inspect` (and `--inspect-brk`) means "listen where the port
+    // option points", so the previous host and port are inherited rather than
+    // reset. `NODE_OPTIONS=--inspect-port=9339` plus `--inspect` listens on
+    // 9339 in Node, and that only works if the bare form is a no-op on the
+    // address.
+    let parsed = if value.is_none() {
+        InspectRequest {
+            wait: false,
+            ..options.debug_port.clone()
+        }
+    } else {
+        InspectRequest::parse_with_host(value, options.debug_port.host.as_str(), false)?
+    };
     match name {
-        "--inspect" | "--inspect-port" => Some(InspectRequest::parse(value, false)),
-        "--inspect-brk" => Some(InspectRequest::parse(value, true)),
-        _ => None,
+        "--inspect-port" => {
+            // Only the address changes; whether to listen is a separate flag.
+            options.debug_port = parsed;
+        }
+        "--inspect" | "--inspect-wait" => {
+            options.debug_port = parsed;
+            options.inspect_enabled = true;
+        }
+        "--inspect-brk" => {
+            options.debug_port = parsed;
+            options.inspect_enabled = true;
+            options.inspect_wait = true;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Records `--abort-on-uncaught-exception`, in either spelling or its negation.
+///
+/// Called for both sources so the command line can turn off what
+/// `NODE_OPTIONS` turned on, which is what `NODE_OPTIONS=--abort-on-uncaught-exception
+/// -- --no-abort-on-uncaught-exception` does in Node.
+fn apply_abort(argument: &str, options: &mut Options) {
+    if ABORT_ON_UNCAUGHT.contains(&argument) {
+        options.abort_on_uncaught_exception = true;
+    } else if ABORT_ON_UNCAUGHT_NEGATED.contains(&argument) {
+        options.abort_on_uncaught_exception = false;
     }
 }
 
@@ -542,7 +879,13 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
     // reports*, so one implementation cannot quietly become the authority for
     // both. The flags only — never the script path or its arguments, which
     // Node's parser stops at too.
-    options.parsed = rn_bind_options::Store::parse(&options.exec_argv);
+    //
+    // It starts from the environment's store rather than from the table's
+    // defaults, because Node parses `NODE_OPTIONS` and then the command line
+    // into one `PerProcessOptions`. That is what makes a scalar given in both
+    // places take the command line's value while `--require` keeps both, and it
+    // is why the environment's parse has to have happened first.
+    options.parsed.apply(&options.exec_argv);
     // `Environment::InitializePermission` clears `allow_native_addons` when
     // `--permission` (not `--permission-audit`) was given without
     // `--allow-addons`, which is what makes `process.dlopen` throw
@@ -560,7 +903,13 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
     // describes: `PermissionConfig::from_args` already reads these flags in both
     // spellings and owns the 68 tests that pin its grammar, so routing through
     // it keeps one interpretation of `--allow-fs-read=*` rather than two.
-    let mut config = rn_permission::PermissionConfig::from_args(&options.exec_argv);
+    //
+    // Both sources are read, in Node's order, because the grants accumulate:
+    // `NODE_OPTIONS=--permission --allow-fs-read=/a` plus `--allow-fs-read=/b`
+    // allows both paths, which the oracle confirms.
+    let mut all_args = options.env_argv.clone();
+    all_args.extend(options.exec_argv.iter().cloned());
+    let mut config = rn_permission::PermissionConfig::from_args(&all_args);
     // `Environment::InitializePermission` grants the entry point read access
     // implicitly, so `node --permission app.js` can load the script it was told
     // to run without also needing `--allow-fs-read=app.js`. It does *not* do that
@@ -574,8 +923,10 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
         }
     }
     // `--require` preloads are granted the same way, because Node cannot load
-    // them before `lib/**` runs either.
-    for entry in &options.exec_argv {
+    // them before `lib/**` runs either. Both sources count: a variable-only
+    // preload is denied by `--permission` in Node exactly like a command-line
+    // one, which the oracle confirms.
+    for entry in &all_args {
         if let Some(preload) = entry.strip_prefix("--require=") {
             config.allow_fs_read.push(preload.to_string());
         }
@@ -633,9 +984,15 @@ fn current_dir() -> String {
 mod tests {
     use super::*;
 
+    /// Parses with no `NODE_OPTIONS`, which is what these tests are about.
+    ///
+    /// The environment path is pinned separately, in `tests/node_options.rs` and
+    /// in this module's own environment tests below.
     fn parse_of(args: &[&str]) -> Result<Options, String> {
         let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        parse(&owned)
+        parse_with_env(&owned, None).map_err(|error| match error {
+            ParseError::Cli(message) | ParseError::NodeOptions(message) => message,
+        })
     }
 
     #[test]
@@ -854,5 +1211,96 @@ mod tests {
         let options = parse_of(&["--no-warnings", "app.js", "arg"]).expect("parses");
         assert_eq!(options.exec_argv, ["--no-warnings"]);
         assert_eq!(options.script_args, ["arg"]);
+    }
+
+    /// `--inspect-port` records where to listen without asking to listen.
+    ///
+    /// It used to be conflated with `--inspect`, so `rustnode --inspect-port=9339`
+    /// opened a socket Node does not open. The two facts are separate in Node
+    /// (`--inspect-port` writes `HostPort`; `--inspect` sets
+    /// `inspector_enabled`), which is why they are separate fields here.
+    #[test]
+    fn inspect_port_records_an_address_without_enabling_the_inspector() {
+        let options = parse_of(&["--inspect-port=9339"]).expect("parses");
+        assert!(!options.inspect_enabled);
+        assert_eq!(options.debug_port.port, 9339);
+        assert_eq!(options.debug_port.host, "127.0.0.1");
+    }
+
+    #[test]
+    fn inspect_enables_the_inspector_at_the_configured_address() {
+        let options = parse_of(&["--inspect=0.0.0.0:9339"]).expect("parses");
+        assert!(options.inspect_enabled);
+        assert!(!options.inspect_wait);
+        assert_eq!(options.debug_port.port, 9339);
+        assert_eq!(options.debug_port.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn inspect_brk_also_waits_for_a_client() {
+        let options = parse_of(&["--inspect-brk=9339"]).expect("parses");
+        assert!(options.inspect_enabled);
+        assert!(options.inspect_wait);
+        assert_eq!(options.debug_port.port, 9339);
+    }
+
+    /// A bare `--inspect` keeps whatever `--inspect-port` already set.
+    ///
+    /// The oracle listens on 9339 for
+    /// `NODE_OPTIONS=--inspect-port=9339 rustnode --inspect`, so the bare form
+    /// must not reset the address to the default.
+    #[test]
+    fn a_bare_inspect_keeps_the_configured_port() {
+        let env = rn_bind_options::parse_env("--inspect-port=9339").expect("parses");
+        let options = parse_with_env(&["--inspect".to_string()], Some(env)).expect("parses");
+        assert!(options.inspect_enabled);
+        assert_eq!(options.debug_port.port, 9339);
+    }
+
+    #[test]
+    fn a_later_inspect_port_still_moves_the_address() {
+        let env = rn_bind_options::parse_env("--inspect").expect("parses");
+        let options =
+            parse_with_env(&["--inspect-port=9338".to_string()], Some(env)).expect("parses");
+        assert!(options.inspect_enabled);
+        assert_eq!(options.debug_port.port, 9338);
+    }
+
+    /// `SplitHostPort` has four branches, and the value is observable through
+    /// `process.debugPort` in Node. Each case below is what the oracle reports.
+    #[test]
+    fn an_inspect_value_follows_node_split_host_port() {
+        let cases = [
+            ("9339", ("127.0.0.1", 9339)),
+            ("myhost", ("myhost", 9229)),
+            ("0.0.0.0:9339", ("0.0.0.0", 9339)),
+            ("[::1]:9339", ("::1", 9339)),
+            ("[::1]", ("::1", 9229)),
+            (":9339", ("127.0.0.1", 9339)),
+            ("abc:def", ("abc", 0)),
+            ("0", ("127.0.0.1", 0)),
+        ];
+        for (value, (host, port)) in cases {
+            let options = parse_of(&[&format!("--inspect={value}")])
+                .unwrap_or_else(|error| panic!("--inspect={value}: {error}"));
+            assert_eq!(
+                (options.debug_port.host.as_str(), options.debug_port.port),
+                (host, port),
+                "--inspect={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_inspect_port_is_rejected() {
+        // `ParseAndValidatePort` rejects a non-zero port below 1024 and anything
+        // above 65535 with one sentence.
+        for value in ["80", "1023", "99999"] {
+            let error = parse_of(&[&format!("--inspect-port={value}")]).expect_err("rejects");
+            assert_eq!(error, "must be 0 or in range 1024 to 65535.", "{value}");
+        }
+        // 0 asks the OS for a free port and is allowed; 1024 is the floor.
+        assert!(parse_of(&["--inspect-port=0"]).is_ok());
+        assert!(parse_of(&["--inspect-port=1024"]).is_ok());
     }
 }

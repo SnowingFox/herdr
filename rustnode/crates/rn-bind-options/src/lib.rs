@@ -24,6 +24,7 @@
 //! distinction is invisible to every current caller, so this crate returns
 //! ordinary Maps and says so here rather than pretending otherwise.
 
+pub mod env;
 pub mod install;
 pub mod option;
 pub mod parsed;
@@ -33,6 +34,7 @@ pub mod values;
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
+pub use env::{parse as parse_env, EnvError, EnvOptions};
 pub use option::{DefaultValue, OptionInfo, OptionNamespace};
 pub use parsed::{ParsedValue, Store};
 pub use values::{
