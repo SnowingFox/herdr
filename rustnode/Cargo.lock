@@ -1747,6 +1747,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bun-files"
+version = "0.1.0"
+dependencies = [
+ "ada-url",
+ "libc",
+ "rn-bind-glob",
+ "rn-bind-url",
+ "rn-bun-api",
+ "rn-core",
+ "rn-module",
+ "rn-node-oracle",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-bun-hash"
 version = "0.1.0"
 dependencies = [
@@ -1765,6 +1781,7 @@ dependencies = [
  "rn-bun-api",
  "rn-bun-compression",
  "rn-bun-encoding",
+ "rn-bun-files",
  "rn-bun-hash",
  "rn-bun-text",
  "rn-bun-time",

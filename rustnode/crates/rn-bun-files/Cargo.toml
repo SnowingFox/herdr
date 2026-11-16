@@ -1,0 +1,47 @@
+[package]
+name = "rn-bun-files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "the file and path members of the Bun global for rustnode"
+
+[dependencies]
+# The contribution contract: `BunModule` plus the `BunRegistry` that installs a
+# module into a staging object and compares it against the declaration.
+rn-bun-api = { path = "../rn-bun-api" }
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# `Bun.Glob` is Node's own glob engine rather than a second one: the pattern
+# parser, the brace expander, the matcher and the directory walker already exist
+# and already agree with the reference implementation, and `Bun.Glob` differs
+# from `fs.glob` in option handling rather than in matching. Re-deriving the
+# pattern semantics would be a second answer to the same question.
+rn-bind-glob = { path = "../rn-bind-glob" }
+# `Bun.pathToFileURL` and `Bun.fileURLToPath` are measured identical to
+# `node:url` on every case, including the two a hand-rolled encoder gets wrong
+# (`%23`/`%3F` escaping, and the `localhost` authority strip). They call the
+# same code `node:url` does rather than a copy of it.
+rn-bind-url = { path = "../rn-bind-url" }
+# The URL parser `node:url` itself is built on, for the one step
+# `rn-bind-url` does not re-export: serialising the encoded path.
+ada-url = "4.0"
+# `Bun.resolve`/`Bun.resolveSync` reuse the loader's resolution where the
+# semantics agree. The crate is here for the specifier forms Bun answers itself
+# (`node:fs` and `bun:test` pass through, `fs` becomes `node:fs`), which are
+# decided before any filesystem lookup happens.
+rn-module = { path = "../rn-module" }
+libc.workspace = true
+
+[dev-dependencies]
+# The conformance tests run the built `rustnode` binary, which is where `Bun` is
+# really assembled: the shared foundation installs it from the generated
+# contribution aggregator, so a test that hand-built the object would skip the
+# declaration check. `tools/check.sh` builds `target/debug/rustnode` before the
+# test sweep for exactly this reason, and
+# `crates/rn-bun-time/tests/differential.rs` is the reference for the shape.
+serde_json.workspace = true
+# The Node oracle, to prove `Bun` is absent under Node and that the path
+# conversions agree with `node:url`.
+rn-node-oracle = { path = "../../tools/node-oracle" }
