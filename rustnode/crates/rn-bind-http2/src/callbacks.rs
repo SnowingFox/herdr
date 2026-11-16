@@ -411,6 +411,12 @@ fn handle_data_frame(
     if end_stream {
         // `EmitRead` with EOF on the stream's own `StreamBase`, which is what ends
         // the readable side. Chunks arrived through `on_data_chunk`.
+        //
+        // This is the *only* place EOF is emitted, matching Node: `END_STREAM` is
+        // the peer saying it will send nothing more, and `core.js` decides what
+        // that means by asking whether the readable side ended. Emitting it
+        // anywhere else — `on_stream_close` in particular — answers that question
+        // before it is asked and hides every early close.
         crate::stream::emit_eof(state, hd.stream_id);
     }
     0
@@ -457,12 +463,6 @@ unsafe extern "C" fn on_stream_close(
             None => false,
         }
     };
-    // The readable side has to see EOF before `onStreamClose` can decide the
-    // stream ended cleanly. `core.js` checks `stream._readableState.ended`, and a
-    // stream whose readable side never emitted `'end'` is treated as aborted —
-    // so without this the client receives its DATA, never gets `'end'`, and the
-    // session's cleanup never runs. That is the whole timeout family.
-    crate::stream::end_readable(state, stream_id);
     let _ = rn_uv::callback::with_context(|scope| {
         let args = [
             v8::Integer::new(scope, error_code as i32).into(),
