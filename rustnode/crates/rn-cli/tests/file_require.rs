@@ -273,3 +273,103 @@ fn private_symbols_are_all_present_and_distinct() {
         "every private symbol must be installed and distinct"
     );
 }
+
+/// The shape `require()` of an ES module has to produce.
+///
+/// `lib/internal/modules/cjs/loader.js` calls `createRequiredModuleFacade` when
+/// the required module has a `default` export, rather than handing back its
+/// namespace directly: the facade re-exports the original and adds
+/// `__esModule`, so transpiled CommonJS consumers (`_mod.__esModule ?
+/// _mod.default : _mod`) see a real ES module.
+///
+/// The assertion is the *rendering*, compared against the recorded oracle
+/// output, because the interesting parts are not just "a property exists": the
+/// namespace tag, the null prototype, the exact key set including `__esModule`,
+/// and the live binding all come from V8's module machinery and a hand-built
+/// object would satisfy none of them.
+#[test]
+fn require_of_an_es_module_returns_the_facade_namespace() {
+    let fixture = Fixture::new("require-esm-facade");
+    fixture.write(
+        "dep.mjs",
+        "export const z = 3;\nexport default function log() { return 1; }\n",
+    );
+    let main = fixture.write(
+        "main.js",
+        "const { inspect } = require('util');\n\
+         const m = require('./dep.mjs');\n\
+         console.log(inspect(m), typeof m.default, JSON.stringify(Object.keys(m)),\n\
+         \x20 m.__esModule, Object.getPrototypeOf(m) === null);\n",
+    );
+    assert_eq!(
+        stdout_of(&main),
+        "[Module: null prototype] {\n  \
+           __esModule: true,\n  \
+           default: [Function: log],\n  \
+           z: 3\n\
+         } function [\"__esModule\",\"default\",\"z\"] true true"
+    );
+}
+
+/// An ES module that defines `__esModule` keeps its own value.
+///
+/// `populateCJSExportsFromESM` skips the facade entirely in that case
+/// (`ObjectHasOwn(namespace, '__esModule')`), because the user's binding has to
+/// win. A facade applied unconditionally would silently replace it with `true`.
+#[test]
+fn an_es_module_that_defines_esmodule_keeps_its_own_value() {
+    let fixture = Fixture::new("require-esm-esmodule");
+    fixture.write(
+        "override.mjs",
+        "export const __esModule = 'test';\nexport default { hello: 'world' };\n",
+    );
+    let main = fixture.write(
+        "main.js",
+        "const m = require('./override.mjs');\n\
+         console.log(m.__esModule, JSON.stringify(m.default));\n",
+    );
+    assert_eq!(stdout_of(&main), "test {\"hello\":\"world\"}");
+}
+
+/// An ES module with no default export is handed back as its namespace.
+///
+/// The facade exists only to add `__esModule` for a module that has a
+/// `default`; nothing else needs it, and Node skips it. Getting this wrong
+/// shows up as a phantom `__esModule` key on a module that never had one.
+#[test]
+fn an_es_module_without_a_default_export_has_no_esmodule_key() {
+    let fixture = Fixture::new("require-esm-nodefault");
+    fixture.write("named.mjs", "export const only = 'named';\n");
+    let main = fixture.write(
+        "main.js",
+        "const m = require('./named.mjs');\n\
+         console.log(Object.keys(m).join(), Object.hasOwn(m, '__esModule'));\n",
+    );
+    assert_eq!(stdout_of(&main), "only false");
+}
+
+/// The transpiled-CommonJS interop shape the facade exists for.
+///
+/// This is the pattern from `loader.js`'s own comment: a consumer written
+/// against a transpiled ESM package does `_mod.__esModule ? _mod.default :
+/// _mod`. It has to pick the `default` export out of a `require()`d real ES
+/// module, which only works when that module's exports carry `__esModule` —
+/// the single reason `createRequiredModuleFacade` is not just the namespace.
+#[test]
+fn the_transpiled_interop_pattern_reaches_the_default_export() {
+    let fixture = Fixture::new("require-esm-interop");
+    fixture.write(
+        "log.mjs",
+        "export const level = 'info';\n\
+         export default function log(message) { return `[${level}] ${message}`; }\n",
+    );
+    let main = fixture.write(
+        "main.js",
+        "function _interopRequireDefault(obj) {\n\
+         \x20 return obj && obj.__esModule ? obj : { default: obj };\n\
+         }\n\
+         const log = _interopRequireDefault(require('./log.mjs'));\n\
+         console.log(log.default('hello'), require('./log.mjs').level);\n",
+    );
+    assert_eq!(stdout_of(&main), "[info] hello info");
+}

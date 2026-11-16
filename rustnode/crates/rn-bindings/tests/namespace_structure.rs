@@ -151,7 +151,6 @@ const KNOWN_STUBS: &[&str] = &[
     // that path) installed unconditionally here and then hardcoded to `ENOSYS`.
     "fs.handleToFd:not-implemented",
     "mksnapshot.compileSerializeMain:not-implemented",
-    "module_wrap.createRequiredModuleFacade:not-implemented",
     "performance.createELDHistogram:not-implemented",
 ];
 
@@ -1406,7 +1405,7 @@ mod rule_tests {
         );
         assert_eq!(
             KNOWN_STUBS.len(),
-            5,
+            4,
             "KNOWN_STUBS holds the stub debt; update this count when a fix removes an \
              entry: {:?}",
             KNOWN_STUBS
