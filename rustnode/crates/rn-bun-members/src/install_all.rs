@@ -13,6 +13,7 @@ use rn_bun_api::BunRegistry;
 /// before any isolate exists.
 pub fn install_all() -> Result<BunRegistry, String> {
     let mut registry = BunRegistry::new();
+    rn_bun_compression::register(&mut registry)?;
     rn_bun_hash::register(&mut registry)?;
     rn_bun_time::register(&mut registry)?;
     Ok(registry)
