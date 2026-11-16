@@ -280,6 +280,17 @@ impl ZlibStream {
         }
     }
 
+    /// Records the output buffer a write was given, before its step runs.
+    ///
+    /// `node_zlib.cc` calls `SetBuffers()` from `Write()` and keeps
+    /// `next_out`/`avail_out` in the `z_stream` until `DoThreadPoolWork` runs, so
+    /// a `params()` that arrives in between sees a live output cursor. Node's
+    /// async `write()` is scheduled rather than run, which is what gives
+    /// `paramsAfterFlushCallback` that window.
+    pub fn set_out_cursor(&mut self, output: (*mut u8, usize)) {
+        self.out_cursor = Some(output);
+    }
+
     /// `ZlibContext::SetParams()`: changes level and strategy mid-stream.
     /// `deflateParams` may need output room to flush the pending block, and
     /// reports `Z_BUF_ERROR` when it could not finish; Node treats that as

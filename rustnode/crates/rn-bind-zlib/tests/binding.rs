@@ -80,11 +80,40 @@ globalThis.makeHandle = function makeHandle(ctorName, mode, args, chunkSize) {
   handle.__writeState = new Uint32Array(2);
   handle.__error = null;
   handle.__out = new Uint8Array(chunkSize);
+  handle.__chunks = [];
+  handle.__availOutBefore = chunkSize;
   handle.onerror = (message, errno, code) => {
     handle.__error = { message, errno, code };
   };
-  handle.init(...args, handle.__writeState, () => {}, null, false);
+  // The write callback is fixed at `init`, so it dispatches to whichever step
+  // is currently outstanding. `lib/zlib.js` does the same thing in
+  // `processCallback`, which is one function for every write.
+  handle.init(...args, handle.__writeState, () => finishStep(handle), null, false);
   return handle;
+};
+
+// `lib/zlib.js`'s async driver, reduced to one step at a time:
+// `_transform` -> `processChunk` -> native `write()` -> threadpool hop ->
+// `processCallback` -> the step's callback.
+//
+// `writeState[0]` is `availOutAfter` after the step runs, exactly what
+// `processCallback` reads, and the step callback runs *after* it, so callers can
+// start the next step from inside it the way `Transform` does.
+globalThis.startStep = function startStep(handle, input, flushFlag, chunkSize, done) {
+  if (handle.__error) throw new Error(handle.__error.message);
+  handle.__out = new Uint8Array(chunkSize);
+  handle.__availOutBefore = chunkSize;
+  handle.__stepDone = done;
+  handle.write(flushFlag, input, 0, input.length, handle.__out, 0, chunkSize);
+};
+
+globalThis.finishStep = function finishStep(handle) {
+  if (handle.__error) throw new Error(handle.__error.message);
+  const produced = handle.__availOutBefore - handle.__writeState[0];
+  if (produced > 0) handle.__chunks.push(handle.__out.slice(0, produced));
+  const done = handle.__stepDone;
+  handle.__stepDone = null;
+  if (done) done();
 };
 "#;
 
@@ -271,51 +300,137 @@ fn one_byte_chunks() {
     assert_eq!(result, "streamed through one byte writes");
 }
 
+/// `params()` has to work through the *async* `write()` path.
+///
+/// `lib/zlib.js` never calls `params()` from `writeSync`: `Zlib.prototype.params`
+/// flushes with `Z_SYNC_FLUSH` through `this.flush()`, which is an async
+/// `this.write()`, and calls the native `params()` from
+/// `paramsAfterFlushCallback` — i.e. from inside that write's callback, while the
+/// next write may already be queued. Node's `write()` only *schedules* the
+/// compression on the threadpool, so `deflateParams()` sees the stream as the
+/// flush left it.
+///
+/// The previous version of this test drove `writeSync` only, so it exercised the
+/// "step already ran" ordering and stayed green while the real path threw
+/// `Z_STREAM_ERROR` (see the crate's `handle` module docs).
 fn params_mid_stream() {
-    let result = eval_with_binding(
+    // The whole sequence completes across several turns of the microtask queue,
+    // so the case is split into one script per step and `eval_sequence` runs a
+    // checkpoint between them, the way the event loop would.
+    let observed = eval_sequence(&[
+        // Turn 1: first chunk, then the Z_SYNC_FLUSH that `params()` issues.
         r#"
-        const MODE_DEFLATE = 1;
-        const MODE_INFLATE = 2;
-        const Z_FINISH = 4;
-        const Z_SYNC_FLUSH = 2;
+        globalThis.__paramsCase = (() => {
+          const MODE_DEFLATE = 1;
+          const MODE_INFLATE = 2;
+          // The callbacks below run from later scripts, so the constants they
+          // need have to outlive this one.
+          globalThis.__Z_FINISH = 4;
+          globalThis.__Z_SYNC_FLUSH = 2;
+          globalThis.__Z_NO_FLUSH = 0;
 
-        const text = 'params can change the compression level mid stream '.repeat(40);
-        const input = asciiBytes(text);
-        const half = input.length >> 1;
+          const text = 'params can change the compression level mid stream '.repeat(40);
+          const input = asciiBytes(text);
+          const half = input.length >> 1;
 
-        const compressor = makeHandle('Zlib', MODE_DEFLATE, [15, 1, 8, 0], 4096);
-        const state = compressor.__writeState;
-        const chunks = [];
-        const pump = (bytes, flush) => {
-          compressor.writeSync(flush, bytes, 0, bytes.length, compressor.__out, 0, 4096);
-          if (compressor.__error) throw new Error(compressor.__error.message);
-          const produced = 4096 - state[0];
-          if (produced > 0) chunks.push(compressor.__out.slice(0, produced));
-        };
+          const case_ = {
+            text, half, input,
+            errors: [], paramsCalls: 0, phase: 'first', finishedWrite: 0,
+          };
+          const compressor = makeHandle('Zlib', MODE_DEFLATE, [15, 1, 8, 0], 4096);
+          case_.compressor = compressor;
 
-        pump(input.subarray(0, half), 0);
-        // `params()` in lib/zlib.js always flushes with Z_SYNC_FLUSH first and
-        // calls the native `params()` from that write's callback.
-        pump(new Uint8Array(0), Z_SYNC_FLUSH);
-        compressor.params(9, 0);
-        if (compressor.__error) throw new Error(compressor.__error.message);
-        pump(input.subarray(half), Z_FINISH);
-        compressor.close();
-
-        let total = 0;
-        for (const chunk of chunks) total += chunk.length;
-        const compressed = new Uint8Array(total);
-        let offset = 0;
-        for (const chunk of chunks) { compressed.set(chunk, offset); offset += chunk.length; }
-
-        const decompressor = makeHandle('Zlib', MODE_INFLATE, [0, -1, 8, 0], 8192);
-        const restored = driveSync(decompressor, compressed, Z_FINISH, 8192);
-        decompressor.close();
-
-        asciiText(restored) === text ? 'ok' : 'mismatch';
+          startStep(compressor, input.subarray(0, half), globalThis.__Z_NO_FLUSH, 4096, () => {
+            // `Zlib.prototype.params` is `this.flush(Z_SYNC_FLUSH, cb)`, and the
+            // native `params()` runs from `paramsAfterFlushCallback` — this
+            // callback.
+            startStep(compressor, new Uint8Array(0), globalThis.__Z_SYNC_FLUSH, 4096, () => {
+              // `lib/zlib.js` reaches here with the next chunk's `_transform`
+              // already dispatched: `processCallback` calls `this.cb()` (which
+              // releases `Transform` to run the queued chunk) *before* the flush
+              // callback that calls `params()`. So the native write for the
+              // finishing chunk is queued and not yet run when `params()` sees
+              // the stream. Reproducing that order is the point of this test.
+              startStep(compressor, input.subarray(half), globalThis.__Z_FINISH, 4096, () => {
+                case_.phase = 'done';
+              });
+              case_.paramsCalls += 1;
+              compressor.params(9, 0);
+              if (compressor.__error) case_.errors.push(compressor.__error);
+            });
+          });
+          return case_;
+        })();
+        'queued';
         "#,
+        r#"
+        (() => {
+          const case_ = globalThis.__paramsCase;
+          case_.compressor.close();
+          let total = 0;
+          for (const chunk of case_.compressor.__chunks) total += chunk.length;
+          const compressed = new Uint8Array(total);
+          let offset = 0;
+          for (const chunk of case_.compressor.__chunks) {
+            compressed.set(chunk, offset); offset += chunk.length;
+          }
+          return JSON.stringify({
+            errors: case_.errors,
+            paramsCalls: case_.paramsCalls,
+            phase: case_.phase,
+            compressed: [...compressed],
+            text: case_.text,
+          });
+        })();
+        "#,
+    ]);
+
+    let fields: serde_json::Value = serde_json::from_str(&observed).expect("observation is JSON");
+    assert_eq!(
+        fields["errors"].as_array().map(Vec::len),
+        Some(0),
+        "params() through the async write path must not report an error: {observed}"
     );
-    assert_eq!(result, "ok");
+    assert_eq!(fields["paramsCalls"], 1, "params() must have been called");
+    assert_eq!(
+        fields["phase"], "done",
+        "the queued writes must all complete: {observed}"
+    );
+
+    // The changed level must still yield a stream that decodes to the original
+    // bytes, so the test proves `deflateParams` applied rather than merely
+    // returning `Z_OK`.
+    let compressed: Vec<u8> = fields["compressed"]
+        .as_array()
+        .expect("compressed bytes")
+        .iter()
+        .map(|value| value.as_u64().unwrap_or(0) as u8)
+        .collect();
+    let expected = fields["text"].as_str().expect("text").as_bytes().to_vec();
+    let restored = inflate_with_binding(&compressed);
+    assert_eq!(restored, expected, "the compressed stream must round trip");
+}
+
+/// Decompresses `data` through the same native handle `driveSync` uses.
+fn inflate_with_binding(data: &[u8]) -> Vec<u8> {
+    let bytes = data
+        .iter()
+        .map(|byte| byte.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!(
+        r#"
+        (() => {{
+          const MODE_INFLATE = 2;
+          const handle = makeHandle('Zlib', MODE_INFLATE, [0, -1, 8, 0], 1 << 16);
+          const restored = driveSync(handle, new Uint8Array([{bytes}]), 4, 1 << 16);
+          handle.close();
+          return JSON.stringify([...restored]);
+        }})();
+        "#
+    );
+    let result = eval_with_binding(&source);
+    serde_json::from_str::<Vec<u8>>(&result).expect("restored bytes")
 }
 
 fn brotli_round_trip() {
