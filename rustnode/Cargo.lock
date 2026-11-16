@@ -1424,6 +1424,7 @@ name = "rn-bind-worker"
 version = "0.1.0"
 dependencies = [
  "rn-bind-heap-utils",
+ "rn-bind-inspector",
  "rn-bind-messaging",
  "rn-bind-options",
  "rn-bind-task-queue",

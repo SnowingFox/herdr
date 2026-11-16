@@ -302,19 +302,14 @@ worker.on('exit', (code) => console.log('code: ' + code));
 "#,
     );
     assert!(!run.timed_out, "the process must not hang");
-    // The worker bootstrap logs a tracing warning on the parent's stdout, so the
-    // assertion is on the lines that matter rather than on the whole stream.
-    let lines: Vec<&str> = run.stdout.lines().collect();
-    assert!(
-        lines.contains(&"worker: from worker"),
-        "the worker's own listener must run; stdout: {:?}, stderr: {}",
-        run.stdout,
+    // Whole-stream, in order: nothing but the worker's own two lines reaches
+    // stdout. This used to filter for the lines that mattered to step around a
+    // tracing warning the worker bootstrap printed there.
+    assert_eq!(
+        run.stdout.trim(),
+        "worker: from worker\ncode: 6",
+        "the worker's own listener must run and set the exit code; stderr: {}",
         run.stderr
-    );
-    assert!(
-        lines.contains(&"code: 6"),
-        "the worker's exit code must be the one its listener set; stdout: {:?}",
-        run.stdout
     );
 }
 

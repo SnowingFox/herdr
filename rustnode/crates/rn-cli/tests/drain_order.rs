@@ -519,30 +519,12 @@ fn the_checkpoint_holds_inside_a_worker_thread() {
     };
     let expected = run_verbatim(reference, body);
     let actual = run_verbatim(env!("CARGO_BIN_EXE_rustnode"), body);
-    // rustnode's worker bootstrap emits one `WARN rn_bind_inspector: the
-    // inspector namespace was installed without an isolate` line on *stdout*
-    // before any JavaScript runs. That is pre-existing and unrelated — the
-    // baseline binary prints it too — but it is a real defect of its own (a
-    // program's stdout is polluted), so the assertion drops exactly that shape
-    // rather than loosening the comparison.
-    let actual = strip_tracing(&actual);
+    // Byte-exact, with nothing stripped. A worker's startup must not write to
+    // the program's stdout, and a runtime warning about the inspector namespace
+    // used to land here on every `new Worker(...)`. The comparison drops nothing
+    // so a diagnostic that reaches stdout again fails on the line it added.
     assert_eq!(actual, expected);
     assert_eq!(actual, r#"["io-cb","tick","micro","immediate"]"#);
-}
-
-/// Drops tracing-format lines (`<rfc3339 timestamp>  LEVEL target: message`).
-fn strip_tracing(stdout: &str) -> String {
-    stdout
-        .lines()
-        .filter(|line| {
-            let is_warn = line.contains(" WARN ") || line.contains(" ERROR ");
-            let starts_with_timestamp = line
-                .split_once(' ')
-                .is_some_and(|(first, _)| first.len() == 27 && first.ends_with('Z'));
-            !(is_warn && starts_with_timestamp)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Runs `source` as a script file, with no wrapper around it.

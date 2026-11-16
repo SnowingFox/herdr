@@ -680,17 +680,15 @@ fn a_worker_reads_the_option_values_this_process_was_started_with() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Not an exact match on stdout: starting a worker also emits a `tracing`
-    // warning about the inspector namespace, and that warning is not this test's
-    // subject. The line under test is the one the worker posted back.
+    // Exact, because the runtime no longer writes anything of its own to a
+    // program's stdout. This used to filter for the `worker:` prefix to step
+    // around a `tracing` warning about the inspector namespace; that warning is
+    // gone, so a runtime line on stdout now fails here rather than being
+    // tolerated.
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let reported: Vec<&str> = stdout
-        .lines()
-        .filter(|line| line.starts_with("worker:"))
-        .collect();
     assert_eq!(
-        reported,
-        vec!["worker:false"],
+        stdout.trim(),
+        "worker:false",
         "a worker must inherit this process's corrected option values; stdout: {stdout}"
     );
 }
