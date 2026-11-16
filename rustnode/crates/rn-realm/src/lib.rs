@@ -360,7 +360,17 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
         // forces undici to load and fails without them. Node installs them from
         // `internal/bootstrap/web/exposed-window-or-worker.js`, the same module
         // this function mirrors.
-        ("internal/worker/io", &["MessageChannel", "MessagePort"][..]),
+        //
+        // `BroadcastChannel` is the three-line neighbour of `MessageChannel` and
+        // `MessagePort` in that file (line 50, two lines above them), so leaving it
+        // out made `globalThis.BroadcastChannel` `undefined` while
+        // `require('worker_threads').BroadcastChannel` worked. Node publishes the
+        // same class both ways, and both `lib/**` and user code feature-test the
+        // global.
+        (
+            "internal/worker/io",
+            &["BroadcastChannel", "MessageChannel", "MessagePort"][..],
+        ),
         ("internal/blob", &["Blob"][..]),
         ("internal/file", &["File"][..]),
     ] {

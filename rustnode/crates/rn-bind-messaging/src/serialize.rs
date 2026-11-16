@@ -428,6 +428,17 @@ pub fn serialize<'s>(
     // A detached port cannot be reached from the receiving side, so this must not
     // run when serialization failed — which the early returns above already
     // guarantee.
+    // The queues this message hands over, so `dispatch` can tell a destination it
+    // is about to deliver to that the transfer list just moved it. Node compares
+    // `MessagePortData*` pointers for this; the addresses are the same identity.
+    // Read before the detach below, so the lookup cannot race the owner change.
+    let transferred_ports: Vec<usize> = transfers
+        .ports
+        .iter()
+        .filter_map(|port| crate::port_state_of(scope, *port))
+        .map(|state| PortTransferData::address(&state.data))
+        .collect();
+
     for port in &transfers.ports {
         if let Some(state) = crate::port_state_of(scope, *port) {
             state.detach_for_transfer();
@@ -511,6 +522,7 @@ pub fn serialize<'s>(
         shared_array_buffers,
         payloads,
         transferred,
+        transferred_ports,
     ))
 }
 
@@ -746,7 +758,17 @@ mod tests {
         // `ReceiveMessage` relies on it to dispatch `close` rather than trying to
         // deserialize an empty payload.
         assert!(Message::close_marker().close);
-        assert!(!Message::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0).close);
+        assert!(
+            !Message::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                Vec::new()
+            )
+            .close
+        );
     }
 
     #[test]
@@ -768,6 +790,7 @@ mod tests {
             Vec::new(),
             vec![port_a.clone(), port_b.clone(), clone_a.clone()],
             2,
+            Vec::new(),
         );
 
         assert_eq!(message.transferred_count, 2, "two transfer-list entries");

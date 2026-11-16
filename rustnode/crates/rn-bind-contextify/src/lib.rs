@@ -100,6 +100,12 @@ impl BindingModule for Contextify {
     ) -> Result<v8::Local<'s, v8::Object>, String> {
         let object = v8::Object::new(scope);
 
+        // Publish the sandbox-to-realm lookup this crate owns, so a namespace that
+        // needs a `vm` context but cannot depend on this one can ask for it.
+        // `moveMessagePortToContext` is the caller; Node reaches the same table
+        // through the static `ContextFromContextifiedSandbox`.
+        rn_core::hook_slot::set_sandbox_context_lookup(script::context_of);
+
         let values: [(&str, v8::Local<v8::Value>); 7] = [
             ("ContextifyScript", script::constructor(scope)?),
             (

@@ -331,6 +331,17 @@ impl WorkerThread {
             return 1;
         }
 
+        // The same wiring the main thread gets, and for the same reason: this
+        // thread now runs a loop of its own, so it needs a `uv_async_t` another
+        // thread can signal. Without it a `postMessage` from the parent into a port
+        // this thread owns is queued and never delivered — the sender's
+        // `ThreadToken::notify` finds no handle and gives up — so a worker's
+        // `BroadcastChannel` never saw a post from the main thread.
+        //
+        // Safe on a thread that already has the handle: the second call replaces
+        // the wake closure and returns the existing token.
+        crate::install_check_phase();
+
         // `worker_thread.js` waits for `LOAD_SCRIPT` on the port and runs the
         // user's script from that handler, so it has to run *before* the loop:
         // it ends with `port.start()`, and the loop is what delivers the message.

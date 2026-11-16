@@ -996,13 +996,11 @@ fn cause_segfault(
 // Node keeps it in `env->process_emit_warning_sync()`, a per-environment
 // `Global<Function>`. It is read by `ProcessEmitWarningSync` in
 // `src/node_process_events.cc:23-45`, which the contextify and module-wrap
-// paths call when V8 rejects a code cache, and by the fatal-error path. A
-// `thread_local` because one isolate per thread is the model the rest of this
-// crate uses for the same reason.
-thread_local! {
-    static EMIT_WARNING_SYNC: std::cell::RefCell<Option<v8::Global<v8::Function>>> =
-        const { std::cell::RefCell::new(None) };
-}
+// paths call when V8 rejects a code cache, and by the fatal-error path — and by
+// `SiblingGroup::Dispatch` when a broadcast channel's post targets a port the
+// same message transfers. That last caller lives in `rn-bind-messaging`, which
+// cannot depend on this crate, so the slot moved to `rn_core::hook_slot` where
+// both can see it. A private copy here would be a second slot nothing installs.
 
 /// `setEmitWarningSync(fn)`.
 ///
@@ -1031,7 +1029,7 @@ fn set_emit_warning_sync(
         return;
     };
     let callback = v8::Global::new(scope, callback);
-    EMIT_WARNING_SYNC.with(|slot| *slot.borrow_mut() = Some(callback));
+    rn_core::hook_slot::set_warning_sink(callback);
 }
 
 /// Emits a warning synchronously through the installed callback.
@@ -1041,20 +1039,7 @@ fn set_emit_warning_sync(
 /// ("called too early — before the bootstrap is even finished") in
 /// `ProcessEmitWarningSync` but which a Rust caller can only report.
 pub fn emit_warning_sync(scope: &mut v8::PinScope<'_, '_>, message: &str) -> bool {
-    let callback = EMIT_WARNING_SYNC.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .map(|callback| v8::Local::new(scope, callback))
-    });
-    let Some(callback) = callback else {
-        return false;
-    };
-    let Some(message) = v8::String::new(scope, message) else {
-        return false;
-    };
-    callback
-        .call(scope, v8::undefined(scope).into(), &[message.into()])
-        .is_some()
+    rn_core::hook_slot::emit_warning(scope, message)
 }
 
 /// Reproduces Node's `CHECK`/`Assertion failed` where this crate has to keep one.

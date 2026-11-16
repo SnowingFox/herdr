@@ -95,16 +95,31 @@ pub struct Message {
     /// everything already queued, which is what makes
     /// `postMessage(1); postMessage(2); close()` deliver `1`, `2`, then `close`.
     pub close: bool,
+    /// The `MessagePortData` addresses this message hands over, in transfer-list
+    /// order.
+    ///
+    /// `SiblingGroup::Dispatch` compares a message's transferables against the
+    /// ports it is about to deliver to, so it can report the "posted to itself"
+    /// warning instead of delivering a payload that names an object the receiver
+    /// is taking over. Node does that with a pointer comparison because a
+    /// transferred port's `TransferData` *is* its `MessagePortData`; keeping the
+    /// addresses is the same comparison without downcasting `Arc<dyn>`.
+    transferred_ports: Vec<usize>,
 }
 
 impl Message {
     /// A real message carrying `data`.
+    ///
+    /// `transferred_ports` names the ports the transfer list handed over, as
+    /// `MessagePortData` addresses. [`MessagePortData::dispatch`] is its only
+    /// reader.
     pub fn new(
         data: Vec<u8>,
         array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
         shared_array_buffers: Vec<v8::SharedRef<v8::BackingStore>>,
         host_objects: Vec<Arc<dyn TransferData>>,
         transferred_count: usize,
+        transferred_ports: Vec<usize>,
     ) -> Self {
         Self {
             data,
@@ -113,6 +128,7 @@ impl Message {
             host_objects: Arc::new(host_objects),
             transferred_count,
             close: false,
+            transferred_ports,
         }
     }
 
@@ -125,9 +141,65 @@ impl Message {
             host_objects: Arc::new(Vec::new()),
             transferred_count: 0,
             close: true,
+            transferred_ports: Vec::new(),
         }
     }
+
+    /// Whether this message hands anything over, Node's `has_transferables`.
+    ///
+    /// `!transferables_.empty() || !array_buffers_.empty()`: a transferred
+    /// `ArrayBuffer` counts as much as a transferred port, because either one makes
+    /// the message undeliverable to more than one destination. A *shared* buffer
+    /// does not, since it is referenced rather than moved.
+    #[must_use]
+    pub fn has_transferables(&self) -> bool {
+        self.transferred_count > 0 || !self.array_buffers.is_empty()
+    }
+
+    /// Whether `port` is one of the ports this message transfers.
+    ///
+    /// `SiblingGroup::Dispatch` walks `message->transferables()` for this, so a
+    /// destination that the transfer list just moved out of the group is reported
+    /// with Node's warning rather than delivered a payload naming itself.
+    fn transfers_port(&self, port: &MessagePortData) -> bool {
+        let address = std::ptr::from_ref(port) as usize;
+        self.transferred_ports.contains(&address)
+    }
 }
+
+/// What [`MessagePortData::dispatch`] did with a message.
+///
+/// Node's `v8::Maybe<bool>` from `SiblingGroup::Dispatch`, plus the warning it
+/// writes through its `error` out-parameter. The shapes are distinct at the API
+/// and cannot be collapsed into one `false`:
+///
+/// * [`Self::NotEntangled`] and [`Self::TransferablesMultipleDestinations`] are
+///   `Nothing()`: `postMessage` returns `undefined` and throws nothing.
+/// * [`Self::NoDestinations`] is `Just(false)`, which `postMessage` returns as
+///   `false` — and which `io.js`'s `BroadcastChannel.postMessage` turns into
+///   `DOMException('Message could not be posted.')`.
+/// * [`Self::DeliveredWithWarning`] is a successful post that also emits a
+///   process warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// The sender is in no group at all, Node's "MessagePortData is not entangled".
+    NotEntangled,
+    /// The group has no member other than the sender.
+    NoDestinations,
+    /// A transfer list with more than one other member, which cannot be honoured.
+    TransferablesMultipleDestinations,
+    /// Delivered to every other member.
+    Delivered,
+    /// Delivered, and Node warns that a destination was itself transferred.
+    DeliveredWithWarning(&'static str),
+}
+
+/// `Dispatch`'s warning for a post whose target is one of its own transferables.
+///
+/// `src/node_messaging.cc`'s text, verbatim: the message reaches nobody else, and
+/// the channel the target was moved onto is the one that was posted to.
+pub const DISPATCH_WARNING_TARGET_TRANSFERRING: &str =
+    "The target port was posted to itself, and the communication channel was lost";
 
 /// Which thread a port belongs to, and which port on it.
 ///
@@ -254,6 +326,18 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Separate per-port lists would queue a second close for a port that had
 /// already been closed by its peer's departure, which is observable as a
 /// duplicate `close` event.
+///
+/// # Anonymous and named groups are not the same thing
+///
+/// A `MessageChannel` makes an anonymous group of exactly two, and losing one end
+/// closes the other because nothing can ever reach it again. A `BroadcastChannel`
+/// joins a group *by name*, which is process-wide: `SiblingGroup::Get` in
+/// `src/node_messaging.cc` keeps `groups_`, an `unordered_map<string,
+/// weak_ptr<SiblingGroup>>` behind one mutex, so two channels on one name land in
+/// the same group whether they were built on one thread or two. A named group has
+/// no fixed size and no survivor rule: closing one member leaves the rest open,
+/// which is why [`MessagePortData::disentangle`] only closes a last peer when
+/// `name` is empty.
 #[derive(Default)]
 pub struct SiblingGroup {
     /// The ends, in entanglement order.
@@ -261,6 +345,26 @@ pub struct SiblingGroup {
     /// Weak, because membership must not keep a port alive: Node's `ports_` holds
     /// raw pointers and a port removes itself on close.
     ports: Mutex<Vec<SharedWeak<MessagePortData>>>,
+    /// The name a `BroadcastChannel` group is shared under, empty when anonymous.
+    ///
+    /// Node's `const std::string name_`, and the emptiness is load-bearing rather
+    /// than cosmetic: it is the only thing that distinguishes "close the survivor"
+    /// from "leave the other channels alone".
+    name: String,
+}
+
+/// The process-wide table of named groups, Node's `SiblingGroup::groups_`.
+///
+/// Weak values, and an entry whose group is gone is replaced rather than reused,
+/// which is `SiblingGroup::Get`'s `i->second.expired()` branch. That is what makes
+/// a name reusable after every channel on it closed — observable, and the case a
+/// strong map would break by handing the next `BroadcastChannel('n')` a group
+/// nobody is listening to.
+fn named_groups() -> &'static Mutex<std::collections::HashMap<String, SharedWeak<SiblingGroup>>> {
+    static GROUPS: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, SharedWeak<SiblingGroup>>>,
+    > = std::sync::OnceLock::new();
+    GROUPS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
 impl SiblingGroup {
@@ -271,6 +375,29 @@ impl SiblingGroup {
         group.add(b);
         *lock(&a.group) = Some(Arc::clone(&group));
         *lock(&b.group) = Some(Arc::clone(&group));
+    }
+
+    /// The named group for `name`, creating it if no live channel holds it.
+    ///
+    /// Node's `SiblingGroup::Get`. The lock covers creation *and* insertion so two
+    /// threads racing on one name cannot make two groups for it, which is the whole
+    /// reason the table is behind one mutex rather than per-name.
+    pub fn get_or_create(name: &str) -> Arc<Self> {
+        let mut groups = lock(named_groups());
+        if let Some(existing) = groups.get(name).and_then(SharedWeak::upgrade) {
+            return existing;
+        }
+        let group = Arc::new(Self {
+            ports: Mutex::new(Vec::new()),
+            name: name.to_string(),
+        });
+        groups.insert(name.to_string(), Arc::downgrade(&group));
+        group
+    }
+
+    /// Whether this group is shared by name rather than being one channel's pair.
+    fn is_named(&self) -> bool {
+        !self.name.is_empty()
     }
 
     fn add(&self, port: &Arc<MessagePortData>) {
@@ -337,6 +464,19 @@ impl MessagePortData {
     /// Joins two ends into one anonymous group, the way `MessageChannel` does.
     pub fn entangle(a: &Arc<Self>, b: &Arc<Self>) {
         SiblingGroup::entangle(a, b);
+    }
+
+    /// Joins the process-wide group called `name`, the way `BroadcastChannel` does.
+    ///
+    /// Node's `MessagePort::New(env, context, {}, SiblingGroup::Get(name))`, whose
+    /// only effect is `sibling_group->Entangle(port->data_.get())`. A channel joins
+    /// whatever group already holds that name, creating one if none does, so two
+    /// channels on one name share a group whether or not anything else on the name
+    /// exists yet.
+    pub fn join_named(self: &Arc<Self>, name: &str) {
+        let group = SiblingGroup::get_or_create(name);
+        group.add(self);
+        *lock(&self.group) = Some(group);
     }
 
     /// Records the port that owns this end.
@@ -439,18 +579,42 @@ impl MessagePortData {
 
     /// Delivers `message` to every other end of the group.
     ///
-    /// Returns `false` when the sender is not part of a group, which is Node's
-    /// "MessagePortData is not entangled" case: `postMessage` warns rather than
-    /// throwing, so the caller has to tell the two apart.
-    pub fn dispatch(&self, message: &Message) -> bool {
+    /// This is `SiblingGroup::Dispatch`, and its refusals are real rather than
+    /// defensive. The shapes are distinct at the API — see [`Dispatch`] — because
+    /// `postMessage` answers `undefined`, `false` or `true` depending on which one
+    /// happened, and `io.js` maps only `undefined` to "Message could not be
+    /// posted."
+    pub fn dispatch(&self, message: &Message) -> Dispatch {
         let group = lock(&self.group).clone();
         let Some(group) = group else {
-            return false;
+            // `MessagePortData::Dispatch`'s "not entangled", which is `Nothing`.
+            return Dispatch::NotEntangled;
         };
-        for peer in group.peers_of(self) {
+        let peers = group.peers_of(self);
+        if peers.is_empty() {
+            // `if (size() <= 1) return Just(false);`
+            return Dispatch::NoDestinations;
+        }
+        // `if (size() > 2 && message->has_transferables())`: a transfer names one
+        // receiver, so a group with room for more cannot honour it.
+        if peers.len() > 1 && message.has_transferables() {
+            return Dispatch::TransferablesMultipleDestinations;
+        }
+        let mut warned = None;
+        for peer in peers {
+            // A destination the transfer list just moved out of the group has
+            // nowhere to deliver to; Node answers `Just(true)` with a warning
+            // rather than failing the post.
+            if message.transfers_port(&peer) {
+                warned = Some(DISPATCH_WARNING_TARGET_TRANSFERRING);
+                continue;
+            }
             peer.enqueue(message.clone_for_peer());
         }
-        true
+        match warned {
+            Some(text) => Dispatch::DeliveredWithWarning(text),
+            None => Dispatch::Delivered,
+        }
     }
 
     /// Leaves the group, queueing a close for this end and for a last peer.
@@ -459,6 +623,14 @@ impl MessagePortData {
     /// port is removed from the group *first*, so the size check at the end sees
     /// only the ends that are still members. An anonymous two-port group
     /// therefore closes each end exactly once however many times this runs.
+    ///
+    /// A *named* group never closes its survivors. Node's check is
+    /// `if (size() == 1 && name_.empty())`, so the last member of a
+    /// `BroadcastChannel` group stays open and usable: it can be posted to again
+    /// once another channel joins the name. Closing it would make
+    /// `new BroadcastChannel('n'); peer.close(); channel.postMessage(...)` throw
+    /// where Node accepts it, and would make a name unusable after its first pair
+    /// of channels went away.
     pub fn disentangle(&self) {
         let group = lock(&self.group).take();
         let Some(group) = group else {
@@ -468,7 +640,7 @@ impl MessagePortData {
         let remaining = group.remove(self);
 
         self.enqueue(Message::close_marker());
-        if remaining == 1 {
+        if remaining == 1 && !group.is_named() {
             if let Some(last) = group.members().first() {
                 last.enqueue(Message::close_marker());
             }
@@ -494,6 +666,7 @@ fn clone_message(message: &Message) -> Message {
         host_objects: Arc::clone(&message.host_objects),
         transferred_count: message.transferred_count,
         close: message.close,
+        transferred_ports: message.transferred_ports.clone(),
     }
 }
 
@@ -529,6 +702,14 @@ impl PortTransferData {
     pub fn for_port(data: Arc<MessagePortData>) -> Arc<dyn TransferData> {
         Arc::new(Self { data })
     }
+
+    /// The address of the queue this payload hands over.
+    ///
+    /// `Message::transferred_ports` records these so `dispatch` can ask whether a
+    /// port it is about to deliver to is one the transfer list just moved.
+    pub fn address(data: &MessagePortData) -> usize {
+        std::ptr::from_ref(data) as usize
+    }
 }
 
 impl TransferData for PortTransferData {
@@ -563,6 +744,24 @@ pub struct PortInner {
     pub closing: Cell<bool>,
     /// Set once the close event ran.
     pub closed: Cell<bool>,
+    /// Whether this port currently holds one [`rn_uv::wake::acquire`].
+    ///
+    /// Node gives every port its own `uv_async_t` and refs it while the port is
+    /// live, so libuv counts the loop alive and a foreign `uv_async_send` is
+    /// dispatched. rustnode has one wake handle per thread shared by every port on
+    /// it, so "this port is ref'd" has to be translated into a refcount on that
+    /// shared handle — and the ref/deref pair has to be balanced, which is why the
+    /// port remembers whether it holds one.
+    wake_refed: Cell<bool>,
+    /// Whether the queue has been given up, Node's `data_ == nullptr`.
+    ///
+    /// Set by [`Self::detach_for_move`], which is `MessagePort::MoveToContext`'s
+    /// `port->Detach()`. That is *not* `close()`: the old object keeps its handle,
+    /// so `postMessage` on it still serializes (and still validates its transfer
+    /// list), returns `true`, and dispatches nothing. Folding this into `closing`
+    /// would change what `postMessage` returns and skip the serialization Node
+    /// performs, so it is a separate fact.
+    data_detached: Cell<bool>,
     /// Identity of this port, so two ports never compare equal.
     identity: Rc<()>,
     /// The JavaScript object, weakly.
@@ -651,6 +850,8 @@ impl PortInner {
             refed: Cell::new(false),
             closing: Cell::new(false),
             closed: Cell::new(false),
+            wake_refed: Cell::new(false),
+            data_detached: Cell::new(false),
             identity: Rc::new(()),
             object: RefCell::new(None),
         });
@@ -749,7 +950,30 @@ impl PortInner {
         self.receiving.set(false);
     }
 
-    /// Detaches a port that is being moved to another owner.
+    /// Detaches a port whose queue is being re-homed into another realm.
+    ///
+    /// `MessagePort::MoveToContext` calls `port->Detach()`, not
+    /// `TransferForMessaging`: the old object keeps its handle — so `postMessage`
+    /// on it still answers `true` and delivers nothing — and the port is not
+    /// marked closing, so no `close` event is owed. What changes is that this
+    /// object no longer owns the queue, which is what stops it competing with the
+    /// new object for messages.
+    pub fn detach_for_move(&self) {
+        self.receiving.set(false);
+        self.data_detached.set(true);
+        self.drop_wake();
+        self.data.detach();
+    }
+
+    /// Whether this port has given its queue away, Node's `data_ == nullptr`.
+    ///
+    /// True only after [`Self::detach_for_move`]; a transferred port is `closing`
+    /// instead, which is what `PostMessage` already answers differently.
+    pub fn is_detached(&self) -> bool {
+        self.data_detached.get()
+    }
+
+    /// Detaches a port that is being transferred to another owner.
     ///
     /// Node's `TransferForMessaging` closes and detaches; the queue lives on in
     /// the receiving object, so this drops the owner link and stops delivery
@@ -757,6 +981,7 @@ impl PortInner {
     pub fn detach_for_transfer(self: &Rc<Self>) {
         self.closing.set(true);
         self.receiving.set(false);
+        self.drop_wake();
         self.data.detach();
         // `TransferForMessaging` is `Close(); return Detach();`, so the sender's
         // end owes the same `close` event a `close()` call would queue — and,
@@ -805,6 +1030,55 @@ impl PortInner {
         !self.closed.get() && self.refed.get()
     }
 
+    /// Takes this thread's wake handle ref, if this port does not already hold it.
+    ///
+    /// Node's port owns a `uv_async_t` that is ref'd for exactly as long as the
+    /// port is ref'd, and libuv then counts the loop alive. The distinction matters
+    /// in a *worker*: its loop has no other ref'd handle most of the time, so
+    /// `uv_run(UV_RUN_NOWAIT)` — which is what
+    /// [`crate::has_message_port_work`]'s caller falls back to — returns
+    /// immediately without running the async callback. A `postMessage` from another
+    /// thread then sits in the queue and is never delivered, even though
+    /// `uv_async_send` reported success.
+    ///
+    /// Keyed on the ref bit rather than on `receiving`, because that is what libuv
+    /// counts: `port.ref()` with no listener pins the process in Node, and
+    /// `stop()` does not unref anything.
+    fn hold_wake(&self) {
+        if self.wake_refed.get() {
+            return;
+        }
+        self.wake_refed.set(true);
+        rn_uv::wake::acquire();
+    }
+
+    /// Gives back the wake ref taken by [`Self::hold_wake`].
+    ///
+    /// Balanced by construction: `wake_refed` records whether this port holds one,
+    /// so releasing a ref this port never took cannot unref the shared handle while
+    /// another port still needs it.
+    fn drop_wake(&self) {
+        if !self.wake_refed.get() {
+            return;
+        }
+        self.wake_refed.set(false);
+        rn_uv::wake::release();
+    }
+
+    /// `ref()`: takes the wake ref and records the bit.
+    pub fn set_ref(&self) {
+        self.refed.set(true);
+        if !self.closed.get() {
+            self.hold_wake();
+        }
+    }
+
+    /// `unref()`: releases the wake ref and clears the bit.
+    pub fn clear_ref(&self) {
+        self.refed.set(false);
+        self.drop_wake();
+    }
+
     /// `HandleWrap::OnClose`'s `kClosed`.
     pub fn mark_closed(&self) {
         self.closed.set(true);
@@ -835,6 +1109,9 @@ impl PortInner {
         }
         self.closing.set(true);
         self.receiving.set(false);
+        // The port's handle is going away, so it gives up its claim on the
+        // thread's wake handle. Node drops the port's own `uv_async_t` here.
+        self.drop_wake();
         // `SiblingGroup::Disentangle`, inline. Node runs it from
         // `MessagePort::OnClose`, but its only observable effect is the close
         // marker it queues for the peer, and that marker is honoured by
@@ -994,13 +1271,17 @@ mod tests {
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
 
-        assert!(a.dispatch(&Message::new(
-            vec![1],
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            0
-        )));
+        assert!(matches!(
+            a.dispatch(&Message::new(
+                vec![1],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                Vec::new(),
+            )),
+            Dispatch::Delivered
+        ));
 
         assert_eq!(a.len(), 0, "the poster must not receive its own message");
         assert_eq!(b.len(), 1);
@@ -1021,6 +1302,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             0,
+            Vec::new(),
         ));
 
         assert_eq!(b.len(), 1);
@@ -1039,6 +1321,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             0,
+            Vec::new(),
         ));
         a.dispatch(&Message::new(
             vec![2],
@@ -1046,6 +1329,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             0,
+            Vec::new(),
         ));
         b.disentangle();
         a.disentangle();
@@ -1089,16 +1373,171 @@ mod tests {
     #[test]
     fn a_group_of_one_dispatches_nothing() {
         let a = MessagePortData::new();
-        assert!(
-            !a.dispatch(&Message::new(
+        assert_eq!(
+            a.dispatch(&Message::new(
                 vec![1],
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
-                0
+                0,
+                Vec::new(),
             )),
+            Dispatch::NotEntangled,
             "an unentangled port has no peer to warn about"
         );
+    }
+
+    /// A name nobody else in the process uses, so these tests cannot see a group
+    /// another test left behind.
+    fn unique_name(label: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        format!(
+            "rn-test-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    #[test]
+    fn a_named_group_delivers_to_every_other_member_and_never_to_the_poster() {
+        // `BroadcastChannel`'s whole reason to exist, and the case the removed
+        // deferral reason said needed a second thread: three members of one name,
+        // all on this thread, one post reaching two of them.
+        let name = unique_name("three-way");
+        let a = MessagePortData::new();
+        let b = MessagePortData::new();
+        let c = MessagePortData::new();
+        a.join_named(&name);
+        b.join_named(&name);
+        c.join_named(&name);
+
+        assert_eq!(
+            a.dispatch(&Message::new(
+                vec![9],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                Vec::new(),
+            )),
+            Dispatch::Delivered
+        );
+
+        assert_eq!(a.len(), 0, "the poster must not receive its own message");
+        assert_eq!(b.len(), 1);
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn a_named_group_whose_last_peer_left_has_no_destinations() {
+        // Distinct from `NotEntangled`: the sender is still in a live group, there
+        // is just nobody else in it. `postMessage` answers `false` here and
+        // `undefined` there, and `io.js` turns only the first into
+        // "Message could not be posted."
+        let name = unique_name("solo");
+        let a = MessagePortData::new();
+        a.join_named(&name);
+
+        assert_eq!(
+            a.dispatch(&Message::new(
+                vec![1],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                Vec::new(),
+            )),
+            Dispatch::NoDestinations
+        );
+    }
+
+    #[test]
+    fn a_name_becomes_reusable_once_every_channel_on_it_closed() {
+        // `SiblingGroup::Get` replaces an expired entry, so a later channel on the
+        // same name gets a new group rather than one nobody is in. A strong map
+        // would hand it the dead group and the next pair would never talk.
+        let name = unique_name("reuse");
+        let first = MessagePortData::new();
+        let first_peer = MessagePortData::new();
+        first.join_named(&name);
+        first_peer.join_named(&name);
+        first.disentangle();
+        first_peer.disentangle();
+
+        let second = MessagePortData::new();
+        let second_peer = MessagePortData::new();
+        second.join_named(&name);
+        second_peer.join_named(&name);
+
+        assert_eq!(
+            second.dispatch(&Message::new(
+                vec![2],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                0,
+                Vec::new(),
+            )),
+            Dispatch::Delivered
+        );
+        assert_eq!(second_peer.len(), 1);
+    }
+
+    #[test]
+    fn a_named_group_keeps_its_survivor_open() {
+        // `Disentangle` closes a last peer only for an anonymous group. A named one
+        // must not, or closing one `BroadcastChannel` would close every other
+        // channel on the name — and the name would be unusable afterwards.
+        let name = unique_name("survivor");
+        let a = MessagePortData::new();
+        let b = MessagePortData::new();
+        a.join_named(&name);
+        b.join_named(&name);
+
+        b.disentangle();
+
+        assert_eq!(
+            a.front_is_close(),
+            None,
+            "a named group must not close its survivor"
+        );
+    }
+
+    #[test]
+    fn a_transfer_list_with_more_than_one_destination_is_refused() {
+        // `SiblingGroup::Dispatch`'s `size() > 2` branch: a transfer names one
+        // receiver, so a group with room for more cannot honour it.
+        let name = unique_name("transfer");
+        let a = MessagePortData::new();
+        let b = MessagePortData::new();
+        let c = MessagePortData::new();
+        a.join_named(&name);
+        b.join_named(&name);
+        c.join_named(&name);
+
+        // `transferred_count` of 1 is what `has_transferables()` reads, so this is
+        // a message that hands something over without needing a real port payload.
+        let message = Message::new(vec![3], Vec::new(), Vec::new(), Vec::new(), 1, Vec::new());
+        assert!(message.has_transferables());
+        assert_eq!(
+            a.dispatch(&message),
+            Dispatch::TransferablesMultipleDestinations
+        );
+        assert_eq!(b.len(), 0, "nothing may be delivered when it is refused");
+        assert_eq!(c.len(), 0);
+    }
+
+    #[test]
+    fn a_moved_port_is_detached_without_being_closed() {
+        // `MessagePort::MoveToContext` calls `Detach()`, so the old handle keeps
+        // its identity and owes no `close` event; only the queue moves. Folding this
+        // into `closing` would change what `postMessage` answers on the old handle.
+        let (data, inner) = port();
+        inner.detach_for_move();
+
+        assert!(inner.is_detached());
+        assert!(!inner.closing.get(), "a move is not a close");
+        assert_eq!(data.owner_record(), None, "the queue lost its owner");
     }
 
     #[test]
