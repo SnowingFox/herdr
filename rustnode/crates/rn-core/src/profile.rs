@@ -59,6 +59,23 @@ pub fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("RN_PROFILE_PHASES").is_some())
 }
 
+/// Whether per-builtin compile reporting is on.
+///
+/// `RN_PROFILE_BUILTIN_COMPILE` reports the cost of each builtin compile on
+/// stderr, and — because the line also names the id and whether a code cache was
+/// consumed — it is how an integration test asserts that
+/// `rn-builtins::cache_plan` still covers what a run actually compiles. A gap in
+/// that plan costs startup time and nothing else, so it needs an observable
+/// signal to be testable at all.
+///
+/// Cached like [`enabled`], for the same reason: this is read once per builtin
+/// compile, and `std::env::var` takes a lock.
+#[must_use]
+pub fn builtin_compile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RN_PROFILE_BUILTIN_COMPILE").is_some())
+}
+
 /// Records the moment the process started.
 ///
 /// Call this as early as `main` can, so `entry` in the report is the cost of

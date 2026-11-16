@@ -295,8 +295,30 @@ fn compile_function_callback(
         throw(scope, &format!("Unknown builtin '{id}'"));
         return;
     };
-    match compile(scope, builtin.id(), builtin.source(), builtin.kind()) {
-        Some(function) => rv.set(function.into()),
+    // The instrumentation is off by default and the clock read is inside the
+    // guard rather than before it: this callback runs once per builtin, and an
+    // unconditional `Instant::now()` showed up as a measurable startup cost.
+    let logging = rn_core::profile::builtin_compile_enabled();
+    let started = if logging {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let cache = code_cache_for(builtin.id());
+    match rn_builtin_codegen::compile(scope, builtin.id(), builtin.source(), builtin.kind(), cache)
+    {
+        Some(compiled) => {
+            if let Some(started) = started {
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                // The id is last so a reader can split on the last double space;
+                // the integration test in `rn-cli` parses exactly that.
+                eprintln!(
+                    "builtin compile {ms:>8.3} ms  cache={}  {id}",
+                    cache.is_some()
+                );
+            }
+            rv.set(compiled.function().into())
+        }
         None => throw(scope, &format!("Failed to compile builtin '{id}'")),
     }
 }
@@ -306,7 +328,7 @@ fn compile_function_callback(
 ///
 /// When the build generated a code cache for this builtin, it is consumed and V8
 /// skips parsing and bytecode generation. That is the single largest saving in
-/// rustnode's startup: the 65 builtins an empty script loads took about 18 ms to
+/// rustnode's startup: the builtins an empty script loads took about 18 ms to
 /// compile and take about 0.3 ms from cache.
 ///
 /// V8 validates the blob and rejects a stale one rather than using it, so the
