@@ -1579,6 +1579,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bun-compression"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "libz-rs-sys",
+ "rn-bun-api",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "serde_json",
+ "zstd-sys",
+]
+
+[[package]]
 name = "rn-bun-hash"
 version = "0.1.0"
 dependencies = [
@@ -1595,6 +1609,7 @@ name = "rn-bun-members"
 version = "0.1.0"
 dependencies = [
  "rn-bun-api",
+ "rn-bun-compression",
  "rn-bun-hash",
  "rn-bun-time",
 ]

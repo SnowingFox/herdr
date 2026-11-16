@@ -1,0 +1,45 @@
+[package]
+name = "rn-bun-compression"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bun.gzipSync/gunzipSync/deflateSync/inflateSync/zstdCompress* for rustnode"
+
+[lib]
+name = "rn_bun_compression"
+path = "src/lib.rs"
+
+[dependencies]
+# The contract this crate implements: `BunModule` declares the member names it
+# sets and `BunRegistry` proves the declarations match the object before `Bun` is
+# published.
+rn-bun-api = { path = "../rn-bun-api" }
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+# The event loop, for the two asynchronous members. `Bun.zstdCompress` and
+# `Bun.zstdDecompress` queue on libuv's threadpool and settle a promise from the
+# completion, which is what makes them asynchronous rather than a resolved
+# promise over work that already ran. `rn-uv::threadpool` (so `process.exit()`
+# cancels a queued job) and `rn-uv::callback::with_context` (the one primitive
+# that re-enters V8 from inside `uv_run`) are the reused halves.
+rn-uv.workspace = true
+libuv-sys2.workspace = true
+# The same pure-Rust zlib C ABI `internalBinding('zlib')` is built on, so the
+# one-shot codecs here and the streaming handles in `rn-bind-zlib` cannot
+# disagree about which wrapper a mode selects. Naming it rather than binding zlib
+# a second time is the whole reuse decision: `libz-rs-sys` is already in the
+# dependency graph, its version is pinned by the workspace lock, and the vendored
+# source under `vendor/` is untouched either way.
+libz-rs-sys = { version = "=0.6.8", default-features = false, features = ["std"] }
+# zstd, vendored and compiled by cc-rs. `rn-bind-zlib` already names it with the
+# same pin for Node's own `zstd` surface, so this crate adds no new third-party
+# code: it reuses the `zstd-sys` artifact that is already built for the workspace.
+# `bindgen`, `legacy` and `pkg-config` are off exactly as there: the pregenerated
+# bindings are checked in, and leaving `pkg-config` off is what keeps the build
+# from needing a system libzstd the CI image does not have.
+zstd-sys = { version = "=2.0.17", default-features = false, features = ["zdict_builder"] }
+
+[dev-dependencies]
+serde_json.workspace = true
