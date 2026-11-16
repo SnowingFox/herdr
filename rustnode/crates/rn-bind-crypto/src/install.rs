@@ -917,7 +917,18 @@ fn hash_constructor<'s>(
     };
     // `xofLen` is `undefined` unless the caller asked for a specific output
     // length, which only the extendable-output digests use.
-    let xof_len = args.get(1).uint32_value(scope);
+    //
+    // The `is_undefined` guard is load-bearing, not defensive:
+    // `Value::uint32_value` is V8's `ToUint32`, which coerces `undefined` to
+    // `Some(0)`. Reading it directly therefore turned "no request" into "request
+    // zero bytes", and `createHash('shake128').digest()` returned an empty buffer
+    // because the XOF branch treats an explicit request as authoritative.
+    let requested_length = args.get(1);
+    let xof_len = if requested_length.is_undefined() {
+        None
+    } else {
+        requested_length.uint32_value(scope)
+    };
 
     // `outputLength` only means anything for the extendable-output digests; for a
     // fixed-length algorithm it is ignored, which is what Node does.
@@ -1371,15 +1382,18 @@ fn timing_safe_equal(
 
 /// `getFipsCrypto()`.
 ///
-/// Always false: `openssl-src` builds without the FIPS provider, and reporting
-/// true would make `lib/internal/crypto/util.js` behave as if a validated module
-/// were in use.
+/// Returns the **number** `0`, not `false`. `lib/crypto.js`'s `getFips` is
+/// `return getOptionValue('--force-fips') ? 1 : getFipsCrypto();`, and
+/// `lib/internal/crypto/util.js` compares `getFipsCrypto() === 1`. A boolean
+/// fails that comparison the same way `0` does, but `crypto.getFips()` itself
+/// returns whatever this returns, so a boolean leaks out as `typeof` `boolean`
+/// where Node reports `number`.
 fn get_fips_crypto(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    rv.set(v8::Boolean::new(scope, engine::FIPS_ENABLED).into());
+    rv.set(v8::Integer::new(scope, i32::from(engine::FIPS_ENABLED)).into());
 }
 
 /// `getFipsCryptoGeneration()`: the counter `getHashCache()` watches.
@@ -1395,19 +1409,27 @@ fn get_fips_crypto_generation(
     rv.set(v8::Integer::new(scope, 0).into());
 }
 
-/// `secureHeapUsed()`: bytes used from OpenSSL's secure heap, or `undefined`.
+/// `secureHeapUsed()`: bytes used from OpenSSL's secure heap, as a BigInt.
 ///
-/// `lib/internal/crypto/util.js` turns `undefined` into
-/// `{ total: 0, used: 0, utilization: 0, min: 0 }`, which is exactly right for a
-/// build with no secure heap configured (`--secure-heap` is not passed, and
-/// `openssl-src` is built without one), so `undefined` is the honest answer rather
-/// than a fabricated zero.
+/// The binding returns a **BigInt**, not `undefined` and not an object. Node's
+/// `SecureHeapUsed` is `BigInt::New(isolate, DataPointer::GetSecureHeapUsed())`,
+/// and the rest of the answer is computed in JavaScript: `secureHeapUsed` in
+/// `lib/internal/crypto/util.js` only takes its hardcoded
+/// `{ total: 0, used: 0, utilization: 0, min: 0 }` fallback when this returns
+/// `undefined`. Returning `undefined` here therefore reported `min: 0` and
+/// `utilization: 0` where Node reports `min: 2` (the `--secure-heap-min` default)
+/// and `utilization: NaN`, which `JSON.stringify` renders as `null`.
+///
+/// `GetSecureHeapUsed` is `CRYPTO_secure_malloc_initialized() ?
+/// CRYPTO_secure_used() : 0`, so an unconfigured heap reports `0n` and the shared
+/// JavaScript still produces the `min`/`utilization` fields Node's callers see.
 fn secure_heap_used(
-    _scope: &mut v8::PinScope<'_, '_>,
+    scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    rv.set_undefined();
+    let used = crate::enumerate::secure_heap_used();
+    rv.set(v8::BigInt::new_from_u64(scope, used).into());
 }
 
 /// `getOpenSSLSecLevelCrypto()`.
@@ -1487,7 +1509,15 @@ fn hash_job<'s>(
         throw_type_error(scope, "The data must be a string or an ArrayBufferView");
         return;
     };
-    let output_length = args.get(3).uint32_value(scope);
+    // As in `hash_constructor`: `uint32_value` coerces `undefined` to `Some(0)`,
+    // so the absent case has to be read explicitly or a job without an output
+    // length would finalise an XOF to zero bytes.
+    let requested_length = args.get(3);
+    let output_length = if requested_length.is_undefined() {
+        None
+    } else {
+        requested_length.uint32_value(scope)
+    };
 
     install_job_state(
         scope,
@@ -1953,17 +1983,95 @@ pub(crate) fn throw_construct_call_required(scope: &mut v8::PinScope<'_, '_>) {
     scope.throw_exception(exception);
 }
 
-/// Throws the JavaScript error a [`CryptoError`] corresponds to.
+/// Builds the JavaScript error object a [`CryptoError`] corresponds to, without
+/// throwing it.
 ///
-/// The messages are the ones `lib/internal/errors.js` turns into
-/// `ERR_CRYPTO_INVALID_DIGEST`, so the code a caller sees is Node's.
-pub(crate) fn throw_crypto_error(scope: &mut v8::PinScope<'_, '_>, error: &CryptoError) {
-    match error {
-        CryptoError::UnknownAlgorithm(name) => {
-            throw(scope, &format!("Digest method not supported: {name}"));
+/// Every arm reproduces a specific `THROW_ERR_*` from Node's C++, because the
+/// class and the `code` property are both part of the contract a caller catches
+/// on. The digest-name arm is the one place Node itself is inconsistent:
+/// `crypto_hash.cc:899` throws an uncoded `Error` with "Digest method not
+/// supported" from the `Hash` constructor, while `crypto_hmac.cc`,
+/// `crypto_hkdf.cc` and `crypto_pbkdf2.cc` throw a `TypeError` carrying
+/// `ERR_CRYPTO_INVALID_DIGEST` and "Invalid digest: <name>". Both are reproduced
+/// as they are rather than unified, because a library that catches the code must
+/// see the same absence or presence it would on Node.
+pub(crate) fn crypto_error_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    error: &CryptoError,
+) -> v8::Local<'s, v8::Value> {
+    let (kind, message, code): (ErrorClass, String, Option<&str>) = match error {
+        CryptoError::UnknownAlgorithm { name, api } => match api {
+            engine::DigestApi::HashConstructor => (
+                ErrorClass::Error,
+                "Digest method not supported".to_string(),
+                None,
+            ),
+            engine::DigestApi::DigestConsumer => (
+                ErrorClass::TypeError,
+                format!("Invalid digest: {name}"),
+                Some("ERR_CRYPTO_INVALID_DIGEST"),
+            ),
+        },
+        CryptoError::TimingSafeEqualLength => (
+            ErrorClass::RangeError,
+            "Input buffers must have the same byte length".to_string(),
+            Some("ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH"),
+        ),
+        CryptoError::InvalidKeyLength => (
+            ErrorClass::RangeError,
+            "Invalid key length".to_string(),
+            Some("ERR_CRYPTO_INVALID_KEYLEN"),
+        ),
+        CryptoError::HkdfFailed => (
+            ErrorClass::Error,
+            "HKDF derivation failed".to_string(),
+            None,
+        ),
+        other => (ErrorClass::Error, other.to_string(), None),
+    };
+    build_error(scope, kind, &message, code)
+}
+
+/// Which constructor `build_error` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorClass {
+    Error,
+    TypeError,
+    RangeError,
+}
+
+/// Builds an error of `kind` carrying `code` as an own property, the way
+/// `internal/errors.js` installs it.
+fn build_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    kind: ErrorClass,
+    message: &str,
+    code: Option<&str>,
+) -> v8::Local<'s, v8::Value> {
+    let Some(text) = v8::String::new(scope, message) else {
+        return v8::undefined(scope).into();
+    };
+    let exception = match kind {
+        ErrorClass::Error => v8::Exception::error(scope, text),
+        ErrorClass::TypeError => v8::Exception::type_error(scope, text),
+        ErrorClass::RangeError => v8::Exception::range_error(scope, text),
+    };
+    if let Some(code) = code {
+        if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
+            if let Some(key) = v8::String::new(scope, "code") {
+                if let Some(value) = v8::String::new(scope, code) {
+                    object.set(scope, key.into(), value.into());
+                }
+            }
         }
-        other => throw(scope, &other.to_string()),
     }
+    exception
+}
+
+/// Throws the JavaScript error a [`CryptoError`] corresponds to.
+pub(crate) fn throw_crypto_error(scope: &mut v8::PinScope<'_, '_>, error: &CryptoError) {
+    let exception = crypto_error_object(scope, error);
+    scope.throw_exception(exception);
 }
 
 #[cfg(test)]

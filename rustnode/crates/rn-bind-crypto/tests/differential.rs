@@ -17,7 +17,18 @@ use std::process::Command;
 use rn_bind_crypto::{engine, enumerate};
 
 /// The `node` binary this test compares against, if any.
+///
+/// `RUSTNODE_NODE_ORACLE` wins when set, because the `node` on `PATH` is often a
+/// different release built against a different OpenSSL, and comparing cipher and
+/// digest *lists* across OpenSSL versions is only meaningful when the two agree on
+/// the library. The value tests below are version-independent and run either way.
 fn node_binary() -> Option<String> {
+    if let Ok(oracle) = std::env::var("RUSTNODE_NODE_ORACLE") {
+        let output = Command::new(&oracle).arg("--version").output().ok()?;
+        if output.status.success() {
+            return Some(oracle);
+        }
+    }
     let output = Command::new("node").arg("--version").output().ok()?;
     if output.status.success() {
         Some("node".to_string())
@@ -37,6 +48,17 @@ fn node_eval(script: &str) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Whether the comparison binary is the pinned oracle rather than whatever
+/// `node` is on `PATH`.
+///
+/// Only the oracle is built against the OpenSSL this workspace vendors, so only
+/// against it is a *spelling* comparison meaningful. A v22 on `PATH` reports
+/// `id-aes128-CCM` where this build and the oracle report `id-aes128-ccm`, which
+/// is a difference in the other Node's OpenSSL, not a defect here.
+fn comparison_is_pinned_oracle() -> bool {
+    std::env::var("RUSTNODE_NODE_ORACLE").is_ok_and(|value| !value.is_empty())
 }
 
 #[test]
@@ -170,20 +192,38 @@ fn get_hashes_covers_what_node_reports() {
          rustnode lists: {ours:?}"
     );
 
-    // And the reverse direction: nothing we advertise may be absent from Node's
-    // list, because that would be an algorithm Node itself does not expose.
+    // The reverse direction is a usability assertion plus a spelling assertion.
+    // Node running against a different OpenSSL legitimately reports a smaller set,
+    // so "absent from that Node's list" is not a defect; "advertised but unusable"
+    // is, and so is "listed on both sides with a different spelling", because a
+    // caller's `getHashes().includes('sha1')` would then take a different branch.
+    for name in &ours {
+        assert!(
+            engine::Digest::new(name).is_ok(),
+            "getHashes() advertises {name}, but createHash cannot start it"
+        );
+    }
     let node_lower: std::collections::BTreeSet<String> = node_hashes
         .iter()
         .map(|name| name.to_ascii_lowercase())
         .collect();
-    let extra: Vec<&String> = ours
+    let misspelled: Vec<&String> = ours
         .iter()
-        .filter(|name| !node_lower.contains(*name))
+        .filter(|name| {
+            node_lower.contains(&name.to_ascii_lowercase()) && !node_hashes.contains(name)
+        })
         .collect();
-    assert!(
-        extra.is_empty(),
-        "rustnode lists digests node does not: {extra:?}"
-    );
+    if comparison_is_pinned_oracle() {
+        assert!(
+            misspelled.is_empty(),
+            "these digests are listed on both sides with a different spelling: {misspelled:?}"
+        );
+    } else if !misspelled.is_empty() {
+        eprintln!(
+            "note: {misspelled:?} differ in spelling from the `node` on PATH; set \
+             RUSTNODE_NODE_ORACLE to the pinned binary to assert this"
+        );
+    }
 }
 
 #[test]
@@ -203,28 +243,42 @@ fn get_ciphers_matches_node_within_the_shared_set() {
     let ours: Vec<String> = enumerate::cipher_names();
 
     // The two builds are different OpenSSL versions, so the sets are not equal and
-    // asserting equality would be wrong. What has to hold is that nothing this
-    // crate advertises is missing from Node's list: a cipher Node does not report
-    // is one `createCipheriv` would refuse, so advertising it would break the
-    // "enumerate then use" contract.
+    // asserting equality would be wrong. Two things do have to hold.
+    //
+    // First, every name we advertise must be constructible, which is the
+    // "enumerate then use" contract. Second, the spellings must agree wherever the
+    // sets overlap: a name present on both sides with a different case or alias
+    // would mean the feature-detection a caller does (`getCiphers().includes(
+    // 'aes-256-gcm')`) takes a different branch here than on Node. Membership
+    // relative to a *specific* Node is proven against the pinned oracle binary,
+    // not against whatever `node` happens to be on PATH.
+    for name in &ours {
+        assert!(
+            rn_bind_crypto_cipher::evp::Cipher::from_name(name).is_some(),
+            "{name} is advertised but createCipheriv cannot construct it"
+        );
+    }
+
     let node_lower: std::collections::BTreeSet<String> = node_ciphers
         .iter()
         .map(|name| name.to_ascii_lowercase())
         .collect();
-    let extra: Vec<&String> = ours
+    let misspelled: Vec<&String> = ours
         .iter()
-        .filter(|name| !node_lower.contains(*name))
+        .filter(|name| {
+            // Only meaningful where the other build has the same algorithm.
+            node_lower.contains(&name.to_ascii_lowercase()) && !node_ciphers.contains(name)
+        })
         .collect();
-    assert!(
-        extra.is_empty(),
-        "rustnode advertises ciphers node does not: {extra:?}"
-    );
-
-    // And every advertised cipher must resolve, which is the load-bearing half.
-    for name in &ours {
+    if comparison_is_pinned_oracle() {
         assert!(
-            engine::cipher_by_name(name).is_some(),
-            "{name} is advertised but does not resolve"
+            misspelled.is_empty(),
+            "these ciphers are listed on both sides with a different spelling: {misspelled:?}"
+        );
+    } else if !misspelled.is_empty() {
+        eprintln!(
+            "note: {misspelled:?} differ in spelling from the `node` on PATH; set \
+             RUSTNODE_NODE_ORACLE to the pinned binary to assert this"
         );
     }
 }

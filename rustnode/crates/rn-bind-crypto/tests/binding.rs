@@ -259,12 +259,23 @@ fn cases() -> Vec<Case> {
             expected: "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=",
         },
         Case {
-            name: "an unknown algorithm throws naming it",
+            name: "an unknown algorithm throws the uncoded message node uses",
+            // `crypto_hash.cc:899` throws `THROW_CRYPTO_ERROR_ERR("Digest method
+            // not supported")` from the `Hash` constructor, which carries no
+            // `code`. Verified on the 28.0.0 nightly oracle:
+            // `createHash('nope')` is `Error` with `code === undefined`. The
+            // other digest consumers (`createHmac`, the KDFs) do carry
+            // `ERR_CRYPTO_INVALID_DIGEST`, so this difference is deliberate.
             source: r#"
-                new binding.Hash('no-such-digest', undefined, -1, {});
-                return 'did-not-throw';
+                try {
+                  new binding.Hash('no-such-digest', undefined, -1, {});
+                  return 'did-not-throw';
+                } catch (error) {
+                  return error.constructor.name + ':' + ('code' in error)
+                    + ':' + error.message;
+                }
             "#,
-            expected: "THREW: Digest method not supported: no-such-digest",
+            expected: "Error:false:Digest method not supported",
         },
         Case {
             name: "a finalised hash cannot be finalised again",
@@ -378,14 +389,18 @@ fn cases() -> Vec<Case> {
             expected: "node-spelling",
         },
         Case {
-            name: "getHashes() does not leak provider-only names",
+            name: "getHashes() reports node's full alias set",
+            // Node's `getHashes()` includes the provider spellings, because
+            // `SaveSupportedProviderHashName` lowercases every name a fetched
+            // digest answers to. Measured on the 28.0.0 nightly oracle: all three
+            // of these are present, so dropping them would be the divergence.
             source: r#"
                 const names = binding.getHashes();
-                const providerOnly = ['sha2-256', 'sha2-512', 'blake2b-512'];
-                const leaked = providerOnly.filter((name) => names.includes(name));
-                return leaked.length ? 'leaked: ' + leaked.join(',') : 'clean';
+                const providerNames = ['sha2-256', 'sha2-512', 'blake2b-512'];
+                const missing = providerNames.filter((n) => !names.includes(n));
+                return missing.length ? 'missing: ' + missing.join(',') : 'present';
             "#,
-            expected: "clean",
+            expected: "present",
         },
         Case {
             name: "getCiphers() reports a usable list",
@@ -446,28 +461,45 @@ fn cases() -> Vec<Case> {
             expected: "true:false",
         },
         Case {
-            name: "timingSafeEqual rejects a length mismatch",
-            // `crypto.timingSafeEqual` documents ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH.
+            name: "timingSafeEqual rejects a length mismatch with the documented code",
+            // `crypto.timingSafeEqual` documents
+            // `ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH`, and `node_errors.h` makes it
+            // a `RangeError`. The harness records the class and code after the
+            // message so both are pinned.
             source: r#"
-                binding.timingSafeEqual(new Uint8Array([1]), new Uint8Array([1, 2]));
-                return 'did-not-throw';
+                try {
+                  binding.timingSafeEqual(new Uint8Array([1]), new Uint8Array([1, 2]));
+                  return 'did-not-throw';
+                } catch (error) {
+                  return error.constructor.name + ':' + error.code + ':'
+                    + error.message;
+                }
             "#,
-            expected: "THREW: Input buffers must have the same byte length",
+            expected: "RangeError:ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH:\
+Input buffers must have the same byte length",
         },
         Case {
-            name: "FIPS is reported as off",
-            // `openssl-src` builds without the FIPS provider, so true would make
-            // the JavaScript layer behave as if a validated module were in use.
+            name: "FIPS is reported as the number zero, like node",
+            // `openssl-src` builds without the FIPS provider, so a non-zero
+            // answer would make the JavaScript layer behave as if a validated
+            // module were in use. The *type* is part of the contract:
+            // `crypto.getFips()` returns `return getOptionValue('--force-fips')
+            // ? 1 : getFipsCrypto();`, and the oracle reports `typeof` `number`.
             source: r#"
-                return binding.getFipsCrypto() + ':' + binding.getFipsCryptoGeneration();
+                return binding.getFipsCrypto() + ':' + typeof binding.getFipsCrypto()
+                  + ':' + binding.getFipsCryptoGeneration();
             "#,
-            expected: "false:0",
+            expected: "0:number:0",
         },
         Case {
-            name: "secureHeapUsed is undefined without a secure heap",
-            // `secureHeapUsed()` turns `undefined` into the zeroed summary.
-            source: "return String(binding.secureHeapUsed());",
-            expected: "undefined",
+            name: "secureHeapUsed is a BigInt, so the JS summary gets its min",
+            // The binding returns a BigInt. `secureHeapUsed()` in
+            // `lib/internal/crypto/util.js` only takes its hardcoded fallback when
+            // this is `undefined`, so returning `undefined` reported `min: 0`
+            // where node reports `min: 2`. The oracle's raw value is `0n`.
+            source:
+                "return typeof binding.secureHeapUsed() + ':' + String(binding.secureHeapUsed());",
+            expected: "bigint:0",
         },
         Case {
             name: "oneShotDigest agrees with the Hash class",
@@ -651,17 +683,33 @@ fn cases() -> Vec<Case> {
             ),
         },
         Case {
-            name: "PBKDF2Job reports an error instead of throwing",
-            // The sync contract is `[error, result]`, not a throw: `pbkdf2Sync`
-            // destructures and throws itself, so a throw here would change the
-            // error identity.
+            name: "PBKDF2Job rejects a bad digest at construction, like node",
+            // `PBKDF2Traits::AdditionalConfig` resolves the digest while the job
+            // is being built (`crypto_pbkdf2.cc:109`), so `crypto.pbkdf2(...)`
+            // throws synchronously rather than delivering through `ondone`. The
+            // oracle reports `TypeError` + `ERR_CRYPTO_INVALID_DIGEST`.
             source: r#"
-                const job = new binding.PBKDF2Job(
-                  1, 'password', 'salt', 1, 8, 'no-such-digest');
-                const out = job.run();
-                return out[0] instanceof Error ? 'error-first' : 'no-error';
+                try {
+                  new binding.PBKDF2Job(1, 'password', 'salt', 1, 8, 'no-such-digest');
+                  return 'did-not-throw';
+                } catch (error) {
+                  return error.constructor.name + ':' + error.code + ':' + error.message;
+                }
             "#,
-            expected: "error-first",
+            expected: "TypeError:ERR_CRYPTO_INVALID_DIGEST:Invalid digest: no-such-digest",
+        },
+        Case {
+            name: "HKDFJob rejects a length over 255 digest blocks",
+            source: r#"
+                try {
+                  new binding.HKDFJob(1, 'sha256', Buffer.from('k'), Buffer.alloc(0),
+                    Buffer.alloc(0), 8161);
+                  return 'did-not-throw';
+                } catch (error) {
+                  return error.constructor.name + ':' + error.code + ':' + error.message;
+                }
+            "#,
+            expected: "RangeError:ERR_CRYPTO_INVALID_KEYLEN:Invalid key length",
         },
     ]);
     cases.push(Case {

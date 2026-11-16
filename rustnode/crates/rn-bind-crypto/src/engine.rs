@@ -22,11 +22,37 @@ use openssl::symm::Cipher;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CryptoError {
     /// The algorithm name is not one this OpenSSL knows.
-    UnknownAlgorithm(String),
+    ///
+    /// `api` names the surface that rejected it, because Node does not report
+    /// every digest failure the same way: `createHash('nope')` throws an uncoded
+    /// `Error` with "Digest method not supported", while `createHmac` and the
+    /// KDFs throw a `TypeError` carrying `ERR_CRYPTO_INVALID_DIGEST` and
+    /// "Invalid digest: nope". `crypto_hash.cc:899` is the uncoded one.
+    UnknownAlgorithm {
+        /// The digest name the caller asked for.
+        name: String,
+        /// Which entry point rejected it.
+        api: DigestApi,
+    },
     /// A key or parameter had the wrong shape or length.
     InvalidKey(String),
     /// A length, offset or option was outside what the operation accepts.
     InvalidArgument(String),
+    /// A requested output length a digest's XOF cannot produce.
+    ///
+    /// `ERR_CRYPTO_INVALID_KEYLEN`: Node raises it from `crypto_hkdf.cc` when the
+    /// length exceeds 255 blocks of the digest, and from `crypto_hash.cc` when a
+    /// fixed-length digest is asked for a different length.
+    InvalidKeyLength,
+    /// `crypto.timingSafeEqual` compared buffers of different lengths.
+    ///
+    /// `ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH`, a `RangeError`.
+    TimingSafeEqualLength,
+    /// The HKDF job reported a failure the parameters did not explain.
+    ///
+    /// Node's `HKDF_FAILED` is a bare, uncoded `Error` with "HKDF derivation
+    /// failed", which is what a zero-length derivation produces.
+    HkdfFailed,
     /// OpenSSL itself reported a failure.
     OpenSsl(String),
 }
@@ -34,12 +60,43 @@ pub enum CryptoError {
 impl std::fmt::Display for CryptoError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownAlgorithm(name) => write!(formatter, "unknown algorithm: {name}"),
+            Self::UnknownAlgorithm { name, .. } => write!(formatter, "unknown algorithm: {name}"),
             Self::InvalidKey(message) => write!(formatter, "invalid key: {message}"),
             Self::InvalidArgument(message) => write!(formatter, "invalid argument: {message}"),
+            Self::InvalidKeyLength => write!(formatter, "Invalid key length"),
+            Self::TimingSafeEqualLength => {
+                write!(formatter, "Input buffers must have the same byte length")
+            }
+            Self::HkdfFailed => write!(formatter, "HKDF derivation failed"),
             Self::OpenSsl(message) => write!(formatter, "openssl: {message}"),
         }
     }
+}
+
+impl CryptoError {
+    /// A digest name this OpenSSL cannot resolve, rejected by `api`.
+    fn unknown_digest(name: &str, api: DigestApi) -> Self {
+        Self::UnknownAlgorithm {
+            name: name.to_string(),
+            api,
+        }
+    }
+}
+
+/// Which entry point rejected a digest name.
+///
+/// The distinction is not cosmetic: Node's message, error class and `code` all
+/// differ between them, and a library that catches `ERR_CRYPTO_INVALID_DIGEST`
+/// takes a different path when the error has no code at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestApi {
+    /// `new Hash(...)`, whose C++ site (`crypto_hash.cc:899`) throws a plain
+    /// `Error` with "Digest method not supported" and no `code`.
+    HashConstructor,
+    /// `Hmac.prototype.init`, `crypto_hkdf.cc`, `crypto_pbkdf2.cc` and the hash
+    /// job, which all throw `ERR_CRYPTO_INVALID_DIGEST`, a `TypeError`, with
+    /// "Invalid digest: <name>".
+    DigestConsumer,
 }
 
 impl std::error::Error for CryptoError {}
@@ -118,8 +175,23 @@ impl Digest {
     /// `crypto.createHash('sha256', { outputLength: 8 })` does in Node: the option
     /// only applies to the extendable-output digests.
     pub fn new_with_output_length(name: &str, requested: Option<u32>) -> Result<Self, CryptoError> {
-        let digest = MessageDigest::from_name(name)
-            .ok_or_else(|| CryptoError::UnknownAlgorithm(name.to_string()))?;
+        Self::new_with_output_length_for(name, requested, DigestApi::HashConstructor)
+    }
+
+    /// Starts a digest, reporting a rejection the way `api` reports it.
+    ///
+    /// The resolver is `enumerate::resolve_digest`, which follows Node's
+    /// `ncrypto::Digest::FromName`: the legacy table first, then a provider
+    /// fetch. The provider half is what makes `keccak-256` and `sha2-256/192`
+    /// work here — they appear in `getHashes()` and are absent from the legacy
+    /// table, so a legacy-only lookup would advertise names it cannot start.
+    pub fn new_with_output_length_for(
+        name: &str,
+        requested: Option<u32>,
+        api: DigestApi,
+    ) -> Result<Self, CryptoError> {
+        let digest = crate::enumerate::resolve_digest(name)
+            .ok_or_else(|| CryptoError::unknown_digest(name, api))?;
         // SAFETY: `EVP_MD_CTX_new` returns a valid context or null, checked below.
         let context = unsafe { openssl_sys::EVP_MD_CTX_new() };
         if context.is_null() {
@@ -128,10 +200,10 @@ impl Digest {
             ));
         }
         // SAFETY: `context` was just allocated and is owned by this struct. The
-        // digest pointer from `as_ptr` is static, and a null engine is the
-        // documented "use the default implementation" argument.
+        // digest pointer belongs to `digest`, which outlives this call, and a null
+        // engine is the documented "use the default implementation" argument.
         let initialised = unsafe {
-            openssl_sys::EVP_DigestInit_ex(context, digest.as_ptr(), std::ptr::null_mut())
+            openssl_sys::EVP_DigestInit_ex(context, digest.as_ptr().cast(), std::ptr::null_mut())
         };
         if initialised != 1 {
             // SAFETY: the allocation above is not owned by a live `Digest` yet.
@@ -145,11 +217,16 @@ impl Digest {
         // `size()` (16 and 32, its default output lengths), so testing for a zero
         // size — which is the obvious-looking rule — misses every XOF.
         //
-        // `digest.as_ptr()` is the static `EVP_MD` the `MessageDigest` holds;
+        // `digest.as_ptr()` is the `EVP_MD` the source owns;
         // `digest_flags` documents its own safety contract.
         let flags = crate::enumerate::digest_flags(digest.as_ptr().cast());
         let is_xof = flags & EVP_MD_FLAG_XOF != 0;
-        let fixed_len = digest.size();
+        // SAFETY: the digest pointer is live and belongs to `digest`; the raw size
+        // accessor only reads it.
+        let size = unsafe { openssl_sys::EVP_MD_get_size(digest.as_ptr().cast()) };
+        // A negative size is OpenSSL's "unknown"; `EVP_MD_size` reports it for a
+        // descriptor it cannot measure. Treat it as zero rather than wrapping.
+        let fixed_len = usize::try_from(size).unwrap_or(0);
         // `crypto.createHash('shake128')` defaults to 16 bytes and
         // `createHash('shake256')` to 32, which are exactly what `node` reports;
         // `fixed_len` is already those values, so the explicit request is the only
@@ -160,12 +237,7 @@ impl Digest {
             fixed_len
         };
 
-        let canonical = digest
-            .type_()
-            .short_name()
-            .ok()
-            .map(str::to_string)
-            .unwrap_or_else(|| name.to_string());
+        let canonical = digest.resolution_name().to_string();
         Ok(Self {
             context,
             name: canonical,
@@ -337,9 +409,13 @@ unsafe impl Send for Hmac {}
 
 impl Hmac {
     /// Starts an HMAC.
+    ///
+    /// `Hmac.prototype.init` reports an unresolvable digest as
+    /// `ERR_CRYPTO_INVALID_DIGEST` ("Invalid digest: <name>"), which is what
+    /// `crypto_hmac.cc:196` throws and what a caller catching that code expects.
     pub fn new(algorithm: &str, key: &[u8]) -> Result<Self, CryptoError> {
-        let digest = MessageDigest::from_name(algorithm)
-            .ok_or_else(|| CryptoError::UnknownAlgorithm(algorithm.to_string()))?;
+        let digest = crate::enumerate::resolve_digest(algorithm)
+            .ok_or_else(|| CryptoError::unknown_digest(algorithm, DigestApi::DigestConsumer))?;
         // SAFETY: `HMAC_CTX_new` returns either a valid context or null, and the
         // null case is checked immediately below.
         let context = unsafe { openssl_sys::HMAC_CTX_new() };
@@ -359,7 +435,7 @@ impl Hmac {
                 // `HMAC_Init_ex` takes the key length as a `c_int`, unlike the
                 // `size_t` of the other entry points.
                 c_int_len(key.len())?,
-                digest.as_ptr(),
+                digest.as_ptr().cast(),
                 std::ptr::null_mut(),
             )
         };
@@ -448,9 +524,10 @@ pub fn hmac_once(algorithm: &str, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Cr
 /// returning false.
 pub fn timing_safe_equal(left: &[u8], right: &[u8]) -> Result<bool, CryptoError> {
     if left.len() != right.len() {
-        return Err(CryptoError::InvalidArgument(
-            "Input buffers must have the same byte length".to_string(),
-        ));
+        // `ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH`, a `RangeError` in
+        // `node_errors.h`. A bare message would leave `error.code` undefined and
+        // a caller checking the documented code would take the wrong branch.
+        return Err(CryptoError::TimingSafeEqualLength);
     }
     Ok(openssl::memcmp::eq(left, right))
 }
@@ -555,17 +632,17 @@ pub fn pbkdf2(
     iterations: u32,
     length: usize,
 ) -> Result<Vec<u8>, CryptoError> {
-    let message_digest = MessageDigest::from_name(digest)
-        .ok_or_else(|| CryptoError::UnknownAlgorithm(digest.to_string()))?;
+    let message_digest = crate::enumerate::resolve_digest(digest)
+        .ok_or_else(|| CryptoError::unknown_digest(digest, DigestApi::DigestConsumer))?;
     let mut output = vec![0u8; length];
-    openssl::pkcs5::pbkdf2_hmac(
-        password,
-        salt,
-        iterations as usize,
-        message_digest,
-        &mut output,
-    )
-    .map_err(|_| openssl_error())?;
+    // SAFETY: the resolution may be a fetched provider digest, whose pointer this
+    // borrowed through `as_ptr` and which outlives the call. `pbkdf2_hmac` wants
+    // the safe crate's `MessageDigest`, so the pointer is re-wrapped: the wrapper
+    // is a bare newtype over `*const EVP_MD` with no ownership of its own, and
+    // `message_digest` keeps the reference alive across the call.
+    let borrowed = unsafe { MessageDigest::from_ptr(message_digest.as_ptr().cast()) };
+    openssl::pkcs5::pbkdf2_hmac(password, salt, iterations as usize, borrowed, &mut output)
+        .map_err(|_| openssl_error())?;
     Ok(output)
 }
 
@@ -609,6 +686,14 @@ pub fn scrypt_with_maxmem(
 }
 
 /// HKDF as RFC 5869 defines it, which is what `crypto.hkdf` computes.
+///
+/// The two failure modes are Node's, not OpenSSL's:
+///
+/// * A length over 255 digest blocks is `ERR_CRYPTO_INVALID_KEYLEN`
+///   (`ncrypto::checkHkdfLength`), checked before OpenSSL is asked to allocate.
+/// * An OpenSSL failure — including the zero-length request, which its KDF
+///   entry point rejects — is the bare, uncoded `Error` with "HKDF derivation
+///   failed" that `NodeCryptoError::HKDF_FAILED` produces.
 pub fn hkdf(
     digest: &str,
     ikm: &[u8],
@@ -616,12 +701,21 @@ pub fn hkdf(
     info: &[u8],
     length: usize,
 ) -> Result<Vec<u8>, CryptoError> {
-    let message_digest = MessageDigest::from_name(digest)
-        .ok_or_else(|| CryptoError::UnknownAlgorithm(digest.to_string()))?;
+    let message_digest = crate::enumerate::resolve_digest(digest)
+        .ok_or_else(|| CryptoError::unknown_digest(digest, DigestApi::DigestConsumer))?;
+    // HKDF-Expand emits at most 255 blocks, and each block carries the digest's
+    // output size, so this is the ceiling `checkHkdfLength` enforces.
+    let digest_size = digest_output_size(&message_digest);
+    let block_ceiling = digest_size.saturating_mul(255);
+    if length > block_ceiling {
+        return Err(CryptoError::InvalidKeyLength);
+    }
+    // SAFETY: the pointer belongs to `message_digest`, which outlives the borrow.
+    let borrowed = unsafe { MessageDigest::from_ptr(message_digest.as_ptr().cast()) };
     // `openssl::kdf::hkdf` wants an `MdRef`, which is the fetchable form of the
     // digest rather than its NID.
-    let digest_ref = openssl::md::Md::from_nid(message_digest.type_())
-        .ok_or_else(|| CryptoError::UnknownAlgorithm(digest.to_string()))?;
+    let digest_ref = openssl::md::Md::from_nid(borrowed.type_())
+        .ok_or_else(|| CryptoError::unknown_digest(digest, DigestApi::DigestConsumer))?;
     let mut output = vec![0u8; length];
     // An absent salt is `HashLen` zero bytes per RFC 5869. Passing `None` to the
     // OpenSSL KDF does that internally, which is why it is not substituted here.
@@ -634,8 +728,43 @@ pub fn hkdf(
         None,
         &mut output,
     )
-    .map_err(|_| CryptoError::InvalidArgument("hkdf parameters are invalid".to_string()))?;
+    .map_err(|_| CryptoError::HkdfFailed)?;
     Ok(output)
+}
+
+/// A digest's output size in bytes, from the descriptor behind a resolution.
+fn digest_output_size(source: &crate::enumerate::DigestSource) -> usize {
+    // SAFETY: the pointer is live and owned by `source`; the accessor only reads.
+    let size = unsafe { openssl_sys::EVP_MD_get_size(source.as_ptr().cast()) };
+    usize::try_from(size).unwrap_or(0)
+}
+
+/// Resolves a digest for a KDF job, reporting a bad name the way the job
+/// constructors do.
+///
+/// `PBKDF2Traits::AdditionalConfig` and `HKDFTraits::AdditionalConfig` both call
+/// this before the job is built, so an unknown digest throws from the constructor
+/// rather than arriving through `ondone`.
+pub fn check_digest(name: &str) -> Result<(), CryptoError> {
+    crate::enumerate::resolve_digest(name)
+        .map(|_| ())
+        .ok_or_else(|| CryptoError::unknown_digest(name, DigestApi::DigestConsumer))
+}
+
+/// The two checks `HKDFTraits::AdditionalConfig` performs before building a job.
+///
+/// The length ceiling is `checkHkdfLength` from `deps/ncrypto/ncrypto.cc`: 255
+/// blocks of the digest, because HKDF-Expand appends an 8-bit counter. Zero is
+/// *not* rejected here — Node accepts it and fails later in the derivation with
+/// the uncoded "HKDF derivation failed", which is reproduced by
+/// [`CryptoError::HkdfFailed`].
+pub fn check_hkdf_parameters(digest: &str, length: usize) -> Result<(), CryptoError> {
+    let source = crate::enumerate::resolve_digest(digest)
+        .ok_or_else(|| CryptoError::unknown_digest(digest, DigestApi::DigestConsumer))?;
+    if length > digest_output_size(&source).saturating_mul(255) {
+        return Err(CryptoError::InvalidKeyLength);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -748,7 +877,10 @@ mod tests {
         match Digest::new("no-such-digest") {
             Err(error) => assert_eq!(
                 error,
-                CryptoError::UnknownAlgorithm("no-such-digest".to_string())
+                CryptoError::UnknownAlgorithm {
+                    name: "no-such-digest".to_string(),
+                    api: DigestApi::HashConstructor,
+                }
             ),
             Ok(_) => panic!("an unknown digest name must not resolve"),
         }
@@ -811,11 +943,12 @@ mod tests {
         assert!(timing_safe_equal(b"abcd", b"abcd").expect("equal"));
         assert!(!timing_safe_equal(b"abcd", b"abce").expect("unequal"));
         assert!(timing_safe_equal(b"", b"").expect("both empty"));
+        // The kind matters as much as the message: `crypto.js` documents
+        // `ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH` and the binding turns this into a
+        // `RangeError` carrying that code.
         assert_eq!(
             timing_safe_equal(b"abc", b"abcd").expect_err("length mismatch"),
-            CryptoError::InvalidArgument(
-                "Input buffers must have the same byte length".to_string()
-            )
+            CryptoError::TimingSafeEqualLength
         );
     }
 
@@ -899,9 +1032,13 @@ mod tests {
         let ciphers = cipher_algorithms();
         assert!(!ciphers.is_empty(), "OpenSSL reported no ciphers");
         for name in &ciphers {
+            // The accept test is the one `createCipheriv` uses, not the narrower
+            // legacy-table lookup: a provider-only cipher such as
+            // `aes-128-cbc-cts` has no NID and never appears in the legacy table,
+            // yet `createCipheriv` constructs it fine.
             assert!(
-                cipher_by_name(name).is_some(),
-                "advertised cipher {name} but it did not resolve"
+                rn_bind_crypto_cipher::evp::Cipher::from_name(name).is_some(),
+                "advertised cipher {name} but createCipheriv cannot construct it"
             );
         }
 
