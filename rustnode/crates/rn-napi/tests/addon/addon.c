@@ -67,6 +67,7 @@
  * declarations they need. */
 napi_status register_async_methods(napi_env env, napi_value exports);
 napi_status register_wrap_methods(napi_env env, napi_value exports);
+napi_status register_surface_methods(napi_env env, napi_value exports);
 
 /* Throws a `TypeError` naming the failure, so a broken asynchronous path reports
  * through the same channel as the synchronous ones instead of aborting. */
@@ -374,6 +375,21 @@ NAPI_MODULE_EXPORT napi_value NAPI_MODULE_INITIALIZER(napi_env env,
                        info != NULL && info->error_message != NULL
                            ? info->error_message
                            : "registering the wrap methods failed");
+      return NULL;
+    }
+  }
+
+  /* The Node-API surface that used to be missing, and the three behavioural
+   * defects found while implementing it, from `addon_surface.c`. */
+  {
+    napi_status status = register_surface_methods(env, exports);
+    if (status != napi_ok) {
+      const napi_extended_error_info* info = NULL;
+      napi_get_last_error_info(env, &info);
+      napi_throw_error(env, "ERR_ADDON_SURFACE",
+                       info != NULL && info->error_message != NULL
+                           ? info->error_message
+                           : "registering the surface methods failed");
       return NULL;
     }
   }

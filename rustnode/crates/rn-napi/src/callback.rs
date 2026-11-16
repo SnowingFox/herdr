@@ -59,7 +59,7 @@ pub(crate) struct CallbackFrame<'s> {
 ///
 /// This is installed only through [`build_function`], which puts the matching
 /// [`CallbackData`] in the template's data slot.
-unsafe extern "C" fn invoke_addon_callback(info: *const v8::FunctionCallbackInfo) {
+pub(crate) unsafe extern "C" fn invoke_addon_callback(info: *const v8::FunctionCallbackInfo) {
     // SAFETY: V8 passes a valid callback-info pointer to every function callback,
     // and this function is only ever installed as one.
     let info = unsafe { &*info };

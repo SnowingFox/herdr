@@ -39,6 +39,7 @@ pub mod async_work;
 pub mod buffer;
 pub mod callback;
 pub mod env;
+pub mod handle_scope;
 pub mod load;
 pub mod scope;
 pub mod shims;
@@ -61,7 +62,7 @@ compile_error!(
 pub use abi::{NapiEnv, NapiStatus, NapiValue};
 pub use env::Env;
 pub use load::{LoadError, LoadResult, LoadedAddon};
-pub use shims::{DEFERRED, EXPORTED};
+pub use shims::{DEFERRED, EXPORTED, PARTIAL_GAPS};
 
 /// `napi_register_module_v1`'s symbol name.
 pub const REGISTER_MODULE_SYMBOL: &str = abi::REGISTER_MODULE_SYMBOL;

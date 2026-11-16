@@ -25,8 +25,8 @@ use std::os::raw::c_char;
 use rn_v8_sys::v8;
 
 use crate::abi::{
-    NapiCleanupHook, NapiEnv, NapiExtendedErrorInfo, NapiFinalize, NapiNodeVersion, NapiRef,
-    NapiStatus, NODE_MAJOR_VERSION, NODE_MINOR_VERSION, NODE_PATCH_VERSION,
+    NapiCleanupHook, NapiDeferred, NapiEnv, NapiExtendedErrorInfo, NapiFinalize, NapiNodeVersion,
+    NapiRef, NapiStatus, NODE_MAJOR_VERSION, NODE_MINOR_VERSION, NODE_PATCH_VERSION,
 };
 
 /// The released-module information `napi_get_node_version` reports.
@@ -81,6 +81,56 @@ impl ErrorSlot {
             }),
         }
     }
+}
+
+/// One `napi_add_async_cleanup_hook` registration.
+pub(crate) struct AsyncCleanupHook {
+    hook: crate::abi::NapiAsyncCleanupHook,
+    arg: *mut std::ffi::c_void,
+}
+
+/// Removes and frees an async cleanup hook handle.
+///
+/// Freeing is the removal: the handle owns the registration, as Node's does.
+/// Returns `false` for a handle this runtime did not produce.
+pub(crate) unsafe fn remove_async_cleanup_hook(
+    handle: *mut crate::abi::NapiAsyncCleanupHookHandle,
+) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: the caller passes a handle from `Env::add_async_cleanup_hook`, which
+    // allocated it with `Box::into_raw` and frees it exactly once here.
+    drop(unsafe { Box::from_raw(handle.cast::<AsyncCleanupHook>()) });
+    true
+}
+
+/// Reports `error` through Node's uncaught-exception path.
+///
+/// # Safety
+///
+/// `error` must be a live `napi_value` from the scope the caller has established,
+/// which is the Node-API contract for every shim argument.
+pub(crate) unsafe fn trigger_fatal_exception(env: *mut NapiEnv, error: *mut crate::abi::NapiValue) {
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return;
+    };
+    let owner = environment.owner_thread();
+    let env_address = env as usize;
+    let error_address = error as usize;
+    // A fatal exception may be reported from a thread that does not own the
+    // isolate (a thread-safe function's producer, for instance), so it is deferred
+    // to the owner exactly as the other cross-thread paths are.
+    let _ = rn_core::finalizer::enqueue_for(Some(owner), move || {
+        crate::scope::with_owner_context(env_address as *mut NapiEnv, |scope| {
+            // SAFETY: the value is a handle from the scope that reported it, and
+            // the enqueue happened while that scope was alive.
+            let Some(value) = (unsafe { crate::values::from_napi(error_address as *mut _) }) else {
+                return;
+            };
+            rn_errors::report_uncaught_exception(scope, value);
+        });
+    });
 }
 
 /// One entry in the reference table.
@@ -160,6 +210,22 @@ pub struct Env {
     /// Handles created by `napi_create_reference`, indexed by `napi_ref`.
     #[allow(dead_code)]
     refs: RefCell<Vec<Option<RefEntry>>>,
+    /// Resolvers created by `napi_create_promise`, indexed by `napi_deferred`.
+    ///
+    /// A separate table rather than the reference table because a
+    /// `v8::Global<v8::PromiseResolver>` cannot be recovered from a
+    /// `v8::Global<v8::Value>`: the `v8` crate allows the upcast but not the
+    /// downcast, and a resolver is a `Data` rather than a `Value`. Keeping the
+    /// typed global means settling a deferred needs no unchecked cast.
+    deferreds: RefCell<Vec<Option<v8::Global<v8::PromiseResolver>>>>,
+    /// The `napi_open_handle_scope` scopes this environment has open.
+    ///
+    /// On the environment rather than in a thread-local so a worker's scope can
+    /// never be closed by the main realm, and so a teardown has one place to look
+    /// for a scope an addon forgot to close.
+    scopes: crate::handle_scope::ScopeStack,
+    /// Handles from `napi_add_async_cleanup_hook`, so a teardown can run them.
+    async_cleanup_hooks: RefCell<Vec<*mut crate::abi::NapiAsyncCleanupHookHandle>>,
     exceptions: RefCell<ExceptionState>,
     /// `napi_add_env_cleanup_hook` entries, in registration order.
     ///
@@ -187,6 +253,9 @@ impl Env {
             last_error: RefCell::new(ErrorSlot::new()),
             instance_data: Cell::new(None),
             refs: RefCell::new(Vec::new()),
+            deferreds: RefCell::new(Vec::new()),
+            scopes: crate::handle_scope::ScopeStack::default(),
+            async_cleanup_hooks: RefCell::new(Vec::new()),
             exceptions: RefCell::new(ExceptionState::default()),
             cleanup_hooks: RefCell::new(Vec::new()),
             owner_thread: std::thread::current().id(),
@@ -267,6 +336,35 @@ impl Env {
             if let Some(fun) = fun {
                 // SAFETY: the addon's own hook, with the argument it registered.
                 unsafe { fun(arg) };
+            }
+        }
+    }
+
+    /// Runs every async cleanup hook registered with
+    /// `napi_add_async_cleanup_hook`.
+    ///
+    /// Node runs these at environment teardown, before the plain cleanup hooks,
+    /// and a hook may either finish synchronously or keep its handle alive and
+    /// call back later. This runtime has no teardown path yet (see
+    /// [`Self::run_cleanup_hooks`]), so nothing calls this; it exists so the
+    /// registration's payload is read rather than stored and forgotten.
+    #[allow(dead_code)]
+    pub(crate) fn run_async_cleanup_hooks(&self) {
+        let handles = match self.async_cleanup_hooks.try_borrow_mut() {
+            Ok(mut hooks) => std::mem::take(&mut *hooks),
+            Err(_) => return,
+        };
+        for handle in handles {
+            if handle.is_null() {
+                continue;
+            }
+            // SAFETY: the handle came from `add_async_cleanup_hook`, which
+            // allocated it with `Box::into_raw`, and it is freed exactly once.
+            let entry = unsafe { Box::from_raw(handle.cast::<AsyncCleanupHook>()) };
+            if let Some(hook) = entry.hook {
+                // SAFETY: the addon's own callback with the argument it supplied,
+                // and the handle it may retain to finish asynchronously.
+                unsafe { hook(entry.arg, handle) };
             }
         }
     }
@@ -384,8 +482,60 @@ impl Env {
         true
     }
 
+    /// The environment's open Node-API handle scopes.
+    pub(crate) fn scopes(&self) -> &crate::handle_scope::ScopeStack {
+        &self.scopes
+    }
+
+    /// Registers an async cleanup hook and returns its handle.
+    ///
+    /// The handle *is* the registration: Node's `napi_async_cleanup_hook_handle__`
+    /// owns a node cleanup-hook registration and unlinks it in its destructor, and
+    /// `napi_remove_async_cleanup_hook` takes no environment so the handle has to
+    /// carry everything removal needs. The same holds here.
+    pub(crate) fn add_async_cleanup_hook(
+        &self,
+        hook: crate::abi::NapiAsyncCleanupHook,
+        arg: *mut std::ffi::c_void,
+    ) -> *mut crate::abi::NapiAsyncCleanupHookHandle {
+        let entry = Box::new(AsyncCleanupHook { hook, arg });
+        let handle = Box::into_raw(entry).cast::<crate::abi::NapiAsyncCleanupHookHandle>();
+        if let Ok(mut hooks) = self.async_cleanup_hooks.try_borrow_mut() {
+            hooks.push(handle);
+        }
+        handle
+    }
+
     pub(crate) fn exceptions(&self) -> &RefCell<ExceptionState> {
         &self.exceptions
+    }
+
+    /// Adds a promise resolver and returns its opaque `napi_deferred` handle.
+    ///
+    /// One-based like `add_ref`, so a valid handle is never null — every Node-API
+    /// out parameter treats null as "absent".
+    pub(crate) fn add_deferred(
+        &self,
+        resolver: v8::Global<v8::PromiseResolver>,
+    ) -> *mut NapiDeferred {
+        let mut deferreds = self.deferreds.borrow_mut();
+        deferreds.push(Some(resolver));
+        deferreds.len() as *mut NapiDeferred
+    }
+
+    /// Takes a deferred's resolver out of the table, so settling it twice cannot
+    /// succeed twice.
+    ///
+    /// Node's `ConcludeDeferred` deletes the persistent on every path, which
+    /// makes a second settle unreachable; this is the same outcome expressed as a
+    /// take.
+    pub(crate) fn take_deferred(
+        &self,
+        deferred: *mut NapiDeferred,
+    ) -> Option<v8::Global<v8::PromiseResolver>> {
+        let index = (deferred as usize).checked_sub(1)?;
+        let mut deferreds = self.deferreds.try_borrow_mut().ok()?;
+        deferreds.get_mut(index).and_then(Option::take)
     }
 
     /// Drops any recorded pending exception.
