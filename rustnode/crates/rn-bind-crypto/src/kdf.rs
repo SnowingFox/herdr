@@ -35,6 +35,9 @@ const STATE_FIELD: i32 = 0;
 /// `kCryptoJobSync` from `node_crypto.h`.
 const K_CRYPTO_JOB_SYNC: i32 = 1;
 
+/// `kCryptoJobWebCrypto` from `node_crypto.h`.
+const K_CRYPTO_JOB_WEB_CRYPTO: i32 = 2;
+
 /// What a derivation job was asked to compute.
 enum KdfState {
     Pbkdf2 {
@@ -156,6 +159,70 @@ fn bytes_argument(
     Some(unsafe { std::slice::from_raw_parts(data, length) }.to_vec())
 }
 
+/// Reads key material, which is either a buffer source or a `KeyObjectHandle`.
+///
+/// `HKDFTraits::AdditionalConfig` and `PBKDF2Traits::AdditionalConfig` both
+/// branch on `KeyObjectHandle::HasInstance(env, args[offset])` and read
+/// `key->Data()` in that case. The WebCrypto paths
+/// (`hkdfDeriveBits`, `pbkdf2DeriveBits`) pass `getCryptoKeyHandle(baseKey)`
+/// there, so a bytes-only reader rejects every `subtle.deriveBits` before the
+/// derivation runs. For a secret key the handle's exported bytes *are* the key,
+/// which is what `importSecretKey` put there.
+fn key_material(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<Vec<u8>> {
+    if let Ok(handle) = v8::Local::<v8::Object>::try_from(value) {
+        let has_type = handle
+            .get(scope, v8::String::new(scope, "getKeyType")?.into())
+            .is_some_and(|method| method.is_function());
+        if has_type {
+            let export = handle.get(scope, v8::String::new(scope, "export")?.into())?;
+            let export = v8::Local::<v8::Function>::try_from(export).ok()?;
+            let exported = export.call(scope, handle.into(), &[])?;
+            return exported_as_bytes(exported);
+        }
+    }
+    let args_bytes = if value.is_string() {
+        let text = value.to_string(scope)?;
+        Some(text.to_rust_string_lossy(scope).into_bytes())
+    } else if value.is_null() || value.is_undefined() {
+        Some(Vec::new())
+    } else {
+        None
+    };
+    if let Some(bytes) = args_bytes {
+        return Some(bytes);
+    }
+    exported_as_bytes(value)
+}
+
+/// Copies a buffer source's bytes.
+fn exported_as_bytes(value: v8::Local<'_, v8::Value>) -> Option<Vec<u8>> {
+    if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
+        let length = view.byte_length();
+        let data = view.data().cast::<u8>();
+        if data.is_null() {
+            return if length == 0 { Some(Vec::new()) } else { None };
+        }
+        // SAFETY: as in `bytes_argument`.
+        return Some(unsafe { std::slice::from_raw_parts(data, length) }.to_vec());
+    }
+    let buffer = v8::Local::<v8::ArrayBuffer>::try_from(value).ok()?;
+    let length = buffer.byte_length();
+    let store = buffer.get_backing_store();
+    let mut bytes = vec![0u8; length];
+    if length > 0 {
+        let data = store.data()?;
+        // SAFETY: `data` points at `length` bytes owned by `store`, which is
+        // alive for this call.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), bytes.as_mut_ptr(), length);
+        }
+    }
+    Some(bytes)
+}
+
 /// `new PBKDF2Job(mode, password, salt, iterations, keylen, digest)`.
 pub(crate) fn pbkdf2_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -166,8 +233,7 @@ pub(crate) fn pbkdf2_constructor<'s>(
         crate::install::throw_construct_call_required(scope);
         return;
     }
-    let Some(password) = bytes_argument(scope, &args, 1) else {
-        throw_type_error(scope, "The password must be a string or an ArrayBufferView");
+    let Some(password) = key_material(scope, args.get(1)) else {
         return;
     };
     let Some(salt) = bytes_argument(scope, &args, 2) else {
@@ -265,8 +331,12 @@ pub(crate) fn hkdf_constructor<'s>(
         .to_string(scope)
         .map(|text| text.to_rust_string_lossy(scope))
         .unwrap_or_default();
-    let Some(key) = bytes_argument(scope, &args, 2) else {
-        throw_type_error(scope, "The key must be a string or an ArrayBufferView");
+    // `HKDFTraits::AdditionalConfig` accepts a `KeyObjectHandle` *or* a buffer
+    // source in this slot: the traditional `crypto.hkdf` passes the key bytes and
+    // `subtle.deriveBits` passes `getCryptoKeyHandle(baseKey)`. Reading only
+    // bytes made every WebCrypto HKDF derivation reject with "The key must be a
+    // string or an ArrayBufferView" before it reached OpenSSL.
+    let Some(key) = key_material(scope, args.get(2)) else {
         return;
     };
     // An absent salt is meaningful (RFC 5869 substitutes a zero string), so
@@ -345,6 +415,34 @@ pub(crate) fn run(
 
     if mode == K_CRYPTO_JOB_SYNC {
         rv.set(sync_result(scope, result));
+        return;
+    }
+
+    // `kCryptoJobWebCrypto`: `CryptoJob::Run` creates a resolver, returns its
+    // promise and queues the work. `jobPromise` then awaits the promise, so this
+    // must not go through `ondone` — the WebCrypto callers never set one, and
+    // `hkdfDeriveBits`/`pbkdf2DeriveBits` return `jobPromise(...)` straight to
+    // the caller.
+    if mode == K_CRYPTO_JOB_WEB_CRYPTO {
+        let promise = match result {
+            Ok(bytes) => {
+                let built = crate::encoding::array_buffer(scope, &bytes);
+                match built {
+                    Some(buffer) => resolved(scope, buffer.into()),
+                    None => {
+                        throw(scope, "cannot allocate the derivation result");
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                let value = crypto_error_value(scope, &error);
+                rejected(scope, value)
+            }
+        };
+        if let Some(promise) = promise {
+            rv.set(promise.into());
+        }
         return;
     }
 
@@ -462,6 +560,26 @@ pub(crate) fn install_job_class<'s>(
     // name Node passes in rather than left to the bare builder.
     rn_core::set_class(scope, target, name, template)?;
     Ok(())
+}
+
+/// Builds a promise already resolved with `value`.
+fn resolved<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let resolver = v8::PromiseResolver::new(scope)?;
+    resolver.resolve(scope, value);
+    Some(resolver.get_promise(scope))
+}
+
+/// Builds a promise already rejected with `value`.
+fn rejected<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let resolver = v8::PromiseResolver::new(scope)?;
+    resolver.reject(scope, value);
+    Some(resolver.get_promise(scope))
 }
 
 fn throw(scope: &mut v8::PinScope<'_, '_>, message: &str) {

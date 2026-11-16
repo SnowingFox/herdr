@@ -15,6 +15,13 @@ rn-v8-sys.workspace = true
 # question — PEM versus DER, PKCS#1 versus SPKI, what a failed parse means — is
 # answered there so this crate only has to describe the JavaScript-facing class.
 rn-crypto-openssl = { path = "../rn-crypto-openssl" }
+# The shared `CryptoJob` machinery: the three modes, threadpool dispatch and the
+# three completion shapes. This crate used to carry its own copy (`gen.rs`),
+# which treated `kCryptoJobWebCrypto` as another inline tuple mode — so every
+# WebCrypto key generation returned `[null, KeyObjectHandle]` where Node's
+# binding returns a `CryptoKey` or a `CryptoKeyPair` through a promise. The
+# duplicate is gone; `rn-bind-crypto` already uses this crate for its own jobs.
+rn-crypto-job = { path = "../rn-crypto-job" }
 openssl = { version = "=0.10.82", features = ["vendored"] }
 openssl-sys = { version = "=0.9.118", features = ["vendored"] }
 foreign-types = "0.3"

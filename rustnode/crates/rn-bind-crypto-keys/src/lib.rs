@@ -45,8 +45,8 @@
 
 mod args;
 mod cryptokey;
+mod dhbits;
 mod errors;
-mod gen;
 mod handle;
 mod install;
 mod jobs;

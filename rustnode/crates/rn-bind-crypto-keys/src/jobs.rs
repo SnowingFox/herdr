@@ -28,12 +28,12 @@
 //! the wrong shape.
 
 use openssl::pkey::PKey as OpenSslPKey;
+use rn_crypto_job::{dispatch, Completion, CryptoJobError, JobMode, Runnable};
 use rn_crypto_openssl::{KeyAlgorithm, PKey, PrivateKeyEncoding, PublicKeyEncoding};
 use rn_v8_sys::v8;
 
 use crate::args::{read_format_and_type, read_private_key_tail, EncodingContext, Values};
 use crate::errors::{throw, KeyError};
-use crate::gen::{self, JobMode, Runnable};
 use crate::handle::values_of;
 use crate::install::create_handle;
 use crate::state::{KeyData, KeyType};
@@ -115,30 +115,133 @@ struct KeyPairSpec {
     ec_param_encoding: i32,
     public_encoding: PublicKeyEncoding,
     private_encoding: PrivateKeyEncoding,
+    /// How the result is presented, which is what the mode decides.
+    output: KeyGenOutput,
+}
+
+/// What a key-generation job produces.
+///
+/// `kCryptoJobWebCrypto` is not "the sync mode with a different wrapper": Node
+/// reads four extra constructor arguments (the algorithm dictionary, the two
+/// usage masks and the extractable flag), skips the encoded-key tail entirely,
+/// queues the work like `kCryptoJobAsync`, and settles a promise with a
+/// `CryptoKey` — or, for a pair, an ordinary object with `publicKey` and
+/// `privateKey`. Treating it as a third inline tuple mode is what made
+/// `subtle.generateKey` return `[null, KeyObjectHandle]`.
+enum KeyGenOutput {
+    /// `[encodedPublic, encodedPrivate]`, or `[KeyObjectHandle, KeyObjectHandle]`
+    /// when no encoding was requested. This is the traditional pair form.
+    EncodedPair,
+    /// A single `KeyObjectHandle` over generated secret bytes.
+    SecretHandle,
+    /// A `CryptoKey`, built through `keys.js`'s `InternalCryptoKey`.
+    CryptoKey {
+        algorithm: v8::Global<v8::Value>,
+        usages_mask: u32,
+        extractable: bool,
+    },
+    /// A `{publicKey, privateKey}` pair of `CryptoKey`s.
+    CryptoKeyPair {
+        algorithm: v8::Global<v8::Value>,
+        public_usages_mask: u32,
+        private_usages_mask: u32,
+        extractable: bool,
+    },
 }
 
 impl Runnable for KeyPairSpec {
     type Output = KeyData;
 
-    fn run(&mut self) -> Result<Self::Output, KeyError> {
-        let key = generate_key_pair(self)?;
-        // A generated key is always private; `ToEncodedPublicKey` derives the
-        // public half from it when the caller asked for one.
-        KeyData::asymmetric(KeyType::Private, key).ok_or(KeyError::InvalidKeyType)
+    fn run(&mut self) -> Result<Self::Output, CryptoJobError> {
+        let key = generate_key_pair(self).map_err(|error| crate::errors::job_error(&error))?;
+        // A generated key is always private; Node's `KeyPairGenTraits::DoKeyGen`
+        // stores exactly that (`CreateAsymmetric(kKeyTypePrivate, ...)`), and
+        // `EncodeWebCryptoKey` calls `addRefWithType(kKeyTypePublic)` on it for
+        // the public half.
+        KeyData::asymmetric(KeyType::Private, key)
+            .ok_or_else(|| crate::errors::job_error(&KeyError::InvalidKeyType))
     }
 
-    fn encode<'s>(
+    fn finish<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
         output: Self::Output,
     ) -> Option<v8::Local<'s, v8::Value>> {
-        // `KeyPairGenTraits::EncodeKey`: `[public, private]`, each either a
-        // `KeyObjectHandle` or an encoded value.
         let key = output.asymmetric_key()?;
-        let public = encode_public(scope, key, &self.public_encoding, KeyType::Public)?;
-        let private = encode_private(scope, key, &self.private_encoding, KeyType::Private)?;
-        Some(v8::Array::new_with_elements(scope, &[public, private]).into())
+        match &self.output {
+            // `KeyPairGenTraits::EncodeKey`: `[public, private]`, each either a
+            // `KeyObjectHandle` or an encoded value.
+            KeyGenOutput::EncodedPair => {
+                let public = encode_public(scope, key, &self.public_encoding, KeyType::Public)?;
+                let private = encode_private(scope, key, &self.private_encoding, KeyType::Private)?;
+                Some(v8::Array::new_with_elements(scope, &[public, private]).into())
+            }
+            // `KeyGenJob::EncodeWebCryptoKey` for `kWebCryptoKeyPair`: two
+            // `CryptoKey`s in a plain object with own `publicKey` /
+            // `privateKey` data properties, both taken through
+            // `addRefWithType`. The public half is always extractable and the
+            // private half takes the caller's flag.
+            KeyGenOutput::CryptoKeyPair {
+                algorithm,
+                public_usages_mask,
+                private_usages_mask,
+                extractable,
+            } => {
+                let algorithm = v8::Local::new(scope, algorithm);
+                let public = crypto_key(
+                    scope,
+                    key,
+                    KeyType::Public,
+                    algorithm,
+                    *public_usages_mask,
+                    true,
+                )?;
+                let private = crypto_key(
+                    scope,
+                    key,
+                    KeyType::Private,
+                    algorithm,
+                    *private_usages_mask,
+                    *extractable,
+                )?;
+                let object = v8::Object::new(scope);
+                for (name, value) in [("publicKey", public), ("privateKey", private)] {
+                    let field = v8::String::new(scope, name)?;
+                    object.set(scope, field.into(), value)?;
+                }
+                Some(object.into())
+            }
+            // A single key has no pair to encode; the caller is a secret-key job.
+            KeyGenOutput::SecretHandle | KeyGenOutput::CryptoKey { .. } => None,
+        }
     }
+}
+
+/// Builds one `CryptoKey` over `key` presented as `key_type`.
+///
+/// `NativeCryptoKey::Create` is a handle plus `keys.js`'s `InternalCryptoKey`,
+/// so this wraps the key in a fresh `KeyObjectHandle` first — the handle owns the
+/// `EVP_PKEY` and the `CryptoKey` reads key material back through it, which is
+/// why nothing is copied onto the key object itself.
+fn crypto_key<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    key: &PKey,
+    key_type: KeyType,
+    algorithm: v8::Local<'s, v8::Value>,
+    usages_mask: u32,
+    extractable: bool,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let data = KeyData::asymmetric(key_type, key.clone())?;
+    let handle = create_handle(scope, data)?;
+    crate::cryptokey::create_crypto_key(
+        scope,
+        handle,
+        algorithm,
+        usages_mask,
+        extractable,
+        None,
+        None,
+    )
 }
 
 /// Encodes one half of a generated pair.
@@ -495,16 +598,18 @@ struct SecretSpec {
     /// `ceil(bits / 8)` for WebCrypto.
     length: usize,
     truncate_to_bit_length: bool,
+    output: KeyGenOutput,
 }
 
 impl Runnable for SecretSpec {
     type Output = KeyData;
 
-    fn run(&mut self) -> Result<Self::Output, KeyError> {
+    fn run(&mut self) -> Result<Self::Output, CryptoJobError> {
         let mut bytes = vec![0u8; self.length];
         // `ncrypto::CSPRNG`, which is `RAND_bytes`.
-        openssl::rand::rand_bytes(&mut bytes)
-            .map_err(|_| KeyError::OperationFailed("Failed to generate key"))?;
+        openssl::rand::rand_bytes(&mut bytes).map_err(|_| {
+            crate::errors::job_error(&KeyError::OperationFailed("Failed to generate key"))
+        })?;
         if self.truncate_to_bit_length {
             // A bit length that is not a multiple of 8 has to be masked in the
             // high byte, or the key would be longer than asked for.
@@ -513,14 +618,38 @@ impl Runnable for SecretSpec {
         Ok(KeyData::secret(bytes))
     }
 
-    fn encode<'s>(
+    fn finish<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
         output: Self::Output,
     ) -> Option<v8::Local<'s, v8::Value>> {
-        // `SecretKeyGenTraits::EncodeKey` returns a `KeyObjectHandle`, which
-        // `keygen.js` wraps in a `SecretKeyObject`.
-        create_handle(scope, output).map(v8::Local::into)
+        match &self.output {
+            // `SecretKeyGenTraits::EncodeKey` returns a `KeyObjectHandle`, which
+            // `keygen.js` wraps in a `SecretKeyObject`.
+            KeyGenOutput::SecretHandle | KeyGenOutput::EncodedPair => {
+                create_handle(scope, output).map(v8::Local::into)
+            }
+            // `KeyGenJob::EncodeWebCryptoKey`'s non-pair branch: the same
+            // `KeyObjectData::CreateSecret`, but wrapped through
+            // `NativeCryptoKey::Create` so the caller receives a `CryptoKey`.
+            KeyGenOutput::CryptoKey {
+                algorithm,
+                usages_mask,
+                extractable,
+            } => {
+                let handle = create_handle(scope, output)?;
+                crate::cryptokey::create_crypto_key(
+                    scope,
+                    handle,
+                    v8::Local::new(scope, algorithm),
+                    *usages_mask,
+                    *extractable,
+                    None,
+                    None,
+                )
+            }
+            KeyGenOutput::CryptoKeyPair { .. } => None,
+        }
     }
 }
 
@@ -563,13 +692,67 @@ fn secret_constructor<'s>(
     } else {
         ((bits / 8) as usize, false)
     };
+    // `KeyGenJob::New`'s non-pair WebCrypto branch reads three more slots:
+    // `CHECK(args[offset]->IsObject())`, `CHECK(args[offset + 1]->IsUint32())`
+    // and `CHECK(args[offset + 2]->IsBoolean())`, i.e. the algorithm dictionary,
+    // the usages mask and `extractable`.
+    let output = match read_webcrypto_key_config(scope, &args, 2, mode, false) {
+        Ok(Some(config)) => config,
+        Ok(None) => KeyGenOutput::SecretHandle,
+        Err(()) => return,
+    };
     let spec = SecretSpec {
         length_bits: bits,
         length,
         truncate_to_bit_length: truncate,
+        output,
     };
     install_job(scope, this, mode, spec);
     rv.set(this.into());
+}
+
+/// Reads the WebCrypto tail `KeyGenJob::New` expects after the algorithm's own
+/// parameters.
+///
+/// The pair form is `{algorithm, publicUsages, privateUsages, extractable}` and
+/// the secret form is `{algorithm, usages, extractable}`; the caller says which
+/// by `pair`. Returns `Ok(None)` when the job is not in WebCrypto mode, which is
+/// the traditional path where the same slots are encodings instead.
+fn read_webcrypto_key_config(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    offset: usize,
+    mode: JobMode,
+    pair: bool,
+) -> Result<Option<KeyGenOutput>, ()> {
+    if mode != JobMode::WebCrypto {
+        return Ok(None);
+    }
+    let offset = offset as i32;
+    let algorithm = args.get(offset);
+    let Ok(algorithm) = v8::Local::<v8::Object>::try_from(algorithm) else {
+        throw(scope, &KeyError::InvalidKeyType);
+        return Err(());
+    };
+    let first = args.get(offset + 1).uint32_value(scope).unwrap_or(0);
+    let second = args.get(offset + 2);
+    if pair {
+        let private = second.uint32_value(scope).unwrap_or(0);
+        let extractable = args.get(offset + 3).is_true();
+        Ok(Some(KeyGenOutput::CryptoKeyPair {
+            algorithm: v8::Global::new(scope.as_ref(), v8::Local::<v8::Value>::from(algorithm)),
+            public_usages_mask: first,
+            private_usages_mask: private,
+            extractable,
+        }))
+    } else {
+        let extractable = second.is_true();
+        Ok(Some(KeyGenOutput::CryptoKey {
+            algorithm: v8::Global::new(scope.as_ref(), v8::Local::<v8::Value>::from(algorithm)),
+            usages_mask: first,
+            extractable,
+        }))
+    }
 }
 
 /// `new RsaKeyPairGenJob(mode, variant, modulusBits, exponent[, hash, mgf1, salt], …encoding)`.
@@ -619,6 +802,15 @@ fn rsa_constructor<'s>(
     } else {
         rn_crypto_openssl::RSA
     };
+    // The WebCrypto form stops after the variant's own parameters: no encoding
+    // pair is read, and the next four slots are the algorithm dictionary, the two
+    // usage masks and `extractable` (`KeyGenJob::New`'s `kWebCryptoKeyPair`
+    // branch).
+    let output = match read_webcrypto_key_config(scope, &args, offset, mode, true) {
+        Ok(Some(config)) => config,
+        Ok(None) => KeyGenOutput::EncodedPair,
+        Err(()) => return,
+    };
     let Some((public_encoding, private_encoding)) =
         read_encodings(scope, &values, &mut offset, mode, algorithm)
     else {
@@ -636,6 +828,7 @@ fn rsa_constructor<'s>(
         ec_param_encoding: crate::constants::OPENSSL_EC_NAMED_CURVE,
         public_encoding,
         private_encoding,
+        output,
     };
     install_job(scope, this, mode, spec);
     rv.set(this.into());
@@ -659,12 +852,30 @@ fn ec_constructor<'s>(
         .get(1)
         .to_string(scope)
         .map(|text| text.to_rust_string_lossy(scope));
-    let ec_param_encoding = args
-        .get(2)
-        .int32_value(scope)
-        .unwrap_or(crate::constants::OPENSSL_EC_NAMED_CURVE);
+    // `args[*offset + 1]->IsNullOrUndefined()` means "named curve"; only an
+    // explicit integer selects a form, because `int32_value` coerces `undefined`
+    // to `Some(0)` and 0 is `OPENSSL_EC_EXPLICIT_CURVE`. Reading it blindly
+    // turned every WebCrypto EC key — which passes `undefined` here — into an
+    // explicit-parameter key, whose PKCS#8 export is 381 bytes where the oracle's
+    // is 138.
+    let param_encoding_value = args.get(2);
+    let ec_param_encoding = if param_encoding_value.is_null_or_undefined() {
+        crate::constants::OPENSSL_EC_NAMED_CURVE
+    } else {
+        param_encoding_value
+            .int32_value(scope)
+            .unwrap_or(crate::constants::OPENSSL_EC_NAMED_CURVE)
+    };
     let mut offset = 3;
     let values = values_of(scope, &args);
+    // `new EcKeyPairGenJob(kCryptoJobWebCrypto, namedCurve, undefined,
+    // {name, namedCurve}, publicUsages, privateUsages, extractable)`: the
+    // algorithm dictionary sits where the public encoding's format goes.
+    let output = match read_webcrypto_key_config(scope, &args, offset, mode, true) {
+        Ok(Some(config)) => config,
+        Ok(None) => KeyGenOutput::EncodedPair,
+        Err(()) => return,
+    };
     let Some((public_encoding, private_encoding)) =
         read_encodings(scope, &values, &mut offset, mode, rn_crypto_openssl::EC)
     else {
@@ -682,6 +893,7 @@ fn ec_constructor<'s>(
         ec_param_encoding,
         public_encoding,
         private_encoding,
+        output,
     };
     install_job(scope, this, mode, spec);
     rv.set(this.into());
@@ -709,21 +921,36 @@ fn named_constructor<'s>(
         throw(scope, &KeyError::InvalidKeyType);
         return;
     };
-    // `NamedKeyPairGenTraits::AdditionalConfig`: the name must be a canonical key
-    // type spelling and available in this build.
-    // An unknown or unavailable type is `ERR_INVALID_ARG_VALUE` naming the value,
-    // which is what `test-crypto-keygen.js` expects for `'rsa2'`. Traditional key
-    // generation accepts the lowercase type spelling only; WebCrypto passes
-    // normalised names and checks availability during normalisation instead.
-    let Some(algorithm) = KeyAlgorithm::from_name(&type_name)
-        .filter(|algorithm| algorithm.key_type_name() == Some(type_name.as_str()))
-        .filter(|algorithm| algorithm.is_available())
-    else {
+    // `NamedKeyPairGenTraits::AdditionalConfig`:
+    //
+    //     if (algorithm == nullptr || (!algorithm->isOkp() && !algorithm->isPqc()) ||
+    //         (mode != kCryptoJobWebCrypto &&
+    //          (std::string_view(*name, name.length()) != algorithm->keyTypeName() ||
+    //           !algorithm->isAvailable()))) { THROW_ERR_INVALID_ARG_VALUE(...) }
+    //
+    // So this class names only Okp/Pqc algorithms, and the strict spelling and
+    // availability checks apply to the traditional path alone. WebCrypto passes
+    // normalised names (`'Ed25519'`, `'ML-DSA-44'`) that are neither the lowercase
+    // `asymmetricKeyType` spelling nor case-insensitively equal to it, so applying
+    // the traditional filter made every `subtle.generateKey('Ed25519', ...)` throw
+    // `ERR_INVALID_ARG_VALUE` naming an algorithm the caller had just been given.
+    let algorithm = KeyAlgorithm::from_name(&type_name)
+        .filter(|algorithm| algorithm.is_okp() || algorithm.is_pqc());
+    let algorithm = algorithm.filter(|algorithm| {
+        mode == JobMode::WebCrypto
+            || (algorithm.key_type_name() == Some(type_name.as_str()) && algorithm.is_available())
+    });
+    let Some(algorithm) = algorithm else {
         throw(scope, &KeyError::UnsupportedKeyType(type_name));
         return;
     };
     let mut offset = 2;
     let values = values_of(scope, &args);
+    let output = match read_webcrypto_key_config(scope, &args, offset, mode, true) {
+        Ok(Some(config)) => config,
+        Ok(None) => KeyGenOutput::EncodedPair,
+        Err(()) => return,
+    };
     let Some((public_encoding, private_encoding)) =
         read_encodings(scope, &values, &mut offset, mode, algorithm)
     else {
@@ -741,6 +968,7 @@ fn named_constructor<'s>(
         ec_param_encoding: crate::constants::OPENSSL_EC_NAMED_CURVE,
         public_encoding,
         private_encoding,
+        output,
     };
     install_job(scope, this, mode, spec);
     rv.set(this.into());
@@ -758,12 +986,13 @@ fn read_encodings(
     algorithm: KeyAlgorithm,
 ) -> Option<(PublicKeyEncoding, PrivateKeyEncoding)> {
     if mode == JobMode::WebCrypto {
-        // `KeyGenJob::New` reads the algorithm, usage masks and extractable flag
-        // for this form. Building a `CryptoKey` is the WebCrypto slice's work,
-        // and no acceptance test in this selection uses the WebCrypto keygen
-        // path, so it reports rather than producing the wrong object.
-        throw(scope, &KeyError::UnsupportedOperation);
-        return None;
+        // `KeyPairGenTraits::AdditionalConfig` returns early for this mode:
+        // "if (mode == kCryptoJobWebCrypto) return v8::JustVoid();" — no
+        // public/private encoding pair is read at all, because the job always
+        // produces `CryptoKey`s. The three constructors read the algorithm
+        // dictionary, the two usage masks and the extractable flag themselves,
+        // through `read_webcrypto_key_config`.
+        return Some((PublicKeyEncoding::default(), PrivateKeyEncoding::default()));
     }
 
     // A malformed encoding at generation time is `ERR_CRYPTO_INVALID_KEYTYPE`:
@@ -959,7 +1188,17 @@ fn run<'s, J: Runnable + 'static>(
     // SAFETY: reading the mode, which lives in the same box.
     let mode = *mode;
     let this: v8::Local<v8::Object> = args.this();
-    match gen::dispatch(scope, mode, job, this) {
+    // `Completion::Promise` for the WebCrypto mode: `CryptoJob::Run` creates a
+    // `Promise::Resolver`, returns its promise and queues the work, so
+    // `jobPromise` in `lib/internal/crypto/util.js` receives a promise to await
+    // rather than a `[err, value]` tuple. The other two modes keep their own
+    // shapes — `Callback` for `kCryptoJobAsync` (the `generateKeyPair`
+    // callback form) and the tuple for `kCryptoJobSync`.
+    let completion = match mode {
+        JobMode::WebCrypto => Completion::Promise,
+        JobMode::Async | JobMode::Sync => Completion::Callback,
+    };
+    match dispatch(scope, mode, job, this, completion) {
         Some(value) => rv.set(value),
         // An async job returns `undefined`; `generateKeyPair` ignores the return
         // value and waits for `ondone`.

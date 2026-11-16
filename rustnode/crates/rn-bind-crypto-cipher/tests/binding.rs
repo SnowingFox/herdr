@@ -463,26 +463,38 @@ fn cipher_binding_end_to_end() {
                   },
                 };
                 // `AESCipherJob(mode, cipherMode, key, data, variant, iv)`.
-                // `kCryptoJobSync` is 1 and `kWebCryptoCipherEncrypt` is 0, both
-                // from Node's enums. The cipher mode was 1 here while that table
-                // was shifted one past Node's, which turned this case into a
-                // decrypt of the wrong direction's input.
-                const job = new binding.AESCipherJob(1, 0, handle,
+                // `kCryptoJobWebCrypto` is 2 and `kWebCryptoCipherEncrypt` is 0,
+                // both from Node's enums; `lib/internal/crypto/aes.js` only ever
+                // builds this job in the WebCrypto mode, and that mode's `run()`
+                // returns a promise that `CipherJob::ToResult` settles with an
+                // `ArrayBuffer`. The cipher mode was 1 here while that table was
+                // shifted one past Node's, which turned this case into a decrypt
+                // of the wrong direction's input.
+                const job = new binding.AESCipherJob(2, 0, handle,
                   Buffer.from([0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
                                0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff]),
                   3, Buffer.alloc(16, 0));
                 globalThis.jobResult = 'unresolved';
-                job.run().then((value) => { globalThis.jobResult = hex(value); });
+                globalThis.jobKind = 'unrecorded';
+                job.run().then((value) => {
+                  // `out_.ToArrayBuffer`, so the result is an `ArrayBuffer` and
+                  // not a `Buffer`: `Array.from` on it would be empty, which is
+                  // why the bytes are taken through a `Uint8Array` view.
+                  globalThis.jobKind = Object.prototype.toString.call(value);
+                  globalThis.jobResult = hex(new Uint8Array(value));
+                });
                 return 'scheduled';
             })()"#,
-            // `run()` settles the promise inline for every mode; the `then`
-            // callback is a microtask, so the value is read in the settle phase,
-            // which is where the comparison happens.
+            // `run()` returns the promise immediately; the `then` callback is a
+            // microtask, so the value is read in the settle phase, which is where
+            // the comparison happens.
             expected: "scheduled",
             settle: Some(
-                "globalThis.jobResult === \
+                "globalThis.jobKind === '[object ArrayBuffer]' && \
+                 globalThis.jobResult === \
                  '69c4e0d86a7b0430d8cdb78070b4c55a9e978e6d16b086570ef794ef97984232' \
-                 ? 'cbc job matches subtle' : globalThis.jobResult",
+                 ? 'cbc job matches subtle' \
+                 : globalThis.jobKind + ' ' + globalThis.jobResult",
             ),
         },
     ];
