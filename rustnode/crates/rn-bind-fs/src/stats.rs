@@ -26,8 +26,11 @@ use crate::error::FsError;
 /// Number of f64/i64 slots in one stats record (`kFsStatsFieldsNumber`).
 pub const STATS_FIELDS: usize = 18;
 
-/// Slots one `fs.StatWatcher` needs, matching `kFsStatsBufferLength`. Watch
-/// mode is deferred, but the value is pinned so the layout cannot drift.
+/// Slots one `fs.StatWatcher` needs, matching `kFsStatsBufferLength`.
+///
+/// `FillGlobalStatsArray` writes the current stat at offset 0 and the previous
+/// one at [`STATS_FIELDS`] of one shared array, so a watch report is two records
+/// wide. `watch.rs` builds and `kFsStatsFieldsNumber` publishes the same number.
 pub const STATS_WATCH_FIELDS: usize = STATS_FIELDS * 2;
 
 /// Number of slots in one statfs record (`FsStatFsOffset`).
@@ -183,6 +186,41 @@ impl StatFields {
         }
         // SAFETY: the call succeeded, so the struct is initialised.
         Ok(Self::from_stat(unsafe { &fallback.assume_init() }))
+    }
+
+    /// Copies a `uv_stat_t` into the slot layout.
+    ///
+    /// This is `uv__statx_to_stat`'s field set, and it is what `fs.StatWatcher`
+    /// needs: `uv_fs_poll` hands the callback `uv_stat_t` values it produced
+    /// itself, so reading them is the only way to report the same numbers
+    /// `uv_fs_stat` would. The conversion is field-for-field with the `statx`
+    /// path below, including `st_birthtim` from `STATX_BTIME` — with one
+    /// difference libuv itself has: `st_flags` and `st_gen` are dropped, because
+    /// `fs.Stats` has no slot for either.
+    pub fn from_uv_stat(raw: &libuv_sys2::uv_stat_t) -> Self {
+        // `uv_stat_t`'s fields are already the widths `libc::statx` reports, so
+        // the casts only widen or narrow to the slot types.
+        #[allow(clippy::unnecessary_cast)]
+        Self {
+            dev: raw.st_dev,
+            mode: raw.st_mode,
+            nlink: raw.st_nlink,
+            uid: raw.st_uid,
+            gid: raw.st_gid,
+            rdev: raw.st_rdev,
+            blksize: raw.st_blksize,
+            ino: raw.st_ino,
+            size: raw.st_size,
+            blocks: raw.st_blocks,
+            atime_sec: raw.st_atim.tv_sec,
+            atime_nsec: raw.st_atim.tv_nsec as i64,
+            mtime_sec: raw.st_mtim.tv_sec,
+            mtime_nsec: raw.st_mtim.tv_nsec as i64,
+            ctime_sec: raw.st_ctim.tv_sec,
+            ctime_nsec: raw.st_ctim.tv_nsec as i64,
+            birthtime_sec: raw.st_birthtim.tv_sec,
+            birthtime_nsec: raw.st_birthtim.tv_nsec as i64,
+        }
     }
 
     /// Copies a `struct statx` into the slot layout.
@@ -389,6 +427,73 @@ mod tests {
             birthtime_sec: 17,
             birthtime_nsec: 18,
         }
+    }
+
+    #[test]
+    fn a_uv_stat_t_converts_to_the_same_slots_as_a_statx() {
+        // `uv_fs_poll` hands the watcher `uv_stat_t` values it produced itself,
+        // so `from_uv_stat` is the only path a watch report takes. The two
+        // conversions have to agree field for field or `fs.watchFile` reports
+        // different numbers from `fs.statSync` for the same file.
+        let dir = std::env::temp_dir().join(format!("rn-stat-uv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("data");
+        std::fs::write(&file, b"0123456789").expect("write");
+
+        let by_path =
+            StatFields::for_path(file.as_os_str().as_encoded_bytes(), Follow::Yes).expect("stat");
+
+        // Build the `uv_stat_t` libuv would report for the same file. libuv
+        // fills it from `statx` via `uv__statx_to_stat`, whose birth time comes
+        // from `STATX_BTIME`; `StatFields` takes that same route, so the two
+        // must be identical.
+        let mut raw = std::mem::MaybeUninit::<libuv_sys2::uv_stat_t>::zeroed();
+        let c_path = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).expect("path");
+        let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: `c_path` is NUL-terminated and `statx` is a zeroed writable
+        // struct of the right size.
+        let rc = unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                libc::AT_STATX_SYNC_AS_STAT,
+                libc::STATX_ALL,
+                statx.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "statx must succeed");
+        // SAFETY: the call succeeded, so the struct is initialised.
+        let statx = unsafe { statx.assume_init() };
+        // SAFETY: `raw` is a zeroed writable `uv_stat_t`.
+        let raw = unsafe {
+            let slot = raw.as_mut_ptr();
+            (*slot).st_dev = libc::makedev(statx.stx_dev_major, statx.stx_dev_minor);
+            (*slot).st_mode = statx.stx_mode as u64;
+            (*slot).st_nlink = statx.stx_nlink as u64;
+            (*slot).st_uid = statx.stx_uid as u64;
+            (*slot).st_gid = statx.stx_gid as u64;
+            (*slot).st_rdev = libc::makedev(statx.stx_rdev_major, statx.stx_rdev_minor);
+            (*slot).st_ino = statx.stx_ino;
+            (*slot).st_size = statx.stx_size;
+            (*slot).st_blksize = statx.stx_blksize as u64;
+            (*slot).st_blocks = statx.stx_blocks;
+            (*slot).st_atim.tv_sec = statx.stx_atime.tv_sec;
+            (*slot).st_atim.tv_nsec = statx.stx_atime.tv_nsec as i64;
+            (*slot).st_mtim.tv_sec = statx.stx_mtime.tv_sec;
+            (*slot).st_mtim.tv_nsec = statx.stx_mtime.tv_nsec as i64;
+            (*slot).st_ctim.tv_sec = statx.stx_ctime.tv_sec;
+            (*slot).st_ctim.tv_nsec = statx.stx_ctime.tv_nsec as i64;
+            (*slot).st_birthtim.tv_sec = statx.stx_btime.tv_sec;
+            (*slot).st_birthtim.tv_nsec = statx.stx_btime.tv_nsec as i64;
+            &*slot
+        };
+
+        let from_uv = StatFields::from_uv_stat(raw);
+        assert_eq!(from_uv, by_path, "the two conversions must agree");
+        assert_eq!(from_uv.size, 10);
+        assert_eq!(from_uv.to_f64_slots().len(), STATS_FIELDS);
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

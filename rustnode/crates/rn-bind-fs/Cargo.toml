@@ -22,3 +22,6 @@ rn-uv.workspace = true
 rn-errors.workspace = true
 libuv-sys2.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
