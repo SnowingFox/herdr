@@ -225,9 +225,21 @@ stubbed so a caller gets a clear missing-member failure instead of a wrong answe
 | --- | --- |
 | `cpSyncCheckPaths`, `cpSyncCopyDir`, `cpSyncOverrideFile`, `CpDirJob` | the `fs.cp` fast paths. `lib/internal/fs/cp/cp-sync.js` only reaches them when no `filter` is supplied; with a `filter` it walks with `opendir`/`stat`/`copyFile`. `opendir` itself needs the `fs_dir` namespace. |
 | `opendir`, and the whole `fs_dir` namespace | `internalBinding('fs_dir')` is a separate binding: it owns `DIR*` handles with async iteration. Out of scope for this crate by namespace, and `Dir` in `lib/internal/fs/dir.js` uses it exclusively. |
-| `internalModuleReadJSON`, `legacyMainResolve`, `getFormatOfExtensionlessFile` | read by `lib/internal/modules/helpers.js`. The latter two are helpers over the JSON reader, and `internalModuleReadJSON` has no call site left in this tree, so implementing it would be guesswork. All three belong to the module-loader crate. |
+| `internalModuleReadJSON` | read by `lib/internal/modules/helpers.js`, but it has no call site left in this tree, so implementing it would be guesswork. |
 | `scandir` as a public member | there is no such member in Node's namespace; `readdir` *is* the scandir binding. The syscall name `scandir` is still used in error messages, which is what Node reports. |
 | `FICLONE_FORCE` | `FICLONE` is attempted and honoured, but a forced reflink on a filesystem that supports neither reflink nor a fallback fails with `ENOTSUP` rather than degrading. Ordinary copies are correct. |
+
+`legacyMainResolve` and `getFormatOfExtensionlessFile` used to be on this list,
+with the reason "owned by the CJS loader" and "owned by the ESM loader". That
+reason was false in the way that matters. Neither loader owns either member:
+`lib/internal/modules/helpers.js:81-83` calls both straight off
+`internalFsBinding`, and the ESM resolver reaches `legacyMainResolve` through
+`legacyMainResolve(packageJSONUrl, ...)` in `lib/internal/modules/esm/resolve.js`
+for every package without an `exports` map. The deferral therefore cost
+`internalFsBinding.legacyMainResolve is not a function` on the first dependency
+`npm install` resolved, not a slower fallback. `legacy_main.rs` owns both now;
+see that module's docs for why the return value is an index into the suffix table
+rather than a path.
 
 `ReadFileJob` and `WriteFileJob` used to be on this list, with the reason "reads
 and writes go through read/readv until batching is measured as needed". That

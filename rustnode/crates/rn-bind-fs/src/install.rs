@@ -7,12 +7,18 @@
 //! the documented deferrals, plus `FSReqCallback`, `kUsePromises` and the three
 //! constructor functions (`StatWatcher`, `ReadFileJob`, `WriteFileJob`).
 //!
-//! The deferrals are `CpDirJob`, `FileHandle`, `openFileHandle` and
-//! `cpSyncCopyDir`/`cpSyncOverrideFile`'s shared blocker. The `fs.cp` fast
-//! paths only matter when no `filter` callback is supplied, and the
-//! `FileHandle`-shaped members need the handle type. `README.md` explains each
-//! one. A test in `tests/js_contract.rs` pins the set so it cannot drift
-//! silently.
+//! The deferrals are `CpDirJob`/`cpSyncCopyDir`/`cpSyncOverrideFile`, whose
+//! shared blocker is `fs.cp`'s native recursion, plus the stats-layout members
+//! that follow the BigInt stat surface. `README.md` explains each one. A test in
+//! `tests/js_contract.rs` pins the set so it cannot drift silently.
+//!
+//! `legacyMainResolve` and `getFormatOfExtensionlessFile` used to be deferred as
+//! "owned by the CJS loader" and "owned by the ESM loader". Neither loader owns
+//! them: `lib/internal/modules/helpers.js` calls both straight off
+//! `internalFsBinding`, and the ESM resolver reaches `legacyMainResolve` on an
+//! ordinary dependency resolution, so `npm install` died on the first package it
+//! resolved. A loader having a call site is not the same as a loader owning the
+//! binding. `legacy_main.rs` owns both now.
 //!
 //! `StatWatcher` used to be on that list, on the theory that `fs.watchFile`
 //! needed "the timer loop". It never did: `uv_fs_poll` is a polling handle with
@@ -152,8 +158,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     ("bigintStatValues", "bigint view of stat fields, follows the BigInt stat surface"),
     ("cpSyncCopyDir", "cp -r directory recursion, lands with cp -r"),
     ("cpSyncOverrideFile", "cp -r overwrite rule, lands with cp -r"),
-    ("getFormatOfExtensionlessFile", "ESM format sniffing for extensionless files, owned by the ESM loader"),
-    ("legacyMainResolve", "deprecated main resolution kept for compatibility, owned by the CJS loader"),
     ("statFsValues", "statfs field layout, lands with the statfs member"),
     ("statValues", "stat field layout, lands with the native stats layout"),
 ];
@@ -209,6 +213,11 @@ pub const MEMBERS: &[&str] = &[
     "writeFileUtf8",
     "internalModuleStat",
     "handleToFd",
+    // Module-loader helpers. `lib/internal/modules/helpers.js` calls both
+    // directly, and the ESM resolver depends on `legacyMainResolve` for every
+    // package without an `exports` map. `legacy_main.rs` owns them.
+    "legacyMainResolve",
+    "getFormatOfExtensionlessFile",
     // Request constructor.
     "FSReqCallback",
     // Descriptor handles and their opener.
@@ -274,6 +283,16 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
         mkfn!(self, "writeFileUtf8", write_file_utf8_binding);
         mkfn!(self, "internalModuleStat", internal_module_stat_binding);
         mkfn!(self, "handleToFd", handle_to_fd_binding);
+        mkfn!(
+            self,
+            "legacyMainResolve",
+            crate::legacy_main::legacy_main_resolve
+        );
+        mkfn!(
+            self,
+            "getFormatOfExtensionlessFile",
+            crate::legacy_main::get_format_of_extensionless_file
+        );
         self.fs_req_callback()?;
         self.file_jobs()?;
         // `fs.promises.open()` constructs a `FileHandle` unconditionally, so the

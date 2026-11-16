@@ -884,9 +884,11 @@ fn member_list_tracks_node_minus_documented_deferrals() {
         "fsync",
         "ftruncate",
         "futimes",
+        "getFormatOfExtensionlessFile",
         "handleToFd",
         "internalModuleStat",
         "lchown",
+        "legacyMainResolve",
         "link",
         "lstat",
         "lutimes",
@@ -1504,5 +1506,274 @@ fn the_explicit_undefined_request_slot_stays_synchronous() {
     assert_eq!(
         out,
         r#"{"missingIsUndefined":true,"type":"Float64Array","size":3}"#
+    );
+}
+
+/// `legacyMainResolve` answers an index into the suffix table, not a path.
+///
+/// This is the assertion that pins the detail most likely to be got wrong. The
+/// caller in `lib/internal/modules/esm/resolve.js` re-derives the path as
+/// `(main || './') + legacyMainResolveExtensions[index]`, so a path returned here
+/// would be concatenated onto `main` and resolved to somewhere that does not
+/// exist — a plausible-looking answer that npm then misreads, rather than a
+/// failure. Every index 0-9 is exercised, because a table off by one entry is
+/// only visible at the boundaries.
+#[test]
+fn legacy_main_resolve_answers_the_suffix_index() {
+    let dir = TempDir::new("legacy-main-index");
+
+    // One package per index. `main` is the string `main` for 0-6 and absent for
+    // 7-9, which is exactly the split the JavaScript side assumes.
+    for name in ["main_js", "main_json", "main_node"] {
+        std::fs::create_dir_all(dir.joined(name)).expect("mkdir");
+    }
+    for name in ["main_index_js", "main_index_json", "main_index_node"] {
+        std::fs::create_dir_all(dir.joined(name).join("main")).expect("mkdir");
+    }
+    for name in ["fallback_js", "fallback_json", "fallback_node"] {
+        std::fs::create_dir_all(dir.joined(name)).expect("mkdir");
+    }
+    std::fs::write(dir.joined("main_js/main.js"), b"x").expect("write");
+    std::fs::write(dir.joined("main_json/main.json"), b"{}").expect("write");
+    std::fs::write(dir.joined("main_node/main.node"), b"").expect("write");
+    std::fs::write(dir.joined("main_index_js/main/index.js"), b"x").expect("write");
+    std::fs::write(dir.joined("main_index_json/main/index.json"), b"{}").expect("write");
+    std::fs::write(dir.joined("main_index_node/main/index.node"), b"").expect("write");
+    std::fs::write(dir.joined("fallback_js/index.js"), b"x").expect("write");
+    std::fs::write(dir.joined("fallback_json/index.json"), b"{}").expect("write");
+    std::fs::write(dir.joined("fallback_node/index.node"), b"").expect("write");
+
+    let out = run(&format!(
+        r#"
+        const base = 'file:///tmp/x.js';
+        const at = (name) => fsBinding.legacyMainResolve('{root}/' + name, 'main', base);
+        globalThis.__out = JSON.stringify({{
+          mainJs: at('main_js'),
+          mainJson: at('main_json'),
+          mainNode: at('main_node'),
+          mainIndexJs: at('main_index_js'),
+          mainIndexJson: at('main_index_json'),
+          mainIndexNode: at('main_index_node'),
+          fallbackJs: fsBinding.legacyMainResolve('{root}/fallback_js', undefined, base),
+          fallbackJson: fsBinding.legacyMainResolve('{root}/fallback_json', undefined, base),
+          fallbackNode: fsBinding.legacyMainResolve('{root}/fallback_node', undefined, base),
+        }});
+        "#,
+        root = js_path(&dir.path)
+    ));
+    assert_eq!(
+        out,
+        r#"{"mainJs":1,"mainJson":2,"mainNode":3,"mainIndexJs":4,"mainIndexJson":5,"mainIndexNode":6,"fallbackJs":7,"fallbackJson":8,"fallbackNode":9}"#
+    );
+}
+
+/// The `main` loop is tried first and its result wins over any `index` file.
+#[test]
+fn legacy_main_resolve_prefers_main_over_the_index_fallback() {
+    let dir = TempDir::new("legacy-main-prefer");
+    std::fs::create_dir_all(dir.joined("pkg")).expect("mkdir");
+    std::fs::write(dir.joined("pkg/main.js"), b"x").expect("write");
+    std::fs::write(dir.joined("pkg/index.js"), b"x").expect("write");
+
+    let out = run(&format!(
+        r#"
+        globalThis.__out = JSON.stringify({{
+          withMain: fsBinding.legacyMainResolve('{root}/pkg', 'main', 'file:///tmp/x.js'),
+          // A `main` that matches nothing falls through to `index.js`, which is
+          // suffix 7 and not 4: the fallback loop starts at
+          // `legacy_main_extensions_with_main_end`.
+          missingMain: fsBinding.legacyMainResolve('{root}/pkg', 'nope', 'file:///tmp/x.js'),
+        }});
+        "#,
+        root = js_path(&dir.path)
+    ));
+    assert_eq!(out, r#"{"withMain":1,"missingMain":7}"#);
+}
+
+/// A non-string `main` means "no main" rather than an error, because Node's C++
+/// only tests `args[1]->IsString()`.
+#[test]
+fn legacy_main_resolve_treats_a_non_string_main_as_absent() {
+    let dir = TempDir::new("legacy-main-nonstring");
+    std::fs::create_dir_all(dir.joined("pkg")).expect("mkdir");
+    std::fs::write(dir.joined("pkg/index.js"), b"x").expect("write");
+
+    let out = run(&format!(
+        r#"
+        const root = '{root}/pkg';
+        globalThis.__out = JSON.stringify({{
+          nullMain: fsBinding.legacyMainResolve(root, null, 'file:///tmp/x.js'),
+          numberMain: fsBinding.legacyMainResolve(root, 42, 'file:///tmp/x.js'),
+          emptyMain: fsBinding.legacyMainResolve(root, '', 'file:///tmp/x.js'),
+        }});
+        "#,
+        root = js_path(&dir.path)
+    ));
+    // An empty string *is* a string, so the `main` loop runs; index 4 is
+    // `<pkgPath>/index.js`, which is the file that exists here.
+    assert_eq!(out, r#"{"nullMain":7,"numberMain":7,"emptyMain":4}"#);
+}
+
+/// Nothing resolves: `ERR_MODULE_NOT_FOUND` names the candidate it started
+/// from, which differs between the "main was given" and "no main" shapes.
+#[test]
+fn legacy_main_resolve_reports_the_candidate_it_could_not_find() {
+    let dir = TempDir::new("legacy-main-missing");
+    std::fs::create_dir_all(dir.joined("empty")).expect("mkdir");
+
+    let out = run(&format!(
+        r#"
+        const root = '{root}/empty';
+        const capture = (args) => {{
+          try {{ fsBinding.legacyMainResolve(...args); return null; }}
+          catch (e) {{ return [e.name, e.code, e.message]; }}
+        }};
+        globalThis.__out = JSON.stringify({{
+          noMain: capture([root, undefined, 'file:///tmp/x.js']),
+          withMain: capture([root, 'zzz', 'file:///tmp/x.js']),
+        }});
+        "#,
+        root = js_path(&dir.path)
+    ));
+
+    let root = js_path(&dir.path);
+    let expected = format!(
+        r#"{{"noMain":["Error","ERR_MODULE_NOT_FOUND","Cannot find package '{root}/empty/index.js' imported from /tmp/x.js"],"withMain":["Error","ERR_MODULE_NOT_FOUND","Cannot find package '{root}/empty/zzz' imported from /tmp/x.js"]}}"#
+    );
+    assert_eq!(out, expected);
+}
+
+/// The base URL is only validated once resolution has failed.
+///
+/// A package with a resolvable `main` answers its index even when the base is a
+/// number or not a URL at all. Validating the base up front would turn a
+/// successful resolution into an error, which is a difference npm would hit on
+/// any package whose `package.json` the resolver read with a stale base.
+#[test]
+fn legacy_main_resolve_validates_the_base_only_after_resolution_fails() {
+    let dir = TempDir::new("legacy-main-base");
+    std::fs::create_dir_all(dir.joined("pkg")).expect("mkdir");
+    std::fs::write(dir.joined("pkg/main.js"), b"x").expect("write");
+
+    let out = run(&format!(
+        r#"
+        const ok = '{root}/pkg';
+        const empty = '{root}/empty';
+        const capture = (args) => {{
+          try {{ return ['ok', fsBinding.legacyMainResolve(...args)]; }}
+          catch (e) {{ return ['threw', e.name, e.code, e.message]; }}
+        }};
+        globalThis.__out = JSON.stringify({{
+          // Resolvable, so the base never matters.
+          badBaseOnSuccess: capture([ok, 'main', 'notaurl']),
+          numberBaseOnSuccess: capture([ok, 'main', 5]),
+          omittedBaseOnSuccess: capture([ok, 'main']),
+          // Unresolvable, so the base is checked and reported.
+          omitted: capture([empty, '', undefined]),
+          number: capture([empty, '', 5]),
+          invalid: capture([empty, '', 'notaurl']),
+          notFile: capture([empty, '', 'ftp://x/y']),
+          encodedSlash: capture([empty, '', 'file:///a%2Fb/x']),
+        }});
+        "#,
+        root = js_path(&dir.path)
+    ));
+
+    let root = js_path(&dir.path);
+    let expected = r#"{"badBaseOnSuccess":["ok",1],"numberBaseOnSuccess":["ok",1],"omittedBaseOnSuccess":["ok",1],"omitted":["threw","TypeError","ERR_INVALID_ARG_TYPE","The \"base\" argument must be of type string or an instance of URL."],"number":["threw","TypeError","ERR_INVALID_ARG_TYPE","The \"base\" argument must be of type string or an instance of URL."],"invalid":["threw","TypeError","ERR_INVALID_URL","Invalid URL"],"notFile":["threw","TypeError","ERR_INVALID_URL_SCHEME","The URL must be of scheme file:"],"encodedSlash":["threw","TypeError","ERR_INVALID_FILE_URL_PATH","File URL path must not include encoded / characters"]}"#
+        .replace("{root}", &root);
+    assert_eq!(out, expected);
+}
+
+/// The base URL's pathname is decoded before it appears in the message, and a
+/// relative reference under the special `file:` scheme is rooted.
+#[test]
+fn legacy_main_resolve_decodes_the_base_url_pathname() {
+    let dir = TempDir::new("legacy-main-base-path");
+    std::fs::create_dir_all(dir.joined("empty")).expect("mkdir");
+
+    let out = run(&format!(
+        r#"
+        const root = '{root}/empty';
+        const message = (base) => {{
+          try {{ fsBinding.legacyMainResolve(root, undefined, base); return null; }}
+          catch (e) {{ return e.message; }}
+        }};
+        globalThis.__out = JSON.stringify({{
+          encodedSpace: message('file:///a%20b/x.js'),
+          localhostHost: message('file://localhost/tmp/x.js'),
+          dotSegments: message('file:///tmp/a/../b/x.js'),
+          relativeUnderFile: message('file:x.js'),
+          emptyPath: message('file://'),
+        }});
+        "#,
+        root = js_path(&dir.path)
+    ));
+
+    let root = js_path(&dir.path);
+    let prefix = format!("Cannot find package '{root}/empty/index.js' imported from");
+    let expected = format!(
+        r#"{{"encodedSpace":"{prefix} /a b/x.js","localhostHost":"{prefix} /tmp/x.js","dotSegments":"{prefix} /tmp/b/x.js","relativeUnderFile":"{prefix} /x.js","emptyPath":"{prefix} /"}}"#
+    );
+    assert_eq!(out, expected);
+}
+
+/// `getFormatOfExtensionlessFile` answers 1 only for the Wasm magic number.
+///
+/// Every failure is 0 rather than an error: `lib/internal/modules/esm/get_format.js`
+/// treats the answer as "wasm or module" and has no branch for a read failure.
+#[test]
+fn get_format_of_extensionless_file_sniffs_only_the_wasm_magic() {
+    let dir = TempDir::new("extensionless");
+    std::fs::write(dir.joined("wasm"), [0x00u8, 0x61, 0x73, 0x6d, 0x01, 0x00]).expect("write");
+    std::fs::write(dir.joined("js"), b"console.log(1)").expect("write");
+    std::fs::write(dir.joined("short"), [0x00u8, 0x61, 0x73]).expect("write");
+    std::fs::write(dir.joined("empty"), b"").expect("write");
+    std::fs::create_dir_all(dir.joined("subdir")).expect("mkdir");
+
+    let out = run(&format!(
+        r#"
+        const root = '{root}';
+        const at = (name) => fsBinding.getFormatOfExtensionlessFile(root + '/' + name);
+        globalThis.__out = JSON.stringify({{
+          wasm: at('wasm'),
+          js: at('js'),
+          short: at('short'),
+          empty: at('empty'),
+          missing: at('absent'),
+          directory: at('subdir'),
+        }});
+        "#,
+        root = js_path(&dir.path)
+    ));
+    // A short file answers 0 deterministically. Node reads into an uninitialised
+    // stack buffer there, so its answer for `short` depends on what was on the
+    // stack; the magic number is four bytes, so a real Wasm file is unaffected.
+    assert_eq!(
+        out,
+        r#"{"wasm":1,"js":0,"short":0,"empty":0,"missing":0,"directory":0}"#
+    );
+}
+
+/// A non-string path is reported rather than silently coerced.
+///
+/// Node aborts on `CHECK(args[0]->IsString())` here, which a runtime cannot
+/// reproduce without taking the process down; the error is the equivalent
+/// diagnosis.
+#[test]
+fn the_module_loader_members_reject_a_non_string_path() {
+    let out = run(r#"
+        const capture = (fn) => {
+          try { fn(); return null; }
+          catch (e) { return [e.name, e.code]; }
+        };
+        globalThis.__out = JSON.stringify({
+          legacyMain: capture(() => fsBinding.legacyMainResolve(5, 'main', 'file:///tmp/x.js')),
+          format: capture(() => fsBinding.getFormatOfExtensionlessFile(5)),
+        });
+        "#);
+    assert_eq!(
+        out,
+        r#"{"legacyMain":["TypeError","ERR_INVALID_ARG_TYPE"],"format":["TypeError","ERR_INVALID_ARG_TYPE"]}"#
     );
 }
