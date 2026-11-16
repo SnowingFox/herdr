@@ -15,6 +15,7 @@ pub fn install_all() -> Result<BunRegistry, String> {
     let mut registry = BunRegistry::new();
     rn_bun_compression::register(&mut registry)?;
     rn_bun_hash::register(&mut registry)?;
+    rn_bun_text::register(&mut registry)?;
     rn_bun_time::register(&mut registry)?;
     Ok(registry)
 }

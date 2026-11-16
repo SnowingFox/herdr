@@ -1,0 +1,698 @@
+{
+ "streams": [
+  [
+   "readableStreamToText",
+   [
+    "he",
+    "llo"
+   ],
+   {
+    "ok": true,
+    "value": {
+     "kind": "string",
+     "value": "hello"
+    }
+   }
+  ],
+  [
+   "readableStreamToText",
+   [],
+   {
+    "ok": true,
+    "value": {
+     "kind": "string",
+     "value": ""
+    }
+   }
+  ],
+  [
+   "readableStreamToBytes",
+   [
+    "ab",
+    "cd"
+   ],
+   {
+    "ok": true,
+    "value": {
+     "kind": "bytes",
+     "ctor": "Uint8Array",
+     "hex": "61626364"
+    }
+   }
+  ],
+  [
+   "readableStreamToBytes",
+   [],
+   {
+    "ok": true,
+    "value": {
+     "kind": "bytes",
+     "ctor": "Uint8Array",
+     "hex": ""
+    }
+   }
+  ],
+  [
+   "readableStreamToArrayBuffer",
+   [
+    "ab",
+    "cd"
+   ],
+   {
+    "ok": true,
+    "value": {
+     "kind": "arraybuffer",
+     "ctor": "ArrayBuffer",
+     "hex": "61626364"
+    }
+   }
+  ],
+  [
+   "readableStreamToArray",
+   [
+    "ab",
+    "cd"
+   ],
+   {
+    "ok": true,
+    "value": {
+     "kind": "array",
+     "chunks": [
+      {
+       "ctor": "Uint8Array",
+       "hex": "6162"
+      },
+      {
+       "ctor": "Uint8Array",
+       "hex": "6364"
+      }
+     ]
+    }
+   }
+  ],
+  [
+   "readableStreamToArray",
+   [],
+   {
+    "ok": true,
+    "value": {
+     "kind": "array",
+     "chunks": []
+    }
+   }
+  ],
+  [
+   "readableStreamToBlob",
+   [
+    "ab",
+    "cd"
+   ],
+   {
+    "ok": true,
+    "value": {
+     "kind": "blob",
+     "ctor": "Blob",
+     "size": 4,
+     "type": "",
+     "isBlob": true
+    }
+   }
+  ],
+  [
+   "readableStreamToJSON",
+   [
+    "{\"a\":",
+    "1}"
+   ],
+   {
+    "ok": true,
+    "value": {
+     "kind": "json",
+     "value": {
+      "a": 1
+     }
+    }
+   }
+  ],
+  [
+   "readableStreamToJSON",
+   [
+    "notjson"
+   ],
+   {
+    "threw": true,
+    "ctor": "SyntaxError",
+    "code": null,
+    "message": "JSON Parse error: Unexpected identifier \"notjson\""
+   }
+  ],
+  [
+   "readableStreamToText",
+   "consumed-twice",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_STATE",
+    "message": "Invalid state: ReadableStream has already been used"
+   }
+  ],
+  [
+   "readableStreamToFormData",
+   "multipart",
+   {
+    "ok": true,
+    "value": {
+     "kind": "formdata",
+     "ctor": "FormData",
+     "entries": [
+      [
+       "a",
+       "1"
+      ]
+     ]
+    }
+   }
+  ],
+  [
+   "readableStreamToFormData",
+   "plain",
+   {
+    "ok": true,
+    "value": {
+     "kind": "formdata",
+     "ctor": "FormData",
+     "entries": [
+      [
+       "x",
+       ""
+      ]
+     ]
+    }
+   }
+  ]
+ ],
+ "sink": [
+  [
+   "write-returns-per-call",
+   [
+    2,
+    3
+   ]
+  ],
+  [
+   "end",
+   {
+    "ctor": "ArrayBuffer",
+    "hex": "68656c6c6f"
+   }
+  ],
+  [
+   "end-ignores-dest",
+   {
+    "ctor": "ArrayBuffer",
+    "byteLength": 5
+   }
+  ],
+  [
+   "end-twice",
+   [
+    1,
+    0
+   ]
+  ],
+  [
+   "stream-end",
+   {
+    "ctor": "ArrayBuffer",
+    "hex": "61626364"
+   }
+  ],
+  [
+   "write-uint8array",
+   3
+  ],
+  [
+   "write-empty-string",
+   0
+  ],
+  [
+   "flush",
+   0
+  ],
+  [
+   "flush-stream",
+   0
+  ],
+  [
+   "write-number",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "write() expects a string, ArrayBufferView, or ArrayBuffer"
+   }
+  ],
+  [
+   "end-empty",
+   0
+  ]
+ ],
+ "validations": [
+  [
+   "readableStreamToText",
+   "undefined",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received undefined"
+   }
+  ],
+  [
+   "readableStreamToText",
+   "string",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received type string ('notastream')"
+   }
+  ],
+  [
+   "readableStreamToText",
+   "uint8array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Uint8Array"
+   }
+  ],
+  [
+   "readableStreamToText",
+   "array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Array"
+   }
+  ],
+  [
+   "readableStreamToText",
+   "object",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Object"
+   }
+  ],
+  [
+   "readableStreamToArray",
+   "undefined",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received undefined"
+   }
+  ],
+  [
+   "readableStreamToArray",
+   "string",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received type string ('notastream')"
+   }
+  ],
+  [
+   "readableStreamToArray",
+   "uint8array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Uint8Array"
+   }
+  ],
+  [
+   "readableStreamToArray",
+   "array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Array"
+   }
+  ],
+  [
+   "readableStreamToArray",
+   "object",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Object"
+   }
+  ],
+  [
+   "readableStreamToArrayBuffer",
+   "undefined",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received undefined"
+   }
+  ],
+  [
+   "readableStreamToArrayBuffer",
+   "string",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received type string ('notastream')"
+   }
+  ],
+  [
+   "readableStreamToArrayBuffer",
+   "uint8array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Uint8Array"
+   }
+  ],
+  [
+   "readableStreamToArrayBuffer",
+   "array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Array"
+   }
+  ],
+  [
+   "readableStreamToArrayBuffer",
+   "object",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Object"
+   }
+  ],
+  [
+   "readableStreamToBlob",
+   "undefined",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received undefined"
+   }
+  ],
+  [
+   "readableStreamToBlob",
+   "string",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received type string ('notastream')"
+   }
+  ],
+  [
+   "readableStreamToBlob",
+   "uint8array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Uint8Array"
+   }
+  ],
+  [
+   "readableStreamToBlob",
+   "array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Array"
+   }
+  ],
+  [
+   "readableStreamToBlob",
+   "object",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Object"
+   }
+  ],
+  [
+   "readableStreamToBytes",
+   "undefined",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received undefined"
+   }
+  ],
+  [
+   "readableStreamToBytes",
+   "string",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received type string ('notastream')"
+   }
+  ],
+  [
+   "readableStreamToBytes",
+   "uint8array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Uint8Array"
+   }
+  ],
+  [
+   "readableStreamToBytes",
+   "array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Array"
+   }
+  ],
+  [
+   "readableStreamToBytes",
+   "object",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Object"
+   }
+  ],
+  [
+   "readableStreamToFormData",
+   "undefined",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received undefined"
+   }
+  ],
+  [
+   "readableStreamToFormData",
+   "string",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received type string ('notastream')"
+   }
+  ],
+  [
+   "readableStreamToFormData",
+   "uint8array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Uint8Array"
+   }
+  ],
+  [
+   "readableStreamToFormData",
+   "array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Array"
+   }
+  ],
+  [
+   "readableStreamToFormData",
+   "object",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Object"
+   }
+  ],
+  [
+   "readableStreamToJSON",
+   "undefined",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received undefined"
+   }
+  ],
+  [
+   "readableStreamToJSON",
+   "string",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received type string ('notastream')"
+   }
+  ],
+  [
+   "readableStreamToJSON",
+   "uint8array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Uint8Array"
+   }
+  ],
+  [
+   "readableStreamToJSON",
+   "array",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Array"
+   }
+  ],
+  [
+   "readableStreamToJSON",
+   "object",
+   {
+    "threw": true,
+    "ctor": "TypeError",
+    "code": "ERR_INVALID_ARG_TYPE",
+    "message": "The \"stream\" argument must be of type ReadableStream. Received an instance of Object"
+   }
+  ]
+ ],
+ "errors": [
+  [
+   "readableStreamToText",
+   {
+    "threw": true,
+    "ctor": "Error",
+    "code": null,
+    "message": "boom"
+   }
+  ],
+  [
+   "readableStreamToBytes",
+   {
+    "threw": true,
+    "ctor": "Error",
+    "code": null,
+    "message": "boom"
+   }
+  ],
+  [
+   "readableStreamToArray",
+   {
+    "threw": true,
+    "ctor": "Error",
+    "code": null,
+    "message": "boom"
+   }
+  ],
+  [
+   "readableStreamToArrayBuffer",
+   {
+    "threw": true,
+    "ctor": "Error",
+    "code": null,
+    "message": "boom"
+   }
+  ],
+  [
+   "readableStreamToBlob",
+   {
+    "threw": true,
+    "ctor": "Error",
+    "code": null,
+    "message": "boom"
+   }
+  ],
+  [
+   "readableStreamToFormData",
+   {
+    "threw": true,
+    "ctor": "Error",
+    "code": null,
+    "message": "boom"
+   }
+  ],
+  [
+   "readableStreamToJSON",
+   {
+    "threw": true,
+    "ctor": "Error",
+    "code": null,
+    "message": "boom"
+   }
+  ]
+ ],
+ "sinkShape": {
+  "typeof": "function",
+  "length": 0,
+  "name": "ArrayBufferSink",
+  "prototypeType": "undefined",
+  "methods": [
+   "_getFd",
+   "close",
+   "constructor",
+   "end",
+   "flush",
+   "ref",
+   "sinkId",
+   "start",
+   "unref",
+   "write"
+  ],
+  "ownProps": [],
+  "constructorMatches": true,
+  "sinkId": 0
+ }
+}
