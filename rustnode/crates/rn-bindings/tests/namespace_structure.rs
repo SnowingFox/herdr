@@ -121,9 +121,12 @@ const KNOWN_FINDINGS: &[&str] = &[
     "process_methods.dlopenBinary:claimed-and-deferred",
     "process_methods.execve:claimed-and-deferred",
     "process_methods.setEmitWarningSync:claimed-and-deferred",
-    // `sqlite.backup` — the defect that motivated this check. `rn-compat` reports
-    // `sqlite 5 0 0 ok` while `node:sqlite.backup` is `undefined`.
-    "sqlite.backup:claimed-and-deferred",
+    // (`sqlite.backup` was here. PR #99 removed it from `MEMBERS` and left it in
+    // `DEFERRED` with an accurate reason, so the contradiction is gone and the gap
+    // is honestly declared. `backup` itself is still unimplemented — Node's is a
+    // `function`, this one is absent — but as a declared deferral, which is what the
+    // mechanism is for, not as a member falsely claimed installed.)
+    //
     // `util.getSharedArrayBufferGrowable` — same shape. (`util.parseEnv` was here
     // too; `2a977ca4` implemented it and the ratchet demanded the removal.)
     "util.getSharedArrayBufferGrowable:claimed-and-deferred",
@@ -1396,7 +1399,7 @@ mod rule_tests {
         // fix lands, its line and this number change in the same commit.
         assert_eq!(
             KNOWN_FINDINGS.len(),
-            16,
+            15,
             "KNOWN_FINDINGS holds the structural debt; update this count when a fix \
              removes an entry: {:?}",
             KNOWN_FINDINGS
