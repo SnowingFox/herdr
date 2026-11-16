@@ -20,9 +20,12 @@
 //!   skips loudly when `node` is absent rather than failing, because a Rust
 //!   workspace is not guaranteed to have one.
 //!
-//! Node's own benchmark binary is pinned in `tools/node-pin.toml`; this test
-//! takes whatever `node` is on `PATH` and says so in its skip message, because
-//! it is comparing *implementations* of the same algorithm, not benchmarking.
+//! The reference binary is the oracle `tools/node-pin.toml` pins, resolved by
+//! [`rn_node_oracle`], not whatever `node` is on `PATH`: `encodeInto` is a
+//! `TextEncoder` implementation detail that has changed between Node versions,
+//! so a released Node on `PATH` is a different reference rather than a weaker
+//! one. With no oracle this differential skips loudly; with a wrong-version one
+//! it fails.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -184,50 +187,14 @@ fn the_cases_match_the_recorded_expectations() {
     }
 }
 
-/// The `node` this test compares against.
-///
-/// The pinned oracle wins over whatever is on `PATH`: `tools/node-pin.toml`
-/// names the revision rustnode tracks, and an older `node` on `PATH` encodes
-/// UTF-8 with a different implementation. The search order is the environment
-/// override, then the pinned path, then `PATH`, so the test still runs on a
-/// machine that has only a packaged `node`.
-fn reference_node() -> Option<(PathBuf, String)> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(explicit) = std::env::var("RUSTNODE_ORACLE_NODE") {
-        candidates.push(PathBuf::from(explicit));
-    }
-    let pinned = PathBuf::from("/tmp/oracle-dl")
-        .join("node-v28.0.0-nightly20261111e8c1160d20-linux-x64")
-        .join("bin")
-        .join("node");
-    candidates.push(pinned);
-    candidates.push(PathBuf::from("node"));
-
-    for candidate in candidates {
-        let Ok(output) = Command::new(&candidate).arg("--version").output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        return Some((candidate, version));
-    }
-    None
-}
-
 #[test]
-fn the_cases_match_a_real_node_binary() {
-    let Some((node, node_version)) = reference_node() else {
-        eprintln!(
-            "skipping the differential: no `node` on PATH and no pinned oracle. \
-             The recorded expectations in tests/encode-into-expected.jsonl are \
-             the oracle's output for the same file and still run above."
-        );
+fn the_cases_match_the_pinned_oracle() {
+    let Some(oracle) = rn_node_oracle::require_oracle("rn-bind-encoding encodeInto") else {
         return;
     };
+    let node_version = oracle.version.clone();
 
-    let run = |binary: &PathBuf, arguments: &[&str]| -> std::process::Output {
+    let run = |binary: &std::path::Path, arguments: &[&str]| -> std::process::Output {
         Command::new(binary)
             .args(arguments)
             .arg(cases_path())
@@ -235,14 +202,13 @@ fn the_cases_match_a_real_node_binary() {
             .unwrap_or_else(|error| panic!("cannot run {}: {error}", binary.display()))
     };
 
-    let reference = run(&node, &[]);
+    let reference = run(&oracle.path, &[]);
     assert!(
         reference.status.success(),
         "{} failed: {}",
-        node.display(),
+        oracle.describe(),
         String::from_utf8_lossy(&reference.stderr)
     );
-    eprintln!("comparing against {} ({node_version})", node.display());
 
     let rustnode = rustnode_binary();
     assert!(
@@ -276,10 +242,10 @@ fn the_cases_match_a_real_node_binary() {
     }
     assert!(
         failures.is_empty(),
-        "{} of {} cases differ from node {node_version} ({}):\n{}",
+        "{} of {} cases differ from {}\n{}",
         failures.len(),
         reference.len(),
-        node.display(),
+        oracle.describe(),
         failures.join("\n")
     );
 }

@@ -24,4 +24,7 @@ libuv-sys2.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The differential tests compare against the pinned Node oracle, not whatever
+# `node` `PATH` resolves to; see `tools/node-pin.toml` and `rn-node-oracle`.
+rn-node-oracle = { path = "../../tools/node-oracle" }
 serde_json.workspace = true

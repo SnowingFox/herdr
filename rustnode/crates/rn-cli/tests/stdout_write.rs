@@ -26,6 +26,19 @@
 
 use std::process::Command;
 
+use rn_node_oracle::Oracle;
+
+/// The oracle this test binary compares against, resolved and announced once.
+///
+/// See `rn-cli/tests/event_loop.rs` for why the resolution is shared: the oracle
+/// line is printed once per test binary rather than once per test.
+fn oracle() -> Option<&'static Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-cli stdout write"))
+        .as_ref()
+}
+
 /// Runs `script` under `binary` and returns raw stdout bytes and the exit status.
 fn run(binary: &str, script: &str) -> (Vec<u8>, bool) {
     let output = Command::new(binary)
@@ -36,16 +49,27 @@ fn run(binary: &str, script: &str) -> (Vec<u8>, bool) {
     (output.stdout, output.status.success())
 }
 
-/// `node`'s reference bytes for `script`.
-fn node(script: &str) -> Vec<u8> {
-    let (stdout, ok) = run("node", script);
-    assert!(ok, "node itself failed on {script:?}");
-    stdout
+/// The oracle's reference bytes for `script`.
+fn node(oracle: &Oracle, script: &str) -> Vec<u8> {
+    let output = oracle
+        .command()
+        .arg("-e")
+        .arg(script)
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
+    assert!(
+        output.status.success(),
+        "{} itself failed on {script:?}: {}",
+        oracle.describe(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }
 
-/// Asserts `rustnode` writes exactly the bytes `node` writes, and exits cleanly.
-fn same_bytes_as_node(script: &str) -> Vec<u8> {
-    let expected = node(script);
+/// Asserts `rustnode` writes exactly the bytes the oracle writes, and exits
+/// cleanly.
+fn same_bytes_as_node(oracle: &Oracle, script: &str) -> Vec<u8> {
+    let expected = node(oracle, script);
     let (actual, ok) = run(env!("CARGO_BIN_EXE_rustnode"), script);
     assert!(
         ok,
@@ -64,9 +88,13 @@ fn same_bytes_as_node(script: &str) -> Vec<u8> {
 
 #[test]
 fn a_loop_of_writes_each_reaches_the_pipe() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The reported reproduction. The first write was a string write and the rest
     // were writev chunks; only the first survived.
     let printed = same_bytes_as_node(
+        oracle,
         "for (let i = 0; i < 5; i++) process.stdout.write('x' + i + ' ');\n\
          console.log();",
     );
@@ -75,9 +103,13 @@ fn a_loop_of_writes_each_reaches_the_pipe() {
 
 #[test]
 fn consecutive_writes_without_a_newline_stay_in_order() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // No newline anywhere: this is the queue-building case, where the second and
     // third writes are flushed through `_writev`.
     let printed = same_bytes_as_node(
+        oracle,
         "process.stdout.write('a');\n\
          process.stdout.write('b');\n\
          process.stdout.write('c');",
@@ -87,29 +119,42 @@ fn consecutive_writes_without_a_newline_stay_in_order() {
 
 #[test]
 fn many_small_writes_are_not_lost_and_the_process_exits() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // 10,000 writes overflow the pipe repeatedly, so this exercises both the
     // synchronous path and the queued path, and would hang if a completion were
     // ever dropped.
-    let printed = same_bytes_as_node("for (let i = 0; i < 10000; i++) process.stdout.write('x');");
+    let printed = same_bytes_as_node(
+        oracle,
+        "for (let i = 0; i < 10000; i++) process.stdout.write('x');",
+    );
     assert_eq!(printed.len(), 10000);
     assert!(printed.iter().all(|byte| *byte == b'x'));
 }
 
 #[test]
 fn a_write_larger_than_the_pipe_buffer_arrives_whole() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // 200 KiB is well past any pipe buffer, so libuv must keep writing as the
     // reader drains. A partial write would show up as a length mismatch.
-    let printed = same_bytes_as_node("process.stdout.write('y'.repeat(200000));");
+    let printed = same_bytes_as_node(oracle, "process.stdout.write('y'.repeat(200000));");
     assert_eq!(printed.len(), 200000);
     assert!(printed.iter().all(|byte| *byte == b'y'));
 }
 
 #[test]
 fn repeated_stderr_writes_behave_like_stdout() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // stderr is a `Pipe` of its own with the same `StreamBase` methods; it must
     // not need a separate fix.
     let script = "for (let i = 0; i < 5; i++) process.stderr.write('e' + i + ' ');";
-    let expected = Command::new("node")
+    let expected = oracle
+        .command()
         .arg("-e")
         .arg(script)
         .output()
@@ -126,10 +171,14 @@ fn repeated_stderr_writes_behave_like_stdout() {
 
 #[test]
 fn console_log_still_works_and_interleaves_with_direct_writes() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `console.log` used to be a bootstrap stub writing straight to descriptor 1,
     // which bypassed the queue the earlier `write` calls were still in and
     // printed out of order. The real console writes through `process.stdout`.
     let printed = same_bytes_as_node(
+        oracle,
         "process.stdout.write('A');\n\
          process.stdout.write('B');\n\
          console.log('C');\n\
@@ -140,6 +189,9 @@ fn console_log_still_works_and_interleaves_with_direct_writes() {
 
 #[test]
 fn every_encoding_writes_the_bytes_node_writes() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // One case per `enum encoding`. `hex` and `base64` *decode* their input
     // rather than encoding it, `ucs2` emits UTF-16LE, and `ascii`/`latin1` take
     // the low byte of each code unit — no branch here is interchangeable.
@@ -160,7 +212,7 @@ fn every_encoding_writes_the_bytes_node_writes() {
             "process.stdout.write('{input}', '{encoding}');\n\
              process.stdout.write('{input}', '{encoding}');"
         );
-        let printed = same_bytes_as_node(&script);
+        let printed = same_bytes_as_node(oracle, &script);
         assert!(
             !printed.is_empty(),
             "{encoding} produced no bytes for {input:?}"
@@ -170,12 +222,15 @@ fn every_encoding_writes_the_bytes_node_writes() {
 
 #[test]
 fn the_single_write_string_methods_honour_their_encoding() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `writeLatin1String`, `writeAsciiString` and `writeUcs2String` share one
     // implementation with `writeUtf8String`; passing UTF-8 for all four would
     // make the name a lie and only shows up in the bytes.
     for encoding in ["latin1", "binary", "ascii", "ucs2", "utf16le", "utf8"] {
         let script = format!("process.stdout.write('\\u00e9\\u00ffhi', '{encoding}');");
-        let printed = same_bytes_as_node(&script);
+        let printed = same_bytes_as_node(oracle, &script);
         assert!(!printed.is_empty(), "{encoding} produced no bytes");
     }
 }

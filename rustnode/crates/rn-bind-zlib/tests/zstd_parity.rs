@@ -8,8 +8,11 @@
 //!
 //! Both the reference runtime and the runtime under test are driven with the
 //! same script, and the frames cross over as base64 so a NUL byte or a newline
-//! cannot be mangled by a pipe. The reference is whatever `node` is on `PATH`,
-//! which is why every test states the versions it ran against.
+//! cannot be mangled by a pipe. The reference is the binary
+//! `tools/node-pin.toml` pins, not whatever `node` is on `PATH`; see
+//! [`rn_node_oracle`]. zstd's frame format depends on the library version, so
+//! comparing against an arbitrary Node would be comparing against an arbitrary
+//! zstd as well.
 //!
 //! Set `RUSTNODE_BIN` to point at the binary under test. It defaults to
 //! `target/debug/rustnode`, and a missing binary is a failure rather than a
@@ -17,6 +20,14 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+
+/// The oracle this test binary compares against, resolved and announced once.
+fn oracle() -> Option<&'static rn_node_oracle::Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<rn_node_oracle::Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-bind-zlib zstd parity"))
+        .as_ref()
+}
 
 /// The runtime under test.
 fn rustnode_bin() -> String {
@@ -170,7 +181,10 @@ fn payloads() -> Vec<(&'static str, Vec<u8>)> {
 
 #[test]
 fn our_frames_decompress_on_node() {
-    let node = "node";
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    let node = oracle.reference_path();
     let rustnode = rustnode_bin();
     for (name, payload) in payloads() {
         let frame = from_base64(&compress_on(&rustnode, &payload)).expect("our output is base64");
@@ -184,7 +198,10 @@ fn our_frames_decompress_on_node() {
 
 #[test]
 fn node_frames_decompress_on_rustnode() {
-    let node = "node";
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    let node = oracle.reference_path();
     let rustnode = rustnode_bin();
     for (name, payload) in payloads() {
         let frame = from_base64(&compress_on(node, &payload)).expect("node output is base64");
@@ -201,7 +218,10 @@ fn node_frames_decompress_on_rustnode() {
 /// bytes.
 #[test]
 fn decompression_is_byte_identical_in_both_directions() {
-    let node = "node";
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    let node = oracle.reference_path();
     let rustnode = rustnode_bin();
     for (name, payload) in payloads() {
         let node_frame = from_base64(&compress_on(node, &payload)).expect("node output is base64");
@@ -226,7 +246,10 @@ fn decompression_is_byte_identical_in_both_directions() {
 /// them here would turn a legitimate zstd change into a failure.
 #[test]
 fn compression_shape_matches_node() {
-    let node = "node";
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    let node = oracle.reference_path();
     let rustnode = rustnode_bin();
     let mut differing = Vec::new();
     for (name, payload) in payloads() {

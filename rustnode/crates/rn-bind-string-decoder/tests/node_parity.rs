@@ -1,4 +1,4 @@
-//! Cross-checks the binding against a real `node` binary.
+//! Cross-checks the binding against the pinned Node oracle.
 //!
 //! The expectations in `tests/binding.rs` are literal strings, which is right
 //! for a regression test but only as good as the person who recorded them. This
@@ -6,19 +6,19 @@
 //! `require('string_decoder')` and through this binding's `decode`/`flush`, then
 //! compares the UTF-16 code units of every result.
 //!
-//! The cases skip themselves when no `node` is on `PATH`, because this crate's
-//! gate must not depend on an external binary being installed. When `node` is
-//! present, every case runs.
+//! The oracle is the binary `tools/node-pin.toml` pins, not whatever `node` is
+//! on `PATH`; see [`rn_node_oracle`]. With no oracle the cases skip loudly, and
+//! with a *different* Node the test fails rather than comparing against the
+//! wrong engine.
 //!
 //! Comparing code units rather than the strings themselves matters: it is what
 //! catches a lone surrogate being normalised, a U+FFFD appearing where a
 //! retained byte should have been, or `ascii` masking 0xFF to U+007F instead of
 //! leaving it.
 
-use std::process::Command;
-
 use rn_bind_string_decoder::StringDecoder;
 use rn_core::{AsyncIds, BindingModule, InstallCtx};
+use rn_node_oracle::Oracle;
 use rn_v8_sys::v8;
 
 /// One decoder session: the encoding, and the chunks written in order.
@@ -329,34 +329,34 @@ fn parse_node_output(raw: &str) -> Vec<Vec<u16>> {
         .collect()
 }
 
-fn node_available() -> bool {
-    Command::new("node")
-        .arg("-e")
-        .arg("0")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+/// The oracle this test compares against, resolved and announced once.
+fn oracle() -> Option<&'static Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-bind-string-decoder node parity"))
+        .as_ref()
 }
 
 #[test]
 fn decoded_output_matches_node_code_unit_for_code_unit() {
-    if !node_available() {
-        eprintln!("skipping: no node on PATH");
+    let Some(oracle) = oracle() else {
         return;
-    }
+    };
 
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
 
-    let output = Command::new("node")
+    let output = oracle
+        .command()
         .arg("-e")
         .arg(node_script())
         .output()
-        .expect("node runs");
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
     assert!(
         output.status.success(),
-        "node failed: {}",
+        "{} failed: {}",
+        oracle.describe(),
         String::from_utf8_lossy(&output.stderr)
     );
     let expected = parse_node_output(&String::from_utf8_lossy(&output.stdout));

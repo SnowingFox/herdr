@@ -65,6 +65,18 @@ impl Run {
     }
 }
 
+/// The oracle this test binary compares against, resolved and announced once.
+///
+/// The reference binary is the one `tools/node-pin.toml` pins, not whatever
+/// `node` `PATH` resolves to; see [`rn_node_oracle`]. A missing oracle skips
+/// loudly and a wrong-version one fails, so a green run always names its engine.
+fn oracle() -> Option<&'static rn_node_oracle::Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<rn_node_oracle::Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-cli callback scope"))
+        .as_ref()
+}
+
 /// Runs `script` under `binary`, killing it if it outlives `limit`.
 fn run(binary: &str, script: &str, limit: Duration) -> Run {
     let started = Instant::now();
@@ -111,8 +123,8 @@ fn run(binary: &str, script: &str, limit: Duration) -> Run {
 ///
 /// `node` runs first: if the reference disagrees, the expectation written here
 /// is wrong, and saying so is more useful than blaming rustnode.
-fn same_output_as_node(script: &str, expected: &str) {
-    let reference = run("node", script, Duration::from_secs(20));
+fn same_output_as_node(oracle: &rn_node_oracle::Oracle, script: &str, expected: &str) {
+    let reference = run(oracle.reference_path(), script, Duration::from_secs(20));
     assert!(
         reference.clean(),
         "`node` did not exit cleanly on {script}\nstdout: {}\nstderr: {}",
@@ -176,11 +188,15 @@ server.listen(0, () => {\n\
 
 #[test]
 fn async_local_storage_survives_a_socket_read_callback() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `AsyncWrap`'s constructor captures `async_context_frame::current()`, and
     // `InternalCallbackScope` restores it around the callback. Without the
     // capture the read callback runs with whatever frame the process last set,
     // which outside any `run()` is `undefined`.
     same_output_as_node(
+        oracle,
         ALS_SOCKET_SCRIPT,
         "in run: request-store\nin read: request-store",
     );
@@ -188,6 +204,9 @@ fn async_local_storage_survives_a_socket_read_callback() {
 
 #[test]
 fn async_local_storage_survives_two_requests_on_one_keep_alive_socket() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The pooled-socket case the failing tests use. The socket is created inside
     // `cls.run('first')`, so the handle captures that frame; the second read
     // arrives after the first response completed and must still see it, because
@@ -199,6 +218,7 @@ fn async_local_storage_survives_two_requests_on_one_keep_alive_socket() {
     // encode a behaviour Node does not have — the first version of this test did,
     // and `node` itself caught it.
     same_output_as_node(
+        oracle,
         "const net = require('net');\n\
          const { AsyncLocalStorage } = require('async_hooks');\n\
          const cls = new AsyncLocalStorage();\n\
@@ -231,6 +251,9 @@ fn async_local_storage_survives_two_requests_on_one_keep_alive_socket() {
 
 #[test]
 fn a_store_written_inside_a_callback_does_not_leak_to_the_next_one() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The other direction of the frame exchange. `AsyncContextFrame.exchange`
     // installs the resource's frame on entry; the pair to it is the restore on
     // exit, and without the restore everything that runs afterwards inherits the
@@ -239,6 +262,7 @@ fn a_store_written_inside_a_callback_does_not_leak_to_the_next_one() {
     // The observable consequence is that two interleaved requests each keep their
     // own store. A one-directional fix passes the test above and fails this one.
     same_output_as_node(
+        oracle,
         "const net = require('net');\n\
          const { AsyncLocalStorage } = require('async_hooks');\n\
          const cls = new AsyncLocalStorage();\n\
@@ -263,6 +287,9 @@ fn a_store_written_inside_a_callback_does_not_leak_to_the_next_one() {
 
 #[test]
 fn the_frame_is_in_place_before_the_before_hook_fires() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `InternalCallbackScope`'s constructor exchanges the frame at
     // `src/api/callback.cc:117`, pushes the context at `:124` and emits `before`
     // at `:127` — in that order. So a `before` hook is the one observer that runs
@@ -278,6 +305,7 @@ fn the_frame_is_in_place_before_the_before_hook_fires() {
     // closing. Both runtimes agree on it, which is why the expectation is this
     // shape rather than a tidy sequence of balanced pairs.
     same_output_as_node(
+        oracle,
         "const net = require('net');\n\
          const async_hooks = require('async_hooks');\n\
          const { AsyncLocalStorage } = require('async_hooks');\n\
@@ -311,6 +339,9 @@ fn the_frame_is_in_place_before_the_before_hook_fires() {
 
 #[test]
 fn a_throwing_callback_reports_before_its_microtasks_run() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The ordering, and it is not the intuitive one.
     // `InternalMakeCallback` sets `MarkAsFailed()` when the callback throws, so
     // `InternalCallbackScope::Close` returns at `if (failed_) return;` and its
@@ -322,6 +353,7 @@ fn a_throwing_callback_reports_before_its_microtasks_run() {
     // callback would produce `callback,microtask,listener` and pass any casual
     // smoke test.
     same_output_as_node(
+        oracle,
         "const net = require('net');\n\
          const order = [];\n\
          process.on('uncaughtException', () => order.push('listener'));\n\
@@ -344,11 +376,15 @@ fn a_throwing_callback_reports_before_its_microtasks_run() {
 
 #[test]
 fn a_throw_from_a_socket_read_callback_reaches_the_uncaught_handler() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // `InternalCallbackScope`'s `TryCatch` plus `TriggerUncaughtException` is
     // the only route from a native callback to `process.on('uncaughtException')`.
     // Without it the throw is dropped: the handler never closes the server, and
     // the process stays alive on the server's ref'd handle forever.
     same_output_as_node(
+        oracle,
         "const net = require('net');\n\
          process.once('uncaughtException', (error) => {\n\
            console.log('caught ' + error.message);\n\
@@ -365,10 +401,14 @@ fn a_throw_from_a_socket_read_callback_reaches_the_uncaught_handler() {
 
 #[test]
 fn a_throw_from_an_http_response_callback_reaches_the_uncaught_handler() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The same seam on the HTTP path, which is where the failing files sit. The
     // important half is that the *process exits*: a handler that does not
     // rethrow must let the loop drain normally if it closed everything it owned.
     same_output_as_node(
+        oracle,
         "const http = require('http');\n\
          process.once('uncaughtException', (error) => {\n\
            console.log('caught ' + error.message);\n\
@@ -388,6 +428,9 @@ fn a_throw_from_an_http_response_callback_reaches_the_uncaught_handler() {
 
 #[test]
 fn an_uncaught_error_that_nothing_handles_still_exits_non_zero() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The other half of the contract. Reporting an exception must not turn a
     // fatal error into a silent hang: with no listener, Node prints the error
     // and exits 1. A fix that swallowed the throw to make the handlers work
@@ -398,7 +441,7 @@ fn an_uncaught_error_that_nothing_handles_still_exits_non_zero() {
                     const client = net.connect(server.address().port);\n\
                     client.on('data', () => { throw new Error('handler-less'); });\n\
                   });";
-    let reference = run("node", script, Duration::from_secs(20));
+    let reference = run(oracle.reference_path(), script, Duration::from_secs(20));
     assert_eq!(
         reference.exit_code,
         Some(1),

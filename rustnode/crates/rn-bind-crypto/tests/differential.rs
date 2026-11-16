@@ -1,4 +1,4 @@
-//! Compares the binding against a real `node` binary where one is available.
+//! Compares the binding against the pinned Node oracle.
 //!
 //! Unit tests and the published vectors prove each algorithm in isolation. This
 //! proves the *surface*: that `getHashes()` and `getCiphers()` cover what Node
@@ -7,76 +7,39 @@
 //! test cannot catch — a correct SHA-256 that is not in the list, or a list that
 //! names an algorithm that then differs.
 //!
-//! The test is `#[ignore]`d when no `node` is on `PATH`, because CI for a Rust
-//! workspace may not have one. It is not a silent skip: `node_available()` prints
-//! why it did nothing, and the vector tests in the crate are the always-on
-//! equivalent.
-
-use std::process::Command;
+//! # Which Node this compares against
+//!
+//! The oracle is the binary `tools/node-pin.toml` pins, resolved by
+//! [`rn_node_oracle`]. Comparing cipher and digest *lists* across OpenSSL
+//! versions is only meaningful when both sides agree on the library, and the
+//! `node` on `PATH` is often a different release built against a different
+//! OpenSSL. A missing oracle skips loudly; a *different* Node fails, because a
+//! differential test against another version is a different test.
 
 use rn_bind_crypto::{engine, enumerate};
+use rn_node_oracle::Oracle;
 
-/// The `node` binary this test compares against, if any.
-///
-/// `RUSTNODE_PARITY_NODE` wins when set — the same variable
-/// `rn-bind-v8`'s contract test uses, so one export points every parity test at
-/// the pinned oracle. It matters more here than there: the `node` on `PATH` is
-/// often a different release built against a different OpenSSL, and comparing
-/// cipher and digest *lists* across OpenSSL versions is only meaningful when the
-/// two agree on the library. The value tests below are version-independent and
-/// run against whichever binary is found.
-fn node_binary() -> Option<String> {
-    let requested = std::env::var("RUSTNODE_PARITY_NODE").ok();
-    let candidate = requested.clone().unwrap_or_else(|| "node".to_string());
-    let usable = Command::new(&candidate)
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-    if usable {
-        return Some(candidate);
-    }
-    // An explicitly requested oracle that does not run is a misconfiguration, not
-    // an absent optional dependency. Skipping here would report a green run that
-    // measured nothing — the exact false pass this test exists to prevent — so it
-    // fails instead.
-    assert!(
-        requested.is_none(),
-        "RUSTNODE_PARITY_NODE={} does not run; refusing to skip a comparison \
-         that was explicitly requested",
-        candidate
-    );
-    None
+/// The oracle this test binary compares against, resolved and announced once.
+fn oracle() -> Option<&'static Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-bind-crypto differential"))
+        .as_ref()
 }
 
 /// Runs a one-line `node -e` and returns stdout, trimmed.
-fn node_eval(script: &str) -> Option<String> {
-    let output = Command::new(node_binary()?)
-        .arg("-e")
-        .arg(script)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// Whether the comparison binary is the pinned oracle rather than whatever
-/// `node` is on `PATH`.
 ///
-/// Only a binary built against the OpenSSL this workspace vendors supports a
-/// *spelling* comparison. A v22 reports `id-aes128-CCM` where this build and the
-/// pinned oracle report `id-aes128-ccm`, which is a difference in the other
-/// Node's OpenSSL, not a defect here.
-fn comparison_is_pinned_oracle() -> bool {
-    std::env::var("RUSTNODE_PARITY_NODE").is_ok_and(|value| !value.is_empty())
+/// The oracle is known to be the pinned build, so a script that fails is a
+/// defect in this test rather than a missing algorithm: it panics instead of
+/// returning `None`. The earlier version returned `None` here, which turned
+/// "Node could not compute SHA-256" into a silent pass.
+fn node_eval(oracle: &Oracle, script: &str) -> String {
+    oracle.eval(script)
 }
 
 #[test]
 fn digests_match_node_for_every_published_vector() {
-    let Some(_) = node_binary() else {
-        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
+    let Some(oracle) = oracle() else {
         return;
     };
 
@@ -102,12 +65,7 @@ fn digests_match_node_for_every_published_vector() {
             serde_json::to_string(algorithm).expect("algorithm json"),
             serde_json::to_string(input).expect("input json"),
         );
-        let Some(expected) = node_eval(&script) else {
-            eprintln!("skipping {algorithm}: node could not compute it");
-            // A build of Node without this algorithm is not a failure of this
-            // crate; the vector tests cover the value independently.
-            continue;
-        };
+        let expected = node_eval(oracle, &script);
         let actual = engine::digest_once(algorithm, input.as_bytes())
             .unwrap_or_else(|error| panic!("{algorithm} failed here: {error}"));
         let actual = actual
@@ -115,16 +73,17 @@ fn digests_match_node_for_every_published_vector() {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         assert_eq!(
-            actual, expected,
-            "{algorithm}({input:?}) disagrees with node"
+            actual,
+            expected,
+            "{algorithm}({input:?}) disagrees with {}",
+            oracle.describe()
         );
     }
 }
 
 #[test]
 fn hmac_matches_node_for_every_published_vector() {
-    let Some(_) = node_binary() else {
-        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
+    let Some(oracle) = oracle() else {
         return;
     };
 
@@ -149,10 +108,7 @@ fn hmac_matches_node_for_every_published_vector() {
             serde_json::to_string(key).expect("key json"),
             serde_json::to_string(data).expect("data json"),
         );
-        let Some(expected) = node_eval(&script) else {
-            eprintln!("skipping hmac {algorithm}: node could not compute it");
-            continue;
-        };
+        let expected = node_eval(oracle, &script);
         let actual = engine::hmac_once(algorithm, key.as_bytes(), data.as_bytes())
             .unwrap_or_else(|error| panic!("hmac {algorithm} failed here: {error}"));
         let actual = actual
@@ -160,24 +116,23 @@ fn hmac_matches_node_for_every_published_vector() {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         assert_eq!(
-            actual, expected,
-            "HMAC-{algorithm}({key:?}, {data:?}) disagrees with node"
+            actual,
+            expected,
+            "HMAC-{algorithm}({key:?}, {data:?}) disagrees with {}",
+            oracle.describe()
         );
     }
 }
 
 #[test]
 fn get_hashes_covers_what_node_reports() {
-    let Some(_) = node_binary() else {
-        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
+    let Some(oracle) = oracle() else {
         return;
     };
-    let Some(raw) =
-        node_eval("process.stdout.write(JSON.stringify(require('crypto').getHashes()))")
-    else {
-        eprintln!("skipping: node could not report getHashes()");
-        return;
-    };
+    let raw = node_eval(
+        oracle,
+        "process.stdout.write(JSON.stringify(require('crypto').getHashes()))",
+    );
     let node_hashes: Vec<String> =
         serde_json::from_str(&raw).expect("node getHashes() is a JSON array");
     let ours: std::collections::BTreeSet<String> = enumerate::digest_names().into_iter().collect();
@@ -201,7 +156,9 @@ fn get_hashes_covers_what_node_reports() {
     assert!(
         missing.is_empty(),
         "node lists these usable digests and rustnode does not: {missing:?}\n\
-         rustnode lists: {ours:?}"
+         rustnode lists: {ours:?}\n\
+         against {}",
+        oracle.describe()
     );
 
     // The reverse direction is a usability assertion plus a spelling assertion.
@@ -225,31 +182,23 @@ fn get_hashes_covers_what_node_reports() {
             node_lower.contains(&name.to_ascii_lowercase()) && !node_hashes.contains(name)
         })
         .collect();
-    if comparison_is_pinned_oracle() {
-        assert!(
-            misspelled.is_empty(),
-            "these digests are listed on both sides with a different spelling: {misspelled:?}"
-        );
-    } else if !misspelled.is_empty() {
-        eprintln!(
-            "note: {misspelled:?} differ in spelling from the `node` on PATH; set \
-             RUSTNODE_PARITY_NODE to the pinned binary to assert this"
-        );
-    }
+    assert!(
+        misspelled.is_empty(),
+        "these digests are listed on both sides with a different spelling: {misspelled:?}\n\
+         against {}",
+        oracle.describe()
+    );
 }
 
 #[test]
 fn get_ciphers_matches_node_within_the_shared_set() {
-    let Some(_) = node_binary() else {
-        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
+    let Some(oracle) = oracle() else {
         return;
     };
-    let Some(raw) =
-        node_eval("process.stdout.write(JSON.stringify(require('crypto').getCiphers()))")
-    else {
-        eprintln!("skipping: node could not report getCiphers()");
-        return;
-    };
+    let raw = node_eval(
+        oracle,
+        "process.stdout.write(JSON.stringify(require('crypto').getCiphers()))",
+    );
     let node_ciphers: Vec<String> =
         serde_json::from_str(&raw).expect("node getCiphers() is a JSON array");
     let ours: Vec<String> = enumerate::cipher_names();
@@ -282,31 +231,23 @@ fn get_ciphers_matches_node_within_the_shared_set() {
             node_lower.contains(&name.to_ascii_lowercase()) && !node_ciphers.contains(name)
         })
         .collect();
-    if comparison_is_pinned_oracle() {
-        assert!(
-            misspelled.is_empty(),
-            "these ciphers are listed on both sides with a different spelling: {misspelled:?}"
-        );
-    } else if !misspelled.is_empty() {
-        eprintln!(
-            "note: {misspelled:?} differ in spelling from the `node` on PATH; set \
-             RUSTNODE_PARITY_NODE to the pinned binary to assert this"
-        );
-    }
+    assert!(
+        misspelled.is_empty(),
+        "these ciphers are listed on both sides with a different spelling: {misspelled:?}\n\
+         against {}",
+        oracle.describe()
+    );
 }
 
 #[test]
 fn get_curves_covers_what_node_reports() {
-    let Some(_) = node_binary() else {
-        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
+    let Some(oracle) = oracle() else {
         return;
     };
-    let Some(raw) =
-        node_eval("process.stdout.write(JSON.stringify(require('crypto').getCurves()))")
-    else {
-        eprintln!("skipping: node could not report getCurves()");
-        return;
-    };
+    let raw = node_eval(
+        oracle,
+        "process.stdout.write(JSON.stringify(require('crypto').getCurves()))",
+    );
     let node_curves: Vec<String> =
         serde_json::from_str(&raw).expect("node getCurves() is a JSON array");
     let ours: std::collections::BTreeSet<String> = enumerate::curve_names().into_iter().collect();
@@ -319,7 +260,9 @@ fn get_curves_covers_what_node_reports() {
     // so this one can be an exact superset check.
     assert!(
         missing.is_empty(),
-        "node reports these curves and rustnode does not: {missing:?}"
+        "node reports these curves and rustnode does not: {missing:?}\n\
+         against {}",
+        oracle.describe()
     );
 }
 
@@ -334,30 +277,37 @@ fn random_bytes_are_not_repeated() {
 
 #[test]
 fn pbkdf2_and_scrypt_match_node() {
-    let Some(_) = node_binary() else {
-        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
+    let Some(oracle) = oracle() else {
         return;
     };
 
     let script = "process.stdout.write(require('crypto').pbkdf2Sync(\
          'password', 'salt', 1000, 32, 'sha256').toString('hex'))";
-    if let Some(expected) = node_eval(script) {
-        let actual = engine::pbkdf2("sha256", b"password", b"salt", 1000, 32)
-            .expect("pbkdf2")
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(actual, expected, "PBKDF2-SHA256 disagrees with node");
-    }
+    let expected = node_eval(oracle, script);
+    let actual = engine::pbkdf2("sha256", b"password", b"salt", 1000, 32)
+        .expect("pbkdf2")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        actual,
+        expected,
+        "PBKDF2-SHA256 disagrees with {}",
+        oracle.describe()
+    );
 
     let script = "process.stdout.write(require('crypto').scryptSync(\
          'password', 'salt', 32, { N: 1024, r: 8, p: 16 }).toString('hex'))";
-    if let Some(expected) = node_eval(script) {
-        let actual = engine::scrypt(b"password", b"salt", 1024, 8, 16, 32)
-            .expect("scrypt")
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(actual, expected, "scrypt disagrees with node");
-    }
+    let expected = node_eval(oracle, script);
+    let actual = engine::scrypt(b"password", b"salt", 1024, 8, 16, 32)
+        .expect("scrypt")
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(
+        actual,
+        expected,
+        "scrypt disagrees with {}",
+        oracle.describe()
+    );
 }

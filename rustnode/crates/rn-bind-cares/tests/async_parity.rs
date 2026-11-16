@@ -20,8 +20,6 @@
 //!   `http` and 54321 is `54321`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::Command;
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
@@ -308,51 +306,53 @@ fn the_recording_covers_the_interesting_cases() {
     assert_eq!(unassigned[2], "54321");
 }
 
-/// Replays the probe under a live `node` so the fixture cannot drift from the
-/// binary. Skipped silently when there is no `node` or it cannot run the probe.
+/// Replays the probe under the pinned oracle so the fixture cannot drift from
+/// the binary.
+///
+/// The reference is `tools/node-pin.toml`'s binary, not whatever `node` is on
+/// `PATH`; see [`rn_node_oracle`]. Every early return in the earlier version was
+/// a silent skip: a run that compared nothing looked exactly like a run that
+/// agreed.
 #[test]
-fn the_live_node_binary_agrees_with_the_async_recording() {
-    let Some(node) = node_binary() else {
+fn the_live_oracle_agrees_with_the_async_recording() {
+    let Some(oracle) = oracle() else {
         return;
     };
     let path = std::env::temp_dir().join(format!("rn-cares-async-probe-{}.js", std::process::id()));
-    if std::fs::write(&path, PROBE).is_err() {
-        return;
-    }
-    let output = Command::new(node)
+    std::fs::write(&path, PROBE).expect("the probe script is written");
+    let output = oracle
+        .command()
         .arg("--expose-internals")
         .arg(&path)
         .output();
     let _ = std::fs::remove_file(&path);
-    let Ok(output) = output else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
+    let output = output.unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
+    assert!(
+        output.status.success(),
+        "{} could not run the cares probe: {}",
+        oracle.describe(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(start) = stdout.find('[') else {
-        return;
-    };
+    let start = stdout
+        .find('[')
+        .unwrap_or_else(|| panic!("{} printed no JSON array", oracle.describe()));
     let fresh: Vec<serde_json::Value> =
-        serde_json::from_str(&stdout[start..]).expect("live node printed JSON");
+        serde_json::from_str(&stdout[start..]).expect("the live oracle printed JSON");
     let recorded: Vec<serde_json::Value> =
         serde_json::from_str(RECORDED).expect("recorded is JSON");
-    assert_eq!(fresh, recorded, "the recording has drifted from node");
+    assert_eq!(
+        fresh,
+        recorded,
+        "the recording has drifted from {}",
+        oracle.describe()
+    );
 }
 
-fn node_binary() -> Option<PathBuf> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg("command -v node")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(path))
+/// The oracle this test binary compares against, resolved and announced once.
+fn oracle() -> Option<&'static rn_node_oracle::Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<rn_node_oracle::Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-bind-cares async parity"))
+        .as_ref()
 }

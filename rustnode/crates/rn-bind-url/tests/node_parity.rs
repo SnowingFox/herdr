@@ -10,19 +10,17 @@
 //!
 //! # Which `node` this runs
 //!
-//! The oracle is the nightly rustnode tracks, resolved in this order:
+//! The oracle is the build `tools/node-pin.toml` pins, resolved by
+//! [`rn_node_oracle`] — not whatever `node` is on `PATH`. That matters acutely
+//! in this crate: this image's default is v22, which answers differently from
+//! the v28 nightly in exactly this crate's area (`^` in paths, the `update`
+//! guards, malformed punycode). A v22 run reports disagreements that are not
+//! defects and hides ones that are.
 //!
-//! 1. `HERDR_URL_ORACLE`, an absolute path to a `node` binary.
-//! 2. `$HOME/.cache/herdr-oracle/node`, the path the harness uses when it
-//!    downloads the pinned build.
-//! 3. `node` on `PATH`, with a warning.
-//!
-//! The `PATH` fallback is a known hazard and is deliberately loud: this image's
-//! default is v22, which answers differently from the v28 nightly in this
-//! crate's area (`^` in paths, the `update` guards, malformed punycode), so a
-//! v22 run reports disagreements that are not defects and would pass over ones
-//! that are. A test that cannot find the pinned oracle still runs — the tables
-//! are cheap — but prints which binary it compared against.
+//! With no oracle the parity checks skip loudly, naming every path searched.
+//! With a *different* Node they fail rather than comparing against the wrong
+//! engine, because a differential test against another Node version is a
+//! different test, not a weaker one.
 //!
 //! # How the comparison works
 //!
@@ -33,71 +31,18 @@
 //! then compare the href and all nine offsets. `canParse` is checked on the same
 //! table against `parse`, which is the agreement the two are required to have.
 
-use std::process::Command;
-
 use rn_core::{BindingModule, InstallCtx};
+use rn_node_oracle::Oracle;
 use rn_v8_sys::v8;
 
 use rn_bind_url::Url;
 
-/// The Node build this crate's expectations are pinned to.
-const PINNED_ORACLE_VERSION: &str = "v28.0.0-nightly20261111e8c1160d20";
-
-/// Absolute paths to try before falling back to `PATH`.
-///
-/// The pinned nightly is what the project's own instructions name; the cache
-/// path is where a harness that downloads it would put it.
-fn oracle_candidates() -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Ok(explicit) = std::env::var("HERDR_URL_ORACLE") {
-        if !explicit.is_empty() {
-            candidates.push(explicit);
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(format!("{home}/.cache/herdr-oracle/node"));
-        candidates.push(format!(
-            "{home}/.cache/herdr-oracle/node-{PINNED_ORACLE_VERSION}-linux-x64/bin/node"
-        ));
-    }
-    candidates.push(format!(
-        "/tmp/oracle-dl/node-{PINNED_ORACLE_VERSION}-linux-x64/bin/node"
-    ));
-    candidates
-}
-
-/// The oracle binary, or `None` when none of the candidates exists.
-fn oracle() -> Option<String> {
-    for candidate in oracle_candidates() {
-        let runs = Command::new(&candidate)
-            .arg("-e")
-            .arg("0")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        if runs {
-            return Some(candidate);
-        }
-    }
-    Command::new("node")
-        .arg("-e")
-        .arg("0")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|_| "node".to_string())
-}
-
-/// The oracle, with a warning when it is not the pinned build.
-fn node_binary() -> Option<String> {
-    let binary = oracle()?;
-    if binary == "node" {
-        eprintln!(
-            "warning: no pinned node oracle found; comparing against `node` on PATH \
-             (expected {PINNED_ORACLE_VERSION}). Set HERDR_URL_ORACLE to override."
-        );
-    }
-    Some(binary)
+/// The oracle this test binary compares against, resolved and announced once.
+fn oracle() -> Option<&'static Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-bind-url node parity"))
+        .as_ref()
 }
 
 /// The two lines every Node-side snippet needs: the internal binding, aliased
@@ -110,12 +55,12 @@ const NODE_PRELUDES: &str =
 /// The script is passed on stdin rather than as `-e`, because the sweeps here
 /// build case tables far past `ARG_MAX` and `execve` fails with
 /// `ArgumentListTooLong` long before the script itself is unreasonable.
-fn node_script(source: &str) -> String {
+fn node_script(oracle: &Oracle, source: &str) -> String {
     use std::io::Write;
     use std::process::Stdio;
 
-    let binary = node_binary().expect("the caller checked the oracle exists");
-    let mut child = Command::new(&binary)
+    let mut child = oracle
+        .command()
         .arg("--expose-internals")
         .arg("-")
         .stdin(Stdio::piped())
@@ -132,7 +77,8 @@ fn node_script(source: &str) -> String {
     let out = child.wait_with_output().expect("node runs");
     assert!(
         out.status.success(),
-        "node failed: {}",
+        "{} failed: {}",
+        oracle.describe(),
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -205,7 +151,7 @@ fn parse_here(input: &str, base: Option<&str>) -> Parsed {
 }
 
 /// Parses one input with a real Node binding.
-fn parse_there(input: &str, base: Option<&str>) -> Parsed {
+fn parse_there(oracle: &Oracle, input: &str, base: Option<&str>) -> Parsed {
     let source = format!(
         r#"
         const {{ internalBinding }} = require('internal/test/binding');
@@ -220,7 +166,7 @@ fn parse_there(input: &str, base: Option<&str>) -> Parsed {
         input = js_string(input),
         base = base.map_or("undefined".to_string(), js_string),
     );
-    parse_result(&node_script(&source))
+    parse_result(&node_script(oracle, &source))
 }
 
 /// Reads `{"href": .., "components": [..]}` without pulling in a JSON library.
@@ -270,22 +216,22 @@ fn js_string(value: &str) -> String {
 }
 
 /// Runs `parse` here and in Node for every case, asserting they agree.
-fn assert_parse_parity(cases: &[(&str, Option<&str>)]) {
-    assert_parse_parity_expecting(cases, true)
+fn assert_parse_parity(oracle: &Oracle, cases: &[(&str, Option<&str>)]) {
+    assert_parse_parity_expecting(oracle, cases, true)
 }
 
 /// `assert_parse_parity`, with the anti-vacuity guard made optional so a table
 /// that is deliberately all-failures can still be checked.
-fn assert_parse_parity_expecting(cases: &[(&str, Option<&str>)], expect_mostly_valid: bool) {
-    if node_binary().is_none() {
-        eprintln!("no node oracle available; skipping the parity check");
-        return;
-    }
+fn assert_parse_parity_expecting(
+    oracle: &Oracle,
+    cases: &[(&str, Option<&str>)],
+    expect_mostly_valid: bool,
+) {
     let mut failures = Vec::new();
     let mut parsed_ok = 0usize;
     for (input, base) in cases {
         let here = parse_here(input, *base);
-        let there = parse_there(input, *base);
+        let there = parse_there(oracle, input, *base);
         if here.href.is_some() {
             parsed_ok += 1;
             assert_eq!(here.components.len(), 9, "components for {input:?}");
@@ -512,17 +458,26 @@ const RESOLUTION_CASES: &[(&str, Option<&str>)] = &[
 
 #[test]
 fn parse_matches_node_for_the_required_url_shapes() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     let cases: Vec<(&str, Option<&str>)> = PARSE_CASES.iter().map(|input| (*input, None)).collect();
-    assert_parse_parity(&cases);
+    assert_parse_parity(oracle, &cases);
 }
 
 #[test]
 fn parse_matches_node_when_resolving_against_a_base() {
-    assert_parse_parity(RESOLUTION_CASES);
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    assert_parse_parity(oracle, RESOLUTION_CASES);
 }
 
 #[test]
 fn parse_matches_node_for_every_failure_case() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
     // The failures are already inside the tables above; this names them so a
     // failure reports which class regressed rather than only which string.
     let cases: Vec<(&str, Option<&str>)> = [
@@ -536,7 +491,7 @@ fn parse_matches_node_for_every_failure_case() {
     .iter()
     .map(|input| (*input, None))
     .collect();
-    assert_parse_parity_expecting(&cases, false);
+    assert_parse_parity_expecting(oracle, &cases, false);
 }
 
 #[test]
@@ -592,10 +547,9 @@ fn can_parse_agrees_with_parse_on_every_case() {
 
 #[test]
 fn can_parse_matches_node_on_every_case() {
-    if node_binary().is_none() {
-        eprintln!("no node oracle available; skipping the parity check");
+    let Some(oracle) = oracle() else {
         return;
-    }
+    };
     let mut cases: Vec<(&str, Option<&str>)> =
         PARSE_CASES.iter().map(|input| (*input, None)).collect();
     cases.extend_from_slice(RESOLUTION_CASES);
@@ -627,7 +581,8 @@ fn can_parse_matches_node_on_every_case() {
     );
 
     let here: Vec<bool> = serde_json::from_str(&eval(&here_source)).expect("valid JSON");
-    let there: Vec<bool> = serde_json::from_str(&node_script(&there_source)).expect("valid JSON");
+    let there: Vec<bool> =
+        serde_json::from_str(&node_script(oracle, &there_source)).expect("valid JSON");
     assert_eq!(here, there, "canParse disagrees with node");
 }
 
@@ -822,7 +777,10 @@ fn update_cases() -> Vec<UpdateCase> {
 
 /// Runs one batch of `update` cases through both runtimes and returns the
 /// disagreements, paired with the case that produced them.
-fn update_disagreements(cases: &[UpdateCase]) -> Vec<(UpdateCase, String, String)> {
+fn update_disagreements(
+    oracle: &Oracle,
+    cases: &[UpdateCase],
+) -> Vec<(UpdateCase, String, String)> {
     let source_cases = {
         let mut text = String::new();
         for (base, action, value) in cases {
@@ -844,10 +802,10 @@ fn update_disagreements(cases: &[UpdateCase]) -> Vec<(UpdateCase, String, String
         }});"#
     );
     let here = eval(&format!("{body}\nglobalThis.__out = JSON.stringify(out);"));
-    let there = node_script(&format!(
-        "{}{body}\nconsole.log(JSON.stringify(out));",
-        NODE_PRELUDES
-    ));
+    let there = node_script(
+        oracle,
+        &format!("{}{body}\nconsole.log(JSON.stringify(out));", NODE_PRELUDES),
+    );
 
     let here: Vec<serde_json::Value> = serde_json::from_str(&here).expect("valid JSON");
     let there: Vec<serde_json::Value> = serde_json::from_str(&there).expect("valid JSON");
@@ -864,16 +822,15 @@ fn update_disagreements(cases: &[UpdateCase]) -> Vec<(UpdateCase, String, String
 
 #[test]
 fn update_matches_node_on_every_action_and_value() {
-    if node_binary().is_none() {
-        eprintln!("no node oracle available; skipping the parity check");
+    let Some(oracle) = oracle() else {
         return;
-    }
+    };
     let cases = update_cases();
     // Batched so one disagreement does not require running the whole cross
     // product again, and so a single script stays a sane size.
     let mut disagreements = Vec::new();
     for chunk in cases.chunks(2_000) {
-        disagreements.extend(update_disagreements(chunk));
+        disagreements.extend(update_disagreements(oracle, chunk));
     }
     let report: Vec<String> = disagreements
         .iter()
@@ -905,10 +862,9 @@ fn update_matches_node_on_every_action_and_value() {
 /// class would have called, one action per row.
 #[test]
 fn every_byte_matches_node_in_every_component() {
-    if node_binary().is_none() {
-        eprintln!("no node oracle available; skipping the parity check");
+    let Some(oracle) = oracle() else {
         return;
-    }
+    };
 
     // Rows are `[kind, payload, action]`; `kind` is "parse" or "update".
     let mut rows: Vec<(String, String, String, String)> = Vec::new();
@@ -983,9 +939,10 @@ fn every_byte_matches_node_in_every_component() {
     // read as an opaque JSON value rather than a `(String, Vec<String>)`.
     let here: Vec<(String, serde_json::Value)> =
         serde_json::from_str(&eval(&body)).expect("valid JSON");
-    let there: Vec<(String, serde_json::Value)> = serde_json::from_str(&node_script(&format!(
-        "{NODE_PRELUDES}{body}\nconsole.log(JSON.stringify(out));"
-    )))
+    let there: Vec<(String, serde_json::Value)> = serde_json::from_str(&node_script(
+        oracle,
+        &format!("{NODE_PRELUDES}{body}\nconsole.log(JSON.stringify(out));"),
+    ))
     .expect("valid JSON");
     assert_eq!(here.len(), there.len(), "one result per case");
     assert_eq!(here.len(), rows.len(), "one result per case");
@@ -1011,10 +968,9 @@ fn every_byte_matches_node_in_every_component() {
 
 #[test]
 fn format_matches_node_for_every_flag_combination() {
-    if node_binary().is_none() {
-        eprintln!("no node oracle available; skipping the parity check");
+    let Some(oracle) = oracle() else {
         return;
-    }
+    };
     let hrefs = [
         "https://user:pw@example.com:8080/a/b?q=1#f",
         "http://example.com/",
@@ -1060,10 +1016,10 @@ fn format_matches_node_for_every_flag_combination() {
           urlBinding.format(href, fragment, unicode, search, auth));"#
     );
     let here = eval(&format!("{body}\nglobalThis.__out = JSON.stringify(out);"));
-    let there = node_script(&format!(
-        "{}{body}\nconsole.log(JSON.stringify(out));",
-        NODE_PRELUDES
-    ));
+    let there = node_script(
+        oracle,
+        &format!("{}{body}\nconsole.log(JSON.stringify(out));", NODE_PRELUDES),
+    );
     let here: Vec<String> = serde_json::from_str(&here).expect("valid JSON");
     let there: Vec<String> = serde_json::from_str(&there).expect("valid JSON");
     assert_eq!(here.len(), there.len());
@@ -1094,10 +1050,9 @@ fn format_matches_node_for_every_flag_combination() {
 
 #[test]
 fn get_origin_matches_node() {
-    if node_binary().is_none() {
-        eprintln!("no node oracle available; skipping the parity check");
+    let Some(oracle) = oracle() else {
         return;
-    }
+    };
     let hrefs = [
         "https://user:pw@example.com:8080/a?q#f",
         "http://example.com",
@@ -1132,36 +1087,35 @@ fn get_origin_matches_node() {
         }});"#
     );
     let here = eval(&format!("{body}\nglobalThis.__out = JSON.stringify(out);"));
-    let there = node_script(&format!(
-        "{}{body}\nconsole.log(JSON.stringify(out));",
-        NODE_PRELUDES
-    ));
+    let there = node_script(
+        oracle,
+        &format!("{}{body}\nconsole.log(JSON.stringify(out));", NODE_PRELUDES),
+    );
     assert_eq!(here, there, "getOrigin disagrees with node");
 }
 
 #[test]
 fn get_origin_throws_the_same_error_as_node() {
-    if node_binary().is_none() {
-        eprintln!("no node oracle available; skipping the parity check");
+    let Some(oracle) = oracle() else {
         return;
-    }
+    };
     let body = r#"const out = (() => {
           try { urlBinding.getOrigin('bad url'); return ['no throw']; }
           catch (error) { return [error.name, error.code, error.message, error.input]; }
         })();"#;
     let here = eval(&format!("{body}\nglobalThis.__out = JSON.stringify(out);"));
-    let there = node_script(&format!(
-        "{NODE_PRELUDES}{body}\nconsole.log(JSON.stringify(out));"
-    ));
+    let there = node_script(
+        oracle,
+        &format!("{NODE_PRELUDES}{body}\nconsole.log(JSON.stringify(out));"),
+    );
     assert_eq!(here, there, "the ERR_INVALID_URL shape disagrees");
 }
 
 #[test]
 fn path_to_file_url_matches_node() {
-    if node_binary().is_none() {
-        eprintln!("no node oracle available; skipping the parity check");
+    let Some(oracle) = oracle() else {
         return;
-    }
+    };
     let paths = [
         "/tmp/x",
         "/tmp/a b",
@@ -1206,10 +1160,10 @@ fn path_to_file_url_matches_node() {
         const out = cases.map((path) => urlBinding.pathToFileURL(path, false));"#
     );
     let here = eval(&format!("{body}\nglobalThis.__out = JSON.stringify(out);"));
-    let there = node_script(&format!(
-        "{}{body}\nconsole.log(JSON.stringify(out));",
-        NODE_PRELUDES
-    ));
+    let there = node_script(
+        oracle,
+        &format!("{}{body}\nconsole.log(JSON.stringify(out));", NODE_PRELUDES),
+    );
     let here: Vec<String> = serde_json::from_str(&here).expect("valid JSON");
     let there: Vec<String> = serde_json::from_str(&there).expect("valid JSON");
     let disagreements: Vec<String> = here
@@ -1235,10 +1189,9 @@ fn path_to_file_url_matches_node() {
 
 #[test]
 fn domain_members_match_node() {
-    if node_binary().is_none() {
-        eprintln!("no node oracle available; skipping the parity check");
+    let Some(oracle) = oracle() else {
         return;
-    }
+    };
     let domains = [
         "example.com",
         "EXAMPLE.COM",
@@ -1297,10 +1250,10 @@ fn domain_members_match_node() {
         ]);"#
     );
     let here = eval(&format!("{body}\nglobalThis.__out = JSON.stringify(out);"));
-    let there = node_script(&format!(
-        "{}{body}\nconsole.log(JSON.stringify(out));",
-        NODE_PRELUDES
-    ));
+    let there = node_script(
+        oracle,
+        &format!("{}{body}\nconsole.log(JSON.stringify(out));", NODE_PRELUDES),
+    );
     let here: Vec<(String, String)> = serde_json::from_str(&here).expect("valid JSON");
     let there: Vec<(String, String)> = serde_json::from_str(&there).expect("valid JSON");
     let disagreements: Vec<String> = here

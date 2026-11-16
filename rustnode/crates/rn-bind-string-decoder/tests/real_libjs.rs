@@ -22,7 +22,6 @@
 //! decoding behaviour under test.
 
 use std::path::Path;
-use std::process::Command;
 
 use rn_bind_string_decoder::StringDecoder;
 use rn_core::{AsyncIds, BindingModule, InstallCtx};
@@ -429,19 +428,16 @@ fn real_every_encoding_decodes() {
     );
 }
 
-/// Compares the real module against real Node for a set of decoders driven
-/// through `write`/`end`. Skipped when no `node` is on `PATH`.
+/// Compares the real module against the pinned oracle for a set of decoders
+/// driven through `write`/`end`.
+///
+/// The oracle is `tools/node-pin.toml`'s binary, not whatever `node` is on
+/// `PATH`; a wrong-version Node fails rather than comparing against the wrong
+/// engine, and a machine with none skips loudly.
 fn real_module_matches_node() {
-    let node_available = Command::new("node")
-        .arg("-e")
-        .arg("0")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false);
-    if !node_available {
-        eprintln!("skipping: no node on PATH");
+    let Some(oracle) = rn_node_oracle::require_oracle("rn-bind-string-decoder real libjs") else {
         return;
-    }
+    };
 
     // (encoding, chunks, flush) — the same shape `tests/node_parity.rs` uses.
     let cases: &[(&str, &[&[u8]], bool)] = &[
@@ -496,14 +492,16 @@ for (const testCase of cases) {{
 process.stdout.write(JSON.stringify(out));
 "#
     );
-    let output = Command::new("node")
+    let output = oracle
+        .command()
         .arg("-e")
         .arg(&node_script)
         .output()
-        .expect("node runs");
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
     assert!(
         output.status.success(),
-        "node failed: {}",
+        "{} failed: {}",
+        oracle.describe(),
         String::from_utf8_lossy(&output.stderr)
     );
     let node_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();

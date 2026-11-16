@@ -52,4 +52,5 @@ openssl-sys = { version = "=0.9.118", features = ["vendored"] }
 libc = { workspace = true }
 
 [dev-dependencies]
+rn-node-oracle = { path = "../../tools/node-oracle" }
 serde_json.workspace = true

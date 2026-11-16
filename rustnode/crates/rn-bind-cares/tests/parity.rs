@@ -18,11 +18,9 @@
 //!
 //! Comparing against a recording rather than hand-written expectations means a
 //! misreading of libuv or c-ares shows up as a mismatch instead of as agreement
-//! with itself. When `node` is on `PATH` the recording is regenerated and
-//! compared too, so the fixture cannot silently drift from the binary.
-
-use std::path::PathBuf;
-use std::process::Command;
+//! with itself. The recording is also regenerated from the pinned Node oracle
+//! and compared, so the fixture cannot silently drift from the binary; see
+//! [`rn_node_oracle`] for why that binary is not whatever `node` is on `PATH`.
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
@@ -93,21 +91,12 @@ fn ours() -> String {
     run(&mut context_scope, PROBE)
 }
 
-/// Where `node` lives, when it is on `PATH`.
-fn node_binary() -> Option<PathBuf> {
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg("command -v node")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(path))
+/// The oracle this test binary compares against, resolved and announced once.
+fn oracle() -> Option<&'static rn_node_oracle::Oracle> {
+    static ORACLE: std::sync::OnceLock<Option<rn_node_oracle::Oracle>> = std::sync::OnceLock::new();
+    ORACLE
+        .get_or_init(|| rn_node_oracle::require_oracle("rn-bind-cares parity"))
+        .as_ref()
 }
 
 fn compare(label: &str, recorded: &str, actual: &str) {
@@ -122,38 +111,39 @@ fn the_binding_matches_the_recorded_node_answers() {
     compare("cares_wrap", RECORDED, &ours());
 }
 
-/// Regenerates the recording from a live `node` and compares it, so a fixture
-/// that no longer reflects the binary fails here rather than passing quietly.
+/// Regenerates the recording from the pinned oracle and compares it, so a
+/// fixture that no longer reflects the binary fails here rather than passing
+/// quietly.
+///
+/// The reference is the binary `tools/node-pin.toml` pins, not whatever `node`
+/// is on `PATH`; see [`rn_node_oracle`]. This test used to return early when
+/// `node` was missing, which made a green run indistinguishable from one that
+/// had not compared anything at all.
 #[test]
-fn the_live_node_binary_agrees_with_the_recording() {
-    let Some(node) = node_binary() else {
-        // No `node` on this machine: the fixture is still checked by the test
-        // above, so skipping is honest rather than hiding a gap.
+fn the_live_oracle_agrees_with_the_recording() {
+    let Some(oracle) = oracle() else {
         return;
     };
     let path = std::env::temp_dir().join(format!("rn-cares-probe-{}.js", std::process::id()));
-    if std::fs::write(&path, PROBE).is_err() {
-        return;
-    }
-
-    let output = Command::new(node)
+    std::fs::write(&path, PROBE).expect("the probe script is written");
+    let output = oracle
+        .command()
         .arg("--expose-internals")
         .arg(&path)
         .output();
     let _ = std::fs::remove_file(&path);
-    let Ok(output) = output else {
-        return;
-    };
-    if !output.status.success() {
-        // A binary that cannot run the probe is not a parity failure; the
-        // fixture check above still runs.
-        return;
-    }
+    let output = output.unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
+    assert!(
+        output.status.success(),
+        "{} could not run the cares probe: {}",
+        oracle.describe(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(start) = stdout.find('{') else {
-        return;
-    };
-    compare("live node", RECORDED, &stdout[start..]);
+    let start = stdout
+        .find('{')
+        .unwrap_or_else(|| panic!("{} printed no JSON object", oracle.describe()));
+    compare("live oracle", RECORDED, &stdout[start..]);
 }
 
 /// The fixture is only useful if it actually covers the members under test. A

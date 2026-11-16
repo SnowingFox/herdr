@@ -29,4 +29,5 @@ brotli-decompressor = { version = "=5.0.3", default-features = false, features =
 zstd-sys = { version = "=2.0.17", default-features = false, features = ["zdict_builder"] }
 
 [dev-dependencies]
+rn-node-oracle = { path = "../../tools/node-oracle" }
 serde_json.workspace = true
