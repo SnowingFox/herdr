@@ -914,12 +914,173 @@ fn phase_constant(phase: v8::ModuleImportPhase) -> i32 {
     }
 }
 
-fn create_required_module_facade(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue,
+/// The URL and source of the facade module, from `src/env_properties.h`
+/// (`required_module_facade_url_string` / `required_module_facade_source_string`).
+///
+/// Both are part of the contract, not an implementation detail: the object the
+/// CommonJS loader ends up with as `module.exports` is *this* module's
+/// namespace, so the export names — including `__esModule` — are exactly what
+/// the source says. The URL is also what Node reuses so the facade hits the
+/// compilation cache.
+const REQUIRED_MODULE_FACADE_URL: &str = "node:internal/require_module_default_facade";
+const REQUIRED_MODULE_FACADE_SOURCE: &str =
+    "export * from 'original'; export { default } from 'original'; export const __esModule = true;";
+
+thread_local! {
+    /// The module the facade's `import 'original'` resolves to.
+    ///
+    /// Node stashes it on `Environment` for the duration of
+    /// `InstantiateModule` and restores it immediately, because
+    /// `ResolveModuleCallback` is a bare function pointer with no data slot.
+    /// The same constraint applies here, so the slot is thread-local and is
+    /// emptied as soon as instantiation returns.
+    static FACADE_ORIGINAL: RefCell<Option<v8::Global<v8::Module>>> =
+        const { RefCell::new(None) };
+}
+
+/// `createRequiredModuleFacade(wrap)`: the `module.exports` of a `require()`d
+/// ES module, when that module has a `default` export.
+///
+/// `lib/internal/modules/cjs/loader.js` calls this from
+/// `populateCJSExportsFromESM` instead of handing back the namespace directly,
+/// so that transpiled CommonJS consumers (`_mod.__esModule ? _mod.default : _mod`)
+/// see the module as ESM while the named exports stay live bindings. Node does
+/// it by compiling a three-line facade that re-exports the original module and
+/// adds `__esModule`, instantiating it against the original, and returning the
+/// facade's namespace:
+///
+/// ```text
+/// export * from 'original';
+/// export { default } from 'original';
+/// export const __esModule = true;
+/// ```
+///
+/// The facade has no top-level await, so evaluation settles synchronously.
+fn create_required_module_facade<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
 ) {
-    throw_error(scope, "createRequiredModuleFacade is not implemented yet");
+    let wrapper = args.get(0);
+    let Ok(wrapper) = v8::Local::<v8::Object>::try_from(wrapper) else {
+        throw_type_error(scope, "createRequiredModuleFacade requires a ModuleWrap");
+        return;
+    };
+    let Some(original) = module_of(scope, wrapper) else {
+        throw_type_error(scope, "createRequiredModuleFacade requires a ModuleWrap");
+        return;
+    };
+
+    let Some(source) = v8::String::new(scope, REQUIRED_MODULE_FACADE_SOURCE) else {
+        throw_error(scope, "cannot allocate the required module facade source");
+        return;
+    };
+    let Some(url) = v8::String::new(scope, REQUIRED_MODULE_FACADE_URL) else {
+        throw_error(scope, "cannot allocate the required module facade url");
+        return;
+    };
+    // Same origin Node builds: an ES module whose resource name is the facade
+    // URL, which is what makes a stack frame in it read as the facade rather
+    // than as the original module.
+    let origin = v8::ScriptOrigin::new(
+        scope,
+        url.into(),
+        0,
+        0,
+        true,
+        -1,
+        None,
+        false,
+        false,
+        true,
+        None,
+    );
+    let mut source_text = v8::script_compiler::Source::new(source, Some(&origin));
+    let Some(facade) = v8::script_compiler::compile_module2(
+        scope,
+        &mut source_text,
+        v8::script_compiler::CompileOptions::NoCompileOptions,
+        v8::script_compiler::NoCacheReason::BecauseModule,
+    ) else {
+        // The exception is pending; the facade source is a constant, so this
+        // means the realm is in a state where modules cannot compile at all.
+        return;
+    };
+
+    FACADE_ORIGINAL.with(|slot| {
+        *slot.borrow_mut() = Some(v8::Global::new(scope, original));
+    });
+    let instantiated = facade.instantiate_module(scope, resolve_facade_original);
+    // Restored unconditionally: a failed instantiation must not leave the slot
+    // pointing at a module a later facade would then wrongly re-export.
+    FACADE_ORIGINAL.with(|slot| slot.borrow_mut().take());
+    if instantiated != Some(true) {
+        // Instantiation threw, and the exception is already pending.
+        return;
+    }
+
+    let Some(evaluated) = facade.evaluate(scope) else {
+        return;
+    };
+    let Ok(promise) = v8::Local::<v8::Promise>::try_from(evaluated) else {
+        throw_error(
+            scope,
+            "required module facade evaluation did not return a promise",
+        );
+        return;
+    };
+    // Node `CHECK`s this settled as fulfilled, because the original module is
+    // already evaluated by the time `require()` is asked for its exports. A
+    // rejection means the graph is in a state the loader never produces, so
+    // it is reported as the original failure rather than as a crash.
+    if promise.state() != v8::PromiseState::Fulfilled {
+        rn_bind_task_queue::mark_promise_handled(scope, promise);
+        let rejection = promise.result(scope);
+        scope.throw_exception(rejection);
+        return;
+    }
+    rv.set(facade.get_module_namespace());
+}
+
+/// `LinkRequireFacadeWithOriginal`: resolves the facade's single import.
+///
+/// Node `CHECK`s the specifier is `'original'` and the stashed module is
+/// non-empty. The facade source is a constant, so a different specifier cannot
+/// occur; the check is kept so a future edit to the source fails loudly here
+/// instead of silently re-exporting the wrong module.
+fn resolve_facade_original<'s>(
+    context: v8::Local<'s, v8::Context>,
+    specifier: v8::Local<'s, v8::String>,
+    _attributes: v8::Local<'s, v8::FixedArray>,
+    _referrer: v8::Local<'s, v8::Module>,
+) -> Option<v8::Local<'s, v8::Module>> {
+    v8::callback_scope!(unsafe scope, context);
+    let expected = v8::String::new(scope, "original");
+    if expected
+        .map(|expected| expected != specifier)
+        .unwrap_or(true)
+    {
+        throw_error(
+            scope,
+            "required module facade imported something other than 'original'",
+        );
+        return None;
+    }
+    let original = FACADE_ORIGINAL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|module| v8::Local::new(scope, module))
+    });
+    match original {
+        Some(original) => Some(original),
+        None => {
+            throw_error(
+                scope,
+                "required module facade has no original module to link",
+            );
+            None
+        }
+    }
 }
 
 fn set_dynamic_import<'s>(
