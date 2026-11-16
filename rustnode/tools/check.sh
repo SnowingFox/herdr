@@ -185,6 +185,14 @@ step "process has no member the oracle lacks, and lacks none it has"
 # missing. The audit's own default is the release binary, which belongs to a
 # human or CI run that has one; `process` own-property names do not differ
 # between profiles, so naming the debug build measures the same surface.
+#
+# The self-test runs first, in the same step: the doc source is what decides the
+# documented set, and its two historical defects were both silent passes — a
+# rate-limited `api.github.com` aborted the whole step over a documentation
+# fetch, and an empty parse would have made every population match over no
+# docs at all. The self-test pins the fail-closed behaviour without a network or
+# a pinned tree, and it is a separate statement so its status is the gate's.
+python3 tools/process-member-audit.py --self-test
 python3 tools/process-member-audit.py --rustnode target/debug/rustnode
 
 step "the per-context globals still behave as Node's do"
