@@ -1159,11 +1159,7 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::method(callback).build(scope);
-    let function = template
-        .get_function(scope)
-        .ok_or_else(|| format!("cannot allocate {name}"))?;
-    Ok(function.into())
+    Ok(rn_core::named_method(scope, name, callback)?.into())
 }
 
 fn set(

@@ -54,14 +54,16 @@ use crate::fsops::{self, TimeSpec};
 use crate::request::{classify, install_sentinel, throw_error, Delivery};
 use crate::stats::{Follow, StatFields, StatFsFields};
 
-/// Binds a Rust callback as a namespace function.
+/// Binds a Rust callback as a namespace function, named after its property.
+///
+/// `rn_core::set_method` is `node::SetMethod`, whose last act is
+/// `function->SetName(name_string)`. A function built with the bare V8 builder
+/// and set on the object reports `name === ""`, which is observable in stack
+/// traces and `util.inspect`; `tools/function-name-audit.py` measures it against
+/// the oracle for every member of every namespace.
 macro_rules! mkfn {
     ($installer:expr, $name:expr, $callback:expr) => {{
-        let template = rn_core::method($callback).build($installer.scope);
-        let function = template
-            .get_function($installer.scope)
-            .ok_or_else(|| format!("cannot allocate fs.{}", $name))?;
-        $installer.define($name, function.into())?;
+        rn_core::set_method($installer.scope, $installer.object, $name, $callback)?;
     }};
 }
 
@@ -354,10 +356,10 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
     /// is the `oncomplete` property.
     fn fs_req_callback(&mut self) -> Result<(), String> {
         let template = rn_core::class(fs_req_callback_ctor).build(self.scope);
-        let function = template
-            .get_function(self.scope)
-            .ok_or("cannot allocate fs.FSReqCallback")?;
-        self.define("FSReqCallback", function.into())
+        // `SetConstructorFunction` sets the class name from the property name,
+        // so `fs.FSReqCallback.name` is `"FSReqCallback"`.
+        rn_core::set_class(self.scope, self.object, "FSReqCallback", template)?;
+        Ok(())
     }
 
     /// Defines the two one-shot file job constructors.

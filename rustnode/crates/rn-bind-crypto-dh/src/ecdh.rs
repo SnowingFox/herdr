@@ -761,22 +761,10 @@ pub fn install_classes<'s>(
     );
     let class_name = v8::String::new(scope, "ECDH").ok_or("cannot allocate the ECDH class name")?;
     template.set_class_name(class_name);
-    let function = template
-        .get_function(scope)
-        .ok_or("cannot allocate the ECDH constructor")?;
-    let key = v8::String::new(scope, "ECDH").ok_or("cannot allocate the ECDH name")?;
-    target.set(scope, key.into(), function.into());
-
-    // `ECDH::Initialize` installs this with `SetMethodNoSideEffect`, which is
-    // the same `ConstructorBehavior::kThrow` as `SetMethod`, so a bare builder
-    // made it constructible here where Node throws.
-    let convert = rn_core::method(convert_key)
-        .build(scope)
-        .get_function(scope)
-        .ok_or("cannot allocate crypto.ECDHConvertKey")?;
-    let key = v8::String::new(scope, "ECDHConvertKey")
-        .ok_or("cannot allocate the ECDHConvertKey name")?;
-    target.set(scope, key.into(), convert.into());
+    // `SetConstructorFunction(…, SET_CLASS_NAME)` names the class from the
+    // property, and `SetMethodNoSideEffect` names `ECDHConvertKey` from its own.
+    rn_core::set_class(scope, target, "ECDH", template)?;
+    rn_core::set_method(scope, target, "ECDHConvertKey", convert_key)?;
     Ok(())
 }
 

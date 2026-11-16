@@ -1,0 +1,660 @@
+{
+  "block_list.BlockList": {
+    "addAddress": "addAddress",
+    "addAddresses": "addAddresses",
+    "addRange": "addRange",
+    "addSubnet": "addSubnet",
+    "check": "check",
+    "checkString": "checkString",
+    "clear": "clear",
+    "getRules": "getRules",
+    "getSize": "getSize",
+    "removeAddress": "removeAddress",
+    "removeRange": "removeRange",
+    "removeSubnet": "removeSubnet"
+  },
+  "block_list.SocketAddress": {
+    "detail": "detail",
+    "flowlabel": "flowlabel",
+    "legacyDetail": "legacyDetail"
+  },
+  "cares_wrap.ChannelWrap": {
+    "cancel": "cancel",
+    "getHostByAddr": "getHostByAddr",
+    "getServers": "getServers",
+    "queryA": "queryA",
+    "queryAaaa": "queryAaaa",
+    "queryAny": "queryAny",
+    "queryCaa": "queryCaa",
+    "queryCname": "queryCname",
+    "queryMx": "queryMx",
+    "queryNaptr": "queryNaptr",
+    "queryNs": "queryNs",
+    "queryPtr": "queryPtr",
+    "querySoa": "querySoa",
+    "querySrv": "querySrv",
+    "queryTlsa": "queryTlsa",
+    "queryTxt": "queryTxt",
+    "setLocalAddress": "setLocalAddress",
+    "setServers": "setServers"
+  },
+  "cares_wrap.GetAddrInfoReqWrap": {},
+  "cares_wrap.GetNameInfoReqWrap": {},
+  "cares_wrap.QueryReqWrap": {},
+  "contextify.ContextifyScript": {
+    "createCachedData": "createCachedData",
+    "runInContext": "runInContext"
+  },
+  "crypto.AESCipherJob": {
+    "run": "run"
+  },
+  "crypto.Argon2Job": {
+    "run": "run"
+  },
+  "crypto.ChaCha20Poly1305CipherJob": {
+    "run": "run"
+  },
+  "crypto.CheckPrimeJob": {
+    "run": "run"
+  },
+  "crypto.CipherBase": {
+    "final": "final",
+    "getAuthTag": "getAuthTag",
+    "setAAD": "setAAD",
+    "setAuthTag": "setAuthTag",
+    "setAutoPadding": "setAutoPadding",
+    "update": "update"
+  },
+  "crypto.DHBitsJob": {
+    "run": "run"
+  },
+  "crypto.DhKeyPairGenJob": {
+    "run": "run"
+  },
+  "crypto.DiffieHellman": {
+    "computeSecret": "computeSecret",
+    "generateKeys": "generateKeys",
+    "getGenerator": "getGenerator",
+    "getPrime": "getPrime",
+    "getPrivateKey": "getPrivateKey",
+    "getPublicKey": "getPublicKey",
+    "setPrivateKey": "setPrivateKey",
+    "setPublicKey": "setPublicKey"
+  },
+  "crypto.DiffieHellmanGroup": {
+    "computeSecret": "computeSecret",
+    "generateKeys": "generateKeys",
+    "getGenerator": "getGenerator",
+    "getPrime": "getPrime",
+    "getPrivateKey": "getPrivateKey",
+    "getPublicKey": "getPublicKey",
+    "setPrivateKey": "setPrivateKey",
+    "setPublicKey": "setPublicKey"
+  },
+  "crypto.DsaKeyPairGenJob": {
+    "run": "run"
+  },
+  "crypto.ECDH": {
+    "computeSecret": "computeSecret",
+    "generateKeys": "generateKeys",
+    "getPrivateKey": "getPrivateKey",
+    "getPublicKey": "getPublicKey",
+    "setPrivateKey": "setPrivateKey",
+    "setPublicKey": "setPublicKey"
+  },
+  "crypto.EcKeyPairGenJob": {
+    "run": "run"
+  },
+  "crypto.HKDFJob": {
+    "run": "run"
+  },
+  "crypto.Hash": {
+    "digest": "digest",
+    "update": "update"
+  },
+  "crypto.HashJob": {
+    "run": "run"
+  },
+  "crypto.Hmac": {
+    "digest": "digest",
+    "init": "init",
+    "update": "update"
+  },
+  "crypto.HmacJob": {
+    "run": "run"
+  },
+  "crypto.KEMDecapsulateJob": {
+    "run": "run"
+  },
+  "crypto.KEMEncapsulateJob": {
+    "run": "run"
+  },
+  "crypto.KangarooTwelveJob": {
+    "run": "run"
+  },
+  "crypto.KeyObjectHandle": {
+    "checkEcKeyData": "checkEcKeyData",
+    "equals": "equals",
+    "export": "export",
+    "exportECPrivatePkcs8": "exportECPrivatePkcs8",
+    "exportECPrivateRaw": "exportECPrivateRaw",
+    "exportECPublicRaw": "exportECPublicRaw",
+    "exportJwk": "exportJwk",
+    "getAsymmetricKeyType": "getAsymmetricKeyType",
+    "getKeyType": "getKeyType",
+    "getSymmetricKeySize": "getSymmetricKeySize",
+    "init": "init",
+    "keyDetail": "keyDetail",
+    "rawPrivateKey": "rawPrivateKey",
+    "rawPublicKey": "rawPublicKey",
+    "rawSeed": "rawSeed"
+  },
+  "crypto.KmacJob": {
+    "run": "run"
+  },
+  "crypto.Mac": {
+    "final": "final",
+    "update": "update"
+  },
+  "crypto.NamedKeyPairGenJob": {
+    "run": "run"
+  },
+  "crypto.PBKDF2Job": {
+    "run": "run"
+  },
+  "crypto.RSACipherJob": {
+    "run": "run"
+  },
+  "crypto.RandomBytesJob": {
+    "run": "run"
+  },
+  "crypto.RandomPrimeJob": {
+    "run": "run"
+  },
+  "crypto.RsaKeyPairGenJob": {
+    "run": "run"
+  },
+  "crypto.ScryptJob": {
+    "run": "run"
+  },
+  "crypto.SecretKeyGenJob": {
+    "run": "run"
+  },
+  "crypto.SecureContext": {
+    "addCACert": "addCACert",
+    "addCRL": "addCRL",
+    "addRootCerts": "addRootCerts",
+    "close": "close",
+    "enableTicketKeyCallback": "enableTicketKeyCallback",
+    "getCertificate": "getCertificate",
+    "getIssuer": "getIssuer",
+    "getMaxProto": "getMaxProto",
+    "getMinProto": "getMinProto",
+    "getTicketKeys": "getTicketKeys",
+    "init": "init",
+    "loadPKCS12": "loadPKCS12",
+    "setAllowPartialTrustChain": "setAllowPartialTrustChain",
+    "setCert": "setCert",
+    "setCertificateCompression": "setCertificateCompression",
+    "setCipherSuites": "setCipherSuites",
+    "setCiphers": "setCiphers",
+    "setDHParam": "setDHParam",
+    "setECDHCurve": "setECDHCurve",
+    "setKey": "setKey",
+    "setMaxProto": "setMaxProto",
+    "setMinProto": "setMinProto",
+    "setOptions": "setOptions",
+    "setSessionIdContext": "setSessionIdContext",
+    "setSessionTimeout": "setSessionTimeout",
+    "setSigalgs": "setSigalgs",
+    "setTicketKeys": "setTicketKeys"
+  },
+  "crypto.Sign": {
+    "init": "init",
+    "sign": "sign",
+    "update": "update"
+  },
+  "crypto.SignJob": {
+    "run": "run"
+  },
+  "crypto.TurboShakeJob": {
+    "run": "run"
+  },
+  "crypto.Verify": {
+    "init": "init",
+    "update": "update",
+    "verify": "verify"
+  },
+  "fs.CpDirJob": {
+    "run": "run"
+  },
+  "fs.FSReqCallback": {
+    "cancel": "cancel"
+  },
+  "fs.FileHandle": {
+    "close": "close",
+    "closeSync": "closeSync",
+    "readStart": "readStart",
+    "readStop": "readStop",
+    "releaseFD": "releaseFD",
+    "shutdown": "shutdown",
+    "useUserBuffer": "useUserBuffer",
+    "writeAsciiString": "writeAsciiString",
+    "writeBuffer": "writeBuffer",
+    "writeLatin1String": "writeLatin1String",
+    "writeUcs2String": "writeUcs2String",
+    "writeUtf8String": "writeUtf8String",
+    "writev": "writev"
+  },
+  "fs.ReadFileJob": {
+    "run": "run"
+  },
+  "fs.StatWatcher": {
+    "start": "start"
+  },
+  "fs.WriteFileJob": {
+    "run": "run"
+  },
+  "fs_dir.DirHandle": {
+    "close": "close",
+    "read": "read"
+  },
+  "fs_event_wrap.FSEvent": {
+    "start": "start"
+  },
+  "http2.Http2Session": {
+    "altsvc": "altsvc",
+    "consume": "consume",
+    "destroy": "destroy",
+    "goaway": "goaway",
+    "hasPendingData": "hasPendingData",
+    "localSettings": "localSettings",
+    "origin": "origin",
+    "ping": "ping",
+    "receive": "receive",
+    "refreshState": "refreshState",
+    "remoteSettings": "remoteSettings",
+    "request": "request",
+    "setGracefulClose": "setGracefulClose",
+    "setLocalWindowSize": "setLocalWindowSize",
+    "setNextStreamID": "setNextStreamID",
+    "settings": "settings",
+    "updateChunksSent": "updateChunksSent"
+  },
+  "http2.Http2Stream": {
+    "destroy": "destroy",
+    "disableAutoTrailers": "disableAutoTrailers",
+    "id": "id",
+    "info": "info",
+    "priority": "priority",
+    "pushPromise": "pushPromise",
+    "readStart": "readStart",
+    "readStop": "readStop",
+    "refreshState": "refreshState",
+    "respond": "respond",
+    "rstStream": "rstStream",
+    "shutdown": "shutdown",
+    "trailers": "trailers",
+    "useUserBuffer": "useUserBuffer",
+    "writeAsciiString": "writeAsciiString",
+    "writeBuffer": "writeBuffer",
+    "writeLatin1String": "writeLatin1String",
+    "writeUcs2String": "writeUcs2String",
+    "writeUtf8String": "writeUtf8String",
+    "writev": "writev"
+  },
+  "http_parser.ConnectionsList": {
+    "active": "active",
+    "all": "all",
+    "expired": "expired",
+    "idle": "idle"
+  },
+  "http_parser.HTTPParser": {
+    "close": "close",
+    "consume": "consume",
+    "execute": "execute",
+    "finish": "finish",
+    "free": "free",
+    "getCurrentBuffer": "getCurrentBuffer",
+    "initialize": "initialize",
+    "pause": "pause",
+    "remove": "remove",
+    "resume": "resume",
+    "unconsume": "unconsume"
+  },
+  "inspector.Connection": {
+    "disconnect": "disconnect",
+    "dispatch": "dispatch"
+  },
+  "inspector.MainThreadConnection": {
+    "disconnect": "disconnect",
+    "dispatch": "dispatch"
+  },
+  "js_stream.JSStream": {
+    "emitEOF": "emitEOF",
+    "finishShutdown": "finishShutdown",
+    "finishWrite": "finishWrite",
+    "readBuffer": "readBuffer",
+    "readStart": "readStart",
+    "readStop": "readStop",
+    "shutdown": "shutdown",
+    "useUserBuffer": "useUserBuffer",
+    "writeAsciiString": "writeAsciiString",
+    "writeBuffer": "writeBuffer",
+    "writeLatin1String": "writeLatin1String",
+    "writeUcs2String": "writeUcs2String",
+    "writeUtf8String": "writeUtf8String",
+    "writev": "writev"
+  },
+  "messaging.DOMException": {},
+  "messaging.MessageChannel": {},
+  "messaging.MessagePort": {
+    "postMessage": "postMessage",
+    "start": "start"
+  },
+  "messaging.QuotaExceededError": {},
+  "module_wrap.ModuleWrap": {
+    "createCachedData": "createCachedData",
+    "evaluate": "evaluate",
+    "evaluateSync": "evaluateSync",
+    "getError": "getError",
+    "getModuleRequests": "getModuleRequests",
+    "getModuleSourceObject": "getModuleSourceObject",
+    "getNamespace": "getNamespace",
+    "getStatus": "getStatus",
+    "instantiate": "instantiate",
+    "link": "link",
+    "setExport": "setExport",
+    "setModuleSourceObject": "setModuleSourceObject"
+  },
+  "performance.Histogram": {
+    "add": "add",
+    "cliffsD": "cliffsD",
+    "cohensD": "cohensD",
+    "countBigInt": "countBigInt",
+    "diff": "diff",
+    "exceedsBigInt": "exceedsBigInt",
+    "export": "export",
+    "ksTest": "ksTest",
+    "linearBuckets": "linearBuckets",
+    "logBuckets": "logBuckets",
+    "mannWhitneyTest": "mannWhitneyTest",
+    "maxBigInt": "maxBigInt",
+    "meanCI": "meanCI",
+    "minBigInt": "minBigInt",
+    "percentileBigInt": "percentileBigInt",
+    "percentileCI": "percentileCI",
+    "percentiles": "percentiles",
+    "percentilesAt": "percentilesAt",
+    "percentilesBigInt": "percentilesBigInt",
+    "qrde": "qrde",
+    "recordCorrected": "recordCorrected",
+    "resetCount": "resetCount",
+    "snapshot": "snapshot",
+    "subtract": "subtract",
+    "welchTest": "welchTest"
+  },
+  "performance.SlidingWindowHistogram": {
+    "reset": "reset",
+    "snapshot": "snapshot"
+  },
+  "pipe_wrap.Pipe": {
+    "bind": "bind",
+    "connect": "connect",
+    "fchmod": "fchmod",
+    "listen": "listen",
+    "open": "open"
+  },
+  "pipe_wrap.PipeConnectWrap": {},
+  "process_methods.resetStdioForTesting": {},
+  "process_wrap.Process": {
+    "kill": "kill",
+    "spawn": "spawn"
+  },
+  "serdes.Deserializer": {
+    "_readRawBytes": "_readRawBytes",
+    "getWireFormatVersion": "getWireFormatVersion",
+    "readDouble": "readDouble",
+    "readHeader": "readHeader",
+    "readUint32": "readUint32",
+    "readUint64": "readUint64",
+    "readValue": "readValue",
+    "transferArrayBuffer": "transferArrayBuffer"
+  },
+  "serdes.Serializer": {
+    "_setTreatArrayBufferViewsAsHostObjects": "_setTreatArrayBufferViewsAsHostObjects",
+    "releaseBuffer": "releaseBuffer",
+    "transferArrayBuffer": "transferArrayBuffer",
+    "writeDouble": "writeDouble",
+    "writeHeader": "writeHeader",
+    "writeRawBytes": "writeRawBytes",
+    "writeUint32": "writeUint32",
+    "writeUint64": "writeUint64",
+    "writeValue": "writeValue"
+  },
+  "signal_wrap.Signal": {
+    "start": "start",
+    "stop": "stop"
+  },
+  "sqlite.Database": {
+    "aggregate": "aggregate",
+    "applyChangeset": "applyChangeset",
+    "close": "close",
+    "createModule": "createModule",
+    "createSession": "createSession",
+    "createTagStore": "createTagStore",
+    "deserialize": "deserialize",
+    "enableDefensive": "enableDefensive",
+    "enableLoadExtension": "enableLoadExtension",
+    "exec": "exec",
+    "function": "function",
+    "loadExtension": "loadExtension",
+    "location": "location",
+    "open": "open",
+    "prepare": "prepare",
+    "serialize": "serialize",
+    "setAuthorizer": "setAuthorizer"
+  },
+  "sqlite.Session": {
+    "changeset": "changeset",
+    "close": "close",
+    "patchset": "patchset"
+  },
+  "sqlite.Statement": {
+    "all": "all",
+    "close": "close",
+    "columns": "columns",
+    "get": "get",
+    "iterate": "iterate",
+    "resetStats": "resetStats",
+    "run": "run",
+    "setAllowBareNamedParameters": "setAllowBareNamedParameters",
+    "setAllowUnknownNamedParameters": "setAllowUnknownNamedParameters",
+    "setReadBigInts": "setReadBigInts",
+    "setReturnArrays": "setReturnArrays",
+    "stat": "stat"
+  },
+  "sqlite.backup": {},
+  "stream_pipe.StreamPipe": {
+    "isClosed": "isClosed",
+    "pendingWrites": "pendingWrites",
+    "start": "start",
+    "unpipe": "unpipe"
+  },
+  "stream_wrap.ShutdownWrap": {},
+  "stream_wrap.WriteWrap": {},
+  "tcp_wrap.TCP": {
+    "bind": "bind",
+    "bind6": "bind6",
+    "connect": "connect",
+    "connect6": "connect6",
+    "getTypeOfService": "getTypeOfService",
+    "getpeername": "getpeername",
+    "getsockname": "getsockname",
+    "listen": "listen",
+    "open": "open",
+    "reset": "reset",
+    "setKeepAlive": "setKeepAlive",
+    "setNoDelay": "setNoDelay",
+    "setTypeOfService": "setTypeOfService"
+  },
+  "tcp_wrap.TCPConnectWrap": {},
+  "tls_wrap.TLSWrap": {
+    "certCbDone": "certCbDone",
+    "clientHelloDone": "clientHelloDone",
+    "destroySSL": "destroySSL",
+    "enableALPNCb": "enableALPNCb",
+    "enableCertCb": "enableCertCb",
+    "enableKeylogCallback": "enableKeylogCallback",
+    "enablePskCallback": "enablePskCallback",
+    "enableSessionCallbacks": "enableSessionCallbacks",
+    "enableTrace": "enableTrace",
+    "exportKeyingMaterial": "exportKeyingMaterial",
+    "getALPNNegotiatedProtocol": "getALPNNegotiatedProtocol",
+    "getCertificate": "getCertificate",
+    "getCipher": "getCipher",
+    "getEphemeralKeyInfo": "getEphemeralKeyInfo",
+    "getFinished": "getFinished",
+    "getPeerCertificate": "getPeerCertificate",
+    "getPeerFinished": "getPeerFinished",
+    "getPeerX509Certificate": "getPeerX509Certificate",
+    "getProtocol": "getProtocol",
+    "getServername": "getServername",
+    "getSession": "getSession",
+    "getSharedSigalgs": "getSharedSigalgs",
+    "getTLSTicket": "getTLSTicket",
+    "getX509Certificate": "getX509Certificate",
+    "hasPeerCertificate": "hasPeerCertificate",
+    "isSessionReused": "isSessionReused",
+    "loadSession": "loadSession",
+    "newSessionDone": "newSessionDone",
+    "readStart": "readStart",
+    "readStop": "readStop",
+    "receive": "receive",
+    "renegotiate": "renegotiate",
+    "requestOCSP": "requestOCSP",
+    "setALPNProtocols": "setALPNProtocols",
+    "setKeyCert": "setKeyCert",
+    "setMaxSendFragment": "setMaxSendFragment",
+    "setOCSPResponse": "setOCSPResponse",
+    "setPskIdentityHint": "setPskIdentityHint",
+    "setServername": "setServername",
+    "setSession": "setSession",
+    "setVerifyMode": "setVerifyMode",
+    "shutdown": "shutdown",
+    "start": "start",
+    "useUserBuffer": "useUserBuffer",
+    "verifyError": "verifyError",
+    "writeAsciiString": "writeAsciiString",
+    "writeBuffer": "writeBuffer",
+    "writeLatin1String": "writeLatin1String",
+    "writeUcs2String": "writeUcs2String",
+    "writeUtf8String": "writeUtf8String",
+    "writesIssuedByPrevListenerDone": "writesIssuedByPrevListenerDone",
+    "writev": "writev"
+  },
+  "trace_events.CategorySet": {
+    "disable": "disable",
+    "enable": "enable"
+  },
+  "tty_wrap.TTY": {
+    "getWindowSize": "getWindowSize",
+    "setRawMode": "setRawMode"
+  },
+  "udp_wrap.SendWrap": {},
+  "udp_wrap.UDP": {
+    "addMembership": "addMembership",
+    "addSourceSpecificMembership": "addSourceSpecificMembership",
+    "bind": "bind",
+    "bind6": "bind6",
+    "bufferSize": "bufferSize",
+    "connect": "connect",
+    "connect6": "connect6",
+    "disconnect": "disconnect",
+    "dropMembership": "dropMembership",
+    "dropSourceSpecificMembership": "dropSourceSpecificMembership",
+    "getSendQueueCount": "getSendQueueCount",
+    "getSendQueueSize": "getSendQueueSize",
+    "getpeername": "getpeername",
+    "getsockname": "getsockname",
+    "open": "open",
+    "recvStart": "recvStart",
+    "recvStop": "recvStop",
+    "send": "send",
+    "send6": "send6",
+    "setBroadcast": "setBroadcast",
+    "setMulticastInterface": "setMulticastInterface",
+    "setMulticastLoopback": "setMulticastLoopback",
+    "setMulticastTTL": "setMulticastTTL",
+    "setTTL": "setTTL"
+  },
+  "url_pattern.URLPattern": {
+    "exec": "exec",
+    "test": "test"
+  },
+  "util.isDataView": {},
+  "util.isTypedArray": {},
+  "util.isUint8Array": {},
+  "uv.errname": {},
+  "v8.GCProfiler": {
+    "start": "start",
+    "stop": "stop"
+  },
+  "worker.Worker": {
+    "cpuUsage": "cpuUsage",
+    "getHeapStatistics": "getHeapStatistics",
+    "getResourceLimits": "getResourceLimits",
+    "hasRef": "hasRef",
+    "loopIdleTime": "loopIdleTime",
+    "loopStartTime": "loopStartTime",
+    "ref": "ref",
+    "startCpuProfile": "startCpuProfile",
+    "startHeapProfile": "startHeapProfile",
+    "startThread": "startThread",
+    "stopCpuProfile": "stopCpuProfile",
+    "stopHeapProfile": "stopHeapProfile",
+    "stopThread": "stopThread",
+    "takeHeapSnapshot": "takeHeapSnapshot",
+    "unref": "unref"
+  },
+  "zlib.BrotliDecoder": {
+    "close": "close",
+    "init": "init",
+    "params": "params",
+    "reset": "reset",
+    "write": "write",
+    "writeSync": "writeSync"
+  },
+  "zlib.BrotliEncoder": {
+    "close": "close",
+    "init": "init",
+    "params": "params",
+    "reset": "reset",
+    "write": "write",
+    "writeSync": "writeSync"
+  },
+  "zlib.Zlib": {
+    "close": "close",
+    "init": "init",
+    "params": "params",
+    "reset": "reset",
+    "write": "write",
+    "writeSync": "writeSync"
+  },
+  "zlib.ZstdCompress": {
+    "close": "close",
+    "init": "init",
+    "params": "params",
+    "reset": "reset",
+    "write": "write",
+    "writeSync": "writeSync"
+  },
+  "zlib.ZstdDecompress": {
+    "close": "close",
+    "init": "init",
+    "params": "params",
+    "reset": "reset",
+    "write": "write",
+    "writeSync": "writeSync"
+  }
+}

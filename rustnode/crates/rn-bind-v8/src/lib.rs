@@ -227,9 +227,13 @@ impl BindingModule for V8 {
                 "getHashSeed",
                 function(scope, "getHashSeed", get_hash_seed)?,
             ),
+            // `node_v8.cc` publishes this one with `SetFastMethodNoSideEffect`,
+            // the one `SetMethod` variant that omits `SetName`: Node's
+            // `v8.isStringOneByteRepresentation.name` is `""`. Naming it here
+            // would be a divergence in the opposite direction.
             (
                 "isStringOneByteRepresentation",
-                function(
+                fast_function(
                     scope,
                     "isStringOneByteRepresentation",
                     is_string_one_byte_representation,
@@ -731,8 +735,17 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::method(callback).build(scope);
-    let function = template
+    Ok(rn_core::named_method(scope, name, callback)?.into())
+}
+
+/// A fast-API member, which Node publishes unnamed.
+fn fast_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    callback: impl v8::MapFnTo<v8::FunctionCallback>,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let function = rn_core::method(callback)
+        .build(scope)
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate {name}"))?;
     Ok(function.into())

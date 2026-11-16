@@ -107,12 +107,7 @@ fn install_function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = rn_core::method(callback).build(scope);
-    let function = template
-        .get_function(scope)
-        .ok_or_else(|| format!("cannot allocate {name}"))?;
-    let key = v8::String::new(scope, name).ok_or_else(|| format!("cannot allocate {name} key"))?;
-    object.set(scope, key.into(), function.into());
+    rn_core::set_method(scope, object, name, callback)?;
     Ok(())
 }
 

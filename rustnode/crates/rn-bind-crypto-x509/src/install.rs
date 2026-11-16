@@ -147,59 +147,51 @@ pub fn install_classes<'s>(
     target: v8::Local<'s, v8::Object>,
 ) -> Result<(), String> {
     crate::certificate::register_clone_kind();
-    for (name, callback) in [
-        (
-            "createX509CertificateClass",
-            rn_core::method(create_x509_certificate_class).build(scope),
-        ),
-        (
-            "isX509Certificate",
-            rn_core::method(is_x509_certificate).build(scope),
-        ),
-        ("parseX509", rn_core::method(parse_x509).build(scope)),
-        (
-            "parseX509Snapshot",
-            rn_core::method(parse_snapshot).build(scope),
-        ),
-        (
-            "getX509CertificateSnapshot",
-            rn_core::method(get_snapshot).build(scope),
-        ),
-        ("parsePKCS12", rn_core::method(parse_pkcs12).build(scope)),
-        (
-            "addBlockedSPKIForTesting",
-            rn_core::method(add_blocked_spki).build(scope),
-        ),
-        (
-            "clearBlockedSPKIsForTesting",
-            rn_core::method(clear_blocked_spkis).build(scope),
-        ),
-        (
-            "getBundledRootCertificates",
-            rn_core::method(get_bundled_root_certificates).build(scope),
-        ),
-        (
-            "getExtraCACertificates",
-            rn_core::method(get_extra_ca_certificates).build(scope),
-        ),
-        (
-            "getSystemCACertificates",
-            rn_core::method(get_system_ca_certificates).build(scope),
-        ),
-        (
-            "getUserRootCertificates",
-            rn_core::method(get_user_root_certificates).build(scope),
-        ),
-        (
-            "resetRootCertStore",
-            rn_core::method(reset_root_cert_store).build(scope),
-        ),
-    ] {
-        let function = callback
-            .get_function(scope)
-            .ok_or_else(|| format!("cannot allocate crypto.{name}"))?;
-        set(scope, target, name, function.into())?;
-    }
+    // `crypto_x509.cc` publishes all of these with `SetMethod`, so each is
+    // named after the property it is published under.
+    rn_core::set_method(
+        scope,
+        target,
+        "createX509CertificateClass",
+        create_x509_certificate_class,
+    )?;
+    rn_core::set_method(scope, target, "isX509Certificate", is_x509_certificate)?;
+    rn_core::set_method(scope, target, "parseX509", parse_x509)?;
+    rn_core::set_method(scope, target, "parseX509Snapshot", parse_snapshot)?;
+    rn_core::set_method(scope, target, "getX509CertificateSnapshot", get_snapshot)?;
+    rn_core::set_method(scope, target, "parsePKCS12", parse_pkcs12)?;
+    rn_core::set_method(scope, target, "addBlockedSPKIForTesting", add_blocked_spki)?;
+    rn_core::set_method(
+        scope,
+        target,
+        "clearBlockedSPKIsForTesting",
+        clear_blocked_spkis,
+    )?;
+    rn_core::set_method(
+        scope,
+        target,
+        "getBundledRootCertificates",
+        get_bundled_root_certificates,
+    )?;
+    rn_core::set_method(
+        scope,
+        target,
+        "getExtraCACertificates",
+        get_extra_ca_certificates,
+    )?;
+    rn_core::set_method(
+        scope,
+        target,
+        "getSystemCACertificates",
+        get_system_ca_certificates,
+    )?;
+    rn_core::set_method(
+        scope,
+        target,
+        "getUserRootCertificates",
+        get_user_root_certificates,
+    )?;
+    rn_core::set_method(scope, target, "resetRootCertStore", reset_root_cert_store)?;
     Ok(())
 }
 
@@ -703,17 +695,6 @@ fn view_bytes_of(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) 
         }
     }
     Some(bytes)
-}
-
-fn set<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    object: v8::Local<'s, v8::Object>,
-    name: &str,
-    value: v8::Local<'s, v8::Value>,
-) -> Result<(), String> {
-    let key = v8::String::new(scope, name).ok_or_else(|| format!("cannot allocate {name}"))?;
-    object.set(scope, key.into(), value);
-    Ok(())
 }
 
 fn throw(scope: &mut v8::PinScope<'_, '_>, message: &str) {

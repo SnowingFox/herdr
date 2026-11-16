@@ -79,20 +79,13 @@ pub(crate) fn define_constant(
 /// Node uses `SetMethodNoSideEffect`, which ends in `Set` with no attribute
 /// argument: writable, enumerable and configurable. `lib/**` only calls these,
 /// and `lib/internal/process/per_thread.js` destructures them once at load.
-pub(crate) fn define_method(
-    scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<v8::Object>,
+pub(crate) fn define_method<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let function = rn_core::method(callback)
-        .build(scope)
-        .get_function(scope)
-        .ok_or_else(|| format!("could not create options.{name}"))?;
-    let key = string(scope, name)?;
-    object
-        .set(scope, key.into(), function.into())
-        .ok_or_else(|| format!("could not define method {name:?}"))?;
+    rn_core::set_method(scope, object, name, callback)?;
     Ok(())
 }
 

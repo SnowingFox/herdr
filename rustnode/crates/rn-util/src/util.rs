@@ -133,36 +133,47 @@ impl BindingModule for Util {
         // without knowing this crate exists.
         rn_core::hook_slot::set_abort_toggle(abort_toggle);
 
-        macro_rules! install {
-            ($($name:literal => $callback:expr),* $(,)?) => {
-                $(
-                    let template = rn_core::method($callback).build(scope);
-                    if let (Some(key), Some(function)) =
-                        (v8::String::new(scope, $name), template.get_function(scope))
-                    {
-                        object.set(scope, key.into(), function.into());
-                    }
-                )*
-            };
-        }
-
-        install! {
-            "constructSharedArrayBuffer" => construct_shared_array_buffer,
-            "defineLazyProperties" => define_lazy_properties,
-            "getConstructorName" => get_constructor_name,
-            "getCallSites" => get_call_sites,
-            "getCallerLocation" => get_caller_location,
-            "getExternalValue" => get_external_value,
-            "getOwnNonIndexProperties" => get_own_non_index_properties,
-            "getPromiseDetails" => get_promise_details,
-            "getProxyDetails" => get_proxy_details,
-            "guessHandleType" => guess_handle_type,
-            "isInsideNodeModules" => is_inside_node_modules,
-            "markPromiseAsHandled" => mark_promise_as_handled,
-            "parseEnv" => parse_env,
-            "previewEntries" => preview_entries,
-            "sleep" => sleep,
-        }
+        // Every member below is `SetMethod`/`SetMethodNoSideEffect` in
+        // `src/node_util.cc`, so `rn_core::set_method` is what publishes it:
+        // named after its property, with no `[[Construct]]`.
+        rn_core::set_method(
+            scope,
+            object,
+            "constructSharedArrayBuffer",
+            construct_shared_array_buffer,
+        )?;
+        rn_core::set_method(
+            scope,
+            object,
+            "defineLazyProperties",
+            define_lazy_properties,
+        )?;
+        rn_core::set_method(scope, object, "getConstructorName", get_constructor_name)?;
+        rn_core::set_method(scope, object, "getCallSites", get_call_sites)?;
+        rn_core::set_method(scope, object, "getCallerLocation", get_caller_location)?;
+        rn_core::set_method(scope, object, "getExternalValue", get_external_value)?;
+        rn_core::set_method(
+            scope,
+            object,
+            "getOwnNonIndexProperties",
+            get_own_non_index_properties,
+        )?;
+        rn_core::set_method(scope, object, "getPromiseDetails", get_promise_details)?;
+        rn_core::set_method(scope, object, "getProxyDetails", get_proxy_details)?;
+        rn_core::set_method(scope, object, "isInsideNodeModules", is_inside_node_modules)?;
+        rn_core::set_method(
+            scope,
+            object,
+            "markPromiseAsHandled",
+            mark_promise_as_handled,
+        )?;
+        rn_core::set_method(scope, object, "parseEnv", parse_env)?;
+        rn_core::set_method(scope, object, "previewEntries", preview_entries)?;
+        rn_core::set_method(scope, object, "sleep", sleep)?;
+        // `guessHandleType` is `SetFastMethodNoSideEffect`, the one `SetMethod`
+        // variant that omits `SetName`, so Node's `util.guessHandleType.name` is
+        // `""`. Naming it here would be a divergence in the opposite direction.
+        rn_core::set_fast_method(scope, object, "guessHandleType", guess_handle_type)?;
 
         // Installed after the macro block because the first of these is not a
         // wrapper around a callback of ours, and the second is a `CHECK` that

@@ -64,13 +64,9 @@ pub fn install_classes<'s>(
             template
                 .instance_template(scope)
                 .set_internal_field_count(JOB_FIELD as usize + 1);
-            let Some(function) = template.get_function(scope) else {
-                return Err(format!("cannot allocate crypto.{}", $name));
-            };
-            let Some(key) = v8::String::new(scope, $name) else {
-                return Err(format!("cannot allocate crypto.{}", $name));
-            };
-            target.set(scope, key.into(), function.into());
+            // `SetConstructorFunction(…, SET_CLASS_NAME)` in `crypto_keys.cc`, so
+            // the class name is the property name and `f.name` reports it.
+            rn_core::set_class(scope, target, $name, template)?;
         }};
     }
     job_class!("SecretKeyGenJob" => secret_constructor);

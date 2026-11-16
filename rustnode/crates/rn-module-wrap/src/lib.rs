@@ -243,6 +243,11 @@ fn module_wrap_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
     let template = rn_core::class(module_wrap_new).length(5).build(scope);
+    // `SetConstructorFunction(…, SET_CLASS_NAME)`: the class name is what V8
+    // reports as `f.name`, so it has to be the property Node publishes it under.
+    let class_name =
+        v8::String::new(scope, "ModuleWrap").ok_or("cannot allocate the ModuleWrap name")?;
+    template.set_class_name(class_name);
     let constructor = template
         .get_function(scope)
         .ok_or_else(|| "cannot allocate ModuleWrap".to_string())?;
@@ -257,13 +262,16 @@ fn module_wrap_constructor<'s>(
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
         .ok_or_else(|| "ModuleWrap has no prototype object".to_string())?;
 
+    // `SetProtoMethod` names the function after the property it publishes it
+    // under, so a function extracted from a template and set on the prototype
+    // *object* has to be named here; V8 only names templates placed in a
+    // ``PrototypeTemplate``. `rn_core::named_method` is that half of `SetMethod`.
     macro_rules! method {
         ($name:literal, $callback:expr) => {{
-            let template = rn_core::method($callback).build(scope);
-            if let (Some(key), Some(function)) =
-                (v8::String::new(scope, $name), template.get_function(scope))
-            {
-                prototype.set(scope, key.into(), function.into());
+            if let Ok(function) = rn_core::named_method(scope, $name, $callback) {
+                if let Some(key) = v8::String::new(scope, $name) {
+                    prototype.set(scope, key.into(), function.into());
+                }
             }
         }};
     }
@@ -1634,11 +1642,7 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::method(callback).build(scope);
-    let function = template
-        .get_function(scope)
-        .ok_or_else(|| format!("cannot allocate {name}"))?;
-    Ok(function.into())
+    Ok(rn_core::named_method(scope, name, callback)?.into())
 }
 
 fn throw_error(scope: &mut v8::PinScope, message: &str) {

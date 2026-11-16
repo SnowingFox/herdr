@@ -158,27 +158,22 @@ pub fn install<'s>(
 ) -> Result<v8::Local<'s, v8::Object>, String> {
     let object = v8::Object::new(scope);
 
-    let wrap_template = rn_core::method(wrap).length(4).build(scope);
-    let wrap_fn = wrap_template
-        .get_function(scope)
-        .ok_or("cannot allocate the wrap function")?;
-    set(scope, object, "wrap", wrap_fn.into())?;
-
-    let inject_template = rn_core::method(inject_error).length(0).build(scope);
-    let inject = inject_template
-        .get_function(scope)
-        .ok_or("cannot allocate injectOpenSSLErrorForTesting")?;
-    set(scope, object, "injectOpenSSLErrorForTesting", inject.into())?;
-
-    let has_error_template = rn_core::method(has_error).length(0).build(scope);
-    let has_error_fn = has_error_template
-        .get_function(scope)
-        .ok_or("cannot allocate hasOpenSSLErrorForTesting")?;
-    set(
+    // `SetMethod` in `crypto_tls.cc`: published under its property name, with
+    // that name on the function.
+    rn_core::set_named_method_with_length(scope, object, "wrap", 4, wrap)?;
+    rn_core::set_named_method_with_length(
+        scope,
+        object,
+        "injectOpenSSLErrorForTesting",
+        0,
+        inject_error,
+    )?;
+    rn_core::set_named_method_with_length(
         scope,
         object,
         "hasOpenSSLErrorForTesting",
-        has_error_fn.into(),
+        0,
+        has_error,
     )?;
 
     // `NODE_DEFINE_CONSTANT(target, HAVE_SSL_TRACE)`. `NODE_OPENSSL_HAS_SSL_TRACE`

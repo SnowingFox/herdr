@@ -558,115 +558,55 @@ impl BindingModule for Crypto {
     ) -> Result<v8::Local<'s, v8::Object>, String> {
         let object = v8::Object::new(scope);
 
-        // Functions.
-        for (name, callback) in [
-            (
-                "randomFillSync",
-                rn_core::method(random_fill_sync)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "secureBuffer",
-                rn_core::method(secure_buffer)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "getHashes",
-                rn_core::method(get_hashes).build(scope).get_function(scope),
-            ),
-            (
-                "getCiphers",
-                rn_core::method(get_ciphers)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "getCurves",
-                rn_core::method(get_curves).build(scope).get_function(scope),
-            ),
-            (
-                "getCachedAliases",
-                rn_core::method(get_cached_aliases)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "getMacs",
-                rn_core::method(crate::classes::get_macs)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "getCachedMacAliases",
-                // `rn_core::method` like every neighbour in this table: it is a
-                // `SetMethodNoSideEffect` member in `crypto_mac.cc`, so Node
-                // gives it no `[[Construct]]` and `new` is a `TypeError`.
-                rn_core::method(get_cached_mac_aliases)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "getSSLCiphers",
-                rn_core::method(crate::classes::get_ssl_ciphers)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "getCertificateCompressionAlgorithms",
-                rn_core::method(crate::classes::get_certificate_compression_algorithms)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "startLoadingCertificatesOffThread",
-                rn_core::method(crate::classes::start_loading_certificates_off_thread)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "timingSafeEqual",
-                rn_core::method(timing_safe_equal)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "secureHeapUsed",
-                rn_core::method(secure_heap_used)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "getFipsCrypto",
-                rn_core::method(get_fips_crypto)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "getFipsCryptoGeneration",
-                rn_core::method(get_fips_crypto_generation)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "getOpenSSLSecLevelCrypto",
-                rn_core::method(get_openssl_sec_level)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            (
-                "oneShotDigest",
-                rn_core::method(one_shot_digest)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-        ] {
-            let Some(function) = callback else {
-                return Err(format!("cannot allocate crypto.{name}"));
-            };
-            set(scope, object, name, function.into())?;
-        }
+        // Functions. Each is `SetMethod` in its `src/crypto/**` translation unit,
+        // so `rn_core::set_method` publishes it under its property name with the
+        // name set, exactly as `node::SetMethod` does.
+        rn_core::set_method(scope, object, "randomFillSync", random_fill_sync)?;
+        rn_core::set_method(scope, object, "secureBuffer", secure_buffer)?;
+        rn_core::set_method(scope, object, "getHashes", get_hashes)?;
+        rn_core::set_method(scope, object, "getCiphers", get_ciphers)?;
+        rn_core::set_method(scope, object, "getCurves", get_curves)?;
+        rn_core::set_method(scope, object, "getCachedAliases", get_cached_aliases)?;
+        rn_core::set_method(scope, object, "getMacs", crate::classes::get_macs)?;
+        rn_core::set_method(scope, object, "getCachedMacAliases", get_cached_mac_aliases)?;
+        rn_core::set_method(
+            scope,
+            object,
+            "getSSLCiphers",
+            crate::classes::get_ssl_ciphers,
+        )?;
+        rn_core::set_method(
+            scope,
+            object,
+            "getCertificateCompressionAlgorithms",
+            crate::classes::get_certificate_compression_algorithms,
+        )?;
+        rn_core::set_method(
+            scope,
+            object,
+            "startLoadingCertificatesOffThread",
+            crate::classes::start_loading_certificates_off_thread,
+        )?;
+        rn_core::set_method(scope, object, "secureHeapUsed", secure_heap_used)?;
+        rn_core::set_method(scope, object, "getFipsCrypto", get_fips_crypto)?;
+        rn_core::set_method(
+            scope,
+            object,
+            "getFipsCryptoGeneration",
+            get_fips_crypto_generation,
+        )?;
+        rn_core::set_method(
+            scope,
+            object,
+            "getOpenSSLSecLevelCrypto",
+            get_openssl_sec_level,
+        )?;
+        rn_core::set_method(scope, object, "oneShotDigest", one_shot_digest)?;
+        // `crypto_timing.cc` publishes this with `SetFastMethodNoSideEffect`, the
+        // one `SetMethod` variant that omits `SetName`, so Node's
+        // `binding.timingSafeEqual.name` is `""`. Naming it here would be a
+        // divergence in the opposite direction.
+        rn_core::set_fast_method(scope, object, "timingSafeEqual", timing_safe_equal)?;
 
         // The `Hash` and `Hmac` handle classes.
         install_hash_class(scope, object)?;
@@ -1735,17 +1675,10 @@ fn install_job_class<'s>(
         return Err(format!("cannot allocate {name}.run"));
     };
     prototype.set(key.into(), rn_core::method(job_run).build(scope).into());
-    let Some(class_name) = v8::String::new(scope, name) else {
-        return Err(format!("cannot allocate the {name} class name"));
-    };
-    template.set_class_name(class_name);
-    let Some(function) = template.get_function(scope) else {
-        return Err(format!("cannot allocate the {name} constructor"));
-    };
-    let Some(key) = v8::String::new(scope, name) else {
-        return Err(format!("cannot allocate the {name} property name"));
-    };
-    target.set(scope, key.into(), function.into());
+    // `rn_core::set_class` is `SetConstructorFunction(…, SET_CLASS_NAME)`: the
+    // class name is what V8 reports as `f.name`, so it has to be the property
+    // name Node passes in rather than left to the bare builder.
+    rn_core::set_class(scope, target, name, template)?;
     Ok(())
 }
 
