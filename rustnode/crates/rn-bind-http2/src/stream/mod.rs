@@ -320,22 +320,31 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
     });
 }
 
-/// Makes `stream_id`'s readable side end, which is what `onStreamClose` inspects.
-///
-/// `StreamBase::ReadStop` plus a zero-length read is how Node ends a stream's
-/// readable side when nghttp2 reports the stream closed: the `Duplex` sees EOF and
-/// emits `'end'`, `core.js` marks the stream settled, and the session can finally
-/// destroy. Skipping it leaves `_readableState.ended` false forever, so every
-/// teardown path waits on an event that will never come.
-pub fn end_readable(session: &SessionState, stream_id: i32) {
-    emit_eof(session, stream_id);
-}
-
 /// Reports end-of-stream on `stream_id`'s readable side.
 ///
 /// A non-positive count is how `onStreamRead` learns the stream ended:
 /// `lib/net.js` turns `UV_EOF` into `'end'` and any other negative into
 /// `'error'`.
+///
+/// # When to call this, and when not to
+///
+/// Exactly one condition emits EOF: a DATA frame whose `NGHTTP2_FLAG_END_STREAM`
+/// is set, which is Node's `Http2Session::HandleDataFrame`
+/// (`src/node_http2.cc:1664`). A response that ends on its headers (204, 304,
+/// `{ endStream: true }`) gets its `push(null)` from `core.js`, which reads
+/// `endOfStream` off the flags it was handed — not from here.
+///
+/// Emitting EOF from `on_stream_close` used to look necessary, because
+/// `core.js` gates its teardown on `stream._readableState.ended` and a stream
+/// that never ended appeared to hang. It was not: it made `ended` true for every
+/// closed stream, so a stream that closed *early* — a truncated response, a peer
+/// RST_STREAM — reported a clean end, and `onStreamClose`'s
+/// `!peerReadableEnded` branch, which raises `ERR_HTTP2_STREAM_ABORTED` and
+/// `ERR_HTTP2_STREAM_ERROR`, became unreachable. A partial download then looked
+/// identical to a complete one. The hang has a different cause and a correct
+/// fix: `core.js` waits for `'end'`/`'finish'` and calls `stream.read(0)` to
+/// drive the readable side, which works as soon as EOF is only sent when the
+/// peer actually ended the stream.
 pub fn emit_eof(session: &SessionState, stream_id: i32) {
     let _ = rn_uv::callback::with_context(|scope| {
         if object_for(scope, session, stream_id).is_none() {

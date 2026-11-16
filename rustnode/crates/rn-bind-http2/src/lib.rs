@@ -110,10 +110,9 @@ pub const DEFERRED: &[(&str, &str)] = &[];
 /// `DEFERRED` is for a *member* that is absent. These are behaviours inside
 /// members that are present, which is why they are recorded separately rather than
 /// smuggled into the member list.
-pub const KNOWN_GAPS: &[(&str, &str)] = &[
-    (
-        "trailers are never sent or delivered",
-        "`waitForTrailers` never emits `wantTrailers`, so `sendTrailers` is \
+pub const KNOWN_GAPS: &[(&str, &str)] = &[(
+    "trailers are never sent or delivered",
+    "`waitForTrailers` never emits `wantTrailers`, so `sendTrailers` is \
          unreachable and a client never sees `trailers` or the `x-trailer` pair. \
          `Http2Stream::OnTrailers` (`src/node_http2.cc:2534`) runs from the DATA \
          provider when the body reaches EOF with `has_trailers()` set, and \
@@ -121,21 +120,7 @@ pub const KNOWN_GAPS: &[(&str, &str)] = &[
          reads; the callbacks table carries `stream_trailers` but never invokes \
          it. Repro: respond({ waitForTrailers: true }) + end(), then read \
          `wantTrailers` on the server and `trailers` on the client",
-    ),
-    (
-        "a reset or truncated stream reports a clean 'end'",
-        "`on_stream_close` calls `end_readable`, which pushes EOF before the \
-         JavaScript `onStreamClose` runs. Node leaves the readable side un-ended \
-         in that case on purpose (`src/node_http2.cc:1353` only calls \
-         `stream->Close(code)`), which is what lets `core.js` see \
-         `!peerReadableEnded` and raise ERR_HTTP2_STREAM_ABORTED. Here the push \
-         makes `_readableState.ended` true, so a response cut short by \
-         RST_STREAM finishes with `end` and no error: a partial download is \
-         indistinguishable from a complete one. Repro: respond with \
-         content-length 1000, write 100 bytes, destroy(); the client sees \
-         'end' where Node sees 'error:ERR_HTTP2_STREAM_ABORTED'",
-    ),
-];
+)];
 
 /// `SessionUint8Fields` from `node_http2.h`, as the offsets of `SessionJSFields`.
 ///
