@@ -466,6 +466,95 @@ pub(crate) fn normalize_underscores(name: &str) -> String {
     characters.into_iter().collect()
 }
 
+/// Whether Node hands `argument` to V8, which is to say whether V8 is its
+/// authority.
+///
+/// `Parse` makes exactly this split: a name it resolves through the option table
+/// and acts on is Node's, and everything else — a `kV8Option`, a name the table
+/// has never heard of, and the `--stack-trace-limit` `kInteger` special case —
+/// is pushed onto `v8_args` for `V8::SetFlagsFromCommandLine` to accept or
+/// refuse (`src/node_options-inl.h:446,539`). Node keeps no list of V8 flags,
+/// which is why it accepts V8 flags added after it was written; a caller that
+/// wants the same property has to ask this question rather than consult a list.
+///
+/// This is what keeps a flag rustnode declares but has not implemented from
+/// being forwarded: such a flag is declared, so this answers `false`, and the
+/// caller rejects it instead of changing V8 behind rustnode's back.
+#[must_use]
+pub fn is_v8_flag(argument: &str) -> bool {
+    !declares(argument) || is_v8_owned(argument)
+}
+
+/// Whether Node's option table declares `argument` at all.
+///
+/// `argument` is the whole argument as typed, including an `=value`; the name
+/// half is what is looked up, after the same underscore normalization and alias
+/// expansion `Parse` applies. That is what makes `--expose_gc` the same option
+/// as `--expose-gc` and `--experimental-strip-types` the same as
+/// `--strip-types`.
+#[must_use]
+pub fn declares(argument: &str) -> bool {
+    lookup_argument(argument).is_some()
+}
+
+/// Whether Node hands a *declared* `argument` to V8 as well as acting on it.
+///
+/// Two kinds of entry answer yes: a `kV8Option`, which has no Node field at all
+/// and exists only to be forwarded, and `--stack-trace-limit`, the one
+/// `kInteger` option Node also pushes (`src/node_options-inl.h:504`). A flag the
+/// table does *not* declare is V8's too, but that is [`declares`]'s answer to
+/// give; see [`is_v8_flag`].
+///
+/// A negation is answered by the kind it names, so `--no-jitless` is V8's the
+/// way `--jitless` is — V8 validates its own spellings. The exception is the
+/// negated `--no-stack-trace-limit`: Node itself refuses that before V8 sees it
+/// (`NegationImpliesBooleanError`), so it is not V8's and stays a rejected flag
+/// rather than becoming a V8-level error.
+fn is_v8_owned(argument: &str) -> bool {
+    match lookup_argument(argument) {
+        Some(option) => {
+            option.kind == kind::V8_OPTION
+                || (option.name == "--stack-trace-limit" && !is_negation(argument))
+        }
+        None => false,
+    }
+}
+
+/// The table entry `Parse` resolves `argument` to, if any.
+fn lookup_argument(argument: &str) -> Option<&'static crate::option::OptionInfo> {
+    // `Parse` only splits `--flag=value`; `-e=a` stays one argument.
+    let (name, had_inline_value) = match argument.split_once('=') {
+        Some((name, _)) if argument.starts_with("--") => (name, true),
+        _ => (argument, false),
+    };
+    lookup_name(name, had_inline_value)
+}
+
+/// The table entry for a bare name, after normalization and alias expansion.
+fn lookup_name(name: &str, had_inline_value: bool) -> Option<&'static crate::option::OptionInfo> {
+    let mut name = normalize_underscores(name);
+    if is_negation(&name) {
+        name = format!("--{}", &name[5..]);
+    }
+    // Repeated alias expansion, stopping when a step renames nothing, is the
+    // same walk `Store::apply` makes. The `" <arg>"` alias form is not tried:
+    // its only entry is `--print <arg>`, which expands to `--print --eval`, and
+    // neither is a V8 option, so omitting it cannot change an answer here.
+    while let Some(targets) = alias_for(&name, had_inline_value, None) {
+        let previous = name;
+        name = targets[0].clone();
+        if name == previous {
+            break;
+        }
+    }
+    OPTIONS.iter().find(|option| option.name == name)
+}
+
+/// Whether `name` is written as a negation of the option it names.
+fn is_negation(name: &str) -> bool {
+    name.starts_with("--no-")
+}
+
 /// The expansion `Parse` would use for `name`, if any.
 ///
 /// Three forms are tried, in `Parse`'s order: the plain name, the name with `=`

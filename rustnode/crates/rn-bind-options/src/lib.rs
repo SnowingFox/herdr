@@ -36,7 +36,7 @@ use rn_v8_sys::v8;
 
 pub use env::{parse as parse_env, EnvError, EnvOptions};
 pub use option::{DefaultValue, OptionInfo, OptionNamespace};
-pub use parsed::{ParsedValue, Store};
+pub use parsed::{declares, is_v8_flag, ParsedValue, Store};
 pub use values::{
     cli_info, cli_values, env_options_input_types, namespace_options_input_types, options_as_flags,
     parse_node_options, CliValue, EmbedderOptions, InputType, NodeOptionsError, OptionMetadata,

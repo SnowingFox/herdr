@@ -308,12 +308,15 @@ unchanged (30.5 vs 31.0 ms), and wall clock gets worse by 3.6%, once outside the
 noise floor and reproducible across three batches. The lesson generalises: in
 this bootstrap, a phase-table delta is not a saving until CPU time agrees.
 
-**V8 flags cannot be measured through the CLI at all.** `rn-cli` rejects every
-V8 flag with `rustnode: unsupported option '--no-opt'` before V8 sees it, so a
-flag sweep that passes the flag on the command line measures a process that
-exited during argument parsing — 2.6 ms, an apparent 89% win. Anything measured
-this way must be checked for a zero exit status first. The table above was taken
-by injecting the flag before `V8::initialize` instead.
+**V8 flags now reach the CLI, but a sweep still has to check the exit status.**
+`rn-cli` used to reject every V8 flag with `rustnode: unsupported option
+'--no-opt'` before V8 saw it, so a flag sweep that passed the flag on the command
+line measured a process that exited during argument parsing — 2.6 ms, an
+apparent 89% win. The table above was taken by injecting the flag before
+`V8::initialize` instead. V8 flags are now forwarded and V8 decides them, so
+`--no-opt` on the command line measures the real thing; a flag V8 does not know
+is still a `bad option` with exit 9, which is why every sweep must check for a
+zero exit status before believing its numbers.
 
 ## Measuring it again
 

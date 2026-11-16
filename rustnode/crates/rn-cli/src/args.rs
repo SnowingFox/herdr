@@ -49,6 +49,18 @@ pub struct Options {
     pub script_args: Vec<String>,
     /// Every flag seen, in order, for `process.execArgv`.
     pub exec_argv: Vec<String>,
+    /// The flags V8 owns, in the order V8 must receive them.
+    ///
+    /// This is Node's `v8_args` vector (`src/node.cc:756`), and it is filled the
+    /// same way `OptionsParser::Parse` fills it: `NODE_OPTIONS`'s flags first,
+    /// then the command line's, so a later spelling overrides an earlier one.
+    /// An option the table marks `kV8Option` and one the table has never heard
+    /// of both land here, because only V8 can say whether a flag exists — that
+    /// is the whole reason Node keeps no list of its own.
+    ///
+    /// `main` hands this to `V8::SetFlagsFromCommandLine` before
+    /// `V8::Initialize`, and treats whatever V8 hands back as `bad option`.
+    pub v8_args: Vec<String>,
     /// Flags accepted but whose behaviour is not implemented yet.
     pub unimplemented: Vec<String>,
     /// The option layer's view of the same argv.
@@ -82,22 +94,15 @@ pub struct Options {
     /// The `NODE_OPTIONS` value, already tokenized and accepted.
     ///
     /// `None` when the variable was unset or empty. Kept because the flags have
-    /// to reach two places the command line does not: V8 (before it initialises,
-    /// so `main` forwards `env_v8_args`) and the option store
-    /// (`options.parsed` is the environment's values with the command line
-    /// applied on top, which is Node's two-pass order).
+    /// to reach two places the command line does not: V8 (the variable's flags
+    /// go first in [`Self::v8_args`], so a command-line spelling overrides them)
+    /// and the option store (`options.parsed` is the environment's values with
+    /// the command line applied on top, which is Node's two-pass order).
     ///
     /// They deliberately do **not** reach `exec_argv`: `process.execArgv`
     /// contains only the command line, and passing the environment's flags on
     /// would make a child process inherit them twice.
     pub env_options: Option<rn_bind_options::EnvOptions>,
-    /// The V8 flags `NODE_OPTIONS` named, for forwarding before
-    /// `V8::initialize`.
-    ///
-    /// A copy rather than a borrow of `env_options`, because `main` forwards
-    /// these before the isolate exists and the options struct is moved past
-    /// that point.
-    pub env_v8_args: Vec<String>,
     /// The flags `NODE_OPTIONS` named, for the parsers that read a list rather
     /// than a single value (the permission model).
     pub env_argv: Vec<String>,
@@ -127,6 +132,7 @@ impl Options {
             source: Source::Empty,
             script_args: Vec::new(),
             exec_argv: Vec::new(),
+            v8_args: Vec::new(),
             unimplemented: Vec::new(),
             // The table's defaults, which is what a process with no flags
             // reports. `Store::default()` would be empty, and an empty store
@@ -137,7 +143,6 @@ impl Options {
             permission_config: rn_permission::PermissionConfig::default(),
             abort_on_uncaught_exception: false,
             env_options: None,
-            env_v8_args: Vec::new(),
             env_argv: Vec::new(),
             inspect_enabled: false,
             inspect_wait: false,
@@ -297,23 +302,24 @@ pub enum Source {
 /// Flags that take no separate value and that rustnode deliberately ignores.
 ///
 /// These change Node's behaviour in ways that do not affect whether a script
-/// runs: warning categories, source maps, gc exposure. A script that only needs
-/// them accepted should run.
+/// runs: warning categories, source maps, internals exposure. A script that only
+/// needs them accepted should run.
 ///
 /// The `--allow-*` permission grants are deliberately *not* here. They carry
 /// values, they change what the runtime permits, and accepting them without
 /// acting on them was the bug this list used to hide.
+///
+/// Nor are the flags V8 owns — `--expose-gc` used to be listed here, and being
+/// listed meant it was accepted and recorded but never handed to V8, so `gc()`
+/// was a name from nowhere. V8-owned flags are now recognised from Node's own
+/// option table (`rn_bind_options::is_v8_flag`) and forwarded; see
+/// [`record_v8_flag`] and the fallback in [`parse_with_env`].
 const IGNORED_WITHOUT_VALUE: &[&str] = &[
-    "--allow-natives-syntax",
     "--disable-proto",
     "--enable-source-maps",
-    "--expose-gc",
     "--expose-internals",
     "--expose_internals",
-    "--expose_gc",
-    "--experimental-shadow-realm",
     "--experimental-strip-types",
-    "--experimental-vm-modules",
     "--experimental-worker",
     "--frozen-intrinsics",
     "--no-deprecation",
@@ -382,9 +388,7 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
     "--inspect=",
     "--inspect-brk=",
     "--loader=",
-    "--max-old-space-size=",
     "--permission=",
-    "--stack-size=",
     "--title=",
     "--unhandled-rejections=",
 ];
@@ -602,7 +606,11 @@ pub fn parse_with_env(
             }
             apply_abort(argument, &mut options);
         }
-        options.env_v8_args.clone_from(&env.v8_args);
+        // The variable's V8 flags come first, which is Node's order: the
+        // environment is parsed into the same `v8_args` vector before the
+        // command line, so a command-line `--max-old-space-size` overrides the
+        // one the variable set. They are handed to V8 in this order too.
+        options.v8_args.clone_from(&env.v8_args);
         options.env_argv.clone_from(&env.argv);
         // The environment's values become the base the command line is applied
         // to, which is Node's two-pass order rather than a merge of two lists.
@@ -682,6 +690,20 @@ pub fn parse_with_env(
         // (`src/bind-options/src/parsed.rs` already models that negation).
         // `apply_abort` is the same function the environment's flags go
         // through, so a `--no-` here clears what the variable set.
+        //
+        // It is deliberately **not** forwarded to V8, even though the table
+        // marks it `kV8Option`. Node does forward it, but only because it also
+        // installs `Isolate::SetAbortOnUncaughtExceptionCallback` and points it
+        // at `ShouldAbortOnUncaughtException` (`src/api/environment.cc:65`),
+        // which is what makes V8 ask Node and lets the
+        // `shouldAbortOnUncaughtToggle[0]` half of the decision — the half
+        // `process.setUncaughtExceptionCaptureCallback` clears — override the
+        // flag. rustnode has no per-isolate abort callback, so a forwarded flag
+        // would make V8 abort on its own and no capture callback could stop it:
+        // `--abort-on-uncaught-exception -e
+        // 'process.setUncaughtExceptionCaptureCallback(()=>{}); throw 1'` exited
+        // 0 before this change and died on SIGTRAP after. The decision stays in
+        // `rn-errors`, which reads both halves.
         if ABORT_ON_UNCAUGHT.contains(&argument.as_str())
             || ABORT_ON_UNCAUGHT_NEGATED.contains(&argument.as_str())
         {
@@ -735,14 +757,20 @@ pub fn parse_with_env(
             continue;
         }
 
-        if argument.starts_with("--experimental-") || argument.starts_with("--no-experimental-") {
-            // The experimental surface is broad and most of it gates modules
-            // that have not landed. Record and accept, so a script that merely
-            // mentions one still boots.
-            //
-            // `--experimental-bench` is the exception: it is implemented, so
-            // reporting it missing would be a lie that some tests read. The
-            // other flags stay in `unimplemented` and say so.
+        // `--experimental-` is a namespace, not a promise: the table decides
+        // which experimental flags exist. One it declares is accepted and
+        // recorded so a script that merely mentions it still boots; one it does
+        // not declare is V8's, and falls through to the V8 split below rather
+        // than being accepted here and then never reaching V8. That fall-through
+        // is what makes `--experimental-fuzzing` work and
+        // `--experimental-not-a-real-flag` a `bad option`.
+        if (argument.starts_with("--experimental-") || argument.starts_with("--no-experimental-"))
+            && rn_bind_options::declares(argument)
+        {
+            // Most of the surface gates modules that have not landed, so those
+            // flags stay in `unimplemented` and say so. `--experimental-bench`
+            // is the exception: it is implemented, so reporting it missing
+            // would be a lie that some tests read.
             if !IMPLEMENTED_EXPERIMENTAL.contains(&argument.as_str()) {
                 unimplemented.insert(argument.clone());
             }
@@ -779,11 +807,40 @@ pub fn parse_with_env(
             continue;
         }
 
-        // `-v`, `--version` and `--help` are handled before parsing.
-        return Err(ParseError::Cli(format!("unsupported option '{argument}'")));
+        // Everything the table declares is either handled above or is a flag
+        // rustnode has not implemented, which is reported rather than forwarded:
+        // handing it to V8 would change V8's behaviour behind rustnode's back,
+        // and `VALUE_INLINE_PREFIXES` has already covered the ones it accepts.
+        // This is the rule `forward_v8_flags` used to state as a comment; it is
+        // enforced here now, by asking the table instead of a list.
+        if !rn_bind_options::is_v8_flag(argument) {
+            return Err(ParseError::Cli(format!("unsupported option '{argument}'")));
+        }
+
+        // V8's flag. It is recorded for `execArgv` exactly where Node records
+        // it — `Parse` pushes the argument as typed onto `exec_args` before
+        // looking it up — and queued for V8, which decides whether it exists.
+        // `main` applies the queue before `V8::Initialize`; anything V8 hands
+        // back is Node's `bad option`.
+        record_v8_flag(&mut options, argument);
+        index += 1;
     }
 
     Ok(finish(options, unimplemented))
+}
+
+/// Records one V8 flag for `process.execArgv` and for forwarding.
+///
+/// The argument goes into `exec_argv` as it was typed: the oracle reports
+/// `--expose_gc` verbatim in `process.execArgv`, not a normalized form, because
+/// Node's `ArgsInfo::pop_first` returns the original string.
+///
+/// `v8_args` keeps the same shape. V8 would accept `--flag value` as a pair, but
+/// Node never gives it one from the command line — `--max-old-space-size 4096`
+/// is an error there — so a value that arrived inline stays inline.
+fn record_v8_flag(options: &mut Options, argument: &str) {
+    options.exec_argv.push(argument.to_string());
+    options.v8_args.push(argument.to_string());
 }
 
 /// Whether `argument` is `--inspect`, `--inspect-port`, `--inspect-brk`,
@@ -1166,9 +1223,88 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_flag_is_an_error() {
-        // A typo must not silently change nothing.
-        assert!(parse_of(&["--not-a-real-flag", "app.js"]).is_err());
+    fn an_unknown_flag_is_left_for_v8_to_decide() {
+        // Node does not reject an unknown flag itself: `Parse` pushes it onto
+        // `v8_args` and `V8::SetFlagsFromCommandLine` is what reports it as
+        // `bad option`. The parser therefore accepts it and records it, and
+        // `main` is what turns a V8 refusal into exit 9 — see
+        // `tests/node_options.rs::a_bogus_flag_is_a_bad_option_with_nodes_message_and_status`.
+        let options = parse_of(&["--not-a-real-flag", "-e", "1"]).expect("parses");
+        assert_eq!(options.v8_args, ["--not-a-real-flag"]);
+        assert_eq!(options.exec_argv, ["--not-a-real-flag", "-e", "1"]);
+    }
+
+    #[test]
+    fn a_declared_flag_rustnode_does_not_implement_is_rejected_not_forwarded() {
+        // The rule the old `forward_v8_flags` comment stated: a flag Node's
+        // table declares is Node's, so handing it to V8 would change V8's
+        // behaviour behind rustnode's back. `--max-http-header-size` is in the
+        // table and the CLI does not act on it, so it stays an error and never
+        // reaches `v8_args`.
+        let error = parse_of(&["--max-http-header-size=32768", "-e", "1"]).expect_err("rejects");
+        assert!(error.contains("--max-http-header-size=32768"), "{error}");
+    }
+
+    #[test]
+    fn a_v8_option_in_the_table_is_recorded_for_forwarding() {
+        // `--expose-gc` is a `kV8Option`, so it needs both records: `execArgv`
+        // (what the process reports) and `v8_args` (what reaches V8 before
+        // `initialize`). A flag that reached only the first would be accepted
+        // and then do nothing.
+        let options = parse_of(&["--expose-gc", "-e", "1"]).expect("parses");
+        assert_eq!(options.v8_args, ["--expose-gc"]);
+        assert!(options.exec_argv.iter().any(|flag| flag == "--expose-gc"));
+    }
+
+    #[test]
+    fn the_underscore_spelling_of_a_v8_option_is_forwarded_too() {
+        // `Parse` normalizes underscores before the lookup, so `--expose_gc`
+        // resolves to the same table entry. Both spellings appear in Node's test
+        // headers.
+        let options = parse_of(&["--expose_gc", "-e", "1"]).expect("parses");
+        assert_eq!(options.v8_args, ["--expose_gc"]);
+    }
+
+    #[test]
+    fn a_v8_flag_queued_from_the_variable_comes_before_the_command_lines() {
+        // Node parses the environment into the same `v8_args` vector before the
+        // command line, so a later spelling overrides an earlier one. Reversing
+        // this would make `NODE_OPTIONS=--max-old-space-size=100` win over a
+        // command-line `--max-old-space-size=512`.
+        let env = rn_bind_options::parse_env("--max-old-space-size=100").expect("parses");
+        let options = parse_with_env(
+            &[
+                "--max-old-space-size=512".to_string(),
+                "-e".to_string(),
+                "1".to_string(),
+            ],
+            Some(env),
+        )
+        .expect("parses");
+        assert_eq!(
+            options.v8_args,
+            ["--max-old-space-size=100", "--max-old-space-size=512"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_experimental_flag_is_left_for_v8_rather_than_reported_unimplemented() {
+        // `--experimental-` is a namespace, not a promise. Accepting every name
+        // in it made `--experimental-regexp-engine` (a V8 flag) work only by
+        // accident of never being forwarded, and made `--experimental-nonsense`
+        // succeed. The table decides: a declared entry stays unimplemented, an
+        // undeclared one is V8's.
+        let options = parse_of(&["--experimental-regexp-engine", "-e", "1"]).expect("parses");
+        assert_eq!(options.v8_args, ["--experimental-regexp-engine"]);
+        assert!(
+            options.unimplemented.is_empty(),
+            "{:?}",
+            options.unimplemented
+        );
+
+        let options = parse_of(&["--experimental-vm-modules", "-e", "1"]).expect("parses");
+        assert_eq!(options.unimplemented, ["--experimental-vm-modules"]);
+        assert!(options.v8_args.is_empty(), "{:?}", options.v8_args);
     }
 
     #[test]

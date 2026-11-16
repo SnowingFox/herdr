@@ -42,13 +42,9 @@ fn main() {
     // through `v8.getHeapStatistics().heap_size_limit`, so ignoring it made that
     // field a fixed 1.5 GB no matter what the command line said.
     //
-    // Both sources are forwarded, in Node's order: the variable's flags first,
-    // then the command line's, so a command-line `--max-old-space-size`
-    // overrides the one the variable set.
-    if let Some((env, _)) = env_options.as_ref() {
-        forward_env_v8_flags(&env.v8_args);
-    }
-    forward_v8_flags(&args);
+    // The forwarding itself happens below, immediately before V8 is initialized,
+    // because it is V8 that decides which flags exist and what a rejected one
+    // says. See `apply_v8_flags`.
 
     // The command line is parsed before anything is built, because the
     // permission model it produces has to exist before the binding registry
@@ -169,7 +165,20 @@ fn main() {
     // the flag list, which happens during `V8::Initialize`. Node disables the
     // freeze before initializing for exactly this reason, so a flag set from
     // JavaScript keeps working instead of crashing inside V8's `CHECK`.
+    //
+    // It is also the first of the two flag calls Node makes: `node.cc:949` sets
+    // this string, and the command line's V8 flags are applied further down the
+    // same function (`node.cc:1101`), so the freeze is lifted before the flags
+    // that would otherwise be refused arrive.
     v8::V8::set_flags_from_string("--no-freeze-flags-after-init");
+
+    // The command line's V8 flags, handed over the way Node hands them over:
+    // V8 consumes what it recognizes and the rest is a `bad option`. This has to
+    // happen before `initialize`, because V8 reads its flag list once and
+    // silently ignores anything set afterwards — a flag applied after this point
+    // is accepted and then does nothing, which is the failure mode the old
+    // allow-list version of this function could not detect.
+    apply_v8_flags(&options.v8_args);
 
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
@@ -692,68 +701,49 @@ fn evaluate_script<'s>(
     value
 }
 
-/// Passes the V8 flags `NODE_OPTIONS` named through to V8.
+/// Hands the V8 flags to V8 and reports what V8 refused, the way Node does.
 ///
-/// These need no allow-list: `rn_bind_options::env::parse` already established
-/// that each is a table entry of kind `kV8Option` (or `--stack-trace-limit`)
-/// that Node permits in the variable, so "forward it" is the same decision Node
-/// makes when it pushes the argument onto `v8_args`. Anything it did not accept
-/// never reaches here — the parse fails first, with Node's message.
-fn forward_env_v8_flags(args: &[String]) {
-    for argument in args {
-        v8::V8::set_flags_from_string(argument);
+/// `src/node.cc:1101` calls `ProcessGlobalArgsInternal` for the command line,
+/// which ends with `V8::SetFlagsFromCommandLine(&argc, argv, true)`
+/// (`src/node.cc:827`) and then reports every argument V8 left behind as
+/// `bad option: <flag>` (`src/node.cc:833`). `remove_flags` is the `true`: V8
+/// consumes what it recognizes and leaves the rest, which is why Node needs no
+/// list of V8 flags and accepts flags added to V8 after Node was written.
+///
+/// `v8::V8::set_flags_from_command_line` is that same call: it returns the
+/// arguments V8 did not take. The first element is the program name, which V8
+/// skips and never returns, so nothing has to be accounted for beyond the
+/// leftovers themselves.
+///
+/// # Why this is fatal rather than a warning
+///
+/// A rejected flag means the process was asked to run in a mode it is not in.
+/// Node exits 9 (`ExitCode::kInvalidCommandLineArgument`) and runs nothing, and
+/// so does this: a flag sweep that treats a rejected flag as success measures a
+/// process that never applied the flag, which is how an apparent 89% win gets
+/// reported for a run that exited during argument parsing.
+fn apply_v8_flags(args: &[String]) {
+    if args.is_empty() {
+        return;
     }
-}
+    // V8's own `--help` handling and its `usage` string are not wanted here:
+    // Node routes `--v8-options` and `--help` through its option table instead,
+    // so a flag still in `args` is one the caller already accepted as a flag.
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(args::program_name());
+    argv.extend(args.iter().cloned());
 
-///
-/// Node splits its arguments into its own and V8's, and hands the V8 half over
-/// before `V8::Initialize`. rustnode accepts the same flags, so the ones that
-/// are only meaningful to V8 have to reach it too — otherwise a flag is accepted
-/// and silently does nothing, which is the failure mode `Options::unimplemented`
-/// exists to avoid but cannot catch for a flag that *is* implemented elsewhere.
-///
-/// Only the flags listed here are forwarded. Everything else rustnode handles
-/// itself, and forwarding it would change V8's behaviour behind rustnode's back.
-fn forward_v8_flags(args: &[String]) {
-    /// V8 flags that are also Node flags and are implemented by passing them
-    /// through. `--max-old-space-size` sizes the old generation, which is what
-    /// `v8.getHeapStatistics().heap_size_limit` reports.
-    ///
-    /// `--expose-gc` is here rather than in JavaScript for the same reason: it
-    /// is what makes V8 install the `gc()` global, and a hand-written `gc` would
-    /// not be the same function V8's tests call. Node lists it as a `V8Option`
-    /// in `node_options.cc`, so this is the faithful place for it.
-    const FORWARDED: &[&str] = &[
-        "--max-old-space-size=",
-        "--stack-size=",
-        "--stack-trace-limit=",
-    ];
-    /// V8 flags spelled with no value.
-    ///
-    /// Both spellings appear in Node's test headers — `--expose-gc` and
-    /// `--expose_gc` — and V8 accepts either, so both are forwarded. Matching
-    /// only the dashed form left `test-abortsignal-drop-settled-signals.mjs`
-    /// failing on a flag the harness had already passed through.
-    ///
-    /// `--allow-natives-syntax` is here for the same reason and is the same kind
-    /// of flag: V8 consumes it and Node stores no field for it, so accepting it
-    /// without forwarding leaves `%DebugPrint` and friends as a `SyntaxError`.
-    /// `lib/internal/test_runner/runner.js` names these two as the examples of
-    /// options that must be propagated by hand.
-    const FORWARDED_BARE: &[&str] = &[
-        "--expose-gc",
-        "--expose_gc",
-        "--allow-natives-syntax",
-        "--allow_natives_syntax",
-    ];
-
-    for argument in args {
-        if FORWARDED.iter().any(|prefix| argument.starts_with(prefix))
-            || FORWARDED_BARE.contains(&argument.as_str())
-        {
-            // V8 spells its flags with underscores as well as dashes; the dashed
-            // form is what the command line takes and V8 accepts both.
-            v8::V8::set_flags_from_string(argument);
-        }
+    let leftovers = v8::V8::set_flags_from_command_line(argv);
+    // V8 returns the program name among the leftovers only if it consumed
+    // nothing and kept the array intact; Node starts its loop at index 1 for the
+    // same reason.
+    let bad: Vec<&String> = leftovers.iter().skip(1).collect();
+    if bad.is_empty() {
+        return;
     }
+    let program = args::program_name();
+    for flag in bad {
+        eprintln!("{program}: bad option: {flag}");
+    }
+    terminate(9);
 }
