@@ -104,10 +104,15 @@ const KNOWN_FINDINGS: &[&str] = &[
     "icu.decode:claimed-and-deferred",
     "icu.getConverter:claimed-and-deferred",
     "icu.hasConverter:claimed-and-deferred",
-    // `performance.Histogram`, `performance.SlidingWindowHistogram` — same shape,
-    // and the consequence is user-visible: `lib/internal/histogram.js` destructures
-    // both at module scope, so `perf_hooks.createHistogram()` throws
-    // `_Histogram is not a constructor`.
+    // `performance.Histogram`, `performance.SlidingWindowHistogram` — same shape.
+    // These two MOVED CATEGORY, they were not fixed: they were previously recorded
+    // as `wrong-kind` (installed as `undefined`) and upstream later added them to
+    // `DEFERRED` as well as `MEMBERS`, so they now report as `claimed-and-deferred`.
+    // The underlying defect is unchanged and still live:
+    // `perf_hooks.createHistogram()` throws `_Histogram is not a constructor`,
+    // because deferring a member does not implement it. Tracked separately — do not
+    // treat this entry's presence, or the unchanged total, as evidence it was
+    // addressed.
     "performance.Histogram:claimed-and-deferred",
     "performance.SlidingWindowHistogram:claimed-and-deferred",
     // `process_methods.{causeSegfault,dlopenBinary,execve,setEmitWarningSync}` —
@@ -119,11 +124,9 @@ const KNOWN_FINDINGS: &[&str] = &[
     // `sqlite.backup` — the defect that motivated this check. `rn-compat` reports
     // `sqlite 5 0 0 ok` while `node:sqlite.backup` is `undefined`.
     "sqlite.backup:claimed-and-deferred",
-    // `util.getSharedArrayBufferGrowable`, `util.parseEnv` — same shape. `parseEnv`
-    // is user-visible: `util.parseEnv('A=1')` throws `binding.parseEnv is not a
-    // function`.
+    // `util.getSharedArrayBufferGrowable` — same shape. (`util.parseEnv` was here
+    // too; `2a977ca4` implemented it and the ratchet demanded the removal.)
     "util.getSharedArrayBufferGrowable:claimed-and-deferred",
-    "util.parseEnv:claimed-and-deferred",
     // `util.arrayBufferViewHasBuffer` — claimed, never installed, no deferral.
     "util.arrayBufferViewHasBuffer:claimed-but-absent",
     // `crypto.isKeyAlgorithmAvailable` — installed, but listed in `DEFERRED`, so its
@@ -172,9 +175,13 @@ enum Violation {
     ClaimedButAbsent { member: String },
     /// On the object, and not in `MEMBERS` at all.
     InstalledButUnclaimed { member: String },
-    /// The contract recorded a kind and the object carries a different one — the
-    /// `performance.Histogram` shape, where a `function` was installed as
-    /// `undefined` so `perf_hooks.createHistogram()` throws.
+    /// The contract recorded a kind and the object carries a different one.
+    ///
+    /// `performance.Histogram` used to report through this rule (recorded
+    /// `function`, installed `undefined`). It still installs `undefined`, but
+    /// upstream also added it to `DEFERRED`, so it now reports as
+    /// [`Self::ClaimedAndDeferred`] instead. The defect is the same one; only the
+    /// rule that notices it changed.
     WrongKind {
         member: String,
         contract: String,
@@ -1389,7 +1396,7 @@ mod rule_tests {
         // fix lands, its line and this number change in the same commit.
         assert_eq!(
             KNOWN_FINDINGS.len(),
-            17,
+            16,
             "KNOWN_FINDINGS holds the structural debt; update this count when a fix \
              removes an entry: {:?}",
             KNOWN_FINDINGS
