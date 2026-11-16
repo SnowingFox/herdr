@@ -720,6 +720,20 @@ pub fn flush_inbound(session: &SessionState) {
     // `onStreamClose` asks `stream._readableState.ended`, so a close drained before
     // its EOF reports a clean end as `ERR_HTTP2_STREAM_ABORTED`.
     drain_staged(session);
+    // Every staged event has now been delivered, so the destroyed-stream marks have
+    // done their job. Dropping them here is what keeps the set bounded: without it,
+    // one entry per destroyed stream accumulates for the life of the session — a
+    // slow leak on any long-lived connection.
+    //
+    // Clearing is sound because every staged event is delivered before this point,
+    // so no mark is still load-bearing. A stream destroyed during the drain above
+    // has its remaining staged events delivered in the same drain, and the marks are
+    // only read by `emit_read` — which runs inside the drain. Staging itself cannot
+    // produce a *new* event for a destroyed stream in a later receive: `deliver_data`
+    // bails on a destroyed and on a missing record, and `stage_eof`/`stage_close`
+    // are reached only from `mem_recv` frame callbacks, which a stream that has
+    // already closed no longer produces.
+    session.destroyed_streams.borrow_mut().clear();
 }
 
 /// Delivers every queued event for this session, in arrival order.
