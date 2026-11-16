@@ -25,6 +25,8 @@
 //! Node release that renumbered a field, and both are things to find out about.
 
 use rn_node_oracle::Oracle;
+use std::path::PathBuf;
+use std::process::Command;
 
 /// Collects the numbers and buffer shapes from a real Node binary.
 const PROBE: &str = r#"
@@ -105,6 +107,39 @@ fn recording_v8_version() -> String {
         return "unknown".to_string();
     };
     oracle.eval("process.versions.v8")
+}
+
+fn rustnode() -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.pop();
+    path.pop();
+    path.push("target");
+    path.push(if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    });
+    path.push("rustnode");
+    path
+}
+
+fn binding_heap_spaces() -> Vec<String> {
+    let probe = "const realm = require('internal/bootstrap/realm');\
+                 const binding = realm.internalBinding('v8');\
+                 process.stdout.write(JSON.stringify(Array.from(binding.kHeapSpaces)));";
+    let output = Command::new(rustnode())
+        .arg("--expose-internals")
+        .arg("-e")
+        .arg(probe)
+        .output()
+        .expect("the rustnode binary must be built first");
+    assert!(
+        output.status.success(),
+        "failed to read internalBinding('v8').kHeapSpaces: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    serde_json::from_slice::<Vec<String>>(&output.stdout)
+        .expect("kHeapSpaces probe must print a JSON string array")
 }
 
 /// Asserts `name` is `expected` in the recording.
@@ -270,15 +305,19 @@ fn the_heap_space_names_match_a_real_node_binary() {
     let Some(recorded) = recorded() else {
         return;
     };
-    let names: Vec<&str> = recorded["heapSpaces"]
+    let oracle_names: Vec<String> = recorded["heapSpaces"]
         .as_array()
         .expect("an array of names")
         .iter()
-        .filter_map(|name| name.as_str())
+        .map(|name| {
+            name.as_str()
+                .expect("every heap space name must be a string")
+                .to_string()
+        })
         .collect();
+    let binding_names = binding_heap_spaces();
     assert_eq!(
-        names,
-        rn_bind_v8::constants::HEAP_SPACES,
+        binding_names, oracle_names,
         "the heap space names or their order differ from node's"
     );
 }

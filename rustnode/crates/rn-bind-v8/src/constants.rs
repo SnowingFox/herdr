@@ -48,29 +48,6 @@ pub const HEAP_CODE_STATISTICS_INDEXES: &[(&str, usize)] = &[
     ("cpu_profiler_metadata_size", 3),
 ];
 
-/// The heap spaces `Isolate::GetHeapSpaceStatistics` reports, in the order its
-/// index takes.
-///
-/// This is a snapshot of what V8 15.2 reports, and it has to be: `lib/v8.js`
-/// builds `kNumberOfHeapSpaces` from this array's length and then indexes the
-/// buffer by position. The names are listed in `HEAP_SPACES` order and the
-/// isolate's own space count is checked against them at install time, so a V8
-/// that added a space shows up as a startup error rather than as one space
-/// quietly reporting another space's numbers.
-pub const HEAP_SPACES: &[&str] = &[
-    "read_only_space",
-    "new_space",
-    "old_space",
-    "code_space",
-    "shared_space",
-    "trusted_space",
-    "new_large_object_space",
-    "large_object_space",
-    "code_large_object_space",
-    "shared_large_object_space",
-    "trusted_large_object_space",
-];
-
 /// `v8::HeapProfiler::SamplingFlags::kSamplingNoFlags`.
 pub const SAMPLING_NO_FLAGS: u32 = 0;
 

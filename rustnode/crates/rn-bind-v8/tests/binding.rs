@@ -28,6 +28,7 @@ fn rustnode() -> PathBuf {
 fn run(script: &str) -> String {
     let output = Command::new(rustnode())
         .arg("--expose-internals")
+        .arg("--expose-gc")
         .arg("-e")
         .arg(script)
         .output()
@@ -169,9 +170,17 @@ fn update_heap_space_statistics_buffer_reports_the_indexed_space() {
           if (v8b.kHeapSpaces[i] === 'new_space' &&
               b[v8b.kSpaceSizeIndex] > 0) sawNewSpace = true;
         }}
-        console.log(count, allFinite, sawNewSpace);"
+        console.log(JSON.stringify({{ count, allFinite, sawNewSpace }}));"
     ));
-    assert_eq!(output, "11 true true");
+    let report: serde_json::Value =
+        serde_json::from_str(&output).expect("the space report should be JSON");
+    assert_eq!(
+        report["count"].as_u64(),
+        Some(13),
+        "V8 15.2 should expose 13 heap spaces"
+    );
+    assert_eq!(report["allFinite"].as_bool(), Some(true));
+    assert_eq!(report["sawNewSpace"].as_bool(), Some(true));
 }
 
 #[test]
@@ -193,21 +202,53 @@ fn update_heap_code_statistics_buffer_reports_real_sizes() {
 }
 
 #[test]
-fn the_heap_space_names_are_v8s() {
-    // The order is the contract: `updateHeapSpaceStatisticsBuffer(i)` selects the
-    // space at position `i`, so a reordering would attribute one space's numbers
-    // to another.
+fn heap_space_names_align_with_gc_profiler_rows() {
+    // `kHeapSpaces` drives `updateHeapSpaceStatisticsBuffer(i)` and
+    // `v8.getHeapSpaceStatistics()` in `lib/v8.js`, while `GCProfiler` writes
+    // names from `Isolate::GetHeapSpaceStatistics`. Row-wise equality catches
+    // reorders and misattribution, not only count drift.
     let output = run(&format!(
         "{PRELUDE}
-        console.log(JSON.stringify(v8b.kHeapSpaces));"
+        const v8 = require('v8');
+        let profilerNames = null;
+        for (let attempt = 0; attempt < 8 && profilerNames === null; attempt++) {{
+          const profiler = new v8.GCProfiler();
+          profiler.start();
+          const keep = [];
+          for (let i = 0; i < 250000; i++) keep.push({{ i, text: 'x' + i }});
+          keep.length = 0;
+          if (global.gc) gc();
+          const document = profiler.stop();
+          const sample = document && document.statistics && document.statistics[0];
+          if (sample) profilerNames = sample.beforeGC.heapSpaceStatistics.map((space) => space.spaceName);
+        }}
+        if (profilerNames === null) {{
+          console.log(JSON.stringify({{ sampled: false }}));
+        }} else {{
+          const apiNames = v8.getHeapSpaceStatistics().map((space) => space.space_name);
+          const bindingNames = Array.from(v8b.kHeapSpaces);
+          const rowMatch = (left, right) =>
+            left.length === right.length && left.every((name, index) => name === right[index]);
+          console.log(JSON.stringify({{
+            sampled: true,
+            bindingVsProfiler: rowMatch(bindingNames, profilerNames),
+            apiVsProfiler: rowMatch(apiNames, profilerNames),
+            apiVsBinding: rowMatch(apiNames, bindingNames),
+            count: apiNames.length
+          }}));
+        }}"
     ));
+    let report: serde_json::Value =
+        serde_json::from_str(&output).expect("the profile report should be JSON");
     assert_eq!(
-        output,
-        "[\"read_only_space\",\"new_space\",\"old_space\",\"code_space\",\"shared_space\",\
-         \"trusted_space\",\"new_large_object_space\",\"large_object_space\",\
-         \"code_large_object_space\",\"shared_large_object_space\",\
-         \"trusted_large_object_space\"]"
+        report["sampled"].as_bool(),
+        Some(true),
+        "GCProfiler produced no sample"
     );
+    assert_eq!(report["bindingVsProfiler"].as_bool(), Some(true));
+    assert_eq!(report["apiVsProfiler"].as_bool(), Some(true));
+    assert_eq!(report["apiVsBinding"].as_bool(), Some(true));
+    assert_eq!(report["count"].as_u64(), Some(13));
 }
 
 #[test]

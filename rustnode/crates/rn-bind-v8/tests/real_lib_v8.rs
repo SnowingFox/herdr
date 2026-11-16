@@ -292,16 +292,23 @@ const names = spaces.map((space) => space.space_name);
 const shape = spaces.every((space) =>
   Object.keys(space).join(',') ===
     'space_name,space_size,space_used_size,space_available_size,physical_space_size');
-globalThis.__result = [
-  Array.isArray(spaces),
-  spaces.length,
+globalThis.__result = JSON.stringify({
+  isArray: Array.isArray(spaces),
+  count: spaces.length,
   shape,
-  names.includes('new_space'),
-  names.includes('old_space'),
-  new Set(names).size === names.length
-].join(' ');
+  hasNewSpace: names.includes('new_space'),
+  hasOldSpace: names.includes('old_space'),
+  unique: new Set(names).size === names.length
+});
 "#]);
-    assert_eq!(output, "true 11 true true true true");
+    let report: serde_json::Value =
+        serde_json::from_str(&output).expect("the heap-space report should be JSON");
+    assert_eq!(report["isArray"].as_bool(), Some(true));
+    assert_eq!(report["count"].as_u64(), Some(13));
+    assert_eq!(report["shape"].as_bool(), Some(true));
+    assert_eq!(report["hasNewSpace"].as_bool(), Some(true));
+    assert_eq!(report["hasOldSpace"].as_bool(), Some(true));
+    assert_eq!(report["unique"].as_bool(), Some(true));
 }
 
 #[test]

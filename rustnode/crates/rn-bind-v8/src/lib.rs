@@ -78,8 +78,7 @@ use rn_v8_sys::v8;
 
 use buffers_impl::Buffers;
 use constants::{
-    HEAP_CODE_STATISTICS_INDEXES, HEAP_SPACES, HEAP_SPACE_STATISTICS_INDEXES,
-    HEAP_STATISTICS_INDEXES,
+    HEAP_CODE_STATISTICS_INDEXES, HEAP_SPACE_STATISTICS_INDEXES, HEAP_STATISTICS_INDEXES,
 };
 
 /// The aliased statistics buffers, exposed so tests can read a value JavaScript
@@ -399,14 +398,29 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
 /// `updateHeapSpaceStatisticsBuffer`, so the order is the contract and the
 /// length is `kNumberOfHeapSpaces`.
 fn heap_spaces<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, String> {
-    let array = v8::Array::new(scope, HEAP_SPACES.len() as i32);
-    for (index, name) in HEAP_SPACES.iter().enumerate() {
+    let names = heap_space_names(scope)?;
+    let array = v8::Array::new(scope, names.len() as i32);
+    for (index, name) in names.iter().enumerate() {
         let Some(text) = v8::String::new(scope, name) else {
             return Err(format!("cannot allocate the heap space name {name}"));
         };
         array.set_index(scope, index as u32, text.into());
     }
     Ok(array.into())
+}
+
+fn heap_space_names(scope: &mut v8::PinScope<'_, '_>) -> Result<Vec<String>, String> {
+    let spaces = scope.number_of_heap_spaces();
+    let mut names = Vec::with_capacity(spaces);
+    for index in 0..spaces {
+        let Some(statistics) = scope.get_heap_space_statistics(index) else {
+            return Err(format!(
+                "cannot read heap space statistics for index {index}"
+            ));
+        };
+        names.push(statistics.space_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
 }
 
 /// `detailLevel`: the `cppgc::HeapStatistics::DetailLevel` values
@@ -717,29 +731,6 @@ mod tests {
         assert_eq!(
             HEAP_CODE_STATISTICS_INDEXES.len(),
             buffers::HEAP_CODE_STATISTICS_LENGTH
-        );
-    }
-
-    #[test]
-    fn the_heap_space_names_are_the_ones_v8_reports() {
-        // The order is what `lib/v8.js` passes to
-        // `updateHeapSpaceStatisticsBuffer`, so a rename or a reorder would
-        // silently attribute one space's numbers to another.
-        assert_eq!(
-            HEAP_SPACES,
-            &[
-                "read_only_space",
-                "new_space",
-                "old_space",
-                "code_space",
-                "shared_space",
-                "trusted_space",
-                "new_large_object_space",
-                "large_object_space",
-                "code_large_object_space",
-                "shared_large_object_space",
-                "trusted_large_object_space",
-            ]
         );
     }
 
