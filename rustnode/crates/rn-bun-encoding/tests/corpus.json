@@ -1,0 +1,1634 @@
+[
+ {
+  "name": "YAML.parse mapping",
+  "expression": "Bun.YAML.parse(\"a: 1\\nb: two\")"
+ },
+ {
+  "name": "YAML.parse sequence",
+  "expression": "Bun.YAML.parse(\"- 1\\n- 2\")"
+ },
+ {
+  "name": "YAML.parse nested",
+  "expression": "Bun.YAML.parse(\"a:\\n  b:\\n    c: 1\")"
+ },
+ {
+  "name": "YAML.parse scalars",
+  "expression": "Bun.YAML.parse(\"i: 42\\nf: 1.5\\nt: true\\nf2: false\\nn: null\\ns: hello\")"
+ },
+ {
+  "name": "YAML.parse 1.1 booleans stay strings",
+  "expression": "Bun.YAML.parse(\"a: yes\\nb: no\\nc: on\\nd: off\\ne: y\\nf: n\")"
+ },
+ {
+  "name": "YAML.parse dates stay strings",
+  "expression": "Bun.YAML.parse(\"d: 2024-01-01\\ndt: 2024-01-01T00:00:00Z\")"
+ },
+ {
+  "name": "YAML.parse inf nan",
+  "expression": "Bun.YAML.parse(\"a: .inf\\nb: .nan\\nc: -.inf\")"
+ },
+ {
+  "name": "YAML.parse literal block",
+  "expression": "Bun.YAML.parse(\"a: |\\n  line1\\n  line2\\n\")"
+ },
+ {
+  "name": "YAML.parse literal strip",
+  "expression": "Bun.YAML.parse(\"a: |-\\n  x\\n\")"
+ },
+ {
+  "name": "YAML.parse folded block",
+  "expression": "Bun.YAML.parse(\"a: >\\n  line1\\n  line2\\n\")"
+ },
+ {
+  "name": "YAML.parse anchor alias",
+  "expression": "Bun.YAML.parse(\"a: &x 1\\nb: *x\")"
+ },
+ {
+  "name": "YAML.parse merge key",
+  "expression": "Bun.YAML.parse(\"base: &b\\n  x: 1\\nchild:\\n  <<: *b\\n  y: 2\")"
+ },
+ {
+  "name": "YAML.parse merge sequence order",
+  "expression": "Bun.YAML.parse(\"a: &a {x: 1, z: 1}\\nb: &b {x: 2, y: 2}\\nc: {<<: [*b, *a]}\")"
+ },
+ {
+  "name": "YAML.parse merge non-mapping",
+  "expression": "Bun.YAML.parse(\"c: {<<: 1}\")"
+ },
+ {
+  "name": "YAML.parse duplicate key",
+  "expression": "Bun.YAML.parse(\"a: 1\\nb: 2\\na: 3\")"
+ },
+ {
+  "name": "YAML.parse empty",
+  "expression": "Bun.YAML.parse(\"\")"
+ },
+ {
+  "name": "YAML.parse comment only",
+  "expression": "Bun.YAML.parse(\"# c\")"
+ },
+ {
+  "name": "YAML.parse scalar doc",
+  "expression": "Bun.YAML.parse(\"hello\")"
+ },
+ {
+  "name": "YAML.parse comments",
+  "expression": "Bun.YAML.parse(\"# c\\na: 1 # trailing\")"
+ },
+ {
+  "name": "YAML.parse quoted",
+  "expression": "Bun.YAML.parse(\"a: 'single'\\nb: \\\"double\\\\n\\\"\")"
+ },
+ {
+  "name": "YAML.parse multi document",
+  "expression": "Bun.YAML.parse(\"a: 1\\n---\\nb: 2\")"
+ },
+ {
+  "name": "YAML.parse null forms",
+  "expression": "Bun.YAML.parse(\"a: ~\\nb: null\\nc: Null\\nd: NULL\")"
+ },
+ {
+  "name": "YAML.parse bool forms",
+  "expression": "Bun.YAML.parse(\"a: true\\nb: True\\nc: TRUE\\nd: false\")"
+ },
+ {
+  "name": "YAML.parse number forms",
+  "expression": "Bun.YAML.parse(\"a: 0x10\\nb: 0o17\\nc: 1_000\\nd: 1.5e3\\ne: .5\\nf: -0x10\")"
+ },
+ {
+  "name": "YAML.parse key coercion",
+  "expression": "Bun.YAML.parse(\"1: a\\n~: b\\ntrue: c\\n? [x, y]\\n: d\")"
+ },
+ {
+  "name": "YAML.parse flow",
+  "expression": "Bun.YAML.parse(\"a: {b: [1, {c: 2}]}\")"
+ },
+ {
+  "name": "YAML.parse buffer",
+  "expression": "Bun.YAML.parse(new TextEncoder().encode(\"a: 1\"))"
+ },
+ {
+  "name": "YAML.parse arraybuffer",
+  "expression": "Bun.YAML.parse(new TextEncoder().encode(\"a: 1\").buffer)"
+ },
+ {
+  "name": "YAML.parse number arg",
+  "expression": "Bun.YAML.parse(42)"
+ },
+ {
+  "name": "YAML.parse no arg",
+  "expression": "Bun.YAML.parse()"
+ },
+ {
+  "name": "YAML.parse null arg",
+  "expression": "Bun.YAML.parse(null)"
+ },
+ {
+  "name": "YAML.parse true arg",
+  "expression": "Bun.YAML.parse(true)"
+ },
+ {
+  "name": "YAML.parse object arg",
+  "expression": "Bun.YAML.parse({})"
+ },
+ {
+  "name": "YAML.parse tab indent",
+  "expression": "Bun.YAML.parse(\"a:\\n\\t- 1\")"
+ },
+ {
+  "name": "YAML.parse tab value",
+  "expression": "Bun.YAML.parse(\"a:\\tb\")"
+ },
+ {
+  "name": "YAML.parse unterminated flow",
+  "expression": "Bun.YAML.parse(\"a: [1, 2\")"
+ },
+ {
+  "name": "YAML.parse double colon",
+  "expression": "Bun.YAML.parse(\"a: b: c\")"
+ },
+ {
+  "name": "YAML.parse unterminated quote",
+  "expression": "Bun.YAML.parse(\"a: \\\"x\")"
+ },
+ {
+  "name": "YAML.parse bad escape",
+  "expression": "Bun.YAML.parse(\"a: \\\"\\\\q\\\"\")"
+ },
+ {
+  "name": "YAML.parse unresolved alias",
+  "expression": "Bun.YAML.parse(\"a: *nope\")"
+ },
+ {
+  "name": "YAML.stringify flow",
+  "expression": "Bun.YAML.stringify({a: 1, b: \"x\", c: [1, 2], d: {e: true}, f: null})"
+ },
+ {
+  "name": "YAML.stringify scalar",
+  "expression": "Bun.YAML.stringify(\"hi\")"
+ },
+ {
+  "name": "YAML.stringify number",
+  "expression": "Bun.YAML.stringify(5)"
+ },
+ {
+  "name": "YAML.stringify array",
+  "expression": "Bun.YAML.stringify([1, 2, 3])"
+ },
+ {
+  "name": "YAML.stringify null",
+  "expression": "Bun.YAML.stringify(null)"
+ },
+ {
+  "name": "YAML.stringify undefined",
+  "expression": "Bun.YAML.stringify(undefined)"
+ },
+ {
+  "name": "YAML.stringify function",
+  "expression": "Bun.YAML.stringify({a: () => {}})"
+ },
+ {
+  "name": "YAML.stringify multiline",
+  "expression": "Bun.YAML.stringify({a: \"line1\\nline2\"})"
+ },
+ {
+  "name": "YAML.stringify quote yes",
+  "expression": "Bun.YAML.stringify({a: \"yes\"})"
+ },
+ {
+  "name": "YAML.stringify empty",
+  "expression": "Bun.YAML.stringify({})"
+ },
+ {
+  "name": "YAML.stringify empty array",
+  "expression": "Bun.YAML.stringify([])"
+ },
+ {
+  "name": "YAML.stringify drops undefined",
+  "expression": "Bun.YAML.stringify({a: true, b: undefined, c: null})"
+ },
+ {
+  "name": "YAML.stringify space 2",
+  "expression": "Bun.YAML.stringify({a: 1}, null, 2)"
+ },
+ {
+  "name": "YAML.stringify space 4 nested",
+  "expression": "Bun.YAML.stringify({a: {b: 1}}, null, 4)"
+ },
+ {
+  "name": "YAML.stringify space 0",
+  "expression": "Bun.YAML.stringify({a: 1}, null, 0)"
+ },
+ {
+  "name": "YAML.stringify block list",
+  "expression": "Bun.YAML.stringify({list: [1, 2]}, null, 2)"
+ },
+ {
+  "name": "YAML.stringify top array block",
+  "expression": "Bun.YAML.stringify([1, 2], null, 2)"
+ },
+ {
+  "name": "YAML.stringify -0",
+  "expression": "Bun.YAML.stringify({a: -0, b: 0})"
+ },
+ {
+  "name": "YAML.stringify inf",
+  "expression": "Bun.YAML.stringify({a: Infinity, b: -Infinity})"
+ },
+ {
+  "name": "YAML.stringify special strings",
+  "expression": "Bun.YAML.stringify({a: \"a: b\", b: \"#x\", c: \"-x\", d: \"x-\", e: \"1\", f: \"1_0\"})"
+ },
+ {
+  "name": "YAML.stringify key quoting",
+  "expression": "Bun.YAML.stringify({\"a b\": 1, \"yes\": 2, \"\": 3})"
+ },
+ {
+  "name": "YAML.stringify replacer",
+  "expression": "Bun.YAML.stringify({a: 1}, () => {}, 2)"
+ },
+ {
+  "name": "YAML.stringify bigint",
+  "expression": "Bun.YAML.stringify({a: 10n})"
+ },
+ {
+  "name": "TOML.parse scalars",
+  "expression": "Bun.TOML.parse(\"a = 1\\nb = \\\"two\\\"\\nc = true\")"
+ },
+ {
+  "name": "TOML.parse tables",
+  "expression": "Bun.TOML.parse(\"[t]\\nx = 1\\n[t.sub]\\ny = 2\")"
+ },
+ {
+  "name": "TOML.parse inline table",
+  "expression": "Bun.TOML.parse(\"p = { x = 1, y = \\\"z\\\" }\")"
+ },
+ {
+  "name": "TOML.parse arrays",
+  "expression": "Bun.TOML.parse(\"a = [1, 2, 3]\\nb = [\\\"x\\\", \\\"y\\\"]\")"
+ },
+ {
+  "name": "TOML.parse array of tables",
+  "expression": "Bun.TOML.parse(\"[[a]]\\nx = 1\\n[[a]]\\nx = 2\")"
+ },
+ {
+  "name": "TOML.parse dotted",
+  "expression": "Bun.TOML.parse(\"a.b.c = 1\")"
+ },
+ {
+  "name": "TOML.parse numbers",
+  "expression": "Bun.TOML.parse(\"i = 42\\nf = 3.14\\ne = 1e10\\nh = 0xff\\nu = 1_000\\ninf = inf\")"
+ },
+ {
+  "name": "TOML.parse multiline basic",
+  "expression": "Bun.TOML.parse(\"s = \\\"\\\"\\\"\\nline1\\nline2\\\"\\\"\\\"\")"
+ },
+ {
+  "name": "TOML.parse multiline literal",
+  "expression": "Bun.TOML.parse(\"s = '''\\nline1\\nline2'''\")"
+ },
+ {
+  "name": "TOML.parse literal no escapes",
+  "expression": "Bun.TOML.parse(\"s = 'no \\\\n escape'\")"
+ },
+ {
+  "name": "TOML.parse empty",
+  "expression": "Bun.TOML.parse(\"\")"
+ },
+ {
+  "name": "TOML.parse comment",
+  "expression": "Bun.TOML.parse(\"# c\\na = 1 # t\")"
+ },
+ {
+  "name": "TOML.parse quoted key",
+  "expression": "Bun.TOML.parse(\"\\\"a b\\\" = 1\")"
+ },
+ {
+  "name": "TOML.parse empty table",
+  "expression": "Bun.TOML.parse(\"[a]\")"
+ },
+ {
+  "name": "TOML.parse escape",
+  "expression": "Bun.TOML.parse(\"a = \\\"x\\\\u00e9y\\\\tz\\\"\")"
+ },
+ {
+  "name": "TOML.parse array of inline",
+  "expression": "Bun.TOML.parse(\"a = [{x=1},{y=2}]\")"
+ },
+ {
+  "name": "TOML.parse nested array tables",
+  "expression": "Bun.TOML.parse(\"[[a]]\\nx=1\\n[a.b]\\ny=2\\n[[a]]\\nx=3\\n[a.b]\\ny=4\")"
+ },
+ {
+  "name": "TOML.parse time no seconds",
+  "expression": "Bun.TOML.parse(\"a = 07:32\")"
+ },
+ {
+  "name": "TOML.parse hex escapes",
+  "expression": "Bun.TOML.parse(\"a = \\\"\\\\x41\\\"\")"
+ },
+ {
+  "name": "TOML.parse dup key",
+  "expression": "Bun.TOML.parse(\"a = 1\\na = 2\")"
+ },
+ {
+  "name": "TOML.parse missing value",
+  "expression": "Bun.TOML.parse(\"a = \")"
+ },
+ {
+  "name": "TOML.parse missing equals",
+  "expression": "Bun.TOML.parse(\"a = 1\\nb\")"
+ },
+ {
+  "name": "TOML.parse int64 overflow",
+  "expression": "Bun.TOML.parse(\"big = 9223372036854775807\")"
+ },
+ {
+  "name": "TOML.parse no arg",
+  "expression": "Bun.TOML.parse()"
+ },
+ {
+  "name": "TOML.parse number arg",
+  "expression": "Bun.TOML.parse(42)"
+ },
+ {
+  "name": "TOML.parse redefine table",
+  "expression": "Bun.TOML.parse(\"[a]\\n[a]\")"
+ },
+ {
+  "name": "TOML.parse value then table",
+  "expression": "Bun.TOML.parse(\"a = 1\\n[a]\")"
+ },
+ {
+  "name": "TOML.parse inline then table",
+  "expression": "Bun.TOML.parse(\"a = {b=1}\\n[a]\")"
+ },
+ {
+  "name": "TOML.parse array table then table",
+  "expression": "Bun.TOML.parse(\"[[a]]\\n[a]\")"
+ },
+ {
+  "name": "TOML.parse table then array table",
+  "expression": "Bun.TOML.parse(\"[a]\\n[[a]]\")"
+ },
+ {
+  "name": "TOML.parse unclosed array",
+  "expression": "Bun.TOML.parse(\"a = [1\")"
+ },
+ {
+  "name": "TOML.parse unclosed string",
+  "expression": "Bun.TOML.parse(\"a = \\\"x\")"
+ },
+ {
+  "name": "TOML.parse bad inline",
+  "expression": "Bun.TOML.parse(\"a = {x=1\")"
+ },
+ {
+  "name": "TOML.parse empty key",
+  "expression": "Bun.TOML.parse(\"= 1\")"
+ },
+ {
+  "name": "TOML.parse trailing junk",
+  "expression": "Bun.TOML.parse(\"a = 1 b = 2\")"
+ },
+ {
+  "name": "TOML.parse array missing comma",
+  "expression": "Bun.TOML.parse(\"a = [1 2]\")"
+ },
+ {
+  "name": "TOML.parse bad escape",
+  "expression": "Bun.TOML.parse(\"a = \\\"\\\\q\\\"\")"
+ },
+ {
+  "name": "TOML.parse control char",
+  "expression": "Bun.TOML.parse(\"a = \\\"x\\u0001y\\\"\")"
+ },
+ {
+  "name": "TOML.parse leading zero",
+  "expression": "Bun.TOML.parse(\"a = 01\")"
+ },
+ {
+  "name": "TOML.parse bad underscore",
+  "expression": "Bun.TOML.parse(\"a = 1__0\")"
+ },
+ {
+  "name": "TOML.parse bare string",
+  "expression": "Bun.TOML.parse(\"a = x\")"
+ },
+ {
+  "name": "TOML.parse cr only",
+  "expression": "Bun.TOML.parse(\"a = 1\\rb = 2\")"
+ },
+ {
+  "name": "TOML.parse bad date",
+  "expression": "Bun.TOML.parse(\"a = 1979-13-01\")"
+ },
+ {
+  "name": "TOML.parse bad time",
+  "expression": "Bun.TOML.parse(\"a = 07:60:00\")"
+ },
+ {
+  "name": "TOML.parse bad offset",
+  "expression": "Bun.TOML.parse(\"a = 1979-05-27T07:32:00-25:00\")"
+ },
+ {
+  "name": "TOML.parse dotted then child",
+  "expression": "Bun.TOML.parse(\"x.y = 1\\n[x.y.z]\")"
+ },
+ {
+  "name": "TOML.parse extend inline",
+  "expression": "Bun.TOML.parse(\"a = {b=1}\\n[a.c]\")"
+ },
+ {
+  "name": "TOML.parse extend table dotted",
+  "expression": "Bun.TOML.parse(\"[a.b]\\nx=1\\n[a]\\nb.y = 2\")"
+ },
+ {
+  "name": "TOML.parse implicit reopen",
+  "expression": "Bun.TOML.parse(\"[x.y]\\n[x]\\nz = 1\")"
+ },
+ {
+  "name": "TOML.parse inline dup",
+  "expression": "Bun.TOML.parse(\"a = {x = 1, x = 2}\")"
+ },
+ {
+  "name": "TOML.stringify flat",
+  "expression": "Bun.TOML.stringify({a: 1, b: \"x\", c: true, d: [1, 2], e: {f: \"g\"}})"
+ },
+ {
+  "name": "TOML.stringify deep",
+  "expression": "Bun.TOML.stringify({a: {b: {c: 1}}})"
+ },
+ {
+  "name": "TOML.stringify array of tables",
+  "expression": "Bun.TOML.stringify({a: [{x: 1}, {y: 2}]})"
+ },
+ {
+  "name": "TOML.stringify date",
+  "expression": "Bun.TOML.stringify({d: new Date(0)})"
+ },
+ {
+  "name": "TOML.stringify escapes",
+  "expression": "Bun.TOML.stringify({a: \"line1\\nline2\", b: \"quote\\\"here\"})"
+ },
+ {
+  "name": "TOML.stringify nan inf",
+  "expression": "Bun.TOML.stringify({a: NaN, b: Infinity, c: -Infinity})"
+ },
+ {
+  "name": "TOML.stringify undefined",
+  "expression": "Bun.TOML.stringify({a: undefined})"
+ },
+ {
+  "name": "TOML.stringify no arg",
+  "expression": "Bun.TOML.stringify()"
+ },
+ {
+  "name": "TOML.stringify empty",
+  "expression": "Bun.TOML.stringify({})"
+ },
+ {
+  "name": "TOML.stringify empty table",
+  "expression": "Bun.TOML.stringify({a: {}})"
+ },
+ {
+  "name": "TOML.stringify empty array",
+  "expression": "Bun.TOML.stringify({a: []})"
+ },
+ {
+  "name": "TOML.stringify ordering",
+  "expression": "Bun.TOML.stringify({z: 1, t: {y: 2, s: {x: 3}}, a: 4})"
+ },
+ {
+  "name": "TOML.stringify nested arrays",
+  "expression": "Bun.TOML.stringify({a: [1, \"x\", true]})"
+ },
+ {
+  "name": "TOML.stringify array of arrays",
+  "expression": "Bun.TOML.stringify({a: [[1], [2]]})"
+ },
+ {
+  "name": "TOML.stringify mixed array",
+  "expression": "Bun.TOML.stringify({a: [{x:1}, 2]})"
+ },
+ {
+  "name": "TOML.stringify -0",
+  "expression": "Bun.TOML.stringify({a: -0, b: 0})"
+ },
+ {
+  "name": "TOML.stringify big integral",
+  "expression": "Bun.TOML.stringify({a: 9007199254740992})"
+ },
+ {
+  "name": "TOML.stringify key quoting",
+  "expression": "Bun.TOML.stringify({\"a b\": 1, \"a.b\": 2, \"\": 3, \"a-b_c1\": 4, \"é\": 5})"
+ },
+ {
+  "name": "TOML.stringify null",
+  "expression": "Bun.TOML.stringify({a: null})"
+ },
+ {
+  "name": "TOML.stringify null nested",
+  "expression": "Bun.TOML.stringify({t: {a: null}})"
+ },
+ {
+  "name": "TOML.stringify null array",
+  "expression": "Bun.TOML.stringify({a: [null]})"
+ },
+ {
+  "name": "TOML.stringify non-object",
+  "expression": "Bun.TOML.stringify(5)"
+ },
+ {
+  "name": "TOML.stringify string",
+  "expression": "Bun.TOML.stringify(\"hi\")"
+ },
+ {
+  "name": "TOML.stringify replacer",
+  "expression": "Bun.TOML.stringify({a: 1}, () => {})"
+ },
+ {
+  "name": "TOML.stringify space ignored",
+  "expression": "Bun.TOML.stringify({a: {b: 1}}, null, 2)"
+ },
+ {
+  "name": "TOML.stringify bigint",
+  "expression": "Bun.TOML.stringify({a: 10n})"
+ },
+ {
+  "name": "TOML.stringify nested array tables",
+  "expression": "Bun.TOML.stringify({a: [{b: [{c: 1}]}]})"
+ },
+ {
+  "name": "TOML.stringify empty in array tables",
+  "expression": "Bun.TOML.stringify({a: [{}, {x: 1}]})"
+ },
+ {
+  "name": "JSON5.parse lenient",
+  "expression": "Bun.JSON5.parse(\"{unquoted: 'and single', trailing: [1,2,], hex: 0x1F, plus: +5, inf: Infinity}\")"
+ },
+ {
+  "name": "JSON5.parse comments",
+  "expression": "Bun.JSON5.parse(\"// c\\n{a:1 /* x */}\")"
+ },
+ {
+  "name": "JSON5.parse continuation",
+  "expression": "Bun.JSON5.parse(\"{a:'x\\\\\\ny'}\")"
+ },
+ {
+  "name": "JSON5.parse strict json",
+  "expression": "Bun.JSON5.parse('{\"a\":1}')"
+ },
+ {
+  "name": "JSON5.parse nan",
+  "expression": "Bun.JSON5.parse(\"[NaN, -Infinity, +NaN]\")"
+ },
+ {
+  "name": "JSON5.parse escapes",
+  "expression": "Bun.JSON5.parse(\"['\\\\b\\\\f\\\\n\\\\r\\\\t\\\\v\\\\0\\\\x41\\\\u00e9']\")"
+ },
+ {
+  "name": "JSON5.parse exponents",
+  "expression": "Bun.JSON5.parse(\"[1e3, .5, 5., +.5, -1]\")"
+ },
+ {
+  "name": "JSON5.parse top scalar",
+  "expression": "Bun.JSON5.parse(\"42\")"
+ },
+ {
+  "name": "JSON5.parse top string",
+  "expression": "Bun.JSON5.parse(\"'x'\")"
+ },
+ {
+  "name": "JSON5.parse empty obj",
+  "expression": "Bun.JSON5.parse(\"{}\")"
+ },
+ {
+  "name": "JSON5.parse dup key",
+  "expression": "Bun.JSON5.parse(\"{a:1,a:2}\")"
+ },
+ {
+  "name": "JSON5.parse identifier keys",
+  "expression": "Bun.JSON5.parse(\"{$a:1,_b:2,a1:3}\")"
+ },
+ {
+  "name": "JSON5.parse buffer",
+  "expression": "Bun.JSON5.parse(new TextEncoder().encode(\"{a:1}\"))"
+ },
+ {
+  "name": "JSON5.parse number arg",
+  "expression": "Bun.JSON5.parse(42)"
+ },
+ {
+  "name": "JSON5.parse empty input",
+  "expression": "Bun.JSON5.parse(\"\")"
+ },
+ {
+  "name": "JSON5.parse ws only",
+  "expression": "Bun.JSON5.parse(\"  \")"
+ },
+ {
+  "name": "JSON5.parse truncated",
+  "expression": "Bun.JSON5.parse(\"{a:}\")"
+ },
+ {
+  "name": "JSON5.parse no arg",
+  "expression": "Bun.JSON5.parse()"
+ },
+ {
+  "name": "JSON5.parse bad key char",
+  "expression": "Bun.JSON5.parse(\"{a-b:1}\")"
+ },
+ {
+  "name": "JSON5.parse double comma",
+  "expression": "Bun.JSON5.parse(\"{a:1,,}\")"
+ },
+ {
+  "name": "JSON5.parse trailing junk",
+  "expression": "Bun.JSON5.parse(\"{a:1} extra\")"
+ },
+ {
+  "name": "JSON5.parse dot key",
+  "expression": "Bun.JSON5.parse(\"{a.b:1}\")"
+ },
+ {
+  "name": "JSON5.parse leading zero",
+  "expression": "Bun.JSON5.parse(\"01\")"
+ },
+ {
+  "name": "JSON5.parse undefined",
+  "expression": "Bun.JSON5.parse(\"{a: undefined}\")"
+ },
+ {
+  "name": "JSON5.parse unterminated comment",
+  "expression": "Bun.JSON5.parse(\"{a:1 /* }\")"
+ },
+ {
+  "name": "JSON5.parse unterminated string",
+  "expression": "Bun.JSON5.parse(\"'x\")"
+ },
+ {
+  "name": "JSON5.parse bad hex",
+  "expression": "Bun.JSON5.parse(\"{a:0xG}\")"
+ },
+ {
+  "name": "JSON5.parse bad unicode",
+  "expression": "Bun.JSON5.parse(\"{a:'\\\\u12'}\")"
+ },
+ {
+  "name": "JSON5.parse missing comma",
+  "expression": "Bun.JSON5.parse(\"{a:1 b:2}\")"
+ },
+ {
+  "name": "JSON5.stringify compact",
+  "expression": "Bun.JSON5.stringify({a: 1, b: \"x\", c: [1, 2], d: true, e: null})"
+ },
+ {
+  "name": "JSON5.stringify space 2",
+  "expression": "Bun.JSON5.stringify({a: 1}, null, 2)"
+ },
+ {
+  "name": "JSON5.stringify scalar",
+  "expression": "Bun.JSON5.stringify(\"hi\")"
+ },
+ {
+  "name": "JSON5.stringify undefined",
+  "expression": "Bun.JSON5.stringify(undefined)"
+ },
+ {
+  "name": "JSON5.stringify nan inf",
+  "expression": "Bun.JSON5.stringify({a: NaN, b: Infinity})"
+ },
+ {
+  "name": "JSON5.stringify nested space",
+  "expression": "Bun.JSON5.stringify({a: {b: [1]}}, null, 2)"
+ },
+ {
+  "name": "JSON5.stringify array space",
+  "expression": "Bun.JSON5.stringify([1, 2], null, 2)"
+ },
+ {
+  "name": "JSON5.stringify key quoting",
+  "expression": "Bun.JSON5.stringify({\"a b\": 1, \"a-b\": 2, \"1\": 3, \"$x\": 4, \"\": 5})"
+ },
+ {
+  "name": "JSON5.stringify strings",
+  "expression": "Bun.JSON5.stringify([\"a\", \"b'c\", 'a\"b', \"x\\ny\"])"
+ },
+ {
+  "name": "JSON5.stringify drops undefined",
+  "expression": "Bun.JSON5.stringify({a: undefined, b: 1})"
+ },
+ {
+  "name": "JSON5.stringify hole",
+  "expression": "Bun.JSON5.stringify([undefined, 1])"
+ },
+ {
+  "name": "JSON5.stringify space string",
+  "expression": "Bun.JSON5.stringify({a: 1}, null, \"\\t\")"
+ },
+ {
+  "name": "JSON5.stringify space 0",
+  "expression": "Bun.JSON5.stringify({a: 1}, null, 0)"
+ },
+ {
+  "name": "JSON5.stringify replacer",
+  "expression": "Bun.JSON5.stringify({a: 1}, (k, v) => v)"
+ },
+ {
+  "name": "JSON5.stringify date",
+  "expression": "Bun.JSON5.stringify({d: new Date(0)})"
+ },
+ {
+  "name": "JSON5.stringify number",
+  "expression": "Bun.JSON5.stringify(1.5)"
+ },
+ {
+  "name": "JSON5.stringify null",
+  "expression": "Bun.JSON5.stringify(null)"
+ },
+ {
+  "name": "JSONC.parse comments",
+  "expression": "Bun.JSONC.parse('// c\\n{\"a\":1 /* x */, \"b\":[1,2,]}')"
+ },
+ {
+  "name": "JSONC.parse single quoted",
+  "expression": "Bun.JSONC.parse(\"{'a':1}\")"
+ },
+ {
+  "name": "JSONC.parse trailing comma",
+  "expression": "Bun.JSONC.parse('{\"a\":1,}')"
+ },
+ {
+  "name": "JSONC.parse no stringify",
+  "expression": "typeof Bun.JSONC.stringify"
+ },
+ {
+  "name": "JSONC.parse numbers",
+  "expression": "Bun.JSONC.parse(\"[1e3, -1.5e-3, .5, 1., 01, 0x1, 1_0]\")"
+ },
+ {
+  "name": "JSONC.parse escapes",
+  "expression": "Bun.JSONC.parse(\"['\\\\\\\"\\\\\\\\\\\\/\\\\b\\\\f\\\\n\\\\r\\\\t']\")"
+ },
+ {
+  "name": "JSONC.parse unicode esc",
+  "expression": "Bun.JSONC.parse(\"['\\\\u00e9', '\\\\ud83d\\\\ude00']\")"
+ },
+ {
+  "name": "JSONC.parse top scalar",
+  "expression": "Bun.JSONC.parse(\"5\")"
+ },
+ {
+  "name": "JSONC.parse top null",
+  "expression": "Bun.JSONC.parse(\"null\")"
+ },
+ {
+  "name": "JSONC.parse trailing content",
+  "expression": "Bun.JSONC.parse('{\"a\":1} x')"
+ },
+ {
+  "name": "JSONC.parse two values",
+  "expression": "Bun.JSONC.parse(\"1 2\")"
+ },
+ {
+  "name": "JSONC.parse nested trailing",
+  "expression": "Bun.JSONC.parse('{\"a\":[1,{\"b\":2,},],}')"
+ },
+ {
+  "name": "JSONC.parse buffer",
+  "expression": "Bun.JSONC.parse(new TextEncoder().encode('{\"a\":1}'))"
+ },
+ {
+  "name": "JSONC.parse number arg",
+  "expression": "Bun.JSONC.parse(5)"
+ },
+ {
+  "name": "JSONC.parse no arg",
+  "expression": "Bun.JSONC.parse()"
+ },
+ {
+  "name": "JSONC.parse unquoted key",
+  "expression": "Bun.JSONC.parse(\"{a:1}\")"
+ },
+ {
+  "name": "JSONC.parse truncated value",
+  "expression": "Bun.JSONC.parse('{\"a\":}')"
+ },
+ {
+  "name": "JSONC.parse empty input",
+  "expression": "Bun.JSONC.parse(\"\")"
+ },
+ {
+  "name": "JSONC.parse ws only",
+  "expression": "Bun.JSONC.parse(\"  \")"
+ },
+ {
+  "name": "JSONC.parse unexpected brace",
+  "expression": "Bun.JSONC.parse(\"}\")"
+ },
+ {
+  "name": "JSONC.parse unterminated obj",
+  "expression": "Bun.JSONC.parse(\"{\")"
+ },
+ {
+  "name": "JSONC.parse unterminated arr",
+  "expression": "Bun.JSONC.parse(\"[1\")"
+ },
+ {
+  "name": "JSONC.parse missing colon",
+  "expression": "Bun.JSONC.parse('{\"a\" 1}')"
+ },
+ {
+  "name": "JSONC.parse missing comma",
+  "expression": "Bun.JSONC.parse(\"[1 2]\")"
+ },
+ {
+  "name": "JSONC.parse plus",
+  "expression": "Bun.JSONC.parse(\"[+1]\")"
+ },
+ {
+  "name": "JSONC.parse nan",
+  "expression": "Bun.JSONC.parse(\"[NaN]\")"
+ },
+ {
+  "name": "JSONC.parse infinity",
+  "expression": "Bun.JSONC.parse(\"[Infinity]\")"
+ },
+ {
+  "name": "JSONC.parse undefined kw",
+  "expression": "Bun.JSONC.parse(\"[undefined]\")"
+ },
+ {
+  "name": "JSONC.parse unterminated comment",
+  "expression": "Bun.JSONC.parse('{\"a\":1 /* x}')"
+ },
+ {
+  "name": "JSONC.parse unterminated string",
+  "expression": "Bun.JSONC.parse(\"'x\")"
+ },
+ {
+  "name": "JSONC.parse double comma",
+  "expression": "Bun.JSONC.parse(\"[1,,2]\")"
+ },
+ {
+  "name": "JSONL.parse two objects",
+  "expression": "Bun.JSONL.parse('{\"a\":1}\\n{\"b\":2}\\n')"
+ },
+ {
+  "name": "JSONL.parse blank lines",
+  "expression": "Bun.JSONL.parse('{\"a\":1}\\n\\n{\"b\":2}\\n')"
+ },
+ {
+  "name": "JSONL.parse empty",
+  "expression": "Bun.JSONL.parse(\"\")"
+ },
+ {
+  "name": "JSONL.parse one no newline",
+  "expression": "Bun.JSONL.parse('{\"a\":1}')"
+ },
+ {
+  "name": "JSONL.parse crlf",
+  "expression": "Bun.JSONL.parse('{\"a\":1}\\r\\n{\"b\":2}\\r\\n')"
+ },
+ {
+  "name": "JSONL.parse scalars",
+  "expression": "Bun.JSONL.parse('1\\n2\\n\"x\"\\ntrue\\nnull')"
+ },
+ {
+  "name": "JSONL.parse arrays",
+  "expression": "Bun.JSONL.parse(\"[1]\\n[2]\")"
+ },
+ {
+  "name": "JSONL.parse dup key",
+  "expression": "Bun.JSONL.parse('{\"a\":1,\"a\":2}\\n')"
+ },
+ {
+  "name": "JSONL.parse buffer",
+  "expression": "Bun.JSONL.parse(new TextEncoder().encode('{\"a\":1}\\n'))"
+ },
+ {
+  "name": "JSONL.parse number arg",
+  "expression": "Bun.JSONL.parse(5)"
+ },
+ {
+  "name": "JSONL.parse true arg",
+  "expression": "Bun.JSONL.parse(true)"
+ },
+ {
+  "name": "JSONL.parse bad first",
+  "expression": "Bun.JSONL.parse('notjson\\n{\"a\":1}\\n')"
+ },
+ {
+  "name": "JSONL.parse bad after good",
+  "expression": "Bun.JSONL.parse('{\"a\":1}\\nXXX\\n{\"b\":2}\\n')"
+ },
+ {
+  "name": "JSONL.parse bad only",
+  "expression": "Bun.JSONL.parse(\"nope\")"
+ },
+ {
+  "name": "JSONL.parse no arg",
+  "expression": "Bun.JSONL.parse()"
+ },
+ {
+  "name": "JSONL.parse single quotes",
+  "expression": "Bun.JSONL.parse(\"{'a':1}\\n\")"
+ },
+ {
+  "name": "JSONL.parse trailing comma",
+  "expression": "Bun.JSONL.parse('{\"a\":1,}\\n')"
+ },
+ {
+  "name": "JSONL.parse nan",
+  "expression": "Bun.JSONL.parse(\"NaN\\n\")"
+ },
+ {
+  "name": "JSONL.parse partial last",
+  "expression": "Bun.JSONL.parse('{\"a\":1}\\n{\"b\":')"
+ },
+ {
+  "name": "JSONL.parseChunk complete",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk('{\"a\":1}\\n');return {values:r.values,read:r.read,done:r.done,error:r.error,proto:Object.getPrototypeOf(r).constructor.name};})()"
+ },
+ {
+  "name": "JSONL.parseChunk partial object",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk('{\"a\":');return {values:r.values,read:r.read,done:r.done,err:r.error};})()"
+ },
+ {
+  "name": "JSONL.parseChunk partial string",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk('\"abc');return {values:r.values,read:r.read,done:r.done,err:r.error};})()"
+ },
+ {
+  "name": "JSONL.parseChunk scalar no newline",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk(\"12\");return {values:r.values,read:r.read,done:r.done,err:r.error};})()"
+ },
+ {
+  "name": "JSONL.parseChunk malformed",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk('{\"a\":1}\\nnotjson\\n{\"b\":2}\\n');return {values:r.values,read:r.read,done:r.done,err:r.error&&r.error.constructor.name,msg:r.error&&r.error.message};})()"
+ },
+ {
+  "name": "JSONL.parseChunk two lines",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk('{\"a\":1}\\n{\"b\":2}\\n');return {values:r.values,read:r.read,done:r.done};})()"
+ },
+ {
+  "name": "JSONL.parseChunk blank mid",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk('{\"a\":1}\\n\\n{\"b\":2}\\n');return {values:r.values,read:r.read,done:r.done};})()"
+ },
+ {
+  "name": "JSONL.parseChunk empty",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk(\"\");return {values:r.values,read:r.read,done:r.done};})()"
+ },
+ {
+  "name": "JSONL.parseChunk unterminated object",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk('{\"a\":1}\\n{\"b\":\\n{\"c\":3}\\n');return {values:r.values,read:r.read,done:r.done,err:r.error};})()"
+ },
+ {
+  "name": "JSONL.parseChunk crlf",
+  "expression": "(()=>{const r=Bun.JSONL.parseChunk('{\"a\":1}\\r\\n{\"b\":2}\\r\\n');return {values:r.values,read:r.read,done:r.done};})()"
+ },
+ {
+  "name": "JSONL.parseChunk no arg",
+  "expression": "Bun.JSONL.parseChunk()"
+ },
+ {
+  "name": "XML.parse simple",
+  "expression": "Bun.XML.parse(\"<root><a>1</a><b>two</b></root>\")"
+ },
+ {
+  "name": "XML.parse attributes",
+  "expression": "Bun.XML.parse('<root id=\"1\" class=\"x\"><child/></root>')"
+ },
+ {
+  "name": "XML.parse mixed text",
+  "expression": "Bun.XML.parse(\"<p>hello <b>bold</b> world</p>\")"
+ },
+ {
+  "name": "XML.parse empty element",
+  "expression": "Bun.XML.parse(\"<a></a>\")"
+ },
+ {
+  "name": "XML.parse self closing",
+  "expression": "Bun.XML.parse(\"<a/>\")"
+ },
+ {
+  "name": "XML.parse repeated",
+  "expression": "Bun.XML.parse(\"<r><i>1</i><i>2</i></r>\")"
+ },
+ {
+  "name": "XML.parse entities",
+  "expression": "Bun.XML.parse(\"<a>&lt;&amp;&gt;&quot;&apos;</a>\")"
+ },
+ {
+  "name": "XML.parse numeric entities",
+  "expression": "Bun.XML.parse(\"<a>&#65;&#x42;</a>\")"
+ },
+ {
+  "name": "XML.parse cdata",
+  "expression": "Bun.XML.parse(\"<a><![CDATA[x<y]]></a>\")"
+ },
+ {
+  "name": "XML.parse declaration",
+  "expression": "Bun.XML.parse('<?xml version=\"1.0\"?><a>1</a>')"
+ },
+ {
+  "name": "XML.parse comment",
+  "expression": "Bun.XML.parse(\"<!-- c --><a>1</a>\")"
+ },
+ {
+  "name": "XML.parse doctype",
+  "expression": "Bun.XML.parse(\"<!DOCTYPE root><root/>\")"
+ },
+ {
+  "name": "XML.parse namespace",
+  "expression": "Bun.XML.parse('<ns:a xmlns:ns=\"urn:x\">1</ns:a>')"
+ },
+ {
+  "name": "XML.parse second arg",
+  "expression": "Bun.XML.parse(\"<a>1</a>\", {any: \"option\"})"
+ },
+ {
+  "name": "XML.parse three text runs",
+  "expression": "Bun.XML.parse(\"<p>a<b>1</b>b<i>2</i>c</p>\")"
+ },
+ {
+  "name": "XML.parse whitespace only run",
+  "expression": "Bun.XML.parse(\"<p>a<b>x</b> <i>y</i>c</p>\")"
+ },
+ {
+  "name": "XML.parse newlines between",
+  "expression": "Bun.XML.parse(\"<r>\\n  <a>1</a>\\n  <b>2</b>\\n</r>\")"
+ },
+ {
+  "name": "XML.parse nested repeats",
+  "expression": "Bun.XML.parse(\"<r><g><i>1</i><i>2</i></g><g><i>3</i></g></r>\")"
+ },
+ {
+  "name": "XML.parse attr newline",
+  "expression": "Bun.XML.parse('<a x=\"1\\n2\"/>')"
+ },
+ {
+  "name": "XML.parse buffer",
+  "expression": "Bun.XML.parse(new TextEncoder().encode(\"<a>1</a>\"))"
+ },
+ {
+  "name": "XML.parse number arg",
+  "expression": "Bun.XML.parse(1)"
+ },
+ {
+  "name": "XML.parse mismatched",
+  "expression": "Bun.XML.parse(\"<a><b></a>\")"
+ },
+ {
+  "name": "XML.parse unterminated tag",
+  "expression": "Bun.XML.parse(\"<a\")"
+ },
+ {
+  "name": "XML.parse empty input",
+  "expression": "Bun.XML.parse(\"\")"
+ },
+ {
+  "name": "XML.parse no arg",
+  "expression": "Bun.XML.parse()"
+ },
+ {
+  "name": "XML.parse two roots",
+  "expression": "Bun.XML.parse(\"<a/><b/>\")"
+ },
+ {
+  "name": "XML.parse missing close",
+  "expression": "Bun.XML.parse(\"<a><b></b>\")"
+ },
+ {
+  "name": "XML.parse duplicate attribute",
+  "expression": "Bun.XML.parse('<a x=\"1\" x=\"2\"/>')"
+ },
+ {
+  "name": "XML.parse unknown entity",
+  "expression": "Bun.XML.parse(\"<a>&foo;</a>\")"
+ },
+ {
+  "name": "XML.parse bare ampersand",
+  "expression": "Bun.XML.parse(\"<a>a & b</a>\")"
+ },
+ {
+  "name": "XML.parse bare lt",
+  "expression": "Bun.XML.parse(\"<a>a < b</a>\")"
+ },
+ {
+  "name": "XML.parse text after root",
+  "expression": "Bun.XML.parse(\"<a/>t\")"
+ },
+ {
+  "name": "XML.parse attr no quotes",
+  "expression": "Bun.XML.parse(\"<a id=1/>\")"
+ },
+ {
+  "name": "XML.parse attr no value",
+  "expression": "Bun.XML.parse(\"<a id/>\")"
+ },
+ {
+  "name": "XML.parse unterminated attr",
+  "expression": "Bun.XML.parse('<a x=\"1/>')"
+ },
+ {
+  "name": "XML.parse cdata unterminated",
+  "expression": "Bun.XML.parse(\"<a><![CDATA[x</a>\")"
+ },
+ {
+  "name": "XML.parse comment unterminated",
+  "expression": "Bun.XML.parse(\"<a><!-- x</a>\")"
+ },
+ {
+  "name": "XML.parse bad char ref",
+  "expression": "Bun.XML.parse(\"<a>&#xZZ;</a>\")"
+ },
+ {
+  "name": "XML.parse entity no semicolon",
+  "expression": "Bun.XML.parse(\"<a>&amp</a>\")"
+ },
+ {
+  "name": "XML.parse decl no version",
+  "expression": "Bun.XML.parse(\"<?xml?><a/>\")"
+ },
+ {
+  "name": "XML.stringify parsed",
+  "expression": "Bun.XML.stringify({root: {a: \"1\"}})"
+ },
+ {
+  "name": "XML.stringify roundtrip",
+  "expression": "Bun.XML.stringify(Bun.XML.parse(\"<r><a>1</a></r>\"))"
+ },
+ {
+  "name": "XML.stringify node",
+  "expression": "Bun.XML.stringify({name: \"root\", attributes: {id: \"1\"}, children: [{name: \"a\", attributes: {}, children: [\"txt\"]}]})"
+ },
+ {
+  "name": "XML.stringify empty node",
+  "expression": "Bun.XML.stringify({name: \"a\", attributes: {}, children: []})"
+ },
+ {
+  "name": "XML.stringify no arg",
+  "expression": "Bun.XML.stringify()"
+ },
+ {
+  "name": "XML.stringify attr",
+  "expression": "Bun.XML.stringify({r: {\"@id\": \"1\", a: \"x\"}})"
+ },
+ {
+  "name": "XML.stringify text key",
+  "expression": "Bun.XML.stringify({r: {\"#text\": \"t\", a: \"x\"}})"
+ },
+ {
+  "name": "XML.stringify array child",
+  "expression": "Bun.XML.stringify({r: {a: [\"1\", \"2\"]}})"
+ },
+ {
+  "name": "XML.stringify escaping",
+  "expression": "Bun.XML.stringify({r: {a: \"<&>\\\"'\"}})"
+ },
+ {
+  "name": "XML.stringify attr escaping",
+  "expression": "Bun.XML.stringify({r: {\"@a\": \"<&>\\\"'\"}})"
+ },
+ {
+  "name": "XML.stringify null value",
+  "expression": "Bun.XML.stringify({r: {a: null}})"
+ },
+ {
+  "name": "XML.stringify numbers",
+  "expression": "Bun.XML.stringify({r: {\"@a\": 1, b: 2, c: true}})"
+ },
+ {
+  "name": "XML.stringify string input",
+  "expression": "Bun.XML.stringify(\"x\")"
+ },
+ {
+  "name": "XML.stringify multi root",
+  "expression": "Bun.XML.stringify({a: \"1\", b: \"2\"})"
+ },
+ {
+  "name": "XML.stringify empty obj",
+  "expression": "Bun.XML.stringify({})"
+ },
+ {
+  "name": "XML.stringify array root",
+  "expression": "Bun.XML.stringify({r: [\"1\", \"2\"]})"
+ },
+ {
+  "name": "XML.stringify nested arrays",
+  "expression": "Bun.XML.stringify({r: {a: [[\"1\"]]}})"
+ },
+ {
+  "name": "XML.stringify empty child obj",
+  "expression": "Bun.XML.stringify({r: {}})"
+ },
+ {
+  "name": "markdown.html h1",
+  "expression": "Bun.markdown.html(\"# Hi\")"
+ },
+ {
+  "name": "markdown.html inline emphasis",
+  "expression": "Bun.markdown.html(\"**b** and *i*\")"
+ },
+ {
+  "name": "markdown.html link",
+  "expression": "Bun.markdown.html(\"[t](http://x)\")"
+ },
+ {
+  "name": "markdown.html link title",
+  "expression": "Bun.markdown.html(\"[t](http://x \\\"title\\\")\")"
+ },
+ {
+  "name": "markdown.html autolink",
+  "expression": "Bun.markdown.html(\"<http://x>\")"
+ },
+ {
+  "name": "markdown.html email autolink",
+  "expression": "Bun.markdown.html(\"<a@b.com>\")"
+ },
+ {
+  "name": "markdown.html inline code",
+  "expression": "Bun.markdown.html(\"`x`\")"
+ },
+ {
+  "name": "markdown.html fenced code",
+  "expression": "Bun.markdown.html(\"```js\\nlet a=1\\n```\")"
+ },
+ {
+  "name": "markdown.html fenced no language",
+  "expression": "Bun.markdown.html(\"```\\nx\\n```\")"
+ },
+ {
+  "name": "markdown.html indented code",
+  "expression": "Bun.markdown.html(\"    indented code\")"
+ },
+ {
+  "name": "markdown.html unordered list",
+  "expression": "Bun.markdown.html(\"- a\\n- b\")"
+ },
+ {
+  "name": "markdown.html ordered list",
+  "expression": "Bun.markdown.html(\"1. a\\n2. b\")"
+ },
+ {
+  "name": "markdown.html ordered start",
+  "expression": "Bun.markdown.html(\"3. a\\n4. b\")"
+ },
+ {
+  "name": "markdown.html nested list",
+  "expression": "Bun.markdown.html(\"- a\\n  - b\")"
+ },
+ {
+  "name": "markdown.html task list",
+  "expression": "Bun.markdown.html(\"- [x] done\\n- [ ] todo\")"
+ },
+ {
+  "name": "markdown.html table",
+  "expression": "Bun.markdown.html(\"| a | b |\\n|---|---|\\n| 1 | 2 |\")"
+ },
+ {
+  "name": "markdown.html table alignment",
+  "expression": "Bun.markdown.html(\"| a | b |\\n|:--|--:|\\n| 1 | 2 |\")"
+ },
+ {
+  "name": "markdown.html blockquote",
+  "expression": "Bun.markdown.html(\"> q\")"
+ },
+ {
+  "name": "markdown.html nested blockquote",
+  "expression": "Bun.markdown.html(\">> nested\")"
+ },
+ {
+  "name": "markdown.html thematic break",
+  "expression": "Bun.markdown.html(\"---\")"
+ },
+ {
+  "name": "markdown.html image",
+  "expression": "Bun.markdown.html(\"![alt](u.png)\")"
+ },
+ {
+  "name": "markdown.html image title",
+  "expression": "Bun.markdown.html(\"![alt](u.png \\\"t\\\")\")"
+ },
+ {
+  "name": "markdown.html escapes text",
+  "expression": "Bun.markdown.html(\"a < b & c > d\")"
+ },
+ {
+  "name": "markdown.html raw html block",
+  "expression": "Bun.markdown.html(\"<div>x</div>\")"
+ },
+ {
+  "name": "markdown.html raw html inline",
+  "expression": "Bun.markdown.html(\"<span>x</span>\")"
+ },
+ {
+  "name": "markdown.html empty",
+  "expression": "Bun.markdown.html(\"\")"
+ },
+ {
+  "name": "markdown.html paragraphs",
+  "expression": "Bun.markdown.html(\"line1\\n\\nline2\")"
+ },
+ {
+  "name": "markdown.html softbreak",
+  "expression": "Bun.markdown.html(\"line1\\nline2\")"
+ },
+ {
+  "name": "markdown.html hardbreak",
+  "expression": "Bun.markdown.html(\"text with  \\nhard break\")"
+ },
+ {
+  "name": "markdown.html setext h1",
+  "expression": "Bun.markdown.html(\"Setext\\n======\")"
+ },
+ {
+  "name": "markdown.html setext h2",
+  "expression": "Bun.markdown.html(\"Setext2\\n------\")"
+ },
+ {
+  "name": "markdown.html loose list",
+  "expression": "Bun.markdown.html(\"1. a\\n\\n2. b\")"
+ },
+ {
+  "name": "markdown.html strikethrough",
+  "expression": "Bun.markdown.html(\"~~strike~~\")"
+ },
+ {
+  "name": "markdown.html quoted text",
+  "expression": "Bun.markdown.html(\"\\\"quotes\\\" and 'single'\")"
+ },
+ {
+  "name": "markdown.html link escapes",
+  "expression": "Bun.markdown.html(\"[link](http://x?a=1&b=2)\")"
+ },
+ {
+  "name": "markdown.html entities",
+  "expression": "Bun.markdown.html(\"&amp; &lt; &#65;\")"
+ },
+ {
+  "name": "markdown.html h6",
+  "expression": "Bun.markdown.html(\"###### H6\")"
+ },
+ {
+  "name": "markdown.html seven hashes",
+  "expression": "Bun.markdown.html(\"####### seven\")"
+ },
+ {
+  "name": "markdown.render plain strong",
+  "expression": "Bun.markdown.render(\"**b**\")"
+ },
+ {
+  "name": "markdown.render plain heading",
+  "expression": "Bun.markdown.render(\"# h\\n\\ntext\")"
+ },
+ {
+  "name": "markdown.render plain list",
+  "expression": "Bun.markdown.render(\"- a\\n- b\")"
+ },
+ {
+  "name": "markdown.render plain code",
+  "expression": "Bun.markdown.render(\"```\\ncode\\n```\")"
+ },
+ {
+  "name": "markdown.render callbacks",
+  "expression": "Bun.markdown.render(\"# Hi\\n\\ntext **b**\\n\\n- li1\\n- li2\", {heading: (c, m) => \"<H\" + m.level + \">\" + c + \"</H>\", paragraph: (c) => \"<P>\" + c + \"</P>\", strong: (c) => \"<S>\" + c + \"</S>\", listItem: (c) => \"<LI>\" + c + \"</LI>\"})"
+ },
+ {
+  "name": "markdown.render list meta",
+  "expression": "Bun.markdown.render(\"- a\\n- b\\n\\n1. c\", {list: (c, m) => \"[\" + (m.ordered ? \"o\" : \"u\") + m.depth + \":\" + c + \"]\", listItem: (c, m) => \"[\" + m.index + \":\" + c + \"]\"})"
+ },
+ {
+  "name": "markdown.render nested depth",
+  "expression": "Bun.markdown.render(\"- a\\n  - b\\n    - c\", {list: (c, m) => \"[L\" + m.depth + \":\" + c + \"]\"})"
+ },
+ {
+  "name": "markdown.render link meta",
+  "expression": "Bun.markdown.render(\"[t](u)\\n\\n![i](p)\", {link: (c, m) => \"[\" + c + \",\" + m.href + \"]\", image: (c, m) => \"[\" + c + \",\" + m.src + \"]\"})"
+ },
+ {
+  "name": "markdown.render codespan and code",
+  "expression": "Bun.markdown.render(\"`c`\\n\\n```js\\nx\\n```\", {code: (c) => \"[CB:\" + JSON.stringify(c) + \"]\", codespan: (c) => \"[CS:\" + c + \"]\"})"
+ },
+ {
+  "name": "markdown.render text callback",
+  "expression": "Bun.markdown.render(\"a **b** c\", {text: (t) => \"<\" + t + \">\"})"
+ },
+ {
+  "name": "markdown.render nonstring return",
+  "expression": "Bun.markdown.render(\"# x\", {heading: () => 42})"
+ },
+ {
+  "name": "markdown.render null return",
+  "expression": "Bun.markdown.render(\"# x\", {heading: () => null})"
+ },
+ {
+  "name": "markdown.render null options",
+  "expression": "Bun.markdown.render(\"# x\", null)"
+ },
+ {
+  "name": "markdown.ansi heading",
+  "expression": "Bun.markdown.ansi(\"# Hi\")"
+ },
+ {
+  "name": "markdown.ansi h2",
+  "expression": "Bun.markdown.ansi(\"## H2\")"
+ },
+ {
+  "name": "markdown.ansi strong",
+  "expression": "Bun.markdown.ansi(\"**b**\")"
+ },
+ {
+  "name": "markdown.ansi em",
+  "expression": "Bun.markdown.ansi(\"*i*\")"
+ },
+ {
+  "name": "markdown.ansi del",
+  "expression": "Bun.markdown.ansi(\"~~s~~\")"
+ },
+ {
+  "name": "markdown.ansi codespan",
+  "expression": "Bun.markdown.ansi(\"`x`\")"
+ },
+ {
+  "name": "markdown.ansi link",
+  "expression": "Bun.markdown.ansi(\"[t](u)\")"
+ },
+ {
+  "name": "markdown.ansi list",
+  "expression": "Bun.markdown.ansi(\"- a\\n- b\")"
+ },
+ {
+  "name": "markdown.ansi ordered",
+  "expression": "Bun.markdown.ansi(\"1. a\")"
+ },
+ {
+  "name": "markdown.ansi blockquote",
+  "expression": "Bun.markdown.ansi(\"> q\")"
+ },
+ {
+  "name": "markdown.ansi hr",
+  "expression": "Bun.markdown.ansi(\"---\")"
+ },
+ {
+  "name": "markdown.ansi code block",
+  "expression": "Bun.markdown.ansi(\"```js\\nx\\n```\")"
+ },
+ {
+  "name": "markdown.ansi image",
+  "expression": "Bun.markdown.ansi(\"![a](u)\")"
+ },
+ {
+  "name": "markdown.ansi empty",
+  "expression": "Bun.markdown.ansi(\"\")"
+ },
+ {
+  "name": "markdown.ansi colors false",
+  "expression": "Bun.markdown.ansi(\"# Hi\\n**b**\", {colors: false})"
+ },
+ {
+  "name": "markdown.ansi other options ignored",
+  "expression": "Bun.markdown.ansi(\"# Hi\\n**b**\", {width: 10, columns: 10, strip: true})"
+ },
+ {
+  "name": "markdown.html no arg",
+  "expression": "Bun.markdown.html()"
+ },
+ {
+  "name": "markdown.html number arg",
+  "expression": "Bun.markdown.html(42)"
+ },
+ {
+  "name": "markdown.html null arg",
+  "expression": "Bun.markdown.html(null)"
+ },
+ {
+  "name": "markdown.html buffer input",
+  "expression": "Bun.markdown.html(new TextEncoder().encode(\"# Hi\"))"
+ },
+ {
+  "name": "markdown.render no arg",
+  "expression": "Bun.markdown.render()"
+ },
+ {
+  "name": "markdown.react shape",
+  "expression": "(()=>{const el = Bun.markdown.react(\"# Hi\");return {keys: Object.keys(el), tag: String(el.$$typeof), type: String(el.type), key: el.key, ref: el.ref, props: el.props};})()"
+ },
+ {
+  "name": "markdown.react symbol identity",
+  "expression": "(()=>{const el = Bun.markdown.react(\"# Hi\");return [el.$$typeof === Symbol.for(\"react.transitional.element\"), el.type === Symbol.for(\"react.fragment\")];})()"
+ },
+ {
+  "name": "markdown.react empty",
+  "expression": "Bun.markdown.react(\"\").props"
+ },
+ {
+  "name": "shape YAML",
+  "expression": "Object.getOwnPropertyNames(Bun.YAML)"
+ },
+ {
+  "name": "shape TOML",
+  "expression": "Object.getOwnPropertyNames(Bun.TOML)"
+ },
+ {
+  "name": "shape JSON5",
+  "expression": "Object.getOwnPropertyNames(Bun.JSON5)"
+ },
+ {
+  "name": "shape JSONC",
+  "expression": "Object.getOwnPropertyNames(Bun.JSONC)"
+ },
+ {
+  "name": "shape JSONL",
+  "expression": "Object.getOwnPropertyNames(Bun.JSONL)"
+ },
+ {
+  "name": "shape XML",
+  "expression": "Object.getOwnPropertyNames(Bun.XML)"
+ },
+ {
+  "name": "shape markdown",
+  "expression": "Object.getOwnPropertyNames(Bun.markdown)"
+ },
+ {
+  "name": "shape YAML lengths",
+  "expression": "[Bun.YAML.parse.length, Bun.YAML.stringify.length]"
+ },
+ {
+  "name": "shape TOML lengths",
+  "expression": "[Bun.TOML.parse.length, Bun.TOML.stringify.length]"
+ },
+ {
+  "name": "shape JSON5 lengths",
+  "expression": "[Bun.JSON5.parse.length, Bun.JSON5.stringify.length]"
+ },
+ {
+  "name": "shape JSONC lengths",
+  "expression": "[Bun.JSONC.parse.length]"
+ },
+ {
+  "name": "shape JSONL lengths",
+  "expression": "[Bun.JSONL.parse.length, Bun.JSONL.parseChunk.length]"
+ },
+ {
+  "name": "shape XML lengths",
+  "expression": "[Bun.XML.parse.length, Bun.XML.stringify.length]"
+ },
+ {
+  "name": "shape markdown lengths",
+  "expression": "[Bun.markdown.html.length, Bun.markdown.ansi.length, Bun.markdown.render.length, Bun.markdown.react.length]"
+ },
+ {
+  "name": "shape YAML proto",
+  "expression": "Object.getPrototypeOf(Bun.YAML) === Object.prototype"
+ },
+ {
+  "name": "shape XML proto",
+  "expression": "Object.getPrototypeOf(Bun.XML) === Object.prototype"
+ },
+ {
+  "name": "shape markdown proto",
+  "expression": "Object.getPrototypeOf(Bun.markdown) === Object.prototype"
+ },
+ {
+  "name": "shape YAML parse name",
+  "expression": "Bun.YAML.parse.name"
+ },
+ {
+  "name": "shape markdown react name",
+  "expression": "Bun.markdown.react.name"
+ },
+ {
+  "name": "shape JSONL parseChunk name",
+  "expression": "Bun.JSONL.parseChunk.name"
+ },
+ {
+  "name": "shape YAML not constructor",
+  "expression": "(()=>{try{new Bun.YAML.parse(\"a: 1\");return false}catch(e){return e.constructor.name}})()"
+ },
+ {
+  "name": "shape XML parse not constructor",
+  "expression": "(()=>{try{new Bun.XML.parse(\"<a/>\");return false}catch(e){return e.constructor.name}})()"
+ },
+ {
+  "name": "shape markdown html not constructor",
+  "expression": "(()=>{try{new Bun.markdown.html(\"# x\");return false}catch(e){return e.constructor.name}})()"
+ },
+ {
+  "name": "shape JSON5 parse not constructor",
+  "expression": "(()=>{try{new Bun.JSON5.parse(\"{}\");return false}catch(e){return e.constructor.name}})()"
+ },
+ {
+  "name": "shape JSONL member configurable",
+  "expression": "(()=>{const d = Object.getOwnPropertyDescriptor(Bun.JSONL, \"parse\"); return [d.writable, d.enumerable, d.configurable];})()"
+ },
+ {
+  "name": "shape YAML member configurable",
+  "expression": "(()=>{const d = Object.getOwnPropertyDescriptor(Bun.YAML, \"parse\"); return [d.writable, d.enumerable, d.configurable];})()"
+ },
+ {
+  "name": "shape JSONL tag",
+  "expression": "String(Object.getOwnPropertyDescriptor(Bun.JSONL, Symbol.toStringTag) && Object.getOwnPropertyDescriptor(Bun.JSONL, Symbol.toStringTag).value)"
+ }
+]
