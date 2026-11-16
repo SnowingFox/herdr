@@ -424,6 +424,13 @@ const fs = require("node:fs");
   // writes `"12"`. A single-element array holding one is the exception: Bun
   // reduces it to that element and coerces the element, so `[null]` is the four
   // bytes `null`. Both measured on 1.4.4.
+  //
+  // A **function** payload is the one case this test deliberately does not pin:
+  // `String(function f(){{}})` is `"function f(){{}}"` on V8 and
+  // `"function f() {{}}"` on JavaScriptCore, so the bytes legitimately differ
+  // between the runtimes (14 against 15). That is a real engine difference and is
+  // documented in `write.rs`; it is not the explanation for the array cases
+  // above, whose bytes differ from `String()` on *both* engines.
   await showAsync("arrayParts", async () => {{ const n = await Bun.write("l.txt", [1, 2]); return [n, fs.readFileSync("l.txt", "utf8")]; }});
   await showAsync("arrayNested", async () => {{ const n = await Bun.write("m.txt", [[1], [2]]); return [n, fs.readFileSync("m.txt", "utf8")]; }});
   await showAsync("arrayWithNullGap", async () => {{ const n = await Bun.write("n2.txt", [1, null, 2]); return [n, fs.readFileSync("n2.txt", "utf8")]; }});
