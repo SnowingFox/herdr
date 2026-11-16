@@ -364,10 +364,13 @@ fn secret_key_bytes<'s>(
         throw_type_error(scope, "key must be a KeyObjectHandle");
         return None;
     };
-    // `getKeyType()` must report `kKeyTypeSecret` (1).
+    // `getKeyType()` must report `kKeyTypeSecret` (0, from `enum KeyType` in
+    // `crypto_keys.h`). This was `Some(1)` while the key-type table was shifted
+    // one past Node's numbering; it is written as a literal because this crate
+    // duck-types the handle rather than depending on `rn-bind-crypto-keys`.
     let key_type = call_number(scope, handle, "getKeyType");
     match key_type {
-        Some(1) => {}
+        Some(0) => {}
         Some(_) => {
             throw_type_error(scope, "key must be a secret KeyObject");
             return None;

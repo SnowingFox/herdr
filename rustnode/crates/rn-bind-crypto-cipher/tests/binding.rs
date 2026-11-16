@@ -454,13 +454,20 @@ fn cipher_binding_end_to_end() {
             name: "AESCipherJob AES-128-CBC matches subtle",
             source: r#"(() => {
                 const handle = {
-                  getKeyType() { return 1; },
+                  // `kKeyTypeSecret` is 0, from `enum KeyType` in
+                  // `crypto_keys.h`. It was 1 while the table was shifted.
+                  getKeyType() { return 0; },
                   export() {
                     return Buffer.from([0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
                                         0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f]);
                   },
                 };
-                const job = new binding.AESCipherJob(1, 1, handle,
+                // `AESCipherJob(mode, cipherMode, key, data, variant, iv)`.
+                // `kCryptoJobSync` is 1 and `kWebCryptoCipherEncrypt` is 0, both
+                // from Node's enums. The cipher mode was 1 here while that table
+                // was shifted one past Node's, which turned this case into a
+                // decrypt of the wrong direction's input.
+                const job = new binding.AESCipherJob(1, 0, handle,
                   Buffer.from([0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,
                                0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff]),
                   3, Buffer.alloc(16, 0));

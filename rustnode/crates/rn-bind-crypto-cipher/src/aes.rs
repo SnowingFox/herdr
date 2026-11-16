@@ -44,11 +44,17 @@ pub enum CipherMode {
 }
 
 impl CipherMode {
-    /// `kWebCryptoCipherEncrypt` is 1 and `kWebCryptoCipherDecrypt` is 2.
+    /// `kWebCryptoCipherEncrypt` is 0 and `kWebCryptoCipherDecrypt` is 1.
+    ///
+    /// `WebCryptoCipherMode` in `node_crypto.h` is declared
+    /// `{ kWebCryptoCipherEncrypt, kWebCryptoCipherDecrypt }` and exported with
+    /// `NODE_DEFINE_CONSTANT`, so it starts at zero. This table was previously
+    /// 1 and 2, one past Node's, and stayed invisible because `aes.js` only ever
+    /// compared its own value back against itself.
     pub fn from_number(value: u32) -> Option<Self> {
         match value {
-            1 => Some(Self::Encrypt),
-            2 => Some(Self::Decrypt),
+            0 => Some(Self::Encrypt),
+            1 => Some(Self::Decrypt),
             _ => None,
         }
     }
@@ -516,6 +522,22 @@ mod tests {
             assert_eq!(variant.cipher_name(), *cipher);
         }
         assert!(AesVariant::from_index(VARIANTS.len() as u32).is_none());
+    }
+
+    #[test]
+    fn the_cipher_mode_numbers_are_nodes() {
+        // `WebCryptoCipherMode` in `node_crypto.h` is declared
+        // `{ kWebCryptoCipherEncrypt, kWebCryptoCipherDecrypt }` and exported
+        // with `NODE_DEFINE_CONSTANT`, so `node --expose-internals` reports 0
+        // and 1. This table was 1 and 2 until it was pinned here, which stayed
+        // invisible because `aes.js` only compared its own value back against
+        // itself.
+        assert_eq!(CipherMode::from_number(0), Some(CipherMode::Encrypt));
+        assert_eq!(CipherMode::from_number(1), Some(CipherMode::Decrypt));
+        // Nothing past the enum is a mode, and the old numbering is now a
+        // number Node never sends.
+        assert_eq!(CipherMode::from_number(2), None);
+        assert_eq!(CipherMode::from_number(u32::MAX), None);
     }
 
     #[test]

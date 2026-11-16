@@ -179,22 +179,27 @@ fn cases() -> Vec<Case> {
             expected: "0 1 2 3",
         },
         Case {
-            name: "the key format and key type constants are on the namespace",
-            // NOT an assertion that they equal Node's numbers. Both tables are
-            // shifted from `PKFormatType`/`KeyType` in this build (DER is 1 here
-            // and 0 in Node, `kKeyTypeSecret` is 1 here and 0 in Node), which is
-            // the same class of defect as the encoding table fixed alongside
-            // this case — but it is a different pair of tables and a separate
-            // change, so this pins only that they are installed and integral
-            // rather than freezing the current values as correct.
+            name: "the key format and key type constants are node's numbers",
+            // `crypto_keys.cc` derives the formats from `PKFormatType`'s
+            // declaration order and exports the types with `NODE_DEFINE_CONSTANT`
+            // over `enum KeyType`, so `node --expose-internals` reports
+            // `0 1 2 3 4 5 6` and `0 1 2`.
+            //
+            // Both tables were previously shifted one past Node's and stayed
+            // self-consistent, which is how they survived: an export and a
+            // re-import inside one runtime agreed with each other, so only the
+            // absolute numbers could catch it. They are pinned here for the same
+            // reason the encoding table is.
             source: r#"
-                const values = [binding.kKeyFormatDER, binding.kKeyFormatPEM,
-                                binding.kKeyFormatJWK, binding.kKeyTypeSecret,
-                                binding.kKeyTypePublic, binding.kKeyTypePrivate];
-                return values.every((value) => Number.isInteger(value)) ? 'integral'
-                  : 'not-integral: ' + values.join(',');
+                return [binding.kKeyFormatDER, binding.kKeyFormatPEM,
+                        binding.kKeyFormatJWK, binding.kKeyFormatRawPublic,
+                        binding.kKeyFormatRawPrivate, binding.kKeyFormatRawSeed,
+                        binding.kKeyFormatStore].join(' ')
+                  + ' | '
+                  + [binding.kKeyTypeSecret, binding.kKeyTypePublic,
+                     binding.kKeyTypePrivate].join(' ');
             "#,
-            expected: "integral",
+            expected: "0 1 2 3 4 5 6 | 0 1 2",
         },
         Case {
             name: "SHA-256 of \"abc\" is the FIPS 180-4 value",
@@ -623,6 +628,49 @@ Input buffers must have the same byte length",
             expected: "1:function",
         },
         Case {
+            name: "isCryptoKey brands instances of the class and nothing else",
+            // The brand has to separate a `CryptoKey` from a `KeyObject`, which
+            // a prototype check or an internal-field presence check could not
+            // do: both are objects with a key in an internal field. A plain
+            // object that borrows the class's prototype must still be false,
+            // which is what makes this a brand rather than an instanceof.
+            source: r#"
+                const [CryptoKey] = binding.createCryptoKeyClass((Base) => {
+                  class CryptoKey extends Base {}
+                  return [CryptoKey];
+                });
+                const handle = new binding.KeyObjectHandle();
+                handle.init(binding.kKeyTypeSecret, Buffer.from('0123456789abcdef'));
+                const real = new CryptoKey(handle, { name: 'AES-CBC' }, 0, true);
+                const impostor = Object.create(CryptoKey.prototype);
+                return [binding.isCryptoKey(real), binding.isCryptoKey(impostor),
+                        binding.isCryptoKey({}), binding.isCryptoKey(null),
+                        binding.isCryptoKey(undefined), binding.isCryptoKey(1),
+                        binding.isCryptoKey('x')].join(' ');
+            "#,
+            expected: "true false false false false false false",
+        },
+        Case {
+            name: "isCryptoKey is false for a KeyObject",
+            // `createSecretKey()` returns a `KeyObject`, which Node brands with a
+            // different template. `util.types.isKeyObject` is its accessor;
+            // `isCryptoKey` answering true here would mean the two classes were
+            // conflated, and `keys.js`'s `if (!isCryptoKey(this)) throw new
+            // ERR_INVALID_THIS('CryptoKey')` would then accept a `KeyObject`.
+            source: r#"
+                const handle = new binding.KeyObjectHandle();
+                handle.init(binding.kKeyTypeSecret, Buffer.from('0123456789abcdef'));
+                const [KeyObject] = binding.createNativeKeyObjectClass((Base) => {
+                  class KeyObject extends Base {}
+                  return [KeyObject];
+                });
+                const keyObject = new KeyObject(handle);
+                return [binding.isCryptoKey(keyObject),
+                        binding.isKeyObject(keyObject)].join(' ');
+            "#,
+            expected: "false true",
+        },
+        Case {
             name: "createX509CertificateClass returns the callback's classes",
             source: r#"
                 const result = binding.createX509CertificateClass((Base) => {
@@ -635,6 +683,34 @@ Input buffers must have the same byte length",
         },
     ]);
     cases.extend([
+        Case {
+            name: "the signature and WebCrypto mode constants are node's numbers",
+            // `DSASigEnc` and `SignJobMode` in `node_crypto.h` and
+            // `WebCryptoCipherMode` all start at zero, and
+            // `node --expose-internals` reports `kSigEncDER`/`kSigEncP1363` as
+            // `0`/`1`, `kSignJobModeSign`/`kSignJobModeVerify` as `0`/`1`, and
+            // `kWebCryptoCipherEncrypt`/`kWebCryptoCipherDecrypt` as `0`/`1`.
+            // All three tables were previously one past Node's.
+            source: r#"
+                return [binding.kSigEncDER, binding.kSigEncP1363,
+                        binding.kSignJobModeSign, binding.kSignJobModeVerify,
+                        binding.kWebCryptoCipherEncrypt,
+                        binding.kWebCryptoCipherDecrypt].join(' ');
+            "#,
+            expected: "0 1 0 1 0 1",
+        },
+        Case {
+            name: "the WebCrypto key format constants are node's numbers",
+            // `enum WebCryptoKeyFormat` in `crypto_keys.h` is declared
+            // `RAW, PKCS8, SPKI, JWK`, so the four are 0..=3.
+            source: r#"
+                return [binding.kWebCryptoKeyFormatRaw,
+                        binding.kWebCryptoKeyFormatPKCS8,
+                        binding.kWebCryptoKeyFormatSPKI,
+                        binding.kWebCryptoKeyFormatJWK].join(' ');
+            "#,
+            expected: "0 1 2 3",
+        },
         Case {
             name: "PBKDF2Job sync run matches RFC 6070",
             // `pbkdf2Sync` builds this job, calls `run()`, and destructures

@@ -14,19 +14,19 @@
 /// `ncrypto::EVPKeyPointer::PKFormatType`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyFormat {
-    /// `kKeyFormatDER` (1).
+    /// `kKeyFormatDER` (0).
     Der,
-    /// `kKeyFormatPEM` (2).
+    /// `kKeyFormatPEM` (1).
     Pem,
-    /// `kKeyFormatJWK` (3).
+    /// `kKeyFormatJWK` (2).
     Jwk,
-    /// `kKeyFormatRawPublic` (4).
+    /// `kKeyFormatRawPublic` (3).
     RawPublic,
-    /// `kKeyFormatRawPrivate` (5).
+    /// `kKeyFormatRawPrivate` (4).
     RawPrivate,
-    /// `kKeyFormatRawSeed` (6).
+    /// `kKeyFormatRawSeed` (5).
     RawSeed,
-    /// `kKeyFormatStore` (7), an OpenSSL STORE loader descriptor.
+    /// `kKeyFormatStore` (6), an OpenSSL STORE loader descriptor.
     Store,
 }
 
@@ -34,13 +34,13 @@ impl KeyFormat {
     /// The `kKeyFormat*` value, or `None` for a number Node never sends.
     pub fn from_raw(value: i32) -> Option<Self> {
         Some(match value {
-            1 => Self::Der,
-            2 => Self::Pem,
-            3 => Self::Jwk,
-            4 => Self::RawPublic,
-            5 => Self::RawPrivate,
-            6 => Self::RawSeed,
-            7 => Self::Store,
+            0 => Self::Der,
+            1 => Self::Pem,
+            2 => Self::Jwk,
+            3 => Self::RawPublic,
+            4 => Self::RawPrivate,
+            5 => Self::RawSeed,
+            6 => Self::Store,
             _ => return None,
         })
     }
@@ -54,18 +54,18 @@ impl KeyFormat {
 
     /// The `kKeyFormat*` value, for tests that pin the wire numbers.
     ///
-    /// These are `PKFormatType`'s declaration order plus the three raw formats
-    /// that only newer Node defines, which is why they run 1..=7 rather than
-    /// starting at 0 the way `KeyEncoding` does.
+    /// These are `PKFormatType`'s declaration order — `DER, PEM, JWK,
+    /// RAW_PUBLIC, RAW_PRIVATE, RAW_SEED, STORE` — which is 0..=6, the same
+    /// numbering `crypto_keys.cc` exports with `static_cast<int>`.
     pub fn as_raw(self) -> i32 {
         match self {
-            Self::Der => 1,
-            Self::Pem => 2,
-            Self::Jwk => 3,
-            Self::RawPublic => 4,
-            Self::RawPrivate => 5,
-            Self::RawSeed => 6,
-            Self::Store => 7,
+            Self::Der => 0,
+            Self::Pem => 1,
+            Self::Jwk => 2,
+            Self::RawPublic => 3,
+            Self::RawPrivate => 4,
+            Self::RawSeed => 5,
+            Self::Store => 6,
         }
     }
 }
@@ -143,9 +143,30 @@ mod tests {
         // Both are small integers passed in adjacent argument slots. Sharing a
         // table between them is the easiest way to reintroduce a shift, so the
         // two are pinned separately.
-        assert_eq!(KeyFormat::from_raw(1), Some(KeyFormat::Der));
-        assert_eq!(KeyFormat::from_raw(2), Some(KeyFormat::Pem));
-        assert_eq!(KeyFormat::from_raw(3), Some(KeyFormat::Jwk));
+        //
+        // `crypto_keys.cc` derives these from `PKFormatType`'s declaration
+        // order, and `node --expose-internals` reports exactly 0 1 2 3 4 5 6.
+        // They were numbered 1..=7 here until this was pinned: self-consistent,
+        // and therefore invisible to every round trip inside this runtime.
+        assert_eq!(KeyFormat::Der.as_raw(), 0);
+        assert_eq!(KeyFormat::Pem.as_raw(), 1);
+        assert_eq!(KeyFormat::Jwk.as_raw(), 2);
+        assert_eq!(KeyFormat::RawPublic.as_raw(), 3);
+        assert_eq!(KeyFormat::RawPrivate.as_raw(), 4);
+        assert_eq!(KeyFormat::RawSeed.as_raw(), 5);
+        assert_eq!(KeyFormat::Store.as_raw(), 6);
+
+        assert_eq!(KeyFormat::from_raw(0), Some(KeyFormat::Der));
+        assert_eq!(KeyFormat::from_raw(1), Some(KeyFormat::Pem));
+        assert_eq!(KeyFormat::from_raw(2), Some(KeyFormat::Jwk));
+        assert_eq!(KeyFormat::from_raw(3), Some(KeyFormat::RawPublic));
+        assert_eq!(KeyFormat::from_raw(4), Some(KeyFormat::RawPrivate));
+        assert_eq!(KeyFormat::from_raw(5), Some(KeyFormat::RawSeed));
+        assert_eq!(KeyFormat::from_raw(6), Some(KeyFormat::Store));
+        // The numbering is dense with no gap at either end, so the first value
+        // Node never sends is the one past STORE.
+        assert_eq!(KeyFormat::from_raw(7), None);
+        assert_eq!(KeyFormat::from_raw(-1), None);
     }
 }
 

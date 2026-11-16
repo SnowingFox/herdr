@@ -43,8 +43,8 @@ use crate::templates::{self, set_key_data, with_key_data, INTERNAL_FIELD_COUNT};
 
 /// The members this crate installs, for the parent crate's `MEMBERS` list.
 ///
-/// Eight names: the handle class, the three class-protocol functions, and the
-/// four key-generation jobs.
+/// Eleven names: the handle class, the three `KeyObject` class-protocol
+/// functions, the three `NativeCryptoKey` ones, and the four key-generation jobs.
 pub const MEMBERS: &[&str] = &[
     "KeyObjectHandle",
     "SecretKeyGenJob",
@@ -54,6 +54,9 @@ pub const MEMBERS: &[&str] = &[
     "createNativeKeyObjectClass",
     "getKeyObjectSlots",
     "isKeyObject",
+    "createCryptoKeyClass",
+    "getCryptoKeySlots",
+    "isCryptoKey",
     "isKeyAlgorithmAvailable",
 ];
 
@@ -119,6 +122,23 @@ pub fn install_classes<'s>(
             rn_core::method(get_key_object_slots).build(scope),
         ),
         ("isKeyObject", rn_core::method(is_key_object).build(scope)),
+        // `crypto_keys.cc` publishes all three through `SetMethod` /
+        // `SetMethodNoSideEffect`, so none of them has a `[[Construct]]` and
+        // `new binding.isCryptoKey({})` is a `TypeError` on Node. `method` is
+        // that behaviour; `FunctionTemplate::builder` would silently accept
+        // `new`, and `tools/constructible-audit.py` fails on the difference.
+        (
+            "createCryptoKeyClass",
+            rn_core::method(crate::cryptokey::create_crypto_key_class).build(scope),
+        ),
+        (
+            "getCryptoKeySlots",
+            rn_core::method(crate::cryptokey::get_crypto_key_slots).build(scope),
+        ),
+        (
+            "isCryptoKey",
+            rn_core::method(crate::cryptokey::is_crypto_key).build(scope),
+        ),
         (
             "isKeyAlgorithmAvailable",
             rn_core::method(is_key_algorithm_available).build(scope),
@@ -386,15 +406,24 @@ mod tests {
 
     #[test]
     fn the_member_list_is_the_class_protocol_plus_the_jobs() {
-        // These nine are what `keys.js`, `keygen.js` and `webcrypto` destructure,
+        // These twelve are what `keys.js`, `keygen.js` and `webcrypto` destructure,
         // and `rn-bind-crypto` moves exactly these from `DEFERRED` to `MEMBERS`.
-        assert_eq!(MEMBERS.len(), 9);
+        //
+        // The three `NativeCryptoKey` members were added with the `isCryptoKey`
+        // brand: `keys.js` destructures `createCryptoKeyClass` at module scope
+        // and calls `getCryptoKeySlots`/`isCryptoKey` from the `CryptoKey`
+        // getters, so all three have to exist or `util.types.isCryptoKey` throws
+        // "isNativeCryptoKey is not a function".
+        assert_eq!(MEMBERS.len(), 12);
         for name in [
             "KeyObjectHandle",
             "createNativeKeyObjectClass",
             "getKeyObjectSlots",
             "isKeyObject",
             "isKeyAlgorithmAvailable",
+            "createCryptoKeyClass",
+            "getCryptoKeySlots",
+            "isCryptoKey",
         ] {
             assert!(MEMBERS.contains(&name), "{name}");
         }

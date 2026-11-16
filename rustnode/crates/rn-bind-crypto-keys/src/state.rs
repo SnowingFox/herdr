@@ -29,18 +29,18 @@ impl KeyType {
     /// what `keys.js` compares against.
     pub fn as_raw(self) -> i32 {
         match self {
-            Self::Secret => 1,
-            Self::Public => 2,
-            Self::Private => 3,
+            Self::Secret => 0,
+            Self::Public => 1,
+            Self::Private => 2,
         }
     }
 
     /// Reads a `kKeyType*` value.
     pub fn from_raw(value: i32) -> Option<Self> {
         Some(match value {
-            1 => Self::Secret,
-            2 => Self::Public,
-            3 => Self::Private,
+            0 => Self::Secret,
+            1 => Self::Public,
+            2 => Self::Private,
             _ => return None,
         })
     }
@@ -207,13 +207,19 @@ mod tests {
         // These are the `kKeyType*` constants `rn-bind-crypto` installs, and the
         // JavaScript compares against them; a drift here would make every key
         // report the wrong type without failing anywhere else.
-        assert_eq!(KeyType::Secret.as_raw(), 1);
-        assert_eq!(KeyType::Public.as_raw(), 2);
-        assert_eq!(KeyType::Private.as_raw(), 3);
-        for value in 1..=3 {
+        //
+        // `crypto_keys.h`'s `enum KeyType` is `{ kKeyTypeSecret, kKeyTypePublic,
+        // kKeyTypePrivate }`, exported with `NODE_DEFINE_CONSTANT`, and
+        // `node --expose-internals` reports 0 1 2. They were 1 2 3 here until
+        // this was pinned.
+        assert_eq!(KeyType::Secret.as_raw(), 0);
+        assert_eq!(KeyType::Public.as_raw(), 1);
+        assert_eq!(KeyType::Private.as_raw(), 2);
+        for value in 0..=2 {
             assert_eq!(KeyType::from_raw(value).map(KeyType::as_raw), Some(value));
         }
-        assert_eq!(KeyType::from_raw(0), None);
+        assert_eq!(KeyType::from_raw(3), None);
+        assert_eq!(KeyType::from_raw(-1), None);
         assert_eq!(KeyType::Secret.as_str(), "secret");
         assert_eq!(KeyType::Public.as_str(), "public");
         assert_eq!(KeyType::Private.as_str(), "private");

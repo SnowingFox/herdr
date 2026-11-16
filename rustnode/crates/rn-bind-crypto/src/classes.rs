@@ -8,15 +8,11 @@
 //! # The class factories
 //!
 //! `keys.js` runs `createNativeKeyObjectClass(...)` and `createCryptoKeyClass(...)`
-//! at module scope to build its class hierarchy. Each factory is handed a callback
-//! and returns whatever that callback returns — an array of the classes the
-//! JavaScript then destructures.
-//!
-//! Node's versions create a V8 `FunctionTemplate` that stores an `ncrypto` handle,
-//! and the JavaScript subclasses rely on that base holding the handle for every
-//! later method. Implementing that faithfully is the whole `KeyObject` surface.
-//! What these do is supply the **class shape**: a base constructor that accepts
-//! and retains its arguments, so extending it works and the module loads.
+//! at module scope to build its two class hierarchies. Both are backed by native
+//! state, so both live with the crate that owns that state:
+//! `createNativeKeyObjectClass` in `crate::install`, and `createCryptoKeyClass`,
+//! `getCryptoKeySlots` and `isCryptoKey` in `crate::cryptokey`. What is left here
+//! is the enumeration and lifecycle surface.
 //!
 //! `createX509CertificateClass` used to have a stand-in here as well. It is gone:
 //! `rn-bind-crypto-x509` now installs the real class, and two implementations of
@@ -32,81 +28,6 @@
 //! loads the store synchronously when a TLS context is created.
 
 use rn_v8_sys::v8;
-
-// ---------------------------------------------------------------------------
-// Class factories
-// ---------------------------------------------------------------------------
-
-/// `new.target`-compatible base class the JavaScript extends.
-///
-/// The instance stores its constructor arguments in `__rn_native_args` so a
-/// future method on the real key surface has something to read. The property is an
-/// implementation detail of a class the user never constructs directly, and the
-/// name is chosen to be unmistakably internal.
-fn make_base_class<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    name: &str,
-) -> Option<v8::Local<'s, v8::Function>> {
-    let template = rn_core::class(base_constructor).build(scope);
-    template
-        .instance_template(scope)
-        .set_internal_field_count(1);
-    let class_name = v8::String::new(scope, name)?;
-    template.set_class_name(class_name);
-    template.get_function(scope)
-}
-
-/// The base constructor: keeps its arguments and returns `this`.
-fn base_constructor(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue,
-) {
-    let this: v8::Local<v8::Object> = args.this();
-    let storage = v8::Object::new(scope);
-    for index in 0..args.length() {
-        let Some(key) = v8::String::new(scope, &format!("{index}")) else {
-            continue;
-        };
-        storage.set(scope, key.into(), args.get(index));
-    }
-    let Some(key) = v8::String::new(scope, "__rn_native_args") else {
-        return;
-    };
-    this.set(scope, key.into(), storage.into());
-    rv.set(this.into());
-}
-
-/// Builds a base class, passes it to the callback, and returns the callback's
-/// result, which is the array of classes the JavaScript destructures.
-fn call_with_base_class<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: &v8::FunctionCallbackArguments<'_>,
-    which: &str,
-) -> Option<v8::Local<'s, v8::Value>> {
-    let callback = v8::Local::<v8::Function>::try_from(args.get(0)).ok()?;
-    let base = make_base_class(scope, "NativeBase")?;
-    let receiver = v8::undefined(scope).into();
-    let result = callback.call(scope, receiver, &[base.into()]);
-    if result.is_none() {
-        // The callback threw; leave the pending exception to propagate rather than
-        // replacing it with a different error.
-        let _ = which;
-    }
-    result
-}
-
-/// `createCryptoKeyClass(callback)`.
-pub(crate) fn create_crypto_key_class<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue,
-) {
-    match call_with_base_class(scope, &args, "createCryptoKeyClass") {
-        Some(value) => rv.set(value),
-        None => throw_type_error(scope, "createCryptoKeyClass needs a callback"),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Enumeration and lifecycle members
@@ -202,13 +123,5 @@ fn throw(scope: &mut v8::PinScope<'_, '_>, message: &str) {
         return;
     };
     let exception = v8::Exception::error(scope, text);
-    scope.throw_exception(exception);
-}
-
-fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
-    let Some(text) = v8::String::new(scope, message) else {
-        return;
-    };
-    let exception = v8::Exception::type_error(scope, text);
     scope.throw_exception(exception);
 }

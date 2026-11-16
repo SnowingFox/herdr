@@ -443,9 +443,9 @@ fn padding_options(
 }
 
 /// `kSigEncDER` / `kSigEncP1363`, which `sig.js` passes as `dsaEncoding`.
-const SIGNATURE_ENCODING_DER: i32 = 1;
+const SIGNATURE_ENCODING_DER: i32 = 0;
 /// `kSigEncP1363`.
-const SIGNATURE_ENCODING_P1363: i32 = 2;
+const SIGNATURE_ENCODING_P1363: i32 = 1;
 
 /// Reads the `dsaEncoding` slot, rejecting a value outside `DSASigEnc`.
 ///
@@ -958,7 +958,11 @@ mod tests {
     fn the_signature_encoding_values_match_the_binding_constants() {
         // `kSigEncDER`/`kSigEncP1363` are installed by `rn-bind-crypto`; a drift
         // would make `dsaEncoding: 'ieee-p1363'` silently request DER.
-        assert_eq!(SIGNATURE_ENCODING_DER, 1);
-        assert_eq!(SIGNATURE_ENCODING_P1363, 2);
+        //
+        // `DSASigEnc` in `node_crypto.h` is `{ DER, P1363 }`, and
+        // `node --expose-internals` reports 0 1. They were 1 2 here until this
+        // was pinned, which is the same one-past shift the key tables had.
+        assert_eq!(SIGNATURE_ENCODING_DER, 0);
+        assert_eq!(SIGNATURE_ENCODING_P1363, 1);
     }
 }

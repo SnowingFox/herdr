@@ -159,6 +159,8 @@ pub const MEMBERS: &[&str] = &[
     "startLoadingCertificatesOffThread",
     "createNativeKeyObjectClass",
     "createCryptoKeyClass",
+    "getCryptoKeySlots",
+    "isCryptoKey",
     // The X.509 surface, installed by `rn-bind-crypto-x509`, which owns
     // `src/crypto/crypto_x509.cc` and `crypto_pkcs12.cc`. `x509.js` runs
     // `createX509CertificateClass` at module scope and destructures the rest, so
@@ -309,14 +311,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "SPKAC verification needs the certificate surface, deferred with X.509.",
     ),
     (
-        "getCryptoKeySlots",
-        "Exposes WebCrypto key slots, deferred with CryptoKey.",
-    ),
-    (
-        "isCryptoKey",
-        "The CryptoKey type test needs the WebCrypto CryptoKey class, which is deferred.",
-    ),
-    (
         "isKeyAlgorithmAvailable",
         "Asks whether a named key algorithm is usable; deferred with the key surface.",
     ),
@@ -432,26 +426,36 @@ mod constants {
     pub const K_KEY_ENCODING_SPKI: i32 = 2;
 
     /// `kKeyFormatDER`.
-    pub const K_KEY_FORMAT_DER: i32 = 1;
+    ///
+    /// `crypto_keys.cc` derives these seven from `EVPKeyPointer::PKFormatType`
+    /// with `static_cast<int>`, so they are that enum's declaration order in
+    /// `deps/ncrypto/ncrypto.h`: `DER, PEM, JWK, RAW_PUBLIC, RAW_PRIVATE,
+    /// RAW_SEED, STORE`. They were previously numbered 1..=7, one past Node's
+    /// 0..=6, which is the same shifted-table defect the encoding constants had.
+    pub const K_KEY_FORMAT_DER: i32 = 0;
     /// `kKeyFormatPEM`.
-    pub const K_KEY_FORMAT_PEM: i32 = 2;
+    pub const K_KEY_FORMAT_PEM: i32 = 1;
     /// `kKeyFormatJWK`.
-    pub const K_KEY_FORMAT_JWK: i32 = 3;
+    pub const K_KEY_FORMAT_JWK: i32 = 2;
     /// `kKeyFormatRawPublic`.
-    pub const K_KEY_FORMAT_RAW_PUBLIC: i32 = 4;
+    pub const K_KEY_FORMAT_RAW_PUBLIC: i32 = 3;
     /// `kKeyFormatRawPrivate`.
-    pub const K_KEY_FORMAT_RAW_PRIVATE: i32 = 5;
+    pub const K_KEY_FORMAT_RAW_PRIVATE: i32 = 4;
     /// `kKeyFormatRawSeed`.
-    pub const K_KEY_FORMAT_RAW_SEED: i32 = 6;
+    pub const K_KEY_FORMAT_RAW_SEED: i32 = 5;
     /// `kKeyFormatStore`.
-    pub const K_KEY_FORMAT_STORE: i32 = 7;
+    pub const K_KEY_FORMAT_STORE: i32 = 6;
 
     /// `kKeyTypeSecret`.
-    pub const K_KEY_TYPE_SECRET: i32 = 1;
+    ///
+    /// `crypto_keys.h`'s `enum KeyType { kKeyTypeSecret, kKeyTypePublic,
+    /// kKeyTypePrivate }` exported with `NODE_DEFINE_CONSTANT`, so the three are
+    /// 0, 1, 2 in declaration order. They were previously 1, 2, 3.
+    pub const K_KEY_TYPE_SECRET: i32 = 0;
     /// `kKeyTypePublic`.
-    pub const K_KEY_TYPE_PUBLIC: i32 = 2;
+    pub const K_KEY_TYPE_PUBLIC: i32 = 1;
     /// `kKeyTypePrivate`.
-    pub const K_KEY_TYPE_PRIVATE: i32 = 3;
+    pub const K_KEY_TYPE_PRIVATE: i32 = 2;
 
     /// `kTypeArgon2d`, from `ncrypto::Argon2Type`'s declaration order.
     pub const K_TYPE_ARGON2D: i32 = 0;
@@ -461,37 +465,45 @@ mod constants {
     pub const K_TYPE_ARGON2ID: i32 = 2;
 
     /// `kSigEncDER`.
-    pub const K_SIG_ENC_DER: i32 = 1;
+    ///
+    /// `DSASigEnc` in `node_crypto.h` is `{ DER, P1363 }`, exported by value,
+    /// so the two are 0 and 1.
+    pub const K_SIG_ENC_DER: i32 = 0;
     /// `kSigEncP1363`.
-    pub const K_SIG_ENC_P1363: i32 = 2;
+    pub const K_SIG_ENC_P1363: i32 = 1;
 
-    /// `kSignJobModeSign`.
+    /// `kKeyVariantRSA_SSA_PKCS1_v1_5`.
+    ///
     /// `RSAKeyVariant` from `crypto_rsa.h`, which `keygen.js` passes as the
-    /// second argument of `RsaKeyPairGenJob`.
+    /// second argument of `RsaKeyPairGenJob`. This table was already Node's.
     pub const K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5: i32 = 0;
     /// `kKeyVariantRSA_PSS`.
     pub const K_KEY_VARIANT_RSA_PSS: i32 = 1;
     /// `kKeyVariantRSA_OAEP`.
     pub const K_KEY_VARIANT_RSA_OAEP: i32 = 2;
 
-    /// `kSignJobModeSign`.
-    pub const K_SIGN_JOB_MODE_SIGN: i32 = 1;
+    /// `kSignJobModeSign`, from `SignJobMode` in `node_crypto.h`.
+    pub const K_SIGN_JOB_MODE_SIGN: i32 = 0;
     /// `kSignJobModeVerify`.
-    pub const K_SIGN_JOB_MODE_VERIFY: i32 = 2;
+    pub const K_SIGN_JOB_MODE_VERIFY: i32 = 1;
 
-    /// `kWebCryptoCipherEncrypt`.
-    pub const K_WEBCRYPTO_CIPHER_ENCRYPT: i32 = 1;
+    /// `kWebCryptoCipherEncrypt`, from `WebCryptoCipherMode` in `node_crypto.h`.
+    pub const K_WEBCRYPTO_CIPHER_ENCRYPT: i32 = 0;
     /// `kWebCryptoCipherDecrypt`.
-    pub const K_WEBCRYPTO_CIPHER_DECRYPT: i32 = 2;
+    pub const K_WEBCRYPTO_CIPHER_DECRYPT: i32 = 1;
 
     /// `kWebCryptoKeyFormatRaw`.
-    pub const K_WEBCRYPTO_KEY_FORMAT_RAW: i32 = 1;
+    ///
+    /// `enum WebCryptoKeyFormat` in `crypto_keys.h` is `{ kWebCryptoKeyFormatRaw,
+    /// kWebCryptoKeyFormatPKCS8, kWebCryptoKeyFormatSPKI,
+    /// kWebCryptoKeyFormatJWK }`, so the four are 0..=3 in declaration order.
+    pub const K_WEBCRYPTO_KEY_FORMAT_RAW: i32 = 0;
     /// `kWebCryptoKeyFormatPKCS8`.
-    pub const K_WEBCRYPTO_KEY_FORMAT_PKCS8: i32 = 2;
+    pub const K_WEBCRYPTO_KEY_FORMAT_PKCS8: i32 = 1;
     /// `kWebCryptoKeyFormatSPKI`.
-    pub const K_WEBCRYPTO_KEY_FORMAT_SPKI: i32 = 3;
+    pub const K_WEBCRYPTO_KEY_FORMAT_SPKI: i32 = 2;
     /// `kWebCryptoKeyFormatJWK`.
-    pub const K_WEBCRYPTO_KEY_FORMAT_JWK: i32 = 4;
+    pub const K_WEBCRYPTO_KEY_FORMAT_JWK: i32 = 3;
 
     /// `RSA_PKCS1_PSS_PADDING`, from OpenSSL's `rsa.h`.
     pub const RSA_PKCS1_PSS_PADDING: i32 = 6;
@@ -603,16 +615,6 @@ impl BindingModule for Crypto {
             (
                 "startLoadingCertificatesOffThread",
                 rn_core::method(crate::classes::start_loading_certificates_off_thread)
-                    .build(scope)
-                    .get_function(scope),
-            ),
-            // `createNativeKeyObjectClass` is not here: `rn-bind-crypto-keys`
-            // installs the real one, and installing a base-class stand-in first
-            // would leave two implementations of the same member where only the
-            // later one is reachable.
-            (
-                "createCryptoKeyClass",
-                rn_core::method(crate::classes::create_crypto_key_class)
                     .build(scope)
                     .get_function(scope),
             ),
