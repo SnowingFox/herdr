@@ -9,9 +9,13 @@
 //! `internalBinding('v8')`) rather than read out of `src/node_v8.cc`, because
 //! the C++ numbers its properties with a macro: reading the source only proves
 //! the macro was transcribed correctly, not that this runtime and Node number
-//! the fields the same way. `tests/parity.rs` re-records them from whatever Node
-//! binary is on `PATH` when one is, so a Node upgrade that renumbers a field
-//! fails a test instead of silently mislabelling every size.
+//! the fields the same way. `tests/node_constants.rs` re-records them from the
+//! pinned Node binary, so a Node upgrade that renumbers a field fails a test
+//! instead of silently mislabelling every size.
+//!
+//! The heap space list is the exception, and deliberately so: `src/node_v8.cc`
+//! does not hold it as a table either, it asks the isolate. See
+//! [`crate::heap_space_names`].
 
 /// `HEAP_STATISTICS_PROPERTIES` from `src/node_v8.cc`, in index order.
 pub const HEAP_STATISTICS_INDEXES: &[(&str, usize)] = &[
@@ -46,29 +50,6 @@ pub const HEAP_CODE_STATISTICS_INDEXES: &[(&str, usize)] = &[
     ("bytecode_and_metadata_size", 1),
     ("external_script_source_size", 2),
     ("cpu_profiler_metadata_size", 3),
-];
-
-/// The heap spaces `Isolate::GetHeapSpaceStatistics` reports, in the order its
-/// index takes.
-///
-/// This is a snapshot of what V8 15.2 reports, and it has to be: `lib/v8.js`
-/// builds `kNumberOfHeapSpaces` from this array's length and then indexes the
-/// buffer by position. The names are listed in `HEAP_SPACES` order and the
-/// isolate's own space count is checked against them at install time, so a V8
-/// that added a space shows up as a startup error rather than as one space
-/// quietly reporting another space's numbers.
-pub const HEAP_SPACES: &[&str] = &[
-    "read_only_space",
-    "new_space",
-    "old_space",
-    "code_space",
-    "shared_space",
-    "trusted_space",
-    "new_large_object_space",
-    "large_object_space",
-    "code_large_object_space",
-    "shared_large_object_space",
-    "trusted_large_object_space",
 ];
 
 /// `v8::HeapProfiler::SamplingFlags::kSamplingNoFlags`.

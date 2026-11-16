@@ -286,22 +286,31 @@ fn get_heap_space_statistics_walks_the_public_space_names() {
     // The public API returns `space_name`, which has to be one of V8's names,
     // and `kHeapSpaces` comes from `Isolate::NumberOfHeapSpaces` rather than
     // from a constant in this crate.
+    //
+    // The row count is checked against `kHeapSpaces.length` rather than against
+    // a literal: `lib/v8.js` derives `kNumberOfHeapSpaces` from that array, so
+    // the two agreeing is the invariant this test owns. That the array itself
+    // matches the engine is `tests/binding.rs`'s job, where it can compare
+    // against an independent read of the isolate.
     let output = eval_with_real_module(&[r#"
 const spaces = v8module.getHeapSpaceStatistics();
 const names = spaces.map((space) => space.space_name);
 const shape = spaces.every((space) =>
   Object.keys(space).join(',') ===
     'space_name,space_size,space_used_size,space_available_size,physical_space_size');
+const installed = globalThis.__v8Binding.kHeapSpaces;
 globalThis.__result = [
   Array.isArray(spaces),
+  spaces.length === installed.length,
   spaces.length,
   shape,
+  names.every((name, index) => name === installed[index]),
   names.includes('new_space'),
   names.includes('old_space'),
   new Set(names).size === names.length
 ].join(' ');
 "#]);
-    assert_eq!(output, "true 11 true true true true");
+    assert_eq!(output, "true true 13 true true true true true");
 }
 
 #[test]
