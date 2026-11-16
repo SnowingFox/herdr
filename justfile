@@ -25,6 +25,11 @@ test-windows-input *args:
 test-one filter:
     cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
+# Check the TypeScript port (ts/): native crate tests + lint, typecheck, vitest
+ts-check:
+    cd ts && pnpm install --frozen-lockfile && pnpm check
+    cd ts/packages/native && cargo test --locked && cargo clippy --all-targets --locked -- -D warnings
+
 # Enforce deterministic UI hot-path architecture boundaries
 ui-hot-path-architecture-test:
     {{python}} -m unittest scripts.test_ui_hot_path_architecture
