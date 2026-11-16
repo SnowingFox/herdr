@@ -36,6 +36,7 @@ pub mod callback;
 pub mod handle;
 pub mod ledger;
 pub mod listener;
+pub mod poller;
 pub mod stream;
 pub mod stream_base;
 pub mod streams;
@@ -76,6 +77,19 @@ pub(crate) fn global_state_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub use libuv_sys2 as sys;
+
+/// The environment variable that selects the io_uring readiness backend.
+///
+/// `HERDR_URING=1` (or `true`) asks for io_uring; anything else, including an
+/// unset variable, leaves the epoll backend that every process ran on before
+/// io_uring support existed. The switch exists so a broken io_uring path cannot
+/// silently break users: a process that does not ask for it cannot reach the
+/// ring code at all.
+///
+/// The request is still subject to runtime detection — a kernel without
+/// `io_uring`, a seccomp filter, or `kernel.io_uring_disabled` all fall back to
+/// epoll with a warning rather than failing the program.
+pub const ENV_URING: &str = "HERDR_URING";
 
 /// The libuv version the binary linked, as `uv_version_string` reports it.
 ///
