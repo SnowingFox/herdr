@@ -32,6 +32,11 @@
 //! `loopIdleTime`, `uvMetricsInfo` and `updateGarbageCollectionTracking` report
 //! loop and collector statistics.
 
+mod cbor;
+mod eld;
+mod hdr;
+mod histogram_binding;
+
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
@@ -60,21 +65,21 @@ pub const MEMBERS: &[&str] = &[
 
 /// The members this namespace declares it does not install yet, with the reason.
 ///
-/// `perf_hooks` constructs both classes, so a namespace that published
-/// `undefined` under these names looked complete to `rn-compat` while failing at
-/// the first `new`. They are declared here instead, and the install leaves the
-/// names off rather than setting them to `undefined`.
+/// Empty: every member in [`MEMBERS`] is installed. The two histogram
+/// constructors used to be listed here because the subsystem they need did not
+/// exist, which made `perf_hooks.createHistogram()` throw `_Histogram is not a
+/// constructor`. They are installed now, so there is nothing left to declare.
+///
 pub const DEFERRED: &[(&str, &str)] = &[
-    (
-        "Histogram",
-        "the histogram subsystem and the hdr-histogram it measures do not exist; \
-         perf_hooks builds one through this binding, so the class is deferred \
-         with the rest of that surface",
-    ),
-    (
-        "SlidingWindowHistogram",
-        "built on the same histogram subsystem as Histogram, deferred with it",
-    ),
+    // `performance.Histogram` and `performance.SlidingWindowHistogram` used to be
+    // declared here with a reason saying the histogram subsystem did not exist.
+    // It exists now, so they are installed rather than deferred.
+    //
+    // This block keeps its comment because `tools/deferred-reach.py` matches
+    // `&\[(.*?)\n\];` and rustfmt folds an empty `&[\n]` back to `&[]`, which the
+    // pattern does not accept. The comment is what keeps the two-line form
+    // stable, and the tool then reads this file's entries instead of reporting
+    // that it could not parse them.
 ];
 
 /// `NODE_PERFORMANCE_MILESTONES` in `src/node_perf_common.h`, in enum order.
@@ -231,7 +236,12 @@ fn performance_now() -> f64 {
     now.saturating_sub(origin_nanos) as f64 / 1_000_000.0
 }
 
-fn monotonic_nanos() -> u64 {
+/// A monotonic clock in nanoseconds, which is what `uv_hrtime()` reads.
+///
+/// `clock_gettime(CLOCK_MONOTONIC)` is the same clock libuv uses for
+/// `uv_hrtime`, so a delta computed here is in the unit `recordDelta` records
+/// and in the unit `Histogram::RecordDelta` compares against.
+pub(crate) fn monotonic_nanos() -> u64 {
     // SAFETY: `timespec` is plain-old-data and `clock_gettime` fills it.
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: `now` is a valid, writable `timespec`.
@@ -314,7 +324,7 @@ impl BindingModule for Performance {
         });
 
         let object = v8::Object::new(scope);
-        let values: [(&str, v8::Local<v8::Value>); 13] = [
+        let values: [(&str, v8::Local<v8::Value>); 15] = [
             ("milestones", milestone_array),
             ("observerCounts", observer_array),
             ("uvMetricsBuffer", uv_array),
@@ -346,20 +356,29 @@ impl BindingModule for Performance {
                 "uvMetricsInfo",
                 function(scope, "uvMetricsInfo", uv_metrics_info)?,
             ),
+            // `lib/internal/perf/event_loop_delay.js` calls this and wraps the
+            // result in `ELDHistogram`, so the object it returns has to carry the
+            // whole handle interface plus `start`/`stop`.
+            ("createELDHistogram", eld::create_function(scope)?),
+            // The two histogram classes `lib/internal/histogram.js` destructures
+            // and `perf_hooks.createHistogram()` builds on. Their methods are the
+            // handle interface that module calls by name.
             (
-                "createELDHistogram",
-                function(scope, "createELDHistogram", create_eld_histogram)?,
+                "Histogram",
+                histogram_binding::histogram_constructor(scope)?,
             ),
-            // The two histogram constructors need the histogram subsystem in
-            // `internal/histogram.js`, which drives them through this binding.
-            // They are declared in `DEFERRED` and deliberately not set here: an
-            // own property holding `undefined` still answers `'Histogram' in
-            // performance`, which reads as present to `lib/**` and to
-            // `rn-compat`, so the honest shape is the missing one.
+            (
+                "SlidingWindowHistogram",
+                histogram_binding::sliding_constructor(scope)?,
+            ),
         ];
         for (name, value) in values {
             set(scope, object, name, value)?;
         }
+        // The ELD handle's template is built up front so the first
+        // `monitorEventLoopDelay()` does not pay for a `FunctionTemplate` inside a
+        // call that may already be timing the loop.
+        eld::register_template(scope)?;
         Ok(object)
     }
 }
@@ -697,20 +716,6 @@ fn uv_metrics_info(
         }
     });
     rv.set(v8::BigInt::new_from_u64(scope, 0).into());
-}
-
-fn create_eld_histogram(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue,
-) {
-    // An ELD histogram tracks event-loop delay. Its storage is the histogram
-    // subsystem's, which is not written yet; constructing one that recorded
-    // nothing would look like a working instrument.
-    throw(
-        scope,
-        "createELDHistogram is not implemented: the event loop it measures does not exist yet",
-    );
 }
 
 /// The milestone value at `index`, or `None` when out of range or unset.

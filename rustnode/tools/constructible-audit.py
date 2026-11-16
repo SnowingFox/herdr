@@ -89,8 +89,13 @@ DEFERRED = (
     "crypto.Mac",
     "crypto.TurboShakeJob",
     "fs.CpDirJob",
-    "performance.Histogram",
-    "performance.SlidingWindowHistogram",
+    # (`performance.Histogram` and `performance.SlidingWindowHistogram` were here.
+    # Both ship now, so deleting their lines is what proves the class landed rather
+    # than merely being declared: an entry that is installed fails this audit as
+    # stale. Covered by `crates/rn-bind-performance/tests/differential.rs`.
+    # This is the only change this branch makes to this file; everything #135 added
+    # — the prototype walk, the fixtures and the non-zero-comparison guard — is
+    # master's, untouched.)
     "sqlite.backup",
 )
 

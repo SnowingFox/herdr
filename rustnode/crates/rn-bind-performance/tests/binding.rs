@@ -166,13 +166,150 @@ fn loop_counters_report_not_measured_rather_than_zero() {
 }
 
 #[test]
-fn the_eld_histogram_refuses_rather_than_pretending() {
-    // `createELDHistogram` measures event-loop delay. Returning a working-looking
-    // instrument that never records would be worse than an honest failure.
+fn create_histogram_returns_a_recordable_histogram() {
+    // The headline defect this test replaces: `createHistogram()` used to throw
+    // `_Histogram is not a constructor`, because `performance.Histogram` was
+    // installed as `undefined`. Asserting the values, not just that it built.
+    let output = run("const { createHistogram } = require('perf_hooks');
+        const h = createHistogram({ lowest: 1, highest: 1000, figures: 3 });
+        for (const value of [1, 2, 3, 5, 8, 13, 21]) h.record(value);
+        console.log(h.count, h.min, h.max, h.percentile(50), h.percentile(100));
+        console.log(h.countBigInt, h.minBigInt, h.maxBigInt);
+        console.log(typeof h.mean, h.mean > 0, h.stddev > 0);
+        console.log([...h.percentiles.keys()].join(','));");
+    // The 50th percentile of these seven samples is 5 (the oracle reports the
+    // same), and `max` is 21 because 21 happens to end its bucket at three
+    // significant figures. Only four percentile rows are emitted: the tick
+    // density at this sample count does not reach the 93.75 half-distance.
+    assert_eq!(
+        output,
+        "7 1 21 5 21\n7n 1n 21n\nnumber true true\n0,50,75,87.5,100"
+    );
+}
+
+#[test]
+fn an_empty_histogram_reports_nodes_sentinels() {
+    // `min` is `INT64_MAX` (reported as a Number first, so it loses precision),
+    // `max` is 0 and mean/stddev are NaN. A zero-initialised minimum would claim
+    // every value was recorded at 0.
+    let output = run("const { createHistogram } = require('perf_hooks');
+        const h = createHistogram({ lowest: 1, highest: 1000, figures: 2 });
+        console.log(h.count, h.min, h.max, h.minBigInt, h.maxBigInt);
+        console.log(Number.isNaN(h.mean), Number.isNaN(h.stddev));
+        console.log(JSON.stringify([...h.percentiles.entries()]));");
+    assert_eq!(
+        output,
+        "0 9223372036854776000 0 9223372036854775807n 0n\ntrue true\n[[100,0]]"
+    );
+}
+
+#[test]
+fn a_value_above_the_cap_counts_as_exceeding() {
+    let output = run("const { createHistogram } = require('perf_hooks');
+        const h = createHistogram({ lowest: 1, highest: 100, figures: 3 });
+        h.record(50);
+        h.record(101);
+        h.record(1000000);
+        console.log(h.count, h.exceeds, h.exceedsBigInt);");
+    assert_eq!(output, "1 2 2n");
+}
+
+#[test]
+fn reset_clears_the_data_and_bumps_the_reset_count() {
+    let output = run("const { createHistogram } = require('perf_hooks');
+        const h = createHistogram({ lowest: 1, highest: 1000, figures: 3 });
+        h.record(10);
+        const before = h.resetCount;
+        h.reset();
+        console.log(before, h.resetCount, h.count, h.max);");
+    assert_eq!(output, "0 1 0 0");
+}
+
+#[test]
+fn adding_a_histogram_to_itself_doubles_every_count() {
+    // `add(self)` shares one state cell, so a naive implementation that borrows
+    // the cell twice would panic; the count is the proof it merged instead.
+    let output = run("const { createHistogram } = require('perf_hooks');
+        const h = createHistogram({ lowest: 1, highest: 1000, figures: 3 });
+        h.record(10);
+        h.record(20);
+        h.add(h);
+        console.log(h.count, h.min, h.max);");
+    assert_eq!(output, "4 10 20");
+}
+
+#[test]
+fn a_snapshot_is_independent_and_diffs_against_it() {
+    let output = run("const { createHistogram } = require('perf_hooks');
+        const h = createHistogram({ lowest: 1, highest: 1000, figures: 3 });
+        h.record(10);
+        const snapshot = h.snapshot();
+        h.record(20);
+        h.record(30);
+        const difference = h.diff(snapshot);
+        console.log(snapshot.count, h.count, difference.count, difference.min);");
+    // The snapshot must not see the two later records; the difference holds only
+    // those two, so its minimum is 20.
+    assert_eq!(output, "1 3 2 20");
+}
+
+#[test]
+fn the_sliding_window_keeps_the_records_inside_its_ring() {
+    // Two chunks of two records hold four records exactly, so all four survive;
+    // the fifth is the record that reuses the oldest chunk. The oracle reports
+    // `4 10 40` for the first block and `3 30 50` after the fifth record, which
+    // is the rule this pins.
+    let output = run(
+        "const { createSlidingWindowHistogram } = require('perf_hooks');
+        const h = createSlidingWindowHistogram({
+          chunks: 2, recordsPerChunk: 2, lowest: 1, highest: 1000, figures: 2,
+        });
+        for (const value of [10, 20, 30, 40]) h.record(value);
+        const first = h.snapshot();
+        console.log(first.count, first.min, first.max);
+        h.record(50);
+        const second = h.snapshot();
+        console.log(second.count, second.min, second.max);",
+    );
+    assert_eq!(output, "4 10 40\n3 30 50");
+}
+
+#[test]
+fn monitor_event_loop_delay_records_intervals() {
+    // `monitorEventLoopDelay()` builds an ELD histogram through
+    // `createELDHistogram`, which used to throw "not implemented".
+    //
+    // The loop has to actually run for the interval timer to fire: a busy wait
+    // blocks the loop and records nothing, in Node as well as here. So the
+    // measurement happens from a `setTimeout`, which is also what makes the
+    // enable/disable return values observable in the right order.
+    let output = run("const { monitorEventLoopDelay } = require('perf_hooks');
+        const histogram = monitorEventLoopDelay({ resolution: 1 });
+        const before = histogram.count;
+        histogram.enable();
+        console.log('enableAgain', histogram.enable());
+        setTimeout(() => {
+          console.log('disable', histogram.disable());
+          console.log('disableAgain', histogram.disable());
+          console.log(before, histogram.count > 0, histogram.min > 0,
+                      Number.isFinite(histogram.mean), histogram.max >= histogram.min);
+        }, 20);");
+    assert_eq!(
+        output,
+        "enableAgain false\ndisable true\ndisableAgain false\n0 true true true true"
+    );
+}
+
+#[test]
+fn the_eld_factory_is_not_a_constructor() {
+    // `createELDHistogram` is a plain method, not a constructor: the handle is
+    // made by calling it, and `uv_timer_init` inside is what makes it a sampler.
+    // `new` on it therefore fails the way `--expose-internals` under the oracle
+    // does, with a `TypeError` and no `code`.
     let output = run(&format!(
         "{PRELUDE}
-        try {{ perf.createELDHistogram(); console.log('built'); }}
-        catch (e) {{ console.log('threw', e.message.includes('not implemented')); }}"
+        try {{ new perf.createELDHistogram(); console.log('built'); }}
+        catch (e) {{ console.log('threw', e.name, e.code); }}"
     ));
-    assert_eq!(output, "threw true");
+    assert_eq!(output, "threw TypeError undefined");
 }
