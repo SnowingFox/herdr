@@ -788,14 +788,19 @@ fn patch_process_object(
     // SAFETY: as above.
     let ppid = unsafe { libc::getppid() };
     let pid_value = v8::Integer::new(scope, pid);
-    // Node marks `pid` read-only; a writable one would let user code lie about
-    // its own identity.
+    // The descriptor the oracle reports for `pid` is
+    // `{writable: false, configurable: true, enumerable: true}`. `READ_ONLY` alone
+    // gives exactly that; adding `DONT_DELETE` would make it non-configurable,
+    // which is the opposite of Node. (`node_process_object.cc:184`'s
+    // `READONLY_PROPERTY` does include `DontDelete`, but `rn-realm` defines `pid`
+    // afterwards with the descriptor the oracle actually shows, so this is
+    // consistent with it rather than fighting it.)
     if let Some(key) = v8::String::new(scope, "pid") {
         process.define_own_property(
             scope,
             key.into(),
             pid_value.into(),
-            v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE,
+            v8::PropertyAttribute::READ_ONLY,
         );
     }
 

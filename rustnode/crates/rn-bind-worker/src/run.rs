@@ -270,7 +270,12 @@ impl WorkerThread {
             return 1;
         }
 
-        let loaders = match rn_realm::bootstrap_realm(scope, &argv[1..], &self.exec_argv) {
+        let loaders = match rn_realm::bootstrap_realm(
+            scope,
+            &argv[1..],
+            &self.exec_argv,
+            rn_realm::ProcessState::worker(),
+        ) {
             Ok(loaders) => loaders,
             Err(message) => {
                 tracing::error!(%message, "the worker's realm bootstrap failed");

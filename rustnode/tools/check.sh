@@ -151,7 +151,14 @@ step "the per-context globals audit"
 # remaining steps never noticed: the next one is `cargo test`, which rebuilds.
 # This is the first step that execs the binary directly, so running it first
 # keeps the audit's own result from depending on that restore behaviour.
+# Two passes. The first is the ordinary surface: `primordials` must not be a
+# global, and the DOMException/structuredClone behaviour has to hold. The second
+# sets `RUSTNODE_DEBUG_REALM_PRIMORDIALS=1`, which publishes the realm's object
+# under a debug-only name so the member table `domexception.js` depends on can be
+# checked directly. Without the second pass the leak's fix would silently drop
+# that coverage; without the first the publication would hide the leak.
 ./target/debug/rustnode tools/per-context-audit.js
+RUSTNODE_DEBUG_REALM_PRIMORDIALS=1 ./target/debug/rustnode tools/per-context-audit.js > /dev/null
 
 step "the per-context globals still behave as Node's do"
 # The control for the per-context work: DOMException is a real `Error`, the
