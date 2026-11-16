@@ -494,22 +494,54 @@ fn compile_cache_entries_round_trip_through_the_binding() {
 }
 
 #[test]
-fn deferred_members_destructure_cleanly_at_module_scope() {
-    // `tools/deferred-reach.py` flags these two because
-    // `internal/modules/esm/translators.js` destructures them at module scope.
-    // That is a false positive for *destructuring*: reading an absent member
-    // yields `undefined` and cannot throw. It only breaks a module when the
-    // member is *called* during load, which is what made `zlib.crc32c` fatal.
-    // This pins the reason the deferral is safe so the two cannot drift apart.
+fn the_wasm_cache_members_are_installed_and_a_call_below_module_scope_returns() {
+    // This test has been wrong in both directions, so its history is the point.
+    //
+    // As `deferred_members_destructure_cleanly_at_module_scope` it asserted the
+    // two wasm cache members are `undefined` and reasoned that destructuring an
+    // absent member is harmless. The destructuring *is* harmless; the deferral
+    // was not. `internal/modules/esm/translators.js` calls
+    // `getWasmCompileCacheEntry` inside the `wasm` translator, which runs for
+    // every `.wasm` import, so the absence surfaced as a `TypeError` on first
+    // use rather than as an uncached compile. That is F3 in
+    // `internal/review-loader.md`, and the test pinned the false premise.
+    //
+    // With the import path wired, the same call must simply work. A disabled
+    // compile cache has to read as `undefined` (the JS side tests
+    // `cacheEntry !== undefined` before it saves); an enabled one has to read
+    // as an object carrying an `external` handle, which is what the caller
+    // files the compiled module under. Neither may throw, which is the only
+    // property every `.wasm` import depends on.
     let source = r#"
         const { getWasmCompileCacheEntry, saveWasmCompileCacheEntry } = modulesBinding;
-        const typeofOk = typeof getWasmCompileCacheEntry === "undefined" &&
-                         typeof saveWasmCompileCacheEntry === "undefined";
-        // A guard of the shape a caller would use before the call site.
-        const guarded = typeof getWasmCompileCacheEntry === "function";
-        __out = JSON.stringify({ typeofOk, guarded });
+        const installed = typeof getWasmCompileCacheEntry === "function" &&
+                          typeof saveWasmCompileCacheEntry === "function";
+        // The shape of the real call site: a function body, not module scope.
+        function translateWasm() {
+            return getWasmCompileCacheEntry(
+                new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]),
+                "file:///m.wasm", { __proto__: null });
+        }
+        let code = "no-throw";
+        let shape = "unset";
+        try {
+            const entry = translateWasm();
+            shape = entry === undefined ? "undefined" : typeof entry.external;
+        } catch (error) { code = error.name; }
+        __out = JSON.stringify({ installed, code, shape });
     "#;
-    assert_eq!(run(source), r#"{"typeofOk":true,"guarded":false}"#);
+    // The cache is off in this process unless a test enabled it, so the honest
+    // answer is `undefined` with no throw. Both halves matter: `no-throw` is
+    // what every `.wasm` import needs, and the member being a function is what
+    // makes it possible.
+    let out = run(source);
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect("json");
+    assert_eq!(parsed["installed"], serde_json::Value::Bool(true), "{out}");
+    assert_eq!(
+        parsed["code"],
+        serde_json::Value::String("no-throw".into()),
+        "{out}"
+    );
 }
 
 #[test]
@@ -547,6 +579,6 @@ fn every_contract_member_is_installed_or_deferred() {
         assert!(members.contains_key(name), "{name} is not in the contract");
         assert!(!reason.trim().is_empty(), "{name} gives no reason");
     }
-    assert_eq!(namespace.members.len(), 15, "installed member count");
-    assert_eq!(namespace.deferred.len(), 2, "deferred member count");
+    assert_eq!(namespace.members.len(), 17, "installed member count");
+    assert_eq!(namespace.deferred.len(), 0, "deferred member count");
 }

@@ -287,10 +287,24 @@ step "installed namespaces match what they declare"
 # that list fails. Shrinking the list is the proof a fix landed.
 cargo test -p rn-bindings --test namespace_structure
 
+step "the deferred-reach detector can still fail"
+# `deferred-reach.py` reported a clean run over six live defects, including the
+# unguarded `getWasmCompileCacheEntry` call inside `translators.js` that made
+# every `.wasm` import throw. The cause was its reach rule: it only looked at
+# module scope, so a call inside a function body was invisible. Its self-test
+# pins the shapes it must catch (any depth, `new`, `.call`, a destructuring
+# inside a function) and the ones it must ignore (a guard, a comment), and it is
+# run first so a regression in the rule fails before the analysis can report
+# clean.
+./tools/deferred-reach.py --self-test
+
 step "deferred members reached at module scope"
 # A declared deferral passes the contract check by design, so this is the only
-# gate that catches a member `lib/**` calls while a module loads. It is part of
-# the gate because it silently failed open once already.
+# gate that catches a member `lib/**` reaches without a guard. It is part of the
+# gate because it silently failed open once already. It now reports reaches at
+# any depth against a named baseline of the ones that exist today, so "clean"
+# means "nothing new", not "nothing wrong" — see its docstring for what it
+# cannot see.
 ./tools/deferred-reach.py
 
 step "the smoke classifier still tells a gap from a defect"

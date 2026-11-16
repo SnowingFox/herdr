@@ -58,6 +58,9 @@ pub const CACHED_CODE_TYPES: &[(&str, i32)] = &[
 /// `CachedCodeType::kStrippedTypeScript`, the type the transpile cache uses.
 pub const K_STRIPPED_TYPESCRIPT: i32 = 2;
 
+/// `CachedCodeType::kWasm`.
+pub const K_WASM: i32 = 3;
+
 /// Cache-file magic, from `src/compile_cache.cc`.
 const MAGIC: u32 = 0x8adf_dbb2;
 
@@ -211,6 +214,25 @@ impl CompileCache {
         filename: &str,
         code_type: i32,
     ) -> Option<(u32, Option<String>)> {
+        let (key, cached) = self.get_or_insert_bytes(source, filename, code_type)?;
+        // The TypeScript transpile cache is the only consumer of the text
+        // shape, so a blob that is not valid UTF-8 means a non-text entry was
+        // asked for through the text path; report it as a miss rather than as
+        // replacement characters.
+        Some((key, cached.and_then(|bytes| String::from_utf8(bytes).ok())))
+    }
+
+    /// [`Self::get_or_insert`] without the UTF-8 assumption.
+    ///
+    /// The WebAssembly half of the cache stores V8's serialized compiled
+    /// module, which is arbitrary bytes, so the store itself cannot require
+    /// text. The text view above is a wrapper over this.
+    pub fn get_or_insert_bytes(
+        &mut self,
+        source: &[u8],
+        filename: &str,
+        code_type: i32,
+    ) -> Option<(u32, Option<Vec<u8>>)> {
         if !self.enabled {
             return None;
         }
@@ -218,44 +240,45 @@ impl CompileCache {
         let code_hash = crc32(source);
         let code_size = source.len() as u32;
 
-        let stale = match self.entries.get(&key) {
-            Some(entry) if entry.code_hash == code_hash => {
-                let cached = entry
-                    .cache
-                    .as_ref()
-                    .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
-                return Some((key, cached));
+        if let Some(entry) = self.entries.get(&key) {
+            if entry.code_hash == code_hash {
+                return Some((key, entry.cache.clone()));
             }
-            // A mismatch means the source changed and the entry is discarded.
-            Some(_) => true,
-            None => false,
-        };
-        let _ = stale;
+            // A hash mismatch means the source changed, so the stale entry is
+            // replaced by the read below.
+        }
 
         let cache = read_cache_file(&self.cache_directory, key, code_hash, code_size);
-        let cached = cache
-            .as_ref()
-            .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
         self.entries.insert(
             key,
             Entry {
                 code_hash,
                 code_size,
-                cache,
+                cache: cache.clone(),
                 refreshed: false,
                 persisted: false,
             },
         );
-        Some((key, cached))
+        Some((key, cache))
     }
 
-    /// `saveCompileCacheEntry` for the plain-text payloads Node stores.
+    /// `saveCompileCacheEntry` for the plain-text payloads the TypeScript
+    /// transpile cache stores.
     pub fn save(&mut self, key: u32, payload: &str) {
+        self.save_bytes(key, payload.as_bytes());
+    }
+
+    /// Stores an opaque payload for `key`.
+    ///
+    /// The TypeScript transpile cache stores text and this crate's WebAssembly
+    /// half stores serialized V8 blobs, so the store itself is byte-oriented;
+    /// only the JavaScript-facing member cares which kind it was given.
+    pub fn save_bytes(&mut self, key: u32, payload: &[u8]) {
         if !self.enabled || self.read_only {
             return;
         }
         if let Some(entry) = self.entries.get_mut(&key) {
-            entry.cache = Some(payload.as_bytes().to_vec());
+            entry.cache = Some(payload.to_vec());
             entry.refreshed = true;
         }
     }

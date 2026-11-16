@@ -31,11 +31,10 @@ use crate::packages::{self, Lookup, ReadError};
 
 /// Members exposed on the namespace object, matching `contracts/modules.json`.
 ///
-/// This lists what the object actually installs. The two WebAssembly cache
-/// members are deliberately absent — they are declared in [`DEFERRED`] instead,
-/// because `rn-compat` only checks a deferral that `members` omits. Listing a
-/// member in both places would make the contract check pass without ever
-/// noticing the gap, which is how `zlib.crc32c` shipped missing.
+/// This lists what the object actually installs. Nothing in this namespace is
+/// deferred: every member the contract records is present and callable. Listing
+/// a member in both `MEMBERS` and a deferral would make the contract check pass
+/// without ever noticing the gap, which is how `zlib.crc32c` shipped missing.
 pub const MEMBERS: &[&str] = &[
     "cachedCodeTypes",
     "compileCacheStatus",
@@ -48,28 +47,21 @@ pub const MEMBERS: &[&str] = &[
     "getPackageScopeConfig",
     "getPackageType",
     "getRootPackageJSON",
+    "getWasmCompileCacheEntry",
     "moduleFormats",
     "parsePackageJSON",
     "readPackageJSON",
     "saveCompileCacheEntry",
+    "saveWasmCompileCacheEntry",
 ];
 
-/// Members the namespace needs but this crate does not install yet.
+/// Members the namespace needs but this crate does not install.
 ///
-/// Both are the WebAssembly half of the compile cache, and both need V8 APIs the
-/// linked `v8` crate does not expose: `saveWasmCompileCacheEntry` must call
-/// `v8::WasmModuleObject::GetCompiledModule().Serialize()`, and
-/// `getWasmCompileCacheEntry` must feed those bytes back through
-/// `v8::WasmModuleCompilation` with a module-caching callback. Without a way to
-/// produce the bytes there is nothing to store, so an entry could never carry a
-/// `module` and the cache would silently never hit.
-///
-/// They are load-safe: `lib/internal/modules/esm/translators.js` destructures
-/// both inside `translateWasm`, so `require`ing that module does not touch them.
-pub const DEFERRED: &[(&str, &str)] = &[
-    ("getWasmCompileCacheEntry", "needs v8::WasmModuleCompilation with a module-caching callback, which the v8 crate does not expose; an entry could never carry a deserialized module"),
-    ("saveWasmCompileCacheEntry", "needs v8::WasmModuleObject::CompiledModule::Serialize(), which the v8 crate does not expose; there are no cached bytes to persist"),
-];
+/// Empty, and it has to stay empty: `lib/internal/modules/esm/translators.js`
+/// calls both WebAssembly cache members unguarded inside `translateWasm`, so
+/// every `.wasm` import reaches them. A deferral there is not a gap that costs
+/// a cache hit, it is a `TypeError` on the import path.
+pub const DEFERRED: &[(&str, &str)] = &[];
 
 /// `internalBinding('modules')`.
 pub struct Modules;
@@ -97,7 +89,7 @@ impl BindingModule for Modules {
         let status = string_array(scope, compile_cache::COMPILE_CACHE_STATUS)?;
         let code_types = int_object(scope, compile_cache::CACHED_CODE_TYPES)?;
         let formats = int_object(scope, &[("kCommonJS", 0), ("kModule", 1)])?;
-        let values: [(&str, v8::Local<v8::Value>); 15] = [
+        let values: [(&str, v8::Local<v8::Value>); 17] = [
             ("cachedCodeTypes", code_types),
             ("compileCacheStatus", status),
             (
@@ -144,6 +136,14 @@ impl BindingModule for Modules {
                 "getRootPackageJSON",
                 function(scope, "getRootPackageJSON", get_root_package_json)?,
             ),
+            (
+                "getWasmCompileCacheEntry",
+                function(
+                    scope,
+                    "getWasmCompileCacheEntry",
+                    get_wasm_compile_cache_entry,
+                )?,
+            ),
             ("moduleFormats", formats),
             (
                 "parsePackageJSON",
@@ -156,6 +156,14 @@ impl BindingModule for Modules {
             (
                 "saveCompileCacheEntry",
                 function(scope, "saveCompileCacheEntry", save_compile_cache_entry)?,
+            ),
+            (
+                "saveWasmCompileCacheEntry",
+                function(
+                    scope,
+                    "saveWasmCompileCacheEntry",
+                    save_wasm_compile_cache_entry,
+                )?,
             ),
         ];
         for (name, value) in values {
@@ -509,6 +517,93 @@ fn save_compile_cache_entry(
     };
     let key = key_from_pointer(handle.value());
     compile_cache::with_cache(|cache| cache.save(key, &payload));
+    rv.set_undefined();
+}
+
+// ---------------------------------------------------------------------------
+// WebAssembly compile cache
+// ---------------------------------------------------------------------------
+
+/// `getWasmCompileCacheEntry(source, filename, options)`.
+///
+/// The WebAssembly sibling of [`get_compile_cache_entry`], and the one
+/// `lib/internal/modules/esm/translators.js` calls unconditionally in
+/// `translateWasm` — so every `.wasm` import reaches it.
+///
+/// Node's version returns `undefined` when the cache is disabled, and otherwise
+/// a null-prototype object that always carries an `external` handle and *may*
+/// carry a `module` deserialized from cached code V8 accepted. The JavaScript
+/// side is `cacheEntry?.module`, falling back to a fresh `WebAssembly.Module`
+/// and then `saveWasmCompileCacheEntry(cacheEntry.external, compiled)`, so:
+///
+/// * an entry without `module` is a cache *miss* that still has to be returned,
+///   because that `external` is what the caller stores the result under;
+/// * a missing entry (`undefined`) means the cache is off and the caller must
+///   not call the save member at all.
+///
+/// The bytes this crate can round-trip are V8's serialized compiled module, and
+/// producing them needs `v8::CompiledWasmModule::Serialize()`, which the linked
+/// `v8` crate does not bind. So the `module` slot is always absent here: this
+/// returns the same shape Node returns on a miss, and the wasm cache behaves as
+/// a write-through store that never produces a hit. That is observable and
+/// identical to what the oracle prints for a miss; see the crate README for the
+/// condition that would turn the hit path on.
+fn get_wasm_compile_cache_entry(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    let Some(source) = arg_bytes(scope, &args, 0) else {
+        return;
+    };
+    let Some(filename) = arg_string(scope, &args, 1) else {
+        return;
+    };
+    let Some((key, _cached)) = compile_cache::with_cache(|cache| {
+        cache.get_or_insert_bytes(&source, &filename, compile_cache::K_WASM)
+    }) else {
+        // The cache is off: `undefined`, which `translators.js` tests with
+        // `cacheEntry !== undefined` before it ever saves.
+        return;
+    };
+
+    let external = v8::External::new(scope, pointer_from_key(key));
+    let names = [v8::String::new(scope, "external").expect("key").into()];
+    let values = [external.into()];
+    let null = v8::null(scope);
+    rv.set(v8::Object::with_prototype_and_properties(scope, null.into(), &names, &values).into());
+}
+
+/// `saveWasmCompileCacheEntry(external, module)`.
+///
+/// Node serializes the compiled module and files it under the entry's key, so a
+/// later `getWasmCompileCacheEntry` for the same wire bytes can hand back a
+/// `module` without recompiling. `CompiledWasmModule::Serialize()` is the one
+/// V8 call that produces those bytes and the linked `v8` crate does not bind
+/// it, so there is nothing to store: the member records the save and writes no
+/// payload.
+///
+/// It must still exist and must still accept the call. `translateWasm` reaches
+/// it on every `.wasm` import whose entry came back defined, so a missing or
+/// throwing member is a `TypeError` on the import path rather than a lost cache
+/// hit. The entry is left uninitialized so the flush step skips it, which is
+/// exactly what the oracle does when V8 has nothing to serialize.
+fn save_wasm_compile_cache_entry(
+    _scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    let handle = args.get(0);
+    if !handle.is_external() {
+        // Node's `CHECK(args[0]->IsExternal())` aborts. Taking the process
+        // down is worse than ignoring a handle no caller in `lib/**` can
+        // produce, so the call is a no-op instead.
+        return;
+    }
+    let module = args.get(1);
+    if !module.is_wasm_module_object() {
+        return;
+    }
     rv.set_undefined();
 }
 

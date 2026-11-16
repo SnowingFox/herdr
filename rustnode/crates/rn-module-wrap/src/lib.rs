@@ -311,10 +311,30 @@ fn module_wrap_new<'s>(
     }
 
     let synthetic = args.get(2).is_array();
+    // `ModuleWrap::New` derives the module's host-defined-option id before it
+    // compiles: argument 5 when it is a Symbol, otherwise a fresh `Symbol`
+    // named after the URL. It goes into the module's host-defined options (so
+    // a dynamic import from inside the module resolves through the module's own
+    // registry) and onto the wrapper (so `registerModule` can use it as its
+    // `moduleRegistries` key). A synthetic module gets neither.
+    let id_symbol = if synthetic {
+        None
+    } else {
+        Some(match v8::Local::<v8::Symbol>::try_from(args.get(5)) {
+            Ok(symbol) => symbol,
+            Err(_) => {
+                let url_string = url
+                    .to_string(scope)
+                    .unwrap_or_else(|| v8::String::empty(scope));
+                v8::Symbol::new(scope, Some(url_string))
+            }
+        })
+    };
+
     let module = if synthetic {
         create_synthetic(scope, url, args.get(2))
     } else {
-        create_source_text(scope, url, args.get(2))
+        create_source_text(scope, url, args.get(2), id_symbol)
     };
     let Some(module) = module else {
         if !scope.is_execution_terminating() {
@@ -358,6 +378,18 @@ fn module_wrap_new<'s>(
         v8::Boolean::new(scope, synthetic).into(),
     );
     if !synthetic {
+        // See the `id_symbol` comment above: `lib/internal/modules/esm/utils.js`
+        // reads this back out of the referrer to key `moduleRegistries`, and
+        // `SafeWeakMap.set(undefined, …)` throws. Node stores it with
+        // `SetPrivate`; the value every reader uses is the
+        // `util.privateSymbols` entry, so this sets the property under exactly
+        // that symbol.
+        if let Some(id_symbol) = id_symbol {
+            let key = rn_core::symbol(scope, rn_core::HOST_DEFINED_OPTION);
+            that.set(scope, key.into(), id_symbol.into());
+        }
+    }
+    if !synthetic {
         let has_tla = v8::Boolean::new(scope, module.has_top_level_await());
         set_property(scope, that, "hasTopLevelAwait", has_tla.into());
     } else if args.get(4).is_object() {
@@ -392,11 +424,22 @@ fn create_source_text<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     url: v8::Local<'s, v8::Value>,
     source: v8::Local<'s, v8::Value>,
+    id_symbol: Option<v8::Local<'s, v8::Symbol>>,
 ) -> Option<v8::Local<'s, v8::Module>> {
     let url = v8::Local::<v8::String>::try_from(url).ok()?;
     let source = v8::Local::<v8::String>::try_from(source).ok()?;
     // `is_es_module: true` and a resource name matching the URL is what makes a
     // stack frame from a module read the same as Node's.
+    //
+    // The host-defined options carry the id symbol in slot
+    // `HostDefinedOptions::kID`, which is how V8 hands a module's identity back
+    // to `ImportModuleDynamically` and to the `import.meta` initializer. Node
+    // always allocates the array, even for a synthetic-free path with no id, so
+    // this does too: an empty array and "no options" are distinguishable to V8.
+    let host_defined = match id_symbol {
+        Some(symbol) => host_defined_options(scope, symbol),
+        None => Some(v8::PrimitiveArray::new(scope, HOST_DEFINED_OPTIONS_LENGTH)),
+    };
     let origin = v8::ScriptOrigin::new(
         scope,
         url.into(),
@@ -408,7 +451,7 @@ fn create_source_text<'s>(
         false,
         false,
         true,
-        None,
+        host_defined.map(|options| options.into()),
     );
     let mut source_text = v8::script_compiler::Source::new(source, Some(&origin));
     v8::script_compiler::compile_module2(
@@ -418,6 +461,28 @@ fn create_source_text<'s>(
         v8::script_compiler::NoCacheReason::BecauseModule,
     )
 }
+
+/// `HostDefinedOptions::kLength`, from `src/module_wrap.h`.
+///
+/// V8 identifies a module's host-defined options as two slots: the id at 0 and
+/// the import-attributes type at 1. A non-empty array of the right length is
+/// what `ImportModuleDynamically` and the `import.meta` initializer read the
+/// referrer id out of.
+const HOST_DEFINED_OPTIONS_LENGTH: usize = 2;
+
+/// `ModuleWrap::GetHostDefinedOptions`: a two-slot array holding `id` at
+/// `HostDefinedOptions::kID` (0).
+fn host_defined_options<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    id: v8::Local<'s, v8::Symbol>,
+) -> Option<v8::Local<'s, v8::PrimitiveArray>> {
+    let options = v8::PrimitiveArray::new(scope, HOST_DEFINED_OPTIONS_LENGTH);
+    options.set(scope, HOST_DEFINED_OPTION_ID_SLOT, id.into());
+    Some(options)
+}
+
+/// `HostDefinedOptions::kID`, from `src/module_wrap.h`.
+const HOST_DEFINED_OPTION_ID_SLOT: usize = 0;
 
 /// V8 calls this while evaluating a synthetic module.
 ///
@@ -1235,6 +1300,18 @@ pub fn install_isolate_callbacks(isolate: &mut v8::Isolate) {
 ///
 /// `extern "C"` because V8 takes a bare function pointer here, with no argument
 /// adaptation.
+/// The default initializer applies to a module whose host-defined id is one of
+/// Node's two sentinels: `source_text_module_default_hdo` (a user ES module
+/// compiled by the loader) or `embedder_module_hdo` (an embedder module). Every
+/// other module has a JS registry entry and has to go through
+/// `initializeImportMetaObject`.
+///
+/// Asking whether the id *is* a sentinel is what makes the decision
+/// content-based rather than per-construction-site. An earlier version keyed it
+/// on a `__rustnodeCustomImportMeta` flag that only `vm.SourceTextModule` set,
+/// which sent every synthetic facade — `createDynamicModule`'s output included
+/// — down the default path. A facade's `import.meta` then had no `done`, and
+/// the module threw `import.meta.done is not a function` at evaluation.
 unsafe extern "C" fn host_initialize_import_meta<'s>(
     context: v8::Local<'s, v8::Context>,
     module: v8::Local<'s, v8::Module>,
@@ -1244,22 +1321,31 @@ unsafe extern "C" fn host_initialize_import_meta<'s>(
     let Some(wrapper) = module_by_hash(scope, module) else {
         return;
     };
-    if get_property(scope, wrapper, "__rustnodeCustomImportMeta")
-        .map(|value| value.is_true())
-        .unwrap_or(false)
-    {
-        // A `vm.SourceTextModule`: let the JS registry decide, exactly as Node
-        // does, because the user-supplied `initializeImportMeta` lives there.
-        if let Some(callback) = rn_core::hook_slot::import_meta(scope) {
-            if let Some(id) = get_property(scope, wrapper, "__rustnodeHostDefinedOption") {
+    // The id is stored under the `util.privateSymbols` entry, so the lookup
+    // must use the symbol as its key. A string key would miss the property
+    // entirely — and V8 answers `undefined` rather than nothing for a missing
+    // property, so a miss here would be indistinguishable from a module that
+    // genuinely has no id and would route every facade through the wrong
+    // initializer.
+    let id_key = rn_core::symbol(scope, rn_core::HOST_DEFINED_OPTION);
+    let id = wrapper.get(scope, id_key.into());
+    if let Some(id) = id.filter(|value| value.is_symbol()) {
+        let default_hdo = rn_core::symbol(scope, "source_text_module_default_hdo");
+        let embedder_hdo = rn_core::symbol(scope, "embedder_module_hdo");
+        let is_default =
+            id.strict_equals(default_hdo.into()) || id.strict_equals(embedder_hdo.into());
+        if !is_default {
+            // A module with a JS registry entry: call back with
+            // `(id, meta, wrap)` and let `initializeImportMetaObject` decide.
+            if let Some(callback) = rn_core::hook_slot::import_meta(scope) {
                 let _ = callback.call(
                     scope,
                     v8::undefined(scope).into(),
                     &[id, meta.into(), wrapper.into()],
                 );
             }
+            return;
         }
-        return;
     }
     initialize_import_meta_default(scope, wrapper, meta);
 }
