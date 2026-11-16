@@ -213,7 +213,8 @@ it went when the cache landed.
 Measured with `RN_PROFILE_PHASES=1`, release build, median of 60 runs, each run
 in its own process, on an idle machine (load average 0.16-0.5, `cat /proc/loadavg`
 recorded beside each batch). Deltas are the per-phase cost; cumulative is
-measured from `main`. This is on `2d7ac642`, so it includes `install_bun`.
+measured from `main`. This is on `2d7ac642`, so it includes `install_bun` — but
+see the note after the table, because that phase has grown a great deal since.
 
 | phase | cumulative | delta | p25-p75 |
 | --- | --- | --- | --- |
@@ -239,8 +240,40 @@ measured from `main`. This is on `2d7ac642`, so it includes `install_bun`.
 | user script | 23.05 | 0.01 | 0.01-0.01 |
 | loop finished | 23.09 | 0.04 | 0.04-0.06 |
 
-`install_bun` costs **0.04 ms**, matching the figure in the commit that added it,
-and it sits between `process source maps` and `install_early_globals`.
+`install_bun` costs **0.04 ms** on this tree and it sits between
+`process source maps` and `install_early_globals`.
+
+### `install_bun` is 0.04 ms here and ~1.06 ms on current master
+
+That difference is worth knowing before anyone budgets against 0.04. The number
+above was measured at `2d7ac642`, which carried only `Bun.nanoseconds`; the
+surface is now 78 members across seven crates, and one of them does measurable
+work at startup. Measured by building each commit and taking a median of 9-15
+runs of `-e '0'` per build:
+
+| commit | `install_bun` | what it added |
+| --- | --- | --- |
+| `6f519a7a` | 0.04 ms | — (before any Bun crate) |
+| `7da7d866` | 0.15 ms | the hashing crate |
+| `7f457614` | 0.17 ms | the compression crate |
+| `1d380cff` | 0.85 ms | the text crate |
+| `fc0b6fe6` | 1.06 ms | plus files and process |
+
+The text crate accounts for most of it, and the reason is concrete: it compiles
+and runs an **8.5 KB JavaScript string** (`crates/rn-bun-text/src/streams.js`)
+at every startup to build the seven `readableStreamTo*` helpers. That is a real
+eager code compile in the startup path, not a table lookup.
+
+The honest total was measured with an interleaved three-way batch (oracle, the
+pre-Bun commit, current master, 40 runs of each in the same batch, load 4.8):
+startup went **28.49 → 29.23 ms**, so the whole 78-member surface costs
+**+0.74 ms, or 2.6%**, and against Node 1.34x → 1.37x.
+
+That is a defensible price for the feature. The number in the table above is
+simply not a budget for a surface that keeps growing: an eager 8.5 KB compile
+will grow with the helpers. If startup becomes a target again, making those
+helpers lazy — or compiling them through the builtin code cache the rest of the
+runtime already uses — is the lever, and it is worth about 0.7 ms.
 
 Three things this table changes about the older account:
 
