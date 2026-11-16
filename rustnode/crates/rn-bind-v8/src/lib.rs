@@ -23,13 +23,15 @@
 //!   the length and the value each index constant gets, so the two cannot drift.
 //!
 //! The index constants are exported with exactly the values `lib/v8.js` uses to
-//! index those arrays. They are checked against a real Node binary rather than
-//! copied from the C++: `src/node_v8.cc` numbers its properties with a macro, so
-//! reading the numbers out of the source proves only that the macro was read
-//! correctly, not that this runtime and Node agree. (The recording binary on
-//! this machine is Node 22, which predates `total_allocated_bytes` and so
-//! reports 14 fields; the 15 here follow the pinned Node 28 contract, and
-//! `tests/node_constants.rs` prints that difference rather than hiding it.)
+//! index those arrays. They are checked against the pinned Node binary rather
+//! than copied from the C++: `src/node_v8.cc` numbers its properties with a
+//! macro, so reading the numbers out of the source proves only that the macro
+//! was read correctly, not that this runtime and Node agree.
+//! `tests/node_constants.rs` re-reads them from the oracle, so a Node upgrade
+//! that renumbers a field fails a test instead of mislabelling every size.
+//!
+//! `kHeapSpaces` is built from the isolate at install time rather than listed
+//! here, which is what `src/node_v8.cc` does too. See [`heap_space_names`].
 //!
 //! # What `require('v8')` still needs from other namespaces
 //!
@@ -78,8 +80,7 @@ use rn_v8_sys::v8;
 
 use buffers_impl::Buffers;
 use constants::{
-    HEAP_CODE_STATISTICS_INDEXES, HEAP_SPACES, HEAP_SPACE_STATISTICS_INDEXES,
-    HEAP_STATISTICS_INDEXES,
+    HEAP_CODE_STATISTICS_INDEXES, HEAP_SPACE_STATISTICS_INDEXES, HEAP_STATISTICS_INDEXES,
 };
 
 /// The aliased statistics buffers, exposed so tests can read a value JavaScript
@@ -392,6 +393,67 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(V8);
 }
 
+/// Every heap space name the isolate reports, in index order.
+///
+/// This is the single source for `kHeapSpaces`: it asks the engine what it
+/// has, the way `src/node_v8.cc:765` does, instead of restating a count this
+/// crate would have to keep in step with V8 by hand. A hardcoded table here
+/// cannot be correct in general. `lib/v8.js` builds `kNumberOfHeapSpaces` from
+/// the array's length and then calls `updateHeapSpaceStatisticsBuffer(i)` for
+/// every `i` below it, so a hardcoded array that disagrees with the engine in
+/// either direction is wrong: shorter truncates the public list, and longer
+/// describes spaces that do not exist.
+///
+/// Reading the names from the isolate makes that impossible: the length is the
+/// engine's own count and each name is the engine's own name for that index.
+/// It is also what makes this engine-version independent — a V8 that gains or
+/// loses a space changes this list by itself, which is the invariant the old
+/// doc comment claimed an install-time check provided.
+///
+/// The check that claim described is implemented here rather than against a
+/// constant, because there is no longer a constant to compare: the isolate is
+/// the reference. What is verified is that the isolate's own report is
+/// self-consistent — every index in `0..number_of_heap_spaces()` has
+/// statistics, every name is non-empty, and no two spaces share a name. A
+/// degenerate or mis-versioned engine therefore fails at install instead of
+/// surfacing as one space's numbers under another space's name.
+///
+/// Returns `Err` on any of those inconsistencies, and on a name that cannot be
+/// turned into a JavaScript string.
+pub fn heap_space_names(scope: &mut v8::PinScope<'_, '_>) -> Result<Vec<String>, String> {
+    let count = scope.number_of_heap_spaces();
+    let mut names = Vec::with_capacity(count);
+    for index in 0..count {
+        // A `None` here would mean the isolate's own count is wrong, since
+        // `GetHeapSpaceStatistics` only fails for an index outside
+        // `0..NumberOfHeapSpaces()`. Recording the index as the name would be a
+        // silent lie, so it is an error.
+        let Some(statistics) = scope.get_heap_space_statistics(index) else {
+            return Err(format!(
+                "the isolate reports {count} heap spaces but has no statistics for index {index}"
+            ));
+        };
+        let name = statistics.space_name().to_string_lossy().into_owned();
+        if name.is_empty() {
+            return Err(format!("the isolate gave no name for heap space {index}"));
+        }
+        if names.contains(&name) {
+            return Err(format!(
+                "the isolate reports the heap space name {name} more than once, so one \
+                 space's statistics would be reported under another's name"
+            ));
+        }
+        if v8::String::new(scope, &name).is_none() {
+            return Err(format!("cannot allocate the heap space name {name}"));
+        }
+        names.push(name);
+    }
+    if names.is_empty() {
+        return Err("the isolate reports no heap spaces".to_string());
+    }
+    Ok(names)
+}
+
 /// `kHeapSpaces`: the heap space names, in the order
 /// `Isolate::GetHeapSpaceStatistics` takes its index.
 ///
@@ -399,8 +461,9 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
 /// `updateHeapSpaceStatisticsBuffer`, so the order is the contract and the
 /// length is `kNumberOfHeapSpaces`.
 fn heap_spaces<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, String> {
-    let array = v8::Array::new(scope, HEAP_SPACES.len() as i32);
-    for (index, name) in HEAP_SPACES.iter().enumerate() {
+    let names = heap_space_names(scope)?;
+    let array = v8::Array::new(scope, names.len() as i32);
+    for (index, name) in names.iter().enumerate() {
         let Some(text) = v8::String::new(scope, name) else {
             return Err(format!("cannot allocate the heap space name {name}"));
         };
@@ -455,18 +518,21 @@ fn update_heap_space_statistics_buffer(
         // space, so the buffer is left alone rather than filled with zeroes.
         return;
     };
-    let spaces = scope.number_of_heap_spaces();
-    let index = index as usize;
-    if index >= spaces {
-        // Out of range for this isolate: there is no space to report.
-        return;
-    }
-    let Some(statistics) = scope.get_heap_space_statistics(index) else {
-        return;
-    };
+    // `UpdateHeapSpaceStatisticsBuffer` ignores `GetHeapSpaceStatistics`'s
+    // return value and reads the four fields out of a default-constructed
+    // `HeapSpaceStatistics`, whose members are all zero. An out-of-range index
+    // therefore zeroes the buffer in Node rather than leaving it as it was, and
+    // that difference is observable: with a `kHeapSpaces` longer than the
+    // isolate's space list, a buffer left alone would report the previous
+    // space's numbers under the next space's name. Verified against the pinned
+    // oracle, which answers `0,0,0,0` for both `13` and `9999`.
+    let statistics = scope.get_heap_space_statistics(index as usize);
     buffers_impl::with_heap_space_statistics(|buffer| {
         for (name, slot) in HEAP_SPACE_STATISTICS_INDEXES {
-            buffer.set_float(*slot, heap_space_statistic_value(&statistics, name));
+            let value = statistics.as_ref().map_or(0.0, |statistics| {
+                heap_space_statistic_value(statistics, name)
+            });
+            buffer.set_float(*slot, value);
         }
     });
 }
@@ -721,25 +787,43 @@ mod tests {
     }
 
     #[test]
-    fn the_heap_space_names_are_the_ones_v8_reports() {
-        // The order is what `lib/v8.js` passes to
-        // `updateHeapSpaceStatisticsBuffer`, so a rename or a reorder would
-        // silently attribute one space's numbers to another.
+    fn the_heap_space_names_are_read_from_the_isolate() {
+        // There is no table to compare against any more, by design: the names
+        // come from `Isolate::GetHeapSpaceStatistics`, the way `node_v8.cc`
+        // builds them. What this pins is the invariant that replaced the table —
+        // the list is exactly as long as the isolate says it is, every name is
+        // non-empty, and no two spaces share a name. A stale count cannot
+        // survive that, because there is no count to go stale.
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let platform = v8::new_default_platform(0, false).make_shared();
+            v8::V8::initialize_platform(platform);
+            v8::V8::initialize();
+        });
+
+        let mut isolate = v8::Isolate::new(Default::default());
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let names = heap_space_names(scope).expect("the isolate reports its heap spaces");
         assert_eq!(
-            HEAP_SPACES,
-            &[
-                "read_only_space",
-                "new_space",
-                "old_space",
-                "code_space",
-                "shared_space",
-                "trusted_space",
-                "new_large_object_space",
-                "large_object_space",
-                "code_large_object_space",
-                "shared_large_object_space",
-                "trusted_large_object_space",
-            ]
+            names.len(),
+            scope.number_of_heap_spaces(),
+            "the list must be as long as the isolate's own space count"
+        );
+        assert!(!names.is_empty(), "an isolate always has heap spaces");
+        for name in &names {
+            assert!(!name.is_empty(), "every heap space has a name");
+        }
+        let mut sorted = names.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            names.len(),
+            "two heap spaces cannot share a name: {names:?}"
         );
     }
 

@@ -154,6 +154,14 @@ fn allocation_moves_the_used_heap_number() {
 fn update_heap_space_statistics_buffer_reports_the_indexed_space() {
     // `lib/v8.js` calls this once per space, so the argument has to select the
     // space and the four values have to follow it.
+    //
+    // The count is asserted against an independent read of the isolate rather
+    // than against a number typed here: `GCProfiler` fills its
+    // `heapSpaceStatistics` from `Isolate::NumberOfHeapSpaces` in
+    // `gc_profiler.rs`, which reaches `kHeapSpaces` through neither this test
+    // nor the install path. A count written into the assertion would go stale
+    // the moment V8 gained a space, which is exactly how the 11-entry table
+    // survived.
     let output = run(&format!(
         "{PRELUDE}
         const count = v8b.kHeapSpaces.length;
@@ -169,9 +177,67 @@ fn update_heap_space_statistics_buffer_reports_the_indexed_space() {
           if (v8b.kHeapSpaces[i] === 'new_space' &&
               b[v8b.kSpaceSizeIndex] > 0) sawNewSpace = true;
         }}
-        console.log(count, allFinite, sawNewSpace);"
+        const v8m = require('v8');
+        const profiler = new v8m.GCProfiler();
+        profiler.start();
+        const keep = [];
+        for (let i = 0; i < 100000; i++) keep.push({{ i }});
+        keep.length = 0;
+        const document = profiler.stop();
+        const isolate = document.statistics[0].beforeGC.heapSpaceStatistics
+          .map((space) => space.spaceName);
+        console.log(count, allFinite, sawNewSpace, isolate.length, count === isolate.length);"
     ));
-    assert_eq!(output, "11 true true");
+    assert_eq!(output, "13 true true 13 true");
+}
+
+/// An out-of-range index zeroes the buffer, because Node writes the four fields
+/// of a default-constructed `HeapSpaceStatistics`.
+///
+/// This is the mechanism behind the defect this table caused. When the buffer
+/// was left untouched, a `kHeapSpaces` longer than the isolate's list made the
+/// extra rows report the previous space's numbers — one space's statistics
+/// under another space's name. Zero is unambiguous, and it is what the oracle
+/// answers.
+#[test]
+fn an_out_of_range_space_index_zeroes_the_buffer() {
+    // The sequence matters: fill from a real, non-zero space, then call an
+    // out-of-range index *without* resetting the buffer in between. An untouched
+    // buffer would keep the previous space's numbers; Node writes zeros.
+    let output = run(&format!(
+        "{PRELUDE}
+        const b = v8b.heapSpaceStatisticsBuffer;
+        const fill = (index) => v8b.updateHeapSpaceStatisticsBuffer(index);
+        // A space that reports something, so there are stale numbers to keep.
+        // The last space is not safe: `trusted_large_object_space` is all zeros
+        // on an empty heap, which an untouched buffer would match.
+        let populated = -1;
+        for (let i = 0; i < v8b.kHeapSpaces.length; i++) {{
+          for (let k = 0; k < b.length; k++) b[k] = -1;
+          fill(i);
+          if (Array.from(b).some((x) => x > 0) && populated < 0) populated = i;
+        }}
+        const stale = (index) => {{
+          fill(populated);
+          const before = Array.from(b).join(',');
+          fill(index);
+          return [before, Array.from(b).join(',')];
+        }};
+        const [beforePast, past] = stale(v8b.kHeapSpaces.length);
+        const [beforeFar, far] = stale(9999);
+        console.log(
+          populated >= 0,
+          beforePast !== '0,0,0,0',
+          beforeFar !== '0,0,0,0',
+          past,
+          far
+        );"
+    ));
+    assert_eq!(
+        output, "true true true 0,0,0,0 0,0,0,0",
+        "an index past the isolate's spaces must zero the buffer, not leave the \
+         previous space's numbers in it"
+    );
 }
 
 #[test]
@@ -193,21 +259,40 @@ fn update_heap_code_statistics_buffer_reports_real_sizes() {
 }
 
 #[test]
-fn the_heap_space_names_are_v8s() {
+fn the_heap_space_names_are_the_isolates_own() {
     // The order is the contract: `updateHeapSpaceStatisticsBuffer(i)` selects the
     // space at position `i`, so a reordering would attribute one space's numbers
     // to another.
+    //
+    // The comparison is against a *second, independent* read of the isolate, not
+    // against a literal list. `GCProfiler` in `gc_profiler.rs` walks
+    // `number_of_heap_spaces()`/`get_heap_space_statistics()` on its own, so the
+    // two paths only agree if both really read the engine. A literal list here
+    // would only prove that one transcription matches another, which is how the
+    // 11-entry table stayed green against an engine that has 13 spaces.
     let output = run(&format!(
         "{PRELUDE}
-        console.log(JSON.stringify(v8b.kHeapSpaces));"
+        const v8m = require('v8');
+        const profiler = new v8m.GCProfiler();
+        profiler.start();
+        const keep = [];
+        for (let i = 0; i < 100000; i++) keep.push({{ i }});
+        keep.length = 0;
+        const document = profiler.stop();
+        const isolate = document.statistics[0].beforeGC.heapSpaceStatistics
+          .map((space) => space.spaceName);
+        const installed = Array.from(v8b.kHeapSpaces);
+        console.log([
+          installed.length,
+          isolate.length,
+          JSON.stringify(installed) === JSON.stringify(isolate),
+          installed.includes('read_only_space'),
+          installed.includes('shared_trusted_space'),
+          installed.includes('shared_trusted_large_object_space'),
+          new Set(installed).size === installed.length,
+        ].join(' '));"
     ));
-    assert_eq!(
-        output,
-        "[\"read_only_space\",\"new_space\",\"old_space\",\"code_space\",\"shared_space\",\
-         \"trusted_space\",\"new_large_object_space\",\"large_object_space\",\
-         \"code_large_object_space\",\"shared_large_object_space\",\
-         \"trusted_large_object_space\"]"
-    );
+    assert_eq!(output, "13 13 true true true true true");
 }
 
 #[test]

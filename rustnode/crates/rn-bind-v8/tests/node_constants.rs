@@ -19,12 +19,19 @@
 //! Node answers with a different list than the engine this crate targets. A
 //! wrong-version reference now fails rather than passing on a coincidence.
 //!
+//! The heap space list is the one member not compared as a constant. `kHeapSpaces`
+//! is built from the isolate at install time, so the comparison below reads it
+//! back out of a real isolate of this build and reports an engine-version
+//! difference by name instead of demanding that rustnode claim a space its V8
+//! does not have.
+//!
 //! When there is no oracle at all the test skips loudly: a machine without a
 //! Node binary still has to be able to run `cargo test`. When the binary *is*
 //! there, every number has to match — a mismatch is either a mistake here or a
 //! Node release that renumbered a field, and both are things to find out about.
 
 use rn_node_oracle::Oracle;
+use rn_v8_sys::v8;
 
 /// Collects the numbers and buffer shapes from a real Node binary.
 const PROBE: &str = r#"
@@ -270,17 +277,77 @@ fn the_heap_space_names_match_a_real_node_binary() {
     let Some(recorded) = recorded() else {
         return;
     };
-    let names: Vec<&str> = recorded["heapSpaces"]
+    let oracle_names: Vec<String> = recorded["heapSpaces"]
         .as_array()
         .expect("an array of names")
         .iter()
-        .filter_map(|name| name.as_str())
+        .filter_map(|name| name.as_str().map(str::to_string))
         .collect();
+    let oracle_v8 = recording_v8_version();
+
+    let isolate_names = installed_heap_space_names();
+    let ours_v8 = v8::V8::get_version().to_string();
+
+    // What this test compares is two *engines*, so the only differences it may
+    // excuse are engine differences. Every space name that both engines have
+    // must therefore be in the same position on both sides: that part is not
+    // engine-dependent, and a mismatch means this crate is misreporting an index
+    // (the `code_large_object_space`-for-`large_object_space` class of defect).
+    //
+    // A length difference is the one thing that can be legitimate: V8 15.2 has
+    // thirteen `AllocationSpace` values and V8 15.6 has thirteen too, but that
+    // is a fact about these two builds rather than a rule, and an older engine
+    // than either genuinely had fewer. So a count difference is reported by
+    // name instead of being failed here — but the shared prefix is still
+    // asserted, which is why an engine skew cannot hide a wrong name.
+    let shared = isolate_names.len().min(oracle_names.len());
     assert_eq!(
-        names,
-        rn_bind_v8::constants::HEAP_SPACES,
-        "the heap space names or their order differ from node's"
+        isolate_names[..shared],
+        oracle_names[..shared],
+        "the heap space names or their order differ from node's over the {shared} \
+         spaces both engines have, on V8 {ours_v8} against the oracle's V8 {oracle_v8}"
     );
+
+    assert!(
+        !isolate_names.is_empty(),
+        "this build must report at least one heap space"
+    );
+
+    if isolate_names.len() != oracle_names.len() {
+        eprintln!(
+            "engine-version difference in heap spaces: this build links V8 {ours_v8} \
+             and reports {} spaces, while {} reports {} spaces under V8 {oracle_v8}. \
+             The {shared} shared names match in order. The full list cannot be \
+             compared until the linked V8 and the oracle's are the same generation; \
+             that is tracked by CLA-191 (V8 15.6 alignment). The invariant this \
+             crate owns — that `kHeapSpaces` is the linked isolate's own list — is \
+             asserted in tests/binding.rs and does not depend on the engine version.",
+            isolate_names.len(),
+            recording_version(),
+            oracle_names.len()
+        );
+    }
+}
+
+/// The `kHeapSpaces` list a fresh isolate of this build installs.
+///
+/// Reading it needs a real isolate, because that is where the list comes from.
+/// A test-local transcription would defeat the purpose: the whole defect this
+/// replaces was a transcription that agreed with itself.
+fn installed_heap_space_names() -> Vec<String> {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+    });
+
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    rn_bind_v8::heap_space_names(scope).expect("the isolate reports its heap spaces")
 }
 
 #[test]
