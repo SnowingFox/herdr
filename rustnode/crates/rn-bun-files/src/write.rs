@@ -163,6 +163,22 @@ fn payload_bytes<'s>(
     // 1.4.4: `Bun.write(p, {a: 1})` writes `"[object Object]"`, a boolean writes
     // `"true"`, and a function writes its source text. `null` and `undefined` are
     // the only refusals.
+    //
+    // # The one payload whose bytes this cannot match, and why
+    //
+    // A **function** is the single genuine engine difference in this member:
+    // `String(function f(){})` is `"function f(){}"` on V8 and
+    // `"function f() {}"` on JavaScriptCore, so the two runtimes write different
+    // bytes for the same payload (14 against 15 for that example). Matching it
+    // would mean reproducing JSC's source formatting, which is a different
+    // project; it is recorded here and the conformance test deliberately does not
+    // pin a function's bytes. Everything else about the value — that it is
+    // coerced rather than rejected, and that it arrives as a string — does match.
+    //
+    // This is *not* the explanation for the array case below: `String([1,2])` is
+    // `"1,2"` on both engines, so an earlier version of this comment that blamed
+    // the engine for the array bytes was wrong about the cause. The array rule is
+    // Bun's own.
     if value.is_null() || value.is_undefined() {
         return None;
     }
