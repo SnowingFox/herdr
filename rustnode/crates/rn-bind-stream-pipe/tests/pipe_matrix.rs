@@ -412,6 +412,84 @@ setTimeout(() => {
     );
 }
 
+/// `releaseFD` exists and releases the descriptor without closing it.
+///
+/// `core.js`'s `onFileUnpipe` calls `source.releaseFD()` on the `!stream.ownsFd`
+/// path — the `respondWithFD` family — so a `FileHandle` without it turns those
+/// files into `this.source.releaseFD is not a function` instead of exercising
+/// their subject.
+///
+/// The distinction from `close` is the whole point: `releaseFD` hands the number
+/// back and forgets it, while leaving the descriptor open for the caller who owns
+/// it. So the test writes through the returned descriptor *after* the release, and
+/// expects the write to succeed.
+#[test]
+fn release_fd_hands_the_descriptor_back_without_closing_it() {
+    let Some((stdout, _elapsed, ok)) = run(&format!(
+        "{}{}",
+        prelude(),
+        r#"
+const target = '/tmp/rustnode-streampipe-released.txt';
+fs.writeFileSync(target, 'before');
+const descriptor = fs.openSync(target, 'r+');
+const handle = new FileHandle(descriptor, 0, -1);
+
+const hasRelease = typeof handle.releaseFD === 'function';
+const released = hasRelease ? handle.releaseFD() : null;
+const descriptorAfter = handle.fd;
+
+// The descriptor is still usable: that is what "released, not closed" means, and
+// it is how `respondWithFD` keeps ownership of a caller's descriptor. Writing
+// 'AFTER' over 'before' leaves 'AFTERe', because the file was longer than the
+// replacement — the point is that the write succeeded at all.
+let stillOpen = false;
+try {
+  fs.writeSync(descriptor, 'AFTER', 0);
+  stillOpen = fs.readFileSync(target, 'utf8').startsWith('AFTER');
+} catch (error) {
+  stillOpen = false;
+}
+
+// A second call reports the same `-1` a closed handle does, rather than
+// re-releasing a number that may already belong to something else.
+const again = hasRelease ? handle.releaseFD() : null;
+
+console.log(JSON.stringify({
+  hasRelease,
+  released,
+  returnedTheDescriptor: released === descriptor,
+  descriptorAfter,
+  stillOpen,
+  again,
+}));
+process.exit(0);
+"#
+    )) else {
+        return;
+    };
+    assert!(ok, "the process did not exit cleanly: {stdout}");
+    assert!(
+        stdout.contains(r#""hasRelease":true"#),
+        "FileHandle has no releaseFD, so onFileUnpipe throws on the respondWithFD path: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""returnedTheDescriptor":true"#),
+        "releaseFD did not return the descriptor, which is its entire return value: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""descriptorAfter":-1"#),
+        "the handle still reports a descriptor after releasing it: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""stillOpen":true"#),
+        "releaseFD closed the descriptor; it must only release this handle's claim: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""again":-1"#),
+        "a second releaseFD reported something other than -1: {stdout}"
+    );
+}
+
 /// The sink that cannot be written reports a *synchronous* failure, so the pipe
 /// finishes instead of waiting for a completion nobody will send.
 ///

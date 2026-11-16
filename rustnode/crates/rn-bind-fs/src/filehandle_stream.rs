@@ -144,6 +144,40 @@ impl FileHandleStream {
         self.reading.set(false);
     }
 
+    /// `FileHandle::AfterClose` — the state transition `releaseFD` and `close`
+    /// share.
+    ///
+    /// ```cpp
+    /// void FileHandle::AfterClose() {
+    ///   closing_ = false;
+    ///   closed_ = true;
+    ///   fd_ = -1;
+    ///   if (reading_ && !persistent().IsEmpty()) EmitRead(UV_EOF);
+    /// }
+    /// ```
+    ///
+    /// Two things matter beyond clearing the descriptor. `closed_` makes
+    /// `ReadStart` return `UV_EOF` rather than reading, and a readable side that
+    /// was flowing gets an EOF so whatever is reading stops instead of waiting for
+    /// a stream that will never produce again. `releaseFD` is called from
+    /// `onFileUnpipe` on the `!stream.ownsFd` path — the `respondWithFD` family —
+    /// where the descriptor belongs to the caller and must *not* be closed.
+    pub fn after_close(&self) {
+        let was_reading = self.reading.get();
+        self.release();
+        if was_reading {
+            self.emit_eof();
+        }
+    }
+
+    /// Whether the descriptor has been released, i.e. `FileHandle::closed_`.
+    ///
+    /// `ReadStart` checks this so a released handle reports `UV_EOF` instead of
+    /// issuing a read on `-1`.
+    pub fn is_closed(&self) -> bool {
+        self.descriptor.get() < 0
+    }
+
     /// Issues one `uv_fs_read`, or reports EOF when there is nothing left.
     fn issue(&self) {
         if self.descriptor.get() < 0 {
@@ -249,6 +283,13 @@ impl StreamOps for FileHandleOps {
         };
         // SAFETY: `handle_of` returned the live allocation that owns this state.
         let handle = unsafe { &*handle };
+        // `if (!IsAlive() || IsClosing()) return UV_EOF;` — a released descriptor
+        // must not be read, and reporting EOF is what makes a reader stop rather
+        // than wait. `releaseFD` can land here from `onFileUnpipe` while a pipe is
+        // still attached.
+        if handle.is_closed() {
+            return EOF;
+        }
         handle.reading.set(true);
         if handle.reading_in_flight.get() {
             // `ReadStart` returns 0 when a read is already outstanding: not an
@@ -273,7 +314,11 @@ impl StreamOps for FileHandleOps {
             // SAFETY: as above.
             let handle = unsafe { &*handle };
             let descriptor = handle.descriptor.get();
-            handle.release();
+            // `FileHandle::DoShutdown` dispatches `uv_fs_close` and then
+            // `AfterClose()` — the same state transition a `closeSync` makes, so
+            // the stream half and the descriptor cannot disagree about whether the
+            // handle is still readable.
+            handle.after_close();
             if descriptor >= 0 {
                 // A close failure here is reported by the JavaScript close path,
                 // which owns the descriptor; the shutdown itself completed.
@@ -453,8 +498,8 @@ fn copy_prefix(allocation: &Allocation, count: usize) -> Option<Allocation> {
 
 /// Installs the `StreamBase` prototype surface on `FileHandle`.
 ///
-/// This is `StreamBase::AddMethods(isolate, t)` (`src/stream_base.cc:582`), whose
-/// order is observable on Node's `FileHandle` prototype:
+/// This is `StreamBase::AddMethods(isolate, t)` (`src/stream_base.cc:582`). On
+/// Node the full prototype is
 ///
 /// ```text
 /// close, closeSync, releaseFD, fd, _externalStream, bytesRead, bytesWritten,
@@ -463,9 +508,15 @@ fn copy_prefix(allocation: &Allocation, count: usize) -> Option<Allocation> {
 /// isStreamBase, onread
 /// ```
 ///
-/// `releaseFD` and `_externalStream` are not installed: the first has no
-/// descriptor registry behind it here and the second exists for WebAssembly's
-/// external-memory stream, which this runtime does not have.
+/// `close`, `closeSync` and `releaseFD` are installed by
+/// [`crate::filehandle::constructor`] because `FileHandle::Initialize` does them
+/// itself; everything from `fd` onward is installed here.
+///
+/// `_externalStream` is deliberately absent. It exists only for
+/// `node_wasm_web_api.cc`'s external-memory-backed stream, and nothing on the
+/// `fs` or `http2` path reads it — so it is the one member of this surface that
+/// this runtime genuinely does not need, and it is omitted rather than stubbed
+/// with a value that would be wrong if anything ever did read it.
 pub fn install_stream_base(
     scope: &mut v8::PinScope<'_, '_>,
     prototype: v8::Local<'_, v8::ObjectTemplate>,
@@ -516,6 +567,14 @@ pub fn install_stream_base(
         "writeUtf8String" => write_utf8,
         "writeUcs2String" => write_ucs2,
         "writeLatin1String" => write_latin1,
+        // `FileHandle::Initialize` installs `releaseFD` alongside `close` and
+        // `closeSync`, before `StreamBase::AddMethods` runs. `core.js`'s
+        // `onFileUnpipe` calls it on the `!stream.ownsFd` path — the
+        // `respondWithFD` family — where the descriptor belongs to the caller and
+        // must not be closed. Without it those five files die with
+        // `this.source.releaseFD is not a function` instead of exercising their
+        // subject.
+        "releaseFD" => release_fd,
     }
 
     // `t->PrototypeTemplate()->Set("isStreamBase", True(isolate))`. `lib/net.js`
@@ -538,6 +597,45 @@ pub fn install_stream_base(
         v8::PropertyAttribute::DONT_DELETE,
     );
     Ok(())
+}
+
+/// `handle.releaseFD()` — hand the descriptor back without closing it.
+///
+/// This is `FileHandle::ReleaseFD` (`src/node_file.cc:557`), whose whole body is
+/// `fd->Release()`:
+///
+/// ```cpp
+/// int FileHandle::Release() {
+///   int fd = GetFD();
+///   // Just pretend that Close was called and we're all done.
+///   AfterClose();
+///   return fd;
+/// }
+/// ```
+///
+/// `core.js`'s `onFileUnpipe` calls it from the `!stream.ownsFd` branch: the
+/// descriptor came from the caller (`respondWithFD`), so the pipe must release
+/// its claim on it rather than close a file the caller still owns. Marking the
+/// handle closed first is what stops an in-flight `uv_fs_read` completion from
+/// re-arming on a descriptor number the process may reuse.
+pub(crate) fn release_fd(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    // `ASSIGN_OR_RETURN_UNWRAP(&fd, args.This())` returns `undefined` for a
+    // receiver that is not a `FileHandle`, which is what `release()` on a missing
+    // handle amounts to.
+    let Some(state) = crate::filehandle::raw_handle_state(args.this()) else {
+        rv.set_undefined();
+        return;
+    };
+    // SAFETY: `raw_handle_state` returned the live allocation the object owns.
+    // `HandleState::release` clears both views of the descriptor — the one
+    // `handle.fd` reads and the one a read completion reads — so they cannot
+    // disagree about whether the handle is still open.
+    let descriptor = unsafe { (*state).release() };
+    rv.set(v8::Integer::new(scope, descriptor).into());
 }
 
 /// A prototype key, or the message to fail construction with.

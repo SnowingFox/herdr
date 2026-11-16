@@ -82,10 +82,11 @@ impl HandleState {
             return None;
         }
         self.descriptor.set(-1);
-        // The stream half reads the same descriptor, so it has to learn that it is
-        // gone: otherwise a read completion already in flight would re-arm and
-        // read a number the process may have since reused.
-        self.stream.release();
+        // `AfterClose()`: the stream half reads the same descriptor, so it has to
+        // learn that it is gone — otherwise a read completion already in flight
+        // would re-arm and read a number the process may have since reused, and a
+        // readable side that was flowing would never be told to stop.
+        self.stream.after_close();
         Some(fd)
     }
 }
@@ -116,6 +117,12 @@ pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<Local<'s, v8:
     for (name, template) in [
         ("close", rn_core::method(close).build(scope)),
         ("closeSync", rn_core::method(close_sync).build(scope)),
+        // `FileHandle::Initialize` installs `releaseFD` right after `closeSync`
+        // and before `StreamBase::AddMethods`, so the position matches Node's.
+        (
+            "releaseFD",
+            rn_core::method(crate::filehandle_stream::release_fd).build(scope),
+        ),
         ("getAsyncId", rn_core::method(get_async_id).build(scope)),
     ] {
         let key = v8::String::new(scope, name)
@@ -172,6 +179,19 @@ impl HandleState {
     /// The `StreamBase` half.
     pub(crate) fn stream(&self) -> *mut crate::filehandle_stream::FileHandleStream {
         self.stream.as_ref() as *const crate::filehandle_stream::FileHandleStream as *mut _
+    }
+
+    /// `FileHandle::Release`: hand the descriptor back and mark the handle closed,
+    /// without closing it.
+    ///
+    /// Both the outer `descriptor` and the stream half's copy are cleared, because
+    /// `handle.fd` reads this one while a read completion reads the other. They
+    /// are two views of one fact, so the transition is written once, here.
+    pub(crate) fn release(&self) -> i32 {
+        let fd = self.descriptor.get();
+        self.descriptor.set(-1);
+        self.stream.after_close();
+        fd
     }
 }
 
