@@ -77,30 +77,43 @@ file and renamed so a concurrent reader never sees a partial file.
 `getCompileCacheEntry`/`saveCompileCacheEntry`, and it stores plain transpiled
 text, which is exactly what this implementation round-trips.
 
-## Deferred
+## The WebAssembly compile cache
 
-Two members, both declared in `DEFERRED` with reasons:
+Both wasm cache members are installed:
 
 - `getWasmCompileCacheEntry`
 - `saveWasmCompileCacheEntry`
 
-Both are the WebAssembly half of the compile cache and both need V8 APIs the
-linked `v8` crate does not expose: `WasmModuleObject::CompiledModule::Serialize()`
-to produce bytes, and `WasmModuleCompilation` with a module-caching callback to
-consume them. Without a way to produce the bytes there is nothing to store, so an
-entry could never carry a `module` and the cache would silently never hit. A
-cache that never hits is worse than an honest absence.
+They used to be declared in `DEFERRED`, with a reason that reasoned from
+module-scope destructuring in `lib/internal/modules/esm/translators.js` and
+stopped there. That reason was false and this was recorded as F3 in
+`internal/review-loader.md`: the same file calls `getWasmCompileCacheEntry`
+inside the `wasm` translator, which runs for every `.wasm` import, so each one
+threw `TypeError: getWasmCompileCacheEntry is not a function`.
+`tools/deferred-reach.py` missed it because it only counted module-scope calls;
+it now counts every reach and names unguarded ones.
 
-They are safe to *load*: `lib/internal/modules/esm/translators.js` destructures
-both at module scope, and destructuring an absent member yields `undefined`
-rather than throwing. They are **not** safe to defer, and this was recorded as a
-finding (F3 in `internal/review-loader.md`): the same file calls
-`getWasmCompileCacheEntry` inside the `wasm` translator, which runs for every
-`.wasm` import, so each one threw `TypeError: getWasmCompileCacheEntry is not a
-function`. `tools/deferred-reach.py` missed it because it only counted
-module-scope calls; it now counts every reach and names unguarded ones, which is
-why both members appear in its `KNOWN_UNGUARDED` list until the import path is
-fixed.
+**What the cache does, versus Node.** The *load path* is complete and matches
+Node: an import of a `.wasm` file translates, compiles and instantiates, and the
+translator gets back the same two shapes Node returns. The *hit path* is not
+implemented, because it needs `v8::CompiledWasmModule::Serialize()`, which the
+linked `v8` crate does not bind:
+
+* `getWasmCompileCacheEntry` returns `undefined` when the compile cache is
+  disabled, and otherwise a null-prototype object carrying an `external` handle
+  and no `module`. A missing `module` is a cache *miss*, which is a shape Node
+  also returns; the caller compiles from the wire bytes and calls the save
+  member.
+* `saveWasmCompileCacheEntry` validates its arguments and stores nothing, so no
+  cache file is ever written for a wasm module. That is what the oracle does
+  too under its default lazy-baseline wasm compilation, which leaves nothing for
+  V8 to serialize; the two differ only when V8 has optimized code to serialize.
+
+So the wasm half of the compile cache is a write-through store that never hits.
+That is honest rather than invisible: the members are present and callable, the
+import path is unconditional, and the missing capability is the one V8 call
+named above. See `crates/rn-bind-modules/src/install.rs` for the two functions
+and the condition that would turn the hit path on.
 
 ## The esmodule lexer
 
