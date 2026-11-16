@@ -1,0 +1,20 @@
+[package]
+name = "rn-bun-text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bun's text, value and stream-helper members for rustnode"
+
+[dependencies]
+rn-bun-api = { path = "../rn-bun-api" }
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+# The differential test compares against the pinned Node oracle rather than
+# whatever `node` `PATH` resolves to; see `tools/node-pin.toml`.
+rn-node-oracle = { path = "../../tools/node-oracle" }
