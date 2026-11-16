@@ -6,13 +6,39 @@
 //! caller: it reports `imported from <path>`, and `<path>` is this function's
 //! result, not the URL it was given.
 //!
+//! # There are two `FileURLToPath`s in Node, and they disagree
+//!
+//! This module is the **C++** one (`src/node_url.cc:770`). There is also a
+//! JavaScript one, `url.fileURLToPath` in `lib/internal/url.js:1623`, and the two
+//! answer differently for the same URL. Getting this wrong pins the wrong
+//! contract, so it is worth stating explicitly:
+//!
+//! | input | `src/node_url.cc` (this module) | `lib/internal/url.js` |
+//! | --- | --- | --- |
+//! | `file:///tmp/a%FFb` | `/tmp/a<U+FFFD>b`, no throw | throws `URIError "URI malformed"` |
+//! | `file:///tmp/%C3%A9` | `/tmp/é` | `/tmp/é` |
+//! | `file:///tmp/a%00b` | `/tmp/a<NUL>b` | `/tmp/a<NUL>b` |
+//! | `file:///tmp/a%2Fb` | `ERR_INVALID_FILE_URL_PATH` | `ERR_INVALID_FILE_URL_PATH` |
+//!
+//! The difference is the decoder: ada's `percent_decode` carries raw bytes and
+//! never validates UTF-8, while the JavaScript calls `decodeURIComponent`.
+//!
+//! `LegacyMainResolve` calls **this** one, so invalid UTF-8 becomes U+FFFD when
+//! the path reaches the message and is never a decode error. That is checked
+//! against the oracle in `rn-bind-fs`'s `legacy_main_resolve_decodes_invalid_utf8_…`
+//! test, and the JavaScript function's contrary behaviour is asserted in the same
+//! test so neither can be made to match by relaxing the other.
+//!
 //! # Bytes, not text
 //!
-//! The return type is `Vec<u8>`. A percent-encoded path may decode to bytes that
-//! are not valid UTF-8, and Node's `FileURLToPath` returns a `std::string` that
-//! carries them through untouched. A `String`-returning version would refuse
-//! exactly the paths a real filesystem allows, and `lib/internal/modules/**`
-//! compares the result against paths that came from the same filesystem.
+//! The return type is `Vec<u8>` because the decoded path is a byte string, not
+//! necessarily valid UTF-8: `%FF` decodes to the single byte `0xFF`, and a
+//! filesystem path holding that byte is a path this has to be able to name.
+//! Node's signature is `std::optional<std::string>`, which is the same byte
+//! string, so a `String` return here would be a lossy narrowing that the C++ does
+//! not perform. Rendering it for a message is where UTF-8 validity is decided,
+//! and that decision belongs to the caller (`String::from_utf8_lossy`, which is
+//! also what gives U+FFFD above).
 //!
 //! # What is delegated to ada
 //!
@@ -163,11 +189,58 @@ mod tests {
 
     #[test]
     fn a_decoded_byte_sequence_need_not_be_utf8() {
-        // `%FF` has no UTF-8 reading; Node carries the byte through, and a path
-        // that names a real file with that byte must survive.
+        // `%FF` has no UTF-8 reading. The C++ carries the byte through rather
+        // than rejecting it, which is the behaviour the `fs` caller depends on:
+        // `legacyMainResolve`'s message shows U+FFFD there, and `url`'s own
+        // `fileURLToPath` is the one that throws instead.
         assert_eq!(
             file_url_to_path(b"file:///tmp/a%FFb").expect("a path"),
             b"/tmp/a\xFFb".to_vec()
+        );
+    }
+
+    /// The five shapes the review asked to have pinned, asserted here as bytes
+    /// and cross-checked against the oracle in `rn-bind-fs`'s parity test.
+    ///
+    /// Note what each proves, since a reader comparing this to
+    /// `url.fileURLToPath` will otherwise think one of them is wrong:
+    ///
+    /// * `%FF` and a truncated `%C3%28` decode to bytes that are not UTF-8 and
+    ///   are **not** an error here. `decodeURIComponent` would throw.
+    /// * `%C3%A9` and `%E4%B8%AD` are valid UTF-8 and decode to their bytes.
+    /// * `%00` decodes to a NUL, which is carried through rather than refused.
+    /// * `%2F` is refused earlier, by `fileURLToPath`'s own scan and with its
+    ///   own error code, before any decoding happens.
+    #[test]
+    fn the_reviewed_invalid_utf8_and_nul_cases_decode_as_bytes() {
+        // Invalid UTF-8 decodes; it does not throw.
+        assert_eq!(
+            file_url_to_path(b"file:///tmp/a%FFb").expect("decodes"),
+            b"/tmp/a\xFFb".to_vec()
+        );
+        // A truncated two-byte sequence is two raw bytes, not an error.
+        assert_eq!(
+            file_url_to_path(b"file:///tmp/a%C3%28b").expect("decodes"),
+            b"/tmp/a\xC3(b".to_vec()
+        );
+        // Valid multi-byte text decodes to its UTF-8 bytes.
+        assert_eq!(
+            file_url_to_path(b"file:///tmp/%C3%A9").expect("decodes"),
+            "/tmp/é".as_bytes().to_vec()
+        );
+        assert_eq!(
+            file_url_to_path(b"file:///tmp/%E4%B8%AD").expect("decodes"),
+            "/tmp/中".as_bytes().to_vec()
+        );
+        // A NUL is data, not a terminator, at this layer.
+        assert_eq!(
+            file_url_to_path(b"file:///tmp/a%00b").expect("decodes"),
+            b"/tmp/a\x00b".to_vec()
+        );
+        // `%2F` is the one case that is a rejection rather than bytes.
+        assert_eq!(
+            file_url_to_path(b"file:///tmp/a%2Fb"),
+            Err(FileUrlToPathError::EncodedSlash)
         );
     }
 

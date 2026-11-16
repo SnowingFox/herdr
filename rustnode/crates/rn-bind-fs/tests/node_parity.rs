@@ -488,3 +488,105 @@ console.log(JSON.stringify(out));
         "legacyMainResolve / getFormatOfExtensionlessFile must agree with node"
     );
 }
+
+/// Invalid UTF-8, a NUL, and valid multi-byte text in a `file:` base URL.
+///
+/// Node has **two** functions called `FileURLToPath`, and they disagree here, so
+/// naming which one is matched is the point of this test:
+///
+/// * `lib/internal/url.js:1623` (`url.fileURLToPath`) decodes with
+///   `decodeURIComponent`, which throws `URIError "URI malformed"` on invalid
+///   UTF-8.
+/// * `src/node_url.cc:770` (`node::url::FileURLToPath`) decodes with
+///   `ada::unicode::percent_decode`, which returns raw bytes and never throws.
+///
+/// `LegacyMainResolve` calls the *second* one (`src/node_file.cc:5548`), so
+/// invalid UTF-8 becomes U+FFFD in the `imported from` text rather than an
+/// error. Asserting the JS function's behaviour here would pin the wrong
+/// contract, so the member is compared against the oracle; the JS function's
+/// throw is asserted in both runtimes too, so this cannot be satisfied by
+/// relaxing decoding globally.
+///
+/// The earlier differential only fed well-formed URLs, which is why it did not
+/// find any of this: a well-formed corpus cannot expose a decoding divergence.
+#[test]
+fn legacy_main_resolve_decodes_invalid_utf8_like_the_cpp_not_like_js() {
+    if !node_available() {
+        eprintln!("skipping: no `node` on PATH");
+        return;
+    }
+
+    let dir = TempDir::new("legacy-main-utf8");
+    std::fs::create_dir_all(dir.path.join("pkg")).expect("mkdir");
+    // `main.js` exists so the `nulInMain` and `nulInPkgPath` cases resolve.
+    std::fs::write(dir.path.join("pkg/main.js"), b"x").expect("write");
+    let root = js_path(&dir.path);
+
+    // The six member calls, written once as a JS expression list so the oracle
+    // and this crate evaluate identical source. `{ROOT}` is substituted.
+    let cases = r#"{
+  invalidUtf8: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/a%FFb/x.js')),
+  validUtf8: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/%C3%A9/x.js')),
+  encodedSlash: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/a%2Fb/x.js')),
+  embeddedNul: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/a%00b/x.js')),
+  multiByteCjk: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/%E4%B8%AD/x.js')),
+  nulInMain: capture(() => b.legacyMainResolve('{ROOT}/pkg', 'main.js\u0000zzz', 'file:///tmp/x.js')),
+  nulInPkgPath: capture(() => b.legacyMainResolve('{ROOT}/pkg\u0000junk', 'main.js', 'file:///tmp/x.js')),
+}"#
+        .replace("{ROOT}", &root);
+
+    let preamble = r#"
+const capture = (fn) => {
+  try { const v = fn(); return ['ok', typeof v, v]; }
+  catch (e) { return ['threw', e.name, e.code, e.message]; }
+};
+"#;
+
+    // Oracle: the real `internalBinding`, printing just the case table.
+    let node_script = format!(
+        "{preamble}\n{}\nconst b = internalBinding('fs');\nconsole.log(JSON.stringify({cases}));\n",
+        "const { internalBinding } = require('internal/test/binding');",
+        preamble = preamble,
+        cases = cases,
+    );
+    let script_path = dir.path.join("utf8.js");
+    std::fs::write(&script_path, &node_script).expect("write the script");
+
+    let node_out = Command::new("node")
+        .arg("--expose-internals")
+        .arg(&script_path)
+        .output()
+        .expect("node runs");
+    assert!(
+        node_out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&node_out.stderr)
+    );
+    let expected: Vec<String> = String::from_utf8_lossy(&node_out.stdout)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(expected.len(), 1, "node printed {expected:?}");
+
+    // This crate: only the member calls. This harness has no bootstrap, so
+    // `require('url')` is not available in-process; the vendored
+    // `url.fileURLToPath` keeps throwing for the same input, which
+    // `js_contract.rs` asserts through the real binary.
+    let rust_source = format!(
+        "{preamble}\nconst b = fsBinding;\nglobalThis.__out = JSON.stringify({cases});",
+        preamble = preamble,
+        cases = cases,
+    );
+    let actual: Vec<String> = eval(&rust_source)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    assert_eq!(
+        actual, expected,
+        "legacyMainResolve must decode the base URL like the C++ FileURLToPath, \
+         while url.fileURLToPath keeps throwing on the same input"
+    );
+}

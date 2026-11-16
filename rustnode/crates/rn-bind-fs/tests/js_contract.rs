@@ -1777,3 +1777,108 @@ fn the_module_loader_members_reject_a_non_string_path() {
         r#"{"legacyMain":["TypeError","ERR_INVALID_ARG_TYPE"],"format":["TypeError","ERR_INVALID_ARG_TYPE"]}"#
     );
 }
+
+/// `legacyMainResolve`'s base-URL decoding differs from `url.fileURLToPath`'s,
+/// and this pins both halves through their real entry points.
+///
+/// Node has two functions called `FileURLToPath`:
+///
+/// * `src/node_url.cc:770` — called by `LegacyMainResolve` (`node_file.cc:5548`),
+///   decodes with `ada::unicode::percent_decode`, and carries raw bytes. Invalid
+///   UTF-8 therefore becomes U+FFFD in the `imported from` text rather than an
+///   error, and `%00` survives as a NUL.
+/// * `lib/internal/url.js:1623` — `url.fileURLToPath`, decodes with
+///   `decodeURIComponent`, and throws `URIError "URI malformed"` instead.
+///
+/// Both are asserted so a later change cannot satisfy one by relaxing the other.
+/// The 37-case differential that preceded this fed only well-formed URLs, which
+/// is precisely why it could not see any of it.
+#[test]
+fn legacy_main_resolve_decodes_invalid_utf8_where_url_file_url_to_path_throws() {
+    let dir = TempDir::new("utf8-paths");
+    std::fs::create_dir_all(dir.joined("pkg")).expect("mkdir");
+
+    // The binding half, through the namespace object directly.
+    let binding = run(&format!(
+        r#"
+        const root = '{root}/pkg';
+        const at = (base) => {{
+          try {{ fsBinding.legacyMainResolve(root, undefined, base); return ['no throw']; }}
+          catch (e) {{ return [e.name, e.code, e.message]; }}
+        }};
+        globalThis.__out = JSON.stringify({{
+          invalidUtf8: at('file:///tmp/a%FFb/x.js'),
+          truncatedUtf8: at('file:///tmp/a%C3%28b/x.js'),
+          embeddedNul: at('file:///tmp/a%00b/x.js'),
+          encodedSlash: at('file:///tmp/a%2Fb/x.js'),
+        }});
+        "#,
+        root = js_path(&dir.path)
+    ));
+
+    // U+FFFD appears in the decoded path, and no decode error is raised.
+    assert!(
+        binding.contains(r#""invalidUtf8":["Error","ERR_MODULE_NOT_FOUND""#),
+        "the C++ FileURLToPath must not reject invalid UTF-8: {binding}"
+    );
+    assert!(
+        binding.contains('\u{FFFD}'),
+        "invalid UTF-8 must decode to the replacement character: {binding}"
+    );
+    assert!(
+        binding.contains("\\u0000"),
+        "a NUL must be carried through into the message: {binding}"
+    );
+    // `%2F` keeps its own, earlier rejection and its own code.
+    assert!(
+        binding.contains(r#""encodedSlash":["TypeError","ERR_INVALID_FILE_URL_PATH","File URL path must not include encoded / characters"]"#),
+        "an encoded slash is still its own rejection: {binding}"
+    );
+
+    // The JS half, through the vendored `url` module. No `--expose-internals`
+    // needed, and it runs in the real binary so `require` is a real require.
+    let js = run_in_binary(
+        "utf8-url-fn",
+        r#"
+const { fileURLToPath } = require('url');
+const at = (url) => {
+  try { const v = fileURLToPath(url); return ['ok', typeof v, v]; }
+  catch (e) { return ['threw', e.name, e.code, e.message]; }
+};
+console.log(JSON.stringify({
+  invalidUtf8: at('file:///tmp/a%FFb'),
+  truncatedUtf8: at('file:///tmp/a%C3%28b'),
+  validUtf8: at('file:///tmp/%C3%A9'),
+  nul: at('file:///tmp/a%00b'),
+  cjk: at('file:///tmp/%E4%B8%AD'),
+  encodedSlash: at('file:///tmp/a%2Fb'),
+}));
+"#,
+    );
+
+    assert!(
+        js.contains(r#""invalidUtf8":["threw","URIError",null,"URI malformed"]"#),
+        "url.fileURLToPath must keep throwing on invalid UTF-8: {js}"
+    );
+    assert!(
+        js.contains(r#""truncatedUtf8":["threw","URIError",null,"URI malformed"]"#),
+        "a truncated sequence throws too: {js}"
+    );
+    // The return type is a string, and valid multi-byte text and a NUL decode.
+    assert!(
+        js.contains(r#""validUtf8":["ok","string","/tmp/é"]"#),
+        "valid UTF-8 must decode to a string: {js}"
+    );
+    assert!(
+        js.contains(r#""nul":["ok","string","/tmp/a\u0000b"]"#),
+        "a NUL is allowed through: {js}"
+    );
+    assert!(
+        js.contains(r#""cjk":["ok","string","/tmp/中"]"#),
+        "CJK text must decode to a string: {js}"
+    );
+    assert!(
+        js.contains(r#""encodedSlash":["threw","TypeError","ERR_INVALID_FILE_URL_PATH""#),
+        "an encoded slash is rejected before decoding: {js}"
+    );
+}

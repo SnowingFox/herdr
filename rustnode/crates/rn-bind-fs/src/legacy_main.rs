@@ -234,6 +234,11 @@ pub fn get_format_of_extensionless_file<'a, 's, 'i>(
 
 /// `BindingData::FilePathIsFile`, which is "stat succeeded and it is not a
 /// directory" — so a symlink to a file, a fifo and a device all count as files.
+///
+/// The stat goes through [`stat_fields_via_c_string`] so an embedded NUL
+/// truncates the path, matching the `file_path.c_str()` the C++ passes to
+/// `uv_fs_stat`. Without that, `main.js\0zzz` would fail to stat here and fall
+/// through to the `index` suffixes, which is the opposite of Node's answer.
 fn probe_file(scope: &mut v8::PinScope<'_, '_>, path: &[u8]) -> FileProbe {
     // `FilePathIsFile` passes `kThrowInsufficientPermissions`, so a denial ends
     // the whole call instead of continuing to the next candidate.
@@ -241,17 +246,45 @@ fn probe_file(scope: &mut v8::PinScope<'_, '_>, path: &[u8]) -> FileProbe {
         denied.throw(scope);
         return FileProbe::Denied;
     }
-    match StatFields::for_path(path, Follow::Yes) {
+    match stat_fields_via_c_string(path) {
         Ok(fields) if !is_directory(fields.mode) => FileProbe::File,
         Ok(_) => FileProbe::NotFile,
         Err(_) => FileProbe::NotFile,
     }
 }
 
+/// `statx` on the C string `path` denotes, truncating at an embedded NUL.
+///
+/// `StatFields::for_path` rejects a path containing NUL because a `CString`
+/// cannot hold one. The C++ has no such constraint: it builds a `std::string`
+/// and passes `c_str()`, so everything from the first NUL onward is dropped and
+/// the syscall sees the prefix. Reproducing that is not pedantry — it decides
+/// which candidate `legacyMainResolve` reports, and its message shows the
+/// untruncated path because `package_initial_file` is a `std::string`.
+fn stat_fields_via_c_string(path: &[u8]) -> Result<StatFields, crate::error::FsError> {
+    let truncated = truncate_at_nul(path);
+    StatFields::for_path(truncated, Follow::Yes)
+}
+
+/// The prefix before the first NUL, which is what a `c_str()` receiver sees.
+fn truncate_at_nul(path: &[u8]) -> &[u8] {
+    match path.iter().position(|byte| *byte == 0) {
+        Some(at) => &path[..at],
+        None => path,
+    }
+}
+
 /// Reads the first four bytes of `path`, or `None` when it cannot be opened or
 /// read. Bytes past a short read stay zero, unlike Node's uninitialised buffer.
+///
+/// An embedded NUL truncates the path, because that is what the C++ does: it
+/// hands `input.out()` — a NUL-terminated buffer — to `uv_fs_open`, so
+/// `"<wasm file>\0junk"` opens the wasm file and `"wa\0sm"` opens nothing. A
+/// Rust `CString::new` rejects such a path outright, which would answer
+/// `JAVASCRIPT` for a file Node sniffs as Wasm.
 fn read_first_four(path: &[u8]) -> Option<[u8; 4]> {
-    let c_path = std::ffi::CString::new(path).ok()?;
+    let truncated = truncate_at_nul(path);
+    let c_path = std::ffi::CString::new(truncated).ok()?;
     // SAFETY: `c_path` is NUL-terminated and the flags are plain integers. A
     // successful call returns a descriptor this function owns and closes.
     let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -669,6 +702,39 @@ mod tests {
             Some([0x00, 0x61, 0x73, 0x00])
         );
         assert_eq!(read_first_four(&as_bytes(&dir.join("absent"))), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An embedded NUL truncates the path, because the C++ passes `c_str()`.
+    ///
+    /// Both members are affected and in opposite-looking ways, which is why
+    /// both are pinned: a path whose *prefix* names a Wasm file still sniffs as
+    /// Wasm, and a `main` whose prefix names a real file still resolves to it
+    /// while the message that would have named it shows the whole untruncated
+    /// string. Rejecting the path instead is what a `CString::new` does by
+    /// default, and it silently changes both answers.
+    #[test]
+    fn an_embedded_nul_truncates_the_path_the_way_c_str_does() {
+        assert_eq!(truncate_at_nul(b"/tmp/ok\x00junk"), b"/tmp/ok");
+        assert_eq!(truncate_at_nul(b"\x00junk"), b"");
+        assert_eq!(truncate_at_nul(b"/tmp/ok"), b"/tmp/ok");
+
+        let dir = std::env::temp_dir().join(format!("rn-legacy-nul-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let wasm = dir.join("wasm");
+        std::fs::write(&wasm, [0x00u8, 0x61, 0x73, 0x6d, 0x01]).expect("write");
+
+        use std::os::unix::ffi::OsStrExt;
+        let mut suffixed = wasm.as_os_str().as_bytes().to_vec();
+        suffixed.extend_from_slice(b"\x00JUNK");
+
+        // The prefix is the wasm file, so this reads it, matching `input.out()`.
+        assert_eq!(read_first_four(&suffixed), Some(WASM_MAGIC));
+        // `wa\0sm` truncates to `.../wa`, which does not exist.
+        let mut broken = dir.as_os_str().as_bytes().to_vec();
+        broken.extend_from_slice(b"/wa\x00sm");
+        assert_eq!(read_first_four(&broken), None);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
