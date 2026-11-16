@@ -169,10 +169,13 @@ step "process has no member the oracle lacks, and lacks none it has"
 # `Object.getOwnPropertyNames(process)` on both runtimes.
 #
 # A bare statement under `set -e`, like the controls above, so a mismatch turns
-# the gate red. It reads the release binary and the pinned oracle, both of which
-# the build step and the oracle step above have already guaranteed, and exits 2
-# rather than passing when either is missing.
-python3 tools/process-member-audit.py
+# the gate red. It reads the debug binary — the only profile this gate builds —
+# and the pinned oracle, both of which the build step and the oracle step above
+# have already guaranteed, and refuses rather than passing when either is
+# missing. The audit's own default is the release binary, which belongs to a
+# human or CI run that has one; `process` own-property names do not differ
+# between profiles, so naming the debug build measures the same surface.
+python3 tools/process-member-audit.py --rustnode target/debug/rustnode
 
 step "the per-context globals still behave as Node's do"
 # The control for the per-context work: DOMException is a real `Error`, the
@@ -478,9 +481,23 @@ step "every Node-API gap is either exported or declared"
 # `EXPORTED` in both directions, which is consistent for any split as long as every
 # symbol is covered by one side — which was exactly what was false).
 #
+# Both invocations name `target/debug/rustnode` explicitly. The tool's default is
+# `target/release/rustnode`, which is right for a human or CI run that has a
+# release build, but this gate never makes one: the step above is
+# `cargo check --release`, for the cost reason its comment records. So the
+# default was a path the gate does not produce, and on a clean checkout the tool
+# exited 2 (`does not exist; build it before running this check`) with nothing
+# wrong in the tree. The profile does not change the answer: `nm -D
+# --defined-only` reads linked objects, and the debug and release binaries export
+# the same 155 symbols and report the same 155/161/6 here. Naming the debug
+# binary keeps the exit-2-on-absent-binary refusal intact, which is the guard
+# against reporting clean while measuring nothing.
+#
 # The self-test runs first and is what makes the gate trustworthy: it removes a
 # declaration, typos one, contradicts one, and empties the block, requiring the
 # specific diagnostic for each. A gate that cannot fail is the defect it guards.
+RUSTNODE_NAPI_BINARY="${RUSTNODE_NAPI_BINARY:-target/debug/rustnode}"
+export RUSTNODE_NAPI_BINARY
 ./tools/napi-symbol-coverage.test.sh
 
 # The oracle lives outside the repository, so it may be absent on a machine that
@@ -489,7 +506,7 @@ step "every Node-API gap is either exported or declared"
 # failure mode this whole step exists to prevent. A machine that has the oracle
 # runs it, which is every CI image and every maintainer workstation.
 if [ -x "${RUSTNODE_NAPI_ORACLE:-/tmp/oracle-dl/node-v28.0.0-nightly20261111e8c1160d20-linux-x64/bin/node}" ]; then
-  ./tools/napi-symbol-coverage.py
+  ./tools/napi-symbol-coverage.py --rustnode "$RUSTNODE_NAPI_BINARY"
 else
   echo "napi symbol coverage: no oracle binary; set RUSTNODE_NAPI_ORACLE to run it"
 fi
