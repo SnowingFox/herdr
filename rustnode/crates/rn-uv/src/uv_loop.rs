@@ -308,6 +308,19 @@ fn run_inner(mode: uv::uv_run_mode) -> bool {
     remaining != 0
 }
 
+/// Whether this thread is inside a `uv_run` call right now.
+///
+/// A libuv completion only runs from inside one, so this is the test that
+/// distinguishes "control is returning to the loop" from "JavaScript called a
+/// binding synchronously". The tick/microtask checkpoint belongs only at the
+/// former: a synchronous native call has a JavaScript frame above it, and
+/// draining there would run `process.nextTick` in the middle of a JavaScript
+/// stack — which is exactly what V8's explicit microtask policy exists to
+/// prevent.
+pub fn in_run() -> bool {
+    IN_LOOP.with(|flag| *flag.borrow())
+}
+
 /// Whether libuv considers the loop to have referenced work.
 pub fn is_active() -> bool {
     let Some(pointer) = loop_ptr() else {

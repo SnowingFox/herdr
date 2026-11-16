@@ -29,10 +29,11 @@
 //! # Ordering
 //!
 //! The phases belong to libuv, which `rn-io` drives one iteration at a time.
-//! What stays here is the drain: Node checks the tick and microtask queues after
-//! every JavaScript callback, and the one point where the loop can be asked to
-//! do that is between two iterations. The script body is drained once before the
-//! loop starts, which is why a `.then` scheduled in the script runs before the
+//! Node checks the tick and microtask queues after every native-to-JavaScript
+//! callback, and that checkpoint lives in `rn_uv::callback::with_context` — this
+//! module only registers the `runNextTicks` it calls, through
+//! `rn_core::task_queue`. The script body is drained once before the loop
+//! starts, which is why a `.then` scheduled in the script runs before the
 //! process exits and why `process.nextTick` beats both a promise and a 0ms timer.
 
 use rn_io::{Loop, Scheduler, StopReason};
@@ -126,6 +127,19 @@ impl Runtime {
         });
         rn_bind_timers::set_check_phase_pending(rn_bind_messaging::has_delivery_pending);
         rn_bind_messaging::set_check_phase_armed(rn_bind_timers::arm_check_phase);
+        // The tick half of the per-callback checkpoint `rn-uv` runs after every
+        // libuv completion. `runNextTicks` is the same function the loop's
+        // between-iteration drain calls, so the queue is drained by one
+        // implementation whether it is reached from here or from
+        // `Loop::tick` — which is what keeps a callback's tick ordered the same
+        // way as one queued by the script body.
+        //
+        // It is recorded here rather than read from `INSTALLED` because
+        // `Runtime::install` returns the value to the CLI, which never goes
+        // through `install_runtime`. The CLI is the main thread's only caller.
+        let checkpoint_tick = v8::Global::new(scope, run_next_ticks);
+        CHECKPOINT_TICK.with(|slot| *slot.borrow_mut() = Some(checkpoint_tick));
+        rn_core::task_queue::set_tick_drain(run_checkpoint_ticks);
         Ok(Self {
             run_next_ticks: v8::Global::new(scope, run_next_ticks),
         })
@@ -685,6 +699,46 @@ thread_local! {
     /// it here is the same arrangement `rn_bind_options::parsed` uses for the
     /// option store: one per thread, replaced rather than accumulated.
     static INSTALLED: std::cell::RefCell<Option<Runtime>> = const { std::cell::RefCell::new(None) };
+
+    /// `runNextTicks`, for the per-callback checkpoint.
+    ///
+    /// A separate slot from [`INSTALLED`] because `Runtime::install` hands its
+    /// value to the CLI, which keeps it in a local and never calls
+    /// [`install_runtime`]. The checkpoint is reached from a libuv completion,
+    /// where that local is unreachable, so the function has to be rooted here
+    /// as well.
+    static CHECKPOINT_TICK: std::cell::RefCell<Option<v8::Global<v8::Function>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `runNextTicks` for the per-callback checkpoint.
+///
+/// This is the `TickDrain` registered with [`rn_core::task_queue`]. It is not
+/// [`Runtime::drain`]: that also dispatches inspector messages and runs Node-API
+/// finalizers, which belong to the loop's own idle and not to the boundary
+/// between one native callback and the next.
+fn run_checkpoint_ticks(scope: &mut v8::PinScope<'_, '_>) {
+    let Some(tick) = CHECKPOINT_TICK.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|tick| v8::Local::new(scope, tick))
+    }) else {
+        return;
+    };
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut try_catch.init();
+    let _ = tick.call(scope, v8::undefined(scope).into(), &[]);
+    if scope.has_caught() && !scope.has_terminated() {
+        if let Some(exception) = scope.exception() {
+            report_uncaught(scope, exception);
+        }
+    }
+}
+
+/// Clears the checkpoint's tick function, so a new realm cannot inherit the
+/// previous one's.
+fn clear_checkpoint_tick() {
+    CHECKPOINT_TICK.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// Installs the runtime and records it for this thread.
@@ -732,4 +786,6 @@ pub fn runtime_has_external_work() -> bool {
 /// hooks of the isolate that ran before it.
 pub fn clear_runtime() {
     INSTALLED.with(|slot| *slot.borrow_mut() = None);
+    clear_checkpoint_tick();
+    rn_core::task_queue::clear();
 }

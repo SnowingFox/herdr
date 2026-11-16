@@ -798,6 +798,15 @@ unsafe fn run_timer_callback() {
             }
             result = call_catching(scope, callback, &[argument]);
         }
+        // `RunTimers` opens a plain `InternalCallbackScope`, not an
+        // `InternalMakeCallback`, and the throw above was already handed to
+        // `_fatalException` by this handle's own `TryCatchScope`. So `Close`
+        // still performs the checkpoint, unlike a callback scope that failed.
+        // Clearing the flag `report_uncaught_exception` raised is what keeps
+        // that difference; the oracle orders a throwing timer's queued ticks and
+        // microtasks before the next phase (`throw-timer.js`:
+        // `["timer-cb","caught","tick","micro","immediate"]`).
+        rn_core::task_queue::forget_callback_failure();
         match result {
             Ok(Some(result)) => {
                 // The return value is the next deadline, using libuv's sign
@@ -912,17 +921,43 @@ fn stop_timer() {
 /// installed into is alive.
 unsafe fn run_immediate_callback() {
     rn_uv::callback::with_context(|scope| {
-        let Some(callback) = immediate_callback(scope) else {
-            return;
-        };
-        // The return value is not consulted, matching `CheckImmediate`: only the
-        // timer handle carries a deadline, and an immediate has none. The report's
-        // answer is not consulted either — a fatal throw ends the process from the
-        // loop's own check, and an absorbed one leaves the queue to drain on the
-        // next iteration, which is why immediates and ticks continue after a throw
-        // while timers used to stop.
-        if let Err(exception) = call_catching(scope, callback, &[]) {
-            record_uncaught(scope, exception);
+        // `Environment::CheckImmediate` retries `processImmediate` while the
+        // queue still has an outstanding list and the environment can still call
+        // into JavaScript:
+        //
+        // ```text
+        // do {
+        //   MakeCallback(env->immediate_callback_function(), ...);
+        // } while (env->immediate_info()->has_outstanding() && env->can_call_into_js());
+        // ```
+        //
+        // The retry is what makes a throwing immediate stop only that one
+        // callback rather than the whole phase: `processImmediate` returned
+        // early with `kHasOutstanding` still set, so the loop calls it again and
+        // the sibling immediates run. Without it the siblings were pushed to a
+        // later iteration than Node's (`throw-immediate.js`:
+        // `["immediate-cb","caught","sibling","tick","micro"]`).
+        loop {
+            let Some(callback) = immediate_callback(scope) else {
+                return;
+            };
+            // The return value is not consulted, matching `CheckImmediate`: only
+            // the timer handle carries a deadline, and an immediate has none.
+            if let Err(exception) = call_catching(scope, callback, &[]) {
+                record_uncaught(scope, exception);
+            }
+            // `can_call_into_js()` going false ends the loop, which is the case
+            // an absorbed `process.exit()` produces.
+            if !has_outstanding_immediates()
+                || rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED)
+            {
+                return;
+            }
+            // Node's retry clears the failure its own `MakeCallback` recorded,
+            // because `CheckImmediate` reads `has_outstanding()` and not the
+            // verdict of the callback that threw. Leaving the flag set would
+            // suppress the checkpoint after every later immediate in this phase.
+            rn_core::task_queue::forget_callback_failure();
         }
     });
 }
@@ -1079,6 +1114,20 @@ pub fn immediate_count() -> u32 {
             .as_ref()
             .and_then(|info| info.immediate.get(IMMEDIATE_COUNT))
             .unwrap_or(0)
+    })
+}
+
+/// Whether a `processImmediate` call returned with a list still outstanding.
+///
+/// This is `ImmediateInfo::has_outstanding()` (`src/env.h:519`), the byte
+/// `processImmediate` sets to `1` as soon as it takes the queue and clears when
+/// it reaches the end. `CheckImmediate` retries on it, so a throw that ended the
+/// call early leaves it set and the sibling immediates still run in this phase.
+pub fn has_outstanding_immediates() -> bool {
+    INFO.with(|info| {
+        info.borrow()
+            .as_ref()
+            .is_some_and(|info| info.immediate.flag(IMMEDIATE_HAS_OUTSTANDING))
     })
 }
 

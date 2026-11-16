@@ -6,6 +6,19 @@
 //! phase order: [`Loop::run`] calls `uv_run(UV_RUN_ONCE)` in a loop and drains
 //! ticks between the iterations.
 //!
+//! # Where the checkpoint actually is
+//!
+//! The per-callback checkpoint is *not* here. It is in
+//! `rn_uv::callback::with_context`, the one place a libuv completion re-enters
+//! V8, and it is bracketed by `rn_core::task_queue` exactly as
+//! `InternalCallbackScope::Close` brackets `MakeCallback`. That is the
+//! distinction between `process.nextTick` beating a `setImmediate` in the same
+//! iteration and losing to it, and it used to be wrong here: draining only
+//! between iterations put every tick one phase late.
+//!
+//! [`Scheduler::drain`] remains for the work an iteration does with no
+//! JavaScript callback behind it — see [`Loop::tick`].
+//!
 //! # Why `UV_RUN_ONCE` and not `UV_RUN_DEFAULT`
 //!
 //! `UV_RUN_DEFAULT` runs the whole loop inside one C call, so nothing in Rust
@@ -29,7 +42,7 @@
 //!   their callbacks run `internal/timers.js`'s `processTimers` and
 //!   `processImmediate` and so need a V8 scope. That is the same split Node has
 //!   between `TimerWrap`/`Environment` and `lib/internal/timers.js`.
-//! * This crate owns *when* the loop runs and the drain between iterations.
+//! * This crate owns *when* the loop runs, and the iteration-level drain.
 //! * `rn-cli` implements [`Scheduler`] over V8.
 
 pub use crate::backend::Backend;
@@ -44,10 +57,15 @@ pub use crate::backend::Backend;
 pub trait Scheduler {
     /// Drains `process.nextTick` and V8's microtask queue.
     ///
-    /// Called between loop iterations, never inside one, so a callback that
-    /// queues a microtask cannot have it run before the libuv callback that
-    /// queued it returns. `lib/internal/process/task_queues.js` is what actually
-    /// drains; this only gives it the chance.
+    /// This is the iteration-level drain, not the per-callback checkpoint. Node
+    /// drains after every native-to-JavaScript callback from
+    /// `InternalCallbackScope::Close`, and that happens in
+    /// `rn_uv::callback::with_context` via `rn_core::task_queue`; what is left
+    /// for this method is the work an iteration does with no callback behind it,
+    /// and the queues a callback left when it threw.
+    ///
+    /// `lib/internal/process/task_queues.js` is what actually drains; this only
+    /// gives it the chance.
     fn drain(&mut self);
 
     /// Whether the process has asked to exit, e.g. through `process.exit()`.
@@ -143,6 +161,18 @@ impl Loop {
     /// sleep rather than 20ms of spinning. It does not block at all when libuv
     /// has a callback that is already runnable, because `uv__backend_timeout`
     /// reports zero then.
+    ///
+    /// # Why the drain after the iteration is kept
+    ///
+    /// Node's checkpoint belongs to each callback, not to the iteration, and
+    /// `rn_uv::callback::with_context` is where that happens now. This one is
+    /// still correct to keep, because what it covers is the work an iteration
+    /// does *without* running a JavaScript callback: a libuv internal step that
+    /// queues nothing, `platform->DrainTasks(isolate)` (V8's concurrent marking
+    /// finalizers call back with no scope of their own), and the queues a
+    /// callback left behind when it threw. It is also what makes an idle
+    /// iteration cheap when nothing ran: `Scheduler::drain` on a runtime with
+    /// empty queues reaches `runNextTicks`, which returns after one flag test.
     pub fn tick<S: Scheduler>(&mut self, scheduler: &mut S) -> bool {
         // Nothing is alive, so libuv would return without running an iteration.
         // Taking that answer from libuv rather than deciding it here is what

@@ -122,8 +122,23 @@ impl BindingModule for TaskQueue {
         for (name, value) in values {
             set(scope, object, name, value)?;
         }
+        // The checkpoint `rn-uv` runs after every libuv callback asks whether a
+        // tick or a rejection is waiting, and both flags live in the buffer this
+        // namespace just installed. Registering here is what makes the answer
+        // the JavaScript side's own, rather than a copy in Rust that would drift
+        // the moment `task_queues.js` wrote a byte.
+        rn_core::task_queue::set_pending_check(has_tick_or_rejection);
         Ok(object)
     }
+}
+
+/// Whether a tick or an unhandled rejection is waiting.
+///
+/// `TickInfo::has_tick_scheduled() || TickInfo::has_rejection_to_warn()`, which
+/// is the pair `InternalCallbackScope::Close` tests before and after its
+/// microtask checkpoint.
+fn has_tick_or_rejection() -> bool {
+    has_tick_scheduled() || has_rejection_to_warn()
 }
 
 /// Registers the `task_queue` namespace with the runtime.

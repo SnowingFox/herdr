@@ -78,6 +78,20 @@ pub fn has_context() -> bool {
 /// The body is handed the raw `ContextScope`, not a `PinScope`, so both of the
 /// two things a caller needs work: `Local::new` wants the *handle* scope
 /// underneath it, and method calls want the scope itself.
+///
+/// # The checkpoint this brackets every callback with
+///
+/// This is the process' one boundary where a libuv completion re-enters V8, so
+/// it is the same boundary `MakeCallback` is for Node. Node drains
+/// `process.nextTick` and the microtask queue from that boundary — not between
+/// loop iterations — and the ordering contract that `setImmediate` loses to a
+/// `.then` and that a socket's `'close'` comes after the tick its `'connect'`
+/// queued depends on it. [`rn_core::task_queue`] owns the drain; this only
+/// marks where a callback starts and stops.
+///
+/// The drain is skipped when the scope is opened outside `uv_run`, because then
+/// a native binding was called *from* JavaScript and there is a JavaScript frame
+/// above it.
 pub fn with_context<R>(
     body: impl FnOnce(&mut v8::PinScope<'_, '_, v8::Context>) -> R,
 ) -> Option<R> {
@@ -95,7 +109,10 @@ pub fn with_context<R>(
     let local_context: v8::Local<v8::Context> = v8::Local::new(&scope, &context);
     let context_storage = std::pin::pin!(v8::ContextScope::new(&mut scope, local_context));
     let mut context_scope = context_storage;
-    Some(body(&mut context_scope))
+    rn_core::task_queue::enter_callback();
+    let result = body(&mut context_scope);
+    rn_core::task_queue::leave_callback(&mut context_scope, crate::uv_loop::in_run());
+    Some(result)
 }
 
 /// Calls `function`, with `receiver` as `this` and `arguments` as its arguments.

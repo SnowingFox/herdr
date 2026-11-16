@@ -605,6 +605,18 @@ unsafe fn call_into_module<R>(
             }
         };
         let rooted = caught.map(|exception| v8::Global::new(scope, exception));
+        if rooted.is_some() {
+            // `scope.MarkAsFailed()`, carried across the scope boundary: the
+            // exception is reported by `trigger_fatal_exception` *after* this
+            // closure returns, which is outside the `with_context` that is about
+            // to close. Recording the failure here is what makes that
+            // `with_context` skip its own checkpoint, exactly as `Close()`
+            // returns at `if (failed_) return;` does for Node. Without it the
+            // microtask this callback queued ran before the uncaught handler —
+            // `callback,microtask,listener` instead of
+            // `callback,listener,microtask`.
+            rn_core::task_queue::note_callback_failed();
+        }
         let _ = &guard;
         (result, rooted)
     });
