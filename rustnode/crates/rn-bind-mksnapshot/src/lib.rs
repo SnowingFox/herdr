@@ -28,13 +28,40 @@ use rn_v8_sys::v8;
 /// `contracts/mksnapshot.json`.
 pub const MEMBERS: &[&str] = &[
     "anonymousMainPath",
-    "compileSerializeMain",
     "isBuildingSnapshotBuffer",
     "runEmbedderPreload",
     "setDeserializeCallback",
     "setDeserializeMainFunction",
     "setSerializeCallback",
 ];
+
+/// The members this build does not install yet, with the reason.
+///
+/// `compileSerializeMain` compiles a main script into a `(require, __filename,
+/// __dirname)` function for `internal/main/mksnapshot.js`. The member itself is
+/// three lines — one `ScriptCompiler::CompileFunction` with those three
+/// parameters — but its only caller is that script, and nothing reaches it:
+///
+/// * `--build-snapshot` is rejected at argument parsing (`rustnode: unsupported
+///   option`), and `--prof-process` likewise;
+/// * no mksnapshot binary is built (`crates/rn-cli/Cargo.toml` declares exactly
+///   one `[[bin]]`);
+/// * `internal/main/mksnapshot` is never dispatched — `rn_realm::run_main_script`
+///   is called only for `internal/main/worker_thread`;
+/// * the script itself needs `internalBinding('sea')` at module scope, and `sea`
+///   has no Rust implementation in this tree.
+///
+/// So it is a declared deferral rather than a stub that throws: an installed
+/// member that cannot do its job reads as coverage, which is the exact defect
+/// the stub check exists to surface. Implementing it would add a member no code
+/// path can exercise.
+pub const DEFERRED: &[(&str, &str)] = &[(
+    "compileSerializeMain",
+    "compiles the main script for internal/main/mksnapshot.js, which is never \
+     dispatched: --build-snapshot is rejected at argument parsing, no mksnapshot \
+     binary is built, run_main_script is called only for worker_thread, and the \
+     script needs the unimplemented sea namespace at module scope",
+)];
 
 /// `kAnonymousMainPath` in `src/node_snapshotable.cc`: the name a snapshotted
 /// main script takes, so stack traces read sensibly.
@@ -64,6 +91,10 @@ impl BindingModule for Mksnapshot {
         MEMBERS
     }
 
+    fn deferred(&self) -> &'static [(&'static str, &'static str)] {
+        DEFERRED
+    }
+
     fn install<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
@@ -82,7 +113,7 @@ fn install_impl<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8
     BUILDING.with(|slot| *slot.borrow_mut() = Some(building));
 
     let object = v8::Object::new(scope);
-    let values: [(&str, v8::Local<v8::Value>); 7] = [
+    let values: [(&str, v8::Local<v8::Value>); 6] = [
         ("isBuildingSnapshotBuffer", flag_array),
         (
             "anonymousMainPath",
@@ -105,10 +136,6 @@ fn install_impl<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8
                 "setDeserializeMainFunction",
                 set_deserialize_main_function,
             )?,
-        ),
-        (
-            "compileSerializeMain",
-            function(scope, "compileSerializeMain", compile_serialize_main)?,
         ),
         (
             "runEmbedderPreload",
@@ -166,20 +193,6 @@ fn set_deserialize_main_function(
     set_deserialize_callback(scope, args, _rv);
 }
 
-fn compile_serialize_main(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue,
-) {
-    // Only reachable from `--build-snapshot`, which needs the rest of the
-    // snapshot pipeline. Failing loudly is better than returning a plausible
-    // answer that would produce a broken snapshot.
-    throw(
-        scope,
-        "compileSerializeMain is not implemented: rustnode does not build startup snapshots yet",
-    );
-}
-
 fn run_embedder_preload(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -220,12 +233,4 @@ fn set(
     let key = v8::String::new(scope, name).ok_or("cannot allocate a property name")?;
     object.set(scope, key.into(), value);
     Ok(())
-}
-
-fn throw(scope: &mut v8::PinScope, message: &str) {
-    let Some(message) = v8::String::new(scope, message) else {
-        return;
-    };
-    let exception = v8::Exception::error(scope, message);
-    scope.throw_exception(exception);
 }

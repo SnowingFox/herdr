@@ -222,14 +222,24 @@ fn every_contract_member_is_installed_or_deferred() {
 fn the_deferred_reason_names_the_missing_api() {
     // The point of a declared deferral is that the reason is actionable: it has to
     // say which V8 entry point is absent, not that the feature "is not supported".
+    //
+    // The claim was re-measured rather than carried over from the previous reason.
+    // The `v8` crate binds exactly one `HeapProfiler` method — `TakeHeapSnapshot`
+    // (`v8-152.2.0/src/binding.cc:4068`) — so both the callback registration and
+    // the graph walk are absent, and `Environment::BuildEmbedderGraph` does not
+    // exist to call.
     let (_, reason) = rn_bind_heap_utils::DEFERRED[0];
     assert!(
-        reason.contains("AddBuildEmbedderGraphCallback"),
-        "the reason must name the missing V8 API: {reason}"
+        reason.contains("HeapProfiler"),
+        "the reason must name the missing V8 API family: {reason}"
     );
     assert!(
-        reason.contains("EmbedderGraph"),
-        "the reason must name the type it needs: {reason}"
+        reason.contains("TakeHeapSnapshot"),
+        "the reason must say what the crate does bind instead: {reason}"
+    );
+    assert!(
+        reason.contains("BuildEmbedderGraph"),
+        "the reason must name the walk it needs: {reason}"
     );
 }
 

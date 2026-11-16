@@ -62,7 +62,6 @@ use rn_v8_sys::v8;
 pub const MEMBERS: &[&str] = &[
     "concat",
     "createBlob",
-    "createBlobFromFilePath",
     "getDataObject",
     "revokeObjectURL",
     "storeDataObject",
@@ -70,17 +69,27 @@ pub const MEMBERS: &[&str] = &[
 
 /// Members this build does not install yet.
 ///
-/// `createBlobFromFilePath` needs a file-backed part whose `pull` can report
-/// `STATUS_BLOCK` and be woken when the read completes. Every part here is
-/// memory-resident, so there is no such handle to build; the deferred member
-/// stays declared rather than returning a plausible-looking `undefined`, which
-/// `internal/blob.js` would turn into a `NotReadableError` for a file that
-/// exists and is readable.
+/// `createBlobFromFilePath` is `fs.openAsBlob()`/`fs.openAsBlobSync()`:
+/// `lib/fs.js:811,834` call it directly, so those two functions throw
+/// `_createBlobFromFilePath is not a function` today.
+///
+/// The gap is the handle representation, not a missing syscall. A rustnode blob
+/// handle is `{ArrayBuffer, start, end}` private properties over one
+/// memory-resident `ArrayBuffer` (see the module documentation), so a
+/// file-backed part cannot be expressed at all: `slice` would have to read the
+/// file, `new Blob([filePart])` would have to copy it, and `pull` has no way to
+/// answer "not yet" — which is exactly what `getBlobDataSync` in
+/// `lib/internal/blob.js` reads as the signal that a part is file-backed.
+/// Implementing it means a second handle kind, a `DataQueue`-shaped part list
+/// that can slice across parts, and an asynchronous read path that resumes
+/// `pull`; a synchronous stand-in would report a readable file as
+/// `NotReadableError`, which is a new divergence rather than a fix.
 pub const DEFERRED: &[(&str, &str)] = &[(
     "createBlobFromFilePath",
-    "needs a file-backed part with an asynchronous reader; every Blob part in \
-     this build is memory-resident, and a synchronous stand-in would report a \
-     readable file as NotReadableError",
+    "needs a file-backed blob part: a second handle kind, a part list that can \
+     slice across parts, and an asynchronous reader whose pull can report \
+     STATUS_BLOCK and be woken, none of which a memory-resident ArrayBuffer \
+     handle can express; fs.openAsBlob() and fs.openAsBlobSync() throw today",
 )];
 
 /// `bob::STATUS_EOS`: the reader reached the end.
@@ -855,8 +864,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn member_list_covers_the_recorded_contract() {
-        assert_eq!(MEMBERS.len(), 6);
+    fn member_list_covers_the_recorded_contract_without_the_deferral() {
+        assert_eq!(MEMBERS.len(), 5);
         for member in [
             "concat",
             "createBlob",
@@ -869,19 +878,23 @@ mod tests {
     }
 
     #[test]
-    fn the_deferred_member_is_declared_not_stubbed() {
+    fn the_deferred_member_is_declared_not_claimed() {
         // A stub returning `undefined` would make `internal/blob.js` report a
         // readable file as `NotReadableError`, so the gap is declared instead.
         //
-        // The member stays in `MEMBERS` as well: `MEMBERS` is the contract's
-        // recorded shape, and `DEFERRED` is what this build actually installs, so
-        // the pair says "the contract has it, this build defers it". `messaging`
-        // declares `moveMessagePortToContext` the same way.
+        // The member must not also be in `MEMBERS`. This test used to assert the
+        // opposite — that a deferred member "is still part of the recorded
+        // contract" and so belongs in both lists. That is the self-cancelling
+        // claim `sqlite.backup` shipped: `MEMBERS` means "this crate installs it",
+        // so a name in both lists removes itself from the contract subtraction and
+        // every declaration-only check reports the namespace clean while `lib/**`
+        // reads `undefined`. The contract records the member; `DEFERRED` is where a
+        // build that cannot install it says so.
         assert_eq!(DEFERRED.len(), 1);
         assert_eq!(DEFERRED[0].0, "createBlobFromFilePath");
         assert!(
-            MEMBERS.contains(&DEFERRED[0].0),
-            "a deferred member is still part of the recorded contract"
+            !MEMBERS.contains(&DEFERRED[0].0),
+            "a deferred member must not also be claimed as installed"
         );
         for (member, reason) in DEFERRED {
             assert!(!reason.is_empty(), "{member} needs a reason");

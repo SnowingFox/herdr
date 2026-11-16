@@ -56,15 +56,14 @@ pub const MEMBERS: &[&str] = &[
 ];
 
 /// Members the namespace needs but this crate does not install yet.
-pub const DEFERRED: &[(&str, &str)] = &[
-    // The growable flag is an accessor on the `SharedArrayBuffer` prototype the
-    // buffer namespace owns, so it is that crate's to publish rather than a V8
-    // call this one can make.
-    (
-        "getSharedArrayBufferGrowable",
-        "growable SAB flag, follows the buffer namespace",
-    ),
-];
+///
+/// Empty: every name in [`MEMBERS`] is installed. `getSharedArrayBufferGrowable`
+/// used to be here with a reason claiming the flag belonged to the buffer
+/// namespace; it does not. `src/node_util.cc`'s `Initialize` reads the `growable`
+/// accessor off a fresh `SharedArrayBuffer`'s prototype and republishes that same
+/// getter function under this name, which is a thing this crate can do on its
+/// own. See [`install_shared_array_buffer_growable`].
+pub const DEFERRED: &[(&str, &str)] = &[];
 
 /// The `SKIP_SYMBOLS` bit, used as the default when a caller omits the filter.
 ///
@@ -164,6 +163,12 @@ impl BindingModule for Util {
             "previewEntries" => preview_entries,
             "sleep" => sleep,
         }
+
+        // Installed after the macro block because the first of these is not a
+        // wrapper around a callback of ours, and the second is a `CHECK` that
+        // aborts rather than a `typeof` test.
+        install_array_buffer_view_has_buffer(scope, object);
+        install_shared_array_buffer_growable(scope, object);
 
         // `constants` is a nested object rather than a function.
         //
@@ -302,6 +307,154 @@ fn install_symbols<'s>(
         v8::String::new(scope, "privateSymbols").ok_or("cannot allocate the privateSymbols key")?;
     object.set(scope, key.into(), private.into());
     Ok(())
+}
+
+/// `arrayBufferViewHasBuffer(view)`: has the view's backing ArrayBuffer been
+/// allocated yet?
+///
+/// `src/node_util.cc:186-189` is three lines:
+///
+/// ```text
+/// void ArrayBufferViewHasBuffer(const FunctionCallbackInfo<Value>& args) {
+///   CHECK(args[0]->IsArrayBufferView());
+///   args.GetReturnValue().Set(args[0].As<ArrayBufferView>()->HasBuffer());
+/// }
+/// ```
+///
+/// `CHECK` aborts the process, and it is not defensive: `lib/**` has no caller
+/// (the contract records `origin: runtime` for this member and the recorder only
+/// ever held it through `internal/test/binding`), so the only way to reach this
+/// is JavaScript that already knows it holds a view. Answering `false` for a
+/// non-view would turn a caller's bug into the plausible claim "this view has
+/// been detached", so the abort is reproduced rather than papered over;
+/// `node -e "internalBinding('util').arrayBufferViewHasBuffer({})"` prints
+/// `Assertion failed: args[0]->IsArrayBufferView()` and dies the same way.
+///
+/// # The one divergence, and why it cannot be fixed here
+///
+/// Everything below is a single mechanism. V8's definition
+/// (`v8/src/api/api.cc:9483`) is:
+///
+/// ```text
+/// bool v8::ArrayBufferView::HasBuffer() const {
+///   if (!IsJSTypedArray(*self)) return true;      // DataView: always true
+///   return !typed_array->is_on_heap();
+/// }
+/// ```
+///
+/// A TypedArray created **without** a supplied buffer keeps its elements in the
+/// JS heap while its length is at or below `v8_typed_array_max_size_in_heap`, and
+/// `HasBuffer()` is `false` for exactly those. Supplying a buffer, of any length
+/// including zero, or reading `.buffer` (which materializes one), makes it
+/// `true`. Measured on the pinned nightly:
+///
+/// ```text
+/// new Uint8Array(0)                      false   <- no buffer, len 0
+/// new Uint8Array(64)                     false   <- no buffer, len <= 64
+/// new Uint8Array(65)                     true    <- over the threshold
+/// new Uint8Array(new ArrayBuffer(0))     true    <- buffer supplied
+/// new DataView(new ArrayBuffer(0))       true    <- not a TypedArray
+/// ```
+///
+/// That threshold is a build flag, and the two builds differ: Node's `deps/v8`
+/// uses the 64-byte default, while the `v8` crate rustnode links sets
+/// `v8_typed_array_max_size_in_heap = 0` (`v8-152.2.0/.gn:58`, "so that small
+/// buffers do not get moved around by the garbage collector"). With a threshold
+/// of zero no TypedArray is ever on-heap, so `HasBuffer()` is `true` for every
+/// live view here.
+///
+/// This is not a hidden-accessor problem — the state genuinely does not exist in
+/// this build, and `is_on_heap` is not in V8's public API in any case. It is
+/// therefore not fixable by a special case: returning `false` for length zero
+/// would match `new Uint8Array(0)` while **breaking** `new Uint8Array(new
+/// ArrayBuffer(0))` and `new DataView(new ArrayBuffer(0))`, which are `true` on
+/// the oracle. One wrong answer traded for two is worse than a documented
+/// divergence, so the honest shape is this note plus tests that pin the invariant
+/// which does hold in both runtimes: a detached view and a view over a supplied
+/// buffer both report `true`.
+fn install_array_buffer_view_has_buffer(scope: &mut v8::PinScope, object: v8::Local<v8::Object>) {
+    // `rn_core::method` is Node's `SetMethod`, which is how `src/node_util.cc`
+    // publishes this: `SetMethod(context, target, "arrayBufferViewHasBuffer", …)`.
+    // A bare `FunctionTemplate::builder` defaults to `ConstructorBehavior::Allow`
+    // and would make `new binding.arrayBufferViewHasBuffer()` legal here while
+    // Node throws — the exact permissiveness #121 closed.
+    let template = rn_core::method(
+        |scope: &mut v8::PinScope<'_, '_>,
+         args: v8::FunctionCallbackArguments<'_>,
+         mut rv: v8::ReturnValue| {
+            let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(0)) else {
+                check_failed("args[0]->IsArrayBufferView()");
+                return;
+            };
+            rv.set(v8::Boolean::new(scope, view.has_buffer()).into());
+        },
+    )
+    .build(scope);
+    if let (Some(key), Some(function)) = (
+        v8::String::new(scope, "arrayBufferViewHasBuffer"),
+        template.get_function(scope),
+    ) {
+        // `SetMethod` names the function after the property it is published under,
+        // which is observable as `f.name` and reaches stack traces and
+        // `util.inspect`. `FunctionTemplate::builder` leaves it `""`, so it has to
+        // be set here; `getSharedArrayBufferGrowable` needs no equivalent because
+        // it republishes a getter V8 already named.
+        function.set_name(key);
+        object.set(scope, key.into(), function.into());
+    }
+}
+
+/// `getSharedArrayBufferGrowable`: the `growable` getter itself, republished.
+///
+/// `src/node_util.cc:529-546` does not implement anything. It allocates an empty
+/// `SharedArrayBuffer`, reads the `growable` accessor off that instance's
+/// prototype, and sets the resulting getter function on the target under this
+/// name. The consequence is observable and the reason this has to be done the
+/// same way: `util.getSharedArrayBufferGrowable` *is*
+/// `Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'growable').get`
+/// — same function identity, so its `name` is `"get growable"`, and calling it on
+/// a non-`SharedArrayBuffer` receiver throws V8's own
+/// `TypeError: Method get SharedArrayBuffer.prototype.growable called on
+/// incompatible receiver`.
+///
+/// A hand-written `Boolean::new(scope, ...)` wrapper would answer the same for a
+/// real SharedArrayBuffer and differently for everything else, which is exactly
+/// the kind of near-miss this binding is supposed to stop producing.
+fn install_shared_array_buffer_growable(scope: &mut v8::PinScope, object: v8::Local<v8::Object>) {
+    let Some(probe) = v8::SharedArrayBuffer::new(scope, 0) else {
+        return;
+    };
+    let Some(prototype) = probe.get_prototype(scope) else {
+        return;
+    };
+    let Ok(prototype) = v8::Local::<v8::Object>::try_from(prototype) else {
+        return;
+    };
+    let Some(growable) = v8::String::new(scope, "growable") else {
+        return;
+    };
+    let Some(descriptor) = prototype.get_own_property_descriptor(scope, growable.into()) else {
+        return;
+    };
+    let Ok(descriptor) = v8::Local::<v8::Object>::try_from(descriptor) else {
+        return;
+    };
+    let Some(getter_name) = v8::String::new(scope, "get") else {
+        return;
+    };
+    let Some(getter) = descriptor.get(scope, getter_name.into()) else {
+        return;
+    };
+    if let Some(key) = v8::String::new(scope, "getSharedArrayBufferGrowable") {
+        object.set(scope, key.into(), getter);
+    }
+}
+
+/// Reproduces Node's `CHECK`/`Assertion failed` for the places this crate has to
+/// keep one: the abort is the contract.
+fn check_failed(expression: &str) {
+    rn_core::hook_slot::write_stderr(&format!("\n#\n# Assertion failed: {expression}\n#\n"));
+    std::process::abort();
 }
 
 fn construct_shared_array_buffer(
@@ -1396,5 +1549,19 @@ mod tests {
         // `NODE_OPTIONS`, which is parsed in C++ and never calls this binding.
         assert!(!DEFERRED.iter().any(|(member, _)| *member == "parseEnv"));
         assert!(MEMBERS.contains(&"parseEnv"));
+    }
+
+    #[test]
+    fn the_growable_flag_does_not_belong_to_another_namespace() {
+        // The reason this member carried while it was deferred said the growable
+        // flag "follows the buffer namespace". It does not: `src/node_util.cc`
+        // reads the getter off a fresh `SharedArrayBuffer`'s prototype, which is
+        // V8's own object and needs nothing from any crate. A deferral that names
+        // the wrong owner is worse than no deferral, so this pins the correction.
+        assert!(!DEFERRED
+            .iter()
+            .any(|(member, _)| *member == "getSharedArrayBufferGrowable"));
+        assert!(MEMBERS.contains(&"getSharedArrayBufferGrowable"));
+        assert!(DEFERRED.is_empty());
     }
 }

@@ -107,14 +107,16 @@ matching `MKDirpSync`.
 | `writeFileUtf8` | `writeFileSync(path, string)` fast path |
 | `rmSync` | `fs.rmSync`'s recursive remove, with Node's retry policy |
 | `internalModuleStat` | `0` file, `1` directory, `< 0` errno, for the module loader |
-| `handleToFd` | Windows-only; reports `ENOSYS` here |
 | `FSReqCallback` | the request-object constructor `new FSReqCallback()` needs |
 | `ReadFileJob`, `WriteFileJob` | one-shot open+fstat+read+close (or open+write+close) jobs on libuv's threadpool; `lib/fs.js` and `lib/internal/fs/promises.js` construct them for every `fs.readFile`/`fs.writeFile` with `options.buffer === undefined` |
 | `kUsePromises` | the sentinel that selects promise mode |
 
-`handleToFd` is present but not functional on Linux. `lib/internal/fs/streams.js`
-throws `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` before it ever calls the binding, so
-having the member exist and fail keeps the JS layer on its documented path.
+`handleToFd` is not installed at all, because Node does not install it on Linux
+either: `src/node_file.cc` registers it under `#ifdef _WIN32` only. The contract
+records it from the static pass over `lib/**` (`internal/fs/streams.js:186`, the
+`windowsHandle` path), so it is declared in `DEFERRED` with a platform reason
+rather than claimed as installed. `lib/internal/fs/streams.js` throws
+`ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` before it would ever reach the binding.
 
 ## The three calling conventions
 

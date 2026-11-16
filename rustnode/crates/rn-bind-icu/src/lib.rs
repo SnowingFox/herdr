@@ -37,28 +37,38 @@ use rn_v8_sys::v8;
 use unicode_width::UnicodeWidthChar;
 
 /// Members exposed on the namespace object, matching `contracts/icu.json`.
-pub const MEMBERS: &[&str] = &[
-    "decode",
-    "getConverter",
-    "getStringWidth",
-    "hasConverter",
-    "icuErrName",
-    "transcode",
-];
+pub const MEMBERS: &[&str] = &["getStringWidth", "icuErrName", "transcode"];
 
 /// Members this build does not install yet.
+///
+/// One subsystem, reachable from user code: `lib/internal/encoding.js` builds
+/// every `TextDecoder` with `getConverter`, so `new TextDecoder('shift_jis')`
+/// throws `icuGetConverter is not a function` today.
+///
+/// What it needs is an ICU converter bound over V8's bundled ICU.
+/// `src/node_i18n.cc`'s `ConverterObject` is `ucnv_open` + `ucnv_toUnicode`
+/// with a per-handle state carried across calls, which is what makes
+/// `TextDecoder({ stream: true })` split a multi-byte character across chunks
+/// correctly. The four encodings `transcode` covers are a closed list; a
+/// converter is an arbitrary ICU charset, and a table of the nine multibyte
+/// names `lib/internal/encoding/single-byte.js` does not handle itself would be
+/// a second converter implementation that disagrees with ICU on invalid input.
 pub const DEFERRED: &[(&str, &str)] = &[
     (
         "getConverter",
-        "needs an ICU converter object; the four encodings buffer.js uses are handled by transcode",
+        "needs an ICU converter handle (ucnv_open/ucnv_toUnicode) over the ICU \
+         V8 bundles, with per-handle decoder state so a streamed chunk can end \
+         mid-character; TextDecoder() cannot be constructed without it",
     ),
     (
         "decode",
-        "part of the converter surface, same scope as getConverter",
+        "the namespace-level ucnv_toUnicode call that consumes a getConverter \
+         handle, deferred with it",
     ),
     (
         "hasConverter",
-        "part of the converter surface, same scope as getConverter",
+        "reports whether a charset label resolves in ICU, which needs the same \
+         ucnv_open; deferred with getConverter",
     ),
 ];
 

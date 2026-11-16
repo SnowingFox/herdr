@@ -909,3 +909,48 @@ fn the_addon_can_reach_the_event_loop() {
     ));
     assert_eq!(stdout, "true");
 }
+#[test]
+fn a_real_addon_loads_from_bytes_through_dlopen_binary() {
+    // `process_methods.dlopenBinary(module, filename, flags, binary)` is what
+    // `lib/internal/vfs/setup.js:1093` uses for an addon that lives in a virtual
+    // file system, where `dlopen(2)` has no inode to open: the bytes are handed
+    // over and materialized into a private, self-cleaning image first.
+    //
+    // This drives the same compiled addon through that path rather than through
+    // `require()`, so it proves the image is a loadable object and not just that
+    // the argument checks run. The filename is deliberately one no file backs:
+    // only the bytes may be used, and every diagnostic would still name it.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const fs = require('fs');\n\
+         const {{ internalBinding }} = require('internal/bootstrap/realm');\n\
+         const pm = internalBinding('process_methods');\n\
+         const bytes = fs.readFileSync({paths});\n\
+         const mod = {{ exports: {{}} }};\n\
+         pm.dlopenBinary(mod, '/virtual/in-a-vfs.node', 0, bytes);\n\
+         console.log(mod.exports.addonName, mod.exports.add(2, 3));",
+        paths = literal(&build.path)
+    ));
+    assert_eq!(stdout, "rustnode-test-addon 5");
+}
+
+#[test]
+fn dlopen_binary_rejects_an_argument_that_is_not_a_view() {
+    // `src/node_binding.cc:822-827` checks `args[3]->IsArrayBufferView()` and
+    // throws `ERR_INVALID_ARG_TYPE` with this exact wording. Accepting a string or
+    // an object would mean materializing something that is not the addon.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const fs = require('fs');\n\
+         const {{ internalBinding }} = require('internal/bootstrap/realm');\n\
+         const pm = internalBinding('process_methods');\n\
+         const bytes = fs.readFileSync({paths});\n\
+         try {{ pm.dlopenBinary({{ exports: {{}} }}, '/virtual/x.node', 0, 'not a view'); }}\n\
+         catch (error) {{ console.log(error.name, error.code, error.message); }}",
+        paths = literal(&build.path)
+    ));
+    assert_eq!(
+        stdout,
+        "TypeError ERR_INVALID_ARG_TYPE binary must be a Buffer, TypedArray, or DataView"
+    );
+}

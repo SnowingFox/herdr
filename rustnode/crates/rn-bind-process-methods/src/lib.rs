@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 
 mod dlopen;
 
-use dlopen::dlopen as dlopen_binding;
+use dlopen::{dlopen as dlopen_binding, dlopen_binary};
 use rn_core::{AliasedUint8Array, BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
@@ -68,25 +68,17 @@ pub const MEMBERS: &[&str] = &[
     "uptime",
 ];
 
-/// Members this build does not install yet, each with the reason.
-pub const DEFERRED: &[(&str, &str)] = &[
-    (
-        "dlopenBinary",
-        "loads an addon from bytes via a self-cleaning image; dlopen itself is implemented",
-    ),
-    (
-        "causeSegfault",
-        "exists only for Node's crash-handler tests and deliberately crashes the process",
-    ),
-    (
-        "execve",
-        "needs the event loop to quiesce before replacing the process image",
-    ),
-    (
-        "setEmitWarningSync",
-        "needs the warning subsystem that process.emitWarning will be built on",
-    ),
-];
+/// Members the namespace needs but this crate does not install yet, each with the
+/// reason.
+///
+/// Empty: all thirty-one contract members are installed. `causeSegfault`,
+/// `dlopenBinary`, `execve` and `setEmitWarningSync` used to be listed here while
+/// also appearing in [`MEMBERS`], which is the self-cancelling claim the structure
+/// gate exists to catch — `MEMBERS` says "this crate installs it" and `DEFERRED`
+/// says "it does not", so `rn-compat` subtracted the member from its own gap and
+/// reported the namespace clean while `lib/**` read `undefined`. See each
+/// implementation below for what the real body is.
+pub const DEFERRED: &[(&str, &str)] = &[];
 
 /// `kHrTimeBufferLength` in `src/node_process.h`: the legacy `hrtime()` fills a
 /// `Uint32Array` of this many entries.
@@ -159,9 +151,13 @@ impl BindingModule for ProcessMethods {
         });
 
         let object = v8::Object::new(scope);
-        let values: [(&str, v8::Local<v8::Value>); 27] = [
+        let values: [(&str, v8::Local<v8::Value>); 31] = [
             ("hrtimeBuffer", array),
             ("dlopen", function(scope, "dlopen", dlopen_binding)?),
+            (
+                "dlopenBinary",
+                function(scope, "dlopenBinary", dlopen_binary)?,
+            ),
             ("cwd", function(scope, "cwd", cwd)?),
             ("chdir", function(scope, "chdir", chdir)?),
             ("umask", function(scope, "umask", umask)?),
@@ -222,6 +218,15 @@ impl BindingModule for ProcessMethods {
             (
                 "loadEnvFile",
                 function(scope, "loadEnvFile", load_env_file)?,
+            ),
+            (
+                "causeSegfault",
+                function(scope, "causeSegfault", cause_segfault)?,
+            ),
+            ("execve", function(scope, "execve", execve)?),
+            (
+                "setEmitWarningSync",
+                function(scope, "setEmitWarningSync", set_emit_warning_sync)?,
             ),
         ];
         for (name, value) in values {
@@ -939,6 +944,364 @@ fn throw_file_error(scope: &mut v8::PinScope<'_, '_>, code: &str, path: &str) {
     scope.throw_exception(exception);
 }
 
+/// `causeSegfault()`: crash the process deliberately.
+///
+/// `src/node_process_methods.cc:77-81` writes through a null pointer:
+///
+/// ```text
+/// static void CauseSegfault(const FunctionCallbackInfo<Value>& args) {
+///   // This should crash hard all platforms.
+///   void* volatile* d = static_cast<void* volatile*>(nullptr);
+///   *d = nullptr;
+/// }
+/// ```
+///
+/// Its only caller is `test/abort/test-signal-handler.js`, which installs a
+/// `SIGSEGV` handler and then asserts the handler ran — so the process must die
+/// from a real segmentation fault, not from `abort()`, which raises `SIGABRT` and
+/// would make the test pass for the wrong reason. `std::process::abort` is
+/// therefore not a substitute here.
+///
+/// # Safety
+///
+/// This is the whole point of the member. It is reachable only from JavaScript
+/// that asked for it, and the write is the same one Node performs.
+fn cause_segfault(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue,
+) {
+    // SAFETY: deliberately dereferencing null to raise SIGSEGV, which is the
+    // behaviour `test-signal-handler.js` requires. `write_volatile` stops the
+    // optimiser from removing the store.
+    unsafe {
+        let target = std::ptr::null_mut::<*mut std::ffi::c_void>();
+        std::ptr::write_volatile(target, std::ptr::null_mut());
+    }
+}
+
+// The `emitWarningSync` function `setEmitWarningSync` last installed.
+//
+// Node keeps it in `env->process_emit_warning_sync()`, a per-environment
+// `Global<Function>`. It is read by `ProcessEmitWarningSync` in
+// `src/node_process_events.cc:23-45`, which the contextify and module-wrap
+// paths call when V8 rejects a code cache, and by the fatal-error path. A
+// `thread_local` because one isolate per thread is the model the rest of this
+// crate uses for the same reason.
+thread_local! {
+    static EMIT_WARNING_SYNC: std::cell::RefCell<Option<v8::Global<v8::Function>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// `setEmitWarningSync(fn)`.
+///
+/// `src/node_process_methods.cc:775-779`:
+///
+/// ```text
+/// static void SetEmitWarningSync(const FunctionCallbackInfo<Value>& args) {
+///   CHECK(args[0]->IsFunction());
+///   Environment* env = Environment::GetCurrent(args);
+///   env->set_process_emit_warning_sync(args[0].As<Function>());
+/// }
+/// ```
+///
+/// It returns `undefined`, and `lib/internal/bootstrap/node.js:357` calls it
+/// once at bootstrap with `emitWarningSync` from `internal/process/warning`. The
+/// `CHECK` aborts rather than throwing: the only caller is the bootstrap, so a
+/// non-function argument is a build defect, and the oracle aborts on
+/// `setEmitWarningSync(1)` too.
+fn set_emit_warning_sync(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue,
+) {
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(0)) else {
+        check_failed("args[0]->IsFunction()");
+        return;
+    };
+    let callback = v8::Global::new(scope, callback);
+    EMIT_WARNING_SYNC.with(|slot| *slot.borrow_mut() = Some(callback));
+}
+
+/// Emits a warning synchronously through the installed callback.
+///
+/// The Rust counterpart of `ProcessEmitWarningSync`. Returns `false` when no
+/// callback has been installed yet, which Node treats as a `CHECK` failure
+/// ("called too early — before the bootstrap is even finished") in
+/// `ProcessEmitWarningSync` but which a Rust caller can only report.
+pub fn emit_warning_sync(scope: &mut v8::PinScope<'_, '_>, message: &str) -> bool {
+    let callback = EMIT_WARNING_SYNC.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|callback| v8::Local::new(scope, callback))
+    });
+    let Some(callback) = callback else {
+        return false;
+    };
+    let Some(message) = v8::String::new(scope, message) else {
+        return false;
+    };
+    callback
+        .call(scope, v8::undefined(scope).into(), &[message.into()])
+        .is_some()
+}
+
+/// Reproduces Node's `CHECK`/`Assertion failed` where this crate has to keep one.
+fn check_failed(expression: &str) {
+    rn_core::hook_slot::write_stderr(&format!("\n#\n# Assertion failed: {expression}\n#\n"));
+    std::process::abort();
+}
+
+/// `execve(executable, argv, envp)`: replace the process image.
+///
+/// `src/node_process_methods.cc:532-617`. The order of operations is the
+/// contract, not an implementation detail:
+///
+/// 1. `CHECK` the argument shapes (`string`, `Array`, `Array`), which abort.
+/// 2. Check the `child_process` permission scope against the executable.
+/// 3. Build NUL-terminated `argv`/`envp` vectors from the two arrays.
+/// 4. Clear `FD_CLOEXEC` on fds 0, 1 and 2 so the new image inherits them,
+///    remembering each previous flag. A failure here restores the ones already
+///    cleared and throws the `fcntl` errno.
+/// 5. `execve(2)`. On success nothing below runs — the address space is gone.
+/// 6. On failure, restore all three `FD_CLOEXEC` flags and throw the errno as an
+///    `Error` with `errno`, `code`, `syscall: 'execve'` and the path.
+///
+/// Node deliberately does **not** run `RunAtExit` first: a successful `execve`
+/// discards the address space, and a failed one must leave the environment
+/// intact so the thrown error is observable. That is why the event loop does not
+/// need to quiesce, which is what the old deferral reason claimed — the reason
+/// was wrong, and `lib/internal/process/per_thread.js:282` calls straight
+/// through to this.
+///
+/// On success this function does not return.
+fn execve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue,
+) {
+    let Ok(executable) = v8::Local::<v8::String>::try_from(args.get(0)) else {
+        check_failed("args[0]->IsString()");
+        return;
+    };
+    let Ok(argv_array) = v8::Local::<v8::Array>::try_from(args.get(1)) else {
+        check_failed("args[1]->IsArray()");
+        return;
+    };
+    let Ok(envp_array) = v8::Local::<v8::Array>::try_from(args.get(2)) else {
+        check_failed("args[2]->IsArray()");
+        return;
+    };
+    let executable = executable.to_rust_string_lossy(scope);
+
+    if let Some(denied) = rn_permission::runtime::deny_child_process(&executable) {
+        denied.throw(scope);
+        return;
+    }
+
+    let argv_strings = match string_array(scope, argv_array, "argument") {
+        Ok(values) => values,
+        Err(message) => {
+            dlopen::throw_code(scope, "ERR_INVALID_ARG_VALUE", &message, false);
+            return;
+        }
+    };
+    let envp_strings = match string_array(scope, envp_array, "environment variable") {
+        Ok(values) => values,
+        Err(message) => {
+            dlopen::throw_code(scope, "ERR_INVALID_ARG_VALUE", &message, false);
+            return;
+        }
+    };
+
+    let mut argv = c_strings(&argv_strings);
+    let mut envp = c_strings(&envp_strings);
+    let mut argv_ptrs: Vec<*const libc::c_char> =
+        argv.iter_mut().map(|value| value.as_ptr()).collect();
+    let mut envp_ptrs: Vec<*const libc::c_char> =
+        envp.iter_mut().map(|value| value.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    envp_ptrs.push(std::ptr::null());
+
+    // The executable path needs to be NUL-terminated and NUL-free; an interior
+    // NUL cannot reach here because V8 strings are NUL-terminated in UTF-8 and
+    // the permission check above already copied it, so it is checked explicitly
+    // rather than assumed.
+    let Ok(path) = std::ffi::CString::new(executable.as_str()) else {
+        dlopen::throw_code(
+            scope,
+            "ERR_INVALID_ARG_VALUE",
+            "The \"execPath\" argument must not contain null bytes.",
+            false,
+        );
+        return;
+    };
+
+    let mut saved = [0 as libc::c_int; 3];
+    for (fd, slot) in saved.iter_mut().enumerate() {
+        // SAFETY: `fd` is 0, 1 or 2 and `F_GETFD` takes no further argument.
+        let previous = unsafe { libc::fcntl(fd as libc::c_int, libc::F_GETFD) };
+        if previous < 0 {
+            let errno = std::io::Error::last_os_error();
+            for (restore_fd, flag) in saved.iter().enumerate().take(fd) {
+                // SAFETY: restoring a flag this loop observed a moment ago.
+                unsafe { libc::fcntl(restore_fd as libc::c_int, libc::F_SETFD, *flag) };
+            }
+            throw_errno(scope, "fcntl", &errno, None);
+            return;
+        }
+        // SAFETY: clearing `FD_CLOEXEC` on a standard stream.
+        if unsafe {
+            libc::fcntl(
+                fd as libc::c_int,
+                libc::F_SETFD,
+                previous & !libc::FD_CLOEXEC,
+            )
+        } < 0
+        {
+            let errno = std::io::Error::last_os_error();
+            for (restore_fd, flag) in saved.iter().enumerate().take(fd) {
+                // SAFETY: as above.
+                unsafe { libc::fcntl(restore_fd as libc::c_int, libc::F_SETFD, *flag) };
+            }
+            throw_errno(scope, "fcntl", &errno, None);
+            return;
+        }
+        *slot = previous;
+    }
+
+    // SAFETY: `path`, `argv_ptrs` and `envp_ptrs` are all NUL-terminated and
+    // outlive this call. On success it does not return; on failure it returns
+    // -1 with `errno` set.
+    unsafe {
+        libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+    }
+    let errno = std::io::Error::last_os_error();
+
+    for (fd, flag) in saved.iter().enumerate() {
+        // SAFETY: restoring the flags observed before the call.
+        unsafe { libc::fcntl(fd as libc::c_int, libc::F_SETFD, *flag) };
+    }
+    throw_errno(scope, "execve", &errno, Some(&executable));
+}
+
+/// Reads a JavaScript array of strings into owned Rust strings.
+///
+/// `Utf8Value(isolate, str).ToString()` in Node coerces each element, so a
+/// non-string element becomes its string form rather than an error; only a
+/// failed `Get` is reported, which is the one case V8 leaves an exception
+/// pending for.
+fn string_array(
+    scope: &mut v8::PinScope<'_, '_>,
+    array: v8::Local<v8::Array>,
+    what: &str,
+) -> Result<Vec<String>, String> {
+    let length = array.length();
+    let mut values = Vec::with_capacity(length as usize);
+    for index in 0..length {
+        let Some(value) = array.get_index(scope, index) else {
+            return Err(format!("Failed to deserialize {what}."));
+        };
+        values.push(value.to_rust_string_lossy(scope));
+    }
+    Ok(values)
+}
+
+fn c_strings(values: &[String]) -> Vec<std::ffi::CString> {
+    values
+        .iter()
+        .map(|value| {
+            // An interior NUL cannot survive `Utf8Value` in Node either, so the
+            // truncated prefix is what both runtimes hand to `execve`.
+            std::ffi::CString::new(value.as_str()).unwrap_or_else(|error| {
+                std::ffi::CString::new(error.into_vec()).unwrap_or_default()
+            })
+        })
+        .collect()
+}
+
+/// Throws the `Error` shape `Environment::ThrowErrnoException` produces.
+///
+/// `src/api/exceptions.cc:59-108` builds it as `code + ", " + strerror(errno)`,
+/// then ` + " 'path'"` when a path is present, with `errno`, `code`, `syscall`
+/// and `path` as plain data properties. The `strerror` half is the libc text, not
+/// a table of this crate's own: `node` prints `ENOENT, No such file or directory
+/// '/x'` and a hand-written description would be a second copy that drifts.
+fn throw_errno(
+    scope: &mut v8::PinScope<'_, '_>,
+    syscall: &str,
+    error: &std::io::Error,
+    path: Option<&str>,
+) {
+    let errno = error.raw_os_error().unwrap_or(0);
+    let code = errno_code(errno);
+    let description = errno_description(errno);
+    let message = match path {
+        Some(path) => format!("{code}, {description} '{path}'"),
+        None => format!("{code}, {description}"),
+    };
+    let Some(text) = v8::String::new(scope, &message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
+        if let Some(key) = v8::String::new(scope, "code") {
+            if let Some(value) = v8::String::new(scope, &code) {
+                let _ = object.set(scope, key.into(), value.into());
+            }
+        }
+        if let Some(key) = v8::String::new(scope, "errno") {
+            let _ = object.set(scope, key.into(), v8::Integer::new(scope, errno).into());
+        }
+        if let Some(key) = v8::String::new(scope, "syscall") {
+            if let Some(value) = v8::String::new(scope, syscall) {
+                let _ = object.set(scope, key.into(), value.into());
+            }
+        }
+        if let Some(path) = path {
+            if let Some(key) = v8::String::new(scope, "path") {
+                if let Some(value) = v8::String::new(scope, path) {
+                    let _ = object.set(scope, key.into(), value.into());
+                }
+            }
+        }
+    }
+    scope.throw_exception(exception);
+}
+
+/// `errors::errno_string`, which is `uv_err_name`: the portable name for a
+/// number, not the platform's `sys_errlist` string.
+fn errno_code(errno: i32) -> String {
+    match errno {
+        libc::ENOENT => "ENOENT".to_string(),
+        libc::EACCES => "EACCES".to_string(),
+        libc::EPERM => "EPERM".to_string(),
+        libc::ENOEXEC => "ENOEXEC".to_string(),
+        libc::ENOMEM => "ENOMEM".to_string(),
+        libc::E2BIG => "E2BIG".to_string(),
+        libc::EIO => "EIO".to_string(),
+        libc::EBADF => "EBADF".to_string(),
+        libc::EINVAL => "EINVAL".to_string(),
+        libc::ETXTBSY => "ETXTBSY".to_string(),
+        libc::ENOTDIR => "ENOTDIR".to_string(),
+        other => format!("UNKNOWN({other})"),
+    }
+}
+
+/// `strerror(errno)`, which is the half of the message after `", "`.
+fn errno_description(errno: i32) -> String {
+    // SAFETY: `strerror` returns a pointer to a static NUL-terminated string for
+    // any integer; it never returns null on glibc.
+    let pointer = unsafe { libc::strerror(errno) };
+    if pointer.is_null() {
+        return "unknown error".to_string();
+    }
+    // SAFETY: as above, the pointer is a NUL-terminated static string.
+    unsafe { std::ffi::CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Parses the `KEY=value` form `--env-file` accepts.
 ///
 /// Quoted values, comments and blank lines are handled; `${VAR}` expansion is
@@ -980,6 +1343,15 @@ fn function<'s>(
     let function = template
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate {name}"))?;
+    // `SetMethod(isolate, target, "name", fn)` names the function after its
+    // property, which is observable as `f.name` and shows up in stack traces and
+    // `util.inspect`. `FunctionTemplate::builder` leaves it `""`, so every member
+    // published through this helper would otherwise report an empty name where
+    // Node reports the member's own. Setting it here covers all 30 call sites
+    // rather than each one repeating it.
+    if let Some(key) = v8::String::new(scope, name) {
+        function.set_name(key);
+    }
     Ok(function.into())
 }
 

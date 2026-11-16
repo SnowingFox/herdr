@@ -27,10 +27,39 @@ pub const MEMBERS: &[&str] = &[
     "configs",
     "getCacheUsage",
     "hasCachedBuiltins",
-    "importBuiltinSourceTextModule",
     "natives",
     "setInternalLoaders",
 ];
+
+/// The members this build does not install yet, with the reason.
+///
+/// `importBuiltinSourceTextModule(id)` compiles, instantiates and evaluates one of
+/// the eleven `internal/deps/v8/tools/**.mjs` builtins as a real ES module and
+/// returns `{ promise, namespace }`. Its only caller is
+/// `internal/main/prof_process.js:32`, behind `--prof-process`.
+///
+/// Nothing in that chain exists here, and the gap is not the binding:
+///
+/// * the `.mjs` builtins are not vendored — `vendor/libnode-js/deps/` holds only
+///   `acorn` and `undici`, and the builtin table has no `internal/deps/v8/tools/*`
+///   id at all;
+/// * `rn-js2c` rejects an `.mjs` outright (`crates/rn-js2c/src/scheme.rs:371`)
+///   because Node's js2c embeds it as a `SourceTextModule`, which that scheme does
+///   not cover;
+/// * `rn-builtin-codegen` compiles every builtin with `compile_function` and has
+///   no module branch (`crates/rn-builtin-codegen/src/lib.rs:134`);
+/// * `--prof-process` is rejected at argument parsing, so the main script is never
+///   dispatched.
+///
+/// Installing a stub would report a member that cannot work as coverage, which is
+/// what the stub check is for; the honest shape is a declared deferral.
+pub const DEFERRED: &[(&str, &str)] = &[(
+    "importBuiltinSourceTextModule",
+    "needs the eleven deps/v8/tools/**.mjs builtins vendored, an rn-js2c that \
+     embeds an ES module instead of rejecting it, a module branch in \
+     rn-builtin-codegen, and --prof-process dispatched as a main script; its only \
+     caller is internal/main/prof_process.js behind that flag",
+)];
 
 pub struct Builtins;
 
@@ -41,6 +70,10 @@ impl BindingModule for Builtins {
 
     fn members(&self) -> &'static [&'static str] {
         MEMBERS
+    }
+
+    fn deferred(&self) -> &'static [(&'static str, &'static str)] {
+        DEFERRED
     }
 
     fn install<'s>(
@@ -65,7 +98,7 @@ impl BindingModule for Builtins {
         lazy_member(scope, object, "builtinCategories", categories_getter)?;
         lazy_member(scope, object, "natives", natives_getter)?;
 
-        let values: [(&str, v8::Local<v8::Value>); 5] = [
+        let values: [(&str, v8::Local<v8::Value>); 4] = [
             (
                 "hasCachedBuiltins",
                 function(scope, "hasCachedBuiltins", has_cached_builtins)?,
@@ -77,14 +110,6 @@ impl BindingModule for Builtins {
             (
                 "setInternalLoaders",
                 function(scope, "setInternalLoaders", set_internal_loaders)?,
-            ),
-            (
-                "importBuiltinSourceTextModule",
-                function(
-                    scope,
-                    "importBuiltinSourceTextModule",
-                    import_source_text_module,
-                )?,
             ),
             (
                 "compileFunction",
@@ -355,17 +380,6 @@ fn set_internal_loaders(
     );
 }
 
-fn import_source_text_module(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    _rv: v8::ReturnValue,
-) {
-    throw(
-        scope,
-        "importBuiltinSourceTextModule is not implemented yet",
-    );
-}
-
 fn function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
@@ -397,7 +411,14 @@ mod tests {
 
     #[test]
     fn member_list_covers_the_recorded_contract() {
-        assert_eq!(MEMBERS.len(), 10);
+        // Nine installed members plus the one declared in [`DEFERRED`] are the
+        // contract's ten. `importBuiltinSourceTextModule` is absent from
+        // `MEMBERS` because `install()` does not set it: a name in both lists
+        // cancels itself out of the contract subtraction, which is how
+        // `sqlite.backup` stayed green while `lib/**` read `undefined`.
+        assert_eq!(MEMBERS.len(), 9);
+        assert_eq!(MEMBERS.len() + DEFERRED.len(), 10);
+        assert!(!MEMBERS.contains(&"importBuiltinSourceTextModule"));
         for member in [
             "compileFunction",
             "builtinIds",
@@ -533,7 +554,7 @@ mod tests {
         // would be built on every start again, which is the cost this exists to
         // avoid; the contract check cannot see the difference because both
         // shapes answer the same reads.
-        assert_eq!(MEMBERS.len(), 10);
+        assert_eq!(MEMBERS.len(), 9);
         for name in ["natives", "builtinCategories"] {
             assert!(
                 MEMBERS.contains(&name),

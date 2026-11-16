@@ -926,13 +926,6 @@ pub fn rm_sync(
     }
 }
 
-/// `handleToFd` is a Windows-only helper; on Unix Node answers with
-/// `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` before reaching the binding, so this
-/// reports the same unsupported condition rather than pretending to work.
-pub fn handle_to_fd() -> Result<i32, FsError> {
-    Err(FsError::from_errno("handleToFd", libc::ENOSYS))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1586,11 +1579,5 @@ mod tests {
         rm_sync(&link_path, 0, false, 0).expect("rm symlink");
         let error = StatFields::for_path(&link_path, Follow::No).expect_err("gone");
         assert_eq!(error.code(), "ENOENT");
-    }
-
-    #[test]
-    fn handle_to_fd_is_unsupported_on_unix() {
-        let error = handle_to_fd().expect_err("unsupported");
-        assert_eq!(error.syscall, "handleToFd");
     }
 }
