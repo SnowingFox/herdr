@@ -319,6 +319,46 @@ fn uuid_v5_and_v7_invariants_match_bun() {
     );
 }
 
+/// Bun accepts four RFC 4122 namespace *names* where a namespace UUID goes, and
+/// no test covered that: the differential case above only ever passes a UUID, so
+/// `randomUUIDv5(name, "url")` threw `ERR_INVALID_ARG_VALUE` here while Bun
+/// returned a UUID.
+///
+/// The assertion is a value comparison against the alias rather than "it did not
+/// throw", because a first attempt at this accepted the name and produced a
+/// *different* UUID — a crash-free wrong answer, which is the shape that gets
+/// past a smoke test. `randomUUIDv5(n, "url")` must equal
+/// `randomUUIDv5(n, "6ba7b811-…")`, and Bun agrees for every name tried.
+#[test]
+fn the_named_uuid_namespaces_are_the_rfc_constants() {
+    same(
+        "randomUUIDv5 named namespaces",
+        r#"const names = ["dns", "url", "oid", "x500"];
+        const uuids = [
+          "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "6ba7b811-9dad-11d1-80b4-00c04fd430c8",
+          "6ba7b812-9dad-11d1-80b4-00c04fd430c8",
+          "6ba7b814-9dad-11d1-80b4-00c04fd430c8",
+        ];
+        for (let i = 0; i < names.length; i++) {
+          const byName = Bun.randomUUIDv5("https://example.com", names[i]);
+          const byUuid = Bun.randomUUIDv5("https://example.com", uuids[i]);
+          console.log(names[i], byName, byName === byUuid);
+        }
+        // Case-insensitive: Bun resolves every spelling, and accepts an
+        // uppercase UUID too. Measured on 1.4.4, not inferred.
+        for (const spelling of ["url", "URL", "Url", "uRl"]) {
+          console.log(spelling, Bun.randomUUIDv5("x", spelling));
+        }
+        console.log("UPPER", Bun.randomUUIDv5("x", "6BA7B811-9DAD-11D1-80B4-00C04FD430C8"));
+        // But not whitespace-tolerant, and not an empty string.
+        for (const bad of ["url ", "nope", "", "url\n", "\turl", " oid", "DNS "]) {
+          try { console.log("resolved", JSON.stringify(bad), Bun.randomUUIDv5("x", bad)); }
+          catch (error) { console.log("threw", JSON.stringify(bad), String(error.code)); }
+        }"#,
+    );
+}
+
 #[test]
 fn sleep_and_time_members_match_bun() {
     // `sleep` measures wall time, so only the settled shape and ordering are

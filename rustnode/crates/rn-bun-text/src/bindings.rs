@@ -947,14 +947,15 @@ fn random_uuid_v5(
         return;
     };
     // A 16-byte namespace is used as-is; anything else must be a UUID string,
-    // and failing that the format error is what Bun reports.
+    // and failing that the format error is what Bun reports. Bun also accepts
+    // four RFC 4122 namespace *names* here, resolved case-insensitively.
     let namespace = if namespace_bytes.len() == 16 {
         let mut namespace = [0u8; 16];
         namespace.copy_from_slice(&namespace_bytes);
         namespace
     } else {
         let text = namespace_value.to_rust_string_lossy(scope);
-        match uuid::parse_uuid(&text) {
+        match named_namespace(&text).or_else(|| uuid::parse_uuid(&text)) {
             Some(namespace) => namespace,
             None => {
                 throw_type_error(
@@ -996,6 +997,30 @@ fn random_uuid_v7(
 }
 
 /// The bytes of a string, `ArrayBuffer` or `ArrayBufferView`.
+/// The four RFC 4122 namespace names Bun accepts where a namespace UUID goes.
+///
+/// Each name is exactly its RFC 4122 namespace UUID, which is stronger than a
+/// recorded output: `randomUUIDv5(name, "url")` and
+/// `randomUUIDv5(name, "6ba7b811-9dad-11d1-80b4-00c04fd430c8")` return the same
+/// UUID on Bun 1.4.4 for every name tried, so the alias is the constant and not a
+/// table of recorded results.
+///
+/// Matching is **ASCII case-insensitive but not whitespace-tolerant**, which was
+/// measured rather than assumed: `"url"`, `"URL"`, `"Url"` and `"uRl"` all
+/// resolve to the same UUID, while `"url\n"`, `"\turl"`, `" oid"` and `"DNS "`
+/// are all `ERR_INVALID_ARG_VALUE`. Lowercasing before the lookup gives exactly
+/// that, and nothing else needs trimming.
+fn named_namespace(name: &str) -> Option<[u8; 16]> {
+    let uuid = match name.to_ascii_lowercase().as_str() {
+        "dns" => "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "url" => "6ba7b811-9dad-11d1-80b4-00c04fd430c8",
+        "oid" => "6ba7b812-9dad-11d1-80b4-00c04fd430c8",
+        "x500" => "6ba7b814-9dad-11d1-80b4-00c04fd430c8",
+        _ => return None,
+    };
+    uuid::parse_uuid(uuid)
+}
+
 fn bytes_argument(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<v8::Value>,
