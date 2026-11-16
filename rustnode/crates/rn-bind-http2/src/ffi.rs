@@ -186,6 +186,23 @@ pub struct nghttp2_headers {
     pub cat: c_int,
 }
 
+/// `nghttp2_push_promise`: a PUSH_PROMISE frame, as delivered to the header and
+/// frame callbacks.
+///
+/// `promised_stream_id` is the stream the promise reserves for the response that
+/// follows. The frame's `hd.stream_id` is the *associated* stream — the client's
+/// own request — which is why `GetFrameID` exists on the C++ side.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct nghttp2_push_promise {
+    pub hd: nghttp2_frame_hd,
+    pub padlen: usize,
+    pub nva: *mut nghttp2_nv,
+    pub nvlen: usize,
+    pub promised_stream_id: i32,
+    pub reserved: u8,
+}
+
 /// `nghttp2_frame`: the union every frame callback receives.
 ///
 /// A `#[repr(C)]` union of the frame variants this crate reads. Reading
@@ -201,6 +218,7 @@ pub struct nghttp2_headers {
 pub union nghttp2_frame {
     pub hd: nghttp2_frame_hd,
     pub headers: nghttp2_headers,
+    pub push_promise: nghttp2_push_promise,
     pub data: nghttp2_data,
     pub ping: nghttp2_ping,
     pub goaway: nghttp2_goaway,
@@ -241,6 +259,8 @@ pub const NGHTTP2_GOAWAY: u8 = 0x07;
 pub const NGHTTP2_PRIORITY: u8 = 0x02;
 /// `nghttp2_frame_type.NGHTTP2_RST_STREAM`.
 pub const NGHTTP2_RST_STREAM: u8 = 0x03;
+/// `nghttp2_frame_type.NGHTTP2_PUSH_PROMISE`.
+pub const NGHTTP2_PUSH_PROMISE: u8 = 0x05;
 
 /// `nghttp2_session_callbacks_set_on_frame_recv_callback`.
 pub type on_frame_recv_callback = Option<
@@ -763,6 +783,23 @@ mod tests {
         // with the wrong stride.
         assert_eq!(std::mem::size_of::<nghttp2_nv>(), 40);
         assert_eq!(std::mem::align_of::<nghttp2_nv>(), 8);
+    }
+
+    #[test]
+    fn the_push_promise_layout_matches_the_compiled_one() {
+        // The compiled struct is 48 bytes with `promised_stream_id` at 40 and
+        // `reserved` at 44 (measured against the vendored header). Getting
+        // `promised_stream_id` wrong does not fail to compile or to link: it
+        // reads four bytes of `nvlen`, so a push promise would name a huge or
+        // negative stream id and every lookup after it would miss.
+        assert_eq!(std::mem::size_of::<nghttp2_push_promise>(), 48);
+        assert_eq!(
+            std::mem::offset_of!(nghttp2_push_promise, promised_stream_id),
+            40
+        );
+        assert_eq!(std::mem::offset_of!(nghttp2_push_promise, reserved), 44);
+        // The union has to be large enough for the widest member it is read as.
+        assert_eq!(std::mem::size_of::<nghttp2_frame>(), 64);
     }
 }
 
