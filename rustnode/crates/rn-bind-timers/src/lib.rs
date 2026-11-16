@@ -395,6 +395,23 @@ fn toggle_timer_ref(
 ///
 /// `None` means the loop itself could not be created, which is the only way a
 /// handle here can fail.
+///
+/// # The handle is created *unref'd*, as `Environment::InitializeLibuv` does
+///
+/// `uv_timer_init` leaves `UV_HANDLE_REF` set, so a freshly created timer counts
+/// as work the moment anything starts it. `lib/internal/timers.js` is the only
+/// other writer of this handle's ref bit, and it only calls `toggleTimerRef` on
+/// the `0 <-> 1` transition of `timeoutInfo[0]` — so for a timer that is armed
+/// and cleared while that counter never passes through those values (a
+/// `setUnrefTimeout`, which `Socket.prototype.setTimeout` uses for the TLS
+/// handshake deadline), no `uv_unref` ever reaches the handle. The loop then
+/// waits out a deadline JavaScript considers unref'd and the process never
+/// exits.
+///
+/// That is `src/env.cc:1326-1327`: `uv_timer_init(...)` followed immediately by
+/// `uv_unref(...)`. With it, the handle's ref bit means exactly what the
+/// JavaScript counter says, and every `uv_ref`/`uv_unref` `toggleTimerRef` and
+/// `apply_timer_result` perform is the only thing that changes it.
 fn ensure_timer_handle() -> Option<*mut uv::uv_timer_t> {
     HANDLES.with(|handles| {
         let mut handles = handles.borrow_mut();
@@ -409,7 +426,13 @@ fn ensure_timer_handle() -> Option<*mut uv::uv_timer_t> {
                 return None;
             }
             // SAFETY: `uv_timer_init` succeeded, so the slot is initialised.
-            handles.timer = Some(unsafe { assume_init(handle) });
+            let timer = unsafe { assume_init(handle) };
+            // `Environment::InitializeLibuv`'s `uv_unref`, for the reason the
+            // docs above give. Nothing has started the handle yet, so this only
+            // clears the flag `uv_timer_init` set.
+            // SAFETY: `timer` is the live handle just initialised.
+            unsafe { uv::uv_unref(std::ptr::from_ref(&*timer).cast_mut().cast()) };
+            handles.timer = Some(timer);
             rn_uv::ledger::record_created();
         }
         handles
@@ -1299,6 +1322,59 @@ mod tests {
         let first = ensure_timer_handle().expect("the loop is creatable");
         let second = ensure_timer_handle().expect("the loop is creatable");
         assert_eq!(first, second);
+    }
+
+    /// The shared timer handle starts **unref'd**, which is what makes the
+    /// JavaScript counter the only thing that decides whether a deadline keeps
+    /// the process alive.
+    ///
+    /// `uv_timer_init` leaves `UV_HANDLE_REF` set. `lib/internal/timers.js` only
+    /// calls `toggleTimerRef` on the `0 <-> 1` transition of `timeoutInfo[0]`, so
+    /// a `setUnrefTimeout` armed and cleared while that counter never crosses
+    /// those values never reaches `uv_unref`. A TLS connection to an IP literal
+    /// arms exactly that timer (`Socket.prototype.setTimeout` for the handshake
+    /// deadline) and the process then blocked for the full 120 seconds.
+    ///
+    /// So the assertion is Node's `Environment::InitializeLibuv` pair
+    /// (`src/env.cc:1326-1327`): init, then immediately unref.
+    #[test]
+    fn the_timer_handle_is_unrefed_at_init_like_node() {
+        let timer = ensure_timer_handle().expect("the loop is creatable");
+        // SAFETY: `timer` is the live handle this module owns.
+        unsafe {
+            assert_eq!(
+                uv::uv_has_ref(timer.cast()),
+                0,
+                "a handle nothing has started must not count as work"
+            );
+        }
+    }
+
+    /// A `setUnrefTimeout`-shaped sequence leaves the handle ref-less.
+    ///
+    /// This is the JavaScript pattern the fix exists for, expressed at the
+    /// binding: arm the handle without ever calling `toggleTimerRef(true)`, the
+    /// way `setUnrefTimeout` does when `timeoutInfo[0]` is already zero. Before
+    /// the fix the handle kept the ref `uv_timer_init` gave it and the loop
+    /// waited out the whole deadline.
+    #[test]
+    fn an_unrefed_deadline_is_not_work_even_without_a_ref_transition() {
+        let timer = ensure_timer_handle().expect("the loop is creatable");
+        rn_uv::uv_loop::update_time();
+        // SAFETY: `timer` is the live handle this module owns.
+        let status = unsafe { uv::uv_timer_start(timer, Some(on_timer), 60_000, 0) };
+        assert_eq!(status, 0, "the handle must arm");
+        // SAFETY: as above.
+        unsafe {
+            assert_eq!(
+                uv::uv_has_ref(timer.cast()),
+                0,
+                "arming an unref'd deadline must not make it work; a `1` here is \
+                 the busy-wait that kept every TLS connection to an IP literal \
+                 alive for its 120-second handshake timeout"
+            );
+            uv::uv_timer_stop(timer);
+        }
     }
 
     #[test]
