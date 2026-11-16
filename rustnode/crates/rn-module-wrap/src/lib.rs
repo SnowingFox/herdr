@@ -445,7 +445,16 @@ fn synthetic_steps_callback<'s>(
     // a synthetic evaluation step to report: `None` propagates it.
     let result = steps.call(scope, wrapper.into(), &[])?;
     let _ = result;
-    Some(v8::undefined(scope).into())
+    // V8 `CHECK`s that a synthetic module's evaluation steps return a promise
+    // and stores it as the module's top-level capability; returning
+    // `undefined` aborts the isolate. Node's
+    // `ModuleWrap::SyntheticModuleEvaluationStepsCallback` resolves a fresh
+    // resolver before returning, because the promise is what `evaluate()`
+    // hands back to `module_job.js`.
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let promise = resolver.get_promise(scope);
+    resolver.resolve(scope, v8::undefined(scope).into())?;
+    Some(promise.into())
 }
 
 fn module_link<'s>(
