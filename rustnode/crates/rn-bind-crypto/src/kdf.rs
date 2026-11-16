@@ -181,6 +181,15 @@ pub(crate) fn pbkdf2_constructor<'s>(
         .to_string(scope)
         .map(|text| text.to_rust_string_lossy(scope))
         .unwrap_or_default();
+    // Node's `PBKDF2Traits::AdditionalConfig` resolves the digest while the job
+    // is still being constructed (`crypto_pbkdf2.cc:109`), so a bad name throws
+    // from `new PBKDF2Job(...)` rather than arriving later through `ondone`. That
+    // is observable: `crypto.pbkdf2('p','s',1,32,'nope',cb)` throws synchronously
+    // on Node and a caller's `try`/`catch` sees it.
+    if let Err(error) = engine::check_digest(&digest) {
+        crate::install::throw_crypto_error(scope, &error);
+        return;
+    }
 
     let this: v8::Local<v8::Object> = args.this();
     note_mode(scope, this, &args);
@@ -278,6 +287,18 @@ pub(crate) fn hkdf_constructor<'s>(
         return;
     };
     let length = args.get(5).uint32_value(scope).unwrap_or(0) as usize;
+    // Node's `HKDFTraits::AdditionalConfig` resolves the digest and checks the
+    // length ceiling before the job is built: a bad digest is
+    // `ERR_CRYPTO_INVALID_DIGEST` and a length over 255 digest blocks is
+    // `ERR_CRYPTO_INVALID_KEYLEN`, both thrown synchronously
+    // (`crypto_hkdf.cc:59` and `:98`).
+    match engine::check_hkdf_parameters(&digest, length) {
+        Ok(()) => {}
+        Err(error) => {
+            crate::install::throw_crypto_error(scope, &error);
+            return;
+        }
+    }
 
     let this: v8::Local<v8::Object> = args.this();
     note_mode(scope, this, &args);
@@ -347,16 +368,28 @@ pub(crate) fn run(
                 return;
             }
         },
-        Err(error) => {
-            let Some(text) = v8::String::new(scope, &error.to_string()) else {
-                return;
-            };
-            let exception = v8::Exception::error(scope, text);
-            (exception, v8::undefined(scope).into())
-        }
+        Err(error) => (
+            crypto_error_value(scope, &error),
+            v8::undefined(scope).into(),
+        ),
     };
     let receiver: v8::Local<v8::Value> = this.into();
     callback.call(scope, receiver, &[first, second]);
+}
+
+/// Builds the JavaScript error object a [`CryptoError`] corresponds to, without
+/// throwing it.
+///
+/// The job protocol is `[error, result]` arrays and `ondone(error, result)` calls,
+/// so the error has to be *constructed* rather than thrown. Sharing this with
+/// [`crate::install::throw_crypto_error`] keeps the class and the `code` property
+/// identical between the throwing and the returning surfaces — `pbkdf2Sync` and
+/// `pbkdf2` must report the same `ERR_CRYPTO_INVALID_DIGEST` for the same input.
+pub(crate) fn crypto_error_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    error: &engine::CryptoError,
+) -> v8::Local<'s, v8::Value> {
+    crate::install::crypto_error_object(scope, error)
 }
 
 /// Builds the `[error, result]` array a sync `run()` returns.
@@ -372,13 +405,10 @@ fn sync_result<'s>(
                 return v8::undefined(scope).into();
             }
         },
-        Err(error) => {
-            let Some(text) = v8::String::new(scope, &error.to_string()) else {
-                return v8::undefined(scope).into();
-            };
-            let exception = v8::Exception::error(scope, text);
-            (exception, v8::undefined(scope).into())
-        }
+        Err(error) => (
+            crypto_error_value(scope, &error),
+            v8::undefined(scope).into(),
+        ),
     };
     v8::Array::new_with_elements(scope, &[first, second]).into()
 }
