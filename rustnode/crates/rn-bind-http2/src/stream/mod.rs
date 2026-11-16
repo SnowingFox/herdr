@@ -85,10 +85,105 @@ pub struct StreamHandleState {
     pub stream: crate::stream::stream_base::StreamHalf,
 }
 
+thread_local! {
+    /// The one `Http2Stream` constructor this isolate publishes and makes handles
+    /// from, together with the isolate it belongs to.
+    ///
+    /// Node caches the template on the `Environment`
+    /// (`env->http2stream_constructor_template()`, `src/node_http2.cc:3664-3675`) so
+    /// that `Initialize` publishing `binding.Http2Stream` and `Http2Stream::New`
+    /// building a handle both use the *same* template — which is the only reason a
+    /// handle is an `instanceof` the class JavaScript can see. Building a second
+    /// template for either site leaves every handle an instance of a class nobody
+    /// can reach, so `instanceof` is false and a patched prototype method is
+    /// invisible to the handle `core.js` calls into.
+    ///
+    /// The cached `v8::Global` dies with the isolate rather than beside it:
+    /// [`reset_constructor_cache`] drops it when the namespace is installed, and
+    /// `rn-bind-http2`'s `install` is the only writer — it runs once per isolate, for
+    /// the main thread and again on each worker thread, which has an isolate of its
+    /// own — so the drop happens before the isolate that owned the global is
+    /// disposed. The recorded address is a second line of defence for a read that
+    /// arrives between two installs, which is the sqlite template cache's
+    /// arrangement.
+    static CONSTRUCTOR: RefCell<Option<CachedConstructor>> = const { RefCell::new(None) };
+}
+
+/// A `Http2Stream` constructor belonging to one isolate, by address.
+struct CachedConstructor {
+    isolate: usize,
+    constructor: v8::Global<v8::Function>,
+}
+
+/// The isolate address a scope belongs to, for the cache's ownership check.
+///
+/// Address-comparison alone cannot distinguish a new isolate from a disposed one
+/// that happened to be allocated at the same address; that is why the cache is
+/// also cleared on install. The address is only ever compared, never dereferenced.
+fn isolate_address(scope: &v8::PinScope<'_, '_>) -> usize {
+    let isolate: &v8::Isolate = scope.as_ref();
+    // SAFETY: reading the address is not a dereference.
+    unsafe { std::mem::transmute::<v8::UnsafeRawIsolatePtr, usize>(isolate.as_raw_isolate_ptr()) }
+}
+
+/// Drops the cached constructor when the namespace is installed.
+///
+/// Called from the namespace install, which happens once per isolate: the main
+/// thread installs before running any JavaScript, and a worker thread installs on
+/// its own thread before its realm boots. Dropping here is what keeps the
+/// `v8::Global` from outliving the isolate that owns it — `sqlite` resets its
+/// per-isolate template caches the same way, and for the same reason.
+///
+/// Unconditional rather than keyed on the isolate address, because two isolates
+/// allocated one after the other can share an address: a disposed isolate's
+/// `Global` is a handle into freed storage, and an address comparison cannot tell
+/// the two apart. "Install happened" is the fact that can, because the registry
+/// caches the namespace object, so a second install in one isolate rebuilds
+/// nothing that is still in use.
+pub fn reset_constructor_cache() {
+    CONSTRUCTOR.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The cached `Http2Stream` constructor function, if this isolate has one.
+fn cached_constructor<'s>(scope: &v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    let address = isolate_address(scope);
+    CONSTRUCTOR.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|cached| cached.isolate == address)
+            .map(|cached| v8::Local::new(scope, &cached.constructor))
+    })
+}
+
 /// Builds the `Http2Stream` constructor and its prototype.
+///
+/// This is `Initialize`'s template-building block plus `SetConstructorFunction`
+/// publishing it: the first call in an isolate builds the template and caches the
+/// function, and every later call — including the one inside [`handle_for`] —
+/// returns that same function, so a handle's prototype *is* the exported class's
+/// prototype.
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
+    if let Some(constructor) = cached_constructor(scope) {
+        return Ok(constructor.into());
+    }
+    let function = build_constructor(scope)?;
+    let address = isolate_address(scope);
+    let rooted = v8::Global::new(scope.as_ref(), function);
+    CONSTRUCTOR.with(|slot| {
+        *slot.borrow_mut() = Some(CachedConstructor {
+            isolate: address,
+            constructor: rooted,
+        })
+    });
+    Ok(function.into())
+}
+
+/// Builds the `Http2Stream` template and returns the function it produced.
+fn build_constructor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Result<v8::Local<'s, v8::Function>, String> {
     let template = rn_core::class(new).build(scope);
     let name = v8::String::new(scope, "Http2Stream")
         .ok_or("cannot allocate the Http2Stream class name")?;
@@ -149,7 +244,6 @@ pub fn constructor<'s>(
 
     template
         .get_function(scope)
-        .map(Into::into)
         .ok_or_else(|| "cannot allocate the Http2Stream constructor".to_string())
 }
 
@@ -216,6 +310,10 @@ pub fn handle_for<'s>(
     if let Some(existing) = session.handles.borrow().get(&stream_id) {
         return Some(v8::Local::new(scope, existing));
     }
+    // `constructor` returns the isolate's cached function when there is one, so
+    // this instance is made from the same template `binding.Http2Stream` was
+    // published from. That is what makes `handle instanceof binding.Http2Stream`
+    // true and what lets `core.js`'s prototype patches reach this handle.
     let function = v8::Local::<v8::Function>::try_from(constructor(scope).ok()?).ok()?;
     let object = function.new_instance(scope, &[])?;
 
