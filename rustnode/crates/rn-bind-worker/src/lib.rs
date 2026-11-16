@@ -583,16 +583,18 @@ pub fn clear_stopping() {
 /// This is `process.reallyExit`'s worker branch. It also sets `process._exiting`,
 /// which is what makes a second `process.exit()` a no-op and what `lib/**` reads
 /// to decide whether output should still be flushed.
-pub fn record_worker_exit_code(scope: &mut v8::PinScope<'_, '_>, code: i32) {
+///
+/// Both values are written to `rn_core::exit_state`, which is this environment's
+/// own set: the worker thread *is* the environment, so the write cannot reach the
+/// parent's `process.exitCode` or its `_exiting` guard. Node's equivalent is the
+/// C++ `Environment::set_exit_code`, which also fills the private field the
+/// accessors read rather than assigning through them — that is why this does not
+/// go through the `process` object, where `_exiting` is a configurable property a
+/// script may have deleted.
+pub fn record_worker_exit_code(code: i32) {
     EXIT_CODE.with(|slot| slot.set(Some(code)));
-    if let Some(process) = global_process(scope) {
-        if let Some(key) = v8::String::new(scope, "exitCode") {
-            let _ = process.set(scope, key.into(), v8::Integer::new(scope, code).into());
-        }
-        if let Some(key) = v8::String::new(scope, "_exiting") {
-            let _ = process.set(scope, key.into(), v8::Boolean::new(scope, true).into());
-        }
-    }
+    rn_core::exit_state::set_exit_code(code);
+    rn_core::exit_state::set_exiting(true);
 }
 
 /// The exit code a worker's `process.exit()` asked for, if any.
@@ -604,11 +606,4 @@ pub fn recorded_exit_code() -> Option<i32> {
 /// Clears the recorded exit code, so a reused thread starts clean.
 pub fn clear_exit_code() {
     EXIT_CODE.with(|slot| slot.set(None));
-}
-
-fn global_process<'s>(scope: &v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
-    let global = scope.get_current_context().global(scope);
-    let key = v8::String::new(scope, "process")?;
-    let process = global.get(scope, key.into())?;
-    v8::Local::<v8::Object>::try_from(process).ok()
 }

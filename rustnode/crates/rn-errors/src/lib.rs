@@ -267,6 +267,24 @@ pub fn report_uncaught_exception(
     scope: &mut v8::PinScope<'_, '_>,
     error: v8::Local<v8::Value>,
 ) -> bool {
+    // A terminated isolate is not reporting an exception: V8's
+    // `TerminateExecution` unwinds every JavaScript frame with an exception that
+    // has no value, so a callback that reaches a catch block during a terminate
+    // sees `has_caught()` with nothing in it. Node draws the same line with
+    // `TryCatchScope::HasTerminated` in `node::InternalCallbackScope`, and
+    // reporting it instead is what turned a working terminate into
+    // `Uncaught null: null` — a worker's `process.exit()` serializing the
+    // termination as an unserializable error and the parent raising
+    // `ERR_UNHANDLED_ERROR` for an exit that had already succeeded.
+    //
+    // The `_exiting` half of this is deliberately *not* checked here. Node's
+    // `can_call_into_js = false` refers to its own teardown, and an `exit`
+    // listener that throws is still a real uncaught exception: Node prints it
+    // and exits non-zero. `emit_exit` sets `_exiting` before it emits, so
+    // keying on it would swallow exactly that.
+    if scope.is_execution_terminating() {
+        return true;
+    }
     // `InternalMakeCallback` calls `scope.MarkAsFailed()` when the callback
     // threw, and `InternalCallbackScope::Close` then returns at
     // `if (failed_) return;` — so the tick and microtask checkpoint is skipped
@@ -462,6 +480,17 @@ fn report_uncaught_inner(
         let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
         let scope = &mut try_catch.init();
         let result = handler.call(scope, v8::undefined(scope).into(), &argv);
+        // A handler that terminated the isolate took responsibility for the
+        // exit. `worker_thread.js`'s `workerOnGlobalUncaughtException` is exactly
+        // that: it serializes the error to the parent and then calls
+        // `process.exit()`, whose worker branch calls `TerminateExecution` so the
+        // calling frame unwinds. The terminate reaches here as a call with no
+        // result and no exception value, and reading that as "unhandled" printed
+        // the error to stderr a second time — after the worker had already
+        // reported it and exited with the right code.
+        if scope.has_terminated() {
+            return true;
+        }
         if scope.has_caught() && !scope.has_terminated() {
             let rethrown = scope.exception();
             // The throw is consumed here rather than left pending: the value has

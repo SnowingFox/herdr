@@ -14,6 +14,7 @@ pub mod codec;
 pub mod env;
 pub mod env_proxy;
 pub mod error;
+pub mod exit_state;
 pub mod finalizer;
 pub mod function;
 pub mod handle;

@@ -357,6 +357,23 @@ fn kill(
 /// stops, because [`rn_core::hook_slot::EXIT_REQUESTED`] is set. The exit code
 /// travels out through the worker's `exitCode`, which is what
 /// `WorkerHandle::exit_code` reports to `worker.on('exit')`.
+///
+/// # Why the isolate is terminated as well
+///
+/// Node's `Environment::ExitEnv` does two things a worker's exit depends on: it
+/// sets the exit code, and it calls `isolate->TerminateExecution()`. The second
+/// is what stops the JavaScript that called `process.exit()` from continuing:
+/// `per_thread.js`'s `exit` follows `reallyExit` with a `nop()`, and V8's stack
+/// guard throws the termination exception there, so the frame unwinds and
+/// nothing after the call runs. `test-worker-voluntarily-exit-followed-by-
+/// addition.js` and `test-worker-voluntarily-exit-followed-by-throw.js` assert
+/// exactly that.
+///
+/// Without it a second `process.exit(7)` in the same worker simply overwrote the
+/// first `process.exit(42)`: the first call returned normally, its caller kept
+/// going, and the code the parent reported was the last one written. Node
+/// reports 42. Setting only `EXIT_REQUESTED` is not enough, because that is read
+/// when the loop next turns rather than at the next safepoint inside the caller.
 fn really_exit(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -383,11 +400,19 @@ fn really_exit(
         std::process::exit(code);
     }
     // In a worker: record the code where the parent will read it, mark the realm
-    // as exiting so `process.exit()` cannot run twice, and let the loop stop.
-    // The realm's own teardown (`rn-bind-worker`'s `teardown`) closes this
-    // thread's loop; it must not touch the process-wide threadpool.
-    rn_bind_worker::record_worker_exit_code(scope, code);
+    // as exiting so a second `process.exit()` in *this* worker cannot run again,
+    // and let the loop stop. The realm's own teardown (`rn-bind-worker`'s
+    // `teardown`) closes this thread's loop; it must not touch the process-wide
+    // threadpool.
+    rn_bind_worker::record_worker_exit_code(code);
     rn_core::hook_slot::set_flag(scope, rn_core::hook_slot::EXIT_REQUESTED, true);
+    // Terminating stops the caller as well, which is what makes the second
+    // `process.exit()` unreachable rather than merely ignored. The flag above
+    // still stops the loop for an exit that returns here — a terminate only
+    // unwinds to the next safepoint, and the caller of `process.exit()` may be
+    // native code that never checks.
+    let isolate: &v8::Isolate = scope.as_ref();
+    isolate.terminate_execution();
 }
 
 fn abort(
