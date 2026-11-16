@@ -8,9 +8,13 @@
 //!   internalBinding('sqlite');
 //! ```
 //!
-//! Everything else in the namespace is reached through those five members'
+//! Everything else in the namespace is reached through those members'
 //! prototypes. That means the contract is small — five names — while the work is
 //! almost entirely in the classes, which is the opposite of most namespaces here.
+//!
+//! Of those five, four are installed and `backup` is declared deferred: the
+//! destructure in `lib/sqlite.js` binds `undefined` for it, which is what
+//! `require('node:sqlite').backup` reports until [`DEFERRED`] is emptied.
 //!
 //! # SQLite linkage
 //!
@@ -59,16 +63,27 @@ pub mod tagstore;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod testsupport;
 pub mod url;
 pub mod value;
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
-/// Members exposed on the namespace object, matching `contracts/sqlite.json`.
-pub const MEMBERS: &[&str] = &["Database", "Session", "Statement", "backup", "constants"];
+/// Members this crate actually installs, matching `contracts/sqlite.json`.
+///
+/// `install()` puts exactly these keys on the namespace object. `backup` is
+/// deliberately absent: it is declared in [`DEFERRED`] instead. Listing it here
+/// as well is what made the contract check report `sqlite` complete while
+/// `node:sqlite.backup` was `undefined` — `rn-compat` subtracts a member that
+/// appears in `members()` from the gap before it ever consults `deferred()`, so
+/// a member that is claimed *and* deferred is only ever checked once, as a
+/// claim. `install()` never set it, and nothing compared the built object
+/// against this list.
+pub const MEMBERS: &[&str] = &["Database", "Session", "Statement", "constants"];
 
-/// Members this namespace needs but cannot install yet, each with the reason.
+/// Members this namespace needs but does not install, each with the reason.
 ///
 /// `backup` is the only one. It is a separate subsystem — an asynchronous
 /// page-by-page copy driven through libuv's threadpool with a progress callback
@@ -78,11 +93,15 @@ pub const MEMBERS: &[&str] = &["Database", "Session", "Statement", "backup", "co
 /// callback's timing, and the retry behaviour on `SQLITE_BUSY`.
 ///
 /// It is declared here rather than stubbed so the contract check reports it as a
-/// known gap instead of a member that exists and lies.
+/// known gap instead of a member that exists and lies. `lib/sqlite.js`
+/// destructures it at module scope and re-exports it, so
+/// `require('node:sqlite').backup` is `undefined` until this is implemented —
+/// which is the honest state, and is why the deferral has to be visible to the
+/// contract check rather than hidden behind a `MEMBERS` entry.
 pub const DEFERRED: &[(&str, &str)] = &[
     (
         "backup",
-        "page-wise asynchronous backup with a progress callback and a promise; needs threadpool integration, and a synchronous stand-in would differ from Node in return type, callback timing and SQLITE_BUSY retries",
+        "page-wise asynchronous backup with a progress callback and a promise; needs threadpool integration (uv_queue_work plus a promise settled on the loop), and a synchronous stand-in would differ from Node in return type, progress-callback timing and SQLITE_BUSY retries",
     ),
 ];
 
@@ -107,6 +126,13 @@ impl BindingModule for Sqlite {
         scope: &mut v8::PinScope<'s, '_>,
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
+        // A namespace is installed once per isolate, so this is where session's
+        // per-isolate template cache is reset. It matters because that cache is
+        // keyed by isolate address, and a new isolate can be allocated at the
+        // address a disposed one had; the address check alone cannot tell the
+        // two apart, but "install happened again" can.
+        session::reset_template_cache();
+
         let object = v8::Object::new(scope);
 
         let database = database::constructor(scope)?;

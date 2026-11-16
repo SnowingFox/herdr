@@ -275,13 +275,8 @@ pub fn create<'s>(
         return;
     }
 
-    let Some(constructor) = constructor(scope) else {
+    let Some(object) = allocate(scope) else {
         // SAFETY: `session` is live and nothing else owns it.
-        unsafe { ffi::sqlite3session_delete(session) };
-        return;
-    };
-    let Some(object) = constructor.new_instance(scope, &[]) else {
-        // SAFETY: as above.
         unsafe { ffi::sqlite3session_delete(session) };
         return;
     };
@@ -306,8 +301,68 @@ fn state_of_database(pointer: *mut SessionState) -> &'static mut DatabaseState {
     unsafe { &mut *(*pointer).database }
 }
 
-/// Builds the `Session` constructor. Only `create` produces instances.
-pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+thread_local! {
+    /// The one `Session` template this isolate uses, and the isolate it belongs
+    /// to.
+    ///
+    /// Cached for two reasons Node's `sqlite_session_constructor_template()` is
+    /// cached, and both are observable:
+    ///
+    /// 1. `Session::Create` allocates from the *same* template the namespace
+    ///    exposes, so `Object.getPrototypeOf(db.createSession())` is the
+    ///    `Session.prototype` the caller can reach and `instanceof Session`
+    ///    holds. Building a second template per instance would answer false.
+    /// 2. `InstanceTemplate()->NewInstance(...)` never runs the constructor
+    ///    callback. `Function::new_instance` does, which is what made every
+    ///    `createSession()` throw `ERR_ILLEGAL_CONSTRUCTOR` — the guard that is
+    ///    supposed to stop only `new Session()`.
+    ///
+    /// The isolate address is stored beside it because a process can run more
+    /// than one isolate on one thread (the test suites create one per case), and
+    /// handing a template from a disposed isolate to a new one would read freed
+    /// memory. It is only ever compared, never dereferenced.
+    static TEMPLATE: std::cell::RefCell<Option<CachedTemplate>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A `Session` template belonging to one isolate, by address.
+struct CachedTemplate {
+    isolate: usize,
+    template: v8::Global<v8::FunctionTemplate>,
+}
+
+/// Drops the cached template, called once per namespace install.
+///
+/// The address check below is the first line of defence, but two isolates
+/// allocated one after the other can share an address, and a `Global` from a
+/// disposed isolate is a handle into freed storage. Resetting on install makes
+/// the cache's lifetime the isolate's lifetime in practice, which is what
+/// `Environment`'s `sqlite_session_constructor_template` gets from being owned
+/// by the `Environment` itself.
+pub fn reset_template_cache() {
+    TEMPLATE.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The isolate address a scope belongs to, for the identity check above.
+fn isolate_address(scope: &v8::PinScope<'_, '_>) -> usize {
+    let isolate: &v8::Isolate = scope.as_ref();
+    // SAFETY: reading the address is not a dereference; it is only compared
+    // against the address recorded when the cache was filled.
+    unsafe { std::mem::transmute::<v8::UnsafeRawIsolatePtr, usize>(isolate.as_raw_isolate_ptr()) }
+}
+
+/// The `Session` `FunctionTemplate` for this isolate, built on first use.
+fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::FunctionTemplate>> {
+    let address = isolate_address(scope);
+    let cached = TEMPLATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|cached| cached.isolate == address)
+            .map(|cached| cached.template.clone())
+    });
+    if let Some(template) = cached {
+        return Some(v8::Local::new(scope, template));
+    }
+
     let template = v8::FunctionTemplate::builder(illegal_constructor)
         .length(0)
         .build(scope);
@@ -315,7 +370,7 @@ pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s,
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELDS);
     let prototype = template.prototype_template(scope);
-    for (name, template) in [
+    for (name, method) in [
         (
             "changeset",
             crate::database::method(scope, 0, changeset_method),
@@ -327,7 +382,7 @@ pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s,
         ("close", crate::database::method(scope, 0, close_method)),
     ] {
         let key = v8::String::new(scope, name)?;
-        prototype.set(key.into(), template.into());
+        prototype.set(key.into(), method.into());
     }
     let dispose = crate::database::method(scope, 0, dispose_method);
     let dispose_key: v8::Local<'_, v8::Name> =
@@ -341,7 +396,32 @@ pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s,
     if let Some(name) = v8::String::new(scope, "Session") {
         template.set_class_name(name);
     }
-    template.get_function(scope)
+
+    TEMPLATE.with(|slot| {
+        *slot.borrow_mut() = Some(CachedTemplate {
+            isolate: address,
+            template: v8::Global::new(scope, template),
+        });
+    });
+    Some(template)
+}
+
+/// Allocates a bare `Session` instance from the cached object template.
+///
+/// `Session::Create` in the C++ is
+/// `GetConstructorTemplate(env)->InstanceTemplate()->NewInstance(context)`,
+/// which takes the *object* template and never invokes the constructor body.
+/// `Function::new_instance` would run [`illegal_constructor`] instead, so the
+/// one path that is supposed to succeed throws.
+fn allocate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    template(scope)?
+        .instance_template(scope)
+        .new_instance(scope)
+}
+
+/// Builds the `Session` constructor. Only `create` produces instances.
+pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    template(scope)?.get_function(scope)
 }
 
 fn illegal_constructor<'s>(

@@ -389,12 +389,41 @@ pub fn constants_object<'s>(
 /// limits, then optional extension loading. Each step is checked, because a
 /// setting SQLite silently ignored would make `test-sqlite-config.js` report the
 /// wrong thing rather than fail.
+///
+/// # A second `open()` throws, and a failed `open()` leaves nothing open
+///
+/// Both halves are `Database::Open`'s contract, and both are observable.
+/// `test-sqlite-database.js` opens an already-open database on purpose and
+/// asserts `ERR_INVALID_STATE`; Node's `THROW_ERR_INVALID_STATE(env(),
+/// "database is already open")` runs before `sqlite3_open_v2`, so the existing
+/// connection — and every table and row in it — is untouched. Closing and
+/// reopening instead would silently destroy that state and report success.
+///
+/// The other half is that a *failed* open must not leave a connection behind.
+/// `sqlite3_open_v2` hands back a handle even when it fails, and Node wraps it
+/// in `reset_connection_on_failure` so `isOpen` reports false afterwards
+/// (`test-sqlite-database.js`, "does not leave the database open after a failed
+/// open"). Here that reset is the `state.connection = None` below, which drops
+/// the `Connection` and its zombie close.
 pub fn open(state: &mut DatabaseState) -> Result<(), OpenError> {
     if state.is_open() {
-        // A second `open()` on an open database is not something `lib/**` does;
-        // closing first is the only behaviour that cannot leak the old handle.
-        state.close();
+        return Err(OpenError::AlreadyOpen);
     }
+    match open_connection(state) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // The error already carries owned text, so the handle can go before
+            // the caller sees the failure. `Connection::drop` runs
+            // `sqlite3_close_v2`, which is what releases the sick handle SQLite
+            // assigned on the failed open.
+            state.connection = None;
+            Err(error)
+        }
+    }
+}
+
+/// `Database::Open`'s body once the already-open check has passed.
+fn open_connection(state: &mut DatabaseState) -> Result<(), OpenError> {
     let location = CString::new(state.config.location.as_str())
         .map_err(|_| OpenError::InvalidPath("path contains a null byte".to_string()))?;
     let mut flags = if state.config.read_only {
@@ -415,8 +444,11 @@ pub fn open(state: &mut DatabaseState) -> Result<(), OpenError> {
     }
     state.connection = Some(Connection { raw });
     if result != ffi::SQLITE_OK {
-        // `CHECK_ERROR_OR_THROW` leaves the connection in place on failure, so
-        // `isOpen` stays true.
+        // The caller drops this connection when an `Err` comes back, which is
+        // `reset_connection_on_failure`'s job in the C++. Reporting the error
+        // first would leave a handle whose lifetime the error path has to know
+        // about; keeping the reset in one place is what makes `isOpen` false
+        // after any failed open.
         return Err(error_for(state));
     }
 
@@ -496,6 +528,12 @@ pub fn open(state: &mut DatabaseState) -> Result<(), OpenError> {
 
 /// What went wrong while opening or configuring a connection.
 pub enum OpenError {
+    /// `open()` on a connection that is already open.
+    ///
+    /// `ERR_INVALID_STATE`, thrown before `sqlite3_open_v2` is reached, so the
+    /// existing connection is untouched. This is what makes a second `open()`
+    /// safe to call: Node's own `test-sqlite-database.js` asserts it.
+    AlreadyOpen,
     /// A SQLite failure: the result code, message and extended code.
     Sqlite(i32, String, i32),
     /// A setting SQLite accepted but did not apply.
@@ -508,6 +546,9 @@ impl OpenError {
     /// Reports the failure as the exception `CHECK_ERROR_OR_THROW` would throw.
     pub fn throw(self, scope: &mut v8::PinScope<'_, '_>) {
         match self {
+            OpenError::AlreadyOpen => {
+                errors::throw_coded(scope, "ERR_INVALID_STATE", "database is already open")
+            }
             OpenError::Sqlite(_, message, code) => {
                 // SAFETY: `errstr` returns static text for the code.
                 let errstr = unsafe { errors::c_string(ffi::sqlite3_errstr(code)) };
