@@ -292,6 +292,33 @@ pub fn schedule_ports_with_mail() {
     }
 }
 
+/// Records this thread's wake token on every port it owns.
+///
+/// A port attached before the thread installed a cross-thread wake handle keeps
+/// `None` in its [`Owner`], and a foreign sender then queues its message with
+/// nothing to signal — the receiving loop stays parked. The worker's environment
+/// port is exactly that case: it is built before `install_check_phase` runs, so
+/// the parent's `stdioWantsMoreData` answer for a stdout payload never woke the
+/// worker, its `Writable` stayed `writing`, and the process hung with no active
+/// handle on either side to explain it.
+///
+/// Runs after the handle exists, for every port already registered, so the
+/// correctness of cross-thread delivery does not depend on the creation order of
+/// one port against one install call.
+pub fn refresh_owner_tokens(token: rn_uv::wake::ThreadToken) {
+    let ports: Vec<Rc<PortInner>> = LOCAL_PORTS.with(|ports| {
+        let mut ports = ports.borrow_mut();
+        ports.retain(|(_, port)| port.strong_count() > 0);
+        ports
+            .iter()
+            .filter_map(|(_, port)| port.upgrade())
+            .collect()
+    });
+    for port in ports {
+        port.data.refresh_owner_token(token);
+    }
+}
+
 /// How many ports this thread still has registered.
 ///
 /// Exposed for tests: a create/terminate loop that leaves this climbing has leaked
@@ -489,6 +516,32 @@ impl MessagePortData {
             // can only signal it, never reach the port itself.
             token: rn_uv::wake::current_thread_token(),
         });
+    }
+
+    /// Records this thread's wake token on an owner that was attached without one.
+    ///
+    /// A port created before its thread had a cross-thread wake handle records
+    /// `None` in [`Owner::token`], and a foreign sender then has no way to wake
+    /// this thread's loop: [`Self::enqueue`] queues the message and the loop
+    /// stays parked. That is what left a worker's `process.stdout` stream
+    /// `writing` with bytes still buffered — the parent answers the first
+    /// `_writev` with `stdioWantsMoreData`, the worker's environment port is the
+    /// owner, and that port was attached before the worker installed its wake
+    /// handle, so the answer never woke the worker's loop.
+    ///
+    /// Called once the handle exists, for every port this thread owns, so the
+    /// fix does not depend on each port's creation site being ordered after it.
+    pub fn refresh_owner_token(&self, token: rn_uv::wake::ThreadToken) {
+        let mut owner = lock(&self.owner);
+        let Some(owner) = owner.as_mut() else {
+            return;
+        };
+        // Only this thread may amend its own record: the token names a handle
+        // on the thread that attached the port.
+        if owner.thread != current_thread() {
+            return;
+        }
+        owner.token = Some(token);
     }
 
     /// Drops the owner link, Node's `Detach()`.

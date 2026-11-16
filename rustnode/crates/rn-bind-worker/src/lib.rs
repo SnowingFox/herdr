@@ -124,10 +124,19 @@ pub fn install_check_phase() {
     // finish would be a silent no-op. The callback runs on *this* thread, from
     // inside its loop, which is the only place that can arm this thread's check
     // handle — the very thing a foreign thread cannot do for itself.
-    rn_uv::wake::install_current_thread(|| {
+    let token = rn_uv::wake::install_current_thread(|| {
         rn_bind_timers::arm_check_phase();
         rn_bind_messaging::schedule_ports_with_mail();
     });
+    // A port built before this call recorded its owner with no wake token, so it
+    // had no way to be woken from another thread. The worker's environment port is
+    // always one of those: `worker_thread.js` needs it before this install runs.
+    // Without the refresh, the parent's answer to a stdout write never reached the
+    // worker's loop and its `Writable` stayed `writing` forever — see
+    // `rn_bind_messaging::refresh_owner_tokens`.
+    if let Some(token) = token {
+        rn_bind_messaging::refresh_owner_tokens(token);
+    }
     rn_bind_timers::add_check_phase_hook(report_worker_exits);
     // A running worker pins the loop even though it owns nothing on this loop's
     // libuv handle set: its thread has a loop of its own. Node calls this
