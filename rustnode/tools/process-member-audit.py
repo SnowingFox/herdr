@@ -16,7 +16,8 @@ Three sets, per population:
   commit `tools/node-pin.toml` names, so the reference cannot silently become a
   different Node's documentation.
 * **oracle** — `Object.getOwnPropertyNames(process)` under the pinned binary.
-* **rustnode** — the same under `target/release/rustnode`.
+* **rustnode** — the same under `target/release/rustnode`, or the path passed
+  with `--rustnode`.
 
 The verdict is `oracle - rustnode` (a member Node has that this build does not)
 and `rustnode - oracle` (a name this build invents). The *documented* set is
@@ -59,6 +60,21 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PIN = ROOT / "tools" / "node-pin.toml"
 RUSTNODE = ROOT / "target" / "release" / "rustnode"
+
+
+def rustnode_path() -> Path:
+    """The build to measure: `--rustnode <path>`, else the release binary.
+
+    The release default is right for a human or CI run that has one. The gate
+    builds only the debug profile, so it passes its own path rather than reading
+    an artifact it never produces.
+    """
+    if "--rustnode" in sys.argv:
+        index = sys.argv.index("--rustnode")
+        if index + 1 >= len(sys.argv):
+            raise SystemExit("--rustnode needs a path")
+        return Path(sys.argv[index + 1])
+    return RUSTNODE
 
 
 def pin_value(key: str) -> str:
@@ -214,8 +230,9 @@ def oracle_path() -> str:
 
 
 def main() -> int:
-    if not RUSTNODE.exists():
-        raise SystemExit(f"{RUSTNODE} is missing; cargo build --release -p rn-cli")
+    rustnode = rustnode_path()
+    if not rustnode.exists():
+        raise SystemExit(f"{rustnode} is missing; cargo build --release -p rn-cli")
     oracle = oracle_path()
     docs = documented()
     runner = probe_source()
@@ -223,7 +240,7 @@ def main() -> int:
     failed = False
     for population in ("main", "worker", "forked"):
         theirs = set(measure(oracle, runner, population))
-        ours = set(measure(str(RUSTNODE), runner, population))
+        ours = set(measure(str(rustnode), runner, population))
         missing = sorted(theirs - ours)
         extra = sorted(ours - theirs)
         both_absent = sorted(docs - theirs - ours)

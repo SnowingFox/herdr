@@ -27,6 +27,11 @@ cd "$root"
 
 gate=./tools/napi-symbol-coverage.py
 shims=crates/rn-napi/src/shims.rs
+# The gate passes the binary it actually builds; the tool's own default is the
+# release binary, which `check.sh` never builds (it runs `cargo check --release`).
+# Run standalone, this test keeps the release default to match a human or CI run
+# that has one.
+binary="${RUSTNODE_NAPI_BINARY:-target/release/rustnode}"
 backup="$(mktemp)"
 trap 'rm -f "$backup"' EXIT
 cp "$shims" "$backup"
@@ -42,7 +47,7 @@ checks=0
 expect() {
   local name="$1" needle="$2" expected_status="$3" output status
   set +e
-  output="$("$gate" 2>&1)"
+  output="$("$gate" --rustnode "$binary" 2>&1)"
   status=$?
   set -e
   checks=$((checks + 1))
