@@ -410,13 +410,24 @@ const fs = require("node:fs");
   await showAsync("bunFileDest", async () => {{ await Bun.write(Bun.file("e.txt"), "viafile"); return fs.readFileSync("e.txt", "utf8"); }});
   await showAsync("bunFilePayload", async () => {{ await Bun.write("f.txt", Bun.file("a.txt")); return fs.readFileSync("f.txt", "utf8"); }});
   await showAsync("numberCoerced", async () => {{ const n = await Bun.write("g.txt", 42); return [n, fs.readFileSync("g.txt", "utf8")]; }});
-  // Anything non-nullish that is not binary is `String()`-coerced rather than
-  // rejected. An object and a boolean are here because V8's `String()` and
-  // JavaScriptCore's agree on them; an array ("1,2" against "12") and a
-  // function's source spacing do not, and those are an engine difference this
-  // runtime cannot close while it is V8.
+  // Anything non-nullish that is not binary is coerced rather than rejected. An
+  // object and a boolean are here because V8's `String()` and JavaScriptCore's
+  // agree on them.
   await showAsync("objectCoerced", async () => {{ const n = await Bun.write("h.txt", {{a: 1}}); return [n, fs.readFileSync("h.txt", "utf8")]; }});
   await showAsync("booleanCoerced", async () => {{ const n = await Bun.write("i.txt", true); return [n, fs.readFileSync("i.txt", "utf8")]; }});
+  // An array is a list of **parts**, joined with no separator: Bun writes `"12"`
+  // for `[1, 2]` where `String([1,2])` is `"1,2"`. This is Bun's own rule, not
+  // an engine difference — both V8 and JavaScriptCore report `"1,2"` for
+  // `String([1,2])` — so it is pinned rather than excused as one.
+  //
+  // A nullish element contributes nothing among its neighbours, so `[1, null, 2]`
+  // writes `"12"`. A single-element array holding one is the exception: Bun
+  // reduces it to that element and coerces the element, so `[null]` is the four
+  // bytes `null`. Both measured on 1.4.4.
+  await showAsync("arrayParts", async () => {{ const n = await Bun.write("l.txt", [1, 2]); return [n, fs.readFileSync("l.txt", "utf8")]; }});
+  await showAsync("arrayNested", async () => {{ const n = await Bun.write("m.txt", [[1], [2]]); return [n, fs.readFileSync("m.txt", "utf8")]; }});
+  await showAsync("arrayWithNullGap", async () => {{ const n = await Bun.write("n2.txt", [1, null, 2]); return [n, fs.readFileSync("n2.txt", "utf8")]; }});
+  await showAsync("arrayLoneNull", async () => {{ const n = await Bun.write("n3.txt", [null]); return [n, fs.readFileSync("n3.txt", "utf8")]; }});
   show("nullPayload", () => Bun.write("j.txt", null));
   show("undefinedPayload", () => Bun.write("k.txt", undefined));
   // Parent directories are created; Node's `writeFile` throws ENOENT here.

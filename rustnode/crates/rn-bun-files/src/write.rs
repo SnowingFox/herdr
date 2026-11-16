@@ -159,17 +159,75 @@ fn payload_bytes<'s>(
         return Some(Ok(text.to_rust_string_lossy(scope).into_bytes()));
     }
 
-    // Anything else that is not binary is `String()`-coerced, not rejected.
-    // Measured on Bun 1.4.4: `Bun.write(p, {a: 1})` writes `"[object Object]"`,
-    // `[1, 2]` writes `"12"`, and a function writes its source text. Numbers and
-    // booleans are the same rule, which is why they need no separate arm. `null`
-    // and `undefined` are the only refusals.
+    // Anything else that is not binary is coerced, not rejected. Measured on Bun
+    // 1.4.4: `Bun.write(p, {a: 1})` writes `"[object Object]"`, a boolean writes
+    // `"true"`, and a function writes its source text. `null` and `undefined` are
+    // the only refusals.
     if value.is_null() || value.is_undefined() {
         return None;
     }
     if let Some(bytes) = binary_bytes(scope, value) {
         return Some(Ok(bytes));
     }
+
+    // An **array** is a list of parts, not one value: Bun writes each element's
+    // `String()` with **no separator**. Measured: `[1, 2]` writes `"12"` (two
+    // bytes) and `[[1],[2]]` writes `"12"`, while `String([1,2])` is `"1,2"`.
+    // This is Bun's own rule, not an engine difference — V8 and JavaScriptCore
+    // both report `"1,2"` for `String([1,2])` — which is why coercing the array
+    // whole wrote the wrong bytes and why joining with `","` is not the shape
+    // either.
+    //
+    // A `null` or `undefined` **element** contributes nothing among its
+    // neighbours, because its `String()` is empty: `[1, null, 2]` and
+    // `[1, undefined, 2]` both write `"12"`. But a **single-element** array
+    // holding one is the exception — `[null]` writes the four bytes `null` and
+    // `[undefined]` the nine bytes `undefined` — because Bun reduces a
+    // one-element array to that element and coerces the element, not the array.
+    // Measured across `[null]`, `[null,1]`, `[1,null]`, `[null,""]`, `[null,[]]`
+    // and `[null,null,1]`; only the lone case keeps its text.
+    //
+    // # The zero-part case, which this does *not* reproduce
+    //
+    // A payload that produces no bytes — `[]`, `[null, null]`, `new Blob([])` —
+    // makes Bun reject with `ENOENT` when the destination does not exist yet,
+    // because it writes such a payload through a descriptor it opens with
+    // `truncate` and that call does not create the file. An existing file
+    // succeeds with 0. That is Bun's internal write path rather than this
+    // member's coercion rule, and it shows up for `new Blob([])`, which never
+    // reaches an array here, so reproducing it would be guessing at a different
+    // subsystem. It is recorded as a divergence instead.
+    if let Ok(array) = v8::Local::<v8::Array>::try_from(value) {
+        let length = array.length();
+        if length == 1 {
+            if let Some(only) = array.get_index(scope, 0) {
+                if only.is_null() {
+                    return Some(Ok(b"null".to_vec()));
+                }
+                if only.is_undefined() {
+                    return Some(Ok(b"undefined".to_vec()));
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        for index in 0..length {
+            let Some(element) = array.get_index(scope, index) else {
+                continue;
+            };
+            if element.is_null() || element.is_undefined() {
+                continue;
+            }
+            if let Some(chunk) = binary_bytes(scope, element) {
+                bytes.extend_from_slice(&chunk);
+                continue;
+            }
+            if let Some(text) = element.to_string(scope) {
+                bytes.extend_from_slice(text.to_rust_string_lossy(scope).as_bytes());
+            }
+        }
+        return Some(Ok(bytes));
+    }
+
     value
         .to_string(scope)
         .map(|text| Ok(text.to_rust_string_lossy(scope).into_bytes()))
