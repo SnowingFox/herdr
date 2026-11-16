@@ -658,14 +658,31 @@ fn parser_consume<'s>(
 
     // `StreamBase::FromObject` unwraps the internal `StreamBase` pointer. A
     // handle from another binding has none, and Node `CHECK_NOT_NULL`s it.
+    //
+    // Two shapes are accepted, because a `StreamBase` is not always a libuv
+    // handle. A `TLSWrap` — which is `socket._handle` for every HTTPS server
+    // socket — publishes a `StreamState` with a null `stream` field, since its
+    // ciphertext leaves through the wrapped socket. `lib/internal/http/server.js`
+    // checks `socket._handle?.isStreamBase` before calling this, so it expects
+    // exactly such a handle to work; rejecting it made every HTTPS *server*
+    // request throw `consume() requires a stream handle`.
+    //
     // SAFETY: the scope is live and the object is a live local, so any stream
-    // pointer attached to it belongs to a binding that outlives this call.
-    let Some(stream) = (unsafe { rn_uv::streams::stream_of(scope, object) }) else {
-        throw(scope, "consume() requires a stream handle");
-        return;
+    // pointer or state attached to it belongs to a binding that outlives this
+    // call. The record only stores the address; see `ConsumedStream`.
+    let identity = match unsafe { rn_uv::streams::stream_of(scope, object) } {
+        Some(stream) => crate::parser::ConsumedStream::Stream(stream),
+        None => match unsafe { rn_uv::streams::state_of(scope, object) } {
+            Some(state) => crate::parser::ConsumedStream::State(state),
+            None => {
+                throw(scope, "consume() requires a stream handle");
+                return;
+            }
+        },
     };
 
-    let Some(installed) = with_parser(args.this(), |parser| parser.consume(stream)) else {
+    let Some(installed) = with_parser(args.this(), |parser| parser.consume_identity(identity))
+    else {
         throw(scope, "HTTPParser is not initialized");
         return;
     };

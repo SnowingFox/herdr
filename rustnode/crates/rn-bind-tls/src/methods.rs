@@ -1,13 +1,15 @@
-//! The 42 `TLSWrap` prototype methods.
+//! The 42 `TLSWrap` prototype methods, plus the `AsyncWrap` surface they inherit.
 //!
 //! `crypto_tls.cc:2397-2460` installs them; [`crate::wrap::PROTO_METHODS`] is the
-//! list. This module supplies each body, and it is split in three:
+//! list. This module supplies each body, and it is split in four:
 //!
 //! | group | what they do | increment |
 //! | --- | --- | --- |
 //! | implemented here | read state this crate already has — `destroySSL`, `getServername`, `verifyError`, `getProtocol`, the counters | 1 |
-//! | [`pending`] | throw with the increment that will land them named | 2, 3, 4 |
 //! | the stream surface | [`crate::stream`], which delegates to the wrapped stream | 2 |
+//! | the handshake | `start`, `setVerifyMode`, `getCipher`, the `SSL_get_error` loop | 3 |
+//! | sessions and ALPN | `enableSessionCallbacks`, `loadSession`, `setSession`, `newSessionDone`, `setALPNProtocols`, `enableALPNCb`, `enableKeylogCallback` | 4 |
+//! | the `pending_method!` bodies | throw with the increment that will land them named | 3, 4 |
 //!
 //! # Why the unimplemented ones throw rather than return `undefined`
 //!
@@ -18,6 +20,16 @@
 //! the plan's own numbering, which is what makes a partial landing usable instead
 //! of mysterious. This is the same reasoning `rn-bind-secure-context`'s `STUBS`
 //! records: a declared gap is visible and a lie is not.
+//!
+//! # Why increment 4 covers seven methods and not the whole list
+//!
+//! The seven are the ones a real connection reaches: `https.Agent` attaches a
+//! `'session'` listener to every socket it opens, `http2.connect` sets
+//! `ALPNProtocols`, and a resumption round trip needs `loadSession`/`setSession`
+//! with `newSessionDone` to unpark the server's ticket. What remains is listed in
+//! the `pending_method!` table with a reason each: mostly OCSP, PSK and
+//! SNI-certificate switching, which no ordinary HTTPS or HTTP/2 connection
+//! reaches.
 //!
 //! The code is `ERR_TLS_NOT_IMPLEMENTED` rather than Node's
 //! `ERR_METHOD_NOT_IMPLEMENTED` so a test that matches on it knows it is looking
@@ -38,7 +50,7 @@ use std::os::raw::c_int;
 use rn_v8_sys::v8;
 
 use crate::state::with_state;
-use crate::wrap::{key, throw_coded, throw_type_error};
+use crate::wrap::{key, throw_coded, throw_error, throw_type_error};
 
 /// The code every pending method throws.
 pub const NOT_IMPLEMENTED: &str = "ERR_TLS_NOT_IMPLEMENTED";
@@ -97,67 +109,45 @@ pending_method!(
     "it drives SSL_renegotiate through the retry loop"
 );
 
-// Increment 4: the SSL callbacks, session resumption, and the queries that need a
-// completed handshake.
+// Increment 4 landed the session and ALPN surface a real connection reaches:
+// `enableSessionCallbacks`, `enableALPNCb`, `enableKeylogCallback`,
+// `loadSession`, `setSession`, `newSessionDone`, `setALPNProtocols`. What is
+// still deferred is listed below with the connection shape that would need it, so
+// the remaining gaps are visible rather than implied.
+//
+// | method | why it is still deferred |
+// | --- | --- |
+// | `certCbDone`, `enableCertCb` | OCSP and SNI certificate switching for a server: `SSL_set_cert_cb` parks the handshake until JavaScript answers. An ordinary TLS server and every client path never enters it. |
+// | `clientHelloDone` | Resumes a server handshake parked by the *early ClientHello* callback, which only a `'resumeSession'` server listener reaches. Client-side resumption uses `setSession`, which is implemented. |
+// | `requestOCSP`, `setOCSPResponse` | The stapled-OCSP pair. `requestOCSP` needs `SSL_set_tlsext_status_type` plus the response callback; `setOCSPResponse` needs a peer response to attach. Neither is on by default. |
+// | `setKeyCert` | Per-`SSL` certificate for an SNI-selected context. A server's certificate comes from its `SecureContext`, so only `setSecureContext`-per-session server code needs this. |
+// | `exportKeyingMaterial`, `getFinished`, `getPeerFinished` | Channel-binding and Finished-message queries: `tlsSocket.exportKeyingMaterial()` and the `test-tls-*` files that read them. Nothing in `https`, `http2` or `fetch` calls them. |
+// | `enablePskCallback`, `setPskIdentityHint` | Pre-shared keys, an alternative to certificates. `tls.connect({ pskCallback })` is the only caller, and no mainstream client uses it. |
+// | `getX509Certificate` | The `X509Certificate` object for the *local* certificate. `getCertificate` (legacy shape) is implemented; this is the newer class-returning form. |
+// | `renegotiate` | TLS 1.2 renegotiation. TLS 1.3 has no renegotiation and this build's clients negotiate 1.3; `tlsSocket.renegotiate()` is the only caller. |
 pending_method!(
     pending_cert_cb_done,
     "certCbDone",
     4,
-    "it resumes the handshake from the oncertcb handler, which needs the callback machinery"
+    "it resumes the handshake from the oncertcb handler, which needs the OCSP and SNI certificate-switch path"
 );
 pending_method!(
     pending_client_hello_done,
     "clientHelloDone",
     4,
-    "it resumes a server handshake parked for the session callback"
+    "it resumes a server handshake parked by the early ClientHello callback, which only a 'resumeSession' server listener reaches"
 );
 pending_method!(
     pending_enable_cert_cb,
     "enableCertCb",
     4,
-    "it parks the handshake until oncertcb answers"
-);
-pending_method!(
-    pending_enable_alpn_cb,
-    "enableALPNCb",
-    4,
-    "it installs SSL_CTX_set_alpn_select_cb"
-);
-pending_method!(
-    pending_enable_keylog_callback,
-    "enableKeylogCallback",
-    4,
-    "it installs SSL_CTX_set_keylog_callback, which calls into JavaScript"
-);
-pending_method!(
-    pending_enable_session_callbacks,
-    "enableSessionCallbacks",
-    4,
-    "it installs the new/get session callbacks, which call into JavaScript"
-);
-pending_method!(
-    pending_load_session,
-    "loadSession",
-    4,
-    "it installs a session for the next handshake"
-);
-pending_method!(
-    pending_new_session_done,
-    "newSessionDone",
-    4,
-    "it resumes after the onnewsession handler"
+    "it parks the handshake until oncertcb answers, which is the OCSP and SNI certificate-switch path"
 );
 pending_method!(
     pending_request_ocsp,
     "requestOCSP",
     4,
     "it enables the status-request extension and needs the OCSP response path"
-);
-pending_method!(
-    pending_set_alpn_protocols,
-    "setALPNProtocols",
-    4,
-    "it calls SSL_CTX_set_alpn_protos and needs the ALPN callback"
 );
 pending_method!(
     pending_set_key_cert,
@@ -170,12 +160,6 @@ pending_method!(
     "setOCSPResponse",
     4,
     "it attaches a stapled OCSP response"
-);
-pending_method!(
-    pending_set_session,
-    "setSession",
-    4,
-    "it calls SSL_set_session for resumption"
 );
 pending_method!(
     pending_export_keying_material,
@@ -263,17 +247,17 @@ pub fn install_into<'s>(
         "certCbDone" => method!(pending_cert_cb_done),
         "clientHelloDone" => method!(pending_client_hello_done),
         "enableCertCb" => method!(pending_enable_cert_cb),
-        "enableALPNCb" => method!(pending_enable_alpn_cb),
-        "enableKeylogCallback" => method!(pending_enable_keylog_callback),
-        "enableSessionCallbacks" => method!(pending_enable_session_callbacks),
-        "loadSession" => method!(pending_load_session),
-        "newSessionDone" => method!(pending_new_session_done),
+        "enableALPNCb" => method!(enable_alpn_cb),
+        "enableKeylogCallback" => method!(enable_keylog_callback),
+        "enableSessionCallbacks" => method!(enable_session_callbacks),
+        "loadSession" => method!(load_session),
+        "newSessionDone" => method!(new_session_done),
         "requestOCSP" => method!(pending_request_ocsp),
-        "setALPNProtocols" => method!(pending_set_alpn_protocols),
+        "setALPNProtocols" => method!(set_alpn_protocols),
         "setKeyCert" => method!(pending_set_key_cert),
         "setOCSPResponse" => method!(pending_set_ocsp_response),
         "setServername" => method!(set_servername),
-        "setSession" => method!(pending_set_session),
+        "setSession" => method!(set_session),
         "exportKeyingMaterial" => method!(pending_export_keying_material),
         "getALPNNegotiatedProtocol" => method!(get_alpn_negotiated_protocol),
         "getCertificate" => method!(crate::peer_cert::get_certificate),
@@ -1079,6 +1063,447 @@ fn writes_issued_by_prev_listener_done<'s>(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Increment 4: session callbacks, resumption, and ALPN
+// ---------------------------------------------------------------------------
+
+/// `TLSWrap::EnableSessionCallbacks` (`crypto_tls.cc:1413`).
+///
+/// Three lines in Node: `CHECK_NOT_NULL(ssl_)` and `enable_session_callbacks()`.
+/// The new/get-session callbacks themselves are installed on the `SSL_CTX` when
+/// the wrap is built ([`crate::callback::install`]), exactly as
+/// `TLSWrap::TLSWrap` does it; this method is the *per-wrap* switch that decides
+/// whether they act, which is `has_session_callbacks()` in
+/// `NewSessionCallback`.
+///
+/// This is the method `https.Agent` reaches without meaning to: it attaches a
+/// `'session'` listener to every socket it creates (`lib/https.js:456`) to fill
+/// its session cache, and `wrap.js:940`'s `newListener` hook turns that into this
+/// call. Until it existed, **every** HTTPS request threw here.
+fn enable_session_callbacks<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let result = with_state(args.this(), |state| {
+        if state.ssl.is_none() {
+            return Err("enableSessionCallbacks after destroySSL");
+        }
+        state.flags.session_callbacks = true;
+        if let Some(handles) = state.callback.as_ref() {
+            handles.session_callbacks.set(true);
+        }
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_coded(scope, message, "ERR_TLS_INVALID_STATE"),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
+    }
+}
+
+/// `TLSWrap::EnableALPNCb` (`crypto_tls.cc:1513`).
+///
+/// Sets `flags_.alpn_callback_enabled` and installs `SelectALPNCallback` on the
+/// context. The flag is what makes the callback route the offered list to
+/// JavaScript instead of matching against `alpn_protos_`; installing the callback
+/// without it would leave `ALPNCallback` never firing.
+fn enable_alpn_cb<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let result = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return Err("enableALPNCb after destroySSL");
+        }
+        state.flags.alpn_callback_enabled = true;
+        if let Some(handles) = state.callback.as_ref() {
+            handles.alpn_callback_enabled.set(true);
+        }
+        // SAFETY: `ssl` is live, checked above.
+        let ctx = unsafe { crate::ffi_extra::SSL_get_SSL_CTX(ssl) };
+        if ctx.is_null() {
+            return Err("the SSL has no SSL_CTX");
+        }
+        // SAFETY: `ctx` is live for the SSL's lifetime, and the callback is a
+        // plain `extern "C"` function with no captured state — every wrap's
+        // selection reads its own state through the SSL's app-data.
+        unsafe { install_alpn_select(ctx) };
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_coded(scope, message, "ERR_TLS_INVALID_STATE"),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
+    }
+}
+
+/// `SSL_CTX_set_alpn_select_cb(ctx, SelectALPNCallback, nullptr)`.
+///
+/// The context is shared by every `SSL` built from one `SecureContext`, so this
+/// runs once per wrap and is idempotent: installing the same function twice is
+/// what Node's `EnableALPNCb` and `SetALPNProtocols` both do.
+///
+/// # Safety
+///
+/// `ctx` must be a live `SSL_CTX`.
+unsafe fn install_alpn_select(ctx: *mut openssl_sys::SSL_CTX) {
+    // SAFETY: delegated to the caller's guarantee. The callback and the (ignored)
+    // argument pointer are `'static` and null, so neither can dangle.
+    unsafe {
+        openssl_sys::SSL_CTX_set_alpn_select_cb__fixed_rust(
+            ctx,
+            Some(crate::callback::select_alpn),
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+/// `TLSWrap::EnableKeylogCallback` (`crypto_tls.cc:1419`).
+///
+/// `sc_->SetKeylogCallback(KeylogCallback)`, which is
+/// `SSL_CTX_set_keylog_callback`. `wrap.js` calls it from `newListener` when a
+/// `'keylog'` listener is attached, so a socket with one threw here before this
+/// increment.
+fn enable_keylog_callback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let result = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return Err("enableKeylogCallback after destroySSL");
+        }
+        // SAFETY: `ssl` is live, checked above.
+        let ctx = unsafe { crate::ffi_extra::SSL_get_SSL_CTX(ssl) };
+        if ctx.is_null() {
+            return Err("the SSL has no SSL_CTX");
+        }
+        // SAFETY: `ctx` is live for the SSL's lifetime and the callback reads
+        // only what OpenSSL passes it plus the wrap's own app-data.
+        unsafe { openssl_sys::SSL_CTX_set_keylog_callback(ctx, Some(crate::callback::keylog)) };
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_coded(scope, message, "ERR_TLS_INVALID_STATE"),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
+    }
+}
+
+/// `TLSWrap::LoadSession` (`crypto_tls.cc:2068`): store a session for *this*
+/// handshake.
+///
+/// The server side's resumption path: `wrap.js`'s `loadSession(hello)` emits
+/// `'resumeSession'`, and the application's handler calls this with the DER it
+/// kept, then `clientHelloDone()` to resume the parked handshake. It is also the
+/// client's manual path via `tls.TLSSocket#setSession`.
+///
+/// Node tolerates an argument that does not decode — it stores whatever
+/// `d2i_SSL_SESSION` produced, including null — so a malformed buffer here clears
+/// the slot rather than throwing. The handshake then proceeds unresumed, which is
+/// visible as `session.reused === false` rather than as a connection failure.
+fn load_session<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let Some(der) = bytes_argument(scope, args.get(0), "loadSession") else {
+        return;
+    };
+    let result = with_state(args.this(), |state| {
+        if state.ssl.is_none() {
+            return Err("loadSession after destroySSL");
+        }
+        state.session.store(crate::ssl::Session::from_der(&der));
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_coded(scope, message, "ERR_TLS_INVALID_STATE"),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
+    }
+}
+
+/// `TLSWrap::SetSession` (`crypto_tls.cc:2003`): `SSL_set_session`.
+///
+/// The client's resumption path, reached from `wrap.js`'s `this._handle.setSession`
+/// when `tls.connect({ session })` is given one — which is how an
+/// `https.Agent`-cached session is replayed. The decoded session is freed after
+/// the call because `SSL_set_session` takes its own reference: Node's
+/// `SSLSessionPointer` destructor does exactly the same at the end of the
+/// statement.
+fn set_session<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let Some(der) = bytes_argument(scope, args.get(0), "setSession") else {
+        return;
+    };
+    // Node's `GetTLSSession` returns null for bytes it cannot decode and then
+    // returns silently (`// TODO(tniessen): figure out error handling`).
+    let Some(session) = crate::ssl::Session::from_der(&der) else {
+        return;
+    };
+    let result = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return Err("setSession after destroySSL");
+        }
+        // SAFETY: `ssl` is live, checked above, and `session` outlives the call.
+        // `SSL_set_session` takes its own reference on success, so the `Session`
+        // that owns this pointer frees only the reference created by
+        // `d2i_SSL_SESSION` below.
+        let ok = unsafe { openssl_sys::SSL_set_session(ssl, session.as_ptr()) == 1 };
+        if ok {
+            Ok(())
+        } else {
+            Err("SSL_set_session error")
+        }
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_error(scope, message),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
+    }
+}
+
+/// `TLSWrap::NewSessionDone` (`crypto_tls.cc:2237`).
+///
+/// Clears `flags_.awaiting_new_session` and runs `NewSessionDoneCb`, which is one
+/// `Cycle()`. The flag matters: `EncOut` refuses to write while it is set, so a
+/// server cannot send the ticket before the application has decided whether to
+/// store the session. Clearing it without cycling would leave the parked output
+/// in `enc_out_` until the next unrelated event.
+fn new_session_done<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let object = args.this();
+    let Some(cell) = crate::state::state_cell(object) else {
+        throw_type_error(scope, "Invalid TLSWrap receiver");
+        return;
+    };
+    // The flag is cleared through the callback slot, not through the state: this
+    // method is reached from inside `SSL_do_handshake`, where `cycle` holds the
+    // state's borrow — see `callback::clear_awaiting_new_session`.
+    crate::callback::clear_awaiting_new_session(cell);
+    // `with_state` is attempted afterwards and deliberately ignored when it
+    // fails: the state half of the flag is only readable outside a library call,
+    // and `enc_out` already prefers the slot's value.
+    let _ = with_state(object, |state| {
+        state.flags.awaiting_new_session = false;
+    });
+    // SAFETY: `cell` is this object's live state and the object is the receiver,
+    // so it cannot be collected during the call.
+    unsafe { crate::cycle::run(cell) };
+    // The parked ciphertext — the server's ticket, usually — is now in
+    // `pending_output` and has to reach the socket.
+    let stream = with_state(object, |state| state.underlying).flatten();
+    if let Some(stream) = stream {
+        // SAFETY: `stream` is the wrap's own `underlying`, live while it holds it.
+        unsafe { crate::stream::flush(scope, object, stream, None) };
+    }
+}
+
+/// `TLSWrap::SetALPNProtocols` (`crypto_tls.cc:1819`): the ALPN list.
+///
+/// Two branches, and which one runs is the whole negotiation:
+///
+/// * **client** — `SSL_set_alpn_protos`, which makes OpenSSL send the list in its
+///   ClientHello and pick whatever the server answers. A return of anything but 0
+///   is a `CHECK_EQ` failure in Node; here it is a `TypeError`, because the only
+///   way to reach it is a list OpenSSL considers malformed.
+/// * **server** — keep the list in `alpn_protos_` and install
+///   `SelectALPNCallback`, which matches it against each ClientHello.
+///
+/// This is what `http2.connect('https://…')` reaches first:
+/// `lib/internal/http2/core.js` sets `ALPNProtocols: ['h2']`, so before this
+/// increment a secure HTTP/2 session threw before it was even constructed.
+fn set_alpn_protocols<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let Some(protos) = bytes_argument(scope, args.get(0), "setALPNProtocols") else {
+        return;
+    };
+    let result = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return Err("setALPNProtocols after destroySSL".to_string());
+        }
+        if state.kind == crate::ssl::Kind::Client {
+            // SAFETY: `ssl` is live, checked above, and `protos` outlives the
+            // call; OpenSSL copies the list into the SSL.
+            let status = unsafe {
+                openssl_sys::SSL_set_alpn_protos(
+                    ssl,
+                    protos.as_ptr(),
+                    protos.len() as std::os::raw::c_uint,
+                )
+            };
+            if status != 0 {
+                return Err(format!(
+                    "SSL_set_alpn_protos failed with {status}: the list is empty or malformed"
+                ));
+            }
+            return Ok(());
+        }
+        state.alpn_protos = protos;
+        if let Some(handles) = state.callback.as_ref() {
+            // The callback reads the list from the slot rather than the state,
+            // because it runs on OpenSSL's stack where `cycle` holds the borrow.
+            *handles.alpn_protos.borrow_mut() = state.alpn_protos.clone();
+        }
+        // SAFETY: `ssl` is live, checked above.
+        let ctx = unsafe { crate::ffi_extra::SSL_get_SSL_CTX(ssl) };
+        if ctx.is_null() {
+            return Err("the SSL has no SSL_CTX".to_string());
+        }
+        // SAFETY: `ctx` is live for the SSL's lifetime.
+        unsafe { install_alpn_select(ctx) };
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_type_error(scope, &message),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
+    }
+}
+
+/// The bytes of an `ArrayBufferView` argument, or a `TypeError`.
+///
+/// Node's bindings `CHECK` the view type; a coercion would turn a caller's bug
+/// into a plausible-looking zero-length list, which `AGENTS.md` names as the
+/// reason bindings here are type-strict.
+fn bytes_argument<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+    method: &str,
+) -> Option<Vec<u8>> {
+    let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) else {
+        throw_type_error(scope, &format!("{method} expects a Buffer"));
+        return None;
+    };
+    let length = view.byte_length();
+    if length == 0 {
+        return Some(Vec::new());
+    }
+    let base = view.data().cast::<u8>();
+    if base.is_null() {
+        throw_type_error(scope, &format!("{method} was given a view with no data"));
+        return None;
+    }
+    // SAFETY: `base` points at `length` bytes of the caller's view, valid for the
+    // duration of the call, and the copy does not outlive it.
+    Some(unsafe { std::slice::from_raw_parts(base, length) }.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// The AsyncWrap surface (increment 4, defect 5)
+// ---------------------------------------------------------------------------
+
+/// Installs one `AsyncWrap` method onto `prototype`.
+///
+/// Separate from [`install_into`] because the names are not in
+/// [`crate::wrap::PROTO_METHODS`]: they come from `AsyncWrap`'s template, which
+/// `TLSWrap` inherits rather than lists.
+pub fn install_async_wrap_into<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    prototype: &v8::Template,
+    name: &'static str,
+) -> Result<(), String> {
+    macro_rules! method {
+        ($callback:path, $length:literal) => {{
+            let template = v8::FunctionTemplate::builder($callback)
+                .length($length)
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .build(scope);
+            prototype.set(key(scope, name)?.into(), template.into());
+        }};
+    }
+    match name {
+        "getAsyncId" => method!(get_async_id, 0),
+        "asyncReset" => method!(async_reset, 1),
+        "getProviderType" => method!(get_provider_type, 0),
+        other => return Err(format!("{other} is not an AsyncWrap method")),
+    }
+    Ok(())
+}
+
+/// `AsyncWrap::GetAsyncId`.
+///
+/// The id comes from the wrap's own state, not a fresh value per call: an async
+/// id identifies the *resource*, so two calls must agree and `asyncReset` is the
+/// only thing that changes it. `kInvalidAsyncId` for a receiver that is not a
+/// wrap, which is Node's `Set(kInvalidAsyncId)` before `UNWRAP`.
+fn get_async_id<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let id = with_state(args.this(), |state| state.async_wrap.async_id())
+        .unwrap_or(rn_bind_async_wrap::INVALID_ASYNC_ID);
+    rv.set(v8::Number::new(scope, id).into());
+}
+
+/// `AsyncWrap::GetProviderType`.
+///
+/// `PROVIDER_TLSWRAP` (68) for a real wrap. `lib/internal/http/agent.js` reads
+/// this to build the `ReusedHandle` it resets a pooled socket with, so the
+/// `init` hook that follows names the resource with the kind it already was.
+fn get_provider_type<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+) {
+    let provider = with_state(args.this(), |state| state.async_wrap.provider())
+        .unwrap_or(rn_core::async_wrap::PROVIDER_NONE);
+    rv.set(v8::Integer::new_from_unsigned(scope, provider).into());
+}
+
+/// `AsyncWrap::AsyncReset`.
+///
+/// Assigns a new async id and runs the `destroy`/`init` pair that goes with the
+/// change. A `TLSWrap` is built inside `wrap()`, which resets it once; a socket
+/// pulled back out of an `http.Agent` keep-alive pool is reset per request,
+/// which is what makes a reused TLS connection a new async resource.
+fn async_reset<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    // `CHECK(args[0]->IsObject())`. A non-object is a caller bug that a real
+    // `node` aborts on; throwing keeps the process alive without hiding it.
+    let Ok(resource) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        throw_type_error(scope, "asyncReset requires a resource object");
+        return;
+    };
+    // `args[1]->IsNumber() ? args[1].As<Number>()->Value() : kInvalidAsyncId`.
+    let execution_async_id = if args.get(1).is_number() {
+        args.get(1).number_value(scope)
+    } else {
+        None
+    };
+    let object = args.this();
+    let _ = with_state(object, |state| {
+        rn_bind_async_wrap::async_reset(
+            scope,
+            &mut state.async_wrap,
+            resource,
+            object,
+            execution_async_id,
+        );
+        state.context_frame = rn_bind_async_wrap::current_context_frame(scope);
+    });
+}
+
 /// `TLSWrap::GetWriteQueueSize`, the `writeQueueSize` accessor.
 ///
 /// `NodeBIO::FromBIO(enc_out_)->Length()`, the ciphertext waiting to be written.
@@ -1117,8 +1542,8 @@ mod tests {
         assert_eq!(crate::wrap::PROTO_METHODS.len(), 42);
     }
 
-    /// The ten implemented methods are all in the installed list, and the rest
-    /// are pending — the split the module docs describe.
+    /// The implemented methods are all in the installed list, and the remainder
+    /// throw — the split the module docs describe.
     #[test]
     fn the_implemented_set_is_named() {
         let implemented = [
@@ -1132,6 +1557,23 @@ mod tests {
             "setMaxSendFragment",
             "enableTrace",
             "writesIssuedByPrevListenerDone",
+            // Increment 2 and 3.
+            "receive",
+            "start",
+            "setVerifyMode",
+            "getCipher",
+            "setServername",
+            "getALPNNegotiatedProtocol",
+            "getEphemeralKeyInfo",
+            "getSession",
+            // Increment 4.
+            "enableSessionCallbacks",
+            "enableALPNCb",
+            "enableKeylogCallback",
+            "loadSession",
+            "setSession",
+            "newSessionDone",
+            "setALPNProtocols",
         ];
         for name in implemented {
             assert!(
@@ -1139,8 +1581,42 @@ mod tests {
                 "{name} is implemented but not installed"
             );
         }
-        // 42 installed minus 10 implemented: the remainder throw.
-        assert_eq!(crate::wrap::PROTO_METHODS.len() - implemented.len(), 32);
+        // The rest still throw, and each names its increment. The count is pinned
+        // so a method that quietly becomes implemented — or stops being — shows up
+        // here rather than only in a live smoke test.
+        assert_eq!(crate::wrap::PROTO_METHODS.len() - implemented.len(), 17);
+    }
+
+    /// The deferrals a real HTTPS or HTTP/2 connection does not reach, so the
+    /// remaining gaps are visible with their reasons.
+    ///
+    /// Keeping this as data is the point: `pending` entries throw a message that
+    /// names the increment, and a test that listed them nowhere would let one
+    /// silently drift into "implemented" or vanish from the prototype.
+    #[test]
+    fn the_deferred_set_is_the_ocsp_psk_and_sni_surface() {
+        let deferred = [
+            "certCbDone",
+            "clientHelloDone",
+            "enableCertCb",
+            "enablePskCallback",
+            "exportKeyingMaterial",
+            "getFinished",
+            "getPeerFinished",
+            "getX509Certificate",
+            "renegotiate",
+            "requestOCSP",
+            "setKeyCert",
+            "setOCSPResponse",
+            "setPskIdentityHint",
+        ];
+        for name in deferred {
+            assert!(
+                crate::wrap::PROTO_METHODS.contains(&name),
+                "{name} is deferred but not installed"
+            );
+        }
+        assert_eq!(deferred.len(), 13);
     }
 
     /// `length_of` matches the argument counts `crypto_tls.cc` uses.

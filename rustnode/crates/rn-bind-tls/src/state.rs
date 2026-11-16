@@ -158,7 +158,21 @@ pub struct WrapState {
     /// `TLSWrap::cert_cb_`, whether `enableCertCb` parked the handshake.
     pub cert_cb_pending: bool,
     /// `TLSWrap::next_sess_`, the session `loadSession` supplied.
-    pub next_session: Option<*mut openssl_sys::SSL_SESSION>,
+    ///
+    /// `Rc<RefCell<..>>` rather than a plain field because it is read *and taken*
+    /// by `GetSessionCallback` while `cycle` holds this state's borrow across
+    /// `SSL_do_handshake`. A plain field there would be an unconditional
+    /// `try_borrow_mut` failure, so the handshake would silently never resume.
+    /// The slot is its own cell, so it is reachable from OpenSSL's stack without
+    /// touching the state borrow at all.
+    pub session: SessionSlot,
+    /// `TLSWrap::alpn_protos_`, the ALPN list a **server** advertises.
+    ///
+    /// A client's list goes straight to `SSL_set_alpn_protos` and is not stored:
+    /// OpenSSL owns it from that point. A server's has to be kept because
+    /// `SelectALPNCallback` reads it for every ClientHello and it must outlive
+    /// the call that set it.
+    pub alpn_protos: Vec<u8>,
     /// The bytes `EncOut` has produced but not yet handed to the socket.
     ///
     /// Node writes them straight to the underlying stream from `EncOut`; a queue
@@ -185,6 +199,22 @@ pub struct WrapState {
     /// `pending_output` is ciphertext on its way to the socket. Mixing the two
     /// would put plaintext inside the TLS framing.
     pub pending_cleartext_output: Vec<u8>,
+    /// Mirrors the `AsyncWrap` state of this wrap, for `getAsyncId`,
+    /// `getProviderType` and the `init`/`destroy` hooks.
+    ///
+    /// Node's `TLSWrap` is an `AsyncWrap` (`crypto_tls.cc:404`), and its
+    /// constructor calls `AsyncReset`, so the handle has an async id from the
+    /// moment it exists. `lib/internal/http/client.js:1040` reads
+    /// `socket._handle.getAsyncId()` when a response ends, which is how an
+    /// `https.get` that succeeds now reaches the keep-alive path — and why a
+    /// `TLSWrap` without this surface turned a working HTTPS response into
+    /// `TypeError: socket._handle.getAsyncId is not a function`.
+    ///
+    /// The id space is `rn-bind-async-wrap`'s, not a private counter, exactly as
+    /// `rn-bind-tcp-wrap` documents: an id a hook never saw is worse than no id.
+    pub async_wrap: rn_core::AsyncWrapState,
+    /// `AsyncWrap`'s `kAsyncContextFrame`, captured by the initial reset.
+    pub context_frame: Option<v8::Global<v8::Value>>,
     /// Cleartext the caller wrote that `SSL_write` could not yet accept.
     ///
     /// `crypto_tls.cc`'s `pending_cleartext_input_`, a kept backing store that
@@ -235,7 +265,12 @@ impl WrapState {
             listener: None,
             underlying: None,
             cert_cb_pending: false,
-            next_session: None,
+            session: SessionSlot::default(),
+            alpn_protos: Vec::new(),
+            async_wrap: rn_core::AsyncWrapState::uninitialised(
+                rn_core::async_wrap::PROVIDER_TLSWRAP,
+            ),
+            context_frame: None,
             pending_output: Vec::new(),
             pending_cleartext: Vec::new(),
             pending_cleartext_output: Vec::new(),
@@ -347,6 +382,11 @@ impl WrapState {
         self.pending_output.clear();
         self.pending_cleartext.clear();
         self.pending_cleartext_output.clear();
+        // `next_sess_.reset()`: a session that was loaded and never used is
+        // freed here, which is the only path that can still own one once the
+        // handshake is over.
+        self.session.clear();
+        self.alpn_protos.clear();
         self.error = None;
         self.flags.eof = false;
         self.secure_context = None;
@@ -376,6 +416,74 @@ impl WrapState {
     /// The write BIO, if the SSL is alive.
     pub fn enc_out(&self) -> Option<EncOut> {
         self.ssl.as_ref().and_then(Ssl::enc_out)
+    }
+}
+
+/// The `next_sess_` slot, reachable from inside an SSL library call.
+///
+/// Two things in this crate need the loaded session: `loadSession` stores it
+/// (holding the state borrow) and `GetSessionCallback` takes it (called by
+/// OpenSSL from inside `SSL_do_handshake`, where `cycle` is already holding the
+/// state's `RefCell`). A `Rc<RefCell<Option<Session>>>` is its own cell, so the
+/// callback reaches it without going through the state borrow that would
+/// certainly fail — the same split [`crate::callback`] documents for the
+/// handshake flags.
+///
+/// Cloning shares one slot, which is what makes the callback's copy and the
+/// state's copy the same session.
+#[derive(Clone, Default)]
+pub struct SessionSlot {
+    inner: std::rc::Rc<RefCell<Option<crate::ssl::Session>>>,
+}
+
+impl SessionSlot {
+    /// Stores `session`, replacing whatever was waiting — Node's
+    /// `next_sess_.reset(sess)`.
+    pub fn store(&self, session: Option<crate::ssl::Session>) {
+        // `try_borrow_mut` rather than `borrow_mut` for the same reason the
+        // state uses it: a re-entrant callback must be reported, not panic.
+        if let Ok(mut slot) = self.inner.try_borrow_mut() {
+            *slot = session;
+        }
+    }
+
+    /// Takes the stored session, which is Node's `next_sess_.release()`: the
+    /// caller becomes its owner and must hand it to OpenSSL or drop it.
+    ///
+    /// Returns null rather than `None` because every caller is an `extern "C"`
+    /// callback whose protocol is a pointer.
+    pub fn take_ptr(&self) -> *mut openssl_sys::SSL_SESSION {
+        let Ok(mut slot) = self.inner.try_borrow_mut() else {
+            return ptr::null_mut();
+        };
+        match slot.take() {
+            Some(session) => session.release(),
+            None => ptr::null_mut(),
+        }
+    }
+
+    /// Whether a session is waiting, for the tests that pin the release.
+    pub fn is_set(&self) -> bool {
+        self.inner
+            .try_borrow()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Drops whatever is stored, which is `next_sess_.reset()` at teardown.
+    pub fn clear(&self) {
+        if let Ok(mut slot) = self.inner.try_borrow_mut() {
+            *slot = None;
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionSlot")
+            .field("set", &self.is_set())
+            .finish()
     }
 }
 

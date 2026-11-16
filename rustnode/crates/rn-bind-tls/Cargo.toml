@@ -29,6 +29,10 @@ rn-bind-crypto-x509 = { path = "../rn-bind-crypto-x509" }
 # `getCertificate`/`getPeerCertificate` return Buffers, and `getTLSTicket` does
 # too, so the one Buffer constructor the workspace already has is reused.
 rn-bind-crypto-keys = { path = "../rn-bind-crypto-keys" }
+# `TLSWrap` is an `AsyncWrap` in Node (`t->Inherit(AsyncWrap::GetConstructorTemplate)`),
+# so `getAsyncId`/`asyncReset`/`getProviderType` answer from that namespace's id
+# space and emit its hooks. A private counter would hand out ids no hook ever saw.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 # `verifyError()`'s message depends on `--use-system-ca`, which is a parsed
 # option rather than a runtime flag this crate can read any other way.
 rn-bind-options = { path = "../rn-bind-options" }

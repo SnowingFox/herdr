@@ -423,6 +423,18 @@ pub unsafe fn enc_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
     let Some(enc_out) = state.enc_out() else {
         return 0;
     };
+    // `crypto_tls.cc:722`: a server waits for `newSessionDone` before it lets
+    // output out, so the ticket cannot leave before the application has decided
+    // whether to store the session. Reading it anyway would send the ticket and
+    // then leave `awaiting_new_session` pointing at output that is gone.
+    let awaiting = state
+        .callback
+        .as_ref()
+        .map(|handles| handles.awaiting_new_session.get())
+        .unwrap_or(state.flags.awaiting_new_session);
+    if awaiting {
+        return 0;
+    }
     let bytes = enc_out.take_all();
     if bytes.is_empty() {
         return 0;

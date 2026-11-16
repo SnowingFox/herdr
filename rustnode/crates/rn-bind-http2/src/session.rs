@@ -543,9 +543,10 @@ pub fn send_pending_data(scope: &mut v8::PinScope<'_, '_>, state: &SessionState)
     state.write_scheduled.set(false);
     // SAFETY: `stream_state` is live while the socket object is.
     let stream = unsafe { (*stream_state).stream };
-    if stream.is_null() {
-        return;
-    }
+    // A null `stream` is not "nothing to do": a `TLSWrap` consumed as this
+    // session's socket has no libuv handle of its own, so [`write_to_stream`]
+    // sends through the handle's `writev` instead. Returning here was why a
+    // secure HTTP/2 session sent no frames at all.
     state.sending.set(true);
 
     let mut gathered: Vec<u8> = Vec::new();
@@ -573,22 +574,7 @@ pub fn send_pending_data(scope: &mut v8::PinScope<'_, '_>, state: &SessionState)
     state.has_pending_data.set(true);
 
     let bytes = std::mem::take(&mut *state.outgoing.borrow_mut());
-    let length = bytes.len();
-    let buffer = rn_uv::sys::uv_buf_t {
-        base: bytes.as_ptr() as *mut std::os::raw::c_char,
-        len: length,
-    };
-    // SAFETY: `stream` is the socket this session consumed and is live until the
-    // session closes; `bytes` is moved into `owned` so the buffer outlives the
-    // completion.
-    let status = unsafe {
-        rn_uv::stream::queue_write_unowned(
-            stream,
-            vec![buffer],
-            length,
-            vec![bytes.into_boxed_slice()],
-        )
-    };
+    let status = write_to_stream(scope, state, stream, bytes);
     // nghttp2 reports more to send whenever it queued a frame behind the one just
     // handed over — an ACK it generated while reading, or a SETTINGS submitted
     // after the gather above. Re-arming here is what keeps the connection moving;
@@ -602,7 +588,83 @@ pub fn send_pending_data(scope: &mut v8::PinScope<'_, '_>, state: &SessionState)
     }
     state.has_pending_data.set(status == 0);
     maybe_notify_graceful_close(state);
-    let _ = scope;
+}
+
+/// Hands `bytes` to the stream this session consumed, and returns the status.
+///
+/// Two paths, because a consumed stream is not always a libuv handle:
+///
+/// * a `TCP`/`Pipe` has one, so the bytes go out through the same
+///   `queue_write_unowned` the rest of this crate uses;
+/// * a `TLSWrap` does **not** — it is a `StreamBase` whose own writes encrypt
+///   through `SSL_write` — so `underlying_stream()->Write(*bufs, count)`
+///   (`node_http2.cc:2075`) becomes a call to the handle's `writev`. Node reaches
+///   that through the C++ vtable; here it is the method `TLSWrap.prototype`
+///   publishes, which is exactly the surface `lib/net.js` also writes through.
+///
+/// Without the second path a secure HTTP/2 connection negotiated `h2` and then
+/// put nothing on the wire: the SETTINGS frame was gathered, `state.stream`'s
+/// `stream` field was null, and `send_pending_data` returned before writing.
+fn write_to_stream(
+    scope: &mut v8::PinScope<'_, '_>,
+    state: &SessionState,
+    stream: *mut rn_uv::sys::uv_stream_t,
+    bytes: Vec<u8>,
+) -> i32 {
+    if !stream.is_null() {
+        let length = bytes.len();
+        let buffer = rn_uv::sys::uv_buf_t {
+            base: bytes.as_ptr() as *mut std::os::raw::c_char,
+            len: length,
+        };
+        // SAFETY: `stream` is live while the session holds it, and `bytes` is
+        // moved into `owned` so the buffer outlives the completion.
+        return unsafe {
+            rn_uv::stream::queue_write_unowned(
+                stream,
+                vec![buffer],
+                length,
+                vec![bytes.into_boxed_slice()],
+            )
+        };
+    }
+    let handle = state
+        .stream_object
+        .borrow()
+        .as_ref()
+        .map(|object| v8::Local::new(scope, object));
+    let Some(handle) = handle else {
+        return -1;
+    };
+    // `StreamBase::Write`'s JS spelling: `writev(req, chunks, allBuffers)` with a
+    // null request, which makes the binding allocate the `WriteWrap` and return
+    // it. A non-object result means the write was refused.
+    let Some(key) = v8::String::new(scope, "writev") else {
+        return -1;
+    };
+    let Some(value) = handle.get(scope, key.into()) else {
+        return -1;
+    };
+    let Ok(method) = v8::Local::<v8::Function>::try_from(value) else {
+        return -1;
+    };
+    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+    let Some(view) = v8::Uint8Array::new(scope, array_buffer, 0, array_buffer.byte_length()) else {
+        return -1;
+    };
+    let chunks = v8::Array::new(scope, 1);
+    chunks.set_index(scope, 0, view.into());
+    let arguments: [v8::Local<'_, v8::Value>; 3] = [
+        v8::null(scope).into(),
+        chunks.into(),
+        v8::Boolean::new(scope, true).into(),
+    ];
+    let receiver: v8::Local<'_, v8::Value> = handle.into();
+    match method.call(scope, receiver, &arguments) {
+        Some(result) if result.is_object() => 0,
+        _ => -1,
+    }
 }
 
 /// `Consume`: take over a socket's reads and writes.
@@ -1105,27 +1167,14 @@ pub fn close(scope: &mut v8::PinScope<'_, '_>, session: &SessionState, code: u32
                         (*stream_state).stream
                     }
                 };
-                if !stream.is_null() {
-                    let count = gathered.len();
-                    let buffer = rn_uv::sys::uv_buf_t {
-                        base: gathered.as_ptr() as *mut std::os::raw::c_char,
-                        len: count,
-                    };
-                    // SAFETY: `stream` is live until its own close callback, and
-                    // `gathered` is moved into `owned`.
-                    unsafe {
-                        let _ = rn_uv::stream::queue_write_unowned(
-                            stream,
-                            vec![buffer],
-                            count,
-                            vec![gathered.into_boxed_slice()],
-                        );
-                    }
-                }
+                // `write_to_stream` covers both shapes: a libuv socket, and a
+                // `TLSWrap` that has no handle of its own and writes through its
+                // own `writev`. The null-stream case used to drop the GOAWAY,
+                // which is why a closed HTTP/2 session over TLS sent nothing.
+                let _ = write_to_stream(scope, session, stream, gathered);
             }
         }
     }
-    let _ = scope;
 }
 
 /// Detaches the listener and frees the nghttp2 session.

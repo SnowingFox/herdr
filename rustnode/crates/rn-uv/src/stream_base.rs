@@ -190,7 +190,7 @@ struct Chunk {
 /// unrecognised name is `utf8`, which is what `ParseEncoding`'s fall-through
 /// does — `lib/internal/streams/writable.js` has already rejected anything
 /// `Buffer.isEncoding` does not know, so this only ever sees real names.
-fn chunk_encoding(
+pub fn chunk_encoding(
     scope: &mut v8::PinScope<'_, '_>,
     chunks: v8::Local<v8::Array>,
     index: u32,
@@ -227,7 +227,7 @@ fn encoding_from_name(name: &str) -> rn_core::Encoding {
 /// `StringBytes::Write` works from `String::ValueView`, which is the code units
 /// themselves; the encodings differ in how they narrow them, and `ucs2` needs the
 /// units unmodified, so the conversion cannot happen earlier.
-fn string_units(scope: &v8::Isolate, text: &v8::String) -> Vec<u16> {
+pub fn string_units(scope: &v8::Isolate, text: &v8::String) -> Vec<u16> {
     let length = text.length();
     if length == 0 {
         return Vec::new();

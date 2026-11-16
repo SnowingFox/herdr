@@ -38,7 +38,7 @@
 //! is arranged to avoid: [`crate::wrap::TlsState`] holds a *rooted JavaScript*
 //! reference to the `SecureContext` object, never a second OpenSSL owner.
 
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_long, c_uchar};
 use std::ptr;
 
 use openssl_sys as ffi;
@@ -309,6 +309,150 @@ pub const SSL_MODE_AUTO_RETRY: i64 = 0x0000_0004;
 /// `SSL_CTRL_SET_MAX_SEND_FRAGMENT` (`ssl.h:1311`), which `SSL_set_max_send_fragment`
 /// is a macro over.
 pub const SSL_CTRL_SET_MAX_SEND_FRAGMENT: c_int = 52;
+
+/// An owned `SSL_SESSION`, the type behind `TLSWrap`'s `next_sess_`.
+///
+/// Node holds `next_sess_` as an `ncrypto::SSLSessionPointer`, which is a
+/// `std::unique_ptr<SSL_SESSION>` over `SSL_SESSION_free`. Three entry points
+/// touch it and each needs a different ownership shape, which is why this type
+/// exists rather than a bare pointer:
+///
+/// * `loadSession` decodes DER with `d2i_SSL_SESSION` and **stores** the result,
+///   replacing any session that was already waiting;
+/// * the get-session callback hands the stored session to OpenSSL and **releases**
+///   it — `next_sess_.release()` — because `SSL` takes ownership from there, so a
+///   second `SSL_SESSION_free` would be a double free;
+/// * teardown frees whatever is still stored, which is a session that was loaded
+///   but never used because the handshake took a path that did not need it.
+///
+/// `Option<Session>` expresses all three: `take()` is the release, dropping it is
+/// the free, and `None` is Node's null pointer.
+pub struct Session {
+    raw: *mut ffi::SSL_SESSION,
+}
+
+// The session is only ever touched from the thread that owns the event loop, for
+// the same reason [`Ssl`] is: every entry point is a V8 or libuv callback on that
+// thread.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Session")
+            .field("freed", &self.raw.is_null())
+            .finish()
+    }
+}
+
+impl Session {
+    /// Decodes DER into an owned session, which is `TLSWrap::LoadSession`'s
+    /// `d2i_SSL_SESSION`.
+    ///
+    /// `None` when the bytes are not a session, which Node's `LoadSession`
+    /// tolerates: it stores whatever `d2i_SSL_SESSION` returned, including null,
+    /// and the handshake then proceeds unresumed rather than failing.
+    pub fn from_der(der: &[u8]) -> Option<Self> {
+        if der.is_empty() {
+            return None;
+        }
+        let mut cursor = der.as_ptr();
+        // SAFETY: `cursor` points at `der.len()` readable bytes and `d2i` advances
+        // it within that buffer only; the returned session is a new allocation
+        // owned here.
+        let raw =
+            unsafe { ffi::d2i_SSL_SESSION(ptr::null_mut(), &mut cursor, der.len() as c_long) };
+        if raw.is_null() {
+            None
+        } else {
+            Some(Self { raw })
+        }
+    }
+
+    /// The raw pointer, for `SSL_set_session` or an `SSL`'s get-session callback.
+    ///
+    /// Borrowing rather than releasing: a caller that hands this to OpenSSL and
+    /// keeps the [`Session`] alive transfers its own reference, which is what
+    /// `SSL_set_session` does.
+    pub fn as_ptr(&self) -> *mut ffi::SSL_SESSION {
+        self.raw
+    }
+
+    /// Encodes the session as DER, which the new-session callback hands to
+    /// JavaScript as the `'session'` object.
+    pub fn to_der(&self) -> Option<Vec<u8>> {
+        // SAFETY: `self.raw` is owned by this value, so it is live until `Drop`.
+        unsafe { encode(self.raw) }
+    }
+
+    /// Gives up ownership without freeing, which is Node's `next_sess_.release()`
+    /// in the get-session callback: the `SSL` that receives the session owns it
+    /// from then on.
+    pub fn release(mut self) -> *mut ffi::SSL_SESSION {
+        std::mem::replace(&mut self.raw, ptr::null_mut())
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.raw.is_null() {
+            return;
+        }
+        let raw = std::mem::replace(&mut self.raw, ptr::null_mut());
+        // SAFETY: `raw` was live and nothing else has freed it — `release` is the
+        // only way to give it away, and that consumes the `Session`.
+        unsafe { ffi::SSL_SESSION_free(raw) };
+    }
+}
+
+/// `i2d_SSL_SESSION` into a `Vec`, shared by [`Session::to_der`] and
+/// `getSession`.
+///
+/// A null or unencodable session is `None` rather than an empty buffer: Node's
+/// bindings leave the return value unset, which JavaScript reads as `undefined`.
+///
+/// # Safety
+///
+/// `session` must be null or a live session the caller may read.
+pub unsafe fn encode(session: *mut ffi::SSL_SESSION) -> Option<Vec<u8>> {
+    if session.is_null() {
+        return None;
+    }
+    // SAFETY: `session` is live per the caller's contract; a null output pointer
+    // asks only for the encoded length.
+    let length = unsafe { ffi::i2d_SSL_SESSION(session, ptr::null_mut()) };
+    if length <= 0 {
+        return None;
+    }
+    let mut bytes = vec![0u8; length as usize];
+    let mut cursor = bytes.as_mut_ptr();
+    // SAFETY: `bytes` has exactly `length` bytes and `i2d` advances `cursor` past
+    // what it wrote without overrunning the buffer it was given room for.
+    let written = unsafe { ffi::i2d_SSL_SESSION(session, &mut cursor) };
+    if written <= 0 {
+        return None;
+    }
+    bytes.truncate(written as usize);
+    Some(bytes)
+}
+
+/// `SSL_SESSION_get_id`, the session id the new-session event carries.
+///
+/// # Safety
+///
+/// `session` must be null or a live session.
+pub unsafe fn session_id(session: *mut ffi::SSL_SESSION) -> Vec<u8> {
+    if session.is_null() {
+        return Vec::new();
+    }
+    let mut length: std::os::raw::c_uint = 0;
+    // SAFETY: `session` is live per the caller's contract, and `length` is a live
+    // local out-parameter.
+    let data = unsafe { ffi::SSL_SESSION_get_id(session, &mut length) };
+    if data.is_null() || length == 0 {
+        return Vec::new();
+    }
+    // SAFETY: OpenSSL points at `length` bytes owned by the session.
+    unsafe { std::slice::from_raw_parts(data as *const c_uchar, length as usize) }.to_vec()
+}
 
 /// `SSL_set_max_send_fragment(ssl, val)`, a macro in `ssl.h:2262` with no symbol.
 ///
