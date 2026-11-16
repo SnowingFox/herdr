@@ -1864,7 +1864,12 @@ fn an_ec_peer_certificate_can_be_read() {
             {{ port: server.address().port, host: '127.0.0.1', rejectUnauthorized: false }}); \
           c.on('secureConnect', () => {{ \
             const p = c.getPeerCertificate(); \
-            console.log([typeof p, p && p.bits].join(',')); \
+            console.log([ \
+              typeof p, \
+              p && p.bits, \
+              p && p.pubkey && p.pubkey.length, \
+              p && p.pubkey && p.pubkey[0], \
+            ].join(',')); \
             c.end(); \
             server.close(() => process.exit(0)); \
           }}); \
@@ -1891,9 +1896,17 @@ fn an_ec_peer_certificate_can_be_read() {
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // `object,256,65,4` — the encoded public key must be the 65-byte
+    // uncompressed form, starting with the `0x04` tag. This half of the
+    // assertion is the cheap guard: with the old declaration that passed
+    // `&mut length` as the `BN_CTX`, this printed `object,256,undefined,undefined`
+    // in a plain **debug** build, so a point-length check catches the whole class
+    // without Valgrind and without an optimised build. It is here alongside the
+    // Valgrind assertion rather than instead of it, because Valgrind names the
+    // function and this does not.
     assert!(
-        stdout.contains("object,256"),
-        "the EC key must report its real size; stdout: {stdout}"
+        stdout.contains("object,256,65,4"),
+        "the EC key must report its real size and its uncompressed point; stdout: {stdout}"
     );
     assert_ne!(
         output.status.code(),
