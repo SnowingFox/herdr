@@ -203,39 +203,44 @@ statement is "the blocker is a V8 version skew with a known workaround that is
 not semantically safe", not "blocked with no path".
 
 
-## The current phase budget (re-measured at `e8a7c1b0`)
+## The current phase budget (re-measured at `2d7ac642`)
 
 The tables above record the code-cache work at its own tree. This one is a fresh
 budget of the current startup, and it is the table to read before proposing a
-startup change: it says where the 21-28 ms actually goes now, rather than where
+startup change: it says where the 23-29 ms actually goes now, rather than where
 it went when the cache landed.
 
 Measured with `RN_PROFILE_PHASES=1`, release build, median of 60 runs, each run
-in its own process, on an idle machine (load average 1.7). Deltas are the
-per-phase cost; cumulative is measured from `main`.
+in its own process, on an idle machine (load average 0.16-0.5, `cat /proc/loadavg`
+recorded beside each batch). Deltas are the per-phase cost; cumulative is
+measured from `main`. This is on `2d7ac642`, so it includes `install_bun`.
 
 | phase | cumulative | delta | p25-p75 |
 | --- | --- | --- | --- |
-| tracing init | 0.04 | 0.04 | 0.03-0.04 |
+| tracing init | 0.03 | 0.03 | 0.03-0.04 |
 | v8 link check | 0.04 | 0.01 | 0.01-0.01 |
 | `uv_setup_args` | 0.05 | 0.01 | 0.01-0.01 |
-| args parse + permission install | 0.10 | 0.05 | 0.05-0.06 |
-| binding registry | 0.41 | 0.31 | 0.29-0.36 |
-| `V8::initialize` | 1.01 | 0.59 | 0.56-0.66 |
-| `Isolate::new` | 2.38 | 1.35 | 1.27-1.53 |
-| `Context::new` | 2.78 | 0.41 | 0.38-0.45 |
-| `install_globals` (bootstrap.js) | 3.12 | 0.33 | 0.31-0.37 |
-| primordials | 6.52 | 3.38 | 3.18-3.70 |
-| `realm.js` executed | 9.24 | 2.62 | 2.42-2.92 |
-| **process source maps** | 13.68 | **4.40** | 4.10-4.66 |
-| install_early_globals | 17.37 | 3.71 | 3.49-3.88 |
-| install_cjs_loader | 18.70 | 1.27 | 1.19-1.41 |
-| install_stdio + console | 20.20 | 1.48 | 1.36-1.83 |
-| prepare_execution | 21.45 | 1.23 | 1.19-1.38 |
-| Runtime::install + eval builtins | 21.58 | 0.12 | 0.12-0.14 |
-| push_top_level_context | 21.58 | 0.00 | — |
-| user script | 21.60 | 0.01 | 0.01-0.01 |
-| loop finished | 21.65 | 0.04 | 0.04-0.05 |
+| args parse + permission install | 0.10 | 0.05 | 0.04-0.06 |
+| binding registry | 0.41 | 0.31 | 0.29-0.34 |
+| `V8::initialize` | 1.03 | 0.62 | 0.58-0.67 |
+| `Isolate::new` | 2.42 | 1.38 | 1.31-1.50 |
+| `Context::new` | 2.83 | 0.42 | 0.39-0.44 |
+| `install_globals` (bootstrap.js) | 3.17 | 0.34 | 0.32-0.36 |
+| primordials | 6.77 | 3.56 | 3.34-4.11 |
+| `realm.js` executed | 9.50 | 2.64 | 2.49-2.90 |
+| **process source maps** | 14.14 | **4.55** | 4.29-4.81 |
+| `install_bun` | 14.18 | **0.04** | 0.04-0.04 |
+| install_early_globals | 18.01 | 3.82 | 3.73-4.02 |
+| install_cjs_loader | 19.42 | 1.32 | 1.26-1.42 |
+| install_stdio + console | 21.01 | 1.61 | 1.46-1.82 |
+| prepare_execution | 22.75 | 1.33 | 1.24-1.96 |
+| Runtime::install + eval builtins | 23.04 | 0.13 | 0.12-0.15 |
+| push_top_level_context | 23.04 | 0.00 | — |
+| user script | 23.05 | 0.01 | 0.01-0.01 |
+| loop finished | 23.09 | 0.04 | 0.04-0.06 |
+
+`install_bun` costs **0.04 ms**, matching the figure in the commit that added it,
+and it sits between `process source maps` and `install_early_globals`.
 
 Three things this table changes about the older account:
 
@@ -249,9 +254,56 @@ that module inside its startup snapshot.
 **`realm.js` is no longer 9.8 ms.** The code cache plus `#26`'s fix moved it to
 2.6 ms. `primordials` (3.4 ms) is now larger than `realm.js`.
 
-**V8 bring-up is 2.8 ms of ~22 ms.** `V8::initialize` + `Isolate::new` +
-`Context::new` is 2.8 ms; the JavaScript bootstrap is ~18.5 ms. Any proposal that
+**V8 bring-up is 2.8 ms of ~23 ms.** `V8::initialize` + `Isolate::new` +
+`Context::new` is 2.8 ms; the JavaScript bootstrap is ~19 ms. Any proposal that
 targets V8 initialisation is aiming at an eighth of the problem.
+
+### What a first write costs, and why it is the biggest single number here
+
+The budget above is a `void 0` budget, and `void 0` never touches stdio. A script
+whose first act is to print pays a one-time cost that is larger than any single
+bootstrap phase, and it lands in the `user script` row:
+
+| phase budget, `-e 'console.log(1)'` | delta |
+| --- | --- |
+| `user script` (was 0.01 ms on `void 0`) | **7.09 ms** |
+| every other phase | unchanged (max 4.55 ms) |
+
+Interleaved wall clock agrees and puts the gap slightly higher, because wall time
+also covers exec and teardown:
+
+| | rustnode | node | rustnode delta | node delta |
+| --- | --- | --- | --- | --- |
+| `-e 'void 0'` | 26.32 | 21.85 | — | — |
+| `-e 'console.log(1)'` | 35.45 | 24.52 | **+9.1 ms** | **+2.7 ms** |
+
+Broken down in one process, it is a single lazy stream construction:
+
+- `process.hrtime.bigint()` as the first statement: **0.001 ms**, same as Node
+- that call followed by a `stderr.write`: **6.85 ms** against Node's 1.61 ms
+- any write after an earlier write has warmed the stream: **0.016 ms**, against
+  Node's 0.015 ms — identical
+
+So the cost is the one-time construction of the stdio `Socket` behind
+`process.stdout`/`process.stderr`. `getStdout()` builds it lazily in
+`internal/bootstrap/switches/is_main_thread.js`, and it pulls in `net` and
+`stream`; a cold `require('net')` here is 5.1-5.7 ms against Node's 0.74-0.94 ms.
+
+**Pre-warming does not recover it.** `process.stderr.write('')` before the timed
+work, then `console.log(1)`, measured 34.43-35.10 ms against 33.78 ms for the same
+`console.log(1)` with no warm-up. The work moves, it does not disappear — the same
+pattern as the deferred `source_map_cache` require recorded below. Winning here
+means making the construction cheaper or sharing it with `install_stdio`, not
+triggering it earlier.
+
+**The apparent 5x cold-`require` deficit is this cost, not module loading.**
+Requiring ten modules cold in separate processes — `net`, `stream`, `http`, `fs`,
+`events`, `util`, `url`, `path`, `tty`, `string_decoder` — gives a flat
+**4.7-5.2x** against Node with a constant **~5.2 ms** offset, including `path`,
+which is a few hundred bytes and cannot cost 6 ms. Measuring three requires in
+one process collapses it (`path` 0.758, then `url` 0.508, then `events` 0.014 ms).
+A module-loading comparison taken from one `require` per process measures this
+first-entry cost ten times and reports a loading problem that does not exist.
 
 ### The unmeasured 5 ms: process entry and dynamic loading
 
@@ -273,13 +325,29 @@ an idle box, and CPU time unchanged. The loader statistics exaggerate the cost
 because `LD_DEBUG` timing includes its own accounting; wall clock is the
 authority and it says relocation is not worth a linker flag.
 
+### The null control has to be the same path, not just the same bytes
+
+A null control on this box only works when both arms are the **same file path**.
+Two byte-identical copies of the master binary, one in the build directory and one
+in `/tmp`, measured 29.53 vs 30.48 ms at n=100 and then 29.61 vs 30.73 ms — a
+reproducible **3.2-3.5%** gap that is placement, not the binary. Running the
+*same* path under two labels gives 29.77 vs 29.73 ms (**0.1%**), and staging both
+binaries in one directory gives 1.2%.
+
+That 3.5% is larger than most changes anyone would propose here, and it points in
+whichever direction the second path happens to be cold. Copying a candidate binary
+somewhere convenient and comparing it against the original in its build tree is
+exactly how a false 1.2x is manufactured; every comparison in this document puts
+both arms in the same directory.
+
 ### Levers that were measured and did not help
 
 Each of these was measured against an interleaved control in the same batch, on
-an idle machine, at n=30-80. The A/A noise floor on this box — two binaries from
-the same source, interleaved — is **1.9-2.7%**, so anything inside that band is
-not a result. Recording them because they are the obvious ideas and each one
-would otherwise be tried again.
+an idle machine, at n=30-120, with both binaries in the same directory. The A/A
+noise floor on this box — the same path under two labels, interleaved — is
+**0.1%**; across two different directories it is **1.2-3.5%**, which is why
+placement is controlled rather than assumed. Recording these because they are the
+obvious ideas and each one would otherwise be tried again.
 
 | lever | measured | verdict |
 | --- | --- | --- |
@@ -296,6 +364,8 @@ would otherwise be tried again.
 | stripping 19 MB of symbols from the binary | 26.20 → 27.74 ms | inside noise |
 | skipping the libuv threadpool drain at exit | +0.3 ms (worse) | teardown is not a cost |
 | `_exit` to skip `atexit`/`.fini_array` | -0.19 ms | inside noise; teardown is not a cost |
+| pre-warming `process.stderr` before `console.log(1)` | 34.43-35.10 vs 33.78 ms unwarmed | the stream cost moves, it does not go |
+| `--cpu-prof` for attribution | rejected: `unsupported option '--cpu-prof'` | the CLI has no profiler flag, so attribution is by instrumented probes |
 
 Two of these are worth understanding rather than just recording:
 
