@@ -563,6 +563,25 @@ pub unsafe fn emit_read(state: *mut StreamState, nread: isize, buffer: ReadBuffe
     }
 }
 
+/// `StreamResource::EmitWantsWrite` (`src/stream_base-inl.h:92`).
+///
+/// Node's body is `if (listener_ != nullptr) listener_->OnStreamWantsWrite(suggested_size);`
+/// — nothing when no listener is attached. It is how a stream that reports
+/// `HasWantsWrite()` asks its listener for more data, and a `StreamPipe` over an
+/// `Http2Stream` depends on it entirely: the pipe deliberately stops reading after
+/// each queued write and only resumes here.
+///
+/// # Safety
+///
+/// `state` must be live, or null. No reference to it may be held by the caller
+/// across this call.
+pub unsafe fn emit_wants_write(state: *mut StreamState, suggested_size: usize) {
+    let Some(listener) = top_listener(state) else {
+        return;
+    };
+    listener.with(|inner| inner.on_stream_wants_write(suggested_size));
+}
+
 /// `StreamResource::EmitAfterWrite` (`src/stream_base.h:294`).
 ///
 /// # Safety

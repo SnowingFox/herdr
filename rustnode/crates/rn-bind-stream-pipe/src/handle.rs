@@ -196,16 +196,17 @@ fn new(
         return;
     };
 
-    // `StreamBase::FromObject`. Every stream namespace in this runtime attaches
-    // its state under the shared symbol, which is the same unwrap Node's virtual
-    // performs.
+    // `StreamBase::FromObject`. Every stream namespace in this runtime that owns a
+    // libuv handle attaches its stream under the shared symbol, and every stream
+    // that does not — `JSStream`, a consumed `TLSWrap`, and now `FileHandle` and
+    // `Http2Stream` — attaches its `StreamState` under the state symbol. Node's
+    // virtual unwraps the `BaseObject`, so accepting either spelling here is what
+    // makes the set of accepted objects match.
     // SAFETY: both objects are live locals, so any state a binding attached to
     // them outlives this call.
     let (Some(source), Some(sink)) = (
-        unsafe { rn_uv::streams::stream_of(scope, source_object) }
-            .and_then(|stream| unsafe { rn_uv::handle::owner(stream) }),
-        unsafe { rn_uv::streams::stream_of(scope, sink_object) }
-            .and_then(|stream| unsafe { rn_uv::handle::owner(stream) }),
+        unsafe { rn_uv::streams::state_of(scope, source_object) },
+        unsafe { rn_uv::streams::state_of(scope, sink_object) },
     ) else {
         crate::throw_type_error(scope, "StreamPipe requires two stream handles");
         return;
@@ -224,17 +225,14 @@ fn new(
     pipe.object = Some(v8::Global::new(scope.as_ref(), object));
     pipe.source_object = Some(v8::Global::new(scope.as_ref(), source_object));
     pipe.sink_object = Some(v8::Global::new(scope.as_ref(), sink_object));
-    // `uses_wants_write_ = sink->HasWantsWrite()`. No stream in this runtime
-    // reports it yet, so this is false — but it is read from the sink's state
-    // rather than hardcoded, so a sink that gains the capability needs no change
-    // here.
+    // `uses_wants_write_ = sink->HasWantsWrite()`.
+    //
+    // Read from the sink's ops rather than hardcoded: an `Http2Stream` reports
+    // `true` (`src/node_http2.h:320`), and that is what makes the pipe hand
+    // backpressure to the stream instead of resuming the source itself.
     // SAFETY: `sink` is the live state both objects share, as `FromObject` proved.
-    pipe.uses_wants_write.set(unsafe {
-        (*sink)
-            .listeners
-            .iter()
-            .any(|attached| attached.stream().is_some())
-    });
+    pipe.uses_wants_write
+        .set(unsafe { rn_uv::stream_ops::ops_of(sink).has_wants_write() });
 
     object.set_aligned_pointer_in_internal_field(PIPE_FIELD, pointer.cast::<c_void>(), 0);
 
@@ -365,10 +363,7 @@ fn unpipe_state(pipe: &PipeState, is_in_deletion: bool) {
         // SAFETY: the source is live until its own close callback runs, which is
         // what sets `source_destroyed`.
         unsafe {
-            let raw = (*pipe.source).stream;
-            if !raw.is_null() {
-                rn_uv::stream::read_stop(raw);
-            }
+            rn_uv::stream_ops::ops_of(pipe.source).read_stop(pipe.source);
         }
     }
     pipe.is_closed.set(true);
@@ -470,10 +465,7 @@ fn writable_wants_write(pipe: &PipeState, suggested_size: usize) {
     // SAFETY: the source is live until `source_destroyed` is set, which the guard
     // above checked.
     unsafe {
-        let raw = (*pipe.source).stream;
-        if !raw.is_null() {
-            rn_uv::stream::read_start(raw, pipe.source);
-        }
+        rn_uv::stream_ops::ops_of(pipe.source).read_start(pipe.source);
     }
 }
 
@@ -527,7 +519,9 @@ impl StreamListener for ReadableListener {
         // outlive this callback, and `ReadBuffer::Allocated` is owned by the read
         // that produced it. See this module's docs.
         let bytes = bytes.to_vec();
-        pipe.pending_writes.set(pipe.pending_writes.get() + 1);
+        // The count is raised inside `write_to_sink`, which is where
+        // `StreamPipe::ProcessData` raises it: before the write is dispatched, so
+        // a synchronous completion already sees it.
         write_to_sink(pipe, bytes);
     }
 
@@ -550,49 +544,76 @@ impl StreamListener for ReadableListener {
 }
 
 /// `sink()->Write(&buffer, 1)`, with the completion accounted for.
+///
+/// This is `StreamPipe::ProcessData`. Two details are load-bearing:
+///
+/// * `pending_writes_` is incremented **before** the write is dispatched, so a
+///   completion that runs synchronously inside the call already sees the count.
+/// * A synchronous completion is reported inline through the pipe's own writable
+///   listener — Node calls `writable_listener_.OnStreamAfterWrite(nullptr,
+///   res.err)` — because no async completion is coming. Skipping that leaves the
+///   count permanently raised and the pipe never unpipes.
 fn write_to_sink(pipe: &PipeState, bytes: Vec<u8>) {
     if pipe.sink.is_null() {
         return;
     }
-    // SAFETY: the sink is live until `sink_destroyed` is set.
-    let raw = unsafe { (*pipe.sink).stream };
-    if raw.is_null() {
-        return;
-    }
-    let length = bytes.len();
-    let status = drain_to_sink(raw, bytes);
-    if status != 0 {
-        // The write never queued, so no completion will fire. Node's
-        // `ProcessData` decrements only in the asynchronous branch, and reports a
-        // synchronous failure through `OnStreamAfterWrite` with a null request;
-        // this crate reports it by passing the status on and clearing the count.
-        pipe.pending_writes.set(pipe.pending_writes.get() - 1);
-        let _ = length;
-    }
-}
-
-/// Runs the write and returns libuv's status.
-///
-/// `rn_uv::stream::queue_write` wants a request object to hang its completion on.
-/// A `StreamPipe` write has no caller-supplied `WriteWrap` — the bytes came from
-/// the source's read, not from JavaScript — so a bare `WriteWrap` with no
-/// `oncomplete` is used, which is what Node's internal `StreamWriteResult` does
-/// for the same case.
-fn drain_to_sink(raw: *mut rn_uv::sys::uv_stream_t, bytes: Vec<u8>) -> i32 {
     let length = bytes.len();
     let buffer = rn_uv::sys::uv_buf_t {
         base: bytes.as_ptr() as *mut std::os::raw::c_char,
         len: length,
     };
-    // SAFETY: `raw` is the live sink stream, and `bytes` is moved into `owned`
-    // below so its allocation outlives the completion.
-    unsafe {
-        rn_uv::stream::queue_write_unowned(
-            raw,
+    pipe.pending_writes.set(pipe.pending_writes.get() + 1);
+    // SAFETY: the sink is live until `sink_destroyed` is set, which the callers
+    // of this function have checked by not having seen it.
+    let outcome = unsafe {
+        rn_uv::stream_ops::ops_of(pipe.sink).write(
+            pipe.sink,
             vec![buffer],
             length,
             vec![bytes.into_boxed_slice()],
         )
+    };
+    match outcome {
+        rn_uv::stream_ops::WriteOutcome::Queued => {
+            // An async sink keeps the pipe from reading more until the completion
+            // arrives, which is the backpressure `ProcessData` applies.
+            pipe.is_reading.set(false);
+            if !pipe.source.is_null() {
+                // SAFETY: the source is live; the pipe has not been unpiped.
+                unsafe {
+                    rn_uv::stream_ops::ops_of(pipe.source).read_stop(pipe.source);
+                }
+            }
+        }
+        rn_uv::stream_ops::WriteOutcome::Sync(status) => {
+            // No completion will fire, so run the pipe's own. Everything below is
+            // `WritableListener::OnStreamAfterWrite` with a null request.
+            after_sink_write(pipe, status);
+        }
+    }
+}
+
+/// The body `WritableListener::OnStreamAfterWrite` runs after the count drops.
+///
+/// Split out so the synchronous arm above can call it without a V8 scope: a sync
+/// completion inside a read is not allowed to re-enter JavaScript, and Node's own
+/// synchronous branch passes a null `WriteWrap` for exactly that reason.
+fn after_sink_write(pipe: &PipeState, status: i32) {
+    pipe.pending_writes.set(pipe.pending_writes.get() - 1);
+    if pipe.is_closed.get() {
+        return;
+    }
+    if pipe.is_eof.get() {
+        shutdown_sink(pipe);
+        unpipe_state(pipe, false);
+        return;
+    }
+    if status != 0 {
+        unpipe_state(pipe, false);
+        return;
+    }
+    if !pipe.uses_wants_write.get() {
+        writable_wants_write(pipe, 65_536);
     }
 }
 
@@ -601,13 +622,18 @@ fn shutdown_sink(pipe: &PipeState) {
     if pipe.sink.is_null() {
         return;
     }
+    // `StreamBase::Shutdown` returns 1 for a synchronous completion, 0 when one is
+    // owed, and a negative error. An `Http2Stream` finishes synchronously (its
+    // `CreateShutdownWrap` returns nullptr for exactly that reason), so its
+    // completion must be run here; a socket always queues one, which arrives
+    // through `WritableListener::on_stream_after_shutdown`.
     // SAFETY: the sink is live while the pipe exists.
-    unsafe {
-        let raw = (*pipe.sink).stream;
-        if !raw.is_null() {
-            rn_uv::stream::end_stream(raw);
-        }
-    }
+    let status = unsafe { rn_uv::stream_ops::ops_of(pipe.sink).shutdown(pipe.sink) };
+    // 1 is "finished synchronously" and 0 is "a completion is owed"; either is
+    // normal. A negative status is the sink refusing, which its own close path
+    // reports — `uv_shutdown` answers `UV_ENOTCONN` for a stream that never
+    // connected, and `core.js` treats that as "nothing to flush".
+    let _ = status;
 }
 
 /// The listener on the sink: counts writes down and finishes the pipe.

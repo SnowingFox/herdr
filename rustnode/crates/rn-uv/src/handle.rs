@@ -138,6 +138,25 @@ pub struct StreamState {
     /// `crate::listener`, because that module maintains the
     /// `previous_listener_` links the forwarding paths walk.
     pub listeners: Vec<crate::listener::ListenerRef>,
+    /// The four virtual methods a `StreamPipe` drives.
+    ///
+    /// Node's `StreamBase` is polymorphic: a `FileHandle` and an `Http2Stream`
+    /// are both pipe ends without owning a `uv_stream_t`. A state built by a
+    /// socket binding keeps [`crate::stream_ops::LibuvStreamOps`], which is the
+    /// behaviour that existed before this field; a stream with no libuv handle
+    /// installs its own. See [`crate::stream_ops`].
+    pub ops: &'static dyn crate::stream_ops::StreamOps,
+    /// The owner's own allocation, as an opaque pointer.
+    ///
+    /// `StreamBase`'s virtuals are methods on the *derived* object, so an
+    /// implementation needs to get from a `StreamState*` back to the struct that
+    /// contains it. A socket does not (`ops` alone is enough, because the
+    /// `uv_stream_t` carries `data`), but a `FileHandle` or an `Http2Stream` does:
+    /// their read and write paths live on state the state itself does not hold.
+    ///
+    /// Null for every socket. The binding that sets it guarantees the pointee
+    /// outlives the state.
+    pub owner: *mut std::ffi::c_void,
 }
 
 impl StreamState {
@@ -153,6 +172,8 @@ impl StreamState {
             owner_object: None,
             context_frame: None,
             listeners: Vec::new(),
+            ops: &crate::stream_ops::LIBUV_STREAM_OPS,
+            owner: std::ptr::null_mut(),
         }
     }
 

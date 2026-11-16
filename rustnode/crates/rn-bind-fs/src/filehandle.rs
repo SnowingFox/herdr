@@ -60,6 +60,14 @@ pub struct HandleState {
     descriptor: Cell<i32>,
     /// `AsyncWrap`'s id for this resource, stable across calls.
     async_id: f64,
+    /// The `StreamBase` half, boxed so its address is stable.
+    ///
+    /// `StreamBase::AddMethods` makes `FileHandle` a stream, which is what lets
+    /// `new StreamPipe(fileHandle, sink)` work — `lib/internal/http2/core.js` does
+    /// exactly that in `startFilePipe`. The state is behind a `Box` because the
+    /// ops reach it through a raw pointer recorded once, and a move would
+    /// invalidate it.
+    stream: Box<crate::filehandle_stream::FileHandleStream>,
 }
 
 impl HandleState {
@@ -74,6 +82,11 @@ impl HandleState {
             return None;
         }
         self.descriptor.set(-1);
+        // `AfterClose()`: the stream half reads the same descriptor, so it has to
+        // learn that it is gone — otherwise a read completion already in flight
+        // would re-arm and read a number the process may have since reused, and a
+        // readable side that was flowing would never be told to stop.
+        self.stream.after_close();
         Some(fd)
     }
 }
@@ -104,12 +117,25 @@ pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<Local<'s, v8:
     for (name, template) in [
         ("close", rn_core::method(close).build(scope)),
         ("closeSync", rn_core::method(close_sync).build(scope)),
+        // `FileHandle::Initialize` installs `releaseFD` right after `closeSync`
+        // and before `StreamBase::AddMethods`, so the position matches Node's.
+        (
+            "releaseFD",
+            rn_core::method(crate::filehandle_stream::release_fd).build(scope),
+        ),
         ("getAsyncId", rn_core::method(get_async_id).build(scope)),
     ] {
         let key = v8::String::new(scope, name)
             .ok_or_else(|| format!("cannot allocate the name {name}"))?;
         prototype.set(key.into(), template.into());
     }
+
+    // `StreamBase::AddMethods`. `FileHandle::Initialize` calls it right after
+    // installing its own three methods, and the resulting prototype order is
+    // observable, so the `StreamBase` surface follows them here too. Without this
+    // the class cannot be an end of a `StreamPipe`, and `sendFile` — the one
+    // caller — fails at the *type check* rather than at the write.
+    crate::filehandle_stream::install_stream_base(scope, prototype)?;
 
     // `FileHandle::fd` is a plain data property in Node, set by `StreamBase`'s
     // `SetMethod`-adjacent setup. It is an accessor here so the value is `-1`
@@ -141,6 +167,34 @@ fn raw_handle(object: v8::Local<v8::Object>) -> Option<*mut HandleState> {
     (!pointer.is_null()).then_some(pointer)
 }
 
+/// The `HandleState` behind a `FileHandle` object.
+///
+/// Exposed to sibling modules in this crate: the `StreamBase` half needs the
+/// descriptor, and it must not keep a second copy that could drift.
+pub(crate) fn raw_handle_state(object: v8::Local<'_, v8::Object>) -> Option<*mut HandleState> {
+    raw_handle(object)
+}
+
+impl HandleState {
+    /// The `StreamBase` half.
+    pub(crate) fn stream(&self) -> *mut crate::filehandle_stream::FileHandleStream {
+        self.stream.as_ref() as *const crate::filehandle_stream::FileHandleStream as *mut _
+    }
+
+    /// `FileHandle::Release`: hand the descriptor back and mark the handle closed,
+    /// without closing it.
+    ///
+    /// Both the outer `descriptor` and the stream half's copy are cleared, because
+    /// `handle.fd` reads this one while a read completion reads the other. They
+    /// are two views of one fact, so the transition is written once, here.
+    pub(crate) fn release(&self) -> i32 {
+        let fd = self.descriptor.get();
+        self.descriptor.set(-1);
+        self.stream.after_close();
+        fd
+    }
+}
+
 /// Borrows the handle state behind a `FileHandle` object.
 fn with_handle<R>(
     object: v8::Local<v8::Object>,
@@ -170,16 +224,39 @@ fn new_handle(
         throw_type_error(scope, "The fd argument must be non-negative");
         return;
     }
+    // `FileHandle::New`'s optional `(offset, length)`. `core.js` passes them from
+    // `respondWithFile(path, headers, { offset, length })`, and the stream half
+    // uses them to bound a `StreamPipe` transfer. Absent means "no offset, read to
+    // EOF", which is `-1` for the length.
+    let offset = crate::args::int64(scope, args.get(1)).unwrap_or(-1);
+    let length = crate::args::int64(scope, args.get(2)).unwrap_or(-1);
 
     let state = Box::new(HandleState {
         descriptor: Cell::new(fd),
         // A fresh id per handle: an async id identifies the resource, so two
         // FileHandles must not share one.
         async_id: rn_bind_async_wrap::next_async_id(),
+        stream: Box::new(crate::filehandle_stream::FileHandleStream::new(
+            fd, offset, length,
+        )),
     });
     let pointer = Box::into_raw(state);
     let object = args.this();
     object.set_aligned_pointer_in_internal_field(HANDLE_FIELD, pointer.cast(), 0);
+
+    // SAFETY: `pointer` names the live allocation, and `stream` inside it is the
+    // box whose address the ops record — a `Box` does not move with its owner.
+    let stream = unsafe { (*pointer).stream.state_pointer() };
+    // `StreamBase::GetObject()`: what the default listener delivers a read to.
+    // SAFETY: `stream` is live and owned by the box above.
+    unsafe { (*stream).owner_object = Some(v8::Global::new(scope.as_ref(), object)) };
+    // SAFETY: the box's address is final and it lives as long as the state that
+    // points at it.
+    unsafe { (*pointer).stream.install_owner() };
+    // `StreamBase::FromObject` is how `StreamPipe` finds a stream, and a
+    // `FileHandle` has no `uv_stream_t` to publish, so the *state* is published.
+    // SAFETY: `stream` is live for as long as the object is.
+    unsafe { rn_uv::streams::attach_state(scope, object, stream) };
 
     let address = pointer as usize;
     let weak = v8::Weak::with_guaranteed_finalizer(

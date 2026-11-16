@@ -23,6 +23,9 @@
 //!   is built on.
 //! * [`stream`] — the read, write and shutdown paths `TCP` and `Pipe` share.
 //! * [`stream_base`] — the `StreamBase` methods both socket bindings install.
+//! * [`stream_ops`] — the four virtual methods (`ReadStart`, `ReadStop`, `Write`,
+//!   `Shutdown`) a `StreamPipe` drives, so a stream with no libuv handle can still
+//!   be a pipe end.
 //!
 //! # What this crate does not own
 //!
@@ -40,6 +43,7 @@ pub mod poller;
 pub mod process_title;
 pub mod stream;
 pub mod stream_base;
+pub mod stream_ops;
 pub mod streams;
 pub mod threadpool;
 pub mod uv_loop;

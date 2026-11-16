@@ -27,6 +27,7 @@ pub mod cp;
 pub mod dirent;
 pub mod error;
 pub mod filehandle;
+pub mod filehandle_stream;
 pub mod flags;
 pub mod fsops;
 pub mod jobs;

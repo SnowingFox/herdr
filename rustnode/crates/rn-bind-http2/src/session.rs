@@ -97,6 +97,28 @@ pub struct StreamRecord {
     pub pending: Vec<u8>,
     /// Set by `shutdown()`/`end()`: the provider may report EOF.
     pub ended: bool,
+    /// Whether the readable side is flowing, mirrored here from the handle.
+    ///
+    /// `StreamBase::ReadStart`/`ReadStop` are the only writers. The data path runs
+    /// from `mem_recv` with no V8 scope, so it cannot read the handle's `Cell`;
+    /// this is the copy it consults, exactly as `Http2Stream::is_reading()` is on
+    /// the C++ side.
+    pub reading: bool,
+    /// `inbound_consumed_data_while_paused_`: bytes received while the readable
+    /// side was paused.
+    ///
+    /// `OnDataChunkReceived` either consumes a chunk immediately (when
+    /// `is_reading()`) or adds its length here, and `ReadStart` hands the total to
+    /// `nghttp2_session_consume_stream`. Without it a paused stream's flow-control
+    /// window is never reopened, so a peer stalls.
+    pub paused_unconsumed: usize,
+    /// Whether the provider has asked for more data since the last read.
+    ///
+    /// `HasWantsWrite()` is `true` for an HTTP/2 stream, so a `StreamPipe` never
+    /// resumes its source by itself; it waits for `EmitWantsWrite`. The provider
+    /// sets this from inside `mem_send`, where calling into JavaScript is not
+    /// legal, and [`crate::stream::settle_writes`] delivers it on the loop thread.
+    pub wants_write: bool,
 }
 
 /// One `nghttp2_submit_*` call that had to wait for `mem_recv` to return.
@@ -596,6 +618,14 @@ pub fn send_pending_data(scope: &mut v8::PinScope<'_, '_>, state: &SessionState)
         if unsafe { ffi::nghttp2_session_want_write(raw) } != 0 {
             schedule_write(state);
         }
+    }
+    // A provider that ran out of data during the gather above raised its
+    // "wants more" hint; deliver it now, outside `mem_send`. This is what resumes
+    // a `StreamPipe` whose sink is this session's stream, because an HTTP/2
+    // stream reports `HasWantsWrite()` and the pipe therefore never resumes its
+    // own source.
+    for stream_id in state.streams.borrow().keys().copied().collect::<Vec<i32>>() {
+        crate::stream::settle_writes(state, stream_id);
     }
     maybe_notify_graceful_close(state);
 }
