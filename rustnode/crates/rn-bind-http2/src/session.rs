@@ -274,8 +274,6 @@ pub struct SessionState {
     /// `nghttp2_session_mem_send` invalidates them on the next call, and a queued
     /// `uv_write` needs them to outlive this call.
     pub outgoing: RefCell<Vec<u8>>,
-    /// `has_pending_data_`.
-    pub has_pending_data: Cell<bool>,
     /// `custom_recv_error_code_`: the error string nghttp2 reported, if any.
     pub recv_error_code: RefCell<Option<String>>,
     /// `chunks_sent_since_last_write_`.
@@ -341,7 +339,6 @@ impl SessionState {
             stream_object: RefCell::new(None),
             fields: RefCell::new(None),
             outgoing: RefCell::new(Vec::new()),
-            has_pending_data: Cell::new(false),
             recv_error_code: RefCell::new(None),
             chunks_sent: Cell::new(0),
             chunks_sent_at: Cell::new(0),
@@ -583,11 +580,9 @@ pub fn send_pending_data(scope: &mut v8::PinScope<'_, '_>, state: &SessionState)
     state.sending.set(false);
 
     if gathered.is_empty() {
-        state.has_pending_data.set(false);
         return;
     }
     *state.outgoing.borrow_mut() = gathered;
-    state.has_pending_data.set(true);
 
     let bytes = std::mem::take(&mut *state.outgoing.borrow_mut());
     let status = write_to_stream(scope, state, stream, bytes);
@@ -602,7 +597,6 @@ pub fn send_pending_data(scope: &mut v8::PinScope<'_, '_>, state: &SessionState)
             schedule_write(state);
         }
     }
-    state.has_pending_data.set(status == 0);
     maybe_notify_graceful_close(state);
 }
 
@@ -815,15 +809,10 @@ fn apply_deferred(state: &SessionState, submit: DeferredSubmit) {
                 last_stream_id,
                 data,
             } => {
-                let last = if last_stream_id == 0 {
-                    -1
-                } else {
-                    last_stream_id
-                };
                 ffi::nghttp2_submit_goaway(
                     raw,
                     ffi::NGHTTP2_FLAG_NONE,
-                    last,
+                    goaway_last_stream_id(raw, last_stream_id),
                     code,
                     data.as_ptr(),
                     data.len(),
@@ -1200,8 +1189,7 @@ pub fn close(scope: &mut v8::PinScope<'_, '_>, session: &SessionState, code: u32
 ///
 /// `socket_destroyed` is the second argument `Http2Session::Destroy` receives: when
 /// `core.js` already destroyed the socket there is nothing left to read and no
-/// reason to stop the read, but when it has not been destroyed the read has to be
-/// stopped so libuv releases the handle and the loop can drain.
+/// reason to stop the read.
 pub fn detach(session: &SessionState, socket_destroyed: bool) {
     // Drop any deferred flush that still names this session *before* the state is
     // freed below. `flush_writes` dereferences every queued address, so an entry
@@ -1221,12 +1209,19 @@ pub fn detach(session: &SessionState, socket_destroyed: bool) {
             if let Some(id) = listener {
                 rn_uv::listener::remove_stream_listener(stream, id);
             }
-            // Stopping the read is what releases the libuv handle, and it is
-            // outside the `listener` branch on purpose: a session that consumed a
-            // socket but never got a listener id still started a read, and leaving
-            // it running keeps the socket ref'd so `uv_run` never drains. That is a
-            // hang rather than an error, which is much worse to diagnose.
-            if !socket_destroyed {
+            // A running read keeps the handle ref'd, so `uv_run` would never
+            // drain. But a session that is closing must NOT be stopped here:
+            // `finishSessionClose` ends the socket and then calls
+            // `socket.resume()` so a graceful close can still observe the peer
+            // closing, and this teardown runs *after* that — stopping the read
+            // again undid the resume, leaving the socket open with nobody reading
+            // it and the session's `close` event never firing.
+            //
+            // Node never reaches this combination: `MaybeStopReading` returns
+            // early whenever the session is closing (`src/node_http2.cc:1922`),
+            // and `FinishClose` stops the read before the teardown hands control
+            // to JavaScript. The `closing` test is that first guard.
+            if !socket_destroyed && !session.closing.get() {
                 let raw = (*stream).stream;
                 if !raw.is_null() {
                     rn_uv::stream::read_stop(raw);
@@ -1236,6 +1231,27 @@ pub fn detach(session: &SessionState, socket_destroyed: bool) {
     }
     session.consumed.set(false);
     session.dispose();
+}
+
+/// `Http2Session::HasPendingData`: whether nghttp2 still has frames to exchange.
+///
+/// `src/node_http2.cc:792` asks nghttp2 on every call rather than reading a
+/// stored flag. The difference is observable: `core.js`'s `kMaybeDestroy`
+/// consults this to decide whether a gracefully closing session may be
+/// destroyed, so a stale `false` destroys a session with a GOAWAY still queued
+/// and a stale `true` leaves it alive forever.
+pub fn has_pending_data(state: &SessionState) -> bool {
+    let Some(raw) = raw(state) else {
+        return false;
+    };
+    // SAFETY: `raw` is live and both getters only read.
+    let (want_write, want_read) = unsafe {
+        (
+            ffi::nghttp2_session_want_write(raw),
+            ffi::nghttp2_session_want_read(raw),
+        )
+    };
+    want_write != 0 || want_read != 0
 }
 
 /// `MaybeNotifyGracefulCloseComplete`: tell `core.js` the connection is drained.
@@ -1254,17 +1270,7 @@ pub fn maybe_notify_graceful_close(state: &SessionState) {
     if !state.graceful_close.get() {
         return;
     }
-    let Some(raw) = raw(state) else {
-        return;
-    };
-    // SAFETY: `raw` is live and both getters only read.
-    let (want_write, want_read) = unsafe {
-        (
-            ffi::nghttp2_session_want_write(raw),
-            ffi::nghttp2_session_want_read(raw),
-        )
-    };
-    if want_write != 0 || want_read != 0 {
+    if has_pending_data(state) {
         return;
     }
     // The callback runs at most once: a second notification would destroy an
@@ -1318,26 +1324,40 @@ fn submit_goaway_now(session: &SessionState, code: u32, last_stream_id: i32, dat
     let Some(raw) = raw(session) else {
         return;
     };
-    // `core.js` passes 0 to mean "the last one nghttp2 processed"; nghttp2 reads a
-    // negative value that way, so it is translated here.
-    let last = if last_stream_id == 0 {
-        -1
-    } else {
-        last_stream_id
-    };
     // SAFETY: `raw` is live, this is never called from inside `mem_recv`, and
     // `data` is readable for its length.
     unsafe {
         ffi::nghttp2_submit_goaway(
             raw,
             ffi::NGHTTP2_FLAG_NONE,
-            last,
+            goaway_last_stream_id(raw, last_stream_id),
             code,
             data.as_ptr(),
             data.len(),
         );
     }
     schedule_write(session);
+}
+
+/// The `last_stream_id` nghttp2 will accept for a GOAWAY.
+///
+/// `Http2Session::Goaway` (`src/node_http2.cc:3108`) replaces a non-positive
+/// argument with `nghttp2_session_get_last_proc_stream_id`. rustnode passed the
+/// value through, which is not the same thing:
+/// `nghttp2_session_add_goaway` rejects any `last_stream_id` that looks like one
+/// of *our own* streams with `NGHTTP2_ERR_INVALID_ARGUMENT`, and `-1` is odd, so
+/// a client session's GOAWAY was never queued — it failed silently with `-501`.
+/// A client's `close()` therefore sent no GOAWAY, `nghttp2_session_want_read`
+/// stayed 1, `MaybeNotifyGracefulCloseComplete` never fired, and the session
+/// hung until the test harness killed it. That is the teardown bug behind every
+/// `server.close(done)` / `session.close(cb)` timeout in this family.
+fn goaway_last_stream_id(raw: *mut ffi::nghttp2_session, requested: i32) -> i32 {
+    if requested > 0 {
+        return requested;
+    }
+    // SAFETY: `raw` is live for the caller's whole call, and the getter only
+    // reads a field.
+    unsafe { ffi::nghttp2_session_get_last_proc_stream_id(raw) }
 }
 
 /// A PING with `payload`, which is `Http2Session::Ping`.
@@ -1350,4 +1370,166 @@ pub fn ping(session: &SessionState, payload: &[u8; 8]) -> i32 {
     let status = unsafe { ffi::nghttp2_submit_ping(raw, ffi::NGHTTP2_FLAG_NONE, payload.as_ptr()) };
     schedule_write(session);
     status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare nghttp2 session of `session_type`, built without `SessionState`.
+    ///
+    /// `SessionState::new` needs the binding's V8-backed shared state (the
+    /// `optionsBuffer` typed arrays), which does not exist without an isolate. None
+    /// of what these tests measure depends on it: `nghttp2_submit_goaway` and
+    /// `nghttp2_session_is_my_stream_id` only read the session's own fields.
+    struct BareSession {
+        raw: *mut ffi::nghttp2_session,
+        callbacks: *mut ffi::nghttp2_session_callbacks,
+    }
+
+    impl BareSession {
+        fn new(session_type: i32) -> Self {
+            let mut callbacks: *mut ffi::nghttp2_session_callbacks = ptr::null_mut();
+            // SAFETY: both out-parameters are valid, and an empty callback table is
+            // legal — every callback is optional to nghttp2.
+            unsafe {
+                assert_eq!(ffi::nghttp2_session_callbacks_new(&mut callbacks), 0);
+            }
+            let mut raw: *mut ffi::nghttp2_session = ptr::null_mut();
+            // SAFETY: `callbacks` is live, `user_data` may be null because no
+            // callback reads it.
+            let status = unsafe {
+                if session_type == SESSION_SERVER {
+                    ffi::nghttp2_session_server_new2(
+                        &mut raw,
+                        callbacks,
+                        ptr::null_mut(),
+                        ptr::null(),
+                    )
+                } else {
+                    ffi::nghttp2_session_client_new2(
+                        &mut raw,
+                        callbacks,
+                        ptr::null_mut(),
+                        ptr::null(),
+                    )
+                }
+            };
+            assert_eq!(status, 0, "nghttp2 session is created");
+            Self { raw, callbacks }
+        }
+    }
+
+    impl Drop for BareSession {
+        fn drop(&mut self) {
+            // SAFETY: both came from nghttp2's own constructors and are freed once.
+            unsafe {
+                ffi::nghttp2_session_del(self.raw);
+                ffi::nghttp2_session_callbacks_del(self.callbacks);
+            }
+        }
+    }
+
+    /// Submits the GOAWAY `submit_goaway_now` submits for a plain `close()`.
+    ///
+    /// `core.js`'s `close()` calls `this.goaway()` with no arguments, so the values
+    /// are `code = NGHTTP2_NO_ERROR` and `lastStreamID = 0`. `0` is the value that
+    /// was translated into `-1` and silently rejected.
+    fn submit_close_goaway(session: &BareSession) -> i32 {
+        let last = goaway_last_stream_id(session.raw, 0);
+        // SAFETY: `raw` is live and the frame stays owned by nghttp2 until it is
+        // freed with the session.
+        unsafe {
+            ffi::nghttp2_submit_goaway(session.raw, ffi::NGHTTP2_FLAG_NONE, last, 0, ptr::null(), 0)
+        }
+    }
+
+    #[test]
+    fn a_client_close_queues_its_goaway_instead_of_being_rejected() {
+        // The defect this pins: `submit_goaway_now` translated `core.js`'s
+        // `lastStreamID === 0` into `-1`, and `nghttp2_session_add_goaway`
+        // (`vendor/nghttp2/lib/nghttp2_session.c:7224`) rejects any id shaped like
+        // one of our own streams. `nghttp2_session_is_my_stream_id` is
+        // `stream_id & 1` for a client, so `-1` is odd and therefore "mine", and
+        // the call failed with `NGHTTP2_ERR_INVALID_ARGUMENT` (-501).
+        //
+        // That rejection is the whole hang: with no GOAWAY queued
+        // `nghttp2_session_want_read` never reaches 0, so
+        // `MaybeNotifyGracefulCloseComplete` never fires and `close` never emits.
+        //
+        // Asserting the return code, not the frame, because the return code is the
+        // fact the original code threw away.
+        let session = BareSession::new(SESSION_CLIENT);
+        assert_eq!(
+            submit_close_goaway(&session),
+            0,
+            "a client's GOAWAY must be queued; -501 means last_stream_id looked like \
+             one of our own streams, which is what makes close() hang"
+        );
+    }
+
+    #[test]
+    fn a_server_close_queues_its_goaway() {
+        // The same call on a server, where `is_my_stream_id` is `stream_id & 1 == 0`
+        // and `-1` happened to be legal — that side was never broken. Asserted
+        // anyway because `goaway_last_stream_id` is shared by both submit paths, so
+        // a fix must not trade one side for the other.
+        let session = BareSession::new(SESSION_SERVER);
+        assert_eq!(
+            submit_close_goaway(&session),
+            0,
+            "a server's GOAWAY must be queued as well"
+        );
+    }
+
+    #[test]
+    fn the_substituted_last_stream_id_is_never_one_nghttp2_rejects() {
+        // The invariant stated directly, so a future change to the substitution has
+        // an explicit rule to satisfy rather than two incidental return codes.
+        //
+        // `nghttp2_session_is_my_stream_id` (`lib/nghttp2_session.c:271`) is
+        // `stream_id & 1` for a client and `!(stream_id & 1)` for a server, and it
+        // returns false for `0` before either parity test. So a value handed to
+        // `nghttp2_submit_goaway` is acceptable when it is 0, or when its parity is
+        // the peer's rather than ours.
+        //
+        // Only the *substituted* values are held to that rule. A positive argument
+        // is passed through untouched, because Node only substitutes a non-positive
+        // one (`src/node_http2.cc:3108`) — and a caller that explicitly names one of
+        // its own stream ids has made an argument error, which is nghttp2's to
+        // report, not ours to quietly rewrite.
+        for (session_type, our_parity) in [(SESSION_CLIENT, 1), (SESSION_SERVER, 0)] {
+            let session = BareSession::new(session_type);
+            for requested in [0, -1, i32::MIN] {
+                let last = goaway_last_stream_id(session.raw, requested);
+                assert!(
+                    last == 0 || last & 1 != our_parity,
+                    "session type {session_type}: substituted {last} for requested \
+                     {requested} carries our own stream parity, so nghttp2 would reject \
+                     the GOAWAY"
+                );
+                // And the call the invariant protects must actually succeed.
+                // SAFETY: `session.raw` is live; the queued frame is freed with it.
+                let status = unsafe {
+                    ffi::nghttp2_submit_goaway(
+                        session.raw,
+                        ffi::NGHTTP2_FLAG_NONE,
+                        last,
+                        0,
+                        ptr::null(),
+                        0,
+                    )
+                };
+                assert_eq!(
+                    status, 0,
+                    "session type {session_type}: submitting GOAWAY with {last} \
+                     (requested {requested}) was rejected with {status}"
+                );
+            }
+            // A positive request is honoured rather than substituted.
+            for requested in [1, i32::MAX] {
+                assert_eq!(goaway_last_stream_id(session.raw, requested), requested);
+            }
+        }
+    }
 }

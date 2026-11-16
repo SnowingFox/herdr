@@ -512,12 +512,24 @@ fn update_chunks_sent(
 }
 
 /// `Http2Session::HasPendingData`.
+///
+/// `src/node_http2.cc:792` recomputes this on every call from
+/// `nghttp2_session_want_write` and `nghttp2_session_want_read`; it is not a
+/// stored flag. rustnode answered from a cached `has_pending_data`, which
+/// `send_pending_data` sets from the *last* write's status, so the value a
+/// caller reads afterwards describes a flush that had not started yet. That
+/// matters because `core.js`'s `kMaybeDestroy` refuses to destroy a closed
+/// session whose handle reports pending data, and `close()` therefore never
+/// completed.
 fn has_pending_data(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let pending = with_state(args.this(), |state| state.has_pending_data.get()).unwrap_or(false);
+    let pending = with_state(args.this(), |state| state as *const SessionState)
+        // SAFETY: as `receive`; the session is live for the duration of this call.
+        .map(|state| crate::session::has_pending_data(unsafe { &*state }))
+        .unwrap_or(false);
     rv.set(v8::Boolean::new(scope, pending).into());
 }
 
