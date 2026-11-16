@@ -1075,3 +1075,375 @@ fn mutual_tls_completes_when_the_chain_is_not_authorized() {
         "the server must still read the client's certificate; stdout: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Increment 4: the session callbacks, resumption, and ALPN over TLS
+// ---------------------------------------------------------------------------
+
+/// The exact failure that made every HTTPS request throw, now inverted.
+///
+/// `https.Agent` attaches a `'session'` listener to each socket it creates
+/// (`lib/https.js:456`) to fill its session cache, and `wrap.js:940`'s
+/// `newListener` hook turns that listener into an `enableSessionCallbacks()`
+/// call. Before increment 4 that call threw
+/// `ERR_TLS_NOT_IMPLEMENTED: enableSessionCallbacks ... (tls_wrap increment 4)`
+/// from inside `_addListener`, so `https.get` never reached the network at all.
+///
+/// The assertion is deliberately about the listener, not about HTTPS: this is the
+/// one behaviour the report named, and a regression here would put the throw back
+/// on every `https` socket.
+#[test]
+fn attaching_a_session_listener_no_longer_throws() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl is not available to generate a certificate");
+        return;
+    };
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        const key = fs.readFileSync({key:?});
+        const cert = fs.readFileSync({cert:?});
+        const server = tls.createServer({{ key, cert }}, (socket) => socket.end('x'));
+        server.on('tlsClientError', (err) => console.log('S:ERR ' + err.message));
+        server.listen(0, '127.0.0.1', () => {{
+          const client = tls.connect({{
+            port: server.address().port,
+            host: 'localhost',
+            ca: [cert],
+          }});
+          // This is the call that used to throw.
+          let attached = false;
+          try {{
+            client.on('session', (session) => {{
+              console.log('SESSION:' + (Buffer.isBuffer(session) ? session.length : -1));
+            }});
+            attached = true;
+          }} catch (err) {{
+            console.log('THREW:' + err.code);
+          }}
+          console.log('attached=' + attached);
+          client.on('secureConnect', () => console.log('SECURE'));
+          client.on('error', (err) => {{ console.log('C:ERR ' + err.message); server.close(); }});
+          client.on('data', () => {{ client.end(); server.close(() => console.log('CLOSED')); }});
+        }});
+        "#,
+        key = key.display(),
+        cert = cert.display()
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    assert!(
+        !stdout.contains("THREW"),
+        "attaching a 'session' listener must not throw; stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("attached=true"),
+        "the listener must attach; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("SECURE"),
+        "the handshake must still complete; stdout: {stdout}"
+    );
+    // A TLS 1.3 session ticket arrives asynchronously after `secureConnect`, so a
+    // process that exits at once may not see it. Either outcome proves the
+    // callback path is live; a missing ticket would be visible as SESSION:0.
+    assert!(
+        !stdout.contains("SESSION:0") && !stdout.contains("SESSION:-1"),
+        "a 'session' emission must carry a Buffer; stdout: {stdout}"
+    );
+    assert_eq!(
+        code, 0,
+        "the process must exit cleanly; stdout: {stdout}, stderr: {stderr}"
+    );
+}
+
+/// `https.get` over a connection whose CA was supplied explicitly returns 200.
+///
+/// This is acceptance (a). The server is a local HTTPS server rather than a
+/// public host so the test is deterministic and runs offline; the TLS path it
+/// exercises is identical, and the `ca` option is the same one the acceptance
+/// names, because the bundled root store is empty in this build.
+#[test]
+fn https_get_returns_200_over_an_explicit_ca() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl is not available to generate a certificate");
+        return;
+    };
+    let script = format!(
+        r#"
+        const https = require('https');
+        const fs = require('fs');
+        const key = fs.readFileSync({key:?});
+        const cert = fs.readFileSync({cert:?});
+        const server = https.createServer({{ key, cert }}, (req, res) => {{
+          res.writeHead(200, {{ 'content-type': 'text/plain' }});
+          res.end('hello over https');
+        }});
+        server.on('tlsClientError', (err) => console.log('S:ERR ' + err.message));
+        server.listen(0, '127.0.0.1', () => {{
+          const req = https.get(
+            {{
+              port: server.address().port,
+              host: 'localhost',
+              ca: [cert],
+            }},
+            (res) => {{
+              let body = '';
+              res.setEncoding('utf8');
+              res.on('data', (chunk) => {{ body += chunk; }});
+              res.on('end', () => {{
+                console.log('STATUS:' + res.statusCode);
+                console.log('BODY:' + body);
+                server.close(() => console.log('CLOSED'));
+              }});
+            }});
+          req.on('error', (err) => {{ console.log('C:ERR ' + err.message); server.close(); }});
+        }});
+        "#,
+        key = key.display(),
+        cert = cert.display()
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    assert!(
+        !stdout.contains("C:ERR") && !stdout.contains("S:ERR"),
+        "no side may report an error; stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("STATUS:200"),
+        "https.get must report 200; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("BODY:hello over https"),
+        "the response body must arrive; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("CLOSED"),
+        "the connection and server must both close, which proves the TLS teardown \
+         released its handles; stdout: {stdout}"
+    );
+    assert_eq!(code, 0, "the process must exit 0; stderr: {stderr}");
+}
+
+/// `http2.connect` over TLS negotiates `h2` and completes a request.
+///
+/// This is acceptance (c). The `ALPNProtocols: ['h2']` that
+/// `lib/internal/http2/core.js` sets is what used to throw
+/// `setALPNProtocols is not implemented yet`, so the first assertion is the
+/// negotiation and the second is that the negotiated protocol actually carries
+/// frames — a session that negotiated `h2` and then sent nothing was the next
+/// failure behind it.
+#[test]
+fn http2_over_tls_negotiates_h2_and_completes_a_request() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl is not available to generate a certificate");
+        return;
+    };
+    let script = format!(
+        r#"
+        const http2 = require('http2');
+        const fs = require('fs');
+        const key = fs.readFileSync({key:?});
+        const cert = fs.readFileSync({cert:?});
+        const server = http2.createSecureServer({{ key, cert }});
+        server.on('session', (session) => session.on('error', () => {{}}));
+        server.on('stream', (stream) => {{
+          stream.respond({{ ':status': 200, 'content-type': 'text/plain' }});
+          stream.end('h2 body');
+        }});
+        server.on('tlsClientError', (err) => console.log('S:ERR ' + err.message));
+        server.listen(0, '127.0.0.1', () => {{
+          const session = http2.connect(
+            'https://localhost:' + server.address().port,
+            {{ ca: [cert] }});
+          session.on('error', (err) => {{
+            console.log('C:ERR ' + (err.code || err.message));
+            process.exit(0);
+          }});
+          session.on('connect', () => {{
+            console.log('ALPN:' + session.alpnProtocol);
+            const req = session.request({{ ':path': '/' }});
+            let body = '';
+            req.setEncoding('utf8');
+            req.on('response', (headers) => console.log('STATUS:' + headers[':status']));
+            req.on('data', (chunk) => {{ body += chunk; }});
+            req.on('end', () => {{
+              console.log('BODY:' + body);
+              session.close();
+              server.close(() => console.log('CLOSED'));
+            }});
+            req.end();
+          }});
+        }});
+        "#,
+        key = key.display(),
+        cert = cert.display()
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    assert!(
+        !stdout.contains("C:ERR") && !stdout.contains("S:ERR"),
+        "no side may report an error; stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("ALPN:h2"),
+        "the session must negotiate h2; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("STATUS:200"),
+        "a request must complete over the negotiated session; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("BODY:h2 body"),
+        "the response body must arrive; stdout: {stdout}"
+    );
+    assert_eq!(code, 0, "the process must exit 0; stderr: {stderr}");
+}
+
+/// Two sequential connections resume, proven by `session.reused`.
+///
+/// This is acceptance (d). The signal is `tlsSocket.isSessionReused()`, which is
+/// `SSL_session_reused`: it is true only when the second handshake completed
+/// against the first connection's session rather than doing a full key exchange.
+/// That is a proof rather than a hint because the value comes from the TLS
+/// library's own record of which branch it took — the session bytes are opaque,
+/// so comparing them would say nothing about whether the *server* accepted them.
+///
+/// # Why TLS 1.2, and why the address is numeric
+///
+/// TLS 1.3 issues its session tickets only after `secureConnect`, so a 1.3 test
+/// would have to keep the socket open past the handshake and would then be
+/// measuring when the ticket arrived rather than whether resumption works. 1.2
+/// sends the session inside the handshake, so `'session'` fires before the
+/// connection is idle and `isSessionReused()` on the second socket reads the
+/// server's own answer directly. Real `node` behaves the same way on this script
+/// — it also sees no session on a 1.3 local server that closes at once — so the
+/// choice keeps the test measuring this crate rather than the protocol's ticket
+/// timing.
+///
+/// The connection uses the numeric address because a TLS connection to
+/// `127.0.0.1` does not currently let the process exit on its own (measured on
+/// this tree and on the baseline before it, so it is not this increment), so the
+/// script calls `process.exit` after the assertions instead of relying on the
+/// loop draining. `servername` is `localhost` because the fixture certificate's
+/// CN is.
+#[test]
+fn a_second_connection_resumes_the_first_session() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl is not available to generate a certificate");
+        return;
+    };
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        const cert = fs.readFileSync({cert:?});
+        // The server keeps the sessions it issues so `resumeSession` can hand
+        // one back. Without a store the server answers with nothing and the
+        // client does a full handshake, which is what an unhelped resumption
+        // attempt looks like either way.
+        const sessions = new Map();
+        const server = tls.createServer(
+          {{ key: fs.readFileSync({key:?}), cert }},
+          (socket) => {{ socket.on('data', () => {{}}); }});
+        server.on('newSession', (id, data, done) => {{
+          sessions.set(id.toString('hex'), data);
+          done();
+        }});
+        server.on('resumeSession', (id, done) => {{
+          done(null, sessions.get(id.toString('hex')) || null);
+        }});
+        server.on('tlsClientError', (err) => console.log('S:ERR ' + err.message));
+
+        function connect(session, label) {{
+          return new Promise((resolve) => {{
+            const options = {{
+              port: server.address().port,
+              host: '127.0.0.1',
+              servername: 'localhost',
+              ca: [cert],
+              maxVersion: 'TLSv1.2',
+            }};
+            if (session) options.session = session;
+            let ticket = null;
+            const socket = tls.connect(options);
+            socket.on('secureConnect', () => {{
+              console.log(label + ':reused=' + socket.isSessionReused());
+            }});
+            socket.on('session', (value) => {{ if (!ticket) ticket = value; }});
+            socket.on('error', (err) => {{ console.log(label + ':ERR ' + err.message); }});
+            socket.on('data', () => {{}});
+            // Held briefly so the first socket's `'session'` event is observed;
+            // 1.2 sends it during the handshake, so this is a race guard rather
+            // than a wait.
+            setTimeout(() => {{ socket.destroy(); resolve({{ ticket }}); }}, 300);
+          }});
+        }}
+
+        server.listen(0, '127.0.0.1', async () => {{
+          const first = await connect(null, 'first');
+          const second = await connect(first.ticket, 'second');
+          console.log('first:ticket=' + (first.ticket ? first.ticket.length : 'none'));
+          console.log('RESULT:' + (second.reused ? 'resumed' : 'full-handshake'));
+          process.exit(0);
+        }});
+        "#,
+        key = key.display(),
+        cert = cert.display()
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    assert!(
+        !stdout.contains("C:ERR")
+            && !stdout.contains("first:ERR")
+            && !stdout.contains("second:ERR")
+            && !stdout.contains("S:ERR"),
+        "no side may report an error; stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("first:reused=false"),
+        "the first connection cannot have resumed anything; stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("first:ticket=none"),
+        "the first connection must hand back a session; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("second:reused=true"),
+        "the second connection must report isSessionReused() true, which is \
+         SSL_session_reused proving the server accepted the session; \
+         stdout: {stdout}"
+    );
+    assert_eq!(code, 0, "the process must exit 0; stderr: {stderr}");
+}
+
+/// The `AsyncWrap` surface `TLSWrap` inherits answers, and the wrap has an async
+/// id from construction.
+///
+/// `lib/internal/http/client.js:1040` reads `socket._handle.getAsyncId()` when a
+/// response ends. Without it a *successful* HTTPS response failed with
+/// `TypeError: socket._handle.getAsyncId is not a function` — the defect that
+/// only became visible once the session throw was gone.
+#[test]
+fn a_tls_wrap_is_an_async_wrap() {
+    let script = "\
+        const tls = require('tls'); \
+        const tcp = process.binding('tcp_wrap'); \
+        const h = new tcp.TCP(tcp.constants.SOCKET); \
+        const ctx = tls.createSecureContext(); \
+        const W = process.binding('tls_wrap'); \
+        const res = W.wrap(h, ctx.context, false, false); \
+        const id = res.getAsyncId(); \
+        console.log([ \
+          typeof res.getAsyncId, \
+          typeof res.asyncReset, \
+          typeof res.getProviderType, \
+          typeof id === 'number' && id > 0, \
+          res.getProviderType() === 68, \
+          res.getAsyncId() === id, \
+        ].join(','));";
+    let (stdout, stderr, ok) = run(script);
+    assert!(ok, "the AsyncWrap surface must answer; stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "function,function,function,true,true,true",
+        "the wrap must carry a stable async id and PROVIDER_TLSWRAP; stderr: {stderr}"
+    );
+}

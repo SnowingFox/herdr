@@ -133,6 +133,20 @@ pub const STREAM_METHODS: &[&str] = &[
 /// The `StreamBase` accessors, which `AddMethods` installs first.
 pub const STREAM_ACCESSORS: &[&str] = &["fd", "_externalStream", "bytesRead", "bytesWritten"];
 
+/// The `AsyncWrap` method surface `TLSWrap` inherits.
+///
+/// `TLSWrap::Initialize` calls `t->Inherit(AsyncWrap::GetConstructorTemplate(env))`
+/// (`crypto_tls.cc:2395`), so a `TLSWrap` is an `AsyncWrap` with an async id of
+/// its own. `lib/internal/http/client.js:1040` reads
+/// `socket._handle.getAsyncId()` in `responseKeepAlive`, which every
+/// `https.get` reaches once the body ends — so without these three a *working*
+/// HTTPS response failed with `getAsyncId is not a function`.
+///
+/// They are installed on the prototype here rather than through a shared
+/// `AsyncWrap` template because rustnode's other handles each own their own
+/// template; `rn-bind-tcp-wrap` installs the identical three for the same reason.
+pub const ASYNC_WRAP_METHODS: &[&str] = &["getAsyncId", "asyncReset", "getProviderType"];
+
 /// Installs the namespace object.
 ///
 /// `install` rather than a `register*` helper: `tools/regen-bindings.sh` treats a
@@ -369,7 +383,12 @@ fn wrap(
     //
     // The mirrors the info callback reads. Registered before `install` so the
     // very first handshake message can notify JavaScript.
-    let handles = crate::callback::register(cell, v8::Global::new(scope.as_ref(), object));
+    let handles = crate::callback::register(
+        cell,
+        v8::Global::new(scope.as_ref(), object),
+        kind,
+        state.session.clone(),
+    );
     state.callback = Some(handles);
     // SAFETY: `cell` is the state allocated for this object, and it outlives the
     // `SSL` because teardown frees the `SSL` from that same state.
@@ -404,6 +423,36 @@ fn wrap(
             state.listener = listener;
         });
     }
+
+    // `StreamBase::FromObject`'s lookup, which is how anything that *consumes* a
+    // stream reaches its state. `Http2Session.consume(socket._handle)` is the
+    // caller that matters here: over a `tls.connect` socket, `_handle` is this
+    // `TLSWrap`, and without a published state `http2.connect('https://…')`
+    // threw "requires a stream handle" even though the handshake and the ALPN
+    // negotiation had both succeeded.
+    //
+    // A `TLSWrap` has no `uv_stream_t` of its own — its `StreamState::stream` is
+    // null — so this publishes the *state*, the same way `rn-bind-js-stream`
+    // does for a `JSStream`.
+    // SAFETY: `cell` is the state allocated for this object, and the state
+    // outlives the object because the finalizer is what frees it.
+    let reader = state::with_state(object, |state| &mut state.reader as *mut _);
+    if let Some(reader) = reader {
+        // SAFETY: `reader` is the wrap's own `reader` field, live for the wrap's
+        // whole life, and `attach_state` only stores a pointer on the object.
+        unsafe { rn_uv::streams::attach_state(scope, object, reader) };
+    }
+
+    // `AsyncWrap(env, object, PROVIDER_TLSWRAP)`'s `AsyncReset(object)`
+    // (`src/async_wrap.cc:525`), which is the wrap's first async id and its
+    // first `init` emission. It runs last so the object already carries its
+    // native state: `emitInitNative` calls into JavaScript, and an `init` hook
+    // that reads `handle.getAsyncId()` would otherwise reach an uninstalled
+    // handle.
+    let _ = state::with_state(object, |state| {
+        rn_bind_async_wrap::async_reset(scope, &mut state.async_wrap, object, object, None);
+        state.context_frame = rn_bind_async_wrap::current_context_frame(scope);
+    });
 
     rv.set(object.into());
 }
@@ -472,6 +521,12 @@ fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
 
     for name in STREAM_METHODS {
         crate::stream::install_method(scope, &prototype, name)?;
+    }
+
+    // The `AsyncWrap` surface `t->Inherit(AsyncWrap::GetConstructorTemplate(env))`
+    // brings in. See [`ASYNC_WRAP_METHODS`].
+    for name in ASYNC_WRAP_METHODS {
+        crate::methods::install_async_wrap_into(scope, &prototype, name)?;
     }
     // `t->PrototypeTemplate()->Set("isStreamBase", True(isolate))`, which
     // `wrap.js:831` asserts on.

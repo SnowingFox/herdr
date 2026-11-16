@@ -1372,6 +1372,7 @@ dependencies = [
  "libc",
  "openssl",
  "openssl-sys",
+ "rn-bind-async-wrap",
  "rn-bind-crypto-keys",
  "rn-bind-crypto-x509",
  "rn-bind-options",

@@ -40,6 +40,14 @@ pub const PROVIDER_PIPEWRAP: u32 = 27;
 pub const PROVIDER_HTTP2SESSION: u32 = 14;
 /// `PROVIDER_HTTP2STREAM`: one HTTP/2 stream.
 pub const PROVIDER_HTTP2STREAM: u32 = 15;
+/// `PROVIDER_TLSWRAP`: a `TLSWrap`, `AsyncWrap::PROVIDER_TLSWRAP`.
+///
+/// The position of `V(TLSWRAP)` in `NODE_ASYNC_PROVIDER_TYPES`'s crypto half
+/// (`src/async_wrap.h`), counted from `NONE`: 55 non-crypto providers, then the
+/// thirteen crypto requests before it. `PROVIDER_TCPWRAP` is the check that the
+/// counting is right — 42 there and 42 here — and `node --expose-internals`'s
+/// `handle.getProviderType()` on a real `tls_wrap.wrap()` reports 68.
+pub const PROVIDER_TLSWRAP: u32 = 68;
 
 /// The `AsyncWrap` fields of a wrapped handle.
 #[derive(Debug, Clone, Copy, PartialEq)]

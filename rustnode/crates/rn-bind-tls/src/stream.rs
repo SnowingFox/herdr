@@ -488,26 +488,81 @@ fn use_user_buffer<'s>(
 }
 
 /// `StreamBase::Writev`, which is `StreamBase::Write` over an array of buffers.
+///
+/// With `allBuffers` false the array alternates `[chunk, encoding, …]`, and a
+/// chunk may be a **string** rather than a `Buffer`. That form is not an edge
+/// case: `_http_outgoing.js` writes its header block as strings, so an HTTPS
+/// response whose headers went through here produced only the empty line —
+/// measured as a client that received `\r\n\r\n` and nothing else while the
+/// server's own body writes arrived fine.
+///
+/// Node converts each string in `Writev` itself, per chunk, because the encoding
+/// is per chunk (`stream_base.cc:199`). The bytes are copied into owned storage
+/// because a V8 string's representation is not stable across the call into V8
+/// that the completion performs.
 fn writev<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
-    rv: v8::ReturnValue<'s>,
+    mut rv: v8::ReturnValue<'s>,
 ) {
-    let mut chunks = Vec::new();
-    // `writev(req, chunks, allBuffers)`: the middle argument is the array.
-    if let Ok(array) = v8::Local::<v8::Array>::try_from(args.get(1)) {
-        let length = array.length();
-        for index in 0..length {
-            let Some(value) = array.get_index(scope, index) else {
-                continue;
-            };
-            // SAFETY: `stream_base_commons` keeps each view alive on `req.chunks`.
-            if let Some(buffer) = unsafe { rn_uv::stream_base::view_buffer(value) } {
+    let Ok(array) = v8::Local::<v8::Array>::try_from(args.get(1)) else {
+        rv.set(v8::Integer::new(scope, EINVAL).into());
+        return;
+    };
+    let all_buffers = args.get(2).is_true();
+    let count = if all_buffers {
+        array.length() as usize
+    } else {
+        array.length() as usize >> 1
+    };
+    let stride = if all_buffers { 1 } else { 2 };
+
+    let mut chunks = Vec::with_capacity(count);
+    let mut owned: Vec<Vec<u8>> = Vec::new();
+    for index in 0..count {
+        let Some(value) = array.get_index(scope, (index * stride) as u32) else {
+            rv.set(v8::Integer::new(scope, EINVAL).into());
+            return;
+        };
+        // `Buffer::HasInstance` first, as Node does: a Buffer's bytes are already
+        // the wire form and its encoding slot is ignored.
+        // SAFETY: `stream_base_commons` keeps every view alive on `req.chunks`.
+        if let Some(buffer) = unsafe { rn_uv::stream_base::view_buffer(value) } {
+            if all_buffers {
                 chunks.push(buffer);
+                continue;
             }
+            // In the alternating form `view_buffer`'s pointer belongs to the
+            // caller's array, which `stream_base_commons` keeps alive, so it can
+            // be used directly here too.
+            chunks.push(buffer);
+            continue;
         }
+        if all_buffers {
+            // `Writev` reads `Buffer::Data` unconditionally on this branch, so a
+            // non-buffer is a caller error rather than something to coerce.
+            rv.set(v8::Integer::new(scope, EINVAL).into());
+            return;
+        }
+        let Some(text) = value.to_string(scope) else {
+            rv.set(v8::Integer::new(scope, EINVAL).into());
+            return;
+        };
+        let encoding =
+            rn_uv::stream_base::chunk_encoding(scope, array, (index * stride + 1) as u32);
+        let units = rn_uv::stream_base::string_units(scope, &text);
+        let mut bytes = rn_core::codec::write(
+            &units,
+            encoding,
+            rn_core::codec::storage_size(&units, encoding),
+        );
+        chunks.push(rn_uv::sys::uv_buf_t {
+            base: bytes.as_mut_ptr().cast(),
+            len: bytes.len(),
+        });
+        owned.push(bytes);
     }
-    write_chunks(scope, args, chunks, rv);
+    write_chunks(scope, args, chunks, owned, rv);
 }
 
 /// `StreamBase::WriteBuffer`, the single-buffer write.
@@ -521,7 +576,7 @@ fn write_buffer<'s>(
         rv.set(v8::Integer::new(scope, EINVAL).into());
         return;
     };
-    write_chunks(scope, args, vec![buffer], rv);
+    write_chunks(scope, args, vec![buffer], Vec::new(), rv);
 }
 
 /// `StreamBase::WriteString<ASCII>`.
@@ -625,6 +680,7 @@ fn write_chunks<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     chunks: Vec<rn_uv::sys::uv_buf_t>,
+    owned: Vec<Vec<u8>>,
     mut rv: v8::ReturnValue<'s>,
 ) {
     let object = args.this();
@@ -632,7 +688,7 @@ fn write_chunks<'s>(
         rv.set(v8::Integer::new(scope, EINVAL).into());
         return;
     };
-    let status = dispatch_chunks(scope, object, request, chunks, Vec::new());
+    let status = dispatch_chunks(scope, object, request, chunks, owned);
     rv.set(v8::Integer::new(scope, status.max(0)).into());
 }
 
@@ -735,7 +791,6 @@ fn dispatch_chunks<'s>(
         };
         // SAFETY: `written` is this call's own return value.
         let outcome = unsafe { crate::cycle::IoOutcome::of(ssl, written, written.max(0) as usize) };
-        state.library_call_depth = state.library_call_depth.saturating_sub(1);
         match outcome {
             crate::cycle::IoOutcome::Wrote(_) => {}
             crate::cycle::IoOutcome::WantRead | crate::cycle::IoOutcome::WantWrite => {
@@ -748,9 +803,20 @@ fn dispatch_chunks<'s>(
                 state.error = Some(reason);
                 state.flags.write_callback_scheduled = false;
                 let _ = state.current_write.take();
+                state.library_call_depth = state.library_call_depth.saturating_sub(1);
                 return Err(EPROTO);
             }
         }
+        // `crypto_tls.cc:1636`'s closing `EncOut()`: `SSL_write` produced the
+        // record into `enc_out_`, and nothing else moves it from there into
+        // `pending_output` — `flush` drains the latter, not the BIO. Without this
+        // the ciphertext stayed in the BIO until some unrelated cycle ran, which
+        // is why a write issued while the socket was otherwise quiet (a server
+        // echoing inside a `'data'` handler) never reached the peer at all.
+        //
+        // SAFETY: `ssl` is live, checked above, and `state` is this borrow.
+        unsafe { crate::cycle::enc_out(state, ssl) };
+        state.library_call_depth = state.library_call_depth.saturating_sub(1);
         Ok(state.underlying)
     });
 

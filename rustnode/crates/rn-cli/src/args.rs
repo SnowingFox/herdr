@@ -170,6 +170,16 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
 /// Flags whose value is a separate argument (`--flag value`).
 const VALUE_SEPARATE: &[&str] = &["--conditions", "--import", "--loader", "--require", "-r"];
 
+/// Flags that select the default trust store.
+///
+/// Both are read back by `rn-bind-secure-context`'s `addRootCerts`, which is
+/// `NewRootCertStore`'s branch order: `--use-openssl-ca` uses OpenSSL's compiled
+/// `OPENSSLDIR`, `--use-system-ca` adds the OS store beside the bundled list.
+/// `--use-openssl-ca` also has a `NODE_OPTIONS`-visible environment spelling in
+/// Node, but the option table is the one place argv is interpreted, so the flag
+/// is all that is recorded here.
+const ROOT_STORE_FLAGS: &[&str] = &["--use-system-ca", "--use-openssl-ca"];
+
 /// `--abort-on-uncaught-exception` in the spellings Node accepts.
 ///
 /// Both appear in Node's own test headers. `src/node.cc:794` searches its V8
@@ -403,6 +413,17 @@ pub fn parse(args: &[String]) -> Result<Options, String> {
         }
         if ABORT_ON_UNCAUGHT_NEGATED.contains(&argument.as_str()) {
             options.abort_on_uncaught_exception = false;
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
+        // `--use-system-ca` and `--use-openssl-ca` choose where the default
+        // trust store comes from, which `SecureContext#addRootCerts` reads back
+        // out of the parsed options. They are recorded here rather than listed
+        // as ignored, because a flag that is accepted and then not acted on is
+        // the failure mode `Options::unimplemented` exists to avoid.
+        if ROOT_STORE_FLAGS.contains(&argument.as_str()) {
             options.exec_argv.push(argument.clone());
             index += 1;
             continue;

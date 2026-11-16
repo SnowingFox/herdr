@@ -252,20 +252,44 @@ pub struct Parser {
 
 /// The handle a consuming parser is attached to.
 ///
-/// The address is the `uv_stream_t`, which stays valid until the binding that
-/// owns it runs its close callback. A parser that outlives its socket is
-/// therefore possible here in a way Node's intrusive list makes impossible, so
-/// the pointer is only ever compared, never dereferenced: the record exists to
-/// answer "is this parser attached, and to what", which is all `unconsume` and
-/// the idempotence check need.
+/// Two shapes, because a `StreamBase` is not always a libuv handle:
+///
+/// * `Stream` is a `tcp_wrap`/`pipe_wrap` socket, whose `uv_stream_t` stays valid
+///   until its binding runs the close callback;
+/// * `State` is a stream that has a `StreamState` but no handle of its own — a
+///   `JSStream` and a `TLSWrap` are both that shape — so the state address is the
+///   identity instead.
+///
+/// Either pointer is only ever compared, never dereferenced: the record exists to
+/// answer "is this parser attached, and to what", which is all `unconsume` and the
+/// idempotence check need. That is what makes one enum cover both without either
+/// address having to outlive the parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConsumedStream(pub *mut rn_uv::sys::uv_stream_t);
+pub enum ConsumedStream {
+    /// A libuv stream handle.
+    Stream(*mut rn_uv::sys::uv_stream_t),
+    /// A `StreamState` for a stream with no handle of its own.
+    State(*mut rn_uv::handle::StreamState),
+}
 
-// SAFETY: the pointer is never dereferenced by this crate (see above), so
-// carrying it across a thread boundary cannot create aliasing. This is only
-// needed because `v8::Global` and the rest of `Parser` are already `Send`-free;
-// the bound is not load-bearing beyond keeping the struct's auto traits stable.
+// SAFETY: neither pointer is dereferenced by this crate (see above), so carrying
+// one across a thread boundary cannot create aliasing. This is only needed
+// because `v8::Global` and the rest of `Parser` are already `Send`-free; the
+// bound is not load-bearing beyond keeping the struct's auto traits stable.
 unsafe impl Send for ConsumedStream {}
+
+impl ConsumedStream {
+    /// The `uv_stream_t` this records, for a consumer that genuinely needs one.
+    ///
+    /// `None` for the state-only shape, which is the honest answer: such a stream
+    /// has no libuv handle to hand out.
+    pub fn as_stream(self) -> Option<*mut rn_uv::sys::uv_stream_t> {
+        match self {
+            Self::Stream(stream) => Some(stream),
+            Self::State(_) => None,
+        }
+    }
+}
 
 /// The body bytes collected inside one `execute`.
 ///
@@ -661,10 +685,26 @@ impl Parser {
     /// to become a `rn_uv::listener::StreamListener` and be pushed onto the
     /// socket, which is a change to this crate.
     pub fn consume(&mut self, stream: *mut rn_uv::sys::uv_stream_t) -> bool {
-        if self.stream.is_some_and(|existing| existing.0 != stream) {
+        self.consume_identity(ConsumedStream::Stream(stream))
+    }
+
+    /// Records an opaque handle identity, which is what a `StreamBase` with no
+    /// `uv_stream_t` of its own publishes.
+    ///
+    /// A `TLSWrap` is exactly that: its `StreamState::stream` is null because the
+    /// ciphertext goes through the wrapped socket, so `http_parser.consume` on an
+    /// HTTPS socket found no stream and threw
+    /// `consume() requires a stream handle` from `connectionListenerInternal` —
+    /// which meant every HTTPS *server* request failed even once TLS worked.
+    ///
+    /// The record is only ever compared, never dereferenced (see
+    /// [`ConsumedStream`]), so an identity is all this needs. `unconsume` is
+    /// unaffected: it drops the record whichever kind it is.
+    pub fn consume_identity(&mut self, stream: ConsumedStream) -> bool {
+        if self.stream.is_some_and(|existing| existing != stream) {
             return false;
         }
-        self.stream = Some(ConsumedStream(stream));
+        self.stream = Some(stream);
         true
     }
 
@@ -679,7 +719,12 @@ impl Parser {
     /// The handle [`Self::consume`] attached, for tests and `getCurrentBuffer`
     /// consumers.
     pub fn consumed_handle(&self) -> Option<*mut rn_uv::sys::uv_stream_t> {
-        self.stream.map(|stream| stream.0)
+        self.stream.and_then(ConsumedStream::as_stream)
+    }
+
+    /// The record [`Self::consume`] attached, whichever shape it is.
+    pub fn consumed(&self) -> Option<ConsumedStream> {
+        self.stream
     }
 
     /// The buffer being parsed, for `getCurrentBuffer`.

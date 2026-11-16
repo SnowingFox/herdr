@@ -35,10 +35,9 @@ use std::cell::{Cell, RefCell};
 use std::os::raw::{c_char, c_int, c_void};
 use std::rc::Rc;
 
+use crate::state::WrapState;
 use openssl_sys as ffi;
 use rn_v8_sys::v8;
-
-use crate::state::WrapState;
 
 /// `TLSWrap::SSLInfoCallback` (`crypto_tls.cc:679`).
 ///
@@ -197,6 +196,22 @@ struct CallbackSlot {
     pending_done: Rc<Cell<bool>>,
     /// `SSL_CB_HANDSHAKE_START` was seen and has not been delivered.
     pending_start: Rc<Cell<bool>>,
+    /// Which side of the handshake this wrap is, so a callback that only applies
+    /// to one can skip the other without the state borrow.
+    kind: crate::ssl::Kind,
+    /// `flags_.session_callbacks`, so `NewSessionCallback` can answer
+    /// `has_session_callbacks()` without the state borrow.
+    session_callbacks: Rc<Cell<bool>>,
+    /// `flags_.alpn_callback_enabled`, read by `SelectALPNCallback`.
+    alpn_callback_enabled: Rc<Cell<bool>>,
+    /// The `next_sess_` slot the get-session callback drains.
+    session: crate::state::SessionSlot,
+    /// The `alpn_protos_` list a server's `SelectALPNCallback` matches against.
+    alpn_protos: Rc<RefCell<Vec<u8>>>,
+    /// `flags_.awaiting_new_session`, which `EncOut` must honour: a server parks
+    /// its output until `newSessionDone` runs, so a ticket can never be sent
+    /// before the application has decided whether to store the session.
+    awaiting_new_session: Rc<Cell<bool>>,
 }
 
 /// Records the mirrors a wrap's callbacks read.
@@ -206,11 +221,17 @@ struct CallbackSlot {
 pub fn register(
     cell: *const RefCell<WrapState>,
     object: v8::Global<v8::Object>,
+    kind: crate::ssl::Kind,
+    session: crate::state::SessionSlot,
 ) -> CallbackHandles {
     let established = Rc::new(Cell::new(false));
     let depth = Rc::new(Cell::new(0));
     let pending_done = Rc::new(Cell::new(false));
     let pending_start = Rc::new(Cell::new(false));
+    let session_callbacks = Rc::new(Cell::new(false));
+    let alpn_callback_enabled = Rc::new(Cell::new(false));
+    let alpn_protos = Rc::new(RefCell::new(Vec::new()));
+    let awaiting_new_session = Rc::new(Cell::new(false));
     SLOTS.with(|slots| {
         let mut slots = slots.borrow_mut();
         // A wrap registered twice — which a handle swap can do — replaces its
@@ -223,6 +244,12 @@ pub fn register(
             depth: Rc::clone(&depth),
             pending_done: Rc::clone(&pending_done),
             pending_start: Rc::clone(&pending_start),
+            kind,
+            session_callbacks: Rc::clone(&session_callbacks),
+            alpn_callback_enabled: Rc::clone(&alpn_callback_enabled),
+            session,
+            alpn_protos: Rc::clone(&alpn_protos),
+            awaiting_new_session: Rc::clone(&awaiting_new_session),
         });
     });
     CallbackHandles {
@@ -230,6 +257,10 @@ pub fn register(
         depth,
         pending_done,
         pending_start,
+        session_callbacks,
+        alpn_callback_enabled,
+        alpn_protos,
+        awaiting_new_session,
         cell: Some(cell),
     }
 }
@@ -248,6 +279,14 @@ pub struct CallbackHandles {
     pub pending_done: Rc<Cell<bool>>,
     /// A `HANDSHAKE_START` event awaiting delivery.
     pub pending_start: Rc<Cell<bool>>,
+    /// `flags_.session_callbacks`, shared with the slot.
+    pub session_callbacks: Rc<Cell<bool>>,
+    /// `flags_.alpn_callback_enabled`, shared with the slot.
+    pub alpn_callback_enabled: Rc<Cell<bool>>,
+    /// The server's `alpn_protos_`, shared with the slot.
+    pub alpn_protos: Rc<RefCell<Vec<u8>>>,
+    /// `flags_.awaiting_new_session`, shared with the slot.
+    pub awaiting_new_session: Rc<Cell<bool>>,
     /// The state cell this set of handles was registered for.
     ///
     /// Held so [`CallbackHandles::unregister`] can drop the slot without a caller
@@ -270,6 +309,10 @@ impl CallbackHandles {
             depth: Rc::clone(&self.depth),
             pending_done: Rc::clone(&self.pending_done),
             pending_start: Rc::clone(&self.pending_start),
+            session_callbacks: Rc::clone(&self.session_callbacks),
+            alpn_callback_enabled: Rc::clone(&self.alpn_callback_enabled),
+            alpn_protos: Rc::clone(&self.alpn_protos),
+            awaiting_new_session: Rc::clone(&self.awaiting_new_session),
             // Delivery-only: the owning set is the one that unregisters, so this
             // copy must not drop the slot a second time.
             cell: None,
@@ -294,6 +337,398 @@ pub fn unregister(cell: *const RefCell<WrapState>) {
         return;
     }
     SLOTS.with(|slots| slots.borrow_mut().retain(|slot| slot.cell != cell));
+}
+
+/// Clears `flags_.awaiting_new_session` without borrowing the wrap's state.
+///
+/// `newSessionDone` is reached from inside `SSL_do_handshake`: OpenSSL calls
+/// `NewSessionCallback`, which emits `'newSession'`, whose `done` calls
+/// `newSessionDone()`. `cycle` holds the state's `RefCell` on that very stack, so
+/// `with_state` would fail and the method would report "Invalid TLSWrap receiver"
+/// — measured against a local `tls.createServer` before this existed.
+///
+/// The flag lives in the callback slot for exactly this reason (see
+/// [`CallbackSlot`]), so the write goes through the slot rather than the state.
+pub fn clear_awaiting_new_session(cell: *const RefCell<WrapState>) {
+    if cell.is_null() {
+        return;
+    }
+    SLOTS.with(|slots| {
+        for slot in slots.borrow().iter().filter(|slot| slot.cell == cell) {
+            slot.awaiting_new_session.set(false);
+        }
+    });
+}
+
+/// The slot for the wrap whose `SSL` is `ssl`, read through the app-data pointer.
+///
+/// This is the lookup every OpenSSL-initiated callback in this module starts
+/// with, and it deliberately never touches the wrap's `RefCell`: the callbacks run
+/// on the library's stack, where `cycle` holds that borrow.
+fn slot_of(ssl: *const ffi::SSL) -> Option<CallbackSlot> {
+    if ssl.is_null() {
+        return None;
+    }
+    // SAFETY: the caller is an OpenSSL callback for `ssl`, and `wrap()` installed
+    // the wrap's state cell as its app-data at index 0, which
+    // `crate::callback::install` documents.
+    let data = unsafe { ffi::SSL_get_ex_data(ssl, 0) };
+    if data.is_null() {
+        return None;
+    }
+    let cell = data as *const RefCell<WrapState>;
+    SLOTS.with(|slots| {
+        slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.cell == cell)
+            .cloned()
+    })
+}
+
+/// `TLSWrap`'s `NewSessionCallback` (`crypto_tls.cc:152`).
+///
+/// OpenSSL calls this once per completed handshake with the session it would
+/// resume from, and it is what makes `'session'` fire on the client and
+/// `'newSession'` on the server. It returns 0 on every path, as Node's does: the
+/// return value only tells OpenSSL whether the session is still needed, and the
+/// application here keeps its own copy in JavaScript.
+///
+/// # Why nothing is returned for a wrap without session callbacks
+///
+/// `wrap.js` installs `onnewsession` unconditionally on the client, but turns the
+/// callbacks on only when a listener exists or the server asked for them. A wrap
+/// that never called `enableSessionCallbacks` must not run the handler, which is
+/// Node's `has_session_callbacks()` guard, and the reason `https.get`'s socket —
+/// which does attach one — is the case this increment exists for.
+///
+/// # Safety
+///
+/// OpenSSL invokes this with the `SSL*` and session it owns, both live for the
+/// duration of the call.
+pub unsafe extern "C" fn new_session(ssl: *mut ffi::SSL, session: *mut ffi::SSL_SESSION) -> c_int {
+    let Some(slot) = slot_of(ssl) else {
+        return 0;
+    };
+    if !slot.session_callbacks.get() {
+        return 0;
+    }
+    // `SecureContext::kMaxSessionSize`: a session too large to store is dropped
+    // rather than serialized into a buffer JavaScript cannot use.
+    // SAFETY: `session` is live for the duration of the call, per this function's
+    // contract.
+    let Some(session_der) = (unsafe { crate::ssl::encode(session) }) else {
+        return 0;
+    };
+    if session_der.len() > MAX_SESSION_SIZE {
+        return 0;
+    }
+    // SAFETY: as above.
+    let id = unsafe { crate::ssl::session_id(session) };
+
+    // On a server the handshake is parked until `newSessionDone`, so the session
+    // cannot be lost between the callback and the application's `'newSession'`
+    // handler. A client has nothing to wait for, which is why `onnewsessionclient`
+    // emits synchronously.
+    if slot.kind == crate::ssl::Kind::Server {
+        slot.awaiting_new_session.set(true);
+    }
+    let object = slot.object.clone();
+    let buffer_der = session_der;
+    let session_id = id;
+    // JavaScript must not run on the library's stack: `'newSession'` handlers
+    // commonly call `session.setSession()` on another socket, which re-enters the
+    // SSL. Node handles this by emitting from inside the callback anyway
+    // (`MakeCallback`), and so does this — the difference is that
+    // `MakeCallback`'s exception path is handled in `call_handler`.
+    //
+    // The handler is `onnewsession` for both kinds: `wrap.js` assigns
+    // `onnewsessionclient` to that same property for a client (`:1011`).
+    let _ = rn_uv::callback::with_context(|scope| {
+        let Some(object) = object.as_ref().map(|object| v8::Local::new(scope, object)) else {
+            return;
+        };
+        let arguments = match (
+            buffer_to_view(scope, &session_id),
+            buffer_to_view(scope, &buffer_der),
+        ) {
+            (Some(id), Some(session)) => [id, session],
+            _ => return,
+        };
+        let values: [v8::Local<'_, v8::Value>; 2] = [arguments[0].into(), arguments[1].into()];
+        call_handler(scope, object, "onnewsession", &values);
+    });
+    0
+}
+
+/// `SecureContext::kMaxSessionSize`, `10 * 1024` (`crypto_context.h:105`).
+const MAX_SESSION_SIZE: usize = 10 * 1024;
+
+/// A non-negative integral `f64` as a `usize`, for the ALPN callback's offset.
+///
+/// `as` would truncate a fractional or negative value into a plausible-looking
+/// index, and the offset is the *only* thing the JavaScript answer communicates —
+/// so an out-of-range one has to be rejected rather than coerced.
+fn number_to_index(value: f64) -> Option<usize> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+        return None;
+    }
+    if value > usize::MAX as f64 {
+        return None;
+    }
+    Some(value as usize)
+}
+
+/// `TLSWrap`'s `GetSessionCallback` (`crypto_tls.cc:109`).
+///
+/// OpenSSL asks this while it is *starting* a handshake, to make resumption
+/// possible. Node answers with `next_sess_.release()`, which is the session
+/// `loadSession` decoded, and sets `*copy = 0` to say the `SSL` owns the pointer
+/// from here.
+///
+/// The slot is reached without the wrap's `RefCell` because this runs inside
+/// `SSL_do_handshake`, where `cycle` holds that borrow — see [`slot_of`].
+///
+/// # Safety
+///
+/// OpenSSL invokes this with a live `SSL*` and `copy` a writable `int`. The
+/// returned session must be owned by the caller, which is what `release` does.
+pub unsafe extern "C" fn get_session(
+    ssl: *mut ffi::SSL,
+    _key: *const std::os::raw::c_uchar,
+    _length: c_int,
+    copy: *mut c_int,
+) -> *mut ffi::SSL_SESSION {
+    if !copy.is_null() {
+        // SAFETY: `copy` is a live out-parameter, per this function's contract.
+        unsafe { *copy = 0 };
+    }
+    let Some(slot) = slot_of(ssl) else {
+        return std::ptr::null_mut();
+    };
+    slot.session.take_ptr()
+}
+
+/// `TLSWrap`'s `SelectALPNCallback` (`crypto_tls.cc:227`), the **server** half of
+/// ALPN.
+///
+/// Two modes, both from Node:
+///
+/// * `flags_.alpn_callback_enabled` (an `ALPNCallback` option was given): the raw
+///   offered wire-format list goes to JavaScript, which answers with an offset
+///   into it, `undefined` to reject everything, or throws;
+/// * otherwise the wrap matches the offered list against `alpn_protos_` with
+///   `SSL_select_next_proto`, and a list with no overlap is a fatal alert as RFC
+///   7301 requires.
+///
+/// A client does not come here at all: it calls `SSL_set_alpn_protos` and lets
+/// OpenSSL do the matching, which is `setALPNProtocols`'s client branch.
+///
+/// # Safety
+///
+/// All pointers are OpenSSL's own, valid for the duration of the call, and
+/// `out`/`outlen` are out-parameters this function writes exactly once.
+pub unsafe extern "C" fn select_alpn(
+    ssl: *mut ffi::SSL,
+    out: *mut *const std::os::raw::c_uchar,
+    out_len: *mut std::os::raw::c_uchar,
+    offered: *const std::os::raw::c_uchar,
+    offered_len: std::os::raw::c_uint,
+    _arg: *mut std::os::raw::c_void,
+) -> c_int {
+    if ssl.is_null() || out.is_null() || out_len.is_null() {
+        return ffi::SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    let Some(slot) = slot_of(ssl) else {
+        return ffi::SSL_TLSEXT_ERR_ALERT_FATAL;
+    };
+    // SAFETY: the caller guarantees `offered` points at `offered_len` bytes.
+    let offered_bytes = if offered.is_null() || offered_len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(offered, offered_len as usize) }
+    };
+
+    if slot.alpn_callback_enabled.get() {
+        let object = slot.object.clone();
+        let offered_copy = offered_bytes.to_vec();
+        let offset = rn_uv::callback::with_context(|scope| {
+            let object = object
+                .as_ref()
+                .map(|object| v8::Local::new(scope, object))?;
+            let buffer = buffer_to_view(scope, &offered_copy)?;
+            call_handler_returning(scope, object, "ALPNCallback", &[buffer.into()])
+        })
+        .flatten();
+        // `undefined` — which is what a missing handler or an `undefined` return
+        // looks like — rejects every proposed protocol, and Node sends a fatal
+        // alert for it rather than silently continuing without ALPN.
+        let Some(offset) = offset else {
+            return ffi::SSL_TLSEXT_ERR_ALERT_FATAL;
+        };
+        let Some(start) = number_to_index(offset) else {
+            return ffi::SSL_TLSEXT_ERR_ALERT_FATAL;
+        };
+        if start >= offered_bytes.len() {
+            return ffi::SSL_TLSEXT_ERR_ALERT_FATAL;
+        }
+        let length = offered_bytes[start] as usize;
+        let body = start + 1;
+        if body + length > offered_bytes.len() {
+            return ffi::SSL_TLSEXT_ERR_ALERT_FATAL;
+        }
+        // SAFETY: `out` and `out_len` are live out-parameters, and the slice the
+        // pointer names is OpenSSL's own `offered` buffer, which outlives the
+        // callback.
+        unsafe {
+            *out = offered.add(body);
+            *out_len = length as std::os::raw::c_uchar;
+        }
+        return ffi::SSL_TLSEXT_ERR_OK;
+    }
+
+    // The list is borrowed for the duration of this call rather than cloned:
+    // `SSL_select_next_proto` points `selected` *into* it, and OpenSSL reads the
+    // bytes only after this callback returns — so a temporary clone would be a
+    // dangling pointer, which showed up as
+    // `ERR_SSL_TLSV1_ALERT_DECODE_ERROR` on the peer and
+    // `ERR_SSL_BAD_EXTENSION` on the client.
+    //
+    // The borrow is short and nothing here calls back into JavaScript, so it
+    // cannot be re-entered; `try_borrow` reports it rather than panicking if it
+    // ever is.
+    let Ok(supported) = slot.alpn_protos.try_borrow() else {
+        return ffi::SSL_TLSEXT_ERR_ALERT_FATAL;
+    };
+    if supported.is_empty() {
+        return ffi::SSL_TLSEXT_ERR_NOACK;
+    }
+    let mut selected: *mut std::os::raw::c_uchar = std::ptr::null_mut();
+    let mut selected_len: std::os::raw::c_uchar = 0;
+    // SAFETY: both lists are live for the duration of the call, and the two
+    // out-parameters are live locals. `SSL_select_next_proto` only reads the two
+    // lists and points `selected` into `supported`.
+    let negotiated = unsafe {
+        ffi::SSL_select_next_proto(
+            &mut selected,
+            &mut selected_len,
+            supported.as_ptr(),
+            supported.len() as std::os::raw::c_uint,
+            offered_bytes.as_ptr(),
+            offered_bytes.len() as std::os::raw::c_uint,
+        )
+    };
+    if negotiated != ffi::OPENSSL_NPN_NEGOTIATED || selected.is_null() {
+        return ffi::SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    // SAFETY: the out-parameters are live, and `selected` points into
+    // `supported`, which the `RefCell` in the slot owns for as long as the wrap
+    // does — so the bytes are still valid when OpenSSL reads them after this
+    // returns.
+    unsafe {
+        *out = selected;
+        *out_len = selected_len;
+    }
+    ffi::SSL_TLSEXT_ERR_OK
+}
+
+/// `TLSWrap`'s `KeylogCallback` (`crypto_tls.cc:135`).
+///
+/// One `'keylog'` emission per NSS key-log line, with the newline Node appends.
+/// This is diagnostic rather than load-bearing, but `--tls-keylog` and
+/// `setKeylogCallback` both reach it, and a listener that never fires would make
+/// a debugging aid silently useless.
+///
+/// # Safety
+///
+/// OpenSSL invokes this with a live `SSL*` and a NUL-terminated `line`.
+pub unsafe extern "C" fn keylog(ssl: *const ffi::SSL, line: *const std::os::raw::c_char) {
+    if ssl.is_null() || line.is_null() {
+        return;
+    }
+    let Some(slot) = slot_of(ssl) else {
+        return;
+    };
+    // SAFETY: `line` is NUL-terminated, per OpenSSL's contract for this callback.
+    let text = unsafe { std::ffi::CStr::from_ptr(line) };
+    let mut bytes = text.to_bytes().to_vec();
+    bytes.push(b'\n');
+    let object = slot.object.clone();
+    let _ = rn_uv::callback::with_context(|scope| {
+        let Some(object) = object.as_ref().map(|object| v8::Local::new(scope, object)) else {
+            return;
+        };
+        let Some(buffer) = buffer_to_view(scope, &bytes) else {
+            return;
+        };
+        call_handler(scope, object, "onkeylog", &[buffer.into()]);
+    });
+}
+
+/// A `Buffer` over a copy of `bytes`.
+///
+/// `Buffer` rather than a bare `Uint8Array` because `wrap.js` passes the session
+/// straight to `Buffer.concat` (`wrapSessionState`) and reads it back with
+/// `Buffer.isBuffer`, both of which reject a plain view.
+fn buffer_to_view<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: &[u8],
+) -> Option<v8::Local<'s, v8::Uint8Array>> {
+    let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes.to_vec()).make_shared();
+    let array_buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+    let view = v8::Uint8Array::new(scope, array_buffer, 0, array_buffer.byte_length())?;
+    if let Some(prototype) = buffer_prototype(scope) {
+        view.set_prototype(scope, prototype.into());
+    }
+    Some(view)
+}
+
+/// `Buffer.prototype` from the global, so a buffer this crate builds is a real
+/// `Buffer` rather than a bare `Uint8Array`.
+fn buffer_prototype<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    let global = scope.get_current_context().global(scope);
+    let buffer_key = v8::String::new(scope, "Buffer")?;
+    let buffer = global.get(scope, buffer_key.into())?;
+    let buffer = v8::Local::<v8::Object>::try_from(buffer).ok()?;
+    let prototype_key = v8::String::new(scope, "prototype")?;
+    let value = buffer.get(scope, prototype_key.into())?;
+    v8::Local::<v8::Object>::try_from(value).ok()
+}
+
+/// Calls `object[name](...args)` and returns the number it answered, if any.
+///
+/// `SelectALPNCallback` is the one handler whose return value is consumed, and
+/// Node treats `undefined` there as "reject everything" rather than as zero — so
+/// the distinction between "returned a number" and "returned nothing" is
+/// load-bearing, which is why this is separate from [`call_handler`].
+fn call_handler_returning<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+    arguments: &[v8::Local<'s, v8::Value>],
+) -> Option<f64> {
+    let key = v8::String::new(scope, name)?;
+    let value = object.get(scope, key.into())?;
+    let handler = v8::Local::<v8::Function>::try_from(value).ok()?;
+    let receiver: v8::Local<'s, v8::Value> = object.into();
+    let caught = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
+        let inner = &mut try_catch.init();
+        let returned = handler.call(inner, receiver, arguments);
+        let result = returned.map(|value| value.number_value(inner));
+        (
+            result,
+            inner
+                .exception()
+                .map(|exception| v8::Global::new(inner, exception)),
+        )
+    };
+    if let Some(caught) = caught.1 {
+        let exception = v8::Local::new(&*scope, &caught);
+        rn_errors::report_uncaught_exception(scope, exception);
+        return None;
+    }
+    caught.0.flatten()
 }
 
 /// Calls `object[name](...args)` when the property is a function.
@@ -358,6 +793,18 @@ pub unsafe fn install(ssl: *mut ffi::SSL, cell: *mut std::cell::RefCell<WrapStat
         // is the slot `ffi::SSL_get_ex_data(ssl, 0)` reads back.
         ffi::SSL_set_ex_data(ssl, 0, cell.cast::<c_void>());
         crate::ffi_extra::SSL_set_info_callback(ssl, Some(info));
+        // The session callbacks live on the `SSL_CTX`, which the `SSL` shares with
+        // every other wrap built from the same `SecureContext` — so this is
+        // Node's `sc_->SetGetSessionCallback(...)` / `SetNewSessionCallback(...)`
+        // in `TLSWrap::TLSWrap` (`crypto_tls.cc:413`), run once per wrap rather
+        // than once per context. Installing it here rather than at context
+        // creation keeps the callback table keyed by the SSL's app-data, so a
+        // callback for one wrap cannot read another's state.
+        let ctx = crate::ffi_extra::SSL_get_SSL_CTX(ssl);
+        if !ctx.is_null() {
+            ffi::SSL_CTX_sess_set_new_cb(ctx, Some(new_session));
+            ffi::SSL_CTX_sess_set_get_cb(ctx, Some(get_session));
+        }
     }
 }
 
