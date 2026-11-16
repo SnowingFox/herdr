@@ -740,18 +740,21 @@ fn push_promise(
         rv.set(v8::Integer::new(scope, ffi::NGHTTP2_ERR_INVALID_ARGUMENT).into());
         return;
     };
-    if state.receiving.get() {
-        state
-            .deferred_submits
-            .borrow_mut()
-            .push(crate::session::DeferredSubmit::PushPromise {
-                stream_id: id,
-                headers: crate::headers::pairs_of(&headers),
-            });
-        crate::session::schedule_write(state);
-        rv.set(v8::Integer::new(scope, 0).into());
-        return;
-    }
+    let options = args.get(1).uint32_value(scope).unwrap_or(0) as i32;
+    // Submitted inline even while `receiving`, which is the one place in this
+    // module that does not go through `defer_or`.
+    //
+    // `Http2Stream::SubmitPushPromise` calls `nghttp2_submit_push_promise` with no
+    // such gate (`src/node_http2.cc:2687`), and Node reaches it from inside
+    // `mem_recv` routinely: `pushStream` is legal from a `'data'` handler, which
+    // runs synchronously from `OnDataChunkReceived`. Only *sending* is unsafe
+    // there, which is why the flush below stays a `schedule_write`.
+    //
+    // Deferring is not merely unnecessary, it is incompatible with what this
+    // function has to return. nghttp2 assigns the promised stream id as it queues
+    // the frame, and `core.js` reads `ret.id()` from the returned handle
+    // immediately (`vendor/libnode-js/lib/internal/http2/core.js:3223`), so the
+    // id must exist before the call returns.
     // SAFETY: `raw` is live and `headers` owns its storage for the call.
     let promised = unsafe {
         ffi::nghttp2_submit_push_promise(
@@ -763,18 +766,39 @@ fn push_promise(
             ptr::null_mut(),
         )
     };
-    if promised > 0 {
-        state.streams.borrow_mut().insert(
-            promised,
-            crate::session::StreamRecord {
-                id: promised,
-                category: ffi::NGHTTP2_HCAT_PUSH_RESPONSE,
-                ..Default::default()
-            },
-        );
+    if promised <= 0 {
+        // `core.js` turns a number into an error, so every failure returns the
+        // code itself: `NGHTTP2_ERR_STREAM_ID_NOT_AVAILABLE` and
+        // `NGHTTP2_ERR_STREAM_CLOSED` each have their own error class there.
+        rv.set(v8::Integer::new(scope, promised).into());
+        return;
     }
+    state.streams.borrow_mut().insert(
+        promised,
+        crate::session::StreamRecord {
+            id: promised,
+            category: ffi::NGHTTP2_HCAT_PUSH_RESPONSE,
+            options,
+            ..Default::default()
+        },
+    );
     crate::session::schedule_write(state);
-    rv.set(v8::Integer::new(scope, promised).into());
+    // On success `PushPromise` returns the *handle object*, not the id:
+    // `src/node_http2.cc:3271` sets `args.GetReturnValue().Set(stream->object())`.
+    // A bare id here is read by `core.js` as an error code, and since a stream id
+    // is positive it becomes `new NghttpError(<id>)` — `Unknown error code` — on a
+    // push that actually succeeded.
+    let Some(handle) = handle_for(
+        scope,
+        state,
+        promised,
+        ffi::NGHTTP2_HCAT_PUSH_RESPONSE,
+        options,
+    ) else {
+        rv.set(v8::Integer::new(scope, promised).into());
+        return;
+    };
+    rv.set(handle.into());
 }
 
 /// `Http2Stream::Respond`: the final response HEADERS, with a body provider.

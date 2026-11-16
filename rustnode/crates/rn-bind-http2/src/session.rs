@@ -134,11 +134,6 @@ pub enum DeferredSubmit {
     },
     /// `nghttp2_submit_data2`.
     Data { stream_id: i32, flags: u8 },
-    /// `nghttp2_submit_push_promise`.
-    PushPromise {
-        stream_id: i32,
-        headers: Vec<(Vec<u8>, Vec<u8>, u8)>,
-    },
     /// `nghttp2_submit_ping`.
     Ping { payload: [u8; 8] },
     /// `nghttp2_submit_settings`.
@@ -866,17 +861,6 @@ fn apply_deferred(state: &SessionState, submit: DeferredSubmit) {
             DeferredSubmit::Data { stream_id, flags } => {
                 let provider = crate::stream::provider::Provider::new(state, stream_id, 0);
                 ffi::nghttp2_submit_data2(raw, flags, stream_id, provider.as_ptr());
-            }
-            DeferredSubmit::PushPromise { stream_id, headers } => {
-                let block = crate::headers::block_from_pairs(&headers);
-                ffi::nghttp2_submit_push_promise(
-                    raw,
-                    ffi::NGHTTP2_FLAG_NONE,
-                    stream_id,
-                    block.as_ptr(),
-                    block.len(),
-                    std::ptr::null_mut(),
-                );
             }
             DeferredSubmit::Ping { payload } => {
                 ffi::nghttp2_submit_ping(raw, ffi::NGHTTP2_FLAG_NONE, payload.as_ptr());
