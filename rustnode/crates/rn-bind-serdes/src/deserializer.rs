@@ -87,7 +87,18 @@ impl v8::ValueDeserializerImpl for Hooks {
     ) -> Option<v8::Local<'s, v8::Object>> {
         let slot = self.slot()?;
         let object = v8::Local::new(&*scope, &slot.object);
-        let returned = delegate::call_hook(scope, object, "_readHostObject", &[]);
+        // V8 runs `ReadValue` inside a `DisallowJavascriptExecutionScope`, so
+        // calling `_readHostObject` without lifting it aborts the process with
+        // "Invoke in DisallowJavascriptExecutionScope" rather than throwing.
+        // Node lifts it explicitly at the same point
+        // (`src/node_serdes.cc:314`, `Isolate::AllowJavascriptExecutionScope`);
+        // `_readHostObject` is JavaScript — it constructs a `Buffer` or a typed
+        // array — so the deserializer cannot work without this.
+        //
+        // `_writeHostObject` needs no equivalent: `ValueSerializer::WriteValue`
+        // is not entered under a disallow scope.
+        v8::allow_javascript_execution_scope!(let allow, scope);
+        let returned = delegate::call_hook(allow, object, "_readHostObject", &[]);
         let Some(returned) = returned else {
             // A throw inside the hook leaves an exception pending; `None` tells
             // V8 the read failed.
@@ -98,7 +109,7 @@ impl v8::ValueDeserializerImpl for Hooks {
         match v8::Local::<v8::Object>::try_from(returned) {
             Ok(object) => Some(object),
             Err(_) => {
-                delegate::throw_invalid_arg_type(scope, "readHostObject must return an object");
+                delegate::throw_invalid_arg_type(allow, "readHostObject must return an object");
                 None
             }
         }
