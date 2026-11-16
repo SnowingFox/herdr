@@ -41,12 +41,52 @@ fn wants_uring() -> bool {
     rn_uv::poller::Poller::from_env() == rn_uv::poller::Poller::IoUring
 }
 
+/// Ensures a readiness backend has been installed for this thread's loop.
+///
+/// `rn_uv::uv_loop` creates the loop; installing the poller into it is what
+/// `rn_io::Loop::new` does in the runtime. This suite drives `rn-uv` directly, so
+/// it performs that step itself — which is the point: the assertions below are
+/// about what `Readiness::install` actually installed, and installing here is
+/// what gives them something real to observe, including the epoll fallback.
+///
+/// The `Readiness` is forgotten deliberately. Dropping it deregisters the ring
+/// for the loop, and the loop is process-global while the suite keeps using it.
+fn ensure_installed() {
+    thread_local! {
+        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    DONE.with(|done| {
+        if done.get() {
+            return;
+        }
+        let pointer = rn_uv::uv_loop::loop_ptr().expect("the loop must be creatable");
+        std::mem::forget(rn_uv::poller::Readiness::install(
+            rn_uv::poller::Poller::from_env(),
+            pointer,
+        ));
+        done.set(true);
+    });
+}
+
 /// The backend a freshly created loop reports.
 ///
 /// A loop can only be created once per process, so this asserts against what the
 /// existing loop reports rather than trying to make a second one.
+///
+/// This reads `rn_uv::poller::installed_backend()`, **not**
+/// `Poller::from_env()`. `from_env()` answers what `HERDR_URING` asked for, so a
+/// test asserting on it compared the request against itself: every case here that
+/// means "the installed backend" would have passed even if `Readiness::install`
+/// had silently fallen back to epoll. The two are genuinely different questions
+/// whenever a ring cannot be created, which is the path these tests exist for.
 fn installed_poller() -> rn_uv::poller::Poller {
-    rn_uv::poller::Poller::from_env()
+    ensure_installed();
+    rn_uv::poller::installed_backend().unwrap_or_else(|| {
+        panic!(
+            "`Readiness::install` ran for this thread's loop but recorded no backend; \
+             the record is what makes a silent fallback observable"
+        )
+    })
 }
 
 /// Pumps the loop until `done` is set or `limit` expires.
