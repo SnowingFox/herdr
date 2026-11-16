@@ -14,65 +14,64 @@
 //! (canonical href, nine offsets)  ==  (ada::url_aggregator, url_components)
 //! ```
 //!
-//! and [`model::Offsets`] derives the second from the first.
+//! and [`model::Offsets`] reads the second out of ada.
 //!
-//! # Foundation, and why
+//! # Foundation
 //!
-//! The parser underneath is the [`url`](https://docs.rs/url) crate (Servo's
-//! WHATWG implementation) with [`idna`](https://docs.rs/idna) for UTS #46. That
-//! is the same standard ada implements, so the two are not merely similar: they
-//! are two implementations of one specification, which makes agreement the
-//! default and disagreement a bug worth finding.
+//! The parser underneath is [`ada_url`], a binding to the same
+//! `deps/ada/ada.cpp` that Node vendors. `ada-url` 4.0.0 (crate vcs revision
+//! `af35063623f2c93bb337728d03c03644b47e75c9`) bundles the single-header release
+//! of ada generated `2026-07-27 16:10:09 -0400`; the copy in Node's
+//! `deps/ada/` at the revision this runtime targets is the *same release*, and
+//! `ada.cpp` and `ada.h` are byte-identical (sha256 `1c722f8f…` and `0010b17b…`
+//! respectively). So the parser, the per-component percent-encode sets, the
+//! host and port guards, and the `idna` half are the same compiled C++ that
+//! Node 28 runs, not a second implementation of the same standard.
 //!
-//! The alternative — a hand-written parser — was rejected because the WHATWG
-//! algorithm is large and its corner cases are where compatibility actually
-//! lives: percent-encoding sets per component, dot-segment removal, IPv4
-//! shorthand, IPv6 compression, default-port elision, `file:` drive letters.
-//! Writing those by hand would mean re-deriving what a maintained crate already
-//! does, with far more room to be subtly wrong.
+//! That equivalence is the whole reason this crate delegates. An earlier
+//! version used the [`url`](https://docs.rs/url) crate — the same WHATWG
+//! standard, a different implementation — and the interesting disagreements were
+//! never the spec, they were ada's own guards: `^` in the path percent-encode
+//! set, `set_host` truncating at a delimiter and *ignoring* a rejected port,
+//! `set_port` requiring a leading digit, the ASCII fast path in `to_ascii` that
+//! skips UTS #46 validation entirely. Each was re-derived by hand and four were
+//! re-derived wrongly. Delegating to ada deletes that entire class of bug,
+//! because there is no longer a second opinion to reconcile.
 //!
-//! Using a crate is not the same as trusting it. Every disagreement below was
-//! found by differential testing against a real `node` and is covered by a test
-//! in `tests/node_parity.rs`; none was assumed away.
+//! # What is not delegated
+//!
+//! Three things in this namespace are Node's glue rather than ada's, and those
+//! are implemented here:
+//!
+//! * **`format`'s `unicode` mode** rewrites the host to its decoded spelling,
+//!   which produces an href that is not a parseable URL (`http://☃/x`). Node
+//!   sets `out->host` on its parsed object; an aggregator would re-punycode it,
+//!   so the decoded text is spliced in at the host's byte range. See
+//!   [`format`].
+//! * **`pathToFileURL`'s `EncodePathChars`** runs *before* the parse and
+//!   percent-encodes the RFC 1738 unsafe set, which is not the URL parser's own
+//!   escaping and would be double-encoded by it. See [`path`].
+//! * **`search`/`hash` on `update`** map an empty value to ada's `clear_*`
+//!   entry point, because ada spells "empty but present" (`?`) and "absent"
+//!   as different calls. See [`update`].
+//!
+//! `domainToASCII`/`domainToUnicode` were also Node's glue in the old version
+//! and are now built on ada as well: `set_hostname` on a `ws://x` seed, which is
+//! literally what `src/node_url.cc` does, plus `Idna::unicode` for the decoder.
+//! The ASCII fast path that the old `idna`-crate version could not reproduce
+//! comes for free from that arrangement.
 //!
 //! # Known differences from Node
 //!
-//! These are the places where this implementation knowingly answers differently
-//! from a real `node`. Each is a property of the `url`/`idna` crates rather than
-//! of the glue here, and each is small and visible rather than structural.
-//!
-//! 1. **`ẞ` (U+1E9E) uppercases to `ss` in Node, but punycodes here.** Node's
-//!    ada decodes `http://ẞ.com/` to `http://ss.com/`; the `idna` crate keeps
-//!    the character and produces `xn--zca.com`. Both are defensible UTS #46
-//!    readings; ada applies the uppercase mapping first and `idna` does not.
-//!
-//! 2. **`file:` URLs with a drive letter after a host.** Node parses
-//!    `file://h/C:/x` as host `h` and path `/C:/x`; the `url` crate folds the
-//!    drive letter into the path and drops the host, giving `file:///C:/x`.
-//!    This only affects `file:` URLs that name a host *and* a drive letter,
-//!    which is a Windows UNC shape that cannot occur on this platform.
-//!
-//! 3. **`file:` URLs with a `|` drive separator.** Node normalises
-//!    `file:///c|/x` to `file:///c:/x`; the `url` crate leaves the `|` in the
-//!    path. `c|` is the pre-Windows-95 spelling of a drive letter.
-//!
-//! 4. **`set_pathname("//x")` on a `file:` URL.** Node produces
-//!    `file:////x`, whose path is `//x`. The `url` crate folds the extra slash
-//!    while parsing and `Url` has no way to hold the longer form, so the folded
-//!    `file:///x` is produced instead. This is the only one of the 2,240
-//!    `update` cases in `tests/node_parity.rs` that disagrees, and the test
-//!    names it explicitly rather than filtering it out silently.
-//!
-//! 5. **`format` on an unparsable href.** Node's `Format` asserts that the
-//!    re-parse succeeded, so `bindingUrl.format("bad url", ...)` aborts the
-//!    process. This returns the input unchanged instead, which is what the
-//!    surrounding code in `node_url.cc` does for the case it expects (an IDN
-//!    hostname the parser rejects on the second pass). Aborting is never a
-//!    better outcome for the same input, so the difference is deliberate.
-//!
-//! Everything else — including the members' failure conventions, the offsets,
-//! every percent-encoding set reachable from `update`, and the ten update
-//! actions' guards — was verified against Node. See `tests/node_parity.rs`.
+//! 1. **`file:` URLs with a drive letter after a host.** Node parses
+//!    `file://h/C:/x` as host `h` and path `/C:/x`; this produces
+//!    `file:///C:/x`. A Windows UNC shape that cannot occur on this platform.
+//! 2. **`format` on an unparsable href.** Node's `Format` returns `args[0]`
+//!    unchanged; so does this.
+//! 3. **Nothing else.** The `ẞ` case, the `^` case, the `file:////` case and the
+//!    four `update` guard cases that the previous version listed as known
+//!    differences are all Node's answer now, because the code producing them is
+//!    Node's.
 //!
 //! # What is not here
 //!

@@ -4,11 +4,25 @@
 //! source, so a mistake in reading `node_url.cc` shows up as a test failure
 //! instead of as a silently different runtime. The tables cover the cases the
 //! definitions of done call out: credentials, default ports, IPv6 hosts, `file:`
-//! URLs, percent-encoded paths, relative resolution against a base, and invalid
-//! input.
+//! URLs, percent-encoded paths, relative resolution against a base, invalid
+//! input, and — for `update` — every one of the ten actions over a value table
+//! built to hit each guard.
 //!
-//! The tests skip when no `node` is on `PATH`, so the crate's gate does not
-//! depend on an external binary; when `node` is present every assertion runs.
+//! # Which `node` this runs
+//!
+//! The oracle is the nightly rustnode tracks, resolved in this order:
+//!
+//! 1. `HERDR_URL_ORACLE`, an absolute path to a `node` binary.
+//! 2. `$HOME/.cache/herdr-oracle/node`, the path the harness uses when it
+//!    downloads the pinned build.
+//! 3. `node` on `PATH`, with a warning.
+//!
+//! The `PATH` fallback is a known hazard and is deliberately loud: this image's
+//! default is v22, which answers differently from the v28 nightly in this
+//! crate's area (`^` in paths, the `update` guards, malformed punycode), so a
+//! v22 run reports disagreements that are not defects and would pass over ones
+//! that are. A test that cannot find the pinned oracle still runs — the tables
+//! are cheap — but prints which binary it compared against.
 //!
 //! # How the comparison works
 //!
@@ -26,13 +40,64 @@ use rn_v8_sys::v8;
 
 use rn_bind_url::Url;
 
-fn node_available() -> bool {
+/// The Node build this crate's expectations are pinned to.
+const PINNED_ORACLE_VERSION: &str = "v28.0.0-nightly20261111e8c1160d20";
+
+/// Absolute paths to try before falling back to `PATH`.
+///
+/// The pinned nightly is what the project's own instructions name; the cache
+/// path is where a harness that downloads it would put it.
+fn oracle_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Ok(explicit) = std::env::var("HERDR_URL_ORACLE") {
+        if !explicit.is_empty() {
+            candidates.push(explicit);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(format!("{home}/.cache/herdr-oracle/node"));
+        candidates.push(format!(
+            "{home}/.cache/herdr-oracle/node-{PINNED_ORACLE_VERSION}-linux-x64/bin/node"
+        ));
+    }
+    candidates.push(format!(
+        "/tmp/oracle-dl/node-{PINNED_ORACLE_VERSION}-linux-x64/bin/node"
+    ));
+    candidates
+}
+
+/// The oracle binary, or `None` when none of the candidates exists.
+fn oracle() -> Option<String> {
+    for candidate in oracle_candidates() {
+        let runs = Command::new(&candidate)
+            .arg("-e")
+            .arg("0")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if runs {
+            return Some(candidate);
+        }
+    }
     Command::new("node")
         .arg("-e")
         .arg("0")
         .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|_| "node".to_string())
+}
+
+/// The oracle, with a warning when it is not the pinned build.
+fn node_binary() -> Option<String> {
+    let binary = oracle()?;
+    if binary == "node" {
+        eprintln!(
+            "warning: no pinned node oracle found; comparing against `node` on PATH \
+             (expected {PINNED_ORACLE_VERSION}). Set HERDR_URL_ORACLE to override."
+        );
+    }
+    Some(binary)
 }
 
 /// The two lines every Node-side snippet needs: the internal binding, aliased
@@ -41,13 +106,30 @@ const NODE_PRELUDES: &str =
     "const { internalBinding } = require('internal/test/binding');\nconst urlBinding = internalBinding('url');\n";
 
 /// Runs a Node script and returns its stdout.
+///
+/// The script is passed on stdin rather than as `-e`, because the sweeps here
+/// build case tables far past `ARG_MAX` and `execve` fails with
+/// `ArgumentListTooLong` long before the script itself is unreasonable.
 fn node_script(source: &str) -> String {
-    let out = Command::new("node")
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let binary = node_binary().expect("the caller checked the oracle exists");
+    let mut child = Command::new(&binary)
         .arg("--expose-internals")
-        .arg("-e")
-        .arg(source)
-        .output()
-        .expect("node runs");
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("node starts");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin is piped")
+        .write_all(source.as_bytes())
+        .expect("the script fits on stdin");
+    let out = child.wait_with_output().expect("node runs");
     assert!(
         out.status.success(),
         "node failed: {}",
@@ -195,8 +277,8 @@ fn assert_parse_parity(cases: &[(&str, Option<&str>)]) {
 /// `assert_parse_parity`, with the anti-vacuity guard made optional so a table
 /// that is deliberately all-failures can still be checked.
 fn assert_parse_parity_expecting(cases: &[(&str, Option<&str>)], expect_mostly_valid: bool) {
-    if !node_available() {
-        eprintln!("node is not installed; skipping the parity check");
+    if node_binary().is_none() {
+        eprintln!("no node oracle available; skipping the parity check");
         return;
     }
     let mut failures = Vec::new();
@@ -255,13 +337,31 @@ const PARSE_CASES: &[&str] = &[
     "http://[::1]:8080/x?q#h",
     "http://[2001:db8::1]/p",
     "http://[::ffff:1.2.3.4]/",
-    // file URLs.
+    // file URLs, including the double-slash paths an aggregator must hold.
     "file:///tmp/x",
     "file:///tmp/a b.txt",
     "file://localhost/etc/passwd",
     "file://host/share/x",
     "file:/tmp/x",
     "file:///tmp/x?q#h",
+    "file:////a",
+    "file:////",
+    "file:////a/b",
+    "file://///a",
+    "file:/.//a",
+    "file:/.//",
+    "file://host//x",
+    "file://host///x",
+    "file://h/.//x",
+    "file:////a/./b",
+    "file:////a?q#h",
+    "file:////../a",
+    "file:.//x",
+    "file:/..//x",
+    "file:///c|/x",
+    "file:///c|",
+    "file://h/c|/x",
+    "file:///c|?q",
     // Percent-encoded paths and other components.
     "http://example.com/a%20b/c",
     "http://example.com/a%2Fb",
@@ -272,6 +372,18 @@ const PARSE_CASES: &[&str] = &[
     "http://example.com/?q=a+b",
     "http://example.com/#a b",
     "http://ex%41mple.com/",
+    // The path percent-encode set, which is where `^` lives.
+    "http://a/x^y",
+    "http://a/^",
+    "http://example.com/^`\"",
+    "http://a/x^y?q^#h^",
+    "http://a/%2e%2e/^",
+    "http://a/x^y/%2e%2e/",
+    "file:///a^b",
+    "file:///c:/x^",
+    "foo:/p^",
+    "foo://a/p^",
+    "foo:/.//x^y",
     // Empty and bare components.
     "http://example.com",
     "http://example.com/",
@@ -279,13 +391,28 @@ const PARSE_CASES: &[&str] = &[
     "http://example.com/#f",
     "http://example.com/?#",
     "http://example.com/?#f",
-    // Non-special schemes and opaque paths.
+    // An opaque path keeps a trailing space only when nothing follows it.
+    "foo:a b",
+    "foo:a ?q",
+    "foo:a #h",
+    "foo:a  ",
+    "foo:^ ",
+    "foo:%20",
+    // Non-special schemes and opaque paths, including the `/.` guard.
     "foo://bar/baz?x#y",
     "foo://bar",
     "foo://bar/",
     "foo:/bar",
     "foo:bar",
     "foo:/bar?q#h",
+    "foo:/.//x",
+    "foo:/.//x?q#h",
+    "foo:/.//",
+    "foo:////a",
+    "foo:////",
+    "foo:////a?q",
+    "foo://///a",
+    "http:/.//x",
     "mailto:a@b.c",
     "data:text/plain,hi",
     "about:blank",
@@ -307,17 +434,30 @@ const PARSE_CASES: &[&str] = &[
     // IPv4 shorthand, which is host parsing rather than a lookup.
     "http://0x7f.1/",
     "http://127.1/",
-    // IDN.
+    // IDN, and the ASCII fast path that skips UTS #46 validation.
     "http://例え.テスト/",
     "http://xn--r8jz45g.xn--zckzah/",
     "http://faß.de/",
     "http://☃.net/",
+    "http://xn--a/",
+    "http://xn--zz/",
+    "http://xn--/",
+    "http://xn--a.com/",
+    "http://XN--A/",
+    "http://xn--a-/",
+    "http://xn--a./",
+    "http://xn--a..b/",
+    "http://xn--0.com/",
+    "http://a.xn--a/",
+    "http://xn--a%41/",
+    "http://xn--%41/",
+    "http://ẞ.com/",
+    "http://ＡＢＣ.com/",
     // Characters that differ per component's encode set.
     "http://example.com/~",
     "http://example.com/!",
     "http://example.com/'()",
     "http://example.com/[]{}|",
-    "http://example.com/^`\"",
     "http://example.com/<>",
     // Invalid input.
     "://bad",
@@ -329,6 +469,7 @@ const PARSE_CASES: &[&str] = &[
     "http://example.com:999999/",
     "https://exam_ple.com/x",
     "https://example..com/x",
+    "http://xn--a.1/",
 ];
 
 /// Relative resolutions against each kind of base.
@@ -355,6 +496,7 @@ const RESOLUTION_CASES: &[(&str, Option<&str>)] = &[
     ("c", Some("file:///tmp/x/y")),
     ("../c", Some("file:///tmp/x/y")),
     ("/c", Some("file:///tmp/x/y")),
+    ("//x", Some("file:///a")),
     ("c", Some("foo://bar/baz/qux")),
     ("c", Some("foo:/a/b")),
     ("c", Some("https://u:p@h:9/x/y")),
@@ -389,6 +531,7 @@ fn parse_matches_node_for_every_failure_case() {
         "//example.com",
         "http://",
         "http://exa mple.com/",
+        "http://xn--a.1/",
     ]
     .iter()
     .map(|input| (*input, None))
@@ -399,7 +542,7 @@ fn parse_matches_node_for_every_failure_case() {
 #[test]
 fn can_parse_agrees_with_parse_on_every_case() {
     // `ada::can_parse` is defined to agree with `ada::parse`; this asserts the
-    // same of the Rust pair, on both the absolute and the relative tables.
+    // same of the binding pair, on both the absolute and the relative tables.
     let mut cases: Vec<(&str, Option<&str>)> =
         PARSE_CASES.iter().map(|input| (*input, None)).collect();
     cases.extend_from_slice(RESOLUTION_CASES);
@@ -449,8 +592,8 @@ fn can_parse_agrees_with_parse_on_every_case() {
 
 #[test]
 fn can_parse_matches_node_on_every_case() {
-    if !node_available() {
-        eprintln!("node is not installed; skipping the parity check");
+    if node_binary().is_none() {
+        eprintln!("no node oracle available; skipping the parity check");
         return;
     }
     let mut cases: Vec<(&str, Option<&str>)> =
@@ -488,80 +631,212 @@ fn can_parse_matches_node_on_every_case() {
     assert_eq!(here, there, "canParse disagrees with node");
 }
 
-#[test]
-fn update_matches_node_on_every_action_and_value() {
-    if !node_available() {
-        eprintln!("node is not installed; skipping the parity check");
-        return;
-    }
-    let actions = [
-        "kProtocol",
-        "kHost",
-        "kHostname",
-        "kPort",
-        "kUsername",
-        "kPassword",
-        "kPathname",
-        "kSearch",
-        "kHash",
-        "kHref",
-    ];
-    let bases = [
-        "https://user:pw@example.com:8080/a/b?q=1#f",
-        "http://example.com/",
-        "file:///tmp/x",
-        "foo://bar/baz",
-        "foo:/bar",
-        "mailto:a@b.c",
-        "http://[::1]:8080/x",
-        "https://ex.com:443/x",
-    ];
-    let values = [
-        "",
-        "x",
-        "/p q",
-        "http",
-        "https",
-        "ftp",
-        "file",
-        "foo",
-        "a b",
-        "%41",
-        "\u{e9}",
-        "99999",
-        "0",
-        "8080",
-        "#h",
-        "?q=2",
-        "example.org",
-        "[::2]",
-        "bad host",
-        ":",
-        "//x",
-        "a@b",
-        "a:80",
-        "a:",
-        "80a",
-        "65535",
-        "OTHER.test",
-        "/a/../b",
-    ];
+/// One `update` case: a base URL, an action name, and a value.
+type UpdateCase = (&'static str, &'static str, &'static str);
 
-    let mut cases = String::new();
-    for base in bases {
-        for action in actions {
-            for value in values {
-                cases.push_str(&format!(
-                    "[{}, {}, {}],\n",
-                    js_string(base),
-                    js_string(action),
-                    js_string(value)
-                ));
+/// The actions, in `updateActions` order.
+const ACTIONS: &[&str] = &[
+    "kProtocol",
+    "kHost",
+    "kHostname",
+    "kPort",
+    "kUsername",
+    "kPassword",
+    "kPathname",
+    "kSearch",
+    "kHash",
+    "kHref",
+];
+
+/// Base URLs chosen so that every guard has something to preserve.
+///
+/// Each entry is a shape a guard branches on: credentials present or not, a port
+/// present or not, an authority present or not, a `file:` URL, an opaque path,
+/// an explicit empty query or fragment, and the double-slash `file:` path that
+/// the previous implementation could not represent at all.
+const UPDATE_BASES: &[&str] = &[
+    "https://user:pw@example.com:8080/a/b?q=1#f",
+    "http://example.com/",
+    "http://a/?",
+    "http://a/#",
+    "http://a/?#",
+    "http://orig:81/x",
+    "https://ex.com:443/x",
+    "http://[::1]:8080/x",
+    "http://a:9/x",
+    "file:///tmp/x",
+    "file://host/tmp/x",
+    "file:////a",
+    "file://host//x",
+    "foo://bar/baz",
+    "foo:/bar",
+    "foo:bar",
+    "foo:/.//x",
+    "foo:////a",
+    "mailto:a@b.c",
+    "data:,x",
+];
+
+/// Values chosen to hit each guard, plus the characters whose encode sets
+/// differ per component.
+///
+/// Grouped by the guard they exercise so a failure names the class:
+///
+/// * encoding: `^`, space, backslash, the sigils, `%`, non-ASCII;
+/// * delimiter truncation: `/`, `?`, `\`, `:`, `#` inside a host value;
+/// * port acceptance: leading digit vs not, out of range, empty;
+/// * scheme refusal: special vs not, capitals, trailing text;
+/// * path shape: `//`, dot segments, trailing space, drive letters;
+/// * malformed punycode, which the ASCII fast path must accept.
+const UPDATE_VALUES: &[&str] = &[
+    // Nothing / clearing.
+    "",
+    "?",
+    "#",
+    "?#",
+    "??",
+    "##",
+    // Host delimiters.
+    "x",
+    "x/y",
+    "x\\y",
+    "x?y",
+    "x#y",
+    "x:y",
+    "x:",
+    ":",
+    ":80",
+    "a:80",
+    "a:99999",
+    "a:x1",
+    "a b",
+    "a b:80",
+    "[::1]",
+    "[::1]:81",
+    "[::1",
+    "%2e",
+    "..",
+    "a..b",
+    "localhost",
+    "EXAMPLE.ORG",
+    "example.org",
+    // Ports.
+    "0",
+    "1",
+    "1x",
+    "x1",
+    "x0y",
+    "80a",
+    "0009",
+    "0080",
+    "65535",
+    "65536",
+    "99999",
+    "-1",
+    "+80",
+    " 80",
+    "80 ",
+    "\t",
+    // Schemes.
+    "http",
+    "https",
+    "ftp",
+    "file",
+    "FILE",
+    "foo",
+    "wss",
+    "a:80",
+    // Credentials.
+    "a b",
+    "a^b",
+    "a\tb",
+    // Paths.
+    "/",
+    "//",
+    "//x",
+    "///x",
+    "/p q",
+    "/x ",
+    "/x  ",
+    " ",
+    "\t",
+    "x/y",
+    "x\\y",
+    "\\z",
+    "/x^y",
+    "^",
+    "/a/../b",
+    "a/../../b",
+    "/a/.",
+    "/a/..",
+    "..",
+    ".",
+    "/C:/x",
+    "c:/x",
+    "C|/x",
+    "c|",
+    "/%zz",
+    "/%41",
+    "/%2e%2e",
+    "/a//b",
+    "/x\t",
+    // Search and hash payloads.
+    "?q=2",
+    "?a^b",
+    "?a'b",
+    "? ",
+    "#h",
+    "#a^b",
+    "  a",
+    " a",
+    // Hosts the ASCII fast path must accept.
+    "xn--a",
+    "xn--zz",
+    "xn--",
+    "xn--a.com",
+    "xn--a:1",
+    "XN--A",
+    "xn--a.",
+    // Whole-URL replacement.
+    "file:///y",
+    "file:////y",
+    "not a url",
+    "http://b/x^y",
+    "foo:/x^y",
+    "\u{e9}",
+    "\u{2603}.net",
+];
+
+/// The full cross product, built once per test that needs it.
+fn update_cases() -> Vec<UpdateCase> {
+    let mut cases = Vec::with_capacity(UPDATE_BASES.len() * ACTIONS.len() * UPDATE_VALUES.len());
+    for base in UPDATE_BASES {
+        for action in ACTIONS {
+            for value in UPDATE_VALUES {
+                cases.push((*base, *action, *value));
             }
         }
     }
+    cases
+}
+
+/// Runs one batch of `update` cases through both runtimes and returns the
+/// disagreements, paired with the case that produced them.
+fn update_disagreements(cases: &[UpdateCase]) -> Vec<(UpdateCase, String, String)> {
+    let source_cases = {
+        let mut text = String::new();
+        for (base, action, value) in cases {
+            text.push_str(&format!(
+                "[{}, {}, {}],\n",
+                js_string(base),
+                js_string(action),
+                js_string(value)
+            ));
+        }
+        text
+    };
     let body = format!(
-        r#"const cases = [{cases}];
+        r#"const cases = [{source_cases}];
         const A = {{kProtocol:0,kHost:1,kHostname:2,kPort:3,kUsername:4,kPassword:5,kPathname:6,kSearch:7,kHash:8,kHref:9}};
         const out = cases.map(([base, action, value]) => {{
           const result = urlBinding.update(base, A[action], value);
@@ -576,58 +851,168 @@ fn update_matches_node_on_every_action_and_value() {
 
     let here: Vec<serde_json::Value> = serde_json::from_str(&here).expect("valid JSON");
     let there: Vec<serde_json::Value> = serde_json::from_str(&there).expect("valid JSON");
-    assert_eq!(here.len(), there.len());
-    let mut disagreements = Vec::new();
-    let mut known = Vec::new();
-    for (index, (mine, theirs)) in here.iter().zip(there.iter()).enumerate() {
-        if mine == theirs {
-            continue;
-        }
-        let base = bases[index / (actions.len() * values.len())];
-        let rest = index % (actions.len() * values.len());
-        let action = actions[rest / values.len()];
-        let value = values[rest % values.len()];
-        let report = format!("base {base:?} {action}({value:?})\n  rust: {mine}\n  node: {theirs}");
-        // The one documented divergence: the url crate cannot represent a
-        // `file:` URL whose path begins `//`, so `set_pathname("//x")` on a
-        // `file:` URL yields the folded path. See the crate docs.
-        if is_known_path_divergence(base, action, value) {
-            known.push(report);
-        } else {
-            disagreements.push(report);
-        }
+    assert_eq!(here.len(), there.len(), "one result per case");
+    assert_eq!(here.len(), cases.len(), "one result per case");
+
+    here.iter()
+        .zip(there.iter())
+        .enumerate()
+        .filter(|(_, (mine, theirs))| mine != theirs)
+        .map(|(index, (mine, theirs))| (cases[index], mine.to_string(), theirs.to_string()))
+        .collect()
+}
+
+#[test]
+fn update_matches_node_on_every_action_and_value() {
+    if node_binary().is_none() {
+        eprintln!("no node oracle available; skipping the parity check");
+        return;
     }
-    assert!(
-        known.len() <= 1,
-        "the known file://// divergence grew to {} cases:\n{}",
-        known.len(),
-        known.join("\n")
-    );
+    let cases = update_cases();
+    // Batched so one disagreement does not require running the whole cross
+    // product again, and so a single script stays a sane size.
+    let mut disagreements = Vec::new();
+    for chunk in cases.chunks(2_000) {
+        disagreements.extend(update_disagreements(chunk));
+    }
+    let report: Vec<String> = disagreements
+        .iter()
+        .take(20)
+        .map(|((base, action, value), mine, theirs)| {
+            format!("base {base:?} {action}({value:?})\n  rust: {mine}\n  node: {theirs}")
+        })
+        .collect();
     assert!(
         disagreements.is_empty(),
         "{} of {} update cases disagree:\n{}",
         disagreements.len(),
+        cases.len(),
+        report.join("\n")
+    );
+}
+
+/// The 0x00–0xFF sweep: every byte, through parse and through every action.
+///
+/// This is the table that found the `^` divergence. It is kept as a sweep rather
+/// than as a list of the characters that used to differ, so a change to a
+/// percent-encode set on either side shows up as a named byte instead of as an
+/// unnoticed new delta.
+///
+/// It drives `parse` and `update` rather than the JS `URL` class, for two
+/// reasons: those are the two members through which every byte reaches ada, and
+/// the binding is the same object in both runtimes, so one script body runs
+/// unchanged in the bare isolate and under Node. `update` covers the setters the
+/// class would have called, one action per row.
+#[test]
+fn every_byte_matches_node_in_every_component() {
+    if node_binary().is_none() {
+        eprintln!("no node oracle available; skipping the parity check");
+        return;
+    }
+
+    // Rows are `[kind, payload, action]`; `kind` is "parse" or "update".
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    for byte in 0u32..0x100 {
+        let c = char::from_u32(byte)
+            .expect("a single code unit")
+            .to_string();
+        let label = format!("{byte:02x}");
+        let mid = format!("a{c}b");
+
+        // Parsing, per component. Each label names the encode set under test.
+        for (component, href) in [
+            ("parse.path", format!("http://a/p{c}q")),
+            ("parse.pathfile", format!("file:///a{c}b")),
+            ("parse.query", format!("http://a/?a{c}b")),
+            ("parse.query.nonspecial", format!("foo://a/?a{c}b")),
+            ("parse.fragment", format!("http://a/#a{c}b")),
+            ("parse.userinfo.user", format!("http://u{c}s:p@a/")),
+            ("parse.userinfo.pass", format!("http://u:p{c}s@a/")),
+            ("parse.opaque", format!("foo:a{c}b")),
+            ("parse.host", format!("http://a{c}b.example/")),
+            ("parse.file.host", format!("file://h{c}i/x")),
+            ("parse.href", "http://a/x?q#f".to_string()),
+        ] {
+            rows.push((
+                format!("{component}:{label}"),
+                href,
+                "kHref".to_string(),
+                "parse".to_string(),
+            ));
+        }
+
+        // Every setter, as the `update` action the class calls for it. Two bases
+        // where the special/non-special split matters.
+        for (action, base, payload) in [
+            ("kPathname", "http://a/x?q#f", mid.clone()),
+            ("kPathname", "foo://a/x", format!("/a{c}b")),
+            ("kPathname", "file:///a/b", mid.clone()),
+            ("kSearch", "http://a/x?q#f", mid.clone()),
+            ("kSearch", "foo://a/x?q", mid.clone()),
+            ("kHash", "http://a/x?q#f", mid.clone()),
+            ("kUsername", "http://a/x", mid.clone()),
+            ("kPassword", "http://a:x@x/", mid.clone()),
+            ("kHost", "http://a.example:9/x", mid.clone()),
+            ("kHostname", "http://a.example:9/x", mid.clone()),
+            ("kPort", "http://a:9/x", mid.clone()),
+            ("kProtocol", "https://a/x", mid.clone()),
+            ("kHref", "http://a/x", format!("http://b/{mid}")),
+        ] {
+            rows.push((
+                format!("{action}:{label}"),
+                base.to_string(),
+                action.to_string(),
+                payload,
+            ));
+        }
+    }
+
+    let mut body = String::from("const ACTIONS = {kProtocol:0,kHost:1,kHostname:2,kPort:3,kUsername:4,kPassword:5,kPathname:6,kSearch:7,kHash:8,kHref:9};\nconst out = [];\n");
+    for (label, base, action, payload) in &rows {
+        body.push_str(&format!(
+            "{{\n  const base = {base};\n  const action = {action};\n  const payload = {payload};\n  let value;\n  if (action === 'parse') {{\n    value = urlBinding.parse(payload, undefined, false);\n    value = value === undefined ? ['PARSE-FAILED'] : [value, Array.from(urlBinding.urlComponents)];\n  }} else {{\n    const r = urlBinding.update(base, ACTIONS[action], payload);\n    value = r === false ? ['REFUSED'] : [r, Array.from(urlBinding.urlComponents)];\n  }}\n  out.push([{label}, value]);\n}}\n",
+            base = js_string(base),
+            action = js_string(action),
+            payload = js_string(payload),
+            label = js_string(label),
+        ));
+    }
+    body.push_str("globalThis.__out = JSON.stringify(out);");
+
+    // The payload mixes a string href with numeric component offsets, so it is
+    // read as an opaque JSON value rather than a `(String, Vec<String>)`.
+    let here: Vec<(String, serde_json::Value)> =
+        serde_json::from_str(&eval(&body)).expect("valid JSON");
+    let there: Vec<(String, serde_json::Value)> = serde_json::from_str(&node_script(&format!(
+        "{NODE_PRELUDES}{body}\nconsole.log(JSON.stringify(out));"
+    )))
+    .expect("valid JSON");
+    assert_eq!(here.len(), there.len(), "one result per case");
+    assert_eq!(here.len(), rows.len(), "one result per case");
+    let disagreements: Vec<String> = here
+        .iter()
+        .zip(there.iter())
+        .filter(|(mine, theirs)| mine != theirs)
+        .map(|(mine, theirs)| format!("{}\n  rust: {:?}\n  node: {:?}", mine.0, mine.1, theirs.1))
+        .collect();
+    assert!(
+        disagreements.is_empty(),
+        "{} of {} byte cases disagree:\n{}",
+        disagreements.len(),
         there.len(),
         disagreements
             .iter()
-            .take(12)
+            .take(20)
             .cloned()
             .collect::<Vec<_>>()
             .join("\n")
     );
 }
 
-/// Whether a mismatch is the documented `file:` double-slash divergence rather
-/// than a bug. Kept as an explicit predicate so a *new* mismatch in the same
-/// place still fails, and so the reason lives next to the assertion.
-fn is_known_path_divergence(base: &str, action: &str, value: &str) -> bool {
-    base.starts_with("file:") && action == "kPathname" && value.starts_with("//")
-}
-
 #[test]
 fn format_matches_node_for_every_flag_combination() {
-    if !node_available() {
-        eprintln!("node is not installed; skipping the parity check");
+    if node_binary().is_none() {
+        eprintln!("no node oracle available; skipping the parity check");
         return;
     }
     let hrefs = [
@@ -637,11 +1022,17 @@ fn format_matches_node_for_every_flag_combination() {
         "http://example.com/#",
         "http://example.com/?#",
         "file:///tmp/x",
+        "file:////a",
+        "file://host//x",
         "foo://bar/baz?x#y",
+        "foo:/.//x",
         "mailto:a@b.c",
         "http://xn--9ca.com:8080/x?q#h",
+        "http://xn--a/x",
+        "http://xn--n3h/x",
         "http://[::1]:8080/x?q#h",
         "http://example.com/\u{fc}?q=\u{fc}#\u{fc}",
+        "http://a/x^y",
         "https://example.com/x",
     ];
     let mut cases = String::new();
@@ -703,8 +1094,8 @@ fn format_matches_node_for_every_flag_combination() {
 
 #[test]
 fn get_origin_matches_node() {
-    if !node_available() {
-        eprintln!("node is not installed; skipping the parity check");
+    if node_binary().is_none() {
+        eprintln!("no node oracle available; skipping the parity check");
         return;
     }
     let hrefs = [
@@ -712,6 +1103,7 @@ fn get_origin_matches_node() {
         "http://example.com",
         "file:///x",
         "file://host/x",
+        "file:////a",
         "foo://bar/x",
         "mailto:a@b.c",
         "blob:https://example.com/u",
@@ -725,6 +1117,8 @@ fn get_origin_matches_node() {
         "ftp://x:21/",
         "https://example.com:443/",
         "http://u@x:1/",
+        "http://xn--a:81/x",
+        "http://xn--a/",
     ];
     let mut cases = String::new();
     for href in hrefs {
@@ -747,8 +1141,8 @@ fn get_origin_matches_node() {
 
 #[test]
 fn get_origin_throws_the_same_error_as_node() {
-    if !node_available() {
-        eprintln!("node is not installed; skipping the parity check");
+    if node_binary().is_none() {
+        eprintln!("no node oracle available; skipping the parity check");
         return;
     }
     let body = r#"const out = (() => {
@@ -764,8 +1158,8 @@ fn get_origin_throws_the_same_error_as_node() {
 
 #[test]
 fn path_to_file_url_matches_node() {
-    if !node_available() {
-        eprintln!("node is not installed; skipping the parity check");
+    if node_binary().is_none() {
+        eprintln!("no node oracle available; skipping the parity check");
         return;
     }
     let paths = [
@@ -799,6 +1193,9 @@ fn path_to_file_url_matches_node() {
         "/tmp/a<b>",
         "/tmp/a{b}",
         "/tmp/a`b",
+        "//x",
+        "//x/y",
+        "///x",
     ];
     let mut cases = String::new();
     for path in paths {
@@ -838,8 +1235,8 @@ fn path_to_file_url_matches_node() {
 
 #[test]
 fn domain_members_match_node() {
-    if !node_available() {
-        eprintln!("node is not installed; skipping the parity check");
+    if node_binary().is_none() {
+        eprintln!("no node oracle available; skipping the parity check");
         return;
     }
     let domains = [
@@ -854,6 +1251,13 @@ fn domain_members_match_node() {
         "xn--n3h.net",
         "xn--",
         "xn--a",
+        "xn--zz",
+        "xn--a.com",
+        "xn--a-",
+        "xn--0.com",
+        "xn--a.xn--n3h",
+        "XN--A",
+        "XN--N3H",
         "a..b",
         ".a",
         "a.",
