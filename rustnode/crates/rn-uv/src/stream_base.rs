@@ -393,6 +393,21 @@ pub fn writev<'s>(
 /// The bytes are flattened into storage the write owns, so they stay valid until
 /// libuv's completion fires even though the JavaScript string may be collected
 /// immediately.
+///
+/// # Why the short case does not allocate
+///
+/// `src/stream_base.cc:388` is `char stack_storage[16384]` — the encoded bytes
+/// go into the stack frame, `DoTryWrite` is called straight out of it, and when
+/// it takes everything (the keep-alive case) the write returns having made
+/// **no** allocation at all. Only a partial write copies the tail into storage
+/// libuv can hold, and only a string too large for the stack buffer allocates up
+/// front.
+///
+/// rustnode used to build a zero-filled `Vec`, write into it, `truncate` it and
+/// shrink it to a boxed slice on every write: a zero-fill, a `realloc` and a
+/// `free` per HTTP response. That showed up as the single largest mechanical
+/// item in the HTTP profile (`+0.47 us/request` of allocator traffic), so the
+/// stack shape is reproduced here.
 pub fn write_string<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     handle: &mut impl StreamHandle,
@@ -401,22 +416,37 @@ pub fn write_string<'s>(
     encoding: rn_core::Encoding,
     owner: v8::Local<'s, v8::Object>,
 ) -> WriteResult<'s> {
-    // `utf8` is the one encoding `StringBytes::Write` can produce without
-    // materialising the code units first, so it takes V8's own writer. Node
-    // does the same for short strings and uses simdutf for long ones
-    // (`src/string_bytes.cc:304`), but both write straight from the string into
-    // the destination; only the codec choice differs. Every other encoding needs
-    // the units because it narrows or reinterprets them per unit.
+    // `StringBytes::StorageSize`. Node computes this once and uses it for both
+    // the stack-buffer decision and, when the string does not fit, the
+    // allocation size.
+    let storage_size = rn_core::codec::storage_size_for(text.length(), encoding);
+    if storage_size > i32::MAX as usize {
+        // `if (storage_size > INT_MAX) return UV_ENOBUFS;`
+        return WriteResult::Status(uv::uv_errno_t_UV_ENOBUFS);
+    }
+
+    // The encodings that can be produced straight from the V8 string. `ucs2`,
+    // `hex`, `base64` and `base64url` narrow or reinterpret the code units, so
+    // they still materialise them; none of them is on a socket's hot path.
+    let direct = matches!(
+        encoding,
+        rn_core::Encoding::Utf8
+            | rn_core::Encoding::Buffer
+            | rn_core::Encoding::Ascii
+            | rn_core::Encoding::Binary
+    );
+    if direct && storage_size <= STACK_STORAGE {
+        let mut storage = StackStorage::new();
+        let data_size = storage.encode(scope.as_ref(), &text, encoding);
+        let bytes = storage.filled(data_size);
+        return dispatch_stack(scope, handle, request, bytes, owner);
+    }
+
     let storage = if encoding == rn_core::Encoding::Utf8 {
-        let units_len = text.length();
-        rn_core::codec::write_utf8_string(scope.as_ref(), &text, units_len * 3)
+        rn_core::codec::write_utf8_string(scope.as_ref(), &text, storage_size)
     } else {
         let units = string_units(scope.as_ref(), &text);
-        rn_core::codec::write(
-            &units,
-            encoding,
-            rn_core::codec::storage_size(&units, encoding),
-        )
+        rn_core::codec::write(&units, encoding, storage_size)
     };
     let mut storage = storage.into_boxed_slice();
     let buffer = uv::uv_buf_t {
@@ -431,6 +461,137 @@ pub fn write_string<'s>(
         vec![storage],
         owner,
     )
+}
+
+/// Node's `char stack_storage[16384]` — 16 KiB, the whole stack-buffer write.
+///
+/// Uninitialised on purpose. A zero-filled array would cost a 16 KiB `memset`
+/// per write, which is the allocation this exists to remove; `MaybeUninit` is
+/// also what V8's `write_*_uninit_v2` writers take, so the bytes never pass
+/// through a value Rust has to consider initialised.
+const STACK_STORAGE: usize = 16 * 1024;
+
+/// The stack-resident buffer a short string write is encoded into.
+struct StackStorage {
+    bytes: [std::mem::MaybeUninit<u8>; STACK_STORAGE],
+}
+
+impl StackStorage {
+    fn new() -> Self {
+        Self {
+            bytes: [std::mem::MaybeUninit::uninit(); STACK_STORAGE],
+        }
+    }
+
+    /// `StringBytes::Write` with `buf = stack_storage`, returning the byte count.
+    ///
+    /// `Utf8` and `Buffer` go through `WriteUtf8V2`, whose
+    /// `kReplaceInvalidUtf8` turns an unpaired surrogate into U+FFFD and whose
+    /// full-buffer case stops at a character boundary — the two rules
+    /// [`rn_core::codec::write_utf8_string`] documents. `Ascii` and `Binary` are
+    /// the low byte of each code unit, which is what V8's `WriteOneByte` does
+    /// (Node spells the two-byte case out by hand for the same reason:
+    /// `WriteOneByteV2` asserts one-byte input).
+    fn encode(
+        &mut self,
+        scope: &v8::Isolate,
+        text: &v8::String,
+        encoding: rn_core::Encoding,
+    ) -> usize {
+        match encoding {
+            rn_core::Encoding::Ascii | rn_core::Encoding::Binary => {
+                text.write_one_byte_uninit_v2(
+                    scope,
+                    0,
+                    &mut self.bytes[..],
+                    v8::WriteFlags::empty(),
+                );
+                // `nbytes = min(buflen, input_view.length())`.
+                text.length().min(STACK_STORAGE)
+            }
+            _ => text.write_utf8_uninit_v2(
+                scope,
+                &mut self.bytes[..],
+                v8::WriteFlags::kReplaceInvalidUtf8,
+                None,
+            ),
+        }
+    }
+
+    /// The encoded bytes, once [`StackStorage::encode`] has filled `len` of them.
+    fn filled(&mut self, len: usize) -> &mut [u8] {
+        let len = len.min(STACK_STORAGE);
+        // SAFETY: `encode` wrote exactly `len` bytes into the front of the
+        // array through a `MaybeUninit` slice, so that prefix is initialised.
+        unsafe { std::slice::from_raw_parts_mut(self.bytes.as_mut_ptr().cast::<u8>(), len) }
+    }
+}
+
+/// `StreamBase::WriteString`'s stack-buffer half: try the write from `bytes`,
+/// and only take storage when libuv keeps a remainder.
+///
+/// Node (`src/stream_base.cc:397`) calls `DoTryWrite` directly here rather than
+/// going through `Write`, because there is no request object to create unless
+/// the write is partial. A full write therefore publishes a synchronous
+/// completion and returns zero.
+fn dispatch_stack<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    handle: &mut impl StreamHandle,
+    request: Option<v8::Local<'s, v8::Object>>,
+    bytes: &mut [u8],
+    owner: v8::Local<'s, v8::Object>,
+) -> WriteResult<'s> {
+    let total = bytes.len();
+    let state = handle.stream_state();
+    if !state.is_alive() {
+        return WriteResult::Status(EINVAL);
+    }
+    state.bytes_written += total as u64;
+    let stream = state.stream;
+
+    let mut buffer = uv::uv_buf_t {
+        base: bytes.as_mut_ptr().cast(),
+        len: total,
+    };
+    // SAFETY: the stream is live and `buffer` points at `bytes`, which is valid
+    // for this call and is not handed to libuv past it.
+    let written = unsafe { stream::try_write(stream, std::slice::from_mut(&mut buffer)) };
+    if written >= total {
+        // `StreamWriteResult{false, err, nullptr, data_size}`: nothing queued.
+        stream::publish(&stream::WriteOutcome {
+            bytes: written,
+            asynchronous: false,
+            error: 0,
+        });
+        return WriteResult::Status(0);
+    }
+
+    // `// Copy partial data`: the stack frame cannot outlive this call, so the
+    // remainder moves into storage the completion owns.
+    let remaining = &bytes[written..];
+    let mut owned = vec![0u8; remaining.len()];
+    owned.copy_from_slice(remaining);
+    let pending = uv::uv_buf_t {
+        base: owned.as_mut_ptr().cast(),
+        len: owned.len(),
+    };
+    let Some(request) = request.or_else(|| write_wrap(scope)) else {
+        return WriteResult::Status(EINVAL);
+    };
+    // SAFETY: the stream is live and `owned` keeps the bytes alive until the
+    // completion runs.
+    let status = unsafe {
+        stream::queue_write(
+            scope,
+            stream,
+            vec![pending],
+            owned.len(),
+            request,
+            owner,
+            vec![owned.into_boxed_slice()],
+        )
+    };
+    WriteResult::from_status(status, request)
 }
 
 /// What a write produced, in the shape `FinishWrite` returns it.
@@ -598,11 +759,11 @@ pub unsafe fn view_buffer(value: v8::Local<v8::Value>) -> Option<uv::uv_buf_t> {
 /// so this runs inside the handle's `InternalCallbackScope` like a read does:
 /// `executionAsyncId()` inside `'close'` is the socket's id, and
 /// `AsyncLocalStorage` sees the frame the handle captured.
-pub fn call_onclose(
-    scope: &mut v8::PinScope<'_, '_>,
+pub fn call_onclose<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
     context: rn_core::callback_scope::AsyncContext,
     frame: Option<v8::Global<v8::Value>>,
-    object: v8::Local<v8::Object>,
+    object: v8::Local<'s, v8::Object>,
 ) {
     let Some(key) = v8::String::new(scope, "onclose") else {
         return;
@@ -613,8 +774,8 @@ pub fn call_onclose(
     if let Ok(function) = v8::Local::<v8::Function>::try_from(value) {
         let args = rn_core::callback_scope::ScopeArgs {
             context,
-            resource: Some(v8::Global::new(scope.as_ref(), object)),
-            frame,
+            resource: Some(object),
+            frame: frame.map(|f| v8::Local::new(&*scope, &f)),
         };
         let _ = rn_core::callback_scope::with_scope(scope, args, |scope| {
             let receiver: v8::Local<v8::Value> = object.into();

@@ -111,17 +111,27 @@ impl From<crate::AsyncWrapState> for AsyncContext {
 }
 
 /// Everything a scope needs to know about the callback it wraps.
-pub struct ScopeArgs {
+///
+/// The two JS values are `Local` handles, not `Global`s, for the same reason
+/// `InternalCallbackScope` holds raw `Local`s: a `Local` is Copy, while cloning
+/// a `v8::Global` is a `v8__Global__New` plus a `Release`. `deliver_read` used
+/// to build this struct by cloning `owner` and `frame` out of the stream state
+/// and then clone them *again* per arm — four create/release pairs per read
+/// callback that Node never pays.
+///
+/// Handles are only valid inside the handle scope that made them, which is why
+/// the lifetime is tied to the scope the caller is already inside.
+pub struct ScopeArgs<'s> {
     /// The resource's async identity.
     pub context: AsyncContext,
     /// The JS object the resource is visible as, for `executionAsyncResource`.
-    pub resource: Option<v8::Global<v8::Object>>,
+    pub resource: Option<v8::Local<'s, v8::Object>>,
     /// The frame the resource captured when it was created.
     ///
     /// `None` is Node's empty internal field, which `async_context_frame`
     /// represents with `empty_context_frame_sentinel_symbol`. A missing frame and
     /// an explicit `undefined` are the same thing to `AsyncLocalStorage`.
-    pub frame: Option<v8::Global<v8::Value>>,
+    pub frame: Option<v8::Local<'s, v8::Value>>,
 }
 
 /// What a registered implementation has to do.
@@ -135,10 +145,10 @@ pub trait CallbackScopeHooks {
     /// This is `InternalCallbackScope`'s constructor: push the async context,
     /// exchange the frame, then emit `before`. Returns the prior frame, rooted,
     /// because it is a JS value that has to survive the call.
-    fn open(
+    fn open<'s>(
         &self,
-        scope: &mut v8::PinScope<'_, '_>,
-        args: &ScopeArgs,
+        scope: &mut v8::PinScope<'s, '_>,
+        args: &ScopeArgs<'s>,
     ) -> Option<v8::Global<v8::Value>>;
 
     /// Closes the scope, after the call.
@@ -151,10 +161,10 @@ pub trait CallbackScopeHooks {
     ///
     /// Restoring the frame *last* is deliberate: an `after` hook that reads
     /// `getStore()` still sees the callback's own frame.
-    fn close(
+    fn close<'s>(
         &self,
-        scope: &mut v8::PinScope<'_, '_>,
-        args: &ScopeArgs,
+        scope: &mut v8::PinScope<'s, '_>,
+        args: &ScopeArgs<'s>,
         prior_frame: Option<v8::Global<v8::Value>>,
         threw: bool,
     );
@@ -206,10 +216,10 @@ pub fn is_installed() -> bool {
 /// The exception is not left pending: the `TryCatch` here consumes it, because
 /// the only thing above a libuv callback is `uv_run`, where a pending exception
 /// would reach V8's default reporter instead of Node's.
-pub fn with_scope<R>(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: ScopeArgs,
-    body: impl FnOnce(&mut v8::PinScope<'_, '_>) -> R,
+pub fn with_scope<'s, R>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: ScopeArgs<'s>,
+    body: impl FnOnce(&mut v8::PinScope<'s, '_>) -> R,
 ) -> Option<R> {
     // No implementation means no `async_wrap`, i.e. something is calling back
     // before the bindings installed. Running the body unscoped is the only

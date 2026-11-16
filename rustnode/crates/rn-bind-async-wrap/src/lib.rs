@@ -625,7 +625,7 @@ impl rn_core::callback_scope::CallbackScopeHooks for ScopeHooks {
     fn open(
         &self,
         scope: &mut v8::PinScope<'_, '_>,
-        args: &rn_core::callback_scope::ScopeArgs,
+        args: &rn_core::callback_scope::ScopeArgs<'_>,
     ) -> Option<v8::Global<v8::Value>> {
         // `async_context_frame::exchange(env, context_frame)`
         // (`src/api/callback.cc:117`). **First**, before the context is pushed
@@ -634,14 +634,14 @@ impl rn_core::callback_scope::CallbackScopeHooks for ScopeHooks {
         // because a `before` hook that reads `getStore()` sees the callback's own
         // frame — hooking it up after the push but before the exchange would have
         // the hook observe the caller's.
-        let prior = exchange_frame(scope, args.frame.as_ref());
+        let prior = exchange_frame(scope, args.frame);
 
         // `async_hooks()->push_async_context(async_id, trigger_async_id, object)`
         // (`src/api/callback.cc:124`). This is what makes `executionAsyncId()`
         // inside the callback answer the resource's id, and it happens whether
         // or not any hook is enabled: the id stack is state JavaScript reads
         // directly.
-        push_context(scope, args.context, args.resource.as_ref());
+        push_context(scope, args.context, args.resource);
 
         // `AsyncWrap::EmitBefore` (`src/api/callback.cc:127`), guarded by the
         // same `async_id != 0 && !skip_hooks_`.
@@ -655,7 +655,7 @@ impl rn_core::callback_scope::CallbackScopeHooks for ScopeHooks {
     fn close(
         &self,
         scope: &mut v8::PinScope<'_, '_>,
-        args: &rn_core::callback_scope::ScopeArgs,
+        args: &rn_core::callback_scope::ScopeArgs<'_>,
         prior_frame: Option<v8::Global<v8::Value>>,
         threw: bool,
     ) {
@@ -696,7 +696,7 @@ impl rn_core::callback_scope::CallbackScopeHooks for ScopeHooks {
 fn push_context(
     scope: &mut v8::PinScope<'_, '_>,
     context: rn_core::callback_scope::AsyncContext,
-    resource: Option<&v8::Global<v8::Object>>,
+    resource: Option<v8::Local<'_, v8::Object>>,
 ) {
     if !context.is_resource() {
         return;
@@ -713,11 +713,10 @@ fn push_context(
             .unwrap_or(0) as usize
     });
     if let Some(resource) = resource {
-        let local = v8::Local::new(scope, resource);
         RESOURCES.with(|slot| {
             if let Some(resources) = slot.borrow().as_ref() {
                 let resources = v8::Local::new(scope, resources);
-                resources.set_index(scope, offset as u32, local.into());
+                resources.set_index(scope, offset as u32, resource.into());
             }
         });
     }
@@ -857,14 +856,14 @@ fn emit_hook(scope: &mut v8::PinScope<'_, '_>, field: usize, async_id: f64) {
 /// call per callback.
 fn exchange_frame(
     scope: &mut v8::PinScope<'_, '_>,
-    frame: Option<&v8::Global<v8::Value>>,
+    frame: Option<v8::Local<'_, v8::Value>>,
 ) -> Option<v8::Global<v8::Value>> {
     let prior = scope.get_continuation_preserved_embedder_data();
+    // An absent frame is `undefined`: `AsyncContextFrame.current()` answers
+    // `undefined` outside any `run()`, and that is what `getStore()` turns
+    // into the storage's default value.
     let wanted: v8::Local<v8::Value> = match frame {
-        Some(frame) => v8::Local::new(scope, frame),
-        // An absent frame is `undefined`: `AsyncContextFrame.current()` answers
-        // `undefined` outside any `run()`, and that is what `getStore()` turns
-        // into the storage's default value.
+        Some(frame) => frame,
         None => v8::undefined(scope).into(),
     };
     if prior != wanted {
@@ -1064,14 +1063,13 @@ pub fn push_promise_context(
     trigger_async_id: f64,
     promise: Option<v8::Local<'_, v8::Object>>,
 ) {
-    let resource = promise.map(|promise| v8::Global::new(scope, promise));
     push_context(
         scope,
         rn_core::callback_scope::AsyncContext {
             async_id,
             trigger_async_id,
         },
-        resource.as_ref(),
+        promise,
     );
 }
 

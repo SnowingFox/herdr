@@ -402,8 +402,8 @@ fn in_stream_scope<R>(
         scope,
         rn_core::callback_scope::ScopeArgs {
             context,
-            resource: Some(v8::Global::new(scope.as_ref(), object)),
-            frame,
+            resource: Some(object),
+            frame: frame.map(|f| v8::Local::new(&*scope, &f)),
         },
         body,
     )

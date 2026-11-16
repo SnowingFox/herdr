@@ -373,27 +373,35 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
     if state.is_null() {
         return;
     }
+    // The two facts this needs from the state — the rooted owner, the async
+    // identity and the captured frame — are copied out under a borrow that ends
+    // here, before `with_context` can run JavaScript that destroys the socket.
+    //
+    // `owner` and `frame` stay `Global`s across that boundary on purpose: the
+    // JavaScript below can close and free the stream, so a `Local` made from the
+    // handle early would have to outlive the state pointer it came from. What
+    // changed is that they are converted to `Local` **once** per call and the
+    // handles are copied into `ScopeArgs` instead of a `Global` being cloned per
+    // arm. A `v8::Global` clone is a `v8__Global__New` plus a `Release`, so the
+    // old shape paid four of each per read callback — two for the state-to-args
+    // copy, two more in the closure — where Node's `InternalCallbackScope` holds
+    // plain `Local`s.
     let Some((owner, context, frame)) = ({
         // SAFETY: the caller guarantees `state` is live. The borrow ends with
         // this block, before anything below can re-enter and mutate the state.
         let state = unsafe { &*state };
-        state.owner_object.clone().map(|owner| {
+        state.owner_object.as_ref().map(|owner| {
             (
                 owner,
                 rn_core::callback_scope::AsyncContext {
                     async_id: state.async_wrap.async_id,
                     trigger_async_id: state.async_wrap.trigger_async_id,
                 },
-                state.context_frame.clone(),
+                state.context_frame.as_ref(),
             )
         })
     }) else {
         return;
-    };
-    let context_args = || rn_core::callback_scope::ScopeArgs {
-        context,
-        resource: Some(owner.clone()),
-        frame: frame.clone(),
     };
 
     if status > 0 {
@@ -408,8 +416,15 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
             // the read callback sees no async context, no frame — which is what
             // `AsyncLocalStorage` reports as `undefined` — and a throw from it
             // reaches nobody.
-            let _ = rn_core::callback_scope::with_scope(scope, context_args(), |scope| {
-                let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
+            let object: v8::Local<v8::Object> = v8::Local::new(scope, owner);
+            let frame: Option<v8::Local<v8::Value>> = frame.map(|f| v8::Local::new(scope, f));
+            let args = rn_core::callback_scope::ScopeArgs {
+                context,
+                resource: Some(object),
+                frame,
+            };
+            let _ = rn_core::callback_scope::with_scope(scope, args, |scope| {
+                let object: v8::Local<v8::Object> = v8::Local::new(scope, owner);
                 let Some(handler) = onread_of(scope, object) else {
                     return;
                 };
@@ -434,8 +449,15 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
         // `onStreamRead` with no argument is what `lib/net.js` turns into
         // `'end'`/`'error'`, and a throw from an `'end'` handler is just as
         // uncaught as one from `'data'`.
-        let _ = rn_core::callback_scope::with_scope(scope, context_args(), |scope| {
-            let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
+        let object: v8::Local<v8::Object> = v8::Local::new(scope, owner);
+        let frame: Option<v8::Local<v8::Value>> = frame.map(|f| v8::Local::new(scope, f));
+        let args = rn_core::callback_scope::ScopeArgs {
+            context,
+            resource: Some(object),
+            frame,
+        };
+        let _ = rn_core::callback_scope::with_scope(scope, args, |scope| {
+            let object: v8::Local<v8::Object> = v8::Local::new(scope, owner);
             let Some(handler) = onread_of(scope, object) else {
                 return;
             };

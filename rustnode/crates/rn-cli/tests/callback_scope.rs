@@ -338,6 +338,46 @@ fn the_frame_is_in_place_before_the_before_hook_fires() {
 }
 
 #[test]
+fn execution_async_resource_is_present_inside_a_read_callback() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    // `executionAsyncResource()` reads `execution_async_resources[depth]`, which
+    // `push_async_context` fills with the resource it was handed. That handle has
+    // to reach the push as a live `Local`: `deliver_read` converts the rooted
+    // owner once and copies the handle into `ScopeArgs`, and a mistake there —
+    // pushing a stale handle, or dropping the resource entirely — shows up as
+    // `undefined` here and nowhere else. The store cases above cannot catch it,
+    // because `getStore()` reads the frame rather than the resource.
+    //
+    // The resource is the `TCP` wrap, not the `net.Socket` that owns it: `net.js`
+    // constructs the socket around `new TCP(...)`, and the wrap is what carries
+    // the async id. Asserting the *identity* rather than the class is what pinned
+    // the first version of this test to a wrong expectation (`node` itself
+    // disagreed), so the expectation here is the class name both runtimes report.
+    same_output_as_node(
+        oracle,
+        "const net = require('net');\n\
+         const { executionAsyncResource } = require('async_hooks');\n\
+         const server = net.createServer((sock) => {\n\
+           sock.on('data', () => {\n\
+             const resource = executionAsyncResource();\n\
+             console.log('resource ' + (resource === undefined ? 'undefined'\n\
+                                                     : resource.constructor.name));\n\
+             sock.end('bye');\n\
+           });\n\
+         });\n\
+         server.listen(0, () => {\n\
+           const client = net.connect(server.address().port);\n\
+           client.on('connect', () => client.write('hi'));\n\
+           client.on('data', () => {});\n\
+           client.on('close', () => server.close());\n\
+         });",
+        "resource TCP",
+    );
+}
+
+#[test]
 fn a_throwing_callback_reports_before_its_microtasks_run() {
     let Some(oracle) = oracle() else {
         return;

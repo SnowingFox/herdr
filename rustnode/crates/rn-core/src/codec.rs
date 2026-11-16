@@ -354,6 +354,22 @@ pub fn write_utf8_string(scope: &v8::Isolate, text: &v8::String, max: usize) -> 
     out
 }
 
+/// [`write_utf8_string`] into a caller-provided buffer, returning the byte count.
+///
+/// This is the allocation-free half of the same operation, for a caller that
+/// already has somewhere to put the bytes: `rn_uv::stream_base` keeps Node's
+/// `char stack_storage[16384]` for exactly this and only allocates when the
+/// encoded form does not fit.
+///
+/// `buffer` must be sized with [`storage_size_for`] for `Utf8`, which is the
+/// three-bytes-per-unit bound V8's writer is safe to truncate against. When the
+/// buffer is smaller than the encoded form V8 stops at a character boundary, so
+/// a short buffer yields a short write rather than a partial character — the
+/// same rule `char buf[buflen]` follows in `StringBytes::Write`.
+pub fn write_utf8_string_into(scope: &v8::Isolate, text: &v8::String, buffer: &mut [u8]) -> usize {
+    text.write_utf8_v2(scope, buffer, v8::WriteFlags::kReplaceInvalidUtf8, None)
+}
+
 /// `StringBytes::Size` for `utf8`: the UTF-8 byte length of `units`, counted
 /// without producing the bytes.
 ///
@@ -545,19 +561,30 @@ pub fn encode_ucs2(units: &[u16], max: usize) -> Vec<u8> {
 /// estimate rather than a tighter one: `hex`, `base64` and `base64url` *decode*
 /// their input, and `write` sizes its scratch buffer from `max`.
 pub fn storage_size(units: &[u16], encoding: Encoding) -> usize {
+    storage_size_for(units.len(), encoding)
+}
+
+/// [`storage_size`] from a code-unit count, for a caller that has the length of
+/// a V8 string but has not materialised its units.
+///
+/// `write_utf8_string` is exactly that caller: it writes straight from the
+/// string, so building a `Vec<u16>` only to take its `len()` would spend the
+/// allocation it is trying to avoid. The arithmetic is the same one above, so
+/// the two cannot disagree about what a string needs.
+pub fn storage_size_for(units_len: usize, encoding: Encoding) -> usize {
     match encoding {
-        Encoding::Ascii | Encoding::Binary => units.len(),
+        Encoding::Ascii | Encoding::Binary => units_len,
         // `StringBytes::StorageSize` uses 3 * length for both of these, even
         // though a four-byte scalar needs only two units.
-        Encoding::Utf8 | Encoding::Buffer => units.len() * 3,
-        Encoding::Ucs2 => units.len() * 2,
+        Encoding::Utf8 | Encoding::Buffer => units_len * 3,
+        Encoding::Ucs2 => units_len * 2,
         // `simdutf::base64_length_from_binary` on the *input* length, which is
         // an upper bound rather than the decoded size.
         Encoding::Base64 | Encoding::Base64Url => {
-            base64_encoded_len(units.len(), encoding == Encoding::Base64Url)
+            base64_encoded_len(units_len, encoding == Encoding::Base64Url)
         }
         // Two characters per byte; an odd trailing digit is dropped.
-        Encoding::Hex => units.len() / 2,
+        Encoding::Hex => units_len / 2,
     }
 }
 
