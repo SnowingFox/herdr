@@ -15,12 +15,17 @@
 //!
 //! # IDNA
 //!
-//! `toASCII` and `toUnicode` implement the punycode round trip that
-//! `ada::idna` provides. Node applies it when a URL's host contains non-ASCII,
-//! so `new URL('http://münchen.de')` normalises to `xn--mnchen-3ya.de`. The
-//! implementation here is RFC 3492 punycode over lowercase-mapped labels, which
-//! covers the documented behaviour; full UTS #46 mapping is not implemented and
-//! the tests record what that means.
+//! `toASCII` and `toUnicode` are `ada::idna::to_ascii` and
+//! `ada::idna::to_unicode`, which is what `src/encoding_binding.cc` calls: the
+//! whole member is two lines of glue around the same `deps/ada/` release Node
+//! vendors, so the UTS #46 mapping table, the label separators, the
+//! `xn--`-aware ASCII fast path and the pass-through rule are the same compiled
+//! code rather than a second reading of the standard.
+//!
+//! Node applies this when a *legacy* `url.parse()` host contains non-ASCII, so
+//! `url.parse('http://a\\u{200B}b.com/').host` is `"ab.com"` and
+//! `url.parse('http://xn--a.com/')` keeps the label verbatim. The WHATWG `URL`
+//! class does not go through here; it parses hosts inside `rn-bind-url`.
 
 use std::cell::RefCell;
 
@@ -313,200 +318,32 @@ fn to_unicode(
     set_string(scope, &mut rv, &domain_to_unicode(&text));
 }
 
-/// Converts a domain to its ASCII (punycode) form, label by label.
+/// Converts a domain to its ASCII form with UTS #46 mapping.
 ///
-/// Only labels containing non-ASCII are encoded, and the result is lowercased,
-/// which is what `ada::idna::to_ascii` does for the inputs a URL parser sees.
+/// This is `ada::idna::to_ascii`, which is exactly what
+/// `BindingData::ToASCII` in `src/encoding_binding.cc:492` calls. Delegating
+/// matters because the failure mode of a second implementation is silent: a
+/// hand-rolled RFC 3492 encoder that splits only on `U+002E` punycodes a
+/// zero-width space instead of dropping it, and treats an ideographic full stop
+/// as label content instead of as a separator.
+///
+/// The mapping is not the URL parser's host parser: ada's `to_ascii` does no
+/// percent decoding and no delimiter truncation, so `"a/b"` stays `"a/b"` here
+/// while `url.domainToASCII("a/b")` is `"a"`. That asymmetry is Node's, not an
+/// oversight — `src/node_url.cc`'s `DomainToASCII` goes through
+/// `set_hostname` on a `ws://x` seed, a different function.
 pub fn domain_to_ascii(domain: &str) -> String {
-    domain
-        .split('.')
-        .map(|label| {
-            if label.is_ascii() {
-                label.to_ascii_lowercase()
-            } else {
-                let lowered: String = label.chars().flat_map(|c| c.to_lowercase()).collect();
-                format!("xn--{}", punycode_encode(&lowered))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(".")
+    ada_url::Idna::ascii(domain)
 }
 
 /// Converts a domain from its ASCII form back to Unicode.
+///
+/// `ada::idna::to_unicode`, as `BindingData::ToUnicode` calls it. UTS #46
+/// ToUnicode never fails: a label it cannot decode is kept verbatim, so
+/// `toUnicode("xn--a")` is `"xn--a"`. An ASCII label that already is ASCII
+/// keeps its case, so `toUnicode("A.B")` is `"A.B"` and not `"a.b"`.
 pub fn domain_to_unicode(domain: &str) -> String {
-    domain
-        .split('.')
-        .map(|label| {
-            let lowered = label.to_ascii_lowercase();
-            match lowered.strip_prefix("xn--") {
-                Some(encoded) => punycode_decode(encoded).unwrap_or_else(|| label.to_string()),
-                None => lowered,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-/// RFC 3492 punycode encoding, as `ada` implements it.
-pub fn punycode_encode(input: &str) -> String {
-    const BASE: u32 = 36;
-    const T_MIN: u32 = 1;
-    const T_MAX: u32 = 26;
-    const INITIAL_BIAS: u32 = 72;
-    const INITIAL_N: u32 = 128;
-
-    let code_points: Vec<u32> = input.chars().map(|c| c as u32).collect();
-    let mut output = String::new();
-
-    // The basic code points go first, verbatim.
-    for character in input.chars() {
-        if (character as u32) < 0x80 {
-            output.push(character);
-        }
-    }
-    let basic_length = output.len();
-    let mut handled = basic_length;
-    if basic_length > 0 {
-        output.push('-');
-    }
-
-    let mut n = INITIAL_N;
-    let mut delta: u32 = 0;
-    let mut bias = INITIAL_BIAS;
-
-    while handled < code_points.len() {
-        // The next smallest code point above `n`.
-        let m = code_points
-            .iter()
-            .copied()
-            .filter(|cp| *cp >= n)
-            .min()
-            .unwrap_or(INITIAL_N);
-        delta = delta.saturating_add((m - n) * (handled as u32 + 1));
-        n = m;
-
-        for cp in &code_points {
-            if *cp < n {
-                delta = delta.saturating_add(1);
-            } else if *cp == n {
-                let mut q = delta;
-                let mut k = BASE;
-                loop {
-                    let t = if k <= bias {
-                        T_MIN
-                    } else if k >= bias + T_MAX {
-                        T_MAX
-                    } else {
-                        k - bias
-                    };
-                    if q < t {
-                        break;
-                    }
-                    let digit = t + (q - t) % (BASE - t);
-                    output.push(digit_to_char(digit));
-                    q = (q - t) / (BASE - t);
-                    k += BASE;
-                }
-                output.push(digit_to_char(q));
-                bias = adapt(delta, handled as u32 + 1, handled == basic_length);
-                delta = 0;
-                handled += 1;
-            }
-        }
-        delta = delta.saturating_add(1);
-        n += 1;
-    }
-    output
-}
-
-fn adapt(mut delta: u32, num_points: u32, first_time: bool) -> u32 {
-    const BASE: u32 = 36;
-    const T_MIN: u32 = 1;
-    const T_MAX: u32 = 26;
-    const SKEW: u32 = 38;
-    const DAMP: u32 = 700;
-
-    delta = if first_time { delta / DAMP } else { delta / 2 };
-    delta += delta / num_points;
-    let mut k = 0;
-    while delta > ((BASE - T_MIN) * T_MAX) / 2 {
-        delta /= BASE - T_MIN;
-        k += BASE;
-    }
-    k + (((BASE - T_MIN + 1) * delta) / (delta + SKEW))
-}
-
-fn digit_to_char(digit: u32) -> char {
-    if digit < 26 {
-        (b'a' + digit as u8) as char
-    } else {
-        (b'0' + (digit - 26) as u8) as char
-    }
-}
-
-fn char_to_digit(character: char) -> Option<u32> {
-    match character {
-        'a'..='z' => Some(character as u32 - 'a' as u32),
-        'A'..='Z' => Some(character as u32 - 'A' as u32),
-        '0'..='9' => Some(character as u32 - '0' as u32 + 26),
-        _ => None,
-    }
-}
-
-/// RFC 3492 punycode decoding, or `None` for malformed input.
-pub fn punycode_decode(input: &str) -> Option<String> {
-    const BASE: u32 = 36;
-    const T_MIN: u32 = 1;
-    const T_MAX: u32 = 26;
-    const INITIAL_BIAS: u32 = 72;
-    const INITIAL_N: u32 = 128;
-
-    let (basic, encoded) = match input.rfind('-') {
-        Some(position) => (&input[..position], &input[position + 1..]),
-        None => ("", input),
-    };
-
-    let mut output: Vec<u32> = basic.chars().map(|c| c as u32).collect();
-    let mut n = INITIAL_N;
-    let mut bias = INITIAL_BIAS;
-    let mut index: usize = 0;
-
-    let digits: Vec<char> = encoded.chars().collect();
-    let mut position = 0;
-    while position < digits.len() {
-        let old_index = index;
-        let mut weight: u32 = 1;
-        let mut k = BASE;
-        loop {
-            let digit = char_to_digit(*digits.get(position)?)?;
-            position += 1;
-            index = index.checked_add((digit.checked_mul(weight)?) as usize)?;
-            let t = if k <= bias {
-                T_MIN
-            } else if k >= bias + T_MAX {
-                T_MAX
-            } else {
-                k - bias
-            };
-            if digit < t {
-                break;
-            }
-            weight = weight.checked_mul(BASE - t)?;
-            k += BASE;
-        }
-        let length = output.len() as u32 + 1;
-        let length_usize = length as usize;
-        bias = adapt((index - old_index) as u32, length, old_index == 0);
-        n = n.checked_add((index / length_usize) as u32)?;
-        index %= length_usize;
-        output.insert(index, n);
-        index += 1;
-    }
-
-    output
-        .into_iter()
-        .map(char::from_u32)
-        .collect::<Option<String>>()
+    ada_url::Idna::unicode(domain)
 }
 
 fn set_string(scope: &mut v8::PinScope, rv: &mut v8::ReturnValue, value: &str) {
@@ -564,40 +401,125 @@ mod tests {
     use super::*;
 
     #[test]
-    fn punycode_matches_the_published_examples() {
-        // RFC 3492 section 7.1 samples, which is what a punycode
-        // implementation is measured against.
-        assert_eq!(punycode_encode("münchen"), "mnchen-3ya");
-        assert_eq!(punycode_encode("bücher"), "bcher-kva");
-        assert_eq!(punycode_encode("例え"), "r8jz45g");
-        assert_eq!(punycode_encode("日本語"), "wgv71a119e");
-    }
-
-    #[test]
-    fn punycode_round_trips() {
-        for text in ["münchen", "bücher", "例え", "日本語", "тест"] {
-            let encoded = punycode_encode(text);
-            let decoded = punycode_decode(&encoded).expect("decodes");
-            assert_eq!(decoded, text, "round trip of {text} via {encoded}");
-        }
-    }
-
-    #[test]
-    fn a_domain_encodes_only_the_labels_that_need_it() {
+    fn the_published_uts46_examples_round_trip() {
         assert_eq!(domain_to_ascii("münchen.de"), "xn--mnchen-3ya.de");
-        assert_eq!(domain_to_ascii("EXAMPLE.com"), "example.com");
         assert_eq!(domain_to_unicode("xn--mnchen-3ya.de"), "münchen.de");
+        assert_eq!(domain_to_ascii("例え.テスト"), "xn--r8jz45g.xn--zckzah");
+        assert_eq!(domain_to_unicode("xn--r8jz45g.xn--zckzah"), "例え.テスト");
     }
 
     #[test]
-    fn an_ascii_domain_is_only_lowercased() {
-        assert_eq!(domain_to_ascii("example.com"), "example.com");
+    fn an_ascii_domain_is_lowercased_and_an_ascii_unicode_label_keeps_its_case() {
+        // The two members are asymmetric on purpose. `to_ascii` maps case
+        // through the UTS #46 table; `to_unicode` only rewrites the labels it
+        // can decode, so an ASCII label is returned exactly as it arrived.
+        assert_eq!(domain_to_ascii("EXAMPLE.com"), "example.com");
+        assert_eq!(domain_to_ascii("EXAMPLE.COM"), "example.com");
         assert_eq!(domain_to_unicode("example.com"), "example.com");
+        assert_eq!(domain_to_unicode("A.B"), "A.B");
+        assert_eq!(domain_to_unicode("XN--MNCHEN-3YA.de"), "XN--MNCHEN-3YA.de");
     }
 
     #[test]
-    fn malformed_punycode_is_rejected_rather_than_guessed() {
-        assert!(punycode_decode("!!!").is_none());
-        assert!(punycode_decode("mnchen-!!!").is_none());
+    fn a_default_ignorable_code_point_is_dropped_rather_than_punycoded() {
+        // U+200B is default-ignorable, so UTS #46 maps it away. Encoding it as
+        // label content produced `xn--ab-g1t.com` here before the delegation.
+        assert_eq!(domain_to_ascii("a\u{200B}b.com"), "ab.com");
+        assert_eq!(domain_to_ascii("a\u{00AD}b.com"), "ab.com");
+        // U+200D is the case that must still be *rejected*: it is
+        // default-ignorable but its presence in a label is a validity error.
+        assert_eq!(domain_to_ascii("a\u{200D}b.com"), "");
+    }
+
+    #[test]
+    fn every_uts46_label_separator_splits_a_label() {
+        // `U+FF0E`, `U+3002` and `U+FF61` are label separators alongside
+        // `U+002E`, and all of them canonicalise to `U+002E`.
+        assert_eq!(domain_to_ascii("a\u{3002}b"), "a.b");
+        assert_eq!(domain_to_ascii("a\u{FF0E}b"), "a.b");
+        assert_eq!(domain_to_ascii("a\u{FF61}b"), "a.b");
+        assert_eq!(domain_to_ascii("a\u{3002}b\u{FF0E}c"), "a.b.c");
+        // `to_unicode` is not the inverse of `to_ascii` on separators: the
+        // ToUnicode pass only rewrites `xn--` labels, so an already-ASCII string
+        // comes back exactly as it arrived, non-ASCII separator and all.
+        assert_eq!(domain_to_unicode("a\u{3002}b"), "a\u{3002}b");
+    }
+
+    #[test]
+    fn a_halfwidth_katakana_label_is_mapped_before_encoding() {
+        // Halfwidth katakana is a compatibility mapping to fullwidth, so the
+        // punycode is the fullwidth label's and not the halfwidth one's.
+        assert_eq!(
+            domain_to_ascii("\u{FF71}\u{FF72}\u{FF73}.example"),
+            "xn--cckeg.example"
+        );
+        assert_eq!(
+            domain_to_unicode("xn--cckeg.example"),
+            "\u{30A2}\u{30A4}\u{30A6}.example"
+        );
+    }
+
+    #[test]
+    fn a_malformed_punycode_label_is_passed_through_verbatim() {
+        // ToUnicode does not fail; a label it cannot decode is kept. `ToASCII`
+        // takes ada's ASCII fast path for a pure-ASCII input, so it does not
+        // validate either.
+        for input in ["xn--a", "xn--zz", "xn--", "xn--a-", "xn--0.com", "a.xn--a"] {
+            assert_eq!(domain_to_ascii(input), input, "ascii {input:?}");
+            assert_eq!(domain_to_unicode(input), input, "unicode {input:?}");
+        }
+        assert_eq!(domain_to_unicode("xn--a.xn--n3h"), "xn--a.☃");
+    }
+
+    #[test]
+    fn an_empty_label_and_a_trailing_dot_survive_both_members() {
+        for input in ["a..b", ".a", "a.", "example.com.", ".", "..."] {
+            assert_eq!(domain_to_ascii(input), input, "ascii {input:?}");
+            assert_eq!(domain_to_unicode(input), input, "unicode {input:?}");
+        }
+        assert_eq!(domain_to_ascii(""), "");
+    }
+
+    #[test]
+    fn the_dns_length_limits_are_not_enforced() {
+        // `ada::idna::to_ascii` documents that label and total lengths are
+        // checked by ICU but that the errors are ignored, and Node inherits
+        // that: a 64-byte label and a 256-byte name both come back unchanged.
+        let label = "a".repeat(64);
+        assert_eq!(
+            domain_to_ascii(&format!("{label}.com")),
+            format!("{label}.com")
+        );
+        let total = format!("{}.com", vec!["a".repeat(63); 4].join("."));
+        assert_eq!(domain_to_ascii(&total), total);
+    }
+
+    #[test]
+    fn an_input_past_the_documented_cap_is_rejected_by_one_member_and_echoed_by_the_other() {
+        // `ada::idna::max_domain_input_bytes` is 16384 bytes, a heap-growth
+        // bound rather than a DNS one. `to_ascii` reports failure as the empty
+        // string; `to_unicode` cannot fail per the standard, so it returns the
+        // input unchanged. Both are what Node does — the asymmetry is in ada,
+        // not in the glue.
+        assert_eq!(domain_to_ascii(&"a".repeat(16384)).len(), 16384);
+        assert_eq!(domain_to_ascii(&"a".repeat(16385)), "");
+        // 8500 `ü` is 17000 UTF-8 bytes: over the cap, and `to_ascii` also
+        // stops at the 63-byte label, so both reasons point the same way.
+        let over = "ü".repeat(8500);
+        assert_eq!(domain_to_ascii(&over), "");
+        assert_eq!(domain_to_unicode(&over), over);
+    }
+
+    #[test]
+    fn a_lone_surrogate_does_not_reach_the_binding_as_one() {
+        // `args.get(0).to_string(scope)` is what V8 does for Node's `Utf8Value`,
+        // and both replace an unpaired surrogate with U+FFFD, so a domain of
+        // `a\uD800b.com` presents this function with `a\uFFFDb.com`. U+FFFD is
+        // *disallowed* in UTS #46 rather than merely unassigned, so the label is
+        // a validity error and `to_ascii` reports it as the empty string.
+        assert_eq!(domain_to_ascii("a\u{FFFD}b.com"), "");
+        // `to_unicode` echoes it, because the label is not punycode and ToUnicode
+        // never fails.
+        assert_eq!(domain_to_unicode("a\u{FFFD}b.com"), "a\u{FFFD}b.com");
     }
 }

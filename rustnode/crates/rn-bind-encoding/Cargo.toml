@@ -10,6 +10,12 @@ description = "internalBinding('encoding_binding') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+# `toASCII`/`toUnicode` are `ada::idna::to_ascii`/`to_unicode` in
+# `src/encoding_binding.cc`, so this is the same UTS #46 implementation Node
+# compiles, not a second one. The crate is already in the workspace graph
+# (`rn-bind-url` and `rn-bind-url-pattern` depend on it), so naming it here adds
+# no dependency to the build.
+ada-url = "4.0"
 
 [dev-dependencies]
 # The differential test compares against the pinned Node oracle, not whatever

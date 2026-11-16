@@ -918,6 +918,7 @@ dependencies = [
 name = "rn-bind-encoding"
 version = "0.1.0"
 dependencies = [
+ "ada-url",
  "rn-core",
  "rn-node-oracle",
  "rn-v8-sys",
