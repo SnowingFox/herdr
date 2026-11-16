@@ -13,6 +13,19 @@ rn-v8-sys.workspace = true
 libc.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+# `libuv`, `uvthreadResourceUsage` and `sharedObjects` are read through libuv's
+# own accessors, so the report describes the same loop and handles libuv itself
+# reports rather than a second bookkeeping of them.
+libuv-sys2.workspace = true
+# The `libuv` section walks the process' loop, which only `rn-uv` owns.
+rn-uv.workspace = true
+# `componentVersions` repeats the derivations `process.versions` publishes, and
+# those live with the crates that own each linked library.
+rn-bind-crypto = { path = "../rn-bind-crypto" }
+rn-bind-http2 = { path = "../rn-bind-http2" }
+rn-bind-sqlite = { path = "../rn-bind-sqlite" }
+rn-bind-zlib = { path = "../rn-bind-zlib" }
+rn-napi = { path = "../rn-napi" }
 
 [dev-dependencies]
 serde_json.workspace = true

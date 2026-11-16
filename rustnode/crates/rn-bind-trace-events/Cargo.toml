@@ -10,3 +10,4 @@ description = "internalBinding('trace_events') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+tracing.workspace = true
