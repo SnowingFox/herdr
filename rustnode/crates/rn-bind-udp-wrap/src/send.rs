@@ -58,10 +58,14 @@ pub fn constructor<'s>(
 /// `lib/dgram.js` only ever writes properties onto the result, so there is
 /// nothing to do here.
 fn new(
-    _scope: &mut v8::PinScope<'_, '_>,
+    scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
+    if !args.is_construct_call() {
+        crate::throw_type_error(scope, "SendWrap cannot be invoked without 'new'");
+        return;
+    }
     let object = args.this();
     rv.set(object.into());
 }

@@ -32,10 +32,14 @@ pub fn constructor<'s>(
 /// Node's template has no constructor body beyond `AsyncWrap`'s bookkeeping, and
 /// `lib/net.js` only writes properties onto the result.
 fn new(
-    _scope: &mut v8::PinScope<'_, '_>,
+    scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
+    if !args.is_construct_call() {
+        crate::handle::throw_type_error(scope, "PipeConnectWrap cannot be invoked without 'new'");
+        return;
+    }
     let object = args.this();
     rv.set(object.into());
 }

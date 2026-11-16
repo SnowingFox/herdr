@@ -134,6 +134,10 @@ fn sign_job_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        crate::throw_construct_call_required(scope);
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let job_mode = int_at(&args, 1).unwrap_or(K_SIGN_JOB_MODE_SIGN);
     // The state is installed *first*, with no key, so a decode failure below
@@ -237,6 +241,10 @@ fn rsa_cipher_job_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        crate::throw_construct_call_required(_scope);
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let variant = int_at(&args, 4).unwrap_or(K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5);
     install_state(_scope, this, JobKind::RsaCipher { variant });

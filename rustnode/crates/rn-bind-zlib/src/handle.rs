@@ -352,6 +352,10 @@ fn zlib_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw(scope, "zlib handle constructor requires 'new'");
+        return;
+    }
     let mode = arg_i32(scope, &args, 0);
     let Some(mode) = ZlibMode::from_i32(mode) else {
         throw(scope, &format!("invalid zlib mode {mode}"));
@@ -369,6 +373,10 @@ fn brotli_encoder_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw(scope, "zlib handle constructor requires 'new'");
+        return;
+    }
     install_state(
         scope,
         args.this(),
@@ -381,6 +389,10 @@ fn brotli_decoder_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw(scope, "zlib handle constructor requires 'new'");
+        return;
+    }
     install_state(
         scope,
         args.this(),
@@ -399,6 +411,10 @@ fn zstd_compress_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw(scope, "zlib handle constructor requires 'new'");
+        return;
+    }
     install_state(
         scope,
         args.this(),
@@ -412,6 +428,10 @@ fn zstd_decompress_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw(scope, "zlib handle constructor requires 'new'");
+        return;
+    }
     install_state(
         scope,
         args.this(),

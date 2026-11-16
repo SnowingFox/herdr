@@ -162,6 +162,10 @@ pub(crate) fn pbkdf2_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        crate::install::throw_construct_call_required(scope);
+        return;
+    }
     let Some(password) = bytes_argument(scope, &args, 1) else {
         throw_type_error(scope, "The password must be a string or an ArrayBufferView");
         return;
@@ -200,6 +204,10 @@ pub(crate) fn scrypt_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        crate::install::throw_construct_call_required(scope);
+        return;
+    }
     let Some(password) = bytes_argument(scope, &args, 1) else {
         throw_type_error(scope, "The password must be a string or an ArrayBufferView");
         return;
@@ -239,6 +247,10 @@ pub(crate) fn hkdf_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        crate::install::throw_construct_call_required(scope);
+        return;
+    }
     let digest = args
         .get(1)
         .to_string(scope)

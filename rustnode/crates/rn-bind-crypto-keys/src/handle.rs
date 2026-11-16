@@ -52,7 +52,7 @@ use crate::templates::{set_key_data, with_key_data};
 /// whose every method reports "invalid handle", which is what Node's
 /// `ASSIGN_OR_RETURN_UNWRAP` produces.
 pub fn constructor<'s>(
-    _scope: &mut v8::PinScope<'s, '_>,
+    scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
@@ -63,6 +63,15 @@ pub fn constructor<'s>(
     // "No key yet" is therefore represented by never having called
     // `set_key_data`, which is also what `keys.js` does: it constructs the handle
     // and then calls `init`.
+    // A call without `new` must not hand back an object. Node's
+    // `KeyObjectHandle::New` is `CHECK(args.IsConstructCall())`, so Node aborts;
+    // returning the global object here would be worse than the abort, because
+    // every method on the prototype would then answer against a receiver that
+    // is not a handle at all. This is the same guard `SecureContext` uses.
+    if !args.is_construct_call() {
+        throw(scope, &KeyError::ConstructCallRequired);
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     rv.set(this.into());
 }

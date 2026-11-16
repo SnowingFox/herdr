@@ -279,6 +279,17 @@ fn construct_url_pattern<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    // Node's `URLPattern` binding throws `ERR_CONSTRUCT_CALL_REQUIRED` here, and
+    // a plain call would otherwise store the pattern on the global object and
+    // report success.
+    if !args.is_construct_call() {
+        throw_coded(
+            scope,
+            "Cannot call constructor without `new`",
+            "ERR_CONSTRUCT_CALL_REQUIRED",
+        );
+        return;
+    }
     // `new URLPattern(input, base?, options?)`. `this` is the new object.
     let base = args
         .get(1)
@@ -569,6 +580,25 @@ fn throw(scope: &mut v8::PinScope, message: &str) {
         return;
     };
     let exception = v8::Exception::error(scope, message);
+    scope.throw_exception(exception);
+}
+
+/// Throws a `TypeError` carrying a `.code`, which is the shape
+/// `internal/errors` produces for `ERR_CONSTRUCT_CALL_REQUIRED`.
+fn throw_coded(scope: &mut v8::PinScope, message: &str, code: &str) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = v8::Exception::type_error(scope, text);
+    let Ok(object) = v8::Local::<v8::Object>::try_from(exception) else {
+        scope.throw_exception(exception);
+        return;
+    };
+    if let Some(code_key) = v8::String::new(scope, "code") {
+        if let Some(code_value) = v8::String::new(scope, code) {
+            object.set(scope, code_key.into(), code_value.into());
+        }
+    }
     scope.throw_exception(exception);
 }
 

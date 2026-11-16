@@ -323,6 +323,15 @@ fn fs_req_callback_ctor(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
+    // Node's `FSReqCallback::New` is `BaseObject::New`, which asserts that the
+    // receiver has internal fields; called as a plain function, `this` is the
+    // global object and Node aborts. Returning that object instead would hand
+    // the caller a usable-looking value with `useBigint` written onto the
+    // global, so the misuse has to fail.
+    if !args.is_construct_call() {
+        throw_construct_call_required(scope);
+        return;
+    }
     let instance = args.this();
     let bigint = args.length() > 0 && args.get(0).boolean_value(scope);
     if let Some(key) = v8::String::new(scope, "useBigint") {
@@ -335,6 +344,28 @@ fn fs_req_callback_ctor(
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Throws `ERR_CONSTRUCT_CALL_REQUIRED` for a plain call to a constructor.
+///
+/// Node reaches an internal-field write with the global object as `this` and
+/// aborts the process; this is the `TypeError` `internal/errors` declares for
+/// the code, so the failure is catchable and the class matches.
+fn throw_construct_call_required(scope: &mut v8::PinScope<'_, '_>) {
+    let Some(text) = v8::String::new(scope, "Cannot call constructor without `new`") else {
+        return;
+    };
+    let exception = v8::Exception::type_error(scope, text);
+    let Ok(object) = v8::Local::<v8::Object>::try_from(exception) else {
+        scope.throw_exception(exception);
+        return;
+    };
+    if let Some(code_key) = v8::String::new(scope, "code") {
+        if let Some(code_value) = v8::String::new(scope, "ERR_CONSTRUCT_CALL_REQUIRED") {
+            object.set(scope, code_key.into(), code_value.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
 
 /// The trailing argument of a call, which selects the delivery mode.
 fn tail<'s>(args: &v8::FunctionCallbackArguments<'s>) -> Option<Local<'s, v8::Value>> {

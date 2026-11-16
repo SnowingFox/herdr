@@ -121,6 +121,23 @@ step "the per-context globals still behave as Node's do"
 # nothing after the self-test noticed.
 ./tools/per-context-control.sh
 
+step "calling a binding constructor without new never aborts the process"
+# `SecureContext()` aborted with `SetAlignedPointerInInternalField: Internal
+# field out of bounds` at 100 of 100 runs before its `new.target` guard, and the
+# same shape existed in a dozen other constructors. The audit walks every
+# constructor the registry installs, one child process per case, because an
+# abort in-process would take the runner with it and silently skip the rest.
+#
+# `--no-oracle` is the half of the rule that needs no Node binary: a plain call
+# may throw or return `undefined`, but it may not kill the process. The other
+# half -- whether returning at all is right -- needs Node to answer `[[Construct]]`
+# and lives in `tools/no-new-negative-control.sh`, which is opt-in because it
+# rebuilds twice.
+#
+# It runs after the build because it execs the binary, and before the cipher
+# self-test for the same mode-bit reason as the two controls above.
+python3 tools/no-new-audit.py --no-oracle
+
 step "the cipher control still reports a void run as a void run"
 # The control's exit contract — 3 for "the build failed, so there is no
 # verdict", distinct from 1 for "the control misbehaved" — is what stops a

@@ -45,6 +45,13 @@ pub enum KeyError {
     OperationFailed(&'static str),
     /// `ERR_INVALID_THIS`, "Value of \"this\" must be of type %s".
     InvalidThis(&'static str),
+    /// `ERR_CONSTRUCT_CALL_REQUIRED`, "Cannot call constructor without `new`".
+    ///
+    /// Node's job constructors abort here instead, because they reach an
+    /// out-of-bounds internal-field write before any check runs. Throwing the
+    /// error Node *would* have thrown keeps a misuse catchable, and
+    /// `internal/errors` already declares this code as a `TypeError`.
+    ConstructCallRequired,
     /// `ERR_INVALID_ARG_VALUE`, an `ERR_INVALID_ARG_VALUE`-shaped `TypeError`.
     ///
     /// `keygen.js`'s `case 'rsa'` and `NamedKeyPairGenTraits::AdditionalConfig`
@@ -76,6 +83,7 @@ impl KeyError {
             Self::MissingPassphrase => "ERR_MISSING_PASSPHRASE",
             Self::OperationFailed(_) => "ERR_CRYPTO_OPERATION_FAILED",
             Self::InvalidThis(_) => "ERR_INVALID_THIS",
+            Self::ConstructCallRequired => "ERR_CONSTRUCT_CALL_REQUIRED",
             Self::UnsupportedOperation => "ERR_CRYPTO_UNSUPPORTED_OPERATION",
             Self::UnsupportedKeyType(_) => "ERR_INVALID_ARG_VALUE",
             // `ThrowCryptoError` builds its code from the packed error, and
@@ -91,9 +99,13 @@ impl KeyError {
     /// the code's prefix, and `E('ERR_INVALID_THIS', ...)` is declared with
     /// `TypeError`.
     pub fn is_type_error(&self) -> bool {
-        // `ERR_INVALID_THIS` and `ERR_INVALID_ARG_VALUE` are both `TypeError`s;
-        // `internal/errors` derives the constructor from the code.
-        matches!(self, Self::InvalidThis(_) | Self::UnsupportedKeyType(_))
+        // `ERR_INVALID_THIS`, `ERR_INVALID_ARG_VALUE` and
+        // `ERR_CONSTRUCT_CALL_REQUIRED` are all `TypeError`s; `internal/errors`
+        // derives the constructor from the code.
+        matches!(
+            self,
+            Self::InvalidThis(_) | Self::UnsupportedKeyType(_) | Self::ConstructCallRequired
+        )
     }
 
     /// The message text.
@@ -111,6 +123,7 @@ impl KeyError {
             Self::InvalidThis(expected) => {
                 format!("Value of \"this\" must be of type {expected}")
             }
+            Self::ConstructCallRequired => "Cannot call constructor without `new`".to_string(),
             Self::UnsupportedOperation => "Unsupported operation".to_string(),
             Self::UnsupportedKeyType(value) => {
                 format!("The argument 'type' must be a supported key type. Received '{value}'")

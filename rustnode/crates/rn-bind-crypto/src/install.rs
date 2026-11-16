@@ -865,6 +865,10 @@ fn hash_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw_construct_call_required(scope);
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
 
     let first = args.get(0);
@@ -1081,6 +1085,10 @@ fn hmac_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw_construct_call_required(scope);
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     install_hmac_state(
         scope,
@@ -1911,6 +1919,30 @@ pub(crate) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) 
         return;
     };
     let exception = v8::Exception::type_error(scope, text);
+    scope.throw_exception(exception);
+}
+
+/// Throws `ERR_CONSTRUCT_CALL_REQUIRED` for a plain call to a constructor.
+///
+/// Node's `Hash::New` and `Hmac::New` reach `BaseObject`'s internal-field write
+/// with the global object as `this` and abort the process. `internal/errors`
+/// declares this code as a `TypeError`, which is the class Node throws where it
+/// does not abort, so this keeps the error class and the `code` right while
+/// making the misuse catchable.
+pub(crate) fn throw_construct_call_required(scope: &mut v8::PinScope<'_, '_>) {
+    let Some(text) = v8::String::new(scope, "Cannot call constructor without `new`") else {
+        return;
+    };
+    let exception = v8::Exception::type_error(scope, text);
+    let Ok(object) = v8::Local::<v8::Object>::try_from(exception) else {
+        scope.throw_exception(exception);
+        return;
+    };
+    if let Some(code_key) = v8::String::new(scope, "code") {
+        if let Some(code_value) = v8::String::new(scope, "ERR_CONSTRUCT_CALL_REQUIRED") {
+            object.set(scope, code_key.into(), code_value.into());
+        }
+    }
     scope.throw_exception(exception);
 }
 
