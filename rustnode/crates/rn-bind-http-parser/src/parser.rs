@@ -592,7 +592,19 @@ impl Parser {
             return Outcome::CallbackThrew;
         }
 
-        if errno != ffi::errno::OK {
+        // `Parser::Execute` reports an error only when the parser is *not* in
+        // upgrade mode: `if (!parser_.upgrade && err != HPE_OK)`
+        // (`src/node_http_parser.cc:949`). Once llhttp has handed the connection
+        // to whatever asked for the upgrade, the bytes after the handshake are
+        // not HTTP, so the parser's errno afterwards describes the new protocol's
+        // leftovers rather than a fault in this message.
+        //
+        // This is the whole guard and nothing wider. `upgrade` is llhttp's own
+        // field, recomputed at every `before_headers_complete`, so an ordinary
+        // message still errors loudly — including a truncated one, which never
+        // reaches headers-complete and therefore never gains the flag.
+        let upgrading = unsafe { ffi::rn_llhttp_upgrade(self.llhttp.get()) != 0 };
+        if !upgrading && errno != ffi::errno::OK {
             return Outcome::Failed(self.parse_error(errno, consumed));
         }
         match data {

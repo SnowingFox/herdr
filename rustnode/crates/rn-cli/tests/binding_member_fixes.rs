@@ -304,3 +304,256 @@ fn requiring_an_es_module_with_a_default_export_works() {
         "__esModule,default,x\nfunction 2 true null called"
     );
 }
+
+// ------------------------------------------------- http_parser finish after Upgrade --
+
+/// Runs `source` that needs internals and returns its stdout, asserting exit 0.
+fn run_exposed(source: &str) -> String {
+    let (code, stdout, stderr) = run(source);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    stdout
+}
+
+#[test]
+fn finish_after_an_upgrade_handshake_reports_no_error() {
+    // `Parser::Execute` guards its whole error branch with `!parser_.upgrade`
+    // (`src/node_http_parser.cc:949`): once llhttp is in upgrade mode the bytes
+    // after the handshake belong to whoever took the connection, so the parser has
+    // no fault to report. Testing only `errno != HPE_OK` made `finish()` manufacture
+    // an `HPE_INVALID_EOF_STATE` where Node answers `undefined`.
+    //
+    // The oracle's answers for all four cases are in this test, because the guard
+    // is only correct if it is narrow: `normal` and `bad-chunk` must be unaffected
+    // and `truncated` must keep failing loudly.
+    let out = run_exposed(&format!(
+        "{BINDING}
+            const {{ HTTPParser }} = internalBinding('http_parser');
+            const cases = {{
+              upgrade: 'GET /ws HTTP/1.1\\r\\nHost: h\\r\\nConnection: Upgrade\\r\\n' +
+                       'Upgrade: websocket\\r\\n\\r\\n',
+              connect: 'CONNECT h:443 HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n',
+              normal: 'GET /a HTTP/1.1\\r\\nHost: h\\r\\n\\r\\n',
+              // No terminating blank line: never reaches headers-complete, so it
+              // never gains the upgrade flag and must still error.
+              truncated: 'GET /a HTTP/1.1\\r\\nHost: h\\r\\n',
+            }};
+            const results = {{}};
+            for (const [name, bytes] of Object.entries(cases)) {{
+              const p = new HTTPParser();
+              p.initialize(HTTPParser.REQUEST, {{}}, 0, 0, undefined, 0);
+              p[HTTPParser.kOnHeadersComplete] = () => 0;
+              const exec = p.execute(Buffer.from(bytes));
+              const fin = p.finish();
+              results[name] = [String(exec), fin === undefined ? 'undefined' : fin.code];
+            }}
+            console.log(JSON.stringify(results));"
+    ));
+    assert_eq!(
+        out.trim(),
+        r#"{"upgrade":["70","undefined"],"connect":["35","undefined"],"normal":["28","undefined"],"truncated":["26","HPE_INVALID_EOF_STATE"]}"#
+    );
+}
+
+#[test]
+fn an_http_server_receiving_an_upgrade_request_with_no_listener_is_silent() {
+    // The user-visible half of the same bug, through `http`. `socketOnEnd`
+    // (`lib/internal/http/server.js:962`) calls `parser.finish()` when the peer
+    // half-closes, and turns a returned Error into `clientError`. Node emits
+    // nothing here; rustnode emitted `HPE_INVALID_EOF_STATE` for a handshake it had
+    // already accepted.
+    //
+    // The server still serves the request, which is why the clientError emission —
+    // not the response — is what this asserts.
+    let out = run_exposed(
+        "const http = require('node:http');
+         const net = require('node:net');
+         const errors = [];
+         const server = http.createServer((req, res) => res.end('handled'));
+         server.on('clientError', (err, socket) => {
+           errors.push(err.code);
+           if (socket && !socket.destroyed) socket.destroy();
+         });
+         server.listen(0, () => {
+           const socket = net.connect(server.address().port, '127.0.0.1', () => {
+             socket.write('GET /ws HTTP/1.1\\r\\nHost: h\\r\\nConnection: Upgrade\\r\\n' +
+                          'Upgrade: websocket\\r\\n\\r\\n');
+           });
+           socket.setEncoding('utf8');
+           socket.on('data', () => {});
+           socket.on('error', () => {});
+           socket.on('connect', () => setTimeout(() => socket.end(), 40));
+           setTimeout(() => {
+             console.log(JSON.stringify(errors));
+             socket.destroy();
+             server.close();
+             process.exit(0);
+           }, 300);
+         });",
+    );
+    assert_eq!(out.trim(), "[]");
+}
+
+// ------------------------------------------------- http2 trailers --
+
+#[test]
+fn a_server_response_with_wait_for_trailers_delivers_them_to_the_client() {
+    // `Http2Stream::OnTrailers` (`src/node_http2.cc:2534`) runs from the DATA
+    // provider at EOF when `has_trailers()` is set, and the EOF is reported with
+    // `DATA_FLAG_NO_END_STREAM` so the trailer HEADERS frame — not the DATA frame —
+    // closes the stream. Neither happened before this fix: `wantTrailers` never
+    // fired, so `sendTrailers` was unreachable and the client saw no `trailers`
+    // event.
+    //
+    // The trailer object's shape is asserted, not just its arrival: the event
+    // carries a plain object with the keys as sent, and every other surface
+    // (`req.trailers`, `stream.trailers` on both sides) is `undefined` on the
+    // oracle too, so a fix that populated them would be a second divergence.
+    let out = run_exposed(
+        "const http2 = require('node:http2');
+         const server = http2.createServer();
+         server.on('session', (s) => s.on('error', () => {}));
+         server.on('stream', (stream) => {
+           stream.respond({ ':status': 200 }, { waitForTrailers: true });
+           stream.on('wantTrailers', () => stream.sendTrailers({ 'x-t': 'v' }));
+           stream.end('body');
+         });
+         server.listen(0, () => {
+           const client = http2.connect('http://localhost:' + server.address().port);
+           const req = client.request({ ':path': '/' });
+           let body = '';
+           req.setEncoding('utf8');
+           req.on('data', (c) => { body += c; });
+           req.on('trailers', (t) => {
+             console.log(JSON.stringify({
+               trailers: t,
+               keys: Object.keys(t),
+               proto: Object.getPrototypeOf(t),
+               clientStreamTrailers: String(req.trailers),
+             }));
+           });
+           req.on('end', () => {
+             console.log('end ' + body + ' req.trailers=' + String(req.trailers));
+           });
+           req.on('close', () => { client.close(); server.close(); });
+           req.end();
+         });",
+    );
+    assert_eq!(
+        out.trim(),
+        "{\"trailers\":{\"x-t\":\"v\"},\"keys\":[\"x-t\"],\"proto\":null,\
+\"clientStreamTrailers\":\"undefined\"}\n\
+end body req.trailers=undefined"
+    );
+}
+
+#[test]
+fn trailers_that_were_not_asked_for_change_nothing() {
+    // The control that must not move. A response without `waitForTrailers` keeps
+    // ending on its DATA frame, and a stream that sends an empty trailer block
+    // (`sendTrailers({})`, and the compat layer with no registered trailers) must
+    // produce Node's empty DATA frame rather than an empty HEADERS block — the
+    // latter would invent a `trailers` event Node never emits.
+    let out = run_exposed(
+        "const http2 = require('node:http2');
+         const server = http2.createServer();
+         server.on('session', (s) => s.on('error', () => {}));
+         server.on('stream', (stream, headers) => {
+           const mode = headers[':path'];
+           if (mode === '/none') {
+             stream.respond({ ':status': 200 });
+           } else if (mode === '/empty') {
+             stream.respond({ ':status': 200 }, { waitForTrailers: true });
+             stream.on('wantTrailers', () => stream.sendTrailers({}));
+           } else {
+             // The HTTP/1 compat layer arms auto-empty trailers and must finish
+             // normally when no trailers are registered.
+             stream.respond({ ':status': 200 }, { waitForTrailers: true });
+           }
+           stream.end('body');
+         });
+         server.listen(0, () => {
+           const client = http2.connect('http://localhost:' + server.address().port);
+           const paths = ['/none', '/empty', '/auto'];
+           let seen = {};
+           const next = () => {
+             const path = paths.shift();
+             if (path === undefined) {
+               console.log(JSON.stringify(seen));
+               client.close();
+               server.close();
+               return;
+             }
+             const req = client.request({ ':path': path });
+             const events = [];
+             req.setEncoding('utf8');
+             req.on('data', () => {});
+             req.on('trailers', () => events.push('trailers'));
+             req.on('end', () => events.push('end'));
+             req.on('close', () => { seen[path] = events; next(); });
+             req.end();
+           };
+           next();
+         });",
+    );
+    assert_eq!(
+        out.trim(),
+        r#"{"/none":["end"],"/empty":["end"],"/auto":["end"]}"#
+    );
+}
+
+#[test]
+fn the_http1_compat_layer_delivers_trailers_and_keeps_plain_responses_unchanged() {
+    // `Http2ServerResponse.addTrailers` reaches the same native path through
+    // `onStreamTrailersReady` -> `sendTrailers`, and the streamed case exercises
+    // `kDisableAutoTrailers` (headers flushed before `end()`, trailers registered
+    // afterwards). Both must deliver; the plain response must not.
+    let out = run_exposed(
+        "const http2 = require('node:http2');
+         const server = http2.createServer();
+         server.on('session', (s) => s.on('error', () => {}));
+         server.on('request', (req, res) => {
+           if (req.url === '/streamed') {
+             res.write('part1');
+             setTimeout(() => {
+               res.addTrailers({ 'x-late': 'late' });
+               res.end('part2');
+             }, 10);
+           } else if (req.url === '/plain') {
+             res.end('body');
+           } else {
+             res.addTrailers({ 'x-t': 'v' });
+             res.end('body');
+           }
+         });
+         server.listen(0, () => {
+           const client = http2.connect('http://localhost:' + server.address().port);
+           const paths = ['/trailers', '/plain', '/streamed'];
+           const seen = {};
+           const next = () => {
+             const path = paths.shift();
+             if (path === undefined) {
+               console.log(JSON.stringify(seen));
+               client.close();
+               server.close();
+               return;
+             }
+             const req = client.request({ ':path': path });
+             let body = '';
+             const events = [];
+             req.setEncoding('utf8');
+             req.on('data', (c) => { body += c; });
+             req.on('trailers', (t) => events.push(['trailers', t]));
+             req.on('end', () => events.push(['end']));
+             req.on('close', () => { seen[path] = [body, events]; next(); });
+             req.end();
+           };
+           next();
+         });",
+    );
+    assert_eq!(
+        out.trim(),
+        "{\"/trailers\":[\"body\",[[\"trailers\",{\"x-t\":\"v\"}],[\"end\"]]],\
+\"/plain\":[\"body\",[[\"end\"]]],\
+\"/streamed\":[\"part1part2\",[[\"trailers\",{\"x-late\":\"late\"}],[\"end\"]]]}"
+    );
+}

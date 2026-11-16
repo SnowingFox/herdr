@@ -35,6 +35,9 @@ use crate::session::SessionState;
 
 /// `NGHTTP2_DATA_FLAG_EOF`.
 pub const DATA_FLAG_EOF: u32 = 0x01;
+/// `NGHTTP2_DATA_FLAG_NO_END_STREAM`: report EOF but withhold `END_STREAM`, so the
+/// trailers HEADERS frame that follows is what closes the stream.
+pub const DATA_FLAG_NO_END_STREAM: u32 = 0x02;
 /// `NGHTTP2_ERR_DEFERRED`, which asks nghttp2 to retry later.
 pub const ERR_DEFERRED: isize = -508;
 
@@ -119,7 +122,7 @@ unsafe extern "C" fn read_callback(
     if bytes.is_empty() {
         if ended {
             // SAFETY: `data_flags` is writable per this callback's contract.
-            unsafe { *data_flags |= DATA_FLAG_EOF };
+            unsafe { report_eof(state, stream_id, data_flags) };
             return 0;
         }
         return ERR_DEFERRED;
@@ -131,9 +134,48 @@ unsafe extern "C" fn read_callback(
     }
     if ended && count == bytes.len() {
         // SAFETY: `data_flags` is writable per this callback's contract.
-        unsafe { *data_flags |= DATA_FLAG_EOF };
+        unsafe { report_eof(state, stream_id, data_flags) };
     }
     count as isize
+}
+
+/// The `available_outbound_length_ == 0 && !is_writable()` branch of `OnRead`.
+///
+/// Reports EOF, and — when the JS side asked for trailers — withholds
+/// `END_STREAM` and tells it to send them, which is `Http2Stream::OnTrailers`
+/// (`src/node_http2.cc:2534`, called from `:2888`).
+///
+/// Withholding the flag is what distinguishes a trailer-carrying response from an
+/// ordinary one on the wire: `nghttp2_session` sets `NGHTTP2_FLAG_END_STREAM` on
+/// the DATA frame only when `NO_END_STREAM` is clear
+/// (`vendor/nghttp2/lib/nghttp2_session.c:7549`), and drops an empty final frame
+/// outright (`:7586`). So the trailers HEADERS frame submitted afterwards is what
+/// closes the stream, exactly as in Node.
+///
+/// # Safety
+///
+/// `data_flags` must be the writable `u32` nghttp2 passed to the read callback.
+unsafe fn report_eof(state: &SessionState, stream_id: i32, data_flags: *mut u32) {
+    // SAFETY: the caller guarantees `data_flags` is writable.
+    unsafe { *data_flags |= DATA_FLAG_EOF };
+    // The flag is read and cleared in its own scope: `emit_want_trailers` below
+    // calls into JavaScript, whose `wantTrailers` listener may write, reset or
+    // destroy the stream — all of which borrow this map again.
+    let wants_trailers = {
+        let mut streams = state.streams.borrow_mut();
+        match streams.get_mut(&stream_id) {
+            // `set_has_trailers(false)` at the top of `OnTrailers`: clearing before
+            // the callback is what keeps a second EOF from notifying twice.
+            Some(record) => std::mem::take(&mut record.has_trailers),
+            None => false,
+        }
+    };
+    if !wants_trailers {
+        return;
+    }
+    // SAFETY: as above.
+    unsafe { *data_flags |= DATA_FLAG_NO_END_STREAM };
+    crate::stream::emit_want_trailers(state, stream_id);
 }
 
 /// The zero-length read callback: always EOF, never any bytes.

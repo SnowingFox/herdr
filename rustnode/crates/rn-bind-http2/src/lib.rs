@@ -110,17 +110,12 @@ pub const DEFERRED: &[(&str, &str)] = &[];
 /// `DEFERRED` is for a *member* that is absent. These are behaviours inside
 /// members that are present, which is why they are recorded separately rather than
 /// smuggled into the member list.
-pub const KNOWN_GAPS: &[(&str, &str)] = &[(
-    "trailers are never sent or delivered",
-    "`waitForTrailers` never emits `wantTrailers`, so `sendTrailers` is \
-         unreachable and a client never sees `trailers` or the `x-trailer` pair. \
-         `Http2Stream::OnTrailers` (`src/node_http2.cc:2534`) runs from the DATA \
-         provider when the body reaches EOF with `has_trailers()` set, and \
-         `DisableAutoTrailers` sets only `record.want_trailers`, which nothing \
-         reads; the callbacks table carries `stream_trailers` but never invokes \
-         it. Repro: respond({ waitForTrailers: true }) + end(), then read \
-         `wantTrailers` on the server and `trailers` on the client",
-)];
+///
+/// Empty: the trailers gap this list held is fixed. `waitForTrailers` now emits
+/// `wantTrailers` from the DATA provider's EOF branch, `sendTrailers` submits a
+/// real trailer HEADERS frame, and a client receives the `trailers` event. See
+/// `StreamRecord::has_trailers` and `provider::report_eof`.
+pub const KNOWN_GAPS: &[(&str, &str)] = &[];
 
 /// `SessionUint8Fields` from `node_http2.h`, as the offsets of `SessionJSFields`.
 ///
