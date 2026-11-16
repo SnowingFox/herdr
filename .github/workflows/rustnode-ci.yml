@@ -45,8 +45,54 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
+      # `tools/check.sh` runs every one of these six on every commit, but this
+      # workflow used to run only the first. The other five therefore had no CI
+      # coverage at all: a pull request could edit HTTP/2, SQL, the HTTP parser,
+      # the CommonJS export lexer or the trust store and pass CI while failing
+      # the local gate. They live together here, ahead of the toolchain and cache
+      # steps, because they are pure shell/python over the vendored trees and
+      # take about a second, so drift fails the job before minutes are spent
+      # building.
+      #
+      # Each step names the tree it freezes and the surface that drifts if it is
+      # edited.
+
       - name: Verify vendored Node builtins are unmodified
+        # `vendor/libnode-js/lib/**` (435 files) and its `deps/**` (3 files) are
+        # Node's builtin JavaScript layer, byte-identical to the pinned revision.
+        # A local edit changes what every builtin namespace does while the
+        # Rust side still looks correct.
         run: ./tools/verify-libjs.sh
+
+      - name: Verify the vendored llhttp is unmodified
+        # `vendor/llhttp` is the C HTTP parser. It is never patched: an edit
+        # changes how requests are parsed away from what Node produces.
+        run: ./tools/verify-llhttp.sh
+
+      - name: Verify the vendored merve is unmodified
+        # `vendor/merve` is the CommonJS export lexer. An edit silently changes
+        # which names an ESM `import` of a CommonJS file sees; nothing reports
+        # it as an error, the module just becomes a different module.
+        run: ./tools/verify-merve.sh
+
+      - name: Verify the vendored nghttp2 is unmodified
+        # `vendor/nghttp2` is the frame state machine, HPACK tables and error
+        # strings that `node:http2`'s whole compatibility surface is built on.
+        run: ./tools/verify-nghttp2.sh
+
+      - name: Verify the vendored SQLite is unmodified
+        # `vendor/sqlite` is the amalgamation that `node:sqlite`'s SQL
+        # semantics come from, so it is held to the pinned revision rather than
+        # to whatever system library the runner happens to have.
+        run: ./tools/verify-sqlite.sh
+
+      - name: Verify the vendored certdata is unmodified
+        # `vendor/certdata/certdata.txt` is the pinned Node trust store and the
+        # input `src/root_certs.rs` is generated from. This is a different check
+        # from the generator's `--check`: that proves the module matches this
+        # file, this proves the file is Node's. A regenerated module built from a
+        # swapped store passes `--check` and still ships the wrong roots.
+        run: python3 tools/verify-certdata.py
 
       # Install the exact toolchain from `rustnode/rust-toolchain.toml` rather
       # than whatever stable is. Cargo reads the pin file on its own, but
