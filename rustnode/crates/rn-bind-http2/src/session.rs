@@ -1371,3 +1371,165 @@ pub fn ping(session: &SessionState, payload: &[u8; 8]) -> i32 {
     schedule_write(session);
     status
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare nghttp2 session of `session_type`, built without `SessionState`.
+    ///
+    /// `SessionState::new` needs the binding's V8-backed shared state (the
+    /// `optionsBuffer` typed arrays), which does not exist without an isolate. None
+    /// of what these tests measure depends on it: `nghttp2_submit_goaway` and
+    /// `nghttp2_session_is_my_stream_id` only read the session's own fields.
+    struct BareSession {
+        raw: *mut ffi::nghttp2_session,
+        callbacks: *mut ffi::nghttp2_session_callbacks,
+    }
+
+    impl BareSession {
+        fn new(session_type: i32) -> Self {
+            let mut callbacks: *mut ffi::nghttp2_session_callbacks = ptr::null_mut();
+            // SAFETY: both out-parameters are valid, and an empty callback table is
+            // legal — every callback is optional to nghttp2.
+            unsafe {
+                assert_eq!(ffi::nghttp2_session_callbacks_new(&mut callbacks), 0);
+            }
+            let mut raw: *mut ffi::nghttp2_session = ptr::null_mut();
+            // SAFETY: `callbacks` is live, `user_data` may be null because no
+            // callback reads it.
+            let status = unsafe {
+                if session_type == SESSION_SERVER {
+                    ffi::nghttp2_session_server_new2(
+                        &mut raw,
+                        callbacks,
+                        ptr::null_mut(),
+                        ptr::null(),
+                    )
+                } else {
+                    ffi::nghttp2_session_client_new2(
+                        &mut raw,
+                        callbacks,
+                        ptr::null_mut(),
+                        ptr::null(),
+                    )
+                }
+            };
+            assert_eq!(status, 0, "nghttp2 session is created");
+            Self { raw, callbacks }
+        }
+    }
+
+    impl Drop for BareSession {
+        fn drop(&mut self) {
+            // SAFETY: both came from nghttp2's own constructors and are freed once.
+            unsafe {
+                ffi::nghttp2_session_del(self.raw);
+                ffi::nghttp2_session_callbacks_del(self.callbacks);
+            }
+        }
+    }
+
+    /// Submits the GOAWAY `submit_goaway_now` submits for a plain `close()`.
+    ///
+    /// `core.js`'s `close()` calls `this.goaway()` with no arguments, so the values
+    /// are `code = NGHTTP2_NO_ERROR` and `lastStreamID = 0`. `0` is the value that
+    /// was translated into `-1` and silently rejected.
+    fn submit_close_goaway(session: &BareSession) -> i32 {
+        let last = goaway_last_stream_id(session.raw, 0);
+        // SAFETY: `raw` is live and the frame stays owned by nghttp2 until it is
+        // freed with the session.
+        unsafe {
+            ffi::nghttp2_submit_goaway(session.raw, ffi::NGHTTP2_FLAG_NONE, last, 0, ptr::null(), 0)
+        }
+    }
+
+    #[test]
+    fn a_client_close_queues_its_goaway_instead_of_being_rejected() {
+        // The defect this pins: `submit_goaway_now` translated `core.js`'s
+        // `lastStreamID === 0` into `-1`, and `nghttp2_session_add_goaway`
+        // (`vendor/nghttp2/lib/nghttp2_session.c:7224`) rejects any id shaped like
+        // one of our own streams. `nghttp2_session_is_my_stream_id` is
+        // `stream_id & 1` for a client, so `-1` is odd and therefore "mine", and
+        // the call failed with `NGHTTP2_ERR_INVALID_ARGUMENT` (-501).
+        //
+        // That rejection is the whole hang: with no GOAWAY queued
+        // `nghttp2_session_want_read` never reaches 0, so
+        // `MaybeNotifyGracefulCloseComplete` never fires and `close` never emits.
+        //
+        // Asserting the return code, not the frame, because the return code is the
+        // fact the original code threw away.
+        let session = BareSession::new(SESSION_CLIENT);
+        assert_eq!(
+            submit_close_goaway(&session),
+            0,
+            "a client's GOAWAY must be queued; -501 means last_stream_id looked like \
+             one of our own streams, which is what makes close() hang"
+        );
+    }
+
+    #[test]
+    fn a_server_close_queues_its_goaway() {
+        // The same call on a server, where `is_my_stream_id` is `stream_id & 1 == 0`
+        // and `-1` happened to be legal — that side was never broken. Asserted
+        // anyway because `goaway_last_stream_id` is shared by both submit paths, so
+        // a fix must not trade one side for the other.
+        let session = BareSession::new(SESSION_SERVER);
+        assert_eq!(
+            submit_close_goaway(&session),
+            0,
+            "a server's GOAWAY must be queued as well"
+        );
+    }
+
+    #[test]
+    fn the_substituted_last_stream_id_is_never_one_nghttp2_rejects() {
+        // The invariant stated directly, so a future change to the substitution has
+        // an explicit rule to satisfy rather than two incidental return codes.
+        //
+        // `nghttp2_session_is_my_stream_id` (`lib/nghttp2_session.c:271`) is
+        // `stream_id & 1` for a client and `!(stream_id & 1)` for a server, and it
+        // returns false for `0` before either parity test. So a value handed to
+        // `nghttp2_submit_goaway` is acceptable when it is 0, or when its parity is
+        // the peer's rather than ours.
+        //
+        // Only the *substituted* values are held to that rule. A positive argument
+        // is passed through untouched, because Node only substitutes a non-positive
+        // one (`src/node_http2.cc:3108`) — and a caller that explicitly names one of
+        // its own stream ids has made an argument error, which is nghttp2's to
+        // report, not ours to quietly rewrite.
+        for (session_type, our_parity) in [(SESSION_CLIENT, 1), (SESSION_SERVER, 0)] {
+            let session = BareSession::new(session_type);
+            for requested in [0, -1, i32::MIN] {
+                let last = goaway_last_stream_id(session.raw, requested);
+                assert!(
+                    last == 0 || last & 1 != our_parity,
+                    "session type {session_type}: substituted {last} for requested \
+                     {requested} carries our own stream parity, so nghttp2 would reject \
+                     the GOAWAY"
+                );
+                // And the call the invariant protects must actually succeed.
+                // SAFETY: `session.raw` is live; the queued frame is freed with it.
+                let status = unsafe {
+                    ffi::nghttp2_submit_goaway(
+                        session.raw,
+                        ffi::NGHTTP2_FLAG_NONE,
+                        last,
+                        0,
+                        ptr::null(),
+                        0,
+                    )
+                };
+                assert_eq!(
+                    status, 0,
+                    "session type {session_type}: submitting GOAWAY with {last} \
+                     (requested {requested}) was rejected with {status}"
+                );
+            }
+            // A positive request is honoured rather than substituted.
+            for requested in [1, i32::MAX] {
+                assert_eq!(goaway_last_stream_id(session.raw, requested), requested);
+            }
+        }
+    }
+}
