@@ -8,7 +8,7 @@
 //! listed in [`DEFERRED`] with the reason, so the contract check reports it
 //! instead of letting the JS layer read `undefined`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
@@ -57,13 +57,12 @@ pub const MEMBERS: &[&str] = &[
 
 /// Members the namespace needs but this crate does not install yet.
 pub const DEFERRED: &[(&str, &str)] = &[
+    // The growable flag is an accessor on the `SharedArrayBuffer` prototype the
+    // buffer namespace owns, so it is that crate's to publish rather than a V8
+    // call this one can make.
     (
         "getSharedArrayBufferGrowable",
         "growable SAB flag, follows the buffer namespace",
-    ),
-    (
-        "parseEnv",
-        "NODE_OPTIONS env parsing, owned by the CLI option surface",
     ),
 ];
 
@@ -161,6 +160,7 @@ impl BindingModule for Util {
             "guessHandleType" => guess_handle_type,
             "isInsideNodeModules" => is_inside_node_modules,
             "markPromiseAsHandled" => mark_promise_as_handled,
+            "parseEnv" => parse_env,
             "previewEntries" => preview_entries,
             "sleep" => sleep,
         }
@@ -844,21 +844,257 @@ fn get_promise_details(
     rv.set(array.into());
 }
 
-/// Returns the `[target, handler]` pair for a proxy, or undefined.
+/// `getProxyDetails(proxy[, full])`: a proxy's target, or its `[target, handler]`
+/// pair.
+///
+/// This is `src/node_util.cc`'s `GetProxyDetails`, which is what lets
+/// `internal/util/inspect.js` see through a proxy without triggering its traps.
+/// Two shapes matter and `inspect.js` branches on both:
+///
+/// * one argument, or a second argument that is exactly `true`, returns
+///   `[target, handler]` — `formatValue` reads `proxy[0]` and `formatProxy`
+///   prints both halves;
+/// * any other second argument returns the target alone — `formatValue`'s
+///   unwrapping loop and `hasBuiltInToString` use that form.
+///
+/// Anything that is not a proxy returns `undefined`, which is the "no proxy
+/// here" answer every caller tests for.
+///
+/// A revoked proxy is still a `JSProxy`; V8's `JSProxy::Revoke` sets both slots
+/// to the null oddball, so its target is exactly `null` and `inspect.js` prints
+/// `<Revoked Proxy>`. Returning `undefined` for a revoked proxy instead would
+/// send `inspect.js` down the ordinary-object path, where reading a property
+/// throws `Cannot perform 'get' on a proxy that has been revoked`.
 fn get_proxy_details(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let value = args.get(0);
-    if !value.is_proxy() {
-        rv.set(v8::undefined(scope).into());
+    let Ok(proxy) = v8::Local::<v8::Proxy>::try_from(args.get(0)) else {
         return;
+    };
+    // `args.Length() == 1 || args[1]->IsTrue()`. A missing second argument is
+    // *not* the same as a falsy one, which is why the arity check comes first:
+    // `getProxyDetails(proxy)` returns the pair.
+    if args.length() == 1 || args.get(1).is_true() {
+        let pair = v8::Array::new(scope, 2);
+        let _ = pair.set_index(scope, 0, proxy.get_target(scope));
+        let _ = pair.set_index(scope, 1, proxy.get_handler(scope));
+        rv.set(pair.into());
+    } else {
+        rv.set(proxy.get_target(scope));
     }
-    // V8 has no public accessor for a proxy's target and handler, so the pair is
-    // read through the revocable-proxy shape Node also relies on. A proxy made by
-    // `new Proxy` has none, which is why Node returns `undefined` for those too.
-    rv.set(v8::undefined(scope).into());
+}
+
+/// `internalBinding('util').parseEnv`: `lib/util.js`'s `util.parseEnv`.
+///
+/// Node implements this in `src/node_util.cc` by handing the content to
+/// `node::Dotenv::ParseContent` and returning `Dotenv::ToObject`, so the parser
+/// below is a transliteration of `src/node_dotenv.cc` rather than a general
+/// dotenv implementation. Every quirk in that file is reproduced, including the
+/// ones a hand-written parser would "fix":
+///
+/// * a value that trims to nothing swallows the rest of the input, because the
+///   `content.empty() || content.front() == '\n'` branch stores the empty string
+///   and `continue`s *before* the content is re-trimmed;
+/// * an unclosed quote keeps the quote character as part of the value;
+/// * `'...'` and `` `...` `` are not escape-expanded while `"..."` turns a
+///   literal `\n` into a newline and nothing else;
+/// * the result object has a null prototype, and its keys come back in
+///   `std::map` order — byte order, so `"A"` sorts before `"a"`.
+///
+/// `Dotenv::ToObject` builds the object from a `std::map`, which is why the
+/// store is a `BTreeMap` here: a `HashMap` would return the keys in an order
+/// nothing in Node produces.
+fn parse_env(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    // `CHECK_EQ(args.Length(), 1)` and `CHECK(args[0]->IsString())` in Node.
+    // `lib/util.js`'s `parseEnv` validates the argument first, so a non-string
+    // here is a caller bug rather than a script error; throwing a `TypeError`
+    // keeps it from becoming a `String` coercion the way Node's `CHECK` would
+    // have aborted, and it is what a direct binding caller sees under rustnode.
+    let Ok(content) = v8::Local::<v8::String>::try_from(args.get(0)) else {
+        throw_type_error(scope, "parseEnv needs a string of .env content");
+        return;
+    };
+    let mut text = String::new();
+    content.write_utf8_into(scope, &mut text);
+
+    let store = dotenv_parse(&text);
+    let object = v8::Object::new(scope);
+    object.set_prototype(scope, v8::null(scope).into());
+    for (key, value) in &store {
+        // `ToV8Value` on each name and value, so a lone surrogate in the input
+        // becomes U+FFFD on the way in and not on the way out.
+        let (Some(key), Some(value)) = (v8::String::new(scope, key), v8::String::new(scope, value))
+        else {
+            continue;
+        };
+        // `CreateDataProperty` rather than `Set`: the object is a fresh
+        // null-prototype object, so there is no setter to consult and no
+        // `__proto__` special case — `parseEnv("__proto__=x")` really does
+        // produce an own `__proto__` key.
+        let _ = object.create_data_property(scope, key.into(), value.into());
+    }
+    rv.set(object.into());
+}
+
+/// `trim_spaces` from `src/node_dotenv.cc`: strip spaces, tabs and newlines.
+fn dotenv_trim(input: &str) -> &str {
+    input.trim_matches([' ', '\t', '\n'])
+}
+
+/// `Dotenv::ParseContent`, transliterated.
+fn dotenv_parse(input: &str) -> BTreeMap<String, String> {
+    let mut store: BTreeMap<String, String> = BTreeMap::new();
+
+    // "Handle windows newlines "\r\n": remove "\r" and keep only "\n"" — every
+    // carriage return goes, not just the ones in a `\r\n` pair.
+    let lines: String = input.chars().filter(|c| *c != '\r').collect();
+    let mut content = dotenv_trim(&lines);
+
+    while !content.is_empty() {
+        let first = content.chars().next().unwrap_or('\0');
+        // Skip empty lines and comments.
+        if first == '\n' || first == '#' {
+            match content.find('\n') {
+                Some(newline) => content = &content[newline + 1..],
+                None => content = "",
+            }
+            continue;
+        }
+
+        // The next equals sign or newline, whichever comes first.
+        let Some(offset) = content.find(['=', '\n']) else {
+            break;
+        };
+        if content.as_bytes()[offset] == b'\n' {
+            content = dotenv_trim(&content[offset + 1..]);
+            continue;
+        }
+
+        // An equals sign: the key is everything before it.
+        let mut key = dotenv_trim(&content[..offset]);
+        content = &content[offset + 1..];
+
+        // `KEY=` at end of input or before a newline is an empty value. Note
+        // this branch stores and `continue`s *without* re-trimming, which is
+        // why `A=  \nB=2\n` records `A` as `"B=2"` and drops `B`.
+        if content.is_empty() || content.starts_with('\n') {
+            store.insert(key.to_string(), String::new());
+            continue;
+        }
+
+        content = dotenv_trim(content);
+
+        if key.is_empty() {
+            continue;
+        }
+
+        if let Some(rest) = key.strip_prefix("export ") {
+            key = dotenv_trim(rest);
+        }
+
+        if content.is_empty() {
+            store.insert(key.to_string(), String::new());
+            break;
+        }
+
+        // A double-quoted value, with `\n` expanded to a real newline. This arm
+        // only applies when the closing quote exists; the general quoted arm
+        // below handles an unterminated one.
+        if content.starts_with('"') {
+            if let Some(closing) = content[1..].find('"').map(|index| index + 1) {
+                let value = expand_double_quoted_newlines(&content[1..closing]);
+                store.insert(key.to_string(), value);
+                content = match content[closing + 1..].find('\n') {
+                    Some(newline) => &content[closing + 1 + newline + 1..],
+                    None => "",
+                };
+                continue;
+            }
+        }
+
+        let quote = content.chars().next().unwrap_or('\0');
+        if quote == '\'' || quote == '"' || quote == '`' {
+            let closing = content[1..].find(quote).map(|index| index + 1);
+            match closing {
+                // Unterminated: the value keeps the quote character. If a
+                // newline follows, the pair ends there; otherwise the rest of
+                // the input is the value.
+                None => match content.find('\n') {
+                    Some(newline) => {
+                        store.insert(key.to_string(), content[..newline].to_string());
+                        content = &content[newline + 1..];
+                    }
+                    None => {
+                        store.insert(key.to_string(), content.to_string());
+                        break;
+                    }
+                },
+                Some(closing) => {
+                    store.insert(key.to_string(), content[1..closing].to_string());
+                    content = match content[closing + 1..].find('\n') {
+                        Some(newline) => &content[closing + 1 + newline + 1..],
+                        None => "",
+                    };
+                    continue;
+                }
+            }
+        } else {
+            // An unquoted value: everything up to the newline, with an
+            // unquoted `#` starting a comment.
+            match content.find('\n') {
+                Some(newline) => {
+                    let mut value = &content[..newline];
+                    if let Some(hash) = value.find('#') {
+                        value = &value[..hash];
+                    }
+                    store.insert(key.to_string(), dotenv_trim(value).to_string());
+                    content = &content[newline + 1..];
+                }
+                None => {
+                    let mut value = content;
+                    if let Some(hash) = value.find('#') {
+                        value = &value[..hash];
+                    }
+                    store.insert(key.to_string(), dotenv_trim(value).to_string());
+                    content = "";
+                }
+            }
+        }
+
+        content = dotenv_trim(content);
+    }
+
+    store
+}
+
+/// The `"..."` arm's `\n` expansion in `src/node_dotenv.cc`.
+///
+/// It rewrites the two characters `\` `n` to a newline and leaves every other
+/// escape alone, so `"\\n"` (a backslash, then `n`) becomes a backslash
+/// followed by a newline — not a literal backslash-n, and not one backslash.
+fn expand_double_quoted_newlines(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut expanded = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'n') {
+            expanded.push('\n');
+            index += 2;
+            continue;
+        }
+        // Copy one whole character, so a multi-byte sequence stays intact.
+        let rest = &value[index..];
+        let character = rest.chars().next().unwrap_or('\0');
+        expanded.push(character);
+        index += character.len_utf8();
+    }
+    expanded
 }
 
 /// `internalBinding('util').guessHandleType`: the libuv handle kind behind a
@@ -982,5 +1218,183 @@ mod tests {
             .filter(|member| !DEFERRED.iter().any(|(deferred, _)| deferred == *member))
             .count();
         assert_eq!(installed + DEFERRED.len(), MEMBERS.len());
+    }
+
+    /// The parser is measured against Node 28, so each case below is what
+    /// `util.parseEnv` prints there.
+    fn parsed(input: &str) -> Vec<(String, String)> {
+        dotenv_parse(input).into_iter().collect()
+    }
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn dotenv_parses_the_documented_forms() {
+        assert_eq!(
+            parsed("# a comment\n\nPLAIN=value\nQUOTED=\"with spaces\"\nSINGLE='single quoted'\nEMPTY=\n"),
+            pairs(&[
+                ("EMPTY", ""),
+                ("PLAIN", "value"),
+                ("QUOTED", "with spaces"),
+                ("SINGLE", "single quoted"),
+            ])
+        );
+    }
+
+    #[test]
+    fn dotenv_keys_are_sorted_not_in_file_order() {
+        // `Dotenv::ToObject` walks a `std::map`, so the order is byte order and
+        // `"B"` precedes `"a"`. A `HashMap` here would return file order, and
+        // `Object.keys(util.parseEnv(...))` would then disagree with Node.
+        assert_eq!(
+            parsed("b=1\na=2\nB=3\n_=4\n1=5\n"),
+            pairs(&[("1", "5"), ("B", "3"), ("_", "4"), ("a", "2"), ("b", "1")])
+        );
+        assert_eq!(
+            parsed("A=1\nb=2\nB=3\na=4\n"),
+            pairs(&[("A", "1"), ("B", "3"), ("a", "4"), ("b", "2")])
+        );
+    }
+
+    #[test]
+    fn dotenv_last_assignment_wins() {
+        assert_eq!(parsed("A=1\nA=2\nB=3\n"), pairs(&[("A", "2"), ("B", "3")]));
+    }
+
+    #[test]
+    fn dotenv_strips_the_export_prefix() {
+        assert_eq!(
+            parsed("export   FOO=1\nEXPORT BAR=2\nexported=3\n"),
+            pairs(&[("EXPORT BAR", "2"), ("FOO", "1"), ("exported", "3")])
+        );
+    }
+
+    #[test]
+    fn dotenv_expands_newlines_only_inside_double_quotes() {
+        // A literal `\n` becomes a newline in `"..."`; the same two characters
+        // survive in `'...'`, in a backtick string, and in an unquoted value.
+        assert_eq!(
+            parsed("A=\"x\\ny\"\nB='x\\ny'\nC=`x\\ny`\nD=x\\ny\n"),
+            pairs(&[
+                ("A", "x\ny"),
+                ("B", "x\\ny"),
+                ("C", "x\\ny"),
+                ("D", "x\\ny")
+            ])
+        );
+        // `\\n` is a backslash then `n`, and only the `n` is rewritten, so the
+        // result is a backslash followed by a newline — not `\n` as two
+        // characters, and not one backslash.
+        assert_eq!(parsed("A=\"\\\\n\"\n"), pairs(&[("A", "\\\n")]));
+    }
+
+    #[test]
+    fn dotenv_keeps_an_unterminated_quote_in_the_value() {
+        assert_eq!(
+            parsed("A=\"unterminated\nNEXT=2\n"),
+            pairs(&[("A", "\"unterminated"), ("NEXT", "2")])
+        );
+        assert_eq!(parsed("A=\"x\n"), pairs(&[("A", "\"x")]));
+        assert_eq!(parsed("A='x\n"), pairs(&[("A", "'x")]));
+        assert_eq!(parsed("A=`x\n"), pairs(&[("A", "`x")]));
+    }
+
+    #[test]
+    fn dotenv_treats_an_unquoted_hash_as_a_comment() {
+        assert_eq!(
+            parsed("A=1#c\nB=\"1#c\"\nC='1#c'\nD=1 # c\n"),
+            pairs(&[("A", "1"), ("B", "1#c"), ("C", "1#c"), ("D", "1")])
+        );
+    }
+
+    #[test]
+    fn dotenv_drops_every_carriage_return() {
+        assert_eq!(
+            parsed("A=1\r\nB=\"x\r\ny\"\r\n"),
+            pairs(&[("A", "1"), ("B", "x\ny")])
+        );
+    }
+
+    #[test]
+    fn dotenv_keeps_an_empty_key_when_it_has_an_empty_value() {
+        // `=` alone stores the empty key. Node's C++ skips *non-empty* values
+        // under an empty key, which is why `=value` produces nothing.
+        assert_eq!(parsed("="), pairs(&[("", "")]));
+        assert_eq!(parsed("= "), pairs(&[("", "")]));
+        assert_eq!(
+            parsed("A=1\n=\nB=2\n"),
+            pairs(&[("", ""), ("A", "1"), ("B", "2")])
+        );
+        assert_eq!(parsed("=value\nB=2\n"), pairs(&[("B", "2")]));
+    }
+
+    #[test]
+    fn dotenv_swallows_the_tail_when_a_value_trims_to_nothing() {
+        // This is upstream's behaviour, not a bug introduced here: the
+        // `content.empty() || content.front() == '\n'` branch stores the empty
+        // string and `continue`s before the remaining content is re-trimmed, so
+        // the next line is consumed as part of the value of the previous one.
+        // `util.parseEnv("A=   \nB=2\n")` really is `{ A: 'B=2' }` in Node 28.
+        assert_eq!(parsed("A=   \nB=2\n"), pairs(&[("A", "B=2")]));
+        assert_eq!(parsed("A=\t\nB=2\n"), pairs(&[("A", "B=2")]));
+        assert_eq!(
+            parsed("A=1\nB=  \nC=3\n"),
+            pairs(&[("A", "1"), ("B", "C=3")])
+        );
+    }
+
+    #[test]
+    fn dotenv_skips_lines_without_an_equals_sign() {
+        assert_eq!(
+            parsed("NOEQUALS\nA=1\nB\nC=3\n"),
+            pairs(&[("A", "1"), ("C", "3")])
+        );
+    }
+
+    #[test]
+    fn dotenv_accepts_keys_that_are_not_identifiers() {
+        // Nothing validates a key: `__proto__`, `constructor` and a key with a
+        // backslash all come through as ordinary own properties, because the
+        // result object has a null prototype and Node uses `CreateDataProperty`.
+        assert_eq!(
+            parsed("__proto__=x\nconstructor=y\nA\\=1\n"),
+            pairs(&[("A\\", "1"), ("__proto__", "x"), ("constructor", "y"),])
+        );
+    }
+
+    #[test]
+    fn dotenv_of_an_empty_or_comment_only_document_is_empty() {
+        assert!(parsed("").is_empty());
+        assert!(parsed("\n\n\n").is_empty());
+        assert!(parsed("#only comment").is_empty());
+        assert!(parsed("   \n \t \n").is_empty());
+    }
+
+    #[test]
+    fn dotenv_trims_spaces_tabs_and_newlines_but_not_quoted_content() {
+        assert_eq!(
+            parsed("  A  =  \"  spaced  \"  \nA=\t tabbed \t\n"),
+            pairs(&[("A", "tabbed")])
+        );
+        assert_eq!(
+            parsed("  B  =  \"  spaced  \"  \n"),
+            pairs(&[("B", "  spaced  ")])
+        );
+    }
+
+    #[test]
+    fn installed_members_are_exactly_the_contract_minus_the_deferrals() {
+        // `rn-compat` trusts `MEMBERS` and subtracts `DEFERRED` without ever
+        // looking at the object `install()` builds, so a member listed in one
+        // and missing from the other is reported green while `lib/**` reads
+        // `undefined`. `parseEnv` was in `DEFERRED` with a reason naming
+        // `NODE_OPTIONS`, which is parsed in C++ and never calls this binding.
+        assert!(!DEFERRED.iter().any(|(member, _)| *member == "parseEnv"));
+        assert!(MEMBERS.contains(&"parseEnv"));
     }
 }
