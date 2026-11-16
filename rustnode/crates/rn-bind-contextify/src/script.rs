@@ -555,12 +555,16 @@ pub fn constructor<'s>(
         .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
         .ok_or_else(|| "ContextifyScript has no prototype object".to_string())?;
 
+    // `SetProtoMethod` names the function after its property. A template
+    // extracted with `get_function` and set on the prototype *object* keeps no
+    // name, so it has to be set here — V8 only names templates placed in a
+    // `PrototypeTemplate`.
     macro_rules! method {
         ($name:literal, $callback:expr) => {{
-            let method = rn_core::method($callback).build(scope);
-            if let (Some(function), Some(key)) =
-                (method.get_function(scope), v8::String::new(scope, $name))
-            {
+            if let (Ok(function), Some(key)) = (
+                rn_core::named_method(scope, $name, $callback),
+                v8::String::new(scope, $name),
+            ) {
                 prototype.set(scope, key.into(), function.into());
             }
         }};

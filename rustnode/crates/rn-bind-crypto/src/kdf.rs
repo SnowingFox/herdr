@@ -457,17 +457,10 @@ pub(crate) fn install_job_class<'s>(
         return Err(format!("cannot allocate {name}.run"));
     };
     prototype.set(key.into(), rn_core::method(run).build(scope).into());
-    let Some(class_name) = v8::String::new(scope, name) else {
-        return Err(format!("cannot allocate the {name} class name"));
-    };
-    template.set_class_name(class_name);
-    let Some(function) = template.get_function(scope) else {
-        return Err(format!("cannot allocate the {name} constructor"));
-    };
-    let Some(key) = v8::String::new(scope, name) else {
-        return Err(format!("cannot allocate the {name} property name"));
-    };
-    target.set(scope, key.into(), function.into());
+    // `rn_core::set_class` is `SetConstructorFunction(…, SET_CLASS_NAME)`: the
+    // class name is what V8 reports as `f.name`, so it has to be the property
+    // name Node passes in rather than left to the bare builder.
+    rn_core::set_class(scope, target, name, template)?;
     Ok(())
 }
 

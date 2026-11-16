@@ -127,11 +127,8 @@ pub fn install_classes<'s>(
     set(scope, target, "CipherBase", cipher.into())?;
     let job = job::build_aes_cipher_job_class(scope)?;
     set(scope, target, "AESCipherJob", job.into())?;
-    let info = rn_core::method(info::get_cipher_info)
-        .build(scope)
-        .get_function(scope)
-        .ok_or("cannot allocate crypto.getCipherInfo")?;
-    set(scope, target, "getCipherInfo", info.into())?;
+    // `SetMethod` in `crypto_cipher.cc`, so the property name is the function's.
+    rn_core::set_method(scope, target, "getCipherInfo", info::get_cipher_info)?;
     // The four `PublicKeyCipher::Cipher<operation, cipher>` instantiations.
     // `lib/internal/crypto/cipher.js` destructures all four at module scope, so
     // an absent one binds `undefined` and throws `method is not a function` on
@@ -148,13 +145,11 @@ pub fn install_classes<'s>(
         // A bare `FunctionTemplate::builder` defaults to `Allow`, which made
         // every one of them constructible here and not there.
         let function = match operation {
-            public_key::Cipher::Encrypt => rn_core::method(public_encrypt).build(scope),
-            public_key::Cipher::Decrypt => rn_core::method(private_decrypt).build(scope),
-            public_key::Cipher::Sign => rn_core::method(private_encrypt).build(scope),
-            public_key::Cipher::Recover => rn_core::method(public_decrypt).build(scope),
-        }
-        .get_function(scope)
-        .ok_or_else(|| format!("cannot allocate crypto.{name}"))?;
+            public_key::Cipher::Encrypt => rn_core::named_method(scope, name, public_encrypt),
+            public_key::Cipher::Decrypt => rn_core::named_method(scope, name, private_decrypt),
+            public_key::Cipher::Sign => rn_core::named_method(scope, name, private_encrypt),
+            public_key::Cipher::Recover => rn_core::named_method(scope, name, public_decrypt),
+        }?;
         set(scope, target, name, function.into())?;
     }
     Ok(())

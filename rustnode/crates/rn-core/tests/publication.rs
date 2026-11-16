@@ -1,9 +1,16 @@
-//! The two publication builders mean what they say about `new`.
+//! The publication helpers mean what they say about `new` **and** about `name`.
 //!
 //! `rn_core::method` must produce a function with no `[[Construct]]`, and
-//! `rn_core::class` one that has it. That is the whole contract every binding
+//! `rn_core::class` one that has it. That is half the contract every binding
 //! crate relies on now, and it is invisible at the call site: both return the
 //! same `FunctionBuilder` type, so a mistake is not a compile error.
+//!
+//! The other half is naming. Node's `SetMethod(context, target, "open", Open)`
+//! ends with `function->SetName(name_string)`, so `binding.fs.open.name` is
+//! `"open"`; a bare `FunctionTemplate::builder` leaves it `""`. The same file
+//! therefore pins `named_method`, `set_method`, `set_class` and the deliberate
+//! exception, `set_fast_method`, whose Node counterpart omits `SetName` on
+//! purpose.
 //!
 //! The end-to-end consequence — the exact set of `internalBinding()` members
 //! that accept `new`, diffed against the pinned oracle — is measured by
@@ -119,6 +126,105 @@ fn a_method_function_has_no_construct() {
             !constructible(function),
             "`v8::Function::builder` defaults to ConstructorBehavior::Allow too, so \
              the Function-shaped helper must carry the same kThrow."
+        );
+    });
+}
+
+/// The other half of `SetMethod`: the function reports the property name.
+///
+/// `SetMethod(context, target, "open", Open)` ends with
+/// `function->SetName(name_string)`, so `binding.fs.open.name` is `"open"` on
+/// Node. V8's builder leaves it `""`, which was true of 403 of 527 members here
+/// and is observable in stack traces and `util.inspect`.
+#[test]
+fn a_named_method_carries_its_name() {
+    with_scope(|scope| {
+        let function = rn_core::named_method(scope, "open", noop).expect("a named method");
+        assert_eq!(
+            function.get_name(scope).to_rust_string_lossy(scope),
+            "open",
+            "`rn_core::named_method` must name the function after its property, \
+             the way `node::SetMethod` does. Without this every binding member \
+             published through a template reports `name === \"\"`."
+        );
+        assert!(
+            !constructible(function),
+            "naming must not change [[Construct]]: Node's `SetMethod` sets both."
+        );
+    });
+}
+
+/// The name has to survive publication, which is what a caller actually observes.
+#[test]
+fn a_published_method_reports_its_property_name() {
+    with_scope(|scope| {
+        let target = v8::Object::new(scope);
+        rn_core::set_named_method_with_length(scope, target, "writeBuffer", 4, noop)
+            .expect("a published method");
+
+        let key = v8::String::new(scope, "writeBuffer").expect("a key");
+        let value = target.get(scope, key.into()).expect("the published member");
+        let function: v8::Local<v8::Function> = value
+            .try_into()
+            .expect("the published member is a function");
+        assert_eq!(
+            function.get_name(scope).to_rust_string_lossy(scope),
+            "writeBuffer",
+            "`SetMethod` publishes the function under the property name and names \
+             the function from it; both sides have to agree or the divergence \
+             returns the moment the property is renamed."
+        );
+        assert!(
+            !constructible(function),
+            "publishing must keep `SetMethod`'s kThrow."
+        );
+    });
+}
+
+/// `SetFastMethod` is the one `SetMethod` variant that omits `SetName`.
+///
+/// Node's `buffer.copy.name`, `os.getTotalMem.name`, `types.isDate.name`,
+/// `permission.has.name` and `zlib.crc32.name` are all `""`. A helper that named
+/// everything would trade the reported defect for a fresh one in the opposite
+/// direction, so this pins the exemption rather than leaving it to the audit.
+#[test]
+fn a_fast_method_stays_unnamed() {
+    with_scope(|scope| {
+        let target = v8::Object::new(scope);
+        rn_core::set_fast_method(scope, target, "copy", noop).expect("a published fast method");
+
+        let key = v8::String::new(scope, "copy").expect("a key");
+        let value = target.get(scope, key.into()).expect("the published member");
+        let function: v8::Local<v8::Function> = value
+            .try_into()
+            .expect("the published member is a function");
+        assert_eq!(
+            function.get_name(scope).to_rust_string_lossy(scope),
+            "",
+            "`SetFastMethod`/`SetFastMethodNoSideEffect` do not call `SetName`, so \
+             Node's copies are unnamed. Naming these would be a divergence."
+        );
+    });
+}
+
+/// `SetConstructorFunction(…, SET_CLASS_NAME)` names the class from the property.
+#[test]
+fn a_published_class_reports_its_property_name() {
+    with_scope(|scope| {
+        let target = v8::Object::new(scope);
+        let template = rn_core::class(noop).build(scope);
+        let function =
+            rn_core::set_class(scope, target, "FSReqCallback", template).expect("a class");
+
+        assert_eq!(
+            function.get_name(scope).to_rust_string_lossy(scope),
+            "FSReqCallback",
+            "`SetConstructorFunction` sets the class name from the property it is \
+             published under, which is what `f.name` reports."
+        );
+        assert!(
+            constructible(function),
+            "`set_class` is `SetConstructorFunction`, so the class keeps [[Construct]]."
         );
     });
 }

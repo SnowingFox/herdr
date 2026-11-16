@@ -24,20 +24,13 @@ pub(crate) fn string<'s>(
 /// `SetMethod`/`SetMethodNoSideEffect` in `node_url.cc` end in a plain `Set` with
 /// no attribute argument, so the property is writable, enumerable and
 /// configurable. `lib/internal/url.js` reads these once at module scope.
-pub(crate) fn define_method(
-    scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<'_, v8::Object>,
+pub(crate) fn define_method<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = rn_core::method(callback).build(scope);
-    let function = template
-        .get_function(scope)
-        .ok_or_else(|| format!("could not create url.{name}"))?;
-    let key = string(scope, name)?;
-    object
-        .set(scope, key.into(), function.into())
-        .ok_or_else(|| format!("could not define {name:?}"))?;
+    rn_core::set_method(scope, object, name, callback)?;
     Ok(())
 }
 

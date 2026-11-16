@@ -27,14 +27,26 @@ use crate::encoding;
 use crate::misc;
 use rn_core::codec::Encoding;
 
-/// Binds a Rust callback as a namespace function.
+/// Binds a Rust callback as a namespace function, named after its property.
+///
+/// `rn_core::set_method` is `node::SetMethod`, which names the function after the
+/// property it is published under. That is observable as `f.name`, so a member
+/// published any other way reports `""` where Node reports its name.
 macro_rules! mkfn {
     ($installer:expr, $name:expr, $callback:expr) => {{
-        let template = rn_core::method($callback).build($installer.scope);
-        let function = template
-            .get_function($installer.scope)
-            .ok_or_else(|| format!("cannot allocate buffer.{}", $name))?;
-        $installer.define($name, function.into())?;
+        rn_core::set_method($installer.scope, $installer.object, $name, $callback)?;
+    }};
+}
+
+/// Binds a fast-API callback, which Node publishes **unnamed**.
+///
+/// `SetFastMethod`/`SetFastMethodNoSideEffect` (`src/util.cc`) are the one
+/// `SetMethod` family that omits `SetName`, so Node's `binding.copy.name`,
+/// `binding.swap16.name` and `binding.isUtf8.name` are all `""`. This macro is
+/// only for the members `src/node_buffer.cc` publishes through them.
+macro_rules! mkfastfn {
+    ($installer:expr, $name:expr, $callback:expr) => {{
+        rn_core::set_fast_method($installer.scope, $installer.object, $name, $callback)?;
     }};
 }
 
@@ -136,32 +148,32 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
         mkfn!(self, "base64urlWrite", base64url_write);
         mkfn!(self, "hexWrite", hex_write);
         mkfn!(self, "ucs2Write", ucs2_write);
-        mkfn!(self, "asciiWriteStatic", ascii_write_static);
-        mkfn!(self, "latin1WriteStatic", latin1_write_static);
-        mkfn!(self, "utf8WriteStatic", utf8_write_static);
+        mkfastfn!(self, "asciiWriteStatic", ascii_write_static);
+        mkfastfn!(self, "latin1WriteStatic", latin1_write_static);
+        mkfastfn!(self, "utf8WriteStatic", utf8_write_static);
 
         // Lengths.
         mkfn!(self, "byteLengthUtf8", byte_length_utf8);
-        mkfn!(self, "byteLengthUtf8Fast", byte_length_utf8_fast);
-        mkfn!(self, "stringLengthUtf8", string_length_utf8);
+        mkfastfn!(self, "byteLengthUtf8Fast", byte_length_utf8_fast);
+        mkfastfn!(self, "stringLengthUtf8", string_length_utf8);
 
         // Predicates.
-        mkfn!(self, "isUtf8", is_utf8);
-        mkfn!(self, "isAscii", is_ascii);
-        mkfn!(self, "isLatin1", is_latin1);
+        mkfastfn!(self, "isUtf8", is_utf8);
+        mkfastfn!(self, "isAscii", is_ascii);
+        mkfastfn!(self, "isLatin1", is_latin1);
 
         // Byte manipulation.
-        mkfn!(self, "compare", compare);
+        mkfastfn!(self, "compare", compare);
         mkfn!(self, "compareOffset", compare_offset);
-        mkfn!(self, "copy", copy);
+        mkfastfn!(self, "copy", copy);
         mkfn!(self, "fill", fill);
         mkfn!(self, "indexOfBuffer", index_of_buffer);
-        mkfn!(self, "indexOfNumber", index_of_number);
+        mkfastfn!(self, "indexOfNumber", index_of_number);
         mkfn!(self, "indexOfString", index_of_string);
-        mkfn!(self, "swap16", swap16);
-        mkfn!(self, "swap32", swap32);
-        mkfn!(self, "swap64", swap64);
-        mkfn!(self, "mask", mask);
+        mkfastfn!(self, "swap16", swap16);
+        mkfastfn!(self, "swap32", swap32);
+        mkfastfn!(self, "swap64", swap64);
+        mkfastfn!(self, "mask", mask);
 
         // Misc.
         mkfn!(self, "atob", atob);
@@ -169,7 +181,7 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
         mkfn!(self, "setBufferPrototype", set_buffer_prototype);
         mkfn!(self, "setDetachKey", set_detach_key);
         mkfn!(self, "createUnsafeArrayBuffer", create_unsafe_array_buffer);
-        mkfn!(self, "copyArrayBuffer", copy_array_buffer);
+        mkfastfn!(self, "copyArrayBuffer", copy_array_buffer);
         mkfn!(
             self,
             "arrayBufferAlignedOffset",

@@ -33,7 +33,10 @@ pub use binding::{BindingRegistry, Installer, Namespace};
 pub use codec::Encoding;
 pub use env::Env;
 pub use error::KernelError;
-pub use function::{class, method, method_function, method_function_raw};
+pub use function::{
+    class, method, method_function, method_function_raw, named_method, named_method_with_length,
+    named_template, set_class, set_fast_method, set_method, set_named_method_with_length,
+};
 pub use per_context::{
     per_context_exports, per_isolate_symbols_object, private_symbols_object,
     set_per_context_exports, PER_CONTEXT_EXPORTS,

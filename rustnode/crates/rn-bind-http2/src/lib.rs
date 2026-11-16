@@ -541,10 +541,7 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
-    let template = rn_core::method(callback).build(scope);
-    template
-        .get_function(scope)
-        .ok_or_else(|| format!("cannot allocate {name}"))
+    rn_core::named_method(scope, name, callback)
 }
 
 /// Sets a normal property.

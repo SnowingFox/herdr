@@ -122,21 +122,9 @@ impl BindingModule for Config {
         // build.
         crate::install_readonly(scope, object, "bits", Value::int(i64::from(Self::bits())))?;
 
-        // Node installs this with `SetMethodNoSideEffect`, so the function is a
-        // plain data property rather than an accessor.
-        let function = match rn_core::method_function(get_default_locale)
-            .length(0)
-            .build(scope)
-        {
-            Some(function) => function,
-            None => {
-                return Err("config.getDefaultLocale: could not create function".to_string());
-            }
-        };
-        let key = crate::string(scope, "getDefaultLocale")?;
-        object
-            .set(scope, key.into(), function.into())
-            .ok_or_else(|| "config.getDefaultLocale: could not define property".to_string())?;
+        // Node installs this with `SetMethodNoSideEffect`: a plain data property
+        // rather than an accessor, and named after that property.
+        rn_core::set_method(scope, object, "getDefaultLocale", get_default_locale)?;
 
         Ok(object)
     }

@@ -400,10 +400,10 @@ pub(crate) fn create_function<'s>(
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     let template = rn_core::method(create).length(5).build(scope);
     template.remove_prototype();
-    let function = template
-        .get_function(scope)
-        .ok_or_else(|| "cannot allocate createELDHistogram".to_string())?;
-    Ok(function.into())
+    // `SetMethod` names this after the property it is published under. The
+    // template still has to be shaped first (`remove_prototype`), so this is
+    // `named_template` rather than `named_method`.
+    Ok(rn_core::named_template(scope, "createELDHistogram", template)?.into())
 }
 
 /// `createELDHistogram(resolution, samplePerIteration, lowest, highest, figures)`.

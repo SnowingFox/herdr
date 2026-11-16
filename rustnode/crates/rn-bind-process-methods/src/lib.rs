@@ -1339,20 +1339,12 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::method(callback).build(scope);
-    let function = template
-        .get_function(scope)
-        .ok_or_else(|| format!("cannot allocate {name}"))?;
     // `SetMethod(isolate, target, "name", fn)` names the function after its
     // property, which is observable as `f.name` and shows up in stack traces and
-    // `util.inspect`. `FunctionTemplate::builder` leaves it `""`, so every member
-    // published through this helper would otherwise report an empty name where
-    // Node reports the member's own. Setting it here covers all 30 call sites
-    // rather than each one repeating it.
-    if let Some(key) = v8::String::new(scope, name) {
-        function.set_name(key);
-    }
-    Ok(function.into())
+    // `util.inspect`. `rn_core::named_method` is that half of `SetMethod`, so
+    // every member published through this helper carries its name without each
+    // call site repeating it.
+    Ok(rn_core::named_method(scope, name, callback)?.into())
 }
 
 fn set(

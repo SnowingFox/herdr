@@ -59,12 +59,19 @@ impl BindingModule for Os {
     ) -> Result<v8::Local<'s, v8::Object>, String> {
         let object = v8::Object::new(scope);
         let values: [(&str, v8::Local<v8::Value>); 14] = [
+            // `getAvailableParallelism`, `getFreeMem` and `getTotalMem` are the
+            // three `SetFastMethodNoSideEffect` members in `node_os.cc`, the one
+            // `SetMethod` variant that omits `SetName`; Node's copies are
+            // nameless, so these are too.
             (
                 "getAvailableParallelism",
-                function(scope, "getAvailableParallelism", get_available_parallelism)?,
+                fast_function(scope, "getAvailableParallelism", get_available_parallelism)?,
             ),
             ("getCPUs", function(scope, "getCPUs", get_cpus)?),
-            ("getFreeMem", function(scope, "getFreeMem", get_free_mem)?),
+            (
+                "getFreeMem",
+                fast_function(scope, "getFreeMem", get_free_mem)?,
+            ),
             (
                 "getHomeDirectory",
                 function(scope, "getHomeDirectory", get_home_directory)?,
@@ -82,7 +89,7 @@ impl BindingModule for Os {
             ("getPriority", function(scope, "getPriority", get_priority)?),
             (
                 "getTotalMem",
-                function(scope, "getTotalMem", get_total_mem)?,
+                fast_function(scope, "getTotalMem", get_total_mem)?,
             ),
             ("getUptime", function(scope, "getUptime", get_uptime)?),
             (
@@ -1480,8 +1487,17 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::method(callback).build(scope);
-    let function = template
+    Ok(rn_core::named_method(scope, name, callback)?.into())
+}
+
+/// Builds a fast-API member, which Node leaves unnamed.
+fn fast_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    callback: impl v8::MapFnTo<v8::FunctionCallback>,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let function = rn_core::method(callback)
+        .build(scope)
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate {name}"))?;
     Ok(function.into())

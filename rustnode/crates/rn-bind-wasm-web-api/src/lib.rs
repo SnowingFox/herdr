@@ -63,13 +63,9 @@ impl BindingModule for WasmWebApi {
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
         let object = v8::Object::new(scope);
-        let key = v8::String::new(scope, "setImplementation")
-            .ok_or("cannot allocate setImplementation")?;
-        let template = rn_core::method(set_implementation).build(scope);
-        let function = template
-            .get_function(scope)
-            .ok_or("cannot allocate setImplementation")?;
-        object.set(scope, key.into(), function.into());
+        // `SetMethod` in `node_wasm_web_api.cc`, so the property name is the
+        // function's name.
+        rn_core::set_method(scope, object, "setImplementation", set_implementation)?;
         Ok(object)
     }
 }

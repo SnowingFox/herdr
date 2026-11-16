@@ -110,6 +110,12 @@ pub fn install_classes<'s>(
     // fresh template per instance would fail that check.
     let handle = handle_constructor(scope)
         .ok_or_else(|| "cannot build the KeyObjectHandle class".to_string())?;
+    // `crypto_keys.cc` sets this with a plain `target->Set(..., FIXED_ONE_BYTE_STRING(
+    // "KeyObjectHandle"), KeyObjectHandle::Initialize(env))` rather than through
+    // `SetConstructorFunction`, so the class has **no** name on Node —
+    // `binding.KeyObjectHandle.name` is `""`. Setting one here would be a
+    // divergence in the opposite direction, so the constructor keeps the empty
+    // name its template arrives with.
     set(scope, target, "KeyObjectHandle", handle.into())?;
 
     for (name, built) in [
@@ -147,6 +153,11 @@ pub fn install_classes<'s>(
         let function = built
             .get_function(scope)
             .ok_or_else(|| format!("cannot allocate crypto.{name}"))?;
+        // `SetMethod` names the function after the property, which is observable
+        // as `f.name`; the bare template builder leaves it `""`.
+        if let Some(key) = v8::String::new(scope, name) {
+            function.set_name(key);
+        }
         set(scope, target, name, function.into())?;
     }
 
@@ -167,13 +178,12 @@ pub(crate) fn handle_constructor<'s>(
         .set_internal_field_count(INTERNAL_FIELD_COUNT);
     let prototype = template.prototype_template(scope);
     crate::handle::install_methods(scope, prototype)?;
-    if let Some(name) = v8::String::new(scope, "KeyObjectHandle") {
-        template.set_class_name(name);
-    }
+    // No class name and no `set_name`: `crypto_keys.cc` exposes this through a
+    // plain `target->Set`, not `SetConstructorFunction`, so Node's
+    // `binding.KeyObjectHandle.name` is `""`. Its methods still get named,
+    // because `SetProtoMethod` does name those — that happens in
+    // `handle::install_methods`, which puts them in the prototype template.
     let function = template.get_function(scope)?;
-    if let Some(name) = v8::String::new(scope, "KeyObjectHandle") {
-        function.set_name(name);
-    }
     with_classes(|classes| classes.handle = Some(v8::Global::new(scope.as_ref(), function)));
     Some(function)
 }

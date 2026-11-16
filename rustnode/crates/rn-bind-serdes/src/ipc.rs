@@ -81,20 +81,15 @@ impl BindingModule for IpcSerdes {
     }
 }
 
-fn install_method(
-    scope: &mut v8::PinScope<'_, '_>,
-    object: v8::Local<v8::Object>,
+fn install_method<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = rn_core::method(callback).build(scope);
-    let function = template
-        .get_function(scope)
-        .ok_or_else(|| format!("could not create ipc_serdes.{name}"))?;
-    let key = v8::String::new(scope, name).ok_or("cannot allocate a property name")?;
-    object
-        .set(scope, key.into(), function.into())
-        .ok_or_else(|| format!("could not define {name}"))?;
+    // `node_serdes.cc` publishes both with `SetMethod`, which names the function
+    // after its property; the bare builder would leave `name` empty.
+    rn_core::set_method(scope, object, name, callback)?;
     Ok(())
 }
 

@@ -76,7 +76,10 @@ impl BindingModule for PermissionBinding {
 
         let object = v8::Object::new(scope);
 
-        install_member(scope, object, "has", has_callback)?;
+        // `permission.cc` publishes `has` with `SetFastMethodNoSideEffect`,
+        // which omits `SetName`, so `binding.has.name` is `""` on Node; the
+        // other two go through `SetMethod` and carry their property names.
+        rn_core::set_fast_method(scope, object, "has", has_callback)?;
         install_member(scope, object, "drop", drop_callback)?;
         install_member(
             scope,
@@ -100,15 +103,7 @@ fn install_member<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let function = rn_core::method(callback)
-        .build(scope)
-        .get_function(scope)
-        .ok_or_else(|| format!("cannot allocate permission.{name}"))?;
-    let key = v8::String::new(scope, name)
-        .ok_or_else(|| format!("cannot allocate permission.{name} name"))?;
-    object
-        .set(scope, key.into(), function.into())
-        .ok_or_else(|| format!("cannot define permission.{name}"))?;
+    rn_core::set_method(scope, object, name, callback)?;
     Ok(())
 }
 

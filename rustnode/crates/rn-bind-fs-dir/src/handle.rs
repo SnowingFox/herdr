@@ -87,14 +87,12 @@ pub fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::method(callback).build(scope);
+    // `SetMethod` names the function after its property. The class name is set
+    // too, because this helper also stands in for a member `lib/**` prints.
     let text = v8::String::new(scope, name).ok_or_else(|| format!("cannot allocate {name}"))?;
+    let template = rn_core::method(callback).build(scope);
     template.set_class_name(text);
-    let function = template
-        .get_function(scope)
-        .ok_or_else(|| format!("cannot allocate {name}"))?;
-    function.set_name(text);
-    Ok(function.into())
+    Ok(rn_core::named_template(scope, name, template)?.into())
 }
 
 /// Builds the `DirHandle` constructor and its prototype.

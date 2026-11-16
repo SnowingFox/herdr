@@ -547,6 +547,9 @@ fn build_class<'s>(
         return Err(format!("cannot allocate the {name} class name"));
     };
     template.set_class_name(class_name);
+    // The caller installs this under its property name, so the class name has to
+    // be that name: `SetConstructorFunction(…, SET_CLASS_NAME)` sets it from the
+    // property, which is what makes `crypto.Sign.name` report `"Sign"`.
     let Some(function) = template.get_function(scope) else {
         return Err(format!("cannot allocate the {name} constructor"));
     };
