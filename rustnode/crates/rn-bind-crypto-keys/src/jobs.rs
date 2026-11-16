@@ -153,14 +153,6 @@ enum KeyGenOutput {
     },
 }
 
-impl KeyPairSpec {
-    /// Whether this spec produces a `CryptoKey` pair rather than encoded bytes.
-    #[cfg(test)]
-    fn is_crypto_key_pair(&self) -> bool {
-        matches!(self.output, KeyGenOutput::CryptoKeyPair { .. })
-    }
-}
-
 impl Runnable for KeyPairSpec {
     type Output = KeyData;
 
@@ -184,10 +176,8 @@ impl Runnable for KeyPairSpec {
             // `KeyPairGenTraits::EncodeKey`: `[public, private]`, each either a
             // `KeyObjectHandle` or an encoded value.
             KeyGenOutput::EncodedPair => {
-                let public =
-                    encode_public(scope, key, &self.public_encoding, KeyType::Public)?;
-                let private =
-                    encode_private(scope, key, &self.private_encoding, KeyType::Private)?;
+                let public = encode_public(scope, key, &self.public_encoding, KeyType::Public)?;
+                let private = encode_private(scope, key, &self.private_encoding, KeyType::Private)?;
                 Some(v8::Array::new_with_elements(scope, &[public, private]).into())
             }
             // `KeyGenJob::EncodeWebCryptoKey` for `kWebCryptoKeyPair`: two
@@ -245,9 +235,17 @@ fn crypto_key<'s>(
     usages_mask: u32,
     extractable: bool,
 ) -> Option<v8::Local<'s, v8::Value>> {
-    let data = KeyData::asymmetric(key_type.clone(), key.clone())?;
+    let data = KeyData::asymmetric(key_type, key.clone())?;
     let handle = create_handle(scope, data)?;
-    crate::cryptokey::create_crypto_key(scope, handle, algorithm, usages_mask, extractable, None, None)
+    crate::cryptokey::create_crypto_key(
+        scope,
+        handle,
+        algorithm,
+        usages_mask,
+        extractable,
+        None,
+        None,
+    )
 }
 
 /// Encodes one half of a generated pair.
@@ -940,13 +938,11 @@ fn named_constructor<'s>(
     // `asymmetricKeyType` spelling nor case-insensitively equal to it, so applying
     // the traditional filter made every `subtle.generateKey('Ed25519', ...)` throw
     // `ERR_INVALID_ARG_VALUE` naming an algorithm the caller had just been given.
-    let algorithm = KeyAlgorithm::from_name(&type_name).filter(|algorithm| {
-        algorithm.is_okp() || algorithm.is_pqc()
-    });
+    let algorithm = KeyAlgorithm::from_name(&type_name)
+        .filter(|algorithm| algorithm.is_okp() || algorithm.is_pqc());
     let algorithm = algorithm.filter(|algorithm| {
         mode == JobMode::WebCrypto
-            || (algorithm.key_type_name() == Some(type_name.as_str())
-                && algorithm.is_available())
+            || (algorithm.key_type_name() == Some(type_name.as_str()) && algorithm.is_available())
     });
     let Some(algorithm) = algorithm else {
         throw(scope, &KeyError::UnsupportedKeyType(type_name));

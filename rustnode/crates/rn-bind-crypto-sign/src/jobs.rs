@@ -307,14 +307,17 @@ fn rsa_cipher_job_constructor<'s>(
         Ok(handle) => match rn_bind_crypto_keys::key_of_handle(scope, handle) {
             Some(data) if data.asymmetric_key().is_some() => {
                 let data = data.as_type(key_type);
-                (
-                    data.asymmetric_key().cloned(),
-                    None,
-                )
+                (data.asymmetric_key().cloned(), None)
             }
-            _ => (None, Some(("Invalid key type", "ERR_CRYPTO_INVALID_KEYTYPE"))),
+            _ => (
+                None,
+                Some(("Invalid key type", "ERR_CRYPTO_INVALID_KEYTYPE")),
+            ),
         },
-        Err(_) => (None, Some(("Invalid key type", "ERR_CRYPTO_INVALID_KEYTYPE"))),
+        Err(_) => (
+            None,
+            Some(("Invalid key type", "ERR_CRYPTO_INVALID_KEYTYPE")),
+        ),
     };
     let data = bytes_of(args.get(3)).unwrap_or_default();
     // `RSACipherTraits::AdditionalConfig(mode, args, 4, cipher_mode, &params)`.
@@ -362,7 +365,8 @@ fn run(
     };
 
     match &state {
-        JobKind::Sign {            crypto_mode,
+        JobKind::Sign {
+            crypto_mode,
             job_mode,
             key,
             key_error,
@@ -408,7 +412,6 @@ fn run(
             } else {
                 emit_pair(scope, &mut rv, converted);
             }
-            return;
         }
         JobKind::RsaCipher {
             crypto_mode,
@@ -434,9 +437,8 @@ fn run(
             } else {
                 emit_pair(scope, &mut rv, outcome);
             }
-            return;
         }
-    };
+    }
 }
 
 /// Runs the WebCrypto RSA-OAEP operation.
@@ -492,7 +494,9 @@ fn rsa_cipher(
 }
 
 /// Maps the cipher crate's failure onto this crate's `JobError`.
-fn cipher_failure_to_job_error(failure: rn_bind_crypto_cipher::public_key::CryptoFailure) -> JobError {
+fn cipher_failure_to_job_error(
+    failure: rn_bind_crypto_cipher::public_key::CryptoFailure,
+) -> JobError {
     use rn_bind_crypto_cipher::public_key::CryptoFailure;
     match failure {
         // The decode already threw, so the run reports the same code the
@@ -511,7 +515,9 @@ fn cipher_failure_to_job_error(failure: rn_bind_crypto_cipher::public_key::Crypt
         CryptoFailure::InvalidArgument(message) | CryptoFailure::Message(message) => {
             JobError::Owned(message, "ERR_CRYPTO_OPERATION_FAILED")
         }
-        CryptoFailure::InvalidDigest => JobError::Plain("Invalid digest", "ERR_CRYPTO_INVALID_DIGEST"),
+        CryptoFailure::InvalidDigest => {
+            JobError::Plain("Invalid digest", "ERR_CRYPTO_INVALID_DIGEST")
+        }
     }
 }
 ///
@@ -522,7 +528,11 @@ fn cipher_failure_to_job_error(failure: rn_bind_crypto_cipher::public_key::Crypt
 /// `lib/internal/crypto/util.js` passes a rejection straight through, which is
 /// how `subtle.sign` reports `ERR_CRYPTO_INVALID_DIGEST` rather than wrapping it
 /// in an `OperationError` twice.
-fn emit_promise(scope: &mut v8::PinScope<'_, '_>, rv: &mut v8::ReturnValue, outcome: Result<BytesOrBool, JobError>) {
+fn emit_promise(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue,
+    outcome: Result<BytesOrBool, JobError>,
+) {
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         return;
     };
@@ -599,10 +609,9 @@ fn array_buffer<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
 ) -> Option<v8::Local<'s, v8::Value>> {
-    let store = v8::ArrayBuffer::new_backing_store_from_boxed_slice(
-        bytes.to_vec().into_boxed_slice(),
-    )
-    .make_shared();
+    let store =
+        v8::ArrayBuffer::new_backing_store_from_boxed_slice(bytes.to_vec().into_boxed_slice())
+            .make_shared();
     Some(v8::ArrayBuffer::with_backing_store(scope, &store).into())
 }
 

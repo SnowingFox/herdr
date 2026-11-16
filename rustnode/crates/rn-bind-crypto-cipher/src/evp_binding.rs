@@ -681,10 +681,9 @@ pub fn array_buffer_public<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
 ) -> Option<v8::Local<'s, v8::Value>> {
-    let store = v8::ArrayBuffer::new_backing_store_from_boxed_slice(
-        bytes.to_vec().into_boxed_slice(),
-    )
-    .make_shared();
+    let store =
+        v8::ArrayBuffer::new_backing_store_from_boxed_slice(bytes.to_vec().into_boxed_slice())
+            .make_shared();
     Some(v8::ArrayBuffer::with_backing_store(scope, &store).into())
 }
 

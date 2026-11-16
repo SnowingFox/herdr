@@ -51,7 +51,8 @@ pub fn install_classes<'s>(
     let function = template
         .get_function(scope)
         .ok_or_else(|| "cannot allocate the DHBitsJob constructor".to_string())?;
-    let property = v8::String::new(scope, "DHBitsJob").ok_or("cannot allocate the property name")?;
+    let property =
+        v8::String::new(scope, "DHBitsJob").ok_or("cannot allocate the property name")?;
     target.set(scope, property.into(), function.into());
     Ok(())
 }
@@ -69,8 +70,7 @@ impl Runnable for DhBits {
     type Output = Vec<u8>;
 
     fn run(&mut self) -> Result<Self::Output, CryptoJobError> {
-        derive(&self.private, &self.public)
-            .map_err(|error| crate::errors::job_error(&error))
+        derive(&self.private, &self.public).map_err(|error| crate::errors::job_error(&error))
     }
 
     fn finish<'s>(
@@ -81,10 +81,8 @@ impl Runnable for DhBits {
         // `DHBitsTraits::EncodeOutput` is `out->ToArrayBuffer(env)`, so the
         // result is an `ArrayBuffer` and not the `Buffer` the traditional form
         // wraps in `Buffer.from`.
-        let store = v8::ArrayBuffer::new_backing_store_from_boxed_slice(
-            output.into_boxed_slice(),
-        )
-        .make_shared();
+        let store = v8::ArrayBuffer::new_backing_store_from_boxed_slice(output.into_boxed_slice())
+            .make_shared();
         Some(v8::ArrayBuffer::with_backing_store(scope, &store).into())
     }
 }

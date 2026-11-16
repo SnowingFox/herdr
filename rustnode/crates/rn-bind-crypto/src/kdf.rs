@@ -168,7 +168,10 @@ fn bytes_argument(
 /// there, so a bytes-only reader rejects every `subtle.deriveBits` before the
 /// derivation runs. For a secret key the handle's exported bytes *are* the key,
 /// which is what `importSecretKey` put there.
-fn key_material(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> Option<Vec<u8>> {
+fn key_material(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<Vec<u8>> {
     if let Ok(handle) = v8::Local::<v8::Object>::try_from(value) {
         let has_type = handle
             .get(scope, v8::String::new(scope, "getKeyType")?.into())

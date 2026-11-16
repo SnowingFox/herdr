@@ -535,9 +535,16 @@ Input buffers must have the same byte length",
         },
         Case {
             name: "HmacJob returns a promise",
+            // `HmacTraits::AdditionalConfig` reads five slots after the mode:
+            // the sign mode, the digest name, a `KeyObjectHandle`, the data and
+            // an optional signature. The key is a handle and not the raw bytes,
+            // because that is what `mac.js` passes
+            // (`new HmacJob(kCryptoJobWebCrypto, mode, digest, keyHandle, data)`).
             source: r#"
+                const handle = new binding.KeyObjectHandle();
+                handle.init(0, Buffer.from('key'));
                 const job = new binding.HmacJob(
-                  2, 'sha256', Buffer.from('key'),
+                  2, 0, 'sha256', handle,
                   new TextEncoder().encode('data'));
                 return job.run().constructor.name;
             "#,

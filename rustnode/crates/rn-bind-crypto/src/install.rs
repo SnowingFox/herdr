@@ -104,6 +104,13 @@ pub const MEMBERS: &[&str] = &[
     "RsaKeyPairGenJob",
     "EcKeyPairGenJob",
     "NamedKeyPairGenJob",
+    // The shared-secret derivation job, installed by `rn-bind-crypto-keys` from
+    // `crypto_dh.cc` alongside the rest of the key surface.
+    // `lib/internal/crypto/diffiehellman.js` builds it for
+    // `crypto.diffieHellman` and for the WebCrypto ECDH/X25519 `deriveBits` and
+    // `deriveKey` paths, so without it both `subtle.deriveBits` and
+    // `subtle.deriveKey` threw "Unsupported operation".
+    "DHBitsJob",
     // The signature surface, installed by `rn-bind-crypto-sign` from
     // `src/crypto/crypto_sig.cc` and `crypto_rsa.cc`. `Sign`/`Verify` are the
     // streaming classes `lib/internal/crypto/sig.js` drives; `SignJob` is the
@@ -280,13 +287,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "The WebCrypto ChaCha20-Poly1305 job. The algorithm is available \
          (`getCiphers()` lists `chacha20-poly1305`), so this is the job class and the \
          WebCrypto key plumbing rather than a missing primitive.",
-    ),
-    (
-        "DHBitsJob",
-        "`crypto.diffieHellman(options[, callback])`. The `CryptoJob` machinery this \
-         needed now exists (`rn-crypto-job`), so what remains is the job itself: a \
-         two-key `EVP_PKEY_derive` over the DH/EC/X25519 key pairs `prepare*Key` produces, \
-         which is the next landing rather than a missing primitive.",
     ),
     (
         "DhKeyPairGenJob",
@@ -768,7 +768,8 @@ impl BindingModule for Crypto {
                 "kWebCryptoKeyFormatJWK",
                 constants::K_WEBCRYPTO_KEY_FORMAT_JWK,
             ),
-            ("kKeyVariantRSA_SSA_PKCS1_v1_5",
+            (
+                "kKeyVariantRSA_SSA_PKCS1_v1_5",
                 constants::K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5,
             ),
             ("kKeyVariantRSA_PSS", constants::K_KEY_VARIANT_RSA_PSS),
@@ -809,18 +810,9 @@ impl BindingModule for Crypto {
                 "kKeyVariantAES_GCM_256",
                 constants::K_KEY_VARIANT_AES_GCM_256,
             ),
-            (
-                "kKeyVariantAES_KW_128",
-                constants::K_KEY_VARIANT_AES_KW_128,
-            ),
-            (
-                "kKeyVariantAES_KW_192",
-                constants::K_KEY_VARIANT_AES_KW_192,
-            ),
-            (
-                "kKeyVariantAES_KW_256",
-                constants::K_KEY_VARIANT_AES_KW_256,
-            ),
+            ("kKeyVariantAES_KW_128", constants::K_KEY_VARIANT_AES_KW_128),
+            ("kKeyVariantAES_KW_192", constants::K_KEY_VARIANT_AES_KW_192),
+            ("kKeyVariantAES_KW_256", constants::K_KEY_VARIANT_AES_KW_256),
             (
                 "kKeyVariantAES_OCB_128",
                 constants::K_KEY_VARIANT_AES_OCB_128,
@@ -1697,9 +1689,7 @@ fn secret_key_bytes(
         throw_type_error(scope, "The key must be a KeyObjectHandle");
         return None;
     };
-    let Some(name) = v8::String::new(scope, "getKeyType") else {
-        return None;
-    };
+    let name = v8::String::new(scope, "getKeyType")?;
     let function = handle.get(scope, name.into())?;
     let function = v8::Local::<v8::Function>::try_from(function).ok()?;
     let key_type = function.call(scope, handle.into(), &[])?;

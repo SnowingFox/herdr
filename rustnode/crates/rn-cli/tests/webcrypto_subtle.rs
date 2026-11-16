@@ -94,7 +94,9 @@ fn script(lines: &[(&str, &str)]) -> String {
     source.push_str(SUMMARY);
     source.push_str("(async () => {\n");
     for (label, body) in lines {
-        source.push_str(&format!("  console.log(await line({label:?}, async () => {{ {body} }}));\n"));
+        source.push_str(&format!(
+            "  console.log(await line({label:?}, async () => {{ {body} }}));\n"
+        ));
     }
     source.push_str("})();\n");
     source

@@ -214,12 +214,8 @@ pub fn create_crypto_key<'s>(
     let constructor: v8::Local<v8::Function> = v8::Local::new(scope, &constructor);
     let mask = v8::Integer::new_from_unsigned(scope, usages_mask);
     let flag = v8::Boolean::new(scope, extractable);
-    let mut args: Vec<v8::Local<'s, v8::Value>> = vec![
-        handle.into(),
-        algorithm,
-        mask.into(),
-        flag.into(),
-    ];
+    let mut args: Vec<v8::Local<'s, v8::Value>> =
+        vec![handle.into(), algorithm, mask.into(), flag.into()];
     if let Some(secondary) = secondary_handle {
         args.push(secondary);
     }
