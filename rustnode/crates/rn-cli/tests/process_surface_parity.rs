@@ -174,12 +174,24 @@ fn the_process_values_match_the_oracle() {
     );
 }
 
-/// `globalThis` has no name the oracle does not.
+/// `globalThis` has no name the oracle does not, except the allowlisted additions.
 ///
 /// The direction that matters is the first one: a leaked `primordials` or
 /// `require` is an *extra* name, and `test/common/index.js` fails any test whose
 /// process has one. A missing name is reported rather than failed, because the
 /// Web Streams and `perf_hooks` globals are a separate gap.
+///
+/// # Why `Bun` is allowed here
+///
+/// `Bun` is the one global rustnode adds on purpose, and it is not a leak. It is
+/// installed by `rn-realm::install_early_globals` in every mode, it is
+/// non-enumerable so `common/index.js`'s audit does not see it, and
+/// `crates/rn-cli/tests/m0_foundation.rs` pins the enumerable count at 9 with it
+/// present. Listing it here is what makes the test's claim precise: every name
+/// other than `Bun` must be one Node has too, and `Bun` must be the *only*
+/// exception. A second entry here would be a second exception nobody reviewed.
+const DELIBERATE_ADDITIONS: &[&str] = &["Bun"];
+
 #[test]
 fn global_this_leaks_nothing_the_oracle_hides() {
     let Some((ours, theirs)) = both() else {
@@ -198,12 +210,27 @@ fn global_this_leaks_nothing_the_oracle_hides() {
         .filter_map(|name| name.as_str())
         .collect();
 
-    let extra: Vec<&&str> = ours.iter().filter(|name| !theirs.contains(name)).collect();
+    let extra: Vec<&&str> = ours
+        .iter()
+        .filter(|name| !theirs.contains(name))
+        .filter(|name| !DELIBERATE_ADDITIONS.contains(name))
+        .collect();
     assert!(
         extra.is_empty(),
         "globalThis has {} name(s) the oracle hides: {extra:?}",
         extra.len()
     );
+
+    // The allowlist is a claim, not an escape hatch: a name in it that is *not*
+    // present would mean the allowed exception stopped existing, and the entry
+    // would sit here pretending the surface still adds it.
+    for name in DELIBERATE_ADDITIONS {
+        assert!(
+            ours.contains(name),
+            "{name} is allowlisted as a deliberate addition but is not on \
+             globalThis, so the allowlist is stale"
+        );
+    }
 
     let missing: Vec<&&str> = theirs.iter().filter(|name| !ours.contains(name)).collect();
     if !missing.is_empty() {

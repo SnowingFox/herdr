@@ -1,0 +1,22 @@
+[package]
+name = "rn-bun-check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reports the Bun.* declarations and deferrals assembled from every contribution crate"
+
+# A `tools/*` crate, for the same reason `rn-node-oracle` is one: it exports no
+# binding, and `tools/regen-bindings.sh` and `tools/regen-bun-contributions.sh`
+# both scan `crates/*`.
+
+[[bin]]
+name = "rn-bun-check"
+path = "src/main.rs"
+
+[dependencies]
+rn-bun-api = { path = "../../crates/rn-bun-api" }
+rn-bun-members = { path = "../../crates/rn-bun-members" }
+serde.workspace = true
+serde_json.workspace = true

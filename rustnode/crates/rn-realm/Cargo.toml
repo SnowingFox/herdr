@@ -34,6 +34,10 @@ rn-module-wrap = { path = "../rn-module-wrap" }
 rn-bind-timers = { path = "../rn-bind-timers" }
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 rn-bind-zlib = { path = "../rn-bind-zlib" }
+# The `Bun` global. It is installed from `install_early_globals` rather than from
+# the binding registry, because Bun's surface is a global rather than an
+# `internalBinding()` namespace; see `rn-bun`'s module docs for the ordering.
+rn-bun = { path = "../rn-bun" }
 rn-js2c = { path = "../rn-js2c" }
 rn-napi = { path = "../rn-napi" }
 # `getLinkedBinding` checks the `addon` scope against the module name before it

@@ -318,6 +318,26 @@ def crate_deferrals():
                 # Named, not skipped: the entry states why this file cannot hold
                 # a namespace deferral, and an unlisted file fails below.
                 continue
+            if relative.startswith("crates/rn-bun-") and not relative.startswith(
+                "crates/rn-bun-api/"
+            ):
+                # Every `Bun.*` contribution crate: `Bun` is a global, not an
+                # `internalBinding` namespace, so a contribution crate implements
+                # `BunModule` rather than `BindingModule` and its `DEFERRED` list
+                # has no `namespace()` to attribute itself to. This is a *rule*
+                # rather than one entry per crate on purpose: six workers add
+                # crates in parallel, and a list would make each of them edit this
+                # tool. `rn-bun-api` is excluded because it owns the trait and has
+                # no members of its own.
+                #
+                # What replaces the check here is stronger than what it would have
+                # given: `tools/bun-surface-guard.py` reports every deferral by name
+                # with its reason, and `BunRegistry::register_module` refuses a
+                # reasonless deferral, a deferral of a member the crate also
+                # installs, and a deferral that collides with another crate — none
+                # of which this tool can see at all, because it never looks at a
+                # Bun contribution's members.
+                continue
 
             attributed = False
             for start, end in impl_blocks(text):

@@ -1550,6 +1550,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bun"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rn-bun-api",
+ "rn-bun-members",
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-bun-api"
+version = "0.1.0"
+dependencies = [
+ "rn-core",
+ "rn-v8-sys",
+]
+
+[[package]]
+name = "rn-bun-check"
+version = "0.1.0"
+dependencies = [
+ "rn-bun-api",
+ "rn-bun-members",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rn-bun-members"
+version = "0.1.0"
+dependencies = [
+ "rn-bun-api",
+ "rn-bun-time",
+]
+
+[[package]]
+name = "rn-bun-time"
+version = "0.1.0"
+dependencies = [
+ "rn-bun-api",
+ "rn-core",
+ "rn-node-oracle",
+ "rn-v8-sys",
+ "serde_json",
+]
+
+[[package]]
 name = "rn-cli"
 version = "0.1.0"
 dependencies = [
@@ -1731,6 +1779,7 @@ dependencies = [
  "rn-bind-timers",
  "rn-bind-zlib",
  "rn-builtins",
+ "rn-bun",
  "rn-core",
  "rn-env",
  "rn-errors",

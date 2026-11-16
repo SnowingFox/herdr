@@ -1,0 +1,20 @@
+[package]
+name = "rn-bun-time"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bun's process-relative clock members"
+
+[dependencies]
+rn-bun-api = { path = "../rn-bun-api" }
+rn-core.workspace = true
+rn-v8-sys.workspace = true
+
+[dev-dependencies]
+# The differential half runs the same probe under Bun 1.4.4 and under the built
+# runtime, and the "must not break Node" half compares against the pinned Node
+# oracle. Neither is a runtime dependency.
+rn-node-oracle = { path = "../../tools/node-oracle" }
+serde_json.workspace = true
