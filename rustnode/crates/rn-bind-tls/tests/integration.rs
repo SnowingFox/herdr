@@ -398,54 +398,205 @@ fn a_tls_socket_constructs() {
     );
 }
 
-/// A TLS connection whose `host` is an **IP literal** still does not let the
-/// process exit, and this test records that rather than hiding it.
+// ---------------------------------------------------------------------------
+// A TLS connection must let the process exit, whatever address family it used
+// ---------------------------------------------------------------------------
+
+/// How a TLS connection in [`exits_after_tls`] ends.
 ///
-/// Every event completes — `secureConnect`, `'data'`, `'end'`, `'close'` and the
-/// `server.close()` callback — and the loop still reports a **referenced, active
-/// timer** afterwards. Measured with `uv_walk`:
+/// The two directions are separate because they reach different teardown paths:
+/// an explicit `end()` runs the writable side's `shutdown`, while a
+/// server-initiated close arrives as `UV_EOF` on the client's underlying stream
+/// before the caller has written anything again.
+#[derive(Clone, Copy, Debug)]
+enum Close {
+    /// The client calls `end()` once the reply arrives, as the reported
+    /// reproduction did.
+    ClientEnds,
+    /// The server ends the socket and the client never calls `end()`; it only
+    /// waits for `'close'`.
+    ServerEnds,
+}
+
+impl Close {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ClientEnds => "client-end",
+            Self::ServerEnds => "server-end",
+        }
+    }
+}
+
+/// Runs a TLS client/server pair against `host` and asserts the process exits.
 ///
-/// | `host` | exits | timers after close |
-/// | --- | --- | --- |
-/// | omitted | yes, ~70ms | all `active=0` |
-/// | `'localhost'` | yes, ~85ms | all `active=0` |
-/// | `'127.0.0.1'` | **no** | one `active=1` |
+/// # What this measures, and why the exit status is the assertion
 ///
-/// So the difference is the address-literal branch of `net.connect`, not the TLS
-/// handshake: an IP skips `dns.lookup` and completes the connect from
-/// `_handle.connect` directly. `handshakeTimeout: 0` also makes it exit, which
-/// points at the handshake timer being armed a second time on that branch and
-/// never cleared, after `_finishInit` cleared the first one.
+/// Every intermediate event of these connections has always succeeded: the
+/// handshake completes, the payload decrypts, `'end'` and `'close'` fire, and
+/// `server.close()` reaches its callback. The defect was that the loop still had
+/// **referenced work** afterwards, so `uv_run` blocked for the remainder of a
+/// 120-second deadline and the process never exited. Nothing observable from
+/// JavaScript inside the process distinguishes that from success, which is why
+/// the check is the exit status and a bound on it: `run_tls` kills the process
+/// after 6 seconds, so a hang is exit code 124 and a failure rather than a
+/// hanging test run.
 ///
-/// The `#[ignore]` is deliberate: the assertion is the *desired* behaviour, and it
-/// fails today. Removing the attribute is the definition of done for this gap.
-#[test]
-#[ignore = "an IP-literal host leaves a referenced timer armed after close; the \
-            handshake and all events succeed, the process just never exits"]
-fn an_ip_literal_host_lets_the_process_exit() {
+/// `CLOSED` is printed from inside the `server.close()` callback, so it cannot
+/// appear unless the listening handle *and* the accepted socket really closed.
+///
+/// # The `SKIP` arm
+///
+/// `::1` is absent on a kernel booted without IPv6, where the listen fails with
+/// `EADDRNOTAVAIL`. That is an environment fact rather than a verdict about this
+/// runtime, so the script says so and the caller treats it as a skip. Every
+/// other outcome is asserted.
+fn exits_after_tls(host: &str, listen: &str, close: Close) {
     let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl is not available to generate a certificate");
         return;
+    };
+    // The two close directions only differ in which side calls `end`. The
+    // server-end arm still needs a `'data'` listener: a paused stream never
+    // reaches `'end'`, so `'close'` would never fire and the test would measure
+    // its own missing listener rather than the runtime. Real `node` hangs on the
+    // same script without it (measured), so this is the script's requirement and
+    // not a rustnode behaviour.
+    let teardown = match close {
+        Close::ClientEnds => {
+            "c.on('data', () => { c.end(); server.close(() => console.log('CLOSED')); });"
+        }
+        Close::ServerEnds => {
+            "c.on('data', () => {}); \
+             c.on('close', () => server.close(() => console.log('CLOSED')));"
+        }
     };
     let script = format!(
         "\
         const tls = require('tls'); \
         const fs = require('fs'); \
         const opts = {{ \
-          key: fs.readFileSync('{key}'), \
-          cert: fs.readFileSync('{cert}'), \
+          key: fs.readFileSync({key:?}), \
+          cert: fs.readFileSync({cert:?}), \
         }}; \
         const server = tls.createServer(opts, (sock) => sock.end('x')); \
-        server.listen(0, '127.0.0.1', () => {{ \
+        server.on('error', (e) => {{ console.log('SKIP ' + e.code); }}); \
+        server.on('tlsClientError', (e) => console.log('S:ERR ' + e.message)); \
+        server.listen(0, {listen:?}, () => {{ \
           const c = tls.connect( \
-            {{ port: server.address().port, host: '127.0.0.1', rejectUnauthorized: false }}); \
+            {{ port: server.address().port, host: {host:?}, rejectUnauthorized: false }}); \
+          c.on('error', (e) => console.log('C:ERR ' + e.message)); \
+          {teardown} \
+        }});",
+        key = key.display().to_string(),
+        cert = cert.display().to_string(),
+        listen = listen,
+        host = host,
+        teardown = teardown,
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    let context = format!(
+        "host={host} listen={listen} close={}. stdout: {stdout} stderr: {stderr}",
+        close.label()
+    );
+    if stdout.contains("SKIP EADDRNOTAVAIL") || stdout.contains("SKIP EAFNOSUPPORT") {
+        eprintln!("skipping {host}/{listen}: the kernel has no usable {listen} address");
+        return;
+    }
+    assert!(
+        !stdout.contains("C:ERR") && !stdout.contains("S:ERR"),
+        "neither side may report an error; {context}"
+    );
+    assert!(
+        stdout.contains("CLOSED"),
+        "server.close() must reach its callback; {context}"
+    );
+    assert_eq!(
+        code, 0,
+        "the process must exit 0 within 6s rather than blocking on a live handle; {context}"
+    );
+}
+
+/// The four address families × close directions, as one test each.
+///
+/// A single test would report one failure for whichever case came first and stop
+/// there, so each cell is named. The `127.0.0.1` and `::1` cells are the ones
+/// that failed before the fix; `localhost` is here because it passed, and a fix
+/// that made the literal paths exit by breaking the name path would otherwise
+/// look correct.
+#[test]
+fn a_tls_connection_to_an_ipv4_literal_lets_the_process_exit_after_client_end() {
+    exits_after_tls("127.0.0.1", "127.0.0.1", Close::ClientEnds);
+}
+
+#[test]
+fn a_tls_connection_to_an_ipv4_literal_lets_the_process_exit_after_server_end() {
+    exits_after_tls("127.0.0.1", "127.0.0.1", Close::ServerEnds);
+}
+
+#[test]
+fn a_tls_connection_to_an_ipv6_literal_lets_the_process_exit_after_client_end() {
+    exits_after_tls("::1", "::1", Close::ClientEnds);
+}
+
+#[test]
+fn a_tls_connection_to_an_ipv6_literal_lets_the_process_exit_after_server_end() {
+    exits_after_tls("::1", "::1", Close::ServerEnds);
+}
+
+#[test]
+fn a_tls_connection_to_a_hostname_lets_the_process_exit_after_client_end() {
+    exits_after_tls("localhost", "127.0.0.1", Close::ClientEnds);
+}
+
+#[test]
+fn a_tls_connection_to_a_hostname_lets_the_process_exit_after_server_end() {
+    exits_after_tls("localhost", "127.0.0.1", Close::ServerEnds);
+}
+
+/// The same property over a Unix domain socket, where there is no address family
+/// at all.
+///
+/// This is the control for the diagnosis: the leak was the loop's shared
+/// `uv_timer_t` staying referenced, which is armed by the TLS handshake deadline
+/// on every transport, so a path with no `dns.lookup` and no numeric address must
+/// fail the same way before the fix and pass after it.
+#[test]
+fn a_tls_connection_over_a_unix_socket_lets_the_process_exit() {
+    let Some((key, cert)) = certificate() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("rn-tls-unix-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the temp dir must be creatable");
+    let socket = dir.join("tls.sock");
+    let script = format!(
+        "\
+        const tls = require('tls'); \
+        const fs = require('fs'); \
+        const path = {socket:?}; \
+        try {{ fs.unlinkSync(path); }} catch {{}} \
+        const opts = {{ key: fs.readFileSync({key:?}), cert: fs.readFileSync({cert:?}) }}; \
+        const server = tls.createServer(opts, (sock) => sock.end('x')); \
+        server.on('tlsClientError', (e) => console.log('S:ERR ' + e.message)); \
+        server.listen(path, () => {{ \
+          const c = tls.connect({{ path, rejectUnauthorized: false }}); \
+          c.on('error', (e) => console.log('C:ERR ' + e.message)); \
           c.on('data', () => {{ c.end(); server.close(() => console.log('CLOSED')); }}); \
         }});",
-        key = key.display(),
-        cert = cert.display()
+        socket = socket.display().to_string(),
+        key = key.display().to_string(),
+        cert = cert.display().to_string(),
     );
-    let (stdout, _stderr, code) = run_tls(&script);
-    assert_eq!(code, 0, "the process must exit; stdout: {stdout}");
-    assert!(stdout.contains("CLOSED"), "stdout: {stdout}");
+    let (stdout, stderr, code) = run_tls(&script);
+    let _ = std::fs::remove_file(&socket);
+    assert!(
+        stdout.contains("CLOSED"),
+        "server.close() must reach its callback; stdout: {stdout} stderr: {stderr}"
+    );
+    assert_eq!(
+        code, 0,
+        "a TLS connection over a Unix socket must let the process exit; \
+         stdout: {stdout} stderr: {stderr}"
+    );
 }
 
 /// A TLS connection lets the process exit, and `server.close()` reaches its
