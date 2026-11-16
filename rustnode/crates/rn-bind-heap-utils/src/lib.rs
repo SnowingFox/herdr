@@ -42,11 +42,7 @@ pub mod stream;
 
 /// Members exposed on the namespace object, matching
 /// `contracts/heap_utils.json`.
-pub const MEMBERS: &[&str] = &[
-    "buildEmbedderGraph",
-    "createHeapSnapshotStream",
-    "triggerHeapSnapshot",
-];
+pub const MEMBERS: &[&str] = &["createHeapSnapshotStream", "triggerHeapSnapshot"];
 
 /// Members this build does not implement, each with the reason.
 ///
@@ -54,9 +50,11 @@ pub const MEMBERS: &[&str] = &[
 /// failure, so these are visible rather than silent.
 pub const DEFERRED: &[(&str, &str)] = &[(
     "buildEmbedderGraph",
-    "needs v8::HeapProfiler::AddBuildEmbedderGraphCallback with an EmbedderGraph subclass, and \
-     describes Node's BaseObject hierarchy to the inspector; the v8 crate exposes no embedder \
-     graph binding at all, and rustnode has neither that hierarchy nor an inspector",
+    "src/heap_utils.cc:BuildEmbedderGraph walks the embedder graph through \
+     Environment::BuildEmbedderGraph into a JSGraph; the v8 crate this build links \
+     binds no HeapProfiler method except TakeHeapSnapshot, so the callback the walk \
+     needs cannot be registered at all, and the node it would produce has no \
+     rustnode equivalent because the walked hierarchy is Node's BaseObject tree",
 )];
 
 pub struct HeapUtils;
@@ -391,27 +389,44 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
 
 /// `internalBinding('internal_only_v8')`.
 ///
-/// One member, `queryObjects`, which `lib/internal/heap_utils.js` destructures at
-/// module scope — and `lib/v8.js` requires that file — so the namespace has to
-/// exist before `require('v8')` can load at all.
+/// One contract member, `queryObjects`, which `lib/internal/heap_utils.js`
+/// destructures at module scope — and `lib/v8.js` requires that file — so the
+/// namespace has to exist before `require('v8')` can load at all. The name is
+/// absent from the object because it is deferred; see
+/// [`INTERNAL_ONLY_V8_DEFERRED`].
 ///
 /// The implementation is a genuine deferral rather than an oversight: Node's
 /// `QueryObjects` walks the heap through
 /// `HeapProfiler::QueryObjects(context, predicate, out)` with a C++
 /// `QueryObjectPredicate` that checks the creation context and the prototype
-/// chain. The `v8` crate this build links exposes no `QueryObjects` binding at
-/// all, so there is no API to call, and returning an empty array would claim
-/// every object had been collected.
+/// chain. The `v8` crate this build links binds only
+/// `HeapProfiler::TakeHeapSnapshot`, so there is no call to make, and returning
+/// an empty array would claim every object had been collected.
 pub struct InternalOnlyV8;
 
 /// Members `contracts/internal_only_v8.json` records.
-pub const INTERNAL_ONLY_V8_MEMBERS: &[&str] = &["queryObjects"];
+pub const INTERNAL_ONLY_V8_MEMBERS: &[&str] = &[];
 
 /// Why `queryObjects` is not implemented.
+///
+/// `src/internal_only_v8.cc:QueryObjects` walks the heap with
+/// `Isolate::GetHeapProfiler()->QueryObjects(context, &predicate, &out)`, where
+/// the predicate is a C++ `v8::QueryObjectPredicate` subclass that filters on the
+/// creation context and the prototype chain. The filter is the whole behaviour:
+/// it is what makes `v8.queryObjects(Ctor)` answer only objects of that realm
+/// whose prototype chain contains `Ctor.prototype`.
+///
+/// The `v8` header declares it (`v8-152.2.0/v8/include/v8-profiler.h:1008`), but
+/// the crate's `binding.cc` binds no `HeapProfiler` method other than
+/// `TakeHeapSnapshot`, so neither `QueryObjects` nor the C++ subclass it takes is
+/// reachable from Rust. An empty array would claim every object had been
+/// collected, which is worse than an absent member.
 pub const INTERNAL_ONLY_V8_DEFERRED: &[(&str, &str)] = &[(
     "queryObjects",
-    "needs v8::HeapProfiler::QueryObjects with a C++ QueryObjectPredicate; the v8 crate \
-     exposes no such binding, and an empty array would claim every object had been collected",
+    "needs v8::HeapProfiler::QueryObjects and a C++ v8::QueryObjectPredicate \
+     subclass; the v8 crate binds only HeapProfiler::TakeHeapSnapshot, so neither \
+     the walk nor the predicate it takes is reachable, and an empty array would \
+     claim every object had been collected",
 )];
 
 impl BindingModule for InternalOnlyV8 {
@@ -445,19 +460,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn members_cover_the_recorded_contract() {
-        assert_eq!(
-            MEMBERS,
-            [
-                "buildEmbedderGraph",
-                "createHeapSnapshotStream",
-                "triggerHeapSnapshot"
-            ]
-        );
+    fn members_cover_the_recorded_contract_without_the_deferral() {
+        assert_eq!(MEMBERS, ["createHeapSnapshotStream", "triggerHeapSnapshot"]);
         for (name, reason) in DEFERRED {
+            // `MEMBERS` means "install() sets this". A deferred name in both lists
+            // cancels itself out of the contract subtraction, which is the shape
+            // `sqlite.backup` shipped; the gate reports the pair as a
+            // contradiction now.
             assert!(
-                MEMBERS.contains(name),
-                "{name} is deferred but not a member"
+                !MEMBERS.contains(name),
+                "{name} is deferred, so it must not also be claimed installed"
             );
             assert!(!reason.is_empty(), "{name} has no reason");
         }

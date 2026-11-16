@@ -169,6 +169,17 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "bigintStatValues",
         "bigint view of stat fields, follows the BigInt stat surface",
     ),
+    // A platform gap, not an unimplemented feature: `src/node_file.cc` registers
+    // this under `#ifdef _WIN32` only (`:5763-5765`), so a Linux Node has no
+    // `fs.handleToFd` at all — `'handleToFd' in process.binding('fs')` is `false`
+    // there. The contract records it because the recorder's static pass over
+    // `lib/**` found it (`internal/fs/streams.js:186`, the Windowshandle path),
+    // and declaring it is what keeps that recorded gap visible on this platform.
+    (
+        "handleToFd",
+        "Windows-only member: Node registers it under #ifdef _WIN32 alone, so on Unix \
+         there is no fs.handleToFd to implement",
+    ),
     (
         "statFsValues",
         "statfs field layout, lands with the statfs member",
@@ -231,7 +242,6 @@ pub const MEMBERS: &[&str] = &[
     "readFileUtf8",
     "writeFileUtf8",
     "internalModuleStat",
-    "handleToFd",
     // Module-loader helpers. `lib/internal/modules/helpers.js` calls both
     // directly, and the ESM resolver depends on `legacyMainResolve` for every
     // package without an `exports` map. `legacy_main.rs` owns them.
@@ -305,7 +315,6 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
         mkfn!(self, "readFileUtf8", read_file_utf8_binding);
         mkfn!(self, "writeFileUtf8", write_file_utf8_binding);
         mkfn!(self, "internalModuleStat", internal_module_stat_binding);
-        mkfn!(self, "handleToFd", handle_to_fd_binding);
         mkfn!(
             self,
             "legacyMainResolve",
@@ -2039,20 +2048,4 @@ fn internal_module_stat_binding<'a, 's, 'i>(
         None => -libc::EINVAL,
     };
     rv.set(v8::Number::new(scope, f64::from(result)).into());
-}
-
-/// `handleToFd(handle, flags)`: Windows-only in Node.
-///
-/// `lib/internal/fs/streams.js` throws `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`
-/// before calling this on Unix, so reporting the same unsupported condition is
-/// the only correct behaviour.
-fn handle_to_fd_binding<'a, 's, 'i>(
-    scope: &'a mut v8::PinScope<'s, 'i>,
-    _args: v8::FunctionCallbackArguments<'s>,
-    mut rv: v8::ReturnValue<'s>,
-) {
-    match fsops::handle_to_fd() {
-        Ok(fd) => rv.set(v8::Number::new(scope, f64::from(fd)).into()),
-        Err(error) => throw_error(scope, &error),
-    }
 }

@@ -168,18 +168,24 @@ fn chdir_returns_zero_then_a_negative_errno() {
 }
 
 #[test]
-fn dlopen_is_installed_and_dlopen_binary_stays_deferred() {
-    // `dlopen` loads a real addon now, so it must be present. `dlopenBinary` loads
-    // one from bytes through a self-cleaning image and is still deferred; reporting
-    // it as present but non-functional would surface much later as a missing addon,
-    // so it must be genuinely absent.
+fn every_process_method_the_contract_records_is_installed() {
+    // `dlopen`, `dlopenBinary`, `execve` and `causeSegfault` are all real now.
+    // The two that used to be listed here as deferred — `dlopenBinary` and
+    // `execve` — were deferred under reasons that did not survive being checked:
+    // `execve`'s said the event loop had to quiesce, which Node's own
+    // implementation deliberately does not do (`src/node_process_methods.cc:600`),
+    // and `dlopenBinary`'s said the addon image was "a separate slice" when the
+    // materialization is thirty lines over a memfd.
     //
-    // `execve` is the other deferred member, kept here so this test still pins the
-    // distinction between "implemented" and "declared missing".
+    // Both were also in `MEMBERS` at the same time, so the contract subtraction
+    // cancelled them and `rn-compat` reported the namespace clean while `lib/**`
+    // read `undefined`. Pinning `typeof` here is what makes that visible.
     let output = run(&format!(
-        "{PRELUDE} console.log(typeof pm.dlopen, typeof pm.dlopenBinary, typeof pm.execve);"
+        "{PRELUDE}
+        console.log(['dlopen', 'dlopenBinary', 'execve', 'causeSegfault',
+                     'setEmitWarningSync'].map((name) => typeof pm[name]).join(' '));"
     ));
-    assert_eq!(output, "function undefined undefined");
+    assert_eq!(output, "function function function function function");
 }
 
 #[test]

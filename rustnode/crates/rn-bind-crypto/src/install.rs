@@ -158,6 +158,14 @@ pub const MEMBERS: &[&str] = &[
     "getCertificateCompressionAlgorithms",
     "startLoadingCertificatesOffThread",
     "createNativeKeyObjectClass",
+    // Installed by `rn_bind_crypto_keys::install_classes` alongside the rest of
+    // the key class protocol. It was listed in `DEFERRED` with a reason claiming
+    // it was "deferred with the key surface" while `install()` had been setting
+    // it for as long as the keys crate existed, which is the contradiction the
+    // structure gate reports as `installed-but-unclaimed`. `lib/internal/crypto/util.js:488`
+    // calls it at module scope to build the algorithm-availability table, so a
+    // deferral was also the wrong claim about reachability.
+    "isKeyAlgorithmAvailable",
     "createCryptoKeyClass",
     "getCryptoKeySlots",
     "isCryptoKey",
@@ -309,10 +317,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     (
         "certVerifySpkac",
         "SPKAC verification needs the certificate surface, deferred with X.509.",
-    ),
-    (
-        "isKeyAlgorithmAvailable",
-        "Asks whether a named key algorithm is usable; deferred with the key surface.",
     ),
     (
         "kKEMDecapsulate",

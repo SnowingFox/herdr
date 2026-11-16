@@ -167,7 +167,6 @@ KNOWN_UNGUARDED = {
     "crypto.certVerifySpkac",
     "crypto.getCachedMacAliases",
     "crypto.isCryptoKey",
-    "crypto.isKeyAlgorithmAvailable",
     "crypto.setFipsCrypto",
     "fs.CpDirJob",
     "fs.cpSyncCopyDir",
@@ -177,12 +176,31 @@ KNOWN_UNGUARDED = {
     "messaging.broadcastChannel",
     "performance.Histogram",
     "performance.SlidingWindowHistogram",
-    "process_methods.dlopenBinary",
-    "process_methods.execve",
     "v8.startCpuProfile",
     "v8.startHeapProfile",
     "v8.stopCpuProfile",
     "v8.stopHeapProfile",
+    # The three below were *stubs* before: installed, and throwing "not
+    # implemented" on every call. They are declared in their crate's `DEFERRED`
+    # instead now, which is the honest shape but a shape this script can see for
+    # the first time. Each reach is a call the owning module makes, and each is
+    # unreachable or already guarded, not a defect being accepted:
+    #
+    #   builtins.importBuiltinSourceTextModule  internal/main/prof_process.js:32
+    #       reached at module scope, and that module is only dispatched by
+    #       `--prof-process`, which rustnode rejects at argument parsing.
+    #   fs.handleToFd                           internal/fs/streams.js:186
+    #       reached inside `importWindowsHandle`, which throws
+    #       `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` before this line on any
+    #       non-Windows platform. Node does not install this member on Linux at
+    #       all, so the deferred declaration is the platform gap, not a bug.
+    #   mksnapshot.compileSerializeMain          internal/main/mksnapshot.js:199
+    #       inside `minimalRunCjs`, and `internal/main/mksnapshot` is never
+    #       dispatched; it also needs the unimplemented `sea` namespace at module
+    #       scope, so it would throw before reaching this line.
+    "builtins.importBuiltinSourceTextModule",
+    "fs.handleToFd",
+    "mksnapshot.compileSerializeMain",
 }
 
 

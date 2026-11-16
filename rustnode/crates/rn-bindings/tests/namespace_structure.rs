@@ -91,47 +91,27 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// A fix deletes its own entry. The count assertion below then fails until the list
 /// is updated, so a fixed defect cannot linger here as an unnoticed exception, and
 /// the number in the test output is the debt's size.
-const KNOWN_FINDINGS: &[&str] = &[
-    // `blob.createBlobFromFilePath` — declared installed and deferred at once.
-    "blob.createBlobFromFilePath:claimed-and-deferred",
-    // `heap_utils.buildEmbedderGraph` — same shape; the reason says the v8 crate
-    // exposes no embedder-graph binding.
-    "heap_utils.buildEmbedderGraph:claimed-and-deferred",
-    // `internal_only_v8.queryObjects` — same shape. The namespace is also
-    // unreachable through `internal/test/binding`, which is a separate question.
-    "internal_only_v8.queryObjects:claimed-and-deferred",
-    // `icu.decode`, `icu.getConverter`, `icu.hasConverter` — same shape.
-    "icu.decode:claimed-and-deferred",
-    "icu.getConverter:claimed-and-deferred",
-    "icu.hasConverter:claimed-and-deferred",
-    // `process_methods.{causeSegfault,dlopenBinary,execve,setEmitWarningSync}` —
-    // same shape.
-    "process_methods.causeSegfault:claimed-and-deferred",
-    "process_methods.dlopenBinary:claimed-and-deferred",
-    "process_methods.execve:claimed-and-deferred",
-    "process_methods.setEmitWarningSync:claimed-and-deferred",
-    // (`performance.Histogram` and `performance.SlidingWindowHistogram` were here.
-    // Both are installed now, so `perf_hooks.createHistogram()` works and the
-    // entries are gone rather than reclassified. The evidence is
-    // `crates/rn-bind-performance/tests/differential.rs`, which compares every
-    // accessor against the pinned oracle.)
-    //
-    // (`sqlite.backup` was here. PR #99 removed it from `MEMBERS` and left it in
-    // `DEFERRED` with an accurate reason, so the contradiction is gone and the gap
-    // is honestly declared. `backup` itself is still unimplemented — Node's is a
-    // `function`, this one is absent — but as a declared deferral, which is what the
-    // mechanism is for, not as a member falsely claimed installed.)
-    //
-    // `util.getSharedArrayBufferGrowable` — same shape. (`util.parseEnv` was here
-    // too; `2a977ca4` implemented it and the ratchet demanded the removal.)
-    "util.getSharedArrayBufferGrowable:claimed-and-deferred",
-    // `util.arrayBufferViewHasBuffer` — claimed, never installed, no deferral.
-    "util.arrayBufferViewHasBuffer:claimed-but-absent",
-    // `crypto.isKeyAlgorithmAvailable` — installed, but listed in `DEFERRED`, so its
-    // written reason is stale. `lib/internal/crypto/util.js` calls it at module
-    // scope.
-    "crypto.isKeyAlgorithmAvailable:installed-but-unclaimed",
-];
+///
+/// # History
+///
+/// The list is empty now. Every entry that was here was either implemented or moved
+/// to its crate's `DEFERRED` with a reason, so none is an accepted exception:
+///
+/// * `performance.Histogram` and `performance.SlidingWindowHistogram` were
+///   implemented with the histogram subsystem (PR #129), so
+///   `perf_hooks.createHistogram()` works. `crates/rn-bind-performance/tests/differential.rs`
+///   compares every accessor against the pinned oracle.
+/// * `process_methods.{causeSegfault,dlopenBinary,execve,setEmitWarningSync}` and
+///   `util.{getSharedArrayBufferGrowable,arrayBufferViewHasBuffer}` are installed.
+/// * `crypto.isKeyAlgorithmAvailable` was installed already; only its stale
+///   `DEFERRED` entry was wrong, so it is claimed rather than deferred.
+/// * `blob.createBlobFromFilePath`, `icu.{decode,getConverter,hasConverter}`,
+///   `heap_utils.buildEmbedderGraph` and `internal_only_v8.queryObjects` are
+///   declared in `DEFERRED` with measured reasons, and are absent from `MEMBERS`.
+/// * `sqlite.backup` left before this: PR #99 removed it from `MEMBERS` and left it
+///   deferred with an accurate reason. It is still unimplemented, as a declared
+///   deferral rather than a member falsely claimed installed.
+const KNOWN_FINDINGS: &[&str] = &[];
 
 /// Installed members that report themselves unimplemented, as
 /// `namespace.member:not-implemented`.
@@ -141,16 +121,7 @@ const KNOWN_FINDINGS: &[&str] = &[
 /// with a live user-visible consequence, because
 /// `require('perf_hooks').monitorEventLoopDelay()` threw through it; it is
 /// implemented now and its line is gone.
-const KNOWN_STUBS: &[&str] = &[
-    "builtins.importBuiltinSourceTextModule:not-implemented",
-    // `fs.handleToFd` is a Windows-only member (`internal/fs/streams.js` calls it on
-    // that path) installed unconditionally here and then hardcoded to `ENOSYS`.
-    "fs.handleToFd:not-implemented",
-    "mksnapshot.compileSerializeMain:not-implemented",
-    // (`performance.createELDHistogram` was here; it builds a real ELD histogram
-    // now, and `monitorEventLoopDelay()` records intervals. Covered by
-    // `rn-bind-performance/tests/binding.rs` and the differential test.)
-];
+const KNOWN_STUBS: &[&str] = &[];
 
 /// What one installed member turned out to be, read from its property descriptor
 /// rather than by calling it.
@@ -1396,14 +1367,14 @@ mod rule_tests {
         // fix lands, its line and this number change in the same commit.
         assert_eq!(
             KNOWN_FINDINGS.len(),
-            13,
+            0,
             "KNOWN_FINDINGS holds the structural debt; update this count when a fix \
              removes an entry: {:?}",
             KNOWN_FINDINGS
         );
         assert_eq!(
             KNOWN_STUBS.len(),
-            3,
+            0,
             "KNOWN_STUBS holds the stub debt; update this count when a fix removes an \
              entry: {:?}",
             KNOWN_STUBS

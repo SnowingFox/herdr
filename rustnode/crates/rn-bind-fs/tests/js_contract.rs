@@ -885,7 +885,6 @@ fn member_list_tracks_node_minus_documented_deferrals() {
         "ftruncate",
         "futimes",
         "getFormatOfExtensionlessFile",
-        "handleToFd",
         "internalModuleStat",
         "lchown",
         "legacyMainResolve",
@@ -925,7 +924,11 @@ fn member_list_tracks_node_minus_documented_deferrals() {
     // `cp.js` have no fallback on the plain recursive path, so deferring them was
     // a `TypeError` on every `fs.cpSync(src, dest, {recursive: true})` rather
     // than a slower copy.
-    let deferred: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    //
+    // `handleToFd` remains: Node registers it under `#ifdef _WIN32` only, so there
+    // is no such member to install on Linux and the contract's recorded gap is
+    // declared rather than claimed.
+    let deferred: std::collections::BTreeSet<&str> = ["handleToFd"].into_iter().collect();
 
     // Not in Node's `SetMethod` list: the request constructor the JS
     // instantiates, and the promise-mode sentinel it forwards.
