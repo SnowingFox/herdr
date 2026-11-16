@@ -584,7 +584,10 @@ impl BindingModule for Crypto {
             ),
             (
                 "getCachedMacAliases",
-                v8::FunctionTemplate::builder(get_cached_mac_aliases)
+                // `rn_core::method` like every neighbour in this table: it is a
+                // `SetMethodNoSideEffect` member in `crypto_mac.cc`, so Node
+                // gives it no `[[Construct]]` and `new` is a `TypeError`.
+                rn_core::method(get_cached_mac_aliases)
                     .build(scope)
                     .get_function(scope),
             ),

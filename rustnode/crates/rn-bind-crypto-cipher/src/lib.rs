@@ -142,17 +142,16 @@ pub fn install_classes<'s>(
         ("privateEncrypt", public_key::Cipher::Sign),
         ("publicDecrypt", public_key::Cipher::Recover),
     ] {
+        // `rn_core::method`, not a bare builder: these four are Node's
+        // `SetMethod`, which passes `ConstructorBehavior::kThrow`, so
+        // `new binding.crypto.publicEncrypt(...)` is a `TypeError` on Node.
+        // A bare `FunctionTemplate::builder` defaults to `Allow`, which made
+        // every one of them constructible here and not there.
         let function = match operation {
-            public_key::Cipher::Encrypt => {
-                v8::FunctionTemplate::builder(public_encrypt).build(scope)
-            }
-            public_key::Cipher::Decrypt => {
-                v8::FunctionTemplate::builder(private_decrypt).build(scope)
-            }
-            public_key::Cipher::Sign => v8::FunctionTemplate::builder(private_encrypt).build(scope),
-            public_key::Cipher::Recover => {
-                v8::FunctionTemplate::builder(public_decrypt).build(scope)
-            }
+            public_key::Cipher::Encrypt => rn_core::method(public_encrypt).build(scope),
+            public_key::Cipher::Decrypt => rn_core::method(private_decrypt).build(scope),
+            public_key::Cipher::Sign => rn_core::method(private_encrypt).build(scope),
+            public_key::Cipher::Recover => rn_core::method(public_decrypt).build(scope),
         }
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate crypto.{name}"))?;

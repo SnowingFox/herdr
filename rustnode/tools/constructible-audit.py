@@ -68,20 +68,15 @@ PROTOTYPE_EXEMPT = frozenset()
 # reported as a defect, and so removing one from this list is what proves a class
 # shipped. An entry whose member becomes installed fails the audit as stale.
 DEFERRED = (
-    "crypto.Argon2Job",
     "crypto.ChaCha20Poly1305CipherJob",
-    "crypto.CheckPrimeJob",
     "crypto.DHBitsJob",
     "crypto.DhKeyPairGenJob",
     "crypto.DsaKeyPairGenJob",
-    "crypto.ECDH",
     "crypto.KEMDecapsulateJob",
     "crypto.KEMEncapsulateJob",
     "crypto.KangarooTwelveJob",
     "crypto.KmacJob",
     "crypto.Mac",
-    "crypto.RandomBytesJob",
-    "crypto.RandomPrimeJob",
     "crypto.TurboShakeJob",
     "fs.CpDirJob",
     "performance.Histogram",
