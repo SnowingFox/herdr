@@ -92,7 +92,27 @@ pub fn write_buffer<'s>(
     let Some(buffer) = (unsafe { view_buffer(buffer) }) else {
         return WriteResult::Status(EINVAL);
     };
-    dispatch(scope, handle, request, vec![buffer], Vec::new(), owner)
+    dispatch(
+        scope,
+        handle,
+        request,
+        WriteBuffers::One(buffer),
+        Vec::new(),
+        owner,
+    )
+}
+
+/// `StreamBase::Write`'s buffer list, on the stack for the one-chunk case.
+///
+/// Every hot write in `lib/**` is a single chunk: `writeUtf8String` for a
+/// string, `writeBuffer` for a `Buffer`, and the `writev` a socket issues for
+/// one pending piece. A `Vec` per write is a heap allocation per request on the
+/// keep-alive path; the profile showed one `malloc`/`free` pair per request for
+/// exactly this list. `SmallVec` is not a dependency here, so the shape is
+/// spelled out by hand.
+enum WriteBuffers {
+    One(uv::uv_buf_t),
+    Many(Vec<uv::uv_buf_t>),
 }
 
 /// `StreamBase::Write`: try the write synchronously, then queue what is left.
@@ -113,11 +133,11 @@ fn dispatch<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     handle: &mut impl StreamHandle,
     request: Option<v8::Local<'s, v8::Object>>,
-    mut buffers: Vec<uv::uv_buf_t>,
+    mut buffers: WriteBuffers,
     owned: Vec<Box<[u8]>>,
     owner: v8::Local<'s, v8::Object>,
 ) -> WriteResult<'s> {
-    let total: usize = buffers.iter().map(|buffer| buffer.len).sum();
+    let total = buffers.total();
     let state = handle.stream_state();
     if !state.is_alive() {
         return WriteResult::Status(EINVAL);
@@ -127,10 +147,10 @@ fn dispatch<'s>(
     state.bytes_written += total as u64;
     let stream = state.stream;
 
-    // SAFETY: the stream is live and `buffers` is valid for the call. If a
+    // SAFETY: the stream is live and the buffers are valid for the call. If a
     // request is queued below, the storage the buffers point at is kept alive by
     // `owned` (strings) or by `req.buffer` (views).
-    let written = unsafe { stream::try_write(stream, &mut buffers) };
+    let written = unsafe { buffers.try_write(stream) };
     if written >= total {
         // Everything was taken, so no request is created; `afterWriteDispatched`
         // reads the zero as "completed synchronously".
@@ -142,23 +162,9 @@ fn dispatch<'s>(
         return WriteResult::Status(0);
     }
     // Slice off what landed, as `DoTryWrite` does: the partially written buffer
-    // keeps its tail, and fully written ones are discarded.
-    let mut remaining = written;
-    let mut start = 0;
-    while start < buffers.len() {
-        if buffers[start].len > remaining {
-            // SAFETY: `remaining` is less than this buffer's length, so the tail
-            // stays inside the allocation the caller provided.
-            buffers[start] = uv::uv_buf_t {
-                base: unsafe { buffers[start].base.add(remaining) },
-                len: buffers[start].len - remaining,
-            };
-            break;
-        }
-        remaining -= buffers[start].len;
-        start += 1;
-    }
-    buffers.drain(..start);
+    // keeps its tail, and fully written ones are discarded. Only now does the
+    // list become a `Vec`, because libuv keeps the array until the completion.
+    let buffers = buffers.after_partial_write(written);
     let pending: usize = buffers.iter().map(|buffer| buffer.len).sum();
 
     let Some(request) = request.or_else(|| write_wrap(scope)) else {
@@ -169,6 +175,59 @@ fn dispatch<'s>(
     let status =
         unsafe { stream::queue_write(scope, stream, buffers, pending, request, owner, owned) };
     WriteResult::from_status(status, request)
+}
+
+impl WriteBuffers {
+    /// The bytes this list covers.
+    fn total(&self) -> usize {
+        match self {
+            Self::One(buffer) => buffer.len,
+            Self::Many(buffers) => buffers.iter().map(|buffer| buffer.len).sum(),
+        }
+    }
+
+    /// `LibuvStreamWrap::DoTryWrite`'s first call.
+    ///
+    /// # Safety
+    ///
+    /// The stream must be live and every buffer must point at storage valid for
+    /// the call.
+    unsafe fn try_write(&mut self, stream: *mut uv::uv_stream_t) -> usize {
+        match self {
+            // SAFETY: delegated to the caller.
+            Self::One(buffer) => unsafe { stream::try_write(stream, std::slice::from_mut(buffer)) },
+            // SAFETY: as above.
+            Self::Many(buffers) => unsafe { stream::try_write(stream, buffers) },
+        }
+    }
+
+    /// The buffers still to write after libuv took `written` bytes.
+    ///
+    /// This is the body of `DoTryWrite`'s caller: a partially written buffer
+    /// keeps its tail, and fully written ones are dropped.
+    fn after_partial_write(self, written: usize) -> Vec<uv::uv_buf_t> {
+        let mut buffers = match self {
+            Self::One(buffer) => vec![buffer],
+            Self::Many(buffers) => buffers,
+        };
+        let mut remaining = written;
+        let mut start = 0;
+        while start < buffers.len() {
+            if buffers[start].len > remaining {
+                // SAFETY: `remaining` is less than this buffer's length, so the
+                // tail stays inside the allocation the caller provided.
+                buffers[start] = uv::uv_buf_t {
+                    base: unsafe { buffers[start].base.add(remaining) },
+                    len: buffers[start].len - remaining,
+                };
+                break;
+            }
+            remaining -= buffers[start].len;
+            start += 1;
+        }
+        buffers.drain(..start);
+        buffers
+    }
 }
 
 /// One encoded chunk of a write, and the storage that keeps it alive.
@@ -313,7 +372,14 @@ pub fn writev<'s>(
         .into_iter()
         .filter_map(|chunk| chunk.storage)
         .collect();
-    dispatch(scope, handle, request, buffers, owned, owner)
+    dispatch(
+        scope,
+        handle,
+        request,
+        WriteBuffers::Many(buffers),
+        owned,
+        owner,
+    )
 }
 
 /// `StreamBase::WriteString<Encoding>` — `writeUtf8String` and its three
@@ -335,18 +401,36 @@ pub fn write_string<'s>(
     encoding: rn_core::Encoding,
     owner: v8::Local<'s, v8::Object>,
 ) -> WriteResult<'s> {
-    let units = string_units(scope.as_ref(), &text);
-    let storage = rn_core::codec::write(
-        &units,
-        encoding,
-        rn_core::codec::storage_size(&units, encoding),
-    );
+    // `utf8` is the one encoding `StringBytes::Write` can produce without
+    // materialising the code units first, so it takes V8's own writer. Node
+    // does the same for short strings and uses simdutf for long ones
+    // (`src/string_bytes.cc:304`), but both write straight from the string into
+    // the destination; only the codec choice differs. Every other encoding needs
+    // the units because it narrows or reinterprets them per unit.
+    let storage = if encoding == rn_core::Encoding::Utf8 {
+        let units_len = text.length();
+        rn_core::codec::write_utf8_string(scope.as_ref(), &text, units_len * 3)
+    } else {
+        let units = string_units(scope.as_ref(), &text);
+        rn_core::codec::write(
+            &units,
+            encoding,
+            rn_core::codec::storage_size(&units, encoding),
+        )
+    };
     let mut storage = storage.into_boxed_slice();
     let buffer = uv::uv_buf_t {
         base: storage.as_mut_ptr().cast(),
         len: storage.len(),
     };
-    dispatch(scope, handle, request, vec![buffer], vec![storage], owner)
+    dispatch(
+        scope,
+        handle,
+        request,
+        WriteBuffers::One(buffer),
+        vec![storage],
+        owner,
+    )
 }
 
 /// What a write produced, in the shape `FinishWrite` returns it.

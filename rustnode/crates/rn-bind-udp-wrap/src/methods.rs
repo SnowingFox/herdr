@@ -1091,7 +1091,7 @@ fn buffer_from_allocation<'s>(
 ) -> Option<v8::Local<'s, v8::Uint8Array>> {
     let array_buffer = match allocation {
         Some(allocation) if length > 0 && length <= allocation.length() => {
-            allocation.into_array_buffer(scope)
+            allocation.into_array_buffer(scope, length)
         }
         _ => {
             let store = v8::ArrayBuffer::new_backing_store(scope, 0);

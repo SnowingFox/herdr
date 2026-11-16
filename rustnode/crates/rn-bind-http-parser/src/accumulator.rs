@@ -47,6 +47,17 @@ pub struct Span {
 
 impl Span {
     pub fn push(&mut self, bytes: &[u8]) {
+        // llhttp delivers most header names and values as one span, and this
+        // `Vec` starts empty, so `extend_from_slice` grows it 0 -> 8 -> 16 -> ...
+        // — two or three reallocations and a `memcpy` for a name that never
+        // changes again. That measured as `RawVec::finish_grow` under
+        // `on_header_value` and `push_field` at 130 calls per message, about a
+        // sixth of the parser's remaining allocator traffic. Reserving the
+        // incoming span first makes the common one-span case a single
+        // allocation of the final size; a continuation still appends normally.
+        if self.bytes.is_empty() {
+            self.bytes.reserve_exact(bytes.len());
+        }
         self.bytes.extend_from_slice(bytes);
     }
 
@@ -76,7 +87,7 @@ impl Span {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Continue,
-    /// The batch is full: hand [`Accumulator::flush_batch`] to `kOnHeaders`
+    /// The batch is full: hand [`Accumulator::pairs`] to `kOnHeaders`
     /// before continuing.
     Flush,
 }
@@ -97,16 +108,58 @@ pub struct Accumulator {
     /// flush emits the pairs that were complete *before* it, and this name is
     /// the first of the next batch.
     pending_field: Option<Vec<u8>>,
+    /// `fields`/`values` as they were at the end of the last message, kept so
+    /// their buffers are reused rather than reallocated.
+    ///
+    /// Node's `fields_[kMaxHeaderFieldsCount]` is a fixed array of `StringPtr`s
+    /// and `Init` only resets each one, so its buffers persist across the
+    /// messages of a keep-alive connection. `Vec::clear` would drop the `Span`s
+    /// instead, which costs a `malloc` per header name and value per request —
+    /// the largest remaining allocator cost this crate had.
+    spare_fields: Vec<Span>,
+    spare_values: Vec<Span>,
 }
 
 impl Accumulator {
+    /// Ends the current message, keeping the span buffers for the next one.
+    ///
+    /// The `Span`s move into `spare_fields`/`spare_values` with their `Vec`s
+    /// intact and are cleared in place, so the next message's headers reuse
+    /// those allocations instead of making new ones. Node keeps its
+    /// `StringPtr` slab for the same reason (`src/node_http_parser.cc:131`).
     pub fn reset_for_message(&mut self) {
-        self.fields.clear();
-        self.values.clear();
+        self.retire_spans();
         self.url.clear();
         self.status_message.clear();
         self.flushed = false;
         self.pending_field = None;
+    }
+
+    /// Moves the live spans into the spare lists, cleared and ready to reuse.
+    fn retire_spans(&mut self) {
+        for span in self.fields.drain(..) {
+            self.spare_fields.push(span);
+        }
+        for span in self.values.drain(..) {
+            self.spare_values.push(span);
+        }
+        // Cleared after the move, so a span handed out later can never carry
+        // bytes from the message that just ended.
+        for span in self.spare_fields.iter_mut() {
+            span.clear();
+        }
+        for span in self.spare_values.iter_mut() {
+            span.clear();
+        }
+    }
+
+    /// A span to write into: a recycled one when there is one, else a fresh one.
+    fn take_field_span(&mut self) -> Span {
+        self.spare_fields.pop().unwrap_or_default()
+    }
+
+    fn take_value_span(&mut self) -> Span {
+        self.spare_values.pop().unwrap_or_default()
     }
 
     pub fn url_mut(&mut self) -> &mut Span {
@@ -145,16 +198,20 @@ impl Accumulator {
     /// `on_header_field`: extends the current name or starts the next pair.
     ///
     /// Returns [`Action::Flush`] when this name starts the batch after the one
-    /// that just filled up; the caller delivers [`Self::flush_batch`] and then
+    /// that just filled up; the caller delivers [`Self::pairs`] and then
     /// continues, because the name is already held here.
     pub fn push_field(&mut self, bytes: &[u8]) -> Action {
         if self.fields.len() == self.values.len() {
-            self.fields.push(Span::default());
+            let span = self.take_field_span();
+            self.fields.push(span);
             if self.fields.len() == MAX_HEADER_FIELDS {
                 // Node increments the count, sees 32, and flushes. The pair
                 // count handed over is the 31 that have values; this 32nd,
                 // still-empty name is kept for the next batch.
-                self.fields.pop();
+                let unused = self.fields.pop();
+                if let Some(span) = unused {
+                    self.spare_fields.push(span);
+                }
                 self.pending_field = Some(bytes.to_vec());
                 return Action::Flush;
             }
@@ -168,7 +225,8 @@ impl Accumulator {
     /// `on_header_value`: extends the current value or starts the next one.
     pub fn push_value(&mut self, bytes: &[u8]) {
         if self.values.len() != self.fields.len() {
-            self.values.push(Span::default());
+            let span = self.take_value_span();
+            self.values.push(span);
         }
         if let Some(span) = self.values.last_mut() {
             span.push(bytes);
@@ -185,17 +243,23 @@ impl Accumulator {
     ///
     /// The batch is cleared even if the caller never delivers it, so a failing
     /// JavaScript callback cannot leave stale headers behind.
-    pub fn flush_batch(&mut self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let pairs = self.pairs_owned();
-        self.fields.clear();
-        self.values.clear();
+    /// Ends the batch a `kOnHeaders` call just delivered.
+    ///
+    /// This is the second half of a flush, split out so the caller can borrow
+    /// [`Self::pairs`] for the JavaScript call and retire the spans only
+    /// afterwards, without copying every name and value into a fresh `Vec`. It
+    /// clears the URL too, because `Flush()` in `src/node_http_parser.cc` ends
+    /// with `url_.Reset()`: the first `kOnHeaders` carries it and every later one
+    /// for the same message gets an empty string, which is what
+    /// `parserOnHeaders` relies on when it appends: `this._url += url`.
+    pub fn retire_batch(&mut self) {
+        self.retire_spans();
         self.url.clear();
         if let Some(name) = self.pending_field.take() {
-            let mut field = Span::default();
+            let mut field = self.take_field_span();
             field.push(&name);
             self.fields.push(field);
         }
-        pairs
     }
 
     /// The `[name, value, ...]` body for `kOnHeadersComplete`, with values
@@ -203,6 +267,10 @@ impl Accumulator {
     ///
     /// Zips, so a name without a value is not reported — which is exactly
     /// Node's `CreateHeaders`, whose loop runs over `num_values_`.
+    ///
+    /// Borrows rather than clones: the caller builds the JavaScript strings
+    /// straight from these spans and only clears the accumulator afterwards, so
+    /// copying the bytes here would be a second pass over every header.
     pub fn pairs(&self) -> Vec<(&[u8], &[u8])> {
         self.fields
             .iter()
@@ -211,17 +279,9 @@ impl Accumulator {
             .collect()
     }
 
-    fn pairs_owned(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.pairs()
-            .into_iter()
-            .map(|(name, value)| (name.to_vec(), value.to_vec()))
-            .collect()
-    }
-
-    /// Drops the pairs, keeping the URL. Used when headers are handed over.
+    /// Drops the pairs, keeping the URL, and keeps their buffers for reuse.
     pub fn clear_pairs(&mut self) {
-        self.fields.clear();
-        self.values.clear();
+        self.retire_spans();
     }
 
     /// Marks that `kOnHeaders` has run for this message.
@@ -302,6 +362,68 @@ mod tests {
         assert_eq!(names(&accumulator), vec!["C="]);
     }
 
+    #[test]
+    fn a_new_message_reuses_spans_without_carrying_bytes_over() {
+        // The defect this guards: `reset_for_message` keeps each `Span`'s `Vec`
+        // for reuse, so a message that does not clear it would report the
+        // previous message's header bytes as its own. Reuse and correctness have
+        // to be checked together, because either alone passes trivially.
+        let mut accumulator = Accumulator::default();
+        feed(&mut accumulator, &[b"First", b"one", b"Second", b"two"]);
+        assert_eq!(names(&accumulator), vec!["First=one", "Second=two"]);
+
+        accumulator.reset_for_message();
+        assert_eq!(accumulator.field_count(), 0);
+        assert!(
+            accumulator.spare_fields.len() >= 2,
+            "the retired spans are kept for the next message"
+        );
+        let buffered = accumulator
+            .spare_fields
+            .iter()
+            .filter(|span| !span.bytes().is_empty())
+            .count();
+        assert_eq!(buffered, 0, "every retired span is cleared");
+
+        feed(&mut accumulator, &[b"Third", b"three"]);
+        assert_eq!(
+            names(&accumulator),
+            vec!["Third=three"],
+            "the new message reports only its own pair"
+        );
+    }
+
+    #[test]
+    fn a_flush_reuses_the_spans_it_retired() {
+        // `retire_batch` is the other place that ends a batch mid-message. It has
+        // to recycle too, or a request with more than 31 headers allocates a
+        // fresh set of spans for every batch.
+        let mut accumulator = Accumulator::default();
+        for index in 0..31u32 {
+            accumulator.push_field(format!("H{index}").as_bytes());
+            accumulator.push_value(b"v");
+        }
+        assert_eq!(accumulator.push_field(b"H31"), Action::Flush);
+        let flushed: Vec<(Vec<u8>, Vec<u8>)> = accumulator
+            .pairs()
+            .into_iter()
+            .map(|(n, v)| (n.to_vec(), v.to_vec()))
+            .collect();
+        accumulator.retire_batch();
+        assert_eq!(flushed.len(), 31);
+
+        accumulator.push_value(b"v");
+        assert_eq!(
+            names(&accumulator),
+            vec!["H31=v"],
+            "the name that triggered the flush starts the next batch"
+        );
+        assert!(
+            accumulator.spare_fields.len() >= 31,
+            "the 31 retired name spans are available for the next batch"
+        );
+    }
+
     /// The counts Node produces, verified against a real `node` binary:
     /// 31 headers arrive in one `kOnHeadersComplete`, 32 split into
     /// `kOnHeaders` calls of 31 then 1.
@@ -319,7 +441,12 @@ mod tests {
 
         let action = accumulator.push_field(b"H31");
         assert_eq!(action, Action::Flush);
-        let flushed = accumulator.flush_batch();
+        let flushed: Vec<(Vec<u8>, Vec<u8>)> = accumulator
+            .pairs()
+            .into_iter()
+            .map(|(n, v)| (n.to_vec(), v.to_vec()))
+            .collect();
+        accumulator.retire_batch();
         assert_eq!(flushed.len(), 31, "the 31 complete pairs are handed over");
         assert_eq!(flushed[0].0, b"H0");
         assert_eq!(flushed[30].0, b"H30");
@@ -339,7 +466,8 @@ mod tests {
         let mut batches: Vec<usize> = Vec::new();
         for index in 0..64u32 {
             if accumulator.push_field(format!("H{index}").as_bytes()) == Action::Flush {
-                batches.push(accumulator.flush_batch().len());
+                batches.push(accumulator.pairs().len());
+                accumulator.retire_batch();
             }
             accumulator.push_value(b"v");
         }
@@ -353,7 +481,9 @@ mod tests {
     fn flush_batch_clears_even_when_nothing_was_pending() {
         let mut accumulator = Accumulator::default();
         feed(&mut accumulator, &[b"A", b"1"]);
-        assert_eq!(accumulator.flush_batch().len(), 1);
+        let len = accumulator.pairs().len();
+        accumulator.retire_batch();
+        assert_eq!(len, 1);
         assert_eq!(accumulator.field_count(), 0);
         assert_eq!(accumulator.value_count(), 0);
     }
@@ -363,7 +493,7 @@ mod tests {
         let mut accumulator = Accumulator::default();
         accumulator.url_mut().push(b"/path");
         feed(&mut accumulator, &[b"A", b"1"]);
-        accumulator.flush_batch();
+        accumulator.retire_batch();
         assert_eq!(
             accumulator.url().bytes(),
             b"",

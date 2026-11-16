@@ -251,14 +251,54 @@ impl Allocation {
         self.length
     }
 
-    /// Hands the allocation to V8 as the backing store of a new `ArrayBuffer`.
+    /// Hands the allocation to V8 as the backing store of a new `ArrayBuffer`,
+    /// keeping only the `nread` bytes that were actually read.
     ///
     /// Consuming `self` is what transfers ownership: from here on V8 frees the
     /// memory with the buffer, and this type must not.
+    ///
+    /// # Why the buffer is right-sized first
+    ///
+    /// `libuv`'s allocator hands out `suggested_size` (64 KiB here), but a
+    /// keep-alive HTTP request arrives as a few hundred bytes. Handing the whole
+    /// 64 KiB reservation to V8 makes every read an external-memory allocation of
+    /// 64 KiB, and V8 only reclaims external memory at a major GC, so the
+    /// backing stores pile up: measured 214 MB RSS under load against Node's
+    /// 85 MB, and 300 MB on a bare `net` echo server. Node avoids it by giving
+    /// the view only the bytes read (`StreamReadSlab::Commit`'s right-sized copy
+    /// when most of a reservation would be wasted, `env.cc:905`), so this does
+    /// the same: a copy of `nread` bytes, and the full allocation released.
+    ///
+    /// A read that fills its whole buffer still avoids the copy: `nread ==
+    /// length` is the case where the reservation was entirely used, which is
+    /// what a large body read looks like.
     pub fn into_array_buffer<'s>(
         self,
         scope: &mut v8::PinScope<'s, '_>,
+        nread: usize,
     ) -> v8::Local<'s, v8::ArrayBuffer> {
+        if nread < self.length {
+            let sized = match Self::new(nread) {
+                Some(sized) => sized,
+                // Allocation failure leaves nothing to hand over; an empty
+                // buffer keeps `onread`'s contract (`nread` is already
+                // published) and the reservation is released by the drop.
+                None => return v8::ArrayBuffer::new(scope, 0),
+            };
+            // SAFETY: both allocations are live and distinct, `nread` is within
+            // both, and `sized` is exactly `nread` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.pointer, sized.pointer, nread);
+            }
+            // `sized` is consumed below; `self` drops here and frees the
+            // reservation.
+            return sized.hand_over(scope);
+        }
+        self.hand_over(scope)
+    }
+
+    /// Transfers the allocation to a V8 backing store without copying.
+    fn hand_over<'s>(self, scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::ArrayBuffer> {
         let memory = std::mem::ManuallyDrop::new(self);
         // SAFETY: `memory.pointer` came from `std::alloc::alloc` with this exact
         // length and alignment, and `ManuallyDrop` stops this type from freeing
@@ -373,7 +413,7 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
                 let Some(handler) = onread_of(scope, object) else {
                     return;
                 };
-                let buffer = allocation.into_array_buffer(scope);
+                let buffer = allocation.into_array_buffer(scope, status as usize);
                 let argument: v8::Local<v8::Value> = buffer.into();
                 let receiver: v8::Local<v8::Value> = object.into();
                 let _ = handler.call(&*scope, receiver, &[argument]);
