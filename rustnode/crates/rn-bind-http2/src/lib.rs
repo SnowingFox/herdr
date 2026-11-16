@@ -161,6 +161,12 @@ impl BindingModule for Http2 {
         scope: &mut v8::PinScope<'s, '_>,
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
+        // A namespace is installed once per isolate, so this is where the cached
+        // `Http2Stream` constructor is released. It has to happen before the
+        // constructor below is built: that is the call that fills the cache again,
+        // and a `v8::Global` from a disposed isolate is a handle into freed storage.
+        stream::reset_constructor_cache();
+
         let object = v8::Object::new(scope);
 
         // The shared typed arrays first, then the field indices into
