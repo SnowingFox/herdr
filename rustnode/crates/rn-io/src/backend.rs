@@ -1,9 +1,8 @@
 //! Which poller a loop runs on, and the handle other code uses to identify it.
 //!
 //! There is one loop in rustnode and it is libuv's. This enum names the backend
-//! that loop is built on so a future native poller can be selected without
-//! changing any caller, and so an unavailable backend is rejected rather than
-//! silently emulated.
+//! that loop was asked for, and the *readiness backend* inside it is chosen
+//! separately by `HERDR_URING` — see [`crate::loop_::Loop::poller`].
 
 /// Which poller a loop is running on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -17,10 +16,13 @@ pub enum Backend {
     /// `crates/rn-uv` owns the `uv_loop_t` and every handle on it.
     #[default]
     Libuv,
-    /// Native Linux io_uring poller.
+    /// The same loop, with its readiness wait served by io_uring.
     ///
-    /// Not implemented. `Loop::new` rejects it rather than quietly running the
-    /// libuv loop under a name that claims otherwise.
+    /// This is not a second loop: the phases, the deadlines and the callbacks
+    /// are libuv's, and only the `epoll_pwait` inside `uv__io_poll` is replaced.
+    /// It is selected at runtime by `HERDR_URING=1` and falls back to epoll when
+    /// the kernel cannot provide a ring, so a program can request it without
+    /// being able to fail because of it.
     IoUring,
 }
 

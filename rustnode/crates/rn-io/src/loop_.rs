@@ -86,33 +86,51 @@ pub trait Scheduler {
 #[derive(Debug)]
 pub struct Loop {
     backend: Backend,
+    /// The readiness backend this loop waits on.
+    ///
+    /// Held for the loop's lifetime so the ring is released when the loop is, and
+    /// so `backend()` can report what is actually running rather than what was
+    /// asked for.
+    readiness: rn_uv::poller::Readiness,
 }
 
 impl Loop {
     /// Builds a loop for `backend`, or explains why that backend cannot run.
     pub fn new(backend: Backend) -> Result<Self, String> {
-        match backend {
-            Backend::Libuv => {
+        let pointer = match backend {
+            Backend::Libuv | Backend::IoUring => {
                 // Creating the loop here rather than lazily on first use means a
                 // failure to create it reaches the caller that asked for a loop,
                 // instead of surfacing later as an I/O binding that silently
                 // does nothing.
-                if rn_uv::uv_loop::loop_ptr().is_none() {
+                let Some(pointer) = rn_uv::uv_loop::loop_ptr() else {
                     return Err("the libuv loop could not be created".to_string());
-                }
+                };
+                pointer
             }
-            Backend::IoUring => {
-                return Err(
-                    "the io_uring backend is not implemented; use the default libuv loop"
-                        .to_string(),
-                )
-            }
-        }
-        Ok(Self { backend })
+        };
+
+        // The readiness backend is chosen from the environment, not from
+        // `backend`: both variants are the *same* libuv loop, and what differs is
+        // the poller inside it. `HERDR_URING=1` is the only way to reach the
+        // io_uring path, and a request it cannot honour falls back to epoll with
+        // a warning rather than failing here.
+        let readiness =
+            rn_uv::poller::Readiness::install(rn_uv::poller::Poller::from_env(), pointer);
+
+        Ok(Self { backend, readiness })
     }
 
     pub fn backend(&self) -> Backend {
         self.backend
+    }
+
+    /// The readiness backend the loop is actually waiting with.
+    ///
+    /// This can differ from what `HERDR_URING` asked for: a kernel without
+    /// io_uring, a seccomp filter, or a failed ring all leave epoll in place.
+    pub fn poller(&self) -> rn_uv::poller::Poller {
+        self.readiness.poller()
     }
 
     /// Runs one iteration of the libuv loop, then drains ticks.
@@ -310,12 +328,24 @@ mod tests {
         }
     }
 
+    /// The io_uring request is the *same* loop with a different readiness
+    /// wait, so it must build rather than be rejected.
+    ///
+    /// It is installed from `HERDR_URING`, which this test deliberately does not
+    /// set: the assertion is that asking for the backend cannot fail the process,
+    /// which is the property the fallback exists for. What it actually runs is
+    /// reported by `poller()`.
     #[test]
-    fn the_io_uring_backend_is_rejected_rather_than_silently_emulated() {
-        let Err(error) = Loop::new(Backend::IoUring) else {
-            panic!("io_uring must be rejected");
-        };
-        assert!(error.contains("io_uring"));
+    fn the_io_uring_backend_builds_and_never_fails_the_process() {
+        let event_loop = Loop::new(Backend::IoUring).expect("the io_uring backend builds");
+        assert_eq!(event_loop.backend(), Backend::IoUring);
+        assert!(rn_uv::uv_loop::is_initialised());
+        // With `HERDR_URING` unset this is the epoll backend; the point is that
+        // the value is always one of the two and never an error.
+        assert!(matches!(
+            event_loop.poller(),
+            rn_uv::poller::Poller::Epoll | rn_uv::poller::Poller::IoUring
+        ));
     }
 
     #[test]
@@ -324,6 +354,21 @@ mod tests {
         assert_eq!(event_loop.backend(), Backend::Libuv);
         assert!(rn_uv::uv_loop::is_initialised());
         assert!(!rn_uv::uv_loop::is_active(), "an idle loop is not alive");
+    }
+
+    /// With nothing asking for io_uring, the readiness backend is epoll.
+    ///
+    /// `HERDR_URING` is the only way in, so an environment that does not set it
+    /// must not reach the ring code at all. The test is skipped rather than
+    /// asserted when the variable is set, because the suite is also run with it
+    /// forced on to prove both backends behave identically.
+    #[test]
+    fn the_default_readiness_backend_is_epoll() {
+        if std::env::var_os(rn_uv::ENV_URING).is_some() {
+            return;
+        }
+        let event_loop = Loop::new(Backend::Libuv).expect("the default backend runs");
+        assert_eq!(event_loop.poller(), rn_uv::poller::Poller::Epoll);
     }
 
     #[test]

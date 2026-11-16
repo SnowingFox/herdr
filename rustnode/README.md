@@ -62,6 +62,27 @@ cargo build
 
 V8 arrives as the prebuilt `v8` crate. No local V8 build is required.
 
+## Environment switches
+
+`rustnode` runs on libuv's loop on every platform. On Linux the *readiness wait*
+inside that loop has two implementations, and the default is the one every
+release has shipped:
+
+| Variable | Effect |
+| --- | --- |
+| `HERDR_URING=1` | Serve the loop's readiness wait from an `io_uring` submission queue instead of `epoll_pwait(2)`. Readiness is reported as a poll mask, so reads, writes and accepts produce the same completions the epoll path produces. Timers, signals and threadpool work are unaffected. |
+| unset, `0`, or anything else | `epoll_pwait(2)`, libuv's own path. |
+
+The switch is a request, not a requirement. If `io_uring_setup(2)` fails — an
+older kernel (`ENOSYS`), a seccomp filter or `kernel.io_uring_disabled` (`EPERM`),
+or no memory for the rings (`ENOMEM`) — the loop logs a warning and uses epoll.
+A program is never aborted because the kernel would not provide a ring.
+
+It is opt-in because the io_uring path is newer than the epoll one, and a broken
+accelerator must not be able to break users who did not ask for it. The epoll
+path is unchanged by its presence: when the variable is unset, the interposed
+wait is a direct pass-through to the same syscall.
+
 ## Milestones
 
 M0 evaluates JavaScript and reports errors with Node's exit codes. Later
