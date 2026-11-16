@@ -28,13 +28,71 @@
 //! the 4.x line cannot satisfy it. That was verified by building with
 //! `openssl-src 400.0.2+4.0.3` present: cargo compiles both crates and links
 //! **3.6.3**, because only the 3.x version satisfies the dependency. A
-//! `[patch.crates-io]` override fails the same way.
+//! `[patch.crates-io]` override fails the same way: cargo warns that the patch
+//! "was not used in the crate graph" and keeps the 3.6.3 entry.
 //!
 //! So this crate links **OpenSSL 3.6.3**, and `engine::openssl_version()` reports
-//! what is actually linked rather than what Node ships. The consequence is narrow
-//! and worth naming: an algorithm added in 4.x is absent from `getHashes()` and
-//! `getCiphers()` here, and those lists are derived from the linked library
-//! precisely so that absence is visible instead of advertised and then failing.
+//! what is actually linked rather than what Node ships.
+//!
+//! ### The six `getHashes()` names this version cannot supply: cSHAKE
+//!
+//! `getHashes()` matches Node **element for element** except for six cSHAKE
+//! names: `cshake128`, `cshake256`, `cshake-128`, `cshake-256`,
+//! `cshake-keccak-128` and `cshake-keccak-256`. This is not an enumeration gap
+//! and not a provider that needs loading; it is an absence from the OpenSSL
+//! source this build compiles:
+//!
+//! * **3.6.3 has no cSHAKE anywhere.** `grep -ri cshake` over the vendored
+//!   3.6.3 tree returns nothing, `providers/implementations/digests/` has no
+//!   `cshake_prov.c`, and the built `libcrypto.a` exports zero symbols matching
+//!   `cshake`. No spelling, case, or `EVP_MD_fetch` property query can reach a
+//!   digest that was never compiled.
+//! * **The legacy provider is not the answer.** cSHAKE is registered by
+//!   `providers/defltprov.c` — the *default* provider — in the 4.x line, not by
+//!   `legacyprov.c`. `openssl-src` already builds with its `legacy` feature on
+//!   (that is `openssl-sys`'s own default), so loading legacy would add MD2/MD4/
+//!   RC4 and still not cSHAKE. Confirmed in the 4.0.3 tree
+//!   (`defltprov.c:123-133`) and against a real 4.0.3 build, where
+//!   `EVP_MD_fetch("cshake-128")` returns `CSHAKE-128` with no provider
+//!   property query at all.
+//! * **cSHAKE arrived in OpenSSL 4.x.** It is present in every `openssl-src`
+//!   4.0.x release (`400.0.0+4.0.1`, `400.0.1+4.0.2`, `400.0.2+4.0.3`), and
+//!   absent from every 3.x one. It is a new algorithm family, not a build flag.
+//!
+//! **Measured, not assumed.** Building this workspace against OpenSSL 4.0.3
+//! (via a local `openssl-sys` fork whose `openssl-src` requirement was widened
+//! from `^300.2.0` to `<500`) makes `getHashes()` **exactly equal** to the
+//! oracle — 87 names, element for element, including all six cSHAKE spellings —
+//! and `getMacs()` exactly equal at 11. The 230 crypto unit tests pass on that
+//! build. So the cSHAKE gap closes the moment the 4.x line is reachable, and it
+//! is reachable only through a dependency change outside this crate.
+//!
+//! What a future fix needs, stated exactly so it can be checked rather than
+//! re-derived:
+//!
+//! 1. `openssl-sys` (or a maintained fork of it) to accept `openssl-src >=4`,
+//!    then `openssl-src = "400.x"` in place of `300.6.1`; **or**
+//!    `openssl-src 3.7`/`3.8` to backport cSHAKE (not true of any release as of
+//!    3.6.3 — the newest 3.x).
+//! 2. No change in this crate. `enumerate.rs` already walks
+//!    `EVP_MD_do_all_provided` and `EVP_MD_names_do_all`, which is where the
+//!    six names come from; it reports them the moment the library has them.
+//!
+//! Until then the absence is visible by design: the lists are derived from the
+//! linked library, so nothing is advertised that cannot then be used.
+//!
+//! ### Camellia is a build flag, and is now enabled
+//!
+//! The 27 `camellia*` cipher names were absent for a different reason: this was
+//! `openssl-src`'s default, not an OpenSSL 3.6.3 limitation. `openssl-src` passes
+//! `no-camellia` to `Configure` unless its own `camellia` feature is on, which
+//! drops `crypto/camellia/` from the build and leaves no `Camellia_*` symbol in
+//! `libcrypto.a`. `Cargo.toml` now names `openssl-src` with `features =
+//! ["camellia"]` as a build-dependency; because `openssl-sys` already depends on
+//! the same crate, cargo unifies the two and enables the feature on the single
+//! OpenSSL build. See that file for the cost (build time only) and
+//! `enumerate.rs` for why nothing else changed.
+//!
 //! Everything Node's test suite exercises — SHA-1/2/3, MD5, BLAKE2, AES, ChaCha20,
 //! RSA, EC, PBKDF2, scrypt, HKDF — is identical.
 //!

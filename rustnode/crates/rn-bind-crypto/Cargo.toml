@@ -59,6 +59,25 @@ openssl = { version = "=0.10.82", features = ["vendored"] }
 openssl-sys = { version = "=0.9.118", features = ["vendored"] }
 libc = { workspace = true }
 
+# `openssl-src` is already in the graph through `openssl-sys`, so naming it here
+# adds no second OpenSSL build: cargo unifies the versions and enables the union
+# of the requested features on the one instance. That is the whole mechanism.
+#
+# `camellia` is a **build-configuration** flag, not an enumeration one. Without
+# it `openssl-src` passes `no-camellia` to OpenSSL's `Configure`, which drops
+# `crypto/camellia/` from the build entirely; the resulting `libcrypto.a` has no
+# `Camellia_*` symbols, so no spelling can resolve and `getCiphers()` cannot list
+# the 27 names Node does. With it, the module is compiled and the provider
+# registers `camellia-128-cbc` … `camellia256` exactly as Node's OpenSSL does.
+#
+# The cost is build time only, and it is small: `crypto/camellia/` is 7 C files
+# (156 KB of the tree's 1,117 C files), and the vendored artifact is rebuilt from
+# scratch on a clean `target/` regardless. Measured on a clean `target/`: 24s
+# without the feature, 25s with it. No runtime cost, no new dependency in the
+# graph (`openssl-src` was already there), no vendored-file change.
+[build-dependencies]
+openssl-src = { version = "=300.6.1", features = ["camellia"] }
+
 [dev-dependencies]
 rn-node-oracle = { path = "../../tools/node-oracle" }
 serde_json.workspace = true

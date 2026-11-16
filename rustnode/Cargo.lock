@@ -822,6 +822,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "openssl",
+ "openssl-src",
  "openssl-sys",
  "rn-bind-crypto-cipher",
  "rn-bind-crypto-dh",

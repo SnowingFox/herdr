@@ -125,6 +125,64 @@ fn hmac_matches_node_for_every_published_vector() {
 }
 
 #[test]
+fn get_hashes_matches_node_except_the_declared_gap() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    let raw = node_eval(
+        oracle,
+        "process.stdout.write(JSON.stringify(require('crypto').getHashes()))",
+    );
+    let node_hashes: Vec<String> =
+        serde_json::from_str(&raw).expect("node getHashes() is a JSON array");
+    let ours: Vec<String> = enumerate::digest_names();
+
+    // The bar is element-level, not count-level. The oracle's list minus the six
+    // names this build cannot supply must equal ours exactly, in order. Anything
+    // else — a name lost for an unrelated reason, a case or alias drift, a
+    // seventh gap appearing — fails here even when the totals happen to agree.
+    //
+    // Deriving the expected list from the oracle (rather than hardcoding 81 names)
+    // keeps this test honest across an oracle re-pin: a moved oracle changes the
+    // expectation, while a regression in this binding does not.
+    let expected: Vec<String> = node_hashes
+        .iter()
+        .filter(|name| !enumerate::KNOWN_ABSENT_DIGESTS.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    assert_eq!(
+        ours,
+        expected,
+        "getHashes() is not element-equal to the oracle outside the declared \
+         cSHAKE gap (ours {} vs expected {} entries)\n\
+         ours: {ours:?}",
+        ours.len(),
+        expected.len()
+    );
+
+    // And the declared gap must still *be* a gap: a name listed as absent that
+    // the oracle also does not report would be a stale declaration.
+    for absent in enumerate::KNOWN_ABSENT_DIGESTS {
+        assert!(
+            node_hashes_contains(oracle, absent),
+            "KNOWN_ABSENT_DIGESTS records {absent}, but the oracle does not list it"
+        );
+    }
+}
+
+/// Whether the pinned oracle's `getHashes()` lists `name`.
+fn node_hashes_contains(oracle: &Oracle, name: &str) -> bool {
+    let raw = node_eval(
+        oracle,
+        &format!(
+            "process.stdout.write(JSON.stringify(require('crypto').getHashes().includes({})))",
+            serde_json::to_string(name).expect("name json")
+        ),
+    );
+    raw == "true"
+}
+
+#[test]
 fn get_hashes_covers_what_node_reports() {
     let Some(oracle) = oracle() else {
         return;
@@ -187,6 +245,37 @@ fn get_hashes_covers_what_node_reports() {
         "these digests are listed on both sides with a different spelling: {misspelled:?}\n\
          against {}",
         oracle.describe()
+    );
+}
+
+#[test]
+fn get_ciphers_matches_node_exactly() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    let raw = node_eval(
+        oracle,
+        "process.stdout.write(JSON.stringify(require('crypto').getCiphers()))",
+    );
+    let node_ciphers: Vec<String> =
+        serde_json::from_str(&raw).expect("node getCiphers() is a JSON array");
+    let ours: Vec<String> = enumerate::cipher_names();
+
+    // Element for element, in order, against the pinned oracle. A count that
+    // matches while the sets differ is the failure this test exists to prevent —
+    // it is exactly how a missing family hides behind a plausible total.
+    //
+    // This became an exact comparison when the `camellia` feature closed the last
+    // cipher gap. The two builds still differ in OpenSSL *version* (3.6.3 here,
+    // 4.1.0 in the oracle), so if a future oracle move adds a 4.x cipher this
+    // will fail on a real difference rather than on a version mismatch, which is
+    // the correct reason to fail: it means the cipher surface needs a decision.
+    assert_eq!(
+        ours,
+        node_ciphers,
+        "getCiphers() is not element-equal to the oracle (ours {} vs {} entries)",
+        ours.len(),
+        node_ciphers.len()
     );
 }
 

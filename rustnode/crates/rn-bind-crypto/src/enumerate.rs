@@ -210,6 +210,33 @@ const EVP_CIPH_FLAG_TLS1_1_MULTIBLOCK: std::os::raw::c_ulong = 0x40_0000;
 /// `OSSL_CIPHER_PARAM_ENCRYPT_THEN_MAC` from `openssl/core_names.h`.
 const OSSL_CIPHER_PARAM_ENCRYPT_THEN_MAC: &[u8] = b"encrypt-then-mac\0";
 
+/// The digest names the pinned oracle reports that this OpenSSL cannot supply.
+///
+/// This is a declaration, not a filter: `digest_names()` never sees these names
+/// because the library has no such algorithm, and nothing here suppresses them.
+/// It exists so the gap is checkable from code and its reason is recorded next
+/// to the enumeration that produces the list, rather than only in prose.
+///
+/// **cSHAKE is absent from OpenSSL 3.6.3 entirely** — `grep -ri cshake` over the
+/// vendored tree returns nothing, `providers/implementations/digests/` has no
+/// `cshake_prov.c`, and the built `libcrypto.a` exports no `cshake` symbol. It is
+/// a *default*-provider algorithm added in the 4.x line (`defltprov.c`), so the
+/// legacy provider cannot supply it either, and `openssl-src` already enables
+/// `legacy` by default. Verified: a build against OpenSSL 4.0.3 returns
+/// `getHashes()` exactly equal to the oracle, these six names included.
+///
+/// `CAMELIA`-style build flags are *not* the cause here, unlike the cipher gap
+/// this crate fixed separately; there is no configure option that turns cSHAKE on
+/// in 3.x, because the implementation is not in the source.
+pub const KNOWN_ABSENT_DIGESTS: &[&str] = &[
+    "cshake-128",
+    "cshake-256",
+    "cshake-keccak-128",
+    "cshake-keccak-256",
+    "cshake128",
+    "cshake256",
+];
+
 /// Reads a NUL-terminated OpenSSL string that may be null.
 ///
 /// # Safety
@@ -739,6 +766,13 @@ fn resolvable_digest(name: &str) -> bool {
 ///   `rmd160`, `ssl3-sha1`, and the whole `RSA-SHA256` family.
 /// * `do_all_provided` is the only source of algorithms that exist only as
 ///   providers, such as `KECCAK-256` and `SHA2-256/192`.
+///
+/// # The six names this list cannot contain on OpenSSL 3.6.3
+///
+/// `KNOWN_ABSENT_DIGESTS` names them and why. They are cSHAKE, which is not in
+/// the 3.6.3 source at all; see the crate docs for the measured proof and what a
+/// future fix needs. Nothing here filters them out — the walk simply never sees
+/// them, which is the property that makes the list truthful rather than curated.
 pub fn digest_names() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     let argument = (&mut names) as *mut Vec<String> as *mut c_void;
@@ -1167,6 +1201,93 @@ mod tests {
             assert!(
                 mac_is_fetchable(name),
                 "{name} was advertised but does not fetch"
+            );
+        }
+    }
+
+    #[test]
+    fn camellia_is_not_a_build_configuration_gap_any_more() {
+        // `openssl-src` passes `no-camellia` unless its `camellia` feature is on,
+        // and `rn-bind-crypto`'s `Cargo.toml` now enables it. If that dependency
+        // line is ever dropped, 27 names vanish from `getCiphers()` and the only
+        // other symptom is a smaller list — nothing fails to compile and no other
+        // test here notices, because each of them checks a subset.
+        //
+        // The names span all three key sizes and every mode the provider
+        // registers, plus the three NID short names Node also lists, so a partial
+        // build cannot satisfy this.
+        let ciphers = cipher_names();
+        for expected in [
+            "camellia-128-cbc",
+            "camellia-128-ecb",
+            "camellia-192-ctr",
+            "camellia-256-ofb",
+        ] {
+            assert!(
+                ciphers.iter().any(|listed| listed == expected),
+                "getCiphers() is missing {expected}: the `camellia` feature on \
+                 `openssl-src` is probably no longer enabled in Cargo.toml"
+            );
+            assert!(
+                cipher_is_constructible(expected),
+                "{expected} is listed but createCipheriv cannot construct it"
+            );
+        }
+        // The NID short names are a different code path: they come from the
+        // legacy `do_all_sorted` walk rather than the provider walk.
+        for alias in ["camellia128", "camellia192", "camellia256"] {
+            assert!(
+                ciphers.iter().any(|listed| listed == alias),
+                "getCiphers() lost the camellia alias {alias}"
+            );
+        }
+        assert_eq!(
+            ciphers
+                .iter()
+                .filter(|name| name.contains("camellia"))
+                .count(),
+            27,
+            "the oracle lists 27 camellia names"
+        );
+    }
+
+    #[test]
+    fn known_absent_digests_are_really_absent() {
+        // `KNOWN_ABSENT_DIGESTS` is a claim about the linked library. If a future
+        // `openssl-src` supplies cSHAKE, this test fails and says so — which is
+        // the signal to delete the constant and the doc section that explains it,
+        // rather than leaving a stale "impossible" note behind.
+        let names = digest_names();
+        for absent in KNOWN_ABSENT_DIGESTS {
+            assert!(
+                !names.iter().any(|name| name == absent),
+                "{absent} is now in getHashes(); remove it from KNOWN_ABSENT_DIGESTS \
+                 and update the crate docs, which no longer describe this build"
+            );
+            assert!(
+                !resolvable_digest(absent),
+                "{absent} resolves now, so it can be advertised; the declaration \
+                 in KNOWN_ABSENT_DIGESTS is stale"
+            );
+        }
+    }
+
+    #[test]
+    fn known_absent_digests_are_the_whole_difference() {
+        // Pins the cSHAKE set exactly, so neither a name silently disappearing
+        // from the constant nor a seventh gap hiding is possible. Every entry must
+        // be a cSHAKE spelling: that is the single reason currently recorded, and
+        // a non-cSHAKE name here would mean this build lost something else.
+        assert_eq!(
+            KNOWN_ABSENT_DIGESTS.len(),
+            6,
+            "the recorded gap is six names"
+        );
+        for absent in KNOWN_ABSENT_DIGESTS {
+            assert!(
+                absent.to_ascii_lowercase().starts_with("cshake"),
+                "{absent} is not a cSHAKE name; a different gap was recorded \
+                 without documenting why"
             );
         }
     }
