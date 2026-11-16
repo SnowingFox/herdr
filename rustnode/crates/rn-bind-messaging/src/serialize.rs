@@ -46,7 +46,29 @@ use std::sync::Arc;
 use rn_core::host_object::{self, TransferData};
 use rn_v8_sys::v8;
 
+use crate::get_key;
 use crate::port::{Message, PortTransferData};
+
+/// How the caller's transfer-list value is to be interpreted.
+///
+/// The two shapes are genuinely different in Node and produce different errors,
+/// which is why this is not one check:
+///
+/// * [`Argument`](TransferList::Argument) is `postMessage`'s second argument. Node
+///   passes it through `GetTransferList`, which tries it as an iterable, then
+///   falls back to `options.transfer`, and treats an object with neither as an
+///   *empty* list — so `postMessage('x', {})` is legal.
+/// * [`Sequence`](TransferList::Sequence) is `structuredClone`'s already-extracted
+///   `options.transfer`, which `webidl` has already coerced to a sequence. It must
+///   therefore be iterable: `structuredClone(v, {transfer: {}})` throws
+///   `ERR_INVALID_ARG_TYPE` where `postMessage` accepts the same value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferList {
+    /// `postMessage`'s transfer list argument.
+    Argument,
+    /// `structuredClone`'s `options.transfer`, already extracted.
+    Sequence,
+}
 
 /// The transfer list of one `postMessage`, resolved into concrete objects.
 struct Transfers<'s> {
@@ -55,6 +77,26 @@ struct Transfers<'s> {
     array_buffers: Vec<v8::Local<'s, v8::ArrayBuffer>>,
     /// Ports being handed over rather than copied.
     ports: Vec<v8::Local<'s, v8::Object>>,
+}
+
+/// Why a serialization could not produce a message.
+///
+/// The two failure classes are separate because Node raises two different
+/// exceptions and JavaScript distinguishes them: every *entry* problem is a
+/// `DataCloneError` (`Message::Serialize` calls `ThrowDataCloneException` on
+/// every path through its transfer-list loop), while a transfer list that is not
+/// an object at all is `THROW_ERR_INVALID_ARG_TYPE` from `GetTransferList`, which
+/// is a `TypeError`. Routing both through one variant is what made every
+/// transfer-list error a `TypeError` here.
+#[derive(Debug)]
+pub(crate) enum SerializeError {
+    /// A transfer-list entry was rejected. Carries Node's message text.
+    DataClone(String),
+    /// `transferList` is not iterable at all, `GetTransferList`'s
+    /// `ERR_INVALID_ARG_TYPE`.
+    NotIterable,
+    /// V8 scheduled the exception; rethrowing would replace it.
+    Thrown,
 }
 
 /// One entry in the id space, while the message is still being built.
@@ -288,16 +330,24 @@ impl Delegate<'_> {
 
 /// Serializes `value`, detaching everything in `transfer_list`.
 ///
-/// On success returns the message. On failure returns the text to report as an
-/// exception, or `None` when V8 has already scheduled one — throwing again would
-/// replace a precise message with a generic one and leave two exceptions pending.
+/// `source_port` is Node's `Message::Serialize(..., Local<Object> source_port)`:
+/// the port a `postMessage` is being called on, so a transfer list naming it can
+/// be refused with `Transfer list contains source port`. `structuredClone` has no
+/// source port and passes `None`, which is Node's empty `Local<Object>`.
+///
+/// On success returns the message. On failure returns the reason to report as an
+/// exception, or [`SerializeError::Thrown`] when V8 has already scheduled one —
+/// throwing again would replace a precise message with a generic one and leave
+/// two exceptions pending.
 pub fn serialize<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: v8::Local<'s, v8::Value>,
     transfer_list: v8::Local<'s, v8::Value>,
-) -> Result<Message, Option<String>> {
+    source_port: Option<v8::Local<'s, v8::Object>>,
+    shape: TransferList,
+) -> Result<Message, SerializeError> {
     let context = scope.get_current_context();
-    let transfers = collect_transfers(scope, transfer_list)?;
+    let transfers = collect_transfers(scope, transfer_list, source_port, shape)?;
 
     let host_objects = RefCell::new(Vec::new());
     let shared_array_buffers = RefCell::new(Vec::new());
@@ -327,7 +377,7 @@ pub fn serialize<'s>(
                 // `collect_transfers` accepted it as a port, so this cannot fail
                 // unless the object changed mid-serialize.
                 crate::throw_data_clone_exception_str(scope, "The port could not be transferred");
-                return Err(None);
+                return Err(SerializeError::Thrown);
             };
             let payload = PortTransferData::for_port(Arc::clone(&state.data));
             slots.push(Slot {
@@ -357,16 +407,17 @@ pub fn serialize<'s>(
     match serializer.write_value(context, value) {
         Some(true) => {}
         // V8 threw; the exception is pending on the isolate already.
-        _ => return Err(None),
+        _ => return Err(SerializeError::Thrown),
     }
 
     // Detach only after a successful write: a message that could not be serialized
     // must not leave the caller's buffers unusable.
     for buffer in &transfers.array_buffers {
         if buffer.detach(None).is_none() {
-            return Err(Some(
-                "Could not detach an ArrayBuffer for transfer".to_string(),
-            ));
+            // `collect_transfers` already rejected a non-detachable buffer, so
+            // reaching this means V8 refused a detach it advertised. V8 threw, so
+            // its own exception is the one to report.
+            return Err(SerializeError::Thrown);
         }
     }
 
@@ -413,17 +464,17 @@ pub fn serialize<'s>(
         // A hook returning nothing is a failed clone, not a silent skip: Node
         // returns `Nothing<bool>()` from `Finish` and the serialization fails.
         let Some(clone) = clone else {
-            return Err(None);
+            return Err(SerializeError::Thrown);
         };
         if !clone.write_data(scope, &serializer) {
-            return Err(None);
+            return Err(SerializeError::Thrown);
         }
         // The clone's payload lands in the slot its id already names, so the
         // receiver's vector needs no second walk to line up.
         let mut slots = host_objects.borrow_mut();
         match slots.get_mut(index) {
             Some(slot) => slot.payload = Some(clone),
-            None => return Err(None),
+            None => return Err(SerializeError::Thrown),
         }
         index += 1;
     }
@@ -437,7 +488,7 @@ pub fn serialize<'s>(
     let mut payloads: Vec<Arc<dyn TransferData>> = Vec::with_capacity(slots.len());
     for slot in slots {
         let Some(payload) = slot.payload else {
-            return Err(None);
+            return Err(SerializeError::Thrown);
         };
         payloads.push(payload);
     }
@@ -467,10 +518,17 @@ pub fn serialize<'s>(
 ///
 /// Node reads it first, so a bad entry reports the transfer list even when the
 /// message itself is also uncloneable.
+///
+/// This mirrors `GetTransferList` + the head of `Message::Serialize`
+/// (`src/node_messaging.cc`), and the order of the checks is Node's order rather
+/// than a convenient one, because the order decides *which* error a script sees
+/// when a value is wrong in more than one way.
 fn collect_transfers<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     transfer_list: v8::Local<'s, v8::Value>,
-) -> Result<Transfers<'s>, Option<String>> {
+    source: Option<v8::Local<'s, v8::Object>>,
+    shape: TransferList,
+) -> Result<Transfers<'s>, SerializeError> {
     let mut transfers = Transfers {
         array_buffers: Vec::new(),
         ports: Vec::new(),
@@ -478,31 +536,47 @@ fn collect_transfers<'s>(
     if transfer_list.is_undefined() || transfer_list.is_null() {
         return Ok(transfers);
     }
-    let Ok(array) = v8::Local::<v8::Array>::try_from(transfer_list) else {
-        return Err(Some(
-            "The transferList argument must be an array of transferable objects".to_string(),
-        ));
+    // `GetTransferList`: a non-object is `THROW_ERR_INVALID_ARG_TYPE`, which is a
+    // `TypeError`, not a `DataCloneError`. An object that is not iterable falls
+    // back to `options.transfer`, and only a non-iterable *there* is the same
+    // `TypeError`; an object with neither is an empty transfer list.
+    let Ok(holder) = v8::Local::<v8::Object>::try_from(transfer_list) else {
+        return Err(SerializeError::NotIterable);
     };
+    let mut entries: Vec<v8::Local<'s, v8::Value>> = Vec::new();
+    match read_iterable(scope, holder)? {
+        Some(found) => entries = found,
+        None if shape == TransferList::Sequence => return Err(SerializeError::NotIterable),
+        None => {
+            // `ReadIterable` was not an iterable, so `options.transfer` decides.
+            let transfer = get_key(scope, holder, "transfer");
+            let transfer = transfer.unwrap_or_else(|| v8::undefined(scope).into());
+            if !transfer.is_undefined() {
+                let Ok(options) = v8::Local::<v8::Object>::try_from(transfer) else {
+                    return Err(SerializeError::NotIterable);
+                };
+                entries = read_iterable(scope, options)?.ok_or(SerializeError::NotIterable)?;
+            }
+        }
+    }
 
-    for index in 0..array.length() {
-        let Some(entry) = array.get_index(scope, index) else {
-            return Err(None);
-        };
+    for entry in entries {
         let Ok(object) = v8::Local::<v8::Object>::try_from(entry) else {
             // `Message::Serialize`'s `!entry_val->IsObject()` branch, whose text
             // is `env->clone_untransferable_str()`.
-            return Err(Some("Found invalid value in transferList.".to_string()));
+            return Err(SerializeError::DataClone(
+                "Found invalid value in transferList.".to_string(),
+            ));
         };
 
         if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(entry) {
-            if !buffer.is_detachable() {
-                return Err(Some(
-                    "Cannot transfer an ArrayBuffer that is not detachable".to_string(),
-                ));
-            }
-            if buffer.was_detached() {
-                return Err(Some(
-                    "Cannot transfer an ArrayBuffer that was already detached".to_string(),
+            // Node folds "cannot be detached" and "already detached" into one
+            // test and one message: `if (!ab->IsDetachable() || ab->WasDetached())`
+            // with `transfer_unsupported_type_str()`. The two are one mechanism,
+            // not two, and the message says so.
+            if !buffer.is_detachable() || buffer.was_detached() {
+                return Err(SerializeError::DataClone(
+                    "Cannot transfer object of unsupported type.".to_string(),
                 ));
             }
             if transfers
@@ -510,7 +584,7 @@ fn collect_transfers<'s>(
                 .iter()
                 .any(|existing| existing.strict_equals(buffer.into()))
             {
-                return Err(Some(
+                return Err(SerializeError::DataClone(
                     "Transfer list contains duplicate ArrayBuffer".to_string(),
                 ));
             }
@@ -518,26 +592,136 @@ fn collect_transfers<'s>(
             continue;
         }
 
-        if crate::port_state_of(scope, object).is_some() {
-            // Node refuses a second entry for the same object: the receiver would
-            // resolve two ids to one object and move the port twice.
-            if transfers
-                .ports
-                .iter()
-                .any(|existing| existing.strict_equals(object.into()))
-            {
-                return Err(Some(
-                    "Transfer list contains duplicate MessagePort".to_string(),
-                ));
-            }
-            transfers.ports.push(object);
-            continue;
+        // A `SharedArrayBuffer` is not transferable — it is shared by reference
+        // and needs no transfer list entry — so it never reaches the port branch
+        // below and reports the same "invalid value" a plain object does.
+        if entry.is_shared_array_buffer() {
+            return Err(SerializeError::DataClone(
+                "Found invalid value in transferList.".to_string(),
+            ));
         }
 
-        return Err(Some("Found invalid value in transferList.".to_string()));
+        let Some(state) = crate::port_state_of(scope, object) else {
+            return Err(SerializeError::DataClone(
+                "Found invalid value in transferList.".to_string(),
+            ));
+        };
+        // Node tests this *before* the duplicate check, and the source port
+        // before both: `Transfer list contains source port` is what a script sees
+        // when it names the port it is posting on, whether or not that port is
+        // also detached. Passing `None` for the source port (`structuredClone`)
+        // skips the branch entirely, which is Node's `!source_port.IsEmpty()`.
+        if let Some(source) = source {
+            if source.strict_equals(object.into()) {
+                return Err(SerializeError::DataClone(
+                    "Transfer list contains source port".to_string(),
+                ));
+            }
+        }
+        // `MessagePort in transfer list is already detached`. Node's
+        // `IsDetached()` is `data_ == nullptr || IsHandleClosing()`: a port is
+        // detached once `close()` ran *or* once it was handed over. Without this
+        // a port could be transferred twice, and the receiver would get two
+        // messages where the sender posted one.
+        if state.closing.get() {
+            return Err(SerializeError::DataClone(
+                "MessagePort in transfer list is already detached".to_string(),
+            ));
+        }
+        // Node refuses a second entry for the same object: the receiver would
+        // resolve two ids to one object and move the port twice.
+        if transfers
+            .ports
+            .iter()
+            .any(|existing| existing.strict_equals(object.into()))
+        {
+            return Err(SerializeError::DataClone(
+                "Transfer list contains duplicate MessagePort".to_string(),
+            ));
+        }
+        transfers.ports.push(object);
     }
 
     Ok(transfers)
+}
+
+/// `ReadIterable`: the entries of `object`, or `None` when it is not iterable.
+///
+/// Node special-cases an array (index reads, no iterator protocol), then falls
+/// back to `Symbol.iterator`/`next()`/`done`, returning `Just(false)` — not an
+/// error — when any piece is missing. `Some(vec![])` therefore means "iterable
+/// and empty", which is a different answer from `None`.
+fn read_iterable<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Result<Option<Vec<v8::Local<'s, v8::Value>>>, SerializeError> {
+    if let Ok(array) = v8::Local::<v8::Array>::try_from(object) {
+        let mut entries = Vec::with_capacity(array.length() as usize);
+        for index in 0..array.length() {
+            let Some(entry) = array.get_index(scope, index) else {
+                return Err(SerializeError::Thrown);
+            };
+            entries.push(entry);
+        }
+        return Ok(Some(entries));
+    }
+
+    let Some(iterator_method) = well_known_symbol(scope, "iterator") else {
+        return Ok(None);
+    };
+    let Some(method) = object.get(scope, iterator_method) else {
+        return Err(SerializeError::Thrown);
+    };
+    let Ok(method) = v8::Local::<v8::Function>::try_from(method) else {
+        return Ok(None);
+    };
+    let Some(iterator) = method.call(scope, object.into(), &[]) else {
+        return Err(SerializeError::Thrown);
+    };
+    let Ok(iterator) = v8::Local::<v8::Object>::try_from(iterator) else {
+        return Ok(None);
+    };
+    let Some(next) = get_key(scope, iterator, "next") else {
+        return Ok(None);
+    };
+    let Ok(next) = v8::Local::<v8::Function>::try_from(next) else {
+        return Ok(None);
+    };
+
+    let mut entries = Vec::new();
+    loop {
+        let Some(result) = next.call(scope, iterator.into(), &[]) else {
+            return Err(SerializeError::Thrown);
+        };
+        let Ok(result) = v8::Local::<v8::Object>::try_from(result) else {
+            return Ok(None);
+        };
+        let Some(done) = get_key(scope, result, "done") else {
+            return Err(SerializeError::Thrown);
+        };
+        if done.boolean_value(scope) {
+            return Ok(Some(entries));
+        }
+        let Some(value) = get_key(scope, result, "value") else {
+            return Err(SerializeError::Thrown);
+        };
+        entries.push(value);
+    }
+}
+
+/// `Symbol.<name>`, read off the global `Symbol` because the V8 crate exposes no
+/// accessor for it.
+fn well_known_symbol<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "Symbol")?;
+    let holder = global.get(scope, key.into())?;
+    let holder = v8::Local::<v8::Object>::try_from(holder).ok()?;
+    let key = v8::String::new(scope, name)?;
+    let symbol = holder.get(scope, key.into())?;
+    symbol.is_symbol().then_some(symbol)
 }
 
 #[cfg(test)]

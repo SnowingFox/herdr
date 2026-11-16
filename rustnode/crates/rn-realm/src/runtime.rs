@@ -126,7 +126,7 @@ impl Runtime {
             let _ = rn_bind_messaging::run_message_ports(scope);
         });
         rn_bind_timers::set_check_phase_pending(rn_bind_messaging::has_delivery_pending);
-        rn_bind_messaging::set_check_phase_armed(rn_bind_timers::arm_check_phase);
+        rn_bind_messaging::set_check_phase_armed(rn_bind_timers::arm_check_phase_for_port);
         // The tick half of the per-callback checkpoint `rn-uv` runs after every
         // libuv completion. `runNextTicks` is the same function the loop's
         // between-iteration drain calls, so the queue is drained by one
@@ -391,8 +391,13 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
     fn has_external_work(&self) -> bool {
         // A ref'd receiving `MessagePort` pins the process open in Node even
         // though it owns no libuv handle, so libuv's own liveness answer is
-        // incomplete without it.
-        if rn_bind_messaging::has_message_port_work() {
+        // incomplete without it. A message already queued for a port that will read
+        // it counts too: the sender may be on another thread, whose `uv_async_send`
+        // equivalent is a wake on *this* loop, and dropping the message because
+        // nothing happened to be ref'd loses it.
+        if rn_bind_messaging::has_message_port_work()
+            || rn_bind_messaging::has_deliverable_message()
+        {
             return true;
         }
         // A debugger being attached keeps `node --inspect` alive after the script
@@ -779,7 +784,7 @@ pub fn runtime_exit_requested() -> bool {
 /// no libuv handle, so libuv's own liveness answer is incomplete without it.
 #[must_use]
 pub fn runtime_has_external_work() -> bool {
-    rn_bind_messaging::has_message_port_work()
+    rn_bind_messaging::has_message_port_work() || rn_bind_messaging::has_deliverable_message()
 }
 
 /// Clears the recorded runtime, so a new realm on this thread cannot inherit the

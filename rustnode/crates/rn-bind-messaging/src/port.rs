@@ -561,6 +561,8 @@ pub struct PortInner {
     pub refed: Cell<bool>,
     /// Set once `close()` ran.
     pub closing: Cell<bool>,
+    /// Set once the close event ran.
+    pub closed: Cell<bool>,
     /// Identity of this port, so two ports never compare equal.
     identity: Rc<()>,
     /// The JavaScript object, weakly.
@@ -582,7 +584,7 @@ thread_local! {
     /// Node's `uv_close` callback runs in the loop's close phase and dispatches
     /// the event from there, which is why `port.close()` does not fire the event
     /// synchronously.
-    static CLOSING: RefCell<Vec<Rc<PortInner>>> = const { RefCell::new(Vec::new()) };
+    static CLOSING: RefCell<Vec<CloseOwed>> = const { RefCell::new(Vec::new()) };
 
     /// Every port that is still receiving, ref'd and open.
     ///
@@ -592,24 +594,47 @@ thread_local! {
     /// stay true for as long as the port is ref'd, whether or not a message is
     /// waiting. Without it a script whose only work is a `message` listener would
     /// exit immediately, where Node stays alive.
-    static LIVE: RefCell<Vec<Rc<PortInner>>> = const { RefCell::new(Vec::new()) };
+    static LIVE: RefCell<Vec<std::rc::Weak<PortInner>>> = const { RefCell::new(Vec::new()) };
 
-    /// The callback that wakes the loop when a message is queued.
+    /// The callback that starts the loop's check phase for a port.
     ///
-    /// Node signals a port's `uv_async_t` from `TriggerAsync`. rustnode has no
-    /// per-port handle, so the equivalent is to arm the check phase, and the
-    /// CLI registers the arming function here when it starts the loop. `None`
-    /// before that, which is why `schedule` tolerates it: a message queued during
-    /// bootstrap is still in `PENDING` and the first check phase runs it.
-    static CHECK_PHASE_ARMED: Cell<Option<fn()>> = const { Cell::new(None) };
+    /// Node signals a port's `uv_async_t` from `TriggerAsync`, and that handle's
+    /// own ref bit decides whether the signal holds the loop open. rustnode has no
+    /// per-port handle — the check handle is shared — so the callback is told
+    /// whether anything still keeps the loop alive. See [`wake_loop`].
+    static CHECK_PHASE_ARMED: Cell<Option<fn(bool)>> = const { Cell::new(None) };
 }
 
-/// Registers the function that wakes the loop's check phase.
+/// Registers the function that starts the loop's check phase.
 ///
 /// Called once by the CLI when it starts the loop. One slot, replaced rather
 /// than accumulated: there is one loop and one check handle.
-pub fn set_check_phase_armed(armed: fn()) {
+pub fn set_check_phase_armed(armed: fn(bool)) {
     CHECK_PHASE_ARMED.with(|slot| slot.set(Some(armed)));
+}
+
+/// Starts the check phase so a queued delivery runs on the next turn.
+///
+/// The arm never reffs the shared check handle, and never unrefs it either.
+/// Reffing would hold the loop open past the point Node stops — and because the
+/// handle is shared with `setImmediate` and every other producer of check-phase
+/// work, a ref taken here outlives the port that took it. Unreffing is just as
+/// wrong in the other direction: it releases a ref an outstanding immediate took,
+/// which stops the loop reaching its own timer phase.
+///
+/// Port liveness is expressed by [`any_keeps_loop_alive`], which the loop consults
+/// through `has_message_port_work`. That is Node's own split: `uv__loop_alive`
+/// counts a handle only when it is both active and ref'd, and a port's ref bit is
+/// what `ref()`/`unref()` set.
+fn wake_loop() {
+    let Some(armed) = CHECK_PHASE_ARMED.with(|slot| slot.get()) else {
+        return;
+    };
+    // `false`: the wake never reffs the shared check handle. A port's claim on the
+    // loop comes from its own ref bit, reported through `has_message_port_work`,
+    // and reffing here would make `port2.on('message', f); port2.unref();
+    // port1.postMessage('x')` deliver a message Node drops.
+    armed(false);
 }
 
 impl PortInner {
@@ -619,13 +644,37 @@ impl PortInner {
             data,
             id: next_port_id(),
             receiving: Cell::new(false),
-            refed: Cell::new(true),
+            // `setupPortReferencing` in `lib/internal/worker/io.js` calls
+            // `port.unref()` from `oninit`, so every port Node builds starts
+            // unref'd. Starting ref'd made a port pin the loop that Node would let
+            // the process exit with.
+            refed: Cell::new(false),
             closing: Cell::new(false),
+            closed: Cell::new(false),
             identity: Rc::new(()),
             object: RefCell::new(None),
         });
         inner.data.attach(&inner);
         register_local(inner.id, &inner);
+        // Every port is a liveness candidate from birth, because liveness is a
+        // function of the ref bit and not of `start()`: `new MessageChannel()
+        // .port2.ref()` alone pins the process in Node and never calls `start()`.
+        //
+        // Registered *weakly*. A strong `Rc` here would keep every port alive for
+        // the process' life, and since `any_keeps_loop_alive` answers from this
+        // list, a worker's closed ports would go on holding its loop open — which
+        // made a worker's `setTimeout` and `fs.readFile` never run while the loop
+        // spun. `LIVE` is a registry to scan, never an owner.
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            if !live
+                .iter()
+                .filter_map(std::rc::Weak::upgrade)
+                .any(|other| other.same(&inner))
+            {
+                live.push(Rc::downgrade(&inner));
+            }
+        });
         inner
     }
 
@@ -662,11 +711,18 @@ impl PortInner {
 
     /// Queues the async work a posted message creates.
     ///
-    /// Node's `TriggerAsync` does nothing when the handle is closing, and the
-    /// loop then runs `OnMessage` only for a port that is receiving, so a
-    /// non-receiving port is not queued here either.
+    /// Node's `MessagePortData::AddToIncomingQueue` always calls
+    /// `owner_->TriggerAsync()`, and `TriggerAsync` bails out only when the handle
+    /// is closing. `receiving_messages_` does **not** gate the wake — it gates what
+    /// `ReceiveMessage` does once it runs, and a close marker bypasses that gate
+    /// entirely.
+    ///
+    /// So the port is always queued and only the arm is conditional. A worker's
+    /// `parentPort` is unref'd for most of its life, and dropping its message
+    /// because nothing happened to be ref'd lost every `parentPort.postMessage`
+    /// from a worker whose loop had other work.
     pub fn schedule(self: &Rc<Self>) {
-        if self.closing.get() || !self.receiving.get() {
+        if self.closing.get() {
             return;
         }
         PENDING.with(|pending| {
@@ -675,25 +731,12 @@ impl PortInner {
                 pending.push(Rc::clone(self));
             }
         });
-        // Node signals the port's `uv_async_t` here, which is what wakes the
-        // loop. rustnode delivers from the check phase instead, so arming the
-        // check handle is the equivalent wake: without it the message would sit
-        // in `PENDING` until some unrelated timer or immediate happened to keep
-        // the loop turning.
-        if let Some(armed) = CHECK_PHASE_ARMED.with(|slot| slot.get()) {
-            armed();
-        }
+        wake_loop();
     }
 
     /// Marks this port as receiving and wakes it if messages are already queued.
     pub fn start(self: &Rc<Self>) {
         self.receiving.set(true);
-        LIVE.with(|live| {
-            let mut live = live.borrow_mut();
-            if !live.iter().any(|other| other.same(self)) {
-                live.push(Rc::clone(self));
-            }
-        });
         if !self.data.is_empty() {
             self.schedule();
         }
@@ -701,8 +744,9 @@ impl PortInner {
 
     /// Stops draining this port, `stopMessagePort`.
     pub fn stop(&self) {
+        // `stopMessagePort` clears `receiving_messages_` and nothing else: the
+        // handle stays in the registry and is judged by `keeps_loop_alive`.
         self.receiving.set(false);
-        LIVE.with(|live| live.borrow_mut().retain(|other| !other.same_ref(self)));
     }
 
     /// Detaches a port that is being moved to another owner.
@@ -710,10 +754,24 @@ impl PortInner {
     /// Node's `TransferForMessaging` closes and detaches; the queue lives on in
     /// the receiving object, so this drops the owner link and stops delivery
     /// here without queueing a close for the peer.
-    pub fn detach_for_transfer(&self) {
+    pub fn detach_for_transfer(self: &Rc<Self>) {
         self.closing.set(true);
         self.receiving.set(false);
         self.data.detach();
+        // `TransferForMessaging` is `Close(); return Detach();`, so the sender's
+        // end owes the same `close` event a `close()` call would queue — and,
+        // like `close()`, earns the iteration that dispatches it.
+        CLOSING.with(|closing| {
+            let mut closing = closing.borrow_mut();
+            if !closing.iter().any(|owed| owed.port.same(self)) {
+                closing.push(CloseOwed {
+                    port: Rc::clone(self),
+                    creates_iteration: true,
+                    deferred: 0,
+                });
+            }
+        });
+        wake_loop();
     }
 
     /// Whether the loop should keep running for this port.
@@ -722,7 +780,34 @@ impl PortInner {
     /// once it is receiving, which is what makes `port.on('message', ...)` pin
     /// the process and `port.unref()` release it.
     pub fn keeps_loop_alive(&self) -> bool {
-        self.receiving.get() && self.refed.get() && !self.closing.get()
+        !self.closed.get() && (self.refed.get() || self.owes_close_event())
+    }
+
+    /// Whether this port still owes its own `close` event.
+    ///
+    /// This is libuv's `closing_handles` term, bounded by the thing that actually
+    /// ends it: the event being dispatched. `uv_close` puts a handle on
+    /// `closing_handles` and keeps the loop alive until its callback runs, so a
+    /// closed port earns exactly one more iteration — the one that dispatches its
+    /// own `close`. Keying that on the `CLOSING` queue rather than on the
+    /// `closing` flag is what stops it from being unbounded: a port whose object
+    /// was dropped, or one already dispatched, leaves the queue.
+    pub fn owes_close_event(&self) -> bool {
+        CLOSING.with(|queue| {
+            queue.borrow().iter().any(|owed| {
+                owed.creates_iteration && owed.port.same_ref(self) && !self.closed.get()
+            })
+        })
+    }
+
+    /// `HandleWrap::HasRef`.
+    pub fn has_ref(&self) -> bool {
+        !self.closed.get() && self.refed.get()
+    }
+
+    /// `HandleWrap::OnClose`'s `kClosed`.
+    pub fn mark_closed(&self) {
+        self.closed.set(true);
     }
 
     /// Closes this port, queueing the close event for the close phase.
@@ -730,24 +815,52 @@ impl PortInner {
     /// Idempotent: Node's `HandleWrap::Close` returns early unless the handle is
     /// still initialized, which is what makes a second `close()` harmless.
     pub fn close(self: &Rc<Self>) {
+        self.close_with(true);
+    }
+
+    /// `close()`, saying whether this call is the one that owes the event.
+    ///
+    /// Only a close the user initiated keeps the loop alive for its own `close`
+    /// event. A peer's marker consumed by [`crate::delivery::deliver`] also calls
+    /// `Close()` on the receiver — that is what makes a port whose peer went away
+    /// stop pinning the loop — but it must not *create* an iteration: Node
+    /// exits without dispatching it. So the receiver is closed quietly.
+    pub fn close_quietly(self: &Rc<Self>) {
+        self.close_with(false);
+    }
+
+    fn close_with(self: &Rc<Self>, owes_event: bool) {
         if self.closing.get() {
             return;
         }
         self.closing.set(true);
         self.receiving.set(false);
-        LIVE.with(|live| live.borrow_mut().retain(|other| !other.same(self)));
+        // `SiblingGroup::Disentangle`, inline. Node runs it from
+        // `MessagePort::OnClose`, but its only observable effect is the close
+        // marker it queues for the peer, and that marker is honoured by
+        // `deliver` calling `close()` on the receiver — which is the fix for a
+        // port whose peer went away pinning the loop forever.
         self.data.disentangle();
+        // The event is queued either way: Node dispatches a peer's `close` when
+        // anything else keeps the loop turning (`port2.on('close', f);
+        // port1.close(); setTimeout(...)` fires it). `owes_event` only decides
+        // whether the queue itself earns the iteration.
         CLOSING.with(|closing| {
             let mut closing = closing.borrow_mut();
-            if !closing.iter().any(|other| other.same(self)) {
-                closing.push(Rc::clone(self));
+            if !closing.iter().any(|owed| owed.port.same(self)) {
+                closing.push(CloseOwed {
+                    port: Rc::clone(self),
+                    creates_iteration: owes_event,
+                    deferred: 0,
+                });
             }
         });
-        // The close event is dispatched from the check phase, so it needs the
-        // same wake a queued message does; otherwise `port.close()` would only
-        // emit `close` if some other handle happened to keep the loop running.
-        if let Some(armed) = CHECK_PHASE_ARMED.with(|slot| slot.get()) {
-            armed();
+        // Only a close this code initiated earns the iteration. A port closed
+        // because its peer sent a close marker must not: Node exits without
+        // dispatching that event (`port2.on('close', f); port1.close()` prints
+        // nothing), and waking here would make it print.
+        if owes_event {
+            wake_loop();
         }
     }
 }
@@ -769,9 +882,37 @@ pub fn requeue(ports: Vec<Rc<PortInner>>) {
     PENDING.with(|pending| pending.borrow_mut().extend(ports));
 }
 
+/// One owed `close` event, and whether it is allowed to earn an iteration.
+///
+/// Node's `closing_handles` counts a handle from `uv_close` until its callback
+/// runs, so the port that *called* `close` keeps the loop alive for the iteration
+/// that dispatches its own event. A peer closed by a close marker never went
+/// through `uv_close` from this code, and Node exits without dispatching it — so
+/// its event is still queued (anything else that keeps the loop turning will
+/// dispatch it) but does not itself create an iteration.
+pub struct CloseOwed {
+    /// The port that owes the event.
+    pub port: Rc<PortInner>,
+    /// Whether this event is the reason the loop ran the close phase.
+    pub creates_iteration: bool,
+    /// How many close phases this event has been deferred out of.
+    ///
+    /// An event owed by a port that a close marker closed is dispatched one phase
+    /// *after* the one that consumed the marker, which is Node's ordering and only
+    /// happens if something else keeps the loop turning. One deferral is therefore
+    /// enough; a second would never terminate, because the deferred event is the
+    /// only thing left.
+    pub deferred: u32,
+}
+
 /// Takes every port whose close event is owed.
-pub fn take_closing() -> Vec<Rc<PortInner>> {
+pub fn take_closing() -> Vec<CloseOwed> {
     CLOSING.with(|closing| std::mem::take(&mut *closing.borrow_mut()))
+}
+
+/// Puts back the events that another close phase has to dispatch.
+pub fn requeue_closing(owed: Vec<CloseOwed>) {
+    CLOSING.with(|closing| closing.borrow_mut().extend(owed));
 }
 
 /// Whether a delivery is queued for the check phase.
@@ -780,9 +921,42 @@ pub fn take_closing() -> Vec<Rc<PortInner>> {
 /// is what starts the check handle; [`any_keeps_loop_alive`] answers the
 /// different question of whether a port pins the process open.
 pub fn has_delivery_pending() -> bool {
-    let pending = PENDING.with(|queue| !queue.borrow().is_empty());
-    let closing = CLOSING.with(|queue| !queue.borrow().is_empty());
-    pending || closing
+    // Only an event that earns an iteration keeps the phase armed. A deferred one
+    // is dispatched if the loop turns for another reason, and must not be the
+    // reason it turns: `port2.on('close', f); port1.close()` exits without printing
+    // it, while the same script with a pending timer prints it.
+    let closing = CLOSING.with(|queue| {
+        queue
+            .borrow()
+            .iter()
+            .any(|owed| owed.creates_iteration && !owed.port.closed.get())
+    });
+    if closing {
+        return true;
+    }
+    // A queued port is work only when its front entry will actually be consumed.
+    // A close marker on a listener-less port must not be: Node exits without
+    // dispatching it (`port2.on('close', f); port1.close()` prints nothing), so
+    // counting it here would run an iteration Node never runs *and* spin, since
+    // draining it re-queues nothing while the predicate stays true.
+    PENDING.with(|queue| {
+        queue
+            .borrow()
+            .iter()
+            .any(|port| port.receiving.get() && !port.data.is_empty() && !port.closed.get())
+    })
+}
+
+/// Whether a queued port has a message waiting.
+pub fn has_deliverable_message() -> bool {
+    PENDING.with(|queue| {
+        queue.borrow().iter().any(|port| {
+            !port.closed.get()
+                && port.receiving.get()
+                && !port.data.is_empty()
+                && port.data.front_is_close() == Some(false)
+        })
+    })
 }
 
 /// Whether any port is keeping the loop alive.
@@ -793,9 +967,14 @@ pub fn has_delivery_pending() -> bool {
 /// attaches no listener exits; `port.on('message', ...)` re-refs and pins.
 pub fn any_keeps_loop_alive() -> bool {
     LIVE.with(|live| {
-        // Drop ports whose object was collected, then answer from what is left.
-        live.borrow_mut().retain(|port| port.has_object());
-        live.borrow().iter().any(|port| port.keeps_loop_alive())
+        // Drop ports that are gone or whose object was collected, then answer from
+        // what is left. A closed port keeps its object until the `close` event ran,
+        // so the liveness test below is what retires it rather than this prune.
+        let mut live = live.borrow_mut();
+        live.retain(|port| port.upgrade().is_some_and(|port| port.has_object()));
+        live.iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|port| port.keeps_loop_alive())
     })
 }
 
@@ -923,16 +1102,72 @@ mod tests {
     }
 
     #[test]
-    fn a_stopped_port_keeps_no_loop_alive() {
+    fn a_fresh_port_is_unrefed_and_pins_nothing() {
+        // Two facts from `io.js`: `setupPortReferencing` unrefs every port its
+        // constructor builds, and `MessagePort::Start` only sets
+        // `receiving_messages_`. Neither is what makes the loop alive.
         let (_data, inner) = port();
-        assert!(!inner.keeps_loop_alive(), "a fresh port is not receiving");
+        assert!(!inner.receiving.get(), "a fresh port is not receiving");
+        assert!(!inner.refed.get(), "io.js unrefs every port it builds");
+        assert!(!inner.keeps_loop_alive(), "an unref'd port pins nothing");
+    }
+
+    #[test]
+    fn liveness_follows_the_ref_bit_not_the_receiving_flag() {
+        // libuv's `uv__loop_alive` is `active_handles || active_reqs ||
+        // closing_handles`, and a port's `uv_async_t` is active from
+        // `uv_async_init` — not from `start()`. Measured on the pinned oracle:
+        // `new MessageChannel().port2.ref()` alone never exits, while
+        // `port2.start()` alone exits.
+        let (_data, inner) = port();
         inner.start();
-        assert!(inner.keeps_loop_alive());
+        assert!(
+            !inner.keeps_loop_alive(),
+            "start() does not ref: only the ref bit decides"
+        );
+        inner.refed.set(true);
+        assert!(inner.keeps_loop_alive(), "a ref'd port pins");
         inner.stop();
-        assert!(!inner.keeps_loop_alive());
-        inner.start();
+        assert!(
+            inner.keeps_loop_alive(),
+            "stopMessagePort does not unref; io.js's removeListener does that"
+        );
         inner.refed.set(false);
-        assert!(!inner.keeps_loop_alive(), "an unref'd port never pins");
+        assert!(!inner.keeps_loop_alive(), "an unref'd port does not");
+    }
+
+    #[test]
+    fn a_port_owing_its_close_event_keeps_the_loop_alive_once() {
+        // `uv_close` puts the handle on `closing_handles`, which keeps the loop
+        // alive until the callback runs — that is the iteration that dispatches
+        // the event. The term has to end, or a closed port would pin the process
+        // forever: it is the `CLOSING` queue, not the `closing` flag.
+        let _ = take_closing();
+        let (_data, inner) = port();
+        assert!(!inner.owes_close_event());
+        inner.clone().close();
+        assert!(inner.owes_close_event(), "close() owes its own event");
+        let owed = take_closing();
+        assert!(owed.iter().any(|owed| owed.port.same(&inner)));
+        assert!(
+            !inner.owes_close_event(),
+            "a dispatched event ends the obligation"
+        );
+    }
+
+    #[test]
+    fn has_ref_reports_true_between_close_and_its_close_event() {
+        // `HandleWrap::HasRef` is `IsAlive(wrap) && uv_has_ref(handle)`, and
+        // `IsAlive` excludes `kClosed` but not `kClosing`. Measured on the
+        // oracle: `port.on('message'); port.close(); port.hasRef()` is `true`.
+        let (_data, inner) = port();
+        inner.refed.set(true);
+        assert!(inner.has_ref());
+        inner.clone().close();
+        assert!(inner.has_ref(), "closing is not closed");
+        inner.mark_closed();
+        assert!(!inner.has_ref());
+        let _ = take_closing();
     }
 
     #[test]
@@ -973,21 +1208,34 @@ mod tests {
     }
 
     #[test]
-    fn a_transferred_port_stops_receiving_without_closing_its_peer() {
+    fn a_transferred_port_is_detached_and_owes_its_own_close() {
         let a = MessagePortData::new();
         let b = MessagePortData::new();
         MessagePortData::entangle(&a, &b);
         let inner = PortInner::new(Arc::clone(&a));
         inner.start();
+        inner.refed.set(true);
+        let _ = take_closing();
 
         inner.detach_for_transfer();
 
-        assert!(!inner.keeps_loop_alive());
+        // `TransferForMessaging` is `Close(); return Detach();`, so the sender's
+        // end is closing and owes its own `close` event — which is why a second
+        // transfer of the same object reports "already detached". The peer's
+        // marker is queued by the close phase, not by the transfer, so the channel
+        // the port was moved into stays open here.
+        assert!(inner.closing.get());
+        assert!(
+            inner.keeps_loop_alive(),
+            "a port that owes its own close event earns the iteration that runs it"
+        );
+        assert!(inner.owes_close_event(), "the sender's event is owed");
         assert!(a.owner().is_none(), "the queue lost its owner");
         assert_eq!(
             b.front_is_close(),
             None,
             "a move must not close the channel the port was moved into"
         );
+        let _ = take_closing();
     }
 }
