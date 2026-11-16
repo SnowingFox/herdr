@@ -110,7 +110,7 @@ pub fn constructor<'s, K: RequestKind>(
     scope: &mut v8::PinScope<'s, '_>,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(callback).build(scope);
+    let template = rn_core::class(callback).build(scope);
 
     let instance = template.instance_template(scope);
     // One internal field, which is where a write parks the socket it belongs to

@@ -114,7 +114,7 @@ pub fn install_classes<'s>(
     set(scope, target, "CipherBase", cipher.into())?;
     let job = job::build_aes_cipher_job_class(scope)?;
     set(scope, target, "AESCipherJob", job.into())?;
-    let info = v8::FunctionTemplate::builder(info::get_cipher_info)
+    let info = rn_core::method(info::get_cipher_info)
         .build(scope)
         .get_function(scope)
         .ok_or("cannot allocate crypto.getCipherInfo")?;

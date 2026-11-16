@@ -158,28 +158,19 @@ pub fn install<'s>(
 ) -> Result<v8::Local<'s, v8::Object>, String> {
     let object = v8::Object::new(scope);
 
-    let wrap_template = v8::FunctionTemplate::builder(wrap)
-        .length(4)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let wrap_template = rn_core::method(wrap).length(4).build(scope);
     let wrap_fn = wrap_template
         .get_function(scope)
         .ok_or("cannot allocate the wrap function")?;
     set(scope, object, "wrap", wrap_fn.into())?;
 
-    let inject_template = v8::FunctionTemplate::builder(inject_error)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let inject_template = rn_core::method(inject_error).length(0).build(scope);
     let inject = inject_template
         .get_function(scope)
         .ok_or("cannot allocate injectOpenSSLErrorForTesting")?;
     set(scope, object, "injectOpenSSLErrorForTesting", inject.into())?;
 
-    let has_error_template = v8::FunctionTemplate::builder(has_error)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let has_error_template = rn_core::method(has_error).length(0).build(scope);
     let has_error_fn = has_error_template
         .get_function(scope)
         .ok_or("cannot allocate hasOpenSSLErrorForTesting")?;
@@ -483,7 +474,7 @@ fn has_error(
 
 /// Builds the `TLSWrap` constructor and its prototype.
 fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(construct_tls_wrap).build(scope);
+    let template = rn_core::class(construct_tls_wrap).build(scope);
     let name = v8::String::new(scope, "TLSWrap").ok_or("cannot allocate the TLSWrap class name")?;
     template.set_class_name(name);
     template
@@ -494,9 +485,8 @@ fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
 
     // `writeQueueSize`, an accessor with `ReadOnly | DontDelete`. Node installs it
     // before the prototype methods, which is why it comes first here.
-    let queue_size = v8::FunctionTemplate::builder(crate::methods::get_write_queue_size)
+    let queue_size = rn_core::method(crate::methods::get_write_queue_size)
         .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
         .build(scope);
     prototype.set_accessor_property(
         key(scope, "writeQueueSize")?.into(),
@@ -538,13 +528,11 @@ fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
     // `onread`, the accessor `AddMethods` installs last. `lib/net.js` assigns it
     // (`Socket.prototype._handle.onread = onStreamRead`) and the read path calls
     // it, so it has to be a real property that round-trips.
-    let onread_getter = v8::FunctionTemplate::builder(crate::stream::get_onread)
+    let onread_getter = rn_core::method(crate::stream::get_onread)
         .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
         .build(scope);
-    let onread_setter = v8::FunctionTemplate::builder(crate::stream::set_onread)
+    let onread_setter = rn_core::method(crate::stream::set_onread)
         .length(1)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
         .build(scope);
     prototype.set_accessor_property(
         key(scope, "onread")?.into(),

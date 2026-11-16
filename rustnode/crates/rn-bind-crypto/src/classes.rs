@@ -47,7 +47,7 @@ fn make_base_class<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
 ) -> Option<v8::Local<'s, v8::Function>> {
-    let template = v8::FunctionTemplate::builder(base_constructor).build(scope);
+    let template = rn_core::class(base_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);

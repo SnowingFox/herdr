@@ -355,7 +355,7 @@ macro_rules! install_methods {
     ($scope:ident, $prototype:ident, $($name:literal => $callback:path),* $(,)?) => {
         $(
             {
-                let template = v8::FunctionTemplate::builder($callback).build($scope);
+                let template = rn_core::method($callback).build($scope);
                 let Some(key) = v8::String::new($scope, $name) else {
                     return Err(format!("cannot allocate the {} property name", $name));
                 };
@@ -383,7 +383,7 @@ macro_rules! shared_methods {
 
 /// Builds `DiffieHellman`: every method plus the two setters.
 fn build_class<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(constructor).build(scope);
+    let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELD_COUNT);
@@ -404,7 +404,7 @@ fn build_class<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
 fn build_group_class<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(group_constructor).build(scope);
+    let template = rn_core::class(group_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELD_COUNT);

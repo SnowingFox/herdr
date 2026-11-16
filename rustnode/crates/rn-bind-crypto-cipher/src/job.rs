@@ -229,16 +229,13 @@ thread_local! {
 pub fn build_aes_cipher_job_class<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
-    let template = v8::FunctionTemplate::builder(job_constructor).build(scope);
+    let template = rn_core::class(job_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
     let prototype = template.prototype_template(scope);
     let key = v8::String::new(scope, "run").ok_or("cannot allocate AESCipherJob.run")?;
-    prototype.set(
-        key.into(),
-        v8::FunctionTemplate::builder(job_run).build(scope).into(),
-    );
+    prototype.set(key.into(), rn_core::method(job_run).build(scope).into());
     let class_name =
         v8::String::new(scope, "AESCipherJob").ok_or("cannot allocate the AESCipherJob name")?;
     template.set_class_name(class_name);

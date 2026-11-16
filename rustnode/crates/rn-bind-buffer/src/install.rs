@@ -30,7 +30,7 @@ use rn_core::codec::Encoding;
 /// Binds a Rust callback as a namespace function.
 macro_rules! mkfn {
     ($installer:expr, $name:expr, $callback:expr) => {{
-        let template = v8::FunctionTemplate::builder($callback).build($installer.scope);
+        let template = rn_core::method($callback).build($installer.scope);
         let function = template
             .get_function($installer.scope)
             .ok_or_else(|| format!("cannot allocate buffer.{}", $name))?;

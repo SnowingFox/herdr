@@ -88,7 +88,7 @@ pub fn constructor<'s>(
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     // `NewFunctionTemplate`, whose length defaults to 0, and `new Signal()` is
     // the only shape `lib/internal/process/signal.js` uses.
-    let template = v8::FunctionTemplate::builder(new).build(scope);
+    let template = rn_core::class(new).build(scope);
     let name = v8::String::new(scope, "Signal").ok_or("cannot allocate the Signal class name")?;
     template.set_class_name(name);
     template
@@ -103,9 +103,8 @@ pub fn constructor<'s>(
     macro_rules! install_methods {
         ($($method_name:literal => $method:expr),* $(,)?) => {
             $(
-                let method_template = v8::FunctionTemplate::builder($method)
+                let method_template = rn_core::method($method)
                     .length(0)
-                    .constructor_behavior(v8::ConstructorBehavior::Throw)
                     .build(scope);
                 let key = v8::String::new(scope, $method_name)
                     .ok_or_else(|| format!("cannot allocate the name {}", $method_name))?;

@@ -62,7 +62,7 @@ impl BindingModule for Types {
         macro_rules! install {
             ($($name:literal => $callback:expr),* $(,)?) => {
                 $(
-                    let template = v8::FunctionTemplate::builder($callback).build(scope);
+                    let template = rn_core::method($callback).build(scope);
                     if let (Some(key), Some(function)) =
                         (v8::String::new(scope, $name), template.get_function(scope))
                     {

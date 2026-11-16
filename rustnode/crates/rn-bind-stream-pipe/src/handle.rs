@@ -134,7 +134,7 @@ pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     // `StreamPipe.length` is 0: `NewFunctionTemplate`'s default.
-    let template = v8::FunctionTemplate::builder(new).build(scope);
+    let template = rn_core::class(new).build(scope);
     let name =
         v8::String::new(scope, "StreamPipe").ok_or("cannot allocate the StreamPipe class name")?;
     template.set_class_name(name);
@@ -150,9 +150,8 @@ pub fn constructor<'s>(
     macro_rules! install_method {
         ($($method_name:literal => $method:expr),* $(,)?) => {
             $(
-                let method_template = v8::FunctionTemplate::builder($method)
+                let method_template = rn_core::method($method)
                     .length(0)
-                    .constructor_behavior(v8::ConstructorBehavior::Throw)
                     .build(scope);
                 let key = v8::String::new(scope, $method_name)
                     .ok_or_else(|| format!("cannot allocate StreamPipe.{}", $method_name))?;

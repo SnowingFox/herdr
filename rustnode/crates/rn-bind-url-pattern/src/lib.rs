@@ -132,7 +132,7 @@ impl BindingModule for UrlPattern {
 fn constructor_template<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::FunctionTemplate>, String> {
-    let template = v8::FunctionTemplate::builder(construct_url_pattern).build(scope);
+    let template = rn_core::class(construct_url_pattern).build(scope);
     template
         .set_class_name(v8::String::new(scope, "URLPattern").ok_or("cannot name the constructor")?);
     // One internal field, holding the pointer to the compiled pattern's `State`.
@@ -165,9 +165,8 @@ fn constructor_template<'s>(
     // nine installations visibly identical.
     macro_rules! install_component {
         ($name:literal, $getter:path) => {{
-            let getter = v8::FunctionTemplate::builder($getter)
+            let getter = rn_core::method($getter)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .side_effect_type(v8::SideEffectType::HasNoSideEffect)
                 .build(scope);
             let key = v8::String::new(scope, $name).ok_or("cannot name a component")?;
@@ -189,14 +188,12 @@ fn constructor_template<'s>(
 
     // `test` and `exec` are ordinary prototype methods: writable, enumerable
     // and configurable, which is `SetProtoMethodNoSideEffect`'s shape.
-    let exec = v8::FunctionTemplate::builder(exec_pattern)
+    let exec = rn_core::method(exec_pattern)
         .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
         .side_effect_type(v8::SideEffectType::HasNoSideEffect)
         .build(scope);
-    let test = v8::FunctionTemplate::builder(test_pattern)
+    let test = rn_core::method(test_pattern)
         .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
         .side_effect_type(v8::SideEffectType::HasNoSideEffect)
         .build(scope);
     for (name, function) in [("exec", exec), ("test", test)] {

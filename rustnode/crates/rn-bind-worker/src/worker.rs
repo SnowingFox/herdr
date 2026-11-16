@@ -69,7 +69,7 @@ const ONEXIT_KEY: &str = "onexit";
 pub fn install_worker_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(worker_constructor).build(scope);
+    let template = rn_core::class(worker_constructor).build(scope);
     if let Some(name) = v8::String::new(scope, "Worker") {
         template.set_class_name(name);
     }
@@ -106,7 +106,7 @@ fn install_method<'s>(
     name: &str,
     method: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(method).build(scope);
+    let template = rn_core::class(method).build(scope);
     if let Some(key) = v8::String::new(scope, name) {
         template.set_class_name(key);
     }

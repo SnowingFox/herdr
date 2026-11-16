@@ -92,7 +92,9 @@ impl BindingModule for CjsLexer {
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
         let object = v8::Object::new(scope);
-        let parse = v8::Function::new(scope, parse).ok_or("cannot allocate cjs_lexer.parse")?;
+        let parse = rn_core::method_function(parse)
+            .build(scope)
+            .ok_or("cannot allocate cjs_lexer.parse")?;
         let key = v8::String::new(scope, "parse").ok_or("cannot allocate cjs_lexer.parse key")?;
         if object.set(scope, key.into(), parse.into()) != Some(true) {
             return Err("cannot install cjs_lexer.parse".to_string());

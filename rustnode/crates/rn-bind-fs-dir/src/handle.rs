@@ -87,9 +87,7 @@ pub fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(callback)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let template = rn_core::method(callback).build(scope);
     let text = v8::String::new(scope, name).ok_or_else(|| format!("cannot allocate {name}"))?;
     template.set_class_name(text);
     let function = template
@@ -103,7 +101,7 @@ pub fn function<'s>(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(new).build(scope);
+    let template = rn_core::class(new).build(scope);
     let name =
         v8::String::new(scope, "DirHandle").ok_or("cannot allocate the DirHandle class name")?;
     template.set_class_name(name);
@@ -115,9 +113,8 @@ pub fn constructor<'s>(
     macro_rules! install_methods {
         ($($method_name:literal => $method:expr => $length:expr),* $(,)?) => {
             $(
-                let method_template = v8::FunctionTemplate::builder($method)
+                let method_template = rn_core::method($method)
                     .length($length)
-                    .constructor_behavior(v8::ConstructorBehavior::Throw)
                     .build(scope);
                 let key = v8::String::new(scope, $method_name)
                     .ok_or_else(|| format!("cannot allocate the name {}", $method_name))?;

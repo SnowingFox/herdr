@@ -60,7 +60,7 @@ pub fn install_classes<'s>(
     // to write, and `run()` would read a null.
     macro_rules! job_class {
         ($name:literal => $constructor:path) => {{
-            let template = v8::FunctionTemplate::builder($constructor).build(scope);
+            let template = rn_core::class($constructor).build(scope);
             template
                 .instance_template(scope)
                 .set_internal_field_count(JOB_FIELD as usize + 1);
@@ -927,7 +927,7 @@ fn install_run<J: Runnable + 'static>(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<v8::Object>,
 ) {
-    let template = v8::FunctionTemplate::builder(run::<J>).build(scope);
+    let template = rn_core::class(run::<J>).build(scope);
     let Some(function) = template.get_function(scope) else {
         return;
     };

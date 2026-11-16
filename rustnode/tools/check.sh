@@ -190,6 +190,24 @@ step "calling a binding constructor without new never aborts the process"
 # self-test for the same mode-bit reason as the two controls above.
 python3 tools/no-new-audit.py --no-oracle
 
+step "binding members accept new exactly when node's do"
+# Node builds every `SetMethod`/`SetProtoMethod` function with
+# `ConstructorBehavior::kThrow` (`src/util.cc`), so `new binding.fs.open()` is a
+# `TypeError` there. rustnode used V8's builder default, which is `Allow`, and
+# 405 members accepted `new` that Node rejects — more permissive than the
+# reference, so a wrong `new` passed here and failed on Node.
+#
+# `--recorded` needs no Node binary: `tools/constructible-members.json` is the
+# pinned oracle's answer, recorded through `Reflect.construct`. Both directions
+# are judged, because over-correcting the default turns real classes into
+# `TypeError`s. The run is against the shipping object, after the vendored
+# `lib/**` bootstrap, because six members (`util.isUint8Array`,
+# `messaging.DOMException`, ...) are replaced there by the JavaScript layer and
+# judging the native install alone would report them as defects.
+#
+# A bare statement, so its status is the gate's.
+python3 tools/constructible-audit.py --recorded tools/constructible-members.json
+
 step "the cipher control still reports a void run as a void run"
 # The control's exit contract — 3 for "the build failed, so there is no
 # verdict", distinct from 1 for "the control misbehaved" — is what stops a

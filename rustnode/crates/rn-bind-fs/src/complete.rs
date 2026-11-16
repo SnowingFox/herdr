@@ -154,7 +154,7 @@ pub fn deliver_to_callback<'s>(
     let boxed = Box::new(CallbackDelivery { request, payload });
     let pointer = Box::into_raw(boxed);
     let external = v8::External::new(scope, pointer.cast());
-    let template = v8::FunctionTemplate::builder(callback_trampoline)
+    let template = rn_core::class(callback_trampoline)
         .data(external.into())
         .build(scope);
     let Some(function) = template.get_function(scope) else {

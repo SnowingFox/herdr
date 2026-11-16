@@ -461,7 +461,7 @@ fn install_fatal_handler_guard(scope: &mut v8::PinScope<'_, '_>) {
     };
     // The predicate is native so the answer is the realm's real state, not a
     // global that something has to remember to set.
-    let Some(is_stopping) = v8::FunctionTemplate::builder(is_stopping_callback)
+    let Some(is_stopping) = rn_core::class(is_stopping_callback)
         .build(scope)
         .get_function(scope)
     else {

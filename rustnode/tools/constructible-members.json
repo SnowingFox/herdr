@@ -1,0 +1,166 @@
+{
+  "block_list": [
+    "BlockList",
+    "SocketAddress"
+  ],
+  "cares_wrap": [
+    "ChannelWrap",
+    "GetAddrInfoReqWrap",
+    "GetNameInfoReqWrap",
+    "QueryReqWrap"
+  ],
+  "contextify": [
+    "ContextifyScript"
+  ],
+  "crypto": [
+    "AESCipherJob",
+    "Argon2Job",
+    "ChaCha20Poly1305CipherJob",
+    "CheckPrimeJob",
+    "CipherBase",
+    "DHBitsJob",
+    "DhKeyPairGenJob",
+    "DiffieHellman",
+    "DiffieHellmanGroup",
+    "DsaKeyPairGenJob",
+    "ECDH",
+    "EcKeyPairGenJob",
+    "HKDFJob",
+    "Hash",
+    "HashJob",
+    "Hmac",
+    "HmacJob",
+    "KEMDecapsulateJob",
+    "KEMEncapsulateJob",
+    "KangarooTwelveJob",
+    "KeyObjectHandle",
+    "KmacJob",
+    "Mac",
+    "NamedKeyPairGenJob",
+    "PBKDF2Job",
+    "RSACipherJob",
+    "RandomBytesJob",
+    "RandomPrimeJob",
+    "RsaKeyPairGenJob",
+    "ScryptJob",
+    "SecretKeyGenJob",
+    "SecureContext",
+    "Sign",
+    "SignJob",
+    "TurboShakeJob",
+    "Verify"
+  ],
+  "fs": [
+    "CpDirJob",
+    "FSReqCallback",
+    "FileHandle",
+    "ReadFileJob",
+    "StatWatcher",
+    "WriteFileJob"
+  ],
+  "fs_dir": [
+    "DirHandle"
+  ],
+  "fs_event_wrap": [
+    "FSEvent"
+  ],
+  "http2": [
+    "Http2Session",
+    "Http2Stream"
+  ],
+  "http_parser": [
+    "ConnectionsList",
+    "HTTPParser"
+  ],
+  "inspector": [
+    "Connection",
+    "MainThreadConnection"
+  ],
+  "js_stream": [
+    "JSStream"
+  ],
+  "messaging": [
+    "DOMException",
+    "MessageChannel",
+    "MessagePort",
+    "QuotaExceededError"
+  ],
+  "module_wrap": [
+    "ModuleWrap"
+  ],
+  "performance": [
+    "Histogram",
+    "SlidingWindowHistogram"
+  ],
+  "pipe_wrap": [
+    "Pipe",
+    "PipeConnectWrap"
+  ],
+  "process_methods": [
+    "resetStdioForTesting"
+  ],
+  "process_wrap": [
+    "Process"
+  ],
+  "serdes": [
+    "Deserializer",
+    "Serializer"
+  ],
+  "signal_wrap": [
+    "Signal"
+  ],
+  "sqlite": [
+    "Database",
+    "Session",
+    "Statement",
+    "backup"
+  ],
+  "stream_pipe": [
+    "StreamPipe"
+  ],
+  "stream_wrap": [
+    "ShutdownWrap",
+    "WriteWrap"
+  ],
+  "tcp_wrap": [
+    "TCP",
+    "TCPConnectWrap"
+  ],
+  "tls_wrap": [
+    "TLSWrap"
+  ],
+  "trace_events": [
+    "CategorySet"
+  ],
+  "tty_wrap": [
+    "TTY"
+  ],
+  "udp_wrap": [
+    "SendWrap",
+    "UDP"
+  ],
+  "url_pattern": [
+    "URLPattern"
+  ],
+  "util": [
+    "isDataView",
+    "isTypedArray",
+    "isUint8Array"
+  ],
+  "uv": [
+    "errname"
+  ],
+  "v8": [
+    "GCProfiler"
+  ],
+  "worker": [
+    "Worker"
+  ],
+  "zlib": [
+    "BrotliDecoder",
+    "BrotliEncoder",
+    "Zlib",
+    "ZstdCompress",
+    "ZstdDecompress"
+  ]
+}

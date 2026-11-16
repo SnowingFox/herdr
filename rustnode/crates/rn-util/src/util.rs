@@ -137,7 +137,7 @@ impl BindingModule for Util {
         macro_rules! install {
             ($($name:literal => $callback:expr),* $(,)?) => {
                 $(
-                    let template = v8::FunctionTemplate::builder($callback).build(scope);
+                    let template = rn_core::method($callback).build(scope);
                     if let (Some(key), Some(function)) =
                         (v8::String::new(scope, $name), template.get_function(scope))
                     {
@@ -222,7 +222,7 @@ fn install_predicates(scope: &mut v8::PinScope, object: v8::Local<v8::Object>) {
     macro_rules! install {
         ($($name:literal => $test:expr),* $(,)?) => {
             $(
-                let template = v8::FunctionTemplate::builder(move |scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments<'_>, mut rv: v8::ReturnValue| {
+                let template = rn_core::method(move |scope: &mut v8::PinScope<'_, '_>, args: v8::FunctionCallbackArguments<'_>, mut rv: v8::ReturnValue| {
                     let test: fn(v8::Local<v8::Value>) -> bool = $test;
                     rv.set(v8::Boolean::new(scope, test(args.get(0))).into());
                 })

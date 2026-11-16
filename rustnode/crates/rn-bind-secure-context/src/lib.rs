@@ -821,7 +821,7 @@ stub_method!(
 /// `TypeError: context.<name> is not a function`, which is a different failure
 /// from a stub's explicit error and harder to attribute.
 fn build_class<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(constructor).build(scope);
+    let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELD_COUNT);
@@ -831,7 +831,7 @@ fn build_class<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
         ($($name:literal => $callback:path),* $(,)?) => {
             $(
                 {
-                    let method = v8::FunctionTemplate::builder($callback).build(scope);
+                    let method = rn_core::method($callback).build(scope);
                     let Some(key) = v8::String::new(scope, $name) else {
                         return Err(format!("cannot allocate the {} property name", $name));
                     };
@@ -878,7 +878,7 @@ fn build_class<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
     // `typeof prototype._external` must be `undefined` — the property lives on
     // the prototype as an accessor, not as a function value.
     {
-        let getter = v8::FunctionTemplate::builder(external).build(scope);
+        let getter = rn_core::method(external).build(scope);
         let Some(key) = v8::String::new(scope, "_external") else {
             return Err("cannot allocate the _external property name".to_string());
         };

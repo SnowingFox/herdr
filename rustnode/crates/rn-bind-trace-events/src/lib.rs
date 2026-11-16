@@ -192,7 +192,7 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
 fn category_set_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(construct_category_set)
+    let template = rn_core::class(construct_category_set)
         .constructor_behavior(v8::ConstructorBehavior::Allow)
         .build(scope);
     template
@@ -200,13 +200,10 @@ fn category_set_constructor<'s>(
         .set_internal_field_count(CATEGORY_SET_INTERNAL_FIELDS);
     let prototype = template.prototype_template(scope);
     for (name, method) in [
-        (
-            "enable",
-            v8::FunctionTemplate::builder(enable_category_set).build(scope),
-        ),
+        ("enable", rn_core::method(enable_category_set).build(scope)),
         (
             "disable",
-            v8::FunctionTemplate::builder(disable_category_set).build(scope),
+            rn_core::method(disable_category_set).build(scope),
         ),
     ] {
         let key = v8::String::new(scope, name)
@@ -567,7 +564,7 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(callback).build(scope);
+    let template = rn_core::method(callback).build(scope);
     let function = template
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate {name}"))?;

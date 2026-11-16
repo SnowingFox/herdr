@@ -408,7 +408,7 @@ pub fn install_class<'s>(
     target: v8::Local<'s, v8::Object>,
     name: &'static str,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(constructor).build(scope);
+    let template = rn_core::class(constructor).build(scope);
     template.set_class_name(v8::String::new(scope, name).ok_or("cannot allocate the class name")?);
     template
         .instance_template(scope)
@@ -419,14 +419,8 @@ pub fn install_class<'s>(
     // be a primitive or a Template" and aborts the process, which is a hard crash
     // rather than a compile error.
     let methods = [
-        (
-            "dispatch",
-            v8::FunctionTemplate::builder(dispatch).build(scope),
-        ),
-        (
-            "disconnect",
-            v8::FunctionTemplate::builder(disconnect).build(scope),
-        ),
+        ("dispatch", rn_core::class(dispatch).build(scope)),
+        ("disconnect", rn_core::class(disconnect).build(scope)),
     ];
     for (method, function) in methods {
         let key = v8::String::new(scope, method)

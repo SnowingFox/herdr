@@ -222,7 +222,7 @@ fn install_templates(scope: &mut v8::PinScope) -> Result<(), String> {
         return Ok(());
     }
 
-    let handle = v8::FunctionTemplate::builder(noop_constructor).build(scope);
+    let handle = rn_core::class(noop_constructor).build(scope);
     let name = v8::String::new(scope, "BlobHandle").ok_or("cannot name the handle")?;
     handle.set_class_name(name);
     let proto = handle.prototype_template(scope);
@@ -230,16 +230,16 @@ fn install_templates(scope: &mut v8::PinScope) -> Result<(), String> {
         scope,
         proto,
         "slice",
-        v8::FunctionTemplate::builder(handle_slice).build(scope),
+        rn_core::class(handle_slice).build(scope),
     )?;
     set_method(
         scope,
         proto,
         "getReader",
-        v8::FunctionTemplate::builder(handle_get_reader).build(scope),
+        rn_core::class(handle_get_reader).build(scope),
     )?;
 
-    let reader = v8::FunctionTemplate::builder(noop_constructor).build(scope);
+    let reader = rn_core::class(noop_constructor).build(scope);
     let name = v8::String::new(scope, "BlobReader").ok_or("cannot name the reader")?;
     reader.set_class_name(name);
     let reader_proto = reader.prototype_template(scope);
@@ -247,13 +247,13 @@ fn install_templates(scope: &mut v8::PinScope) -> Result<(), String> {
         scope,
         reader_proto,
         "pull",
-        v8::FunctionTemplate::builder(reader_pull).build(scope),
+        rn_core::class(reader_pull).build(scope),
     )?;
     set_method(
         scope,
         reader_proto,
         "setWakeup",
-        v8::FunctionTemplate::builder(reader_set_wakeup).build(scope),
+        rn_core::class(reader_set_wakeup).build(scope),
     )?;
 
     TEMPLATES.with(|slot| {
@@ -830,7 +830,7 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(callback).build(scope);
+    let template = rn_core::method(callback).build(scope);
     let function = template
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate {name}"))?;

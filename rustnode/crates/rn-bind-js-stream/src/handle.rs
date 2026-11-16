@@ -163,7 +163,7 @@ pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     // `JSStream.length` is 0: `NewFunctionTemplate`'s default.
-    let template = v8::FunctionTemplate::builder(new).build(scope);
+    let template = rn_core::class(new).build(scope);
     let name =
         v8::String::new(scope, "JSStream").ok_or("cannot allocate the JSStream class name")?;
     template.set_class_name(name);
@@ -182,9 +182,8 @@ pub fn constructor<'s>(
     macro_rules! install_method {
         ($($method_name:literal => $method:expr => $length:expr),* $(,)?) => {
             $(
-                let method_template = v8::FunctionTemplate::builder($method)
+                let method_template = rn_core::method($method)
                     .length($length)
-                    .constructor_behavior(v8::ConstructorBehavior::Throw)
                     .build(scope);
                 prototype.set(crate::key(scope, $method_name)?.into(), method_template.into());
             )*
@@ -208,15 +207,12 @@ pub fn constructor<'s>(
     ] {
         let _ = getter;
         let template = match name {
-            "fd" => v8::FunctionTemplate::builder(methods::get_fd),
-            "_externalStream" => v8::FunctionTemplate::builder(methods::get_external),
-            "bytesRead" => v8::FunctionTemplate::builder(methods::get_bytes_read),
-            _ => v8::FunctionTemplate::builder(methods::get_bytes_written),
+            "fd" => rn_core::method(methods::get_fd),
+            "_externalStream" => rn_core::method(methods::get_external),
+            "bytesRead" => rn_core::method(methods::get_bytes_read),
+            _ => rn_core::method(methods::get_bytes_written),
         };
-        let template = template
-            .length(0)
-            .constructor_behavior(v8::ConstructorBehavior::Throw)
-            .build(scope);
+        let template = template.length(0).build(scope);
         prototype.set_accessor_property(
             crate::key(scope, name)?.into(),
             Some(template),
@@ -250,14 +246,8 @@ pub fn constructor<'s>(
     // JavaScript is readable by native code that has no property lookup handy.
     // The observable contract is only that assigning and reading agree, which a
     // plain property keeps.
-    let onread = v8::FunctionTemplate::builder(methods::get_onread)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
-    let onread_setter = v8::FunctionTemplate::builder(methods::set_onread)
-        .length(1)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let onread = rn_core::method(methods::get_onread).length(0).build(scope);
+    let onread_setter = rn_core::method(methods::set_onread).length(1).build(scope);
     prototype.set_accessor_property(
         crate::key(scope, "onread")?.into(),
         Some(onread),

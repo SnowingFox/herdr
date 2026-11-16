@@ -24,9 +24,7 @@ use crate::stmt;
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(construct)
-        .length(1)
-        .build(scope);
+    let template = rn_core::class(construct).length(1).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(db::INTERNAL_FIELDS);
@@ -84,10 +82,7 @@ pub fn constructor<'s>(
 
     // `SetProtoDispose` installs `Symbol.dispose`, which is what makes
     // `using db = new Database(...)` close the connection at block exit.
-    let dispose = v8::FunctionTemplate::builder(dispose)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let dispose = rn_core::class(dispose).length(0).build(scope);
     if let Some(name) = v8::String::new(scope, "dispose") {
         dispose.set_class_name(name);
     }
@@ -179,10 +174,7 @@ pub fn method<'s>(
     length: i32,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::Local<'s, v8::FunctionTemplate> {
-    v8::FunctionTemplate::builder(callback)
-        .length(length)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope)
+    rn_core::method(callback).length(length).build(scope)
 }
 
 /// `new Database(path[, options])`.

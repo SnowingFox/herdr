@@ -521,14 +521,14 @@ fn build_class<'s>(
     final_name: &str,
     final_callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<Option<v8::Local<'s, v8::Value>>, String> {
-    let template = v8::FunctionTemplate::builder(constructor).build(scope);
+    let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELD_COUNT);
     let prototype = template.prototype_template(scope);
     for (method, callback) in [
-        ("init", v8::FunctionTemplate::builder(init).build(scope)),
-        ("update", v8::FunctionTemplate::builder(update).build(scope)),
+        ("init", rn_core::method(init).build(scope)),
+        ("update", rn_core::method(update).build(scope)),
     ] {
         let Some(key) = v8::String::new(scope, method) else {
             return Err(format!("cannot allocate the {name}.{method} name"));
@@ -540,9 +540,7 @@ fn build_class<'s>(
     };
     prototype.set(
         key.into(),
-        v8::FunctionTemplate::builder(final_callback)
-            .build(scope)
-            .into(),
+        rn_core::method(final_callback).build(scope).into(),
     );
 
     let Some(class_name) = v8::String::new(scope, name) else {

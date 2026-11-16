@@ -242,9 +242,7 @@ impl BindingModule for ModuleWrapBinding {
 fn module_wrap_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
-    let template = v8::FunctionTemplate::builder(module_wrap_new)
-        .length(5)
-        .build(scope);
+    let template = rn_core::class(module_wrap_new).length(5).build(scope);
     let constructor = template
         .get_function(scope)
         .ok_or_else(|| "cannot allocate ModuleWrap".to_string())?;
@@ -261,7 +259,7 @@ fn module_wrap_constructor<'s>(
 
     macro_rules! method {
         ($name:literal, $callback:expr) => {{
-            let template = v8::FunctionTemplate::builder($callback).build(scope);
+            let template = rn_core::method($callback).build(scope);
             if let (Some(key), Some(function)) =
                 (v8::String::new(scope, $name), template.get_function(scope))
             {
@@ -1550,7 +1548,7 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(callback).build(scope);
+    let template = rn_core::method(callback).build(scope);
     let function = template
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate {name}"))?;

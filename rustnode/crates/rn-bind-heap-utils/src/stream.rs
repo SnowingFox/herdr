@@ -177,7 +177,7 @@ pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     // `FunctionTemplate::New(isolate)` with no callback and the default length.
-    let template = v8::FunctionTemplate::builder(new).build(scope);
+    let template = rn_core::class(new).build(scope);
     let name =
         v8::String::new(scope, "HeapSnapshotStream").ok_or("cannot allocate the class name")?;
     template.set_class_name(name);
@@ -190,21 +190,12 @@ pub fn constructor<'s>(
     // methods, then `isStreamBase`. The order is kept because it is what a
     // caller iterating the prototype sees.
     for (key, accessor) in [
-        ("fd", v8::FunctionTemplate::builder(get_fd)),
-        (
-            "_externalStream",
-            v8::FunctionTemplate::builder(get_external),
-        ),
-        ("bytesRead", v8::FunctionTemplate::builder(get_bytes_read)),
-        (
-            "bytesWritten",
-            v8::FunctionTemplate::builder(get_bytes_written),
-        ),
+        ("fd", rn_core::method(get_fd)),
+        ("_externalStream", rn_core::method(get_external)),
+        ("bytesRead", rn_core::method(get_bytes_read)),
+        ("bytesWritten", rn_core::method(get_bytes_written)),
     ] {
-        let accessor = accessor
-            .length(0)
-            .constructor_behavior(v8::ConstructorBehavior::Throw)
-            .build(scope);
+        let accessor = accessor.length(0).build(scope);
         let key = v8::String::new(scope, key).ok_or("cannot allocate an accessor name")?;
         prototype.set_accessor_property(
             key.into(),
@@ -215,13 +206,10 @@ pub fn constructor<'s>(
     }
 
     for (key, method) in [
-        ("readStart", v8::FunctionTemplate::builder(read_start)),
-        ("readStop", v8::FunctionTemplate::builder(read_stop)),
+        ("readStart", rn_core::method(read_start)),
+        ("readStop", rn_core::method(read_stop)),
     ] {
-        let method = method
-            .length(0)
-            .constructor_behavior(v8::ConstructorBehavior::Throw)
-            .build(scope);
+        let method = method.length(0).build(scope);
         let key = v8::String::new(scope, key).ok_or("cannot allocate a method name")?;
         prototype.set(key.into(), method.into());
     }
@@ -235,14 +223,8 @@ pub fn constructor<'s>(
     // The attributes are part of the surface: `Object.keys(handle)` is empty in
     // Node because every accessor is non-enumerable, and a data property here
     // would make `onread` show up in an inspection of the handle.
-    let getter = v8::FunctionTemplate::builder(get_onread)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
-    let setter = v8::FunctionTemplate::builder(set_onread)
-        .length(1)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let getter = rn_core::method(get_onread).length(0).build(scope);
+    let setter = rn_core::method(set_onread).length(1).build(scope);
     let key = v8::String::new(scope, "onread").ok_or("cannot allocate onread")?;
     prototype.set_accessor_property(
         key.into(),

@@ -700,9 +700,9 @@ fn make_handle<'s>(scope: &mut v8::PinScope<'s, '_>, id: u32) -> Option<v8::Loca
     let key = v8::String::new(scope, "__rn_glob_request")?;
     object.set(scope, key.into(), id_value.into());
 
-    let next = v8::FunctionTemplate::builder(next_pull).build(scope);
-    let all = v8::FunctionTemplate::builder(all_pull).build(scope);
-    let cancel = v8::FunctionTemplate::builder(cancel_pull).build(scope);
+    let next = rn_core::class(next_pull).build(scope);
+    let all = rn_core::class(all_pull).build(scope);
+    let cancel = rn_core::class(cancel_pull).build(scope);
     for (name, template) in [("next", next), ("all", all), ("cancel", cancel)] {
         let name_value = v8::String::new(scope, name)?;
         let function = template.get_function(scope)?;
@@ -875,7 +875,7 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(callback).build(scope);
+    let template = rn_core::method(callback).build(scope);
     let function = template
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate glob.{name}"))?;

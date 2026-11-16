@@ -943,9 +943,7 @@ pub fn read_options(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(illegal_constructor)
-        .length(0)
-        .build(scope);
+    let template = rn_core::class(illegal_constructor).length(0).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELDS);
@@ -1116,9 +1114,7 @@ fn allocate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Ob
     let prototype = match cache {
         Some(prototype) => v8::Local::new(scope, prototype),
         None => {
-            let template = v8::FunctionTemplate::builder(illegal_constructor)
-                .length(0)
-                .build(scope);
+            let template = rn_core::class(illegal_constructor).length(0).build(scope);
             populate_prototype(scope, &template);
             let prototype = template.prototype_template(scope).new_instance(scope)?;
             STATEMENT_PROTOTYPE.with(|slot| {
@@ -1127,9 +1123,7 @@ fn allocate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Ob
             prototype
         }
     };
-    let template = v8::FunctionTemplate::builder(illegal_constructor)
-        .length(0)
-        .build(scope);
+    let template = rn_core::class(illegal_constructor).length(0).build(scope);
     let instance_template = template.instance_template(scope);
     instance_template.set_internal_field_count(INTERNAL_FIELDS);
     let instance = instance_template.new_instance(scope)?;

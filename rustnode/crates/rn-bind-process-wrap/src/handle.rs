@@ -119,7 +119,7 @@ pub fn with_handle<R>(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(new).length(0).build(scope);
+    let template = rn_core::class(new).length(0).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -127,29 +127,22 @@ pub fn constructor<'s>(
     let prototype = template.prototype_template(scope);
 
     // `SetProtoMethod(isolate, constructor, "spawn", Spawn)` and `"kill"`.
-    let spawn = v8::FunctionTemplate::builder(crate::methods::spawn)
+    let spawn = rn_core::method(crate::methods::spawn)
         .length(8)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
         .build(scope);
     prototype.set(crate::key(scope, "spawn")?.into(), spawn.into());
-    let kill = v8::FunctionTemplate::builder(crate::methods::kill)
-        .length(1)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let kill = rn_core::method(crate::methods::kill).length(1).build(scope);
     prototype.set(crate::key(scope, "kill")?.into(), kill.into());
 
     // `HandleWrap`: `close`, `ref`, `unref`, `hasRef`.
     for (name, arity) in [("close", 0), ("ref", 0), ("unref", 0), ("hasRef", 0)] {
         let template = match name {
-            "close" => v8::FunctionTemplate::builder(crate::methods::close),
-            "ref" => v8::FunctionTemplate::builder(crate::methods::reference),
-            "unref" => v8::FunctionTemplate::builder(crate::methods::unreference),
-            _ => v8::FunctionTemplate::builder(crate::methods::has_reference),
+            "close" => rn_core::method(crate::methods::close),
+            "ref" => rn_core::method(crate::methods::reference),
+            "unref" => rn_core::method(crate::methods::unreference),
+            _ => rn_core::method(crate::methods::has_reference),
         };
-        let template = template
-            .length(arity)
-            .constructor_behavior(v8::ConstructorBehavior::Throw)
-            .build(scope);
+        let template = template.length(arity).build(scope);
         prototype.set(crate::key(scope, name)?.into(), template.into());
     }
 

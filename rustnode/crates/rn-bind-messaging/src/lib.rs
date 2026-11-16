@@ -279,7 +279,7 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
 fn handle_wrap_template<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::FunctionTemplate>, String> {
-    let template = v8::FunctionTemplate::builder(handle_wrap_constructor).build(scope);
+    let template = rn_core::class(handle_wrap_constructor).build(scope);
     if let Some(name) = v8::String::new(scope, "HandleWrap") {
         template.set_class_name(name);
     }
@@ -305,7 +305,7 @@ fn install_method<'s>(
     name: &str,
     method: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(method).build(scope);
+    let template = rn_core::class(method).build(scope);
     if let Some(key) = v8::String::new(scope, name) {
         template.set_class_name(key);
     }
@@ -321,7 +321,7 @@ fn install_message_port<'s>(
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     let handle_wrap = handle_wrap_template(scope)?;
 
-    let template = v8::FunctionTemplate::builder(message_port_constructor).build(scope);
+    let template = rn_core::class(message_port_constructor).build(scope);
     if let Some(name) = v8::String::new(scope, "MessagePort") {
         template.set_class_name(name);
     }
@@ -354,7 +354,7 @@ fn install_message_port<'s>(
 fn install_message_channel<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(message_channel_constructor).build(scope);
+    let template = rn_core::class(message_channel_constructor).build(scope);
     if let Some(name) = v8::String::new(scope, "MessageChannel") {
         template.set_class_name(name);
     }
@@ -1188,7 +1188,7 @@ fn function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(callback).build(scope);
+    let template = rn_core::method(callback).build(scope);
     let function = template
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate {name}"))?;

@@ -212,10 +212,7 @@ pub fn install_into<'s>(
             // prototype template accepts a primitive or a *Template*, and a
             // `Function` is neither. Node's `SetProtoMethod` installs the template
             // directly for the same reason.
-            let template = v8::FunctionTemplate::builder($callback)
-                .length(length)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope);
+            let template = rn_core::method($callback).length(length).build(scope);
             prototype.set(key(scope, name)?.into(), template.into());
         }};
     }

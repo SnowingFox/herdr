@@ -65,7 +65,7 @@ impl BindingModule for WasmWebApi {
         let object = v8::Object::new(scope);
         let key = v8::String::new(scope, "setImplementation")
             .ok_or("cannot allocate setImplementation")?;
-        let template = v8::FunctionTemplate::builder(set_implementation).build(scope);
+        let template = rn_core::method(set_implementation).build(scope);
         let function = template
             .get_function(scope)
             .ok_or("cannot allocate setImplementation")?;

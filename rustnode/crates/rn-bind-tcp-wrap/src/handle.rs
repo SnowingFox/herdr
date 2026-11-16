@@ -180,7 +180,7 @@ pub fn park_accept(handle: Box<TcpHandle>) {
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(new).length(1).build(scope);
+    let template = rn_core::class(new).length(1).build(scope);
 
     // `src/tcp_wrap.cc` pre-creates these so instances stay monomorphic and
     // `lib/net.js` assigns them through the fast path:
@@ -204,39 +204,34 @@ pub fn constructor<'s>(
     for (name, template) in [
         (
             "close",
-            v8::FunctionTemplate::builder(crate::methods::close)
+            rn_core::method(crate::methods::close)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "ref",
-            v8::FunctionTemplate::builder(crate::methods::reference)
+            rn_core::method(crate::methods::reference)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "unref",
-            v8::FunctionTemplate::builder(crate::methods::unreference)
+            rn_core::method(crate::methods::unreference)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "hasRef",
-            v8::FunctionTemplate::builder(crate::methods::has_reference)
+            rn_core::method(crate::methods::has_reference)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         // `AsyncWrap`'s id, which `lib/net.js` reads as
         // `this._handle.getAsyncId()` on both the connect and the server paths.
         (
             "getAsyncId",
-            v8::FunctionTemplate::builder(crate::methods::get_async_id)
+            rn_core::method(crate::methods::get_async_id)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         // `AsyncWrap::AsyncReset` and `AsyncWrap::GetProviderType`, which
@@ -251,16 +246,14 @@ pub fn constructor<'s>(
         // request's id and `socket[async_id_symbol]` stays `-1`.
         (
             "asyncReset",
-            v8::FunctionTemplate::builder(crate::methods::async_reset)
+            rn_core::method(crate::methods::async_reset)
                 .length(1)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "getProviderType",
-            v8::FunctionTemplate::builder(crate::methods::get_provider_type)
+            rn_core::method(crate::methods::get_provider_type)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
     ] {
@@ -271,44 +264,38 @@ pub fn constructor<'s>(
     for (name, template) in [
         (
             "readStart",
-            v8::FunctionTemplate::builder(crate::methods::read_start)
+            rn_core::method(crate::methods::read_start)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "readStop",
-            v8::FunctionTemplate::builder(crate::methods::read_stop)
+            rn_core::method(crate::methods::read_stop)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "shutdown",
-            v8::FunctionTemplate::builder(crate::methods::shutdown)
+            rn_core::method(crate::methods::shutdown)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "writeBuffer",
-            v8::FunctionTemplate::builder(crate::methods::write_buffer)
+            rn_core::method(crate::methods::write_buffer)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "writev",
-            v8::FunctionTemplate::builder(crate::methods::writev)
+            rn_core::method(crate::methods::writev)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "writeUtf8String",
-            v8::FunctionTemplate::builder(crate::methods::write_utf8)
+            rn_core::method(crate::methods::write_utf8)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         // The other three string encodings exist for direct users of the handle;
@@ -316,23 +303,20 @@ pub fn constructor<'s>(
         // `writeGeneric`, which converts non-UTF-8 strings to a `Buffer` first.
         (
             "writeAsciiString",
-            v8::FunctionTemplate::builder(crate::methods::write_utf8)
+            rn_core::method(crate::methods::write_utf8)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "writeLatin1String",
-            v8::FunctionTemplate::builder(crate::methods::write_utf8)
+            rn_core::method(crate::methods::write_utf8)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "writeUcs2String",
-            v8::FunctionTemplate::builder(crate::methods::write_utf8)
+            rn_core::method(crate::methods::write_utf8)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
     ] {
@@ -343,30 +327,26 @@ pub fn constructor<'s>(
     for (name, getter) in [
         (
             "fd",
-            v8::FunctionTemplate::builder(crate::methods::get_fd)
+            rn_core::method(crate::methods::get_fd)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "bytesRead",
-            v8::FunctionTemplate::builder(crate::methods::get_bytes_read)
+            rn_core::method(crate::methods::get_bytes_read)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "bytesWritten",
-            v8::FunctionTemplate::builder(crate::methods::get_bytes_written)
+            rn_core::method(crate::methods::get_bytes_written)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "writeQueueSize",
-            v8::FunctionTemplate::builder(crate::methods::get_write_queue_size)
+            rn_core::method(crate::methods::get_write_queue_size)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
     ] {
@@ -388,93 +368,76 @@ pub fn constructor<'s>(
     for (name, template) in [
         (
             "open",
-            v8::FunctionTemplate::builder(crate::methods::open)
-                .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope),
+            rn_core::method(crate::methods::open).length(0).build(scope),
         ),
         (
             "bind",
-            v8::FunctionTemplate::builder(crate::methods::bind)
-                .length(1)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope),
+            rn_core::method(crate::methods::bind).length(1).build(scope),
         ),
         (
             "bind6",
-            v8::FunctionTemplate::builder(crate::methods::bind6)
+            rn_core::method(crate::methods::bind6)
                 .length(1)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "listen",
-            v8::FunctionTemplate::builder(crate::methods::listen)
+            rn_core::method(crate::methods::listen)
                 .length(1)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "connect",
-            v8::FunctionTemplate::builder(crate::methods::connect)
+            rn_core::method(crate::methods::connect)
                 .length(3)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "connect6",
-            v8::FunctionTemplate::builder(crate::methods::connect6)
+            rn_core::method(crate::methods::connect6)
                 .length(3)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "getsockname",
-            v8::FunctionTemplate::builder(crate::methods::getsockname)
+            rn_core::method(crate::methods::getsockname)
                 .length(1)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "getpeername",
-            v8::FunctionTemplate::builder(crate::methods::getpeername)
+            rn_core::method(crate::methods::getpeername)
                 .length(1)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "setNoDelay",
-            v8::FunctionTemplate::builder(crate::methods::set_no_delay)
+            rn_core::method(crate::methods::set_no_delay)
                 .length(1)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "setKeepAlive",
-            v8::FunctionTemplate::builder(crate::methods::set_keep_alive)
+            rn_core::method(crate::methods::set_keep_alive)
                 .length(2)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "setTypeOfService",
-            v8::FunctionTemplate::builder(crate::methods::set_type_of_service)
+            rn_core::method(crate::methods::set_type_of_service)
                 .length(1)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "getTypeOfService",
-            v8::FunctionTemplate::builder(crate::methods::get_type_of_service)
+            rn_core::method(crate::methods::get_type_of_service)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "reset",
-            v8::FunctionTemplate::builder(crate::methods::reset)
+            rn_core::method(crate::methods::reset)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
     ] {

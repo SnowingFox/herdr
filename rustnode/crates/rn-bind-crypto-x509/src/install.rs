@@ -150,55 +150,49 @@ pub fn install_classes<'s>(
     for (name, callback) in [
         (
             "createX509CertificateClass",
-            v8::FunctionTemplate::builder(create_x509_certificate_class).build(scope),
+            rn_core::method(create_x509_certificate_class).build(scope),
         ),
         (
             "isX509Certificate",
-            v8::FunctionTemplate::builder(is_x509_certificate).build(scope),
+            rn_core::method(is_x509_certificate).build(scope),
         ),
-        (
-            "parseX509",
-            v8::FunctionTemplate::builder(parse_x509).build(scope),
-        ),
+        ("parseX509", rn_core::method(parse_x509).build(scope)),
         (
             "parseX509Snapshot",
-            v8::FunctionTemplate::builder(parse_snapshot).build(scope),
+            rn_core::method(parse_snapshot).build(scope),
         ),
         (
             "getX509CertificateSnapshot",
-            v8::FunctionTemplate::builder(get_snapshot).build(scope),
+            rn_core::method(get_snapshot).build(scope),
         ),
-        (
-            "parsePKCS12",
-            v8::FunctionTemplate::builder(parse_pkcs12).build(scope),
-        ),
+        ("parsePKCS12", rn_core::method(parse_pkcs12).build(scope)),
         (
             "addBlockedSPKIForTesting",
-            v8::FunctionTemplate::builder(add_blocked_spki).build(scope),
+            rn_core::method(add_blocked_spki).build(scope),
         ),
         (
             "clearBlockedSPKIsForTesting",
-            v8::FunctionTemplate::builder(clear_blocked_spkis).build(scope),
+            rn_core::method(clear_blocked_spkis).build(scope),
         ),
         (
             "getBundledRootCertificates",
-            v8::FunctionTemplate::builder(get_bundled_root_certificates).build(scope),
+            rn_core::method(get_bundled_root_certificates).build(scope),
         ),
         (
             "getExtraCACertificates",
-            v8::FunctionTemplate::builder(get_extra_ca_certificates).build(scope),
+            rn_core::method(get_extra_ca_certificates).build(scope),
         ),
         (
             "getSystemCACertificates",
-            v8::FunctionTemplate::builder(get_system_ca_certificates).build(scope),
+            rn_core::method(get_system_ca_certificates).build(scope),
         ),
         (
             "getUserRootCertificates",
-            v8::FunctionTemplate::builder(get_user_root_certificates).build(scope),
+            rn_core::method(get_user_root_certificates).build(scope),
         ),
         (
             "resetRootCertStore",
-            v8::FunctionTemplate::builder(reset_root_cert_store).build(scope),
+            rn_core::method(reset_root_cert_store).build(scope),
         ),
     ] {
         let function = callback
@@ -216,7 +210,7 @@ fn base_template<'s>(
     if let Some(template) = with_classes(|classes| classes.base.clone()) {
         return Some(v8::Local::new(scope, &template));
     }
-    let template = v8::FunctionTemplate::builder(certificate::constructor).build(scope);
+    let template = rn_core::class(certificate::constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELD_COUNT);

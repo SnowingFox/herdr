@@ -123,7 +123,7 @@ enum Status {
 pub(crate) fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(construct)
+    let template = rn_core::class(construct)
         .constructor_behavior(v8::ConstructorBehavior::Allow)
         .build(scope);
     template
@@ -132,8 +132,8 @@ pub(crate) fn constructor<'s>(
 
     let prototype = template.prototype_template(scope);
     for (name, method) in [
-        ("start", v8::FunctionTemplate::builder(start).build(scope)),
-        ("stop", v8::FunctionTemplate::builder(stop).build(scope)),
+        ("start", rn_core::method(start).build(scope)),
+        ("stop", rn_core::method(stop).build(scope)),
     ] {
         let Some(key) = v8::String::new(scope, name) else {
             return Err(format!("cannot allocate the GCProfiler method name {name}"));

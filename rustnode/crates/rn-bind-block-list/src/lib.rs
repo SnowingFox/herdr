@@ -437,9 +437,7 @@ fn family_argument(
 fn socket_address_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(socket_address_new)
-        .length(4)
-        .build(scope);
+    let template = rn_core::class(socket_address_new).length(4).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -484,10 +482,7 @@ fn method<'s>(
     length: i32,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::Local<'s, v8::FunctionTemplate> {
-    v8::FunctionTemplate::builder(callback)
-        .length(length)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope)
+    rn_core::method(callback).length(length).build(scope)
 }
 
 /// `new SocketAddress(address, port, family, flowlabel)`.
@@ -614,9 +609,7 @@ fn socket_address_flow_label(
 fn block_list_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(block_list_new)
-        .length(0)
-        .build(scope);
+    let template = rn_core::class(block_list_new).length(0).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
