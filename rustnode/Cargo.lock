@@ -1576,6 +1576,7 @@ dependencies = [
  "rn-util",
  "rn-uv",
  "rn-v8-sys",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

@@ -22,6 +22,13 @@ fn main() {
     rn_core::profile::mark("v8 link check");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // libuv has to be handed the argument block before `process.title` can be
+    // written: `uv_set_process_title` answers `UV_ENOBUFS` until `uv_setup_args`
+    // has run, and Node calls it at the very top of `main` for that reason. Doing
+    // it here means `process.title` is a real rename on `ps` rather than a
+    // Rust-side string that reads back and changes nothing.
+    rn_uv::process_title::setup_args();
+    rn_core::profile::mark("uv_setup_args");
     // `NODE_OPTIONS` is parsed before the command line, the way
     // `InitializeNodeWithArgsInternal` does it (`src/node.cc:1054`), and a
     // rejected variable stops the process there. The message is printed against
@@ -306,7 +313,12 @@ fn main() {
     // the bootstrap itself; the reason is printed so a failure is never silent.
     let mut runtime = None;
     let mut realm_require: Option<v8::Global<v8::Function>> = None;
-    match bootstrap::bootstrap_realm(scope, &argv_rest, &options.exec_argv) {
+    match bootstrap::bootstrap_realm(
+        scope,
+        &argv_rest,
+        &options.exec_argv,
+        bootstrap::ProcessState::main_thread(options.debug_port.port),
+    ) {
         Ok(mut loaders) => {
             rn_core::profile::mark("realm bootstrap returned");
             if options.expose_internals() {
@@ -438,6 +450,15 @@ fn main() {
     let mut entry_fatal = false;
     match &options.source {
         args::Source::File(_) => {
+            // Node exposes a global `require` only for `-e`/`-p`. A file entry
+            // point is a CommonJS or ESM module, whose `require` is the module
+            // wrapper's parameter — an own `globalThis` property is not merely
+            // extra, it shadows nothing and shows up in `test/common/index.js`'s
+            // globals audit, and in `Object.getOwnPropertyNames(globalThis)`.
+            //
+            // `realm_require` below is a captured handle to the *same* loader,
+            // so the entry point still resolves; only the global copy goes.
+            rn_realm::delete_require_global(scope);
             // The resolved absolute path, not the raw argument: the loader
             // treats its request as a specifier, so a relative one would be
             // resolved against the loader's paths instead of the cwd.

@@ -69,3 +69,6 @@ tracing-subscriber.workspace = true
 # The differential tests compare against the pinned Node oracle, not whatever
 # `node` `PATH` resolves to; see `tools/node-pin.toml` and `rn-node-oracle`.
 rn-node-oracle = { path = "../../tools/node-oracle" }
+# The `process` surface parity test compares descriptor maps as JSON, so the
+# comparison is on whole structures rather than on hand-picked fields.
+serde_json.workspace = true

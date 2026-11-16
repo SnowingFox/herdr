@@ -104,6 +104,39 @@ pub fn internal_binding<'s>(
     })
 }
 
+thread_local! {
+    /// The `primordials` object, kept out of `globalThis`.
+    ///
+    /// Node builds `primordials` in `internal/per_context/primordials` and passes
+    /// it to every bootstrap script as a parameter; it is never a global. The
+    /// bootstrap scripts in `internal/bootstrap/**` still *read* it as a free
+    /// variable (`const { ObjectDefineProperty } = primordials;`), which Node
+    /// satisfies by compiling them with `primordials` in the wrapper's parameter
+    /// list — not by defining a global.
+    ///
+    /// rustnode cannot use the parameter path for the files it runs through
+    /// `run_bootstrap_script`, because the object has to be the same one
+    /// `realm.js` built. Holding it here lets that call site hand over the real
+    /// object while `globalThis` stays clean, which is what
+    /// `test/common/index.js`'s globals audit requires.
+    static PRIMORDIALS: RefCell<Option<v8::Global<v8::Object>>> = const { RefCell::new(None) };
+}
+
+/// Records the `primordials` object for later bootstrap scripts.
+pub fn set_primordials(scope: &mut v8::PinScope, primordials: v8::Local<v8::Object>) {
+    let global = v8::Global::new(scope, primordials);
+    PRIMORDIALS.with(|slot| *slot.borrow_mut() = Some(global));
+}
+
+/// A local handle to the recorded `primordials`, if one was stored.
+pub fn primordials<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    PRIMORDIALS.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|primordials| v8::Local::new(scope, primordials))
+    })
+}
+
 /// Writes text to the process standard error.
 type StderrWriter = Box<dyn Fn(&str)>;
 

@@ -37,6 +37,7 @@ pub mod handle;
 pub mod ledger;
 pub mod listener;
 pub mod poller;
+pub mod process_title;
 pub mod stream;
 pub mod stream_base;
 pub mod streams;

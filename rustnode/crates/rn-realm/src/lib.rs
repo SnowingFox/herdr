@@ -1225,10 +1225,18 @@ pub fn install_console<'s>(scope: &mut v8::PinScope<'s, '_>, require: v8::Local<
     }
 }
 
-/// Installs the `primordials` global the realm bootstrap installs.
+/// The `primordials` object the bootstrap scripts read as a free variable.
+///
+/// Node passes it as a wrapper parameter; rustnode records it in the hook slot
+/// so `globalThis` never carries it. The global is checked only as a fallback for
+/// a caller that ran before [`rn_core::hook_slot::set_primordials`], which does
+/// not happen in the CLI's ordering but keeps this function total.
 fn primordials_from_global<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Option<v8::Local<'s, v8::Value>> {
+    if let Some(primordials) = rn_core::hook_slot::primordials(scope) {
+        return Some(primordials.into());
+    }
     let global = scope.get_current_context().global(scope);
     get_property(scope, global.into(), "primordials")
 }
@@ -1491,11 +1499,50 @@ pub fn run_main<'s>(
     execute.call(scope, v8::undefined(scope).into(), &[filename.into()])
 }
 
+/// The `process` state that belongs to the main thread's environment.
+///
+/// Node decides per thread whether it may mutate process-wide state:
+/// `PatchProcessObject` passes `env->owns_process_state() ? ProcessTitleSetter :
+/// nullptr`, so a worker's `process.title` reads the main thread's title and is
+/// read-only. `debugPort` follows the same shape. Modelling it as one value keeps
+/// the two decisions together instead of threading two booleans through every
+/// call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessState {
+    /// The port `process.debugPort` reports, from `--inspect-port`.
+    pub debug_port: u16,
+    /// Whether this thread owns process-wide state, i.e. is the main thread.
+    ///
+    /// A worker passes `false`: its `title` and `debugPort` become getters with
+    /// no setter, so a worker cannot rename the process or move the parent's
+    /// inspector port.
+    pub owns_process_state: bool,
+}
+
+impl ProcessState {
+    /// The main thread's state, which owns the process and reports `debug_port`.
+    pub fn main_thread(debug_port: u16) -> Self {
+        Self {
+            debug_port,
+            owns_process_state: true,
+        }
+    }
+
+    /// A worker's state: it reads the process's port but may not change it.
+    pub fn worker() -> Self {
+        Self {
+            debug_port: rn_uv::process_title::debug_port(),
+            owns_process_state: false,
+        }
+    }
+}
+
 /// Runs the realm bootstrap and returns the loaders it created.
 pub fn bootstrap_realm(
     scope: &mut v8::PinScope,
     script_args: &[String],
     exec_argv: &[String],
+    state: ProcessState,
 ) -> Result<Bootstrapped, String> {
     if rn_core::realm::installed().is_none() {
         return Err("no binding registry is installed for this realm".to_string());
@@ -1506,11 +1553,15 @@ pub fn bootstrap_realm(
     run_per_context(scope, primordials)?;
     rn_core::profile::mark("primordials");
 
-    let process = process_object(scope, script_args, exec_argv)?;
+    let process = process_object(scope, script_args, exec_argv, state)?;
     set_global(scope, global, "process", process.into())?;
-    // `realm.js` reads `primordials` as a bare global inside its wrapper, so the
-    // object has to be reachable both there and through the parameter below.
-    set_global(scope, global, "primordials", primordials.into())?;
+    // `realm.js` destructures `primordials` as a free variable
+    // (`/* global ... primordials */`), so it needs the object in scope — but
+    // Node's `primordials` is a bootstrap-local, never a `globalThis` property.
+    // Recording it in the hook slot lets every bootstrap script reach it without
+    // leaving a name on the global object that `test/common/index.js`'s globals
+    // audit would reject.
+    rn_core::hook_slot::set_primordials(scope, primordials);
 
     let get_linked_binding = function_of(scope, "getLinkedBinding", get_linked_binding)?;
     let get_internal_binding = internal_binding_dispatcher(scope)?;
@@ -1546,6 +1597,42 @@ pub fn bootstrap_realm(
     let require = rn_core::hook_slot::require(scope);
     if let Some(require) = require {
         set_global(scope, global, "require", require.into())?;
+    }
+
+    // `bootstrap/node.js` installs the source-map pair from
+    // `internal/source_map/source_map_cache` after `realm.js` has provided
+    // `require`, so this is the same point in the ordering. A failure is fatal
+    // here rather than swallowed: the getter is what
+    // `Error.prepareStackTrace` and the inspector both consult, and a process
+    // that reported `sourceMapsEnabled` from a parallel copy of the flag would
+    // be worse than one that failed to boot.
+    install_process_source_maps(scope)?;
+    rn_core::profile::mark("process source maps");
+
+    // `primordials` was a global only long enough for `realm.js` to read it.
+    //
+    // `lib/internal/bootstrap/realm.js` opens with
+    // `/* global process, getLinkedBinding, getInternalBinding, primordials */`,
+    // so it resolves `primordials` as a bare global even though the same object
+    // is also passed as its fourth argument — that is how Node's own bootstrap
+    // wraps the file. Node's `primordials` is a bootstrap-local, never a global,
+    // and leaving it visible is observable: `test/common/index.js` enumerates
+    // `globalThis` at exit and fails the test for every name it does not
+    // recognise, so a leaked `primordials` turns into "Unexpected global(s)
+    // found" for any test that loads `common`.
+    //
+    // Deleting it here rather than before `realm.js` is the ordering that
+    // matters: at this point nothing after the bootstrap reads it as a global,
+    // and every later consumer receives it as a parameter or a module.
+    let primordials_key = v8::String::new(scope, "primordials").ok_or("cannot allocate the key")?;
+    let _ = global.delete(scope, primordials_key.into());
+    // Debug-only escape hatch for `tools/per-context-audit.js`; see
+    // `delete_require_global`'s "audit hook" note. Republished *after* the delete
+    // so it is opt-in rather than the leftover the delete was removing.
+    if std::env::var_os("RUSTNODE_DEBUG_REALM_PRIMORDIALS").is_some() {
+        if let Some(slot) = rn_core::hook_slot::primordials(scope) {
+            let _ = set_global(scope, global, "primordials", slot.into());
+        }
     }
 
     Ok(Bootstrapped {
@@ -1644,6 +1731,7 @@ fn process_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     script_args: &[String],
     exec_argv: &[String],
+    state: ProcessState,
 ) -> Result<v8::Local<'s, v8::Object>, String> {
     let process = v8::Object::new(scope);
 
@@ -1673,10 +1761,10 @@ fn process_object<'s>(
             return Err(format!("cannot define process.versions.{}", entry.key));
         }
     }
-    set(scope, process, "versions", versions.into())?;
+    define_read_only(scope, process, "versions", versions.into())?;
 
     let version = v8::String::new(scope, "v28.0.0").ok_or("cannot allocate a version")?;
-    set(scope, process, "version", version.into())?;
+    define_read_only(scope, process, "version", version.into())?;
 
     // These are the platform facts `os.arch()`, `os.platform()` and
     // `process.release` read straight back out, so they have to be the real
@@ -1685,15 +1773,15 @@ fn process_object<'s>(
     // hardcoded "linux" would be wrong on macOS and Windows.
     let platform = node_platform();
     let platform = v8::String::new(scope, platform).ok_or("cannot allocate the platform name")?;
-    set(scope, process, "platform", platform.into())?;
+    define_read_only(scope, process, "platform", platform.into())?;
     let arch =
         v8::String::new(scope, node_arch()).ok_or("cannot allocate the architecture name")?;
-    set(scope, process, "arch", arch.into())?;
+    define_read_only(scope, process, "arch", arch.into())?;
 
     let release = v8::Object::new(scope);
     let release_name = v8::String::new(scope, "node").ok_or("cannot allocate the release name")?;
     set(scope, release, "name", release_name.into())?;
-    set(scope, process, "release", release.into())?;
+    define_read_only(scope, process, "release", release.into())?;
 
     // `process.argv` is `[execPath, ...scriptArgs]`, so the executing script's
     // arguments have to be visible here or `process.argv` lies about what ran.
@@ -1775,17 +1863,18 @@ fn process_object<'s>(
             let _ = features.set(scope, key.into(), value.into());
         }
     }
-    set(scope, process, "features", features.into())?;
+    define_read_only_frozen(scope, process, "features", features.into())?;
 
     let pid = v8::Integer::new(scope, std::process::id() as i32);
-    set(scope, process, "pid", pid.into())?;
+    define_read_only(scope, process, "pid", pid.into())?;
 
     // `process.exitCode` is how a test script reports failure, and every one of
     // Node's own tests relies on it: a script that sets it and returns exits
-    // with that status. It has to stay an assignment target that the CLI reads
-    // on the way out, so it starts at `undefined` — Node's default — and the
-    // exit path substitutes 0 for that.
-    set(scope, process, "exitCode", v8::undefined(scope).into())?;
+    // with that status. Node defines it as an *accessor* over a private field
+    // (`bootstrap/node.js:107`), with `configurable: false`, so a plain data
+    // property reports the right value with the wrong descriptor — visible
+    // through `Object.getOwnPropertyDescriptor` and through
+    // `delete process.exitCode`, which Node refuses.
 
     // `process.config` is serialized `config.gypi`: `internal/bootstrap/node.js`
     // parses `internalBinding('builtins').config` and freezes the result. The
@@ -1831,9 +1920,617 @@ fn process_object<'s>(
         }
     }
     set(scope, config, "variables", config_variables.into())?;
-    set(scope, process, "config", config.into())?;
+    define_read_only(scope, process, "config", config.into())?;
+
+    install_process_state(scope, process, state)?;
 
     Ok(process)
+}
+
+/// The `process` properties `node.cc`'s `PatchProcessObject` and
+/// `bootstrap/node.js`'s later blocks install.
+///
+/// These are the pieces that are not plain data on the object this crate builds:
+/// two of them are *native* accessors, one is an ordinary assignment, and the
+/// source-map pair comes from `internal/source_map/source_map_cache`. They live
+/// together because each has to match Node's descriptor, not just its value, and
+/// keeping them in one place makes that visible.
+fn install_process_state(
+    scope: &mut v8::PinScope<'_, '_>,
+    process: v8::Local<v8::Object>,
+    state: ProcessState,
+) -> Result<(), String> {
+    install_title(scope, process, state.owns_process_state)?;
+    install_debug_port(scope, process, state)?;
+    install_domain(scope, process)?;
+    install_max_listeners(scope, process)?;
+    install_process_to_string_tag(scope, process)?;
+    Ok(())
+}
+
+/// `process._exiting` and `process.exitCode`, as accessors over one field set.
+///
+/// Node backs both with a private-symbol struct (`bootstrap/node.js:92-129`):
+/// `_exiting` is a boolean flag and `exitCode` is a tri-state of
+/// "absent"/"set to N". They are accessors rather than data properties for a
+/// reason that is observable — `exitCode` is `configurable: false`, so an
+/// assignment target that could be deleted or redefined would diverge — and the
+/// exit path reads them through `Object.getOwnPropertyDescriptor` in the tests
+/// below.
+///
+/// `exitCode`'s setter follows Node exactly: `null`/`undefined` clear it, a
+/// finite number stores it, a non-empty numeric *string* is coerced, and
+/// anything else is `ERR_INVALID_ARG_TYPE` from `validateInteger`. The message is
+/// built here rather than through `internal/errors` because that module is not
+/// reachable from this crate's bootstrap, which is the same constraint the
+/// `domain` implementation notes.
+fn install_exit_state(
+    scope: &mut v8::PinScope<'_, '_>,
+    process: v8::Local<v8::Object>,
+) -> Result<(), String> {
+    // Defined in JavaScript, not through `set_accessor`: a native accessor
+    // registered via V8's `SetNativeDataProperty` reports as a `data` descriptor
+    // with its current value materialised, while the oracle reports `accessor`
+    // for both of these. (`title` and `debugPort` go the other way — Node
+    // installs those natively and the oracle reports `data` — which is why the
+    // distinction is measured per property rather than assumed.)
+    let source = r#"
+(function (process, state, ObjectDefineProperty, validateInteger) {
+  ObjectDefineProperty(process, '_exiting', {
+    __proto__: null,
+    get() {
+      return state.exiting();
+    },
+    set(value) {
+      state.setExiting(value ? true : false);
+    },
+    enumerable: true,
+    configurable: true,
+  });
+
+  ObjectDefineProperty(process, 'exitCode', {
+    __proto__: null,
+    get() {
+      return state.exitCode();
+    },
+    set(code) {
+      if (code !== null && code !== undefined) {
+        let value = code;
+        // `NumberIsNaN` is a primordial (`internal/per_context/primordials`),
+        // not a global, so the check is spelled with `Number.isNaN` here. The
+        // observable behaviour is identical: a numeric string is coerced, and a
+        // non-numeric one is left as a string for `validateInteger` to reject.
+        if (typeof code === 'string' && code !== '' &&
+          Number.isNaN((value = Number(code)))) {
+          value = code;
+        }
+        validateInteger(value, 'code');
+        state.setExitCode(value);
+      } else {
+        state.clearExitCode();
+      }
+    },
+    enumerable: true,
+    configurable: false,
+  });
+})"#;
+    let state = exit_state_object(scope)?;
+    let Some(define) = object_define_property(scope) else {
+        return Err("cannot reach Object.defineProperty".to_string());
+    };
+    let Some(validate) = validate_integer(scope) else {
+        // `validateInteger` lives in `internal/validators`; without a loader it
+        // is unreachable, so the setter's validation is the one thing this
+        // cannot provide. Reporting that as an error is better than installing a
+        // setter that accepts nonsense.
+        return Err("cannot reach validateInteger for process.exitCode".to_string());
+    };
+    let code = v8::String::new(scope, source).ok_or("cannot allocate the exit setup script")?;
+    let script = v8::Script::compile(scope, code, None).ok_or("cannot compile the exit script")?;
+    let factory = script.run(scope).ok_or("the exit script threw")?;
+    let factory = v8::Local::<v8::Function>::try_from(factory)
+        .map_err(|_| "the exit script is not a function")?;
+    factory
+        .call(
+            scope,
+            v8::undefined(scope).into(),
+            &[process.into(), state, define.into(), validate],
+        )
+        .ok_or("the exit script threw while installing")?;
+    Ok(())
+}
+
+/// `internal/validators`' `validateInteger`, reached through the realm loader.
+fn validate_integer<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Value>> {
+    let require = rn_core::hook_slot::require(scope)?;
+    let id = v8::String::new(scope, "internal/validators")?;
+    let exports = require.call(scope, v8::undefined(scope).into(), &[id.into()])?;
+    let exports = v8::Local::<v8::Object>::try_from(exports).ok()?;
+    let key = v8::String::new(scope, "validateInteger")?;
+    exports.get(scope, key.into())
+}
+
+/// The Rust-side state the exit accessors read and write.
+///
+/// An object of closures rather than a raw pointer: V8 callback data is a
+/// statically sized slot that a captured closure does not fit in, and the exit
+/// path in `runtime.rs` already goes through the same functions.
+fn exit_state_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    let object = v8::Object::new(scope);
+    // Each is added by its own statement rather than through a loop: the
+    // callbacks are distinct `fn` items, and collecting them into one array would
+    // coerce them to a single function-pointer type, which `MapFnTo` rejects at
+    // compile time (each `fn` has its own `UnitValue`).
+    let exiting = function_of(scope, "exiting", exit_state_exiting)?;
+    set(scope, object, "exiting", exiting)?;
+    let set_exiting = function_of(scope, "setExiting", exit_state_set_exiting)?;
+    set(scope, object, "setExiting", set_exiting)?;
+    let exit_code = function_of(scope, "exitCode", exit_state_exit_code)?;
+    set(scope, object, "exitCode", exit_code)?;
+    let set_exit_code = function_of(scope, "setExitCode", exit_state_set_exit_code)?;
+    set(scope, object, "setExitCode", set_exit_code)?;
+    let clear = function_of(scope, "clearExitCode", exit_state_clear_exit_code)?;
+    set(scope, object, "clearExitCode", clear)?;
+    Ok(object.into())
+}
+
+fn exit_state_exiting(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    let exiting = exit_field()
+        .exiting
+        .load(std::sync::atomic::Ordering::Relaxed);
+    rv.set(v8::Boolean::new(scope, exiting).into());
+}
+
+fn exit_state_set_exiting(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue,
+) {
+    let truthy = args.get(0).boolean_value(scope);
+    exit_field()
+        .exiting
+        .store(truthy, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn exit_state_exit_code(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    let field = exit_field();
+    if !field
+        .has_exit_code
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        rv.set(v8::undefined(scope).into());
+        return;
+    }
+    let code = field.exit_code.load(std::sync::atomic::Ordering::Relaxed);
+    rv.set(v8::Integer::new(scope, code).into());
+}
+
+fn exit_state_set_exit_code(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue,
+) {
+    let Some(code) = args.get(0).number_value(scope) else {
+        return;
+    };
+    let field = exit_field();
+    field
+        .exit_code
+        .store(code as i32, std::sync::atomic::Ordering::Relaxed);
+    field
+        .has_exit_code
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn exit_state_clear_exit_code(
+    _scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue,
+) {
+    exit_field()
+        .has_exit_code
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the process is on its way out, as Node's `_exiting` reports it.
+fn exit_field() -> &'static ExitField {
+    static FIELD: std::sync::OnceLock<ExitField> = std::sync::OnceLock::new();
+    FIELD.get_or_init(ExitField::default)
+}
+
+/// The two values Node keeps behind its private symbol.
+///
+/// `has_exit_code` is separate from `exit_code` because Node distinguishes
+/// "absent" from "set to 0": `kHasExitCode` is its own field, and
+/// `process.exitCode` reads `undefined` until it is assigned.
+#[derive(Default)]
+struct ExitField {
+    exiting: std::sync::atomic::AtomicBool,
+    exit_code: std::sync::atomic::AtomicI32,
+    has_exit_code: std::sync::atomic::AtomicBool,
+}
+///
+/// `bootstrap/node.js` reaches `internal/source_map/source_map_cache` through
+/// `require`, and rustnode's `require` does not exist until `realm.js` has run —
+/// which is after [`process_object`]. Calling this from
+/// [`bootstrap_realm`] immediately after the realm bootstrap is the same point in
+/// Node's own ordering (`node.js` line 386 comes after `realm.js`).
+///
+/// A no-op when `require` is absent, so a caller that has no loader yet (a worker
+/// before its realm) does not fail; the properties are then simply absent, which
+/// the parity test reports rather than hiding.
+pub fn install_process_source_maps(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
+    let global = scope.get_current_context().global(scope);
+    let Some(process) = get_property(scope, global.into(), "process") else {
+        return Ok(());
+    };
+    let Ok(process) = v8::Local::<v8::Object>::try_from(process) else {
+        return Ok(());
+    };
+    install_exit_state(scope, process)?;
+    install_source_maps(scope, process)
+}
+
+/// The realm's `primordials` object, for the audit to inspect.
+///
+/// Exposed because the audit has to read the object the realm actually built.
+/// It is not on `globalThis` — Node never puts it there — so this is the only
+/// route, and it goes through the same slot the bootstrap scripts use.
+pub fn primordials<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Value>> {
+    rn_core::hook_slot::primordials(scope).map(|primordials| primordials.into())
+}
+
+/// Removes the bootstrap's `require` global.
+///
+/// Node has a global `require` in exactly one place: the `-e`/`-p` evaluation
+/// script, where `internal/process/execution.js::evalScript` runs user code with
+/// no module wrapper. Everywhere else — a CommonJS file, an ES module — `require`
+/// is the module wrapper's parameter, and `globalThis` has no such own property.
+///
+/// `rn-cli` installs the global because `realm.js` needs to hand its loader to
+/// user code before the entry kind is known, and the `-e` path has nothing else
+/// to reach it through. This is what a file entry point calls before running, so
+/// the surface matches Node for the case where the difference is observable.
+///
+/// # The audit hook
+///
+/// `tools/per-context-audit.js` has to inspect the realm's `primordials` object,
+/// which Node deliberately keeps off `globalThis`, so there is no supported route
+/// from JavaScript. `RUSTNODE_DEBUG_REALM_PRIMORDIALS=1` publishes it as a global
+/// for that audit alone, and the audit then asserts the members it destructures —
+/// the check that used to read a global that the runtime had leaked by accident.
+///
+/// This mirrors the existing `RUSTNODE_DEBUG_BINDING` hook in `rn-bind-contextify`:
+/// a debug-only variable, off by default, that no normal run sets. It is
+/// deliberately *not* a binding member, because a `primordials` own property on
+/// `builtins` would itself be a surface Node does not have, and this file is about
+/// removing exactly those.
+pub fn delete_require_global(scope: &mut v8::PinScope<'_, '_>) {
+    let global = scope.get_current_context().global(scope);
+    if let Some(key) = v8::String::new(scope, "require") {
+        let _ = global.delete(scope, key.into());
+    }
+}
+
+/// `process.title`, and the two libuv facts behind it.
+///
+/// `node_process_object.cc:168` installs it with `SetNativeDataProperty` and
+/// `ProcessTitleGetter`/`ProcessTitleSetter`. A getter/setter pair defined by
+/// hand would report a *data* property through
+/// `Object.getOwnPropertyDescriptor`, because V8 materialises a native data
+/// property's current value; that is what the oracle reports, and it is why this
+/// has to be `set_accessor_with_setter` rather than `define_own_property`.
+///
+/// The setter really renames the process: `uv_set_process_title`, the same call
+/// Node's `ProcessTitleSetter` makes. That only works once `uv_setup_args` has
+/// run, which `rn-cli` does at startup; without it libuv answers `UV_ENOBUFS`
+/// and the title would be a silent no-op on `ps`.
+fn install_title(
+    scope: &mut v8::PinScope<'_, '_>,
+    process: v8::Local<v8::Object>,
+    owns_process_state: bool,
+) -> Result<(), String> {
+    let key = v8::String::new(scope, "title").ok_or("cannot allocate process.title")?;
+    // Node passes `None` for the property attributes, which is `PropertyAttribute::NONE`:
+    // enumerable, writable, configurable — the descriptor the oracle reports.
+    //
+    // The setter is `nullptr` for a thread that does not own process state, which
+    // is Node's `env->owns_process_state() ? ProcessTitleSetter : nullptr`. A
+    // worker therefore has a getter-only `title`, matching `PatchProcessObject`.
+    let configuration = if owns_process_state {
+        v8::AccessorConfiguration::new(process_title_getter)
+            .setter(process_title_setter)
+            .property_attribute(v8::PropertyAttribute::NONE)
+    } else {
+        v8::AccessorConfiguration::new(process_title_getter)
+            .property_attribute(v8::PropertyAttribute::NONE)
+    };
+    process
+        .set_accessor_with_configuration(scope, key.into(), configuration)
+        .ok_or("cannot define process.title")?;
+    Ok(())
+}
+
+fn process_title_getter(
+    scope: &mut v8::PinScope<'_, '_>,
+    _key: v8::Local<v8::Name>,
+    _args: v8::PropertyCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let Some(title) = rn_uv::process_title::process_title() else {
+        return;
+    };
+    if let Some(value) = v8::String::new(scope, &title) {
+        rv.set(value.into());
+    }
+}
+
+fn process_title_setter(
+    scope: &mut v8::PinScope<'_, '_>,
+    _key: v8::Local<v8::Name>,
+    value: v8::Local<v8::Value>,
+    _args: v8::PropertyCallbackArguments<'_>,
+    _rv: v8::ReturnValue<()>,
+) {
+    // Node's `ProcessTitleSetter` runs `Utf8Value ... ; uv_set_process_title`.
+    // It does not validate the argument: a non-string is coerced, and a title
+    // longer than the original argv[0] area is truncated by libuv rather than
+    // rejected.
+    let Some(text) = value.to_string(scope) else {
+        return;
+    };
+    rn_uv::process_title::set_process_title(&text.to_rust_string_lossy(scope));
+}
+
+/// `process.debugPort`, a native accessor pair like Node's.
+///
+/// `DebugPortGetter` reads the environment's inspector host port and
+/// `DebugPortSetter` validates `0` or `1024..=65535` before storing it. The
+/// stored value is the parsed `--inspect-port`, so `--inspect-port=9339` is what
+/// the getter reports, not the `9229` default.
+fn install_debug_port(
+    scope: &mut v8::PinScope<'_, '_>,
+    process: v8::Local<v8::Object>,
+    state: ProcessState,
+) -> Result<(), String> {
+    // Only the owning thread records the port; a worker reads what the main
+    // thread stored rather than overwriting it with its own (identical) value.
+    if state.owns_process_state {
+        rn_uv::process_title::set_debug_port(state.debug_port);
+    }
+    let key = v8::String::new(scope, "debugPort").ok_or("cannot allocate process.debugPort")?;
+    let configuration = if state.owns_process_state {
+        v8::AccessorConfiguration::new(process_debug_port_getter)
+            .setter(process_debug_port_setter)
+            .property_attribute(v8::PropertyAttribute::NONE)
+    } else {
+        v8::AccessorConfiguration::new(process_debug_port_getter)
+            .property_attribute(v8::PropertyAttribute::NONE)
+    };
+    process
+        .set_accessor_with_configuration(scope, key.into(), configuration)
+        .ok_or("cannot define process.debugPort")?;
+    Ok(())
+}
+
+fn process_debug_port_getter(
+    scope: &mut v8::PinScope<'_, '_>,
+    _key: v8::Local<v8::Name>,
+    _args: v8::PropertyCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let port = rn_uv::process_title::debug_port();
+    rv.set(v8::Integer::new(scope, i32::from(port)).into());
+}
+
+fn process_debug_port_setter(
+    scope: &mut v8::PinScope<'_, '_>,
+    _key: v8::Local<v8::Name>,
+    value: v8::Local<v8::Value>,
+    _args: v8::PropertyCallbackArguments<'_>,
+    _rv: v8::ReturnValue<()>,
+) {
+    // `DebugPortSetter` takes `Int32Value().FromMaybe(0)`, then refuses anything
+    // except 0 and 1024..=65535 with `ERR_OUT_OF_RANGE`. A refused assignment
+    // throws from the setter, which V8 reports as a TypeError at the assignment.
+    let port = value.int32_value(scope).unwrap_or(0);
+    if (port != 0 && port < 1024) || port > 65535 {
+        let message = "process.debugPort must be 0 or in range 1024 to 65535";
+        if let Some(text) = v8::String::new(scope, message) {
+            let exception = v8::Exception::range_error(scope, text);
+            if let (Ok(object), Some(code)) = (
+                v8::Local::<v8::Object>::try_from(exception),
+                v8::String::new(scope, "ERR_OUT_OF_RANGE"),
+            ) {
+                if let Some(key) = v8::String::new(scope, "code") {
+                    let _ = object.set(scope, key.into(), code.into());
+                }
+            }
+            scope.throw_exception(exception);
+        }
+        return;
+    }
+    rn_uv::process_title::set_debug_port(port.clamp(0, i32::from(u16::MAX)) as u16);
+}
+
+/// `process.domain`, which Node's bootstrap assigns as a plain `null`.
+///
+/// `lib/internal/bootstrap/node.js:90` is the whole implementation:
+/// `process.domain = null`. It is an ordinary enumerable, writable,
+/// configurable data property — `lib/domain.js` replaces it when a domain is
+/// entered — so `set` reproduces it exactly and no accessor is involved.
+fn install_domain(
+    scope: &mut v8::PinScope<'_, '_>,
+    process: v8::Local<v8::Object>,
+) -> Result<(), String> {
+    set(scope, process, "domain", v8::null(scope).into())
+}
+
+/// `process.sourceMapsEnabled` and `process.setSourceMapsEnabled`, from
+/// `internal/source_map/source_map_cache`.
+///
+/// `bootstrap/node.js:386-416` defines the getter over `getSourceMapsSupport()`
+/// and the setter as a call to `setSourceMapsSupport(val, {nodeModules: val,
+/// generatedCode: val})`. Both come from the real module here, so the flag is the
+/// same state `Error.prepareStackTrace` reads — not a parallel copy that would
+/// say `true` while no source map was being consulted.
+///
+/// `require` is passed in rather than read from the script's scope: the script is
+/// compiled as a bare script, so a free `require` would resolve against
+/// `globalThis`, and at this point the global `require` is the *wrapper* the CLI
+/// installs later, not the loader. Passing the loader the realm just produced
+/// makes the dependency explicit.
+fn install_source_maps(
+    scope: &mut v8::PinScope<'_, '_>,
+    process: v8::Local<v8::Object>,
+) -> Result<(), String> {
+    let Some(require) = rn_core::hook_slot::require(scope) else {
+        // Without a loader the block cannot reach its module. The caller decides
+        // whether that is fatal; here it means there is nothing to install.
+        return Ok(());
+    };
+    let source = r#"
+(function (process, require, ObjectDefineProperty) {
+  const {
+    getSourceMapsSupport,
+    setSourceMapsSupport,
+  } = require('internal/source_map/source_map_cache');
+  ObjectDefineProperty(process, 'sourceMapsEnabled', {
+    __proto__: null,
+    enumerable: true,
+    configurable: true,
+    get() {
+      return getSourceMapsSupport().enabled;
+    },
+  });
+  process.setSourceMapsEnabled = function setSourceMapsEnabled(val) {
+    setSourceMapsSupport(val, {
+      __proto__: null,
+      nodeModules: val,
+      generatedCode: val,
+    });
+  };
+})"#;
+    run_setup_script(scope, source, process, require)
+}
+
+/// `process[Symbol.toStringTag]`, from `setupProcessObject`.
+///
+/// `bootstrap/node.js:428` defines `value: 'process'` with
+/// `{enumerable: false, writable: true, configurable: false}`. The
+/// non-enumerable bit is what keeps `test/common/index.js`'s globals audit quiet,
+/// and `configurable: false` means the tag cannot be swapped later — both are
+/// visible through `Object.getOwnPropertyDescriptor` and are what the oracle
+/// reports.
+fn install_process_to_string_tag(
+    scope: &mut v8::PinScope<'_, '_>,
+    process: v8::Local<v8::Object>,
+) -> Result<(), String> {
+    let Some(tag) = v8::String::new(scope, "process") else {
+        return Err("cannot allocate the process toStringTag".to_string());
+    };
+    let symbol = v8::Symbol::get_to_string_tag(scope);
+    // `DONT_ENUM` and "configurable: false" are two different flags, and
+    // `PropertyAttribute` has no positive `DONT_DELETE`-off spelling: omitting
+    // `DONT_DELETE` is what makes a property configurable. Node's descriptor is
+    // `enumerable: false, writable: true, configurable: false`, so the delete bit
+    // must be *set* here — which is the opposite of the usual reading of the flag
+    // and exactly what a value-only probe would miss.
+    process
+        .define_own_property(
+            scope,
+            symbol.into(),
+            tag.into(),
+            v8::PropertyAttribute::DONT_ENUM | v8::PropertyAttribute::DONT_DELETE,
+        )
+        .ok_or_else(|| "cannot define process[Symbol.toStringTag]".to_string())?;
+    Ok(())
+}
+
+/// `process._maxListeners`, which Node's `EventEmitter` constructor creates.
+///
+/// `setupProcessObject` calls `FunctionPrototypeCall(EventEmitter, process)`, and
+/// `EventEmitter`'s constructor runs `this._maxListeners = defaultMaxListeners` —
+/// an *own* data property on `process` whose value is `undefined` for a
+/// `defaultMaxListeners` that is not a number. rustnode's `process` inherits
+/// `_maxListeners` from a shared prototype instead, which differs in
+/// `Object.prototype.hasOwnProperty.call(process, '_maxListeners')` and in
+/// `Object.keys(process)`.
+///
+/// The descriptor is `{enumerable: true, writable: true, configurable: true}`
+/// with the value `undefined`, which is what an assignment produces — so this is
+/// the same shape as the assignment, written explicitly because the property has
+/// to exist even though its value is `undefined`.
+fn install_max_listeners(
+    scope: &mut v8::PinScope<'_, '_>,
+    process: v8::Local<v8::Object>,
+) -> Result<(), String> {
+    set(scope, process, "_maxListeners", v8::undefined(scope).into())
+}
+
+/// Runs one bootstrap-shaped script with `process` in scope.
+///
+/// The script returns a factory function, which this calls with `process`, the
+/// realm's loader, and `Object.defineProperty`. All three are passed as
+/// arguments rather than read off `globalThis`: at this point the global
+/// `require` is not yet the loader, and resolving the intrinsic through the
+/// global would pick up whatever user code had replaced it.
+fn run_setup_script(
+    scope: &mut v8::PinScope<'_, '_>,
+    source: &str,
+    process: v8::Local<v8::Object>,
+    require: v8::Local<v8::Function>,
+) -> Result<(), String> {
+    let global = scope.get_current_context().global(scope);
+    let Some(object_key) = v8::String::new(scope, "Object") else {
+        return Err("cannot allocate the Object key".to_string());
+    };
+    let Some(object) = global.get(scope, object_key.into()) else {
+        return Err("cannot reach Object".to_string());
+    };
+    let Ok(object) = v8::Local::<v8::Object>::try_from(object) else {
+        return Err("Object is not an object".to_string());
+    };
+    let Some(define_key) = v8::String::new(scope, "defineProperty") else {
+        return Err("cannot allocate the defineProperty key".to_string());
+    };
+    let Some(define) = object.get(scope, define_key.into()) else {
+        return Err("cannot reach Object.defineProperty".to_string());
+    };
+    let Ok(define) = v8::Local::<v8::Function>::try_from(define) else {
+        return Err("Object.defineProperty is not a function".to_string());
+    };
+
+    let Some(code) = v8::String::new(scope, source) else {
+        return Err("cannot allocate the setup script".to_string());
+    };
+    let Some(script) = v8::Script::compile(scope, code, None) else {
+        return Err("cannot compile the setup script".to_string());
+    };
+    let Some(factory) = script.run(scope) else {
+        return Err("the setup script threw".to_string());
+    };
+    let Ok(factory) = v8::Local::<v8::Function>::try_from(factory) else {
+        return Err("the setup script did not produce a function".to_string());
+    };
+    factory
+        .call(
+            scope,
+            v8::undefined(scope).into(),
+            &[process.into(), require.into(), define.into()],
+        )
+        .ok_or_else(|| "the setup script threw while installing".to_string())?;
+    Ok(())
 }
 
 /// Reads `process.exitCode` the way the interpreter would use it.
@@ -1936,6 +2633,52 @@ fn set(
 ) -> Result<(), String> {
     let key = v8::String::new(scope, name).ok_or("cannot allocate a property name")?;
     object.set(scope, key.into(), value);
+    Ok(())
+}
+
+/// Defines a property Node marks `v8::ReadOnly`.
+///
+/// `READ_ONLY_PROPERTY` in `src/node_process_object.cc` is
+/// `Set(context, key, value, static_cast<PropertyAttribute>(ReadOnly | DontDelete))`
+/// only for `pid`; the rest use plain `Set`, which a *frozen* descriptor is not.
+/// What the oracle actually reports for `version`, `versions`, `platform`,
+/// `arch`, `release` and `config` is `{writable: false, configurable: true,
+/// enumerable: true}`, so `READ_ONLY` alone is the flag — adding `DONT_DELETE`
+/// would make them non-configurable and diverge in the other direction.
+fn define_read_only(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<v8::Object>,
+    name: &str,
+    value: v8::Local<v8::Value>,
+) -> Result<(), String> {
+    let key = v8::String::new(scope, name).ok_or("cannot allocate a property name")?;
+    object
+        .define_own_property(scope, key.into(), value, v8::PropertyAttribute::READ_ONLY)
+        .ok_or_else(|| format!("cannot define {name} as read-only"))?;
+    Ok(())
+}
+
+/// Defines a property Node marks read-only *and* non-configurable.
+///
+/// `process.features` is the one member where `bootstrap/node.js:303` passes
+/// `writable: false, configurable: false`: its getters are the only way in, and a
+/// configurable descriptor would let user code replace the object and defeat
+/// them. The oracle reports exactly that pair, so this is the flag set for it.
+fn define_read_only_frozen(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<v8::Object>,
+    name: &str,
+    value: v8::Local<v8::Value>,
+) -> Result<(), String> {
+    let key = v8::String::new(scope, name).ok_or("cannot allocate a property name")?;
+    object
+        .define_own_property(
+            scope,
+            key.into(),
+            value,
+            v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE,
+        )
+        .ok_or_else(|| format!("cannot define {name} as read-only and non-configurable"))?;
     Ok(())
 }
 

@@ -69,9 +69,23 @@ for (const [name, want] of Object.entries(expectedGlobals)) {
   // here. `globalThis[name]` is `undefined` when absent, which never matches.
   record(`global ${name}`, typeof globalThis[name], want);
 }
-// `primordials` is the one per-context name that has to be a global here,
-// because `realm.js` reads it as a bare identifier inside its wrapper.
-record('global primordials', typeof globalThis.primordials, 'object');
+// `primordials` must NOT be a global in a normal run. Node builds it in
+// `internal/per_context/primordials` and passes it to each script as a wrapper
+// parameter; it is never a `globalThis` property
+// (`node --expose-internals -e 'typeof globalThis.primordials'` answers
+// `undefined`). This assertion used to require it to be an *object*, which
+// encoded the leak as the expectation: the audit had been written from the defect
+// rather than from Node, so fixing the leak made the gate fail.
+//
+// `RUSTNODE_DEBUG_REALM_PRIMORDIALS=1` publishes the object under that name so
+// the member table below can read it, so the expected type depends on which pass
+// this is. Stating that here rather than skipping the assertion keeps the leak
+// check live in the pass that can see it.
+const published = process.env.RUSTNODE_DEBUG_REALM_PRIMORDIALS === '1';
+record('global primordials', typeof globalThis.primordials,
+  published ? 'object' : 'undefined');
+
+
 // These two are wrapper parameters in Node and must NOT be globals. The bug was
 // that they were missing entirely; exposing them as globals would be a different
 // bug (and would fail test/common's global walk).
@@ -80,21 +94,30 @@ record('global perIsolateSymbols', typeof globalThis.perIsolateSymbols, 'undefin
 record('global exports', typeof globalThis.exports, 'undefined');
 
 console.log('\n--- primordials members domexception.js destructures ---');
-// The full destructuring list from the file, at the pinned revision.
+// The realm's object, published only for this audit by
+// `RUSTNODE_DEBUG_REALM_PRIMORDIALS=1` (see `delete_require_global` in
+// `crates/rn-realm/src/lib.rs`). It is NOT a global in a normal run, which is why
+// the assertion above is pass-dependent. Both passes matter: the pass without the
+// variable proves the leak is gone, and the pass with it proves the members
+// `domexception.js` destructures are real — the coverage the leak used to give a
+// test by accident, which is exactly the kind of accidental coverage that
+// disappears when the defect is fixed.
+const primordials = globalThis.primordials;
 const fromPrimordials = [
   'Error', 'ErrorPrototype', 'NumberIsFinite', 'NumberIsNaN',
   'ObjectDefineProperties', 'ObjectDefineProperty', 'ObjectSetPrototypeOf',
   'RangeError', 'SafeMap', 'SafeSet', 'SafeWeakMap', 'SymbolToStringTag',
   'TypeError',
 ];
-for (const name of fromPrimordials) {
-  const kind = typeof primordials[name];
-  const want = name === 'SymbolToStringTag' ? 'symbol'
-    : name.endsWith('Prototype') ? 'object' : 'function';
-  record(`primordials.${name}`, kind, want);
+if (published) {
+  for (const name of fromPrimordials) {
+    const kind = typeof primordials[name];
+    const want = name === 'SymbolToStringTag' ? 'symbol'
+      : name.endsWith('Prototype') ? 'object' : 'function';
+    record(`primordials.${name}`, kind, want);
+  }
+  record('primordials.SymbolFor', typeof primordials.SymbolFor, 'function');
 }
-// messageport.js reads exactly one.
-record('primordials.SymbolFor', typeof primordials.SymbolFor, 'function');
 
 console.log('\n--- observable behaviour that depended on the two symbol tables ---');
 const e = new DOMException('x', 'SyntaxError');

@@ -74,8 +74,8 @@ pub fn install_emit_message<'s>(
     // script that starts reading one of them would fail here rather than
     // silently see `undefined`.
     let exports = v8::Object::new(scope);
-    let primordials = primordials_from_global(scope)
-        .ok_or("the primordials global is missing; the realm bootstrap has not run")?;
+    let primordials =
+        primordials(scope).ok_or("the realm bootstrap has not recorded its primordials yet")?;
     let private_symbols = rn_core::private_symbols_object(scope)
         .map_err(|reason| format!("cannot build privateSymbols: {reason}"))?;
     let per_isolate_symbols = rn_core::per_isolate_symbols_object(scope)
@@ -119,13 +119,15 @@ fn function_named<'s>(
 ///
 /// `bootstrap.rs` sets it on the global because `realm.js` reads it as a bare
 /// identifier inside its wrapper, so the same object is reachable here.
-fn primordials_from_global<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-) -> Option<v8::Local<'s, v8::Object>> {
-    let global = scope.get_current_context().global(scope);
-    let key = v8::String::new(scope, "primordials")?;
-    let value = global.get(scope, key.into())?;
-    v8::Local::<v8::Object>::try_from(value).ok()
+/// The realm's `primordials` object.
+///
+/// Read from the hook slot, not from `globalThis`: Node's `primordials` is a
+/// bootstrap-local that is never a global, and a process where
+/// `Object.getOwnPropertyNames(globalThis)` carries it fails Node's own
+/// `test/common/index.js` globals audit. This used to read the global because
+/// the bootstrap put it there; the bootstrap now records it instead.
+fn primordials<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    rn_core::hook_slot::primordials(scope)
 }
 
 /// Whether `emitMessage` has been installed.
