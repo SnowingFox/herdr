@@ -141,6 +141,18 @@ const PROCESSING_LIMIT: usize = 1000;
 
 /// Delivers everything queued for `port`.
 ///
+/// This is `MessagePort::OnMessage` + `ReceiveMessage` (`src/node_messaging.cc`).
+/// Two details of that pair are load-bearing and were both missing:
+///
+/// * A close marker is honoured **even for a port that is not receiving**.
+///   `ReceiveMessage` peeks the queue's front and bails out with
+///   `no_message_symbol` only when the front is *not* a close message, so a close
+///   is the one thing a listener-less port still notices.
+/// * A close marker calls `Close()` on the receiver. That is what drops the
+///   port's handle, and skipping it is why a port whose peer had closed went on
+///   pinning the loop forever: `close` fired, the state never changed, and
+///   `keeps_loop_alive` kept answering `true`.
+///
 /// Returns whether a message was delivered, which the loop uses to decide
 /// whether another turn is warranted.
 pub fn deliver<'s>(scope: &mut v8::PinScope<'s, '_>, port: &Rc<PortInner>) -> bool {
@@ -151,24 +163,31 @@ pub fn deliver<'s>(scope: &mut v8::PinScope<'s, '_>, port: &Rc<PortInner>) -> bo
     }) else {
         return false;
     };
-    if port.closing.get() {
-        return false;
-    }
 
     let mut delivered = false;
     for _ in 0..PROCESSING_LIMIT {
+        // The close marker is read before anything else, which is Node's order:
+        // `ReceiveMessage` peeks the front and returns to `OnMessage`, which only
+        // checks `IsDetached()` *before* the loop, so a port that went closing
+        // while a marker was queued still consumes it. The same order matters for
+        // a normal message: `data_` going null is the detached case, and a port
+        // that merely started closing keeps its queue.
+        if port.closed.get() {
+            return delivered;
+        }
         let Some(object) = port.object(scope) else {
-            // The JavaScript object was collected; there is nothing left to
-            // dispatch to, and the queue goes with it.
             return delivered;
         };
         let Some(message) = port.data.dequeue() else {
             return delivered;
         };
         if message.close {
-            // A close marker is delivered as a `close` event, which is the
-            // `handle_onclose` hook `io.js` installs on the prototype.
-            close_event(scope, object);
+            // `if (received->IsCloseMessage()) { Close(); return no_message_symbol; }`.
+            // `close()` queues the close event for the close phase and marks the
+            // port closing, so `keeps_loop_alive` stops seeing it — and the
+            // event is dispatched by [`run`]'s close loop exactly once, the same
+            // way a self-initiated `close()` is.
+            port.clone().close_quietly();
             return delivered;
         }
 
@@ -283,12 +302,37 @@ pub fn run<'s>(scope: &mut v8::PinScope<'s, '_>) -> bool {
     // owed the moment `close()` runs and the loop only gets one call per phase
     // here. Dispatching them after the messages keeps `close` last, which is the
     // observable part.
-    for port in take_closing() {
+    //
+    // Only an event that *earned this iteration* is dispatched. An event owed by a
+    // port that a close marker closed was queued during the delivery loop above,
+    // and Node dispatches it in a later close phase — which exists only if
+    // something else keeps the loop turning. Dispatching it here would be that
+    // later phase happening immediately, and `port2.on('close', f);
+    // port1.close()` would print what Node does not.
+    let mut owed_later = Vec::new();
+    for owed in take_closing() {
+        // An event a close marker queued is dispatched one phase later, which is
+        // Node's ordering: the marker is consumed in this phase and the event
+        // belongs to the next one, if there is one.
+        if !owed.creates_iteration && owed.deferred == 0 {
+            owed_later.push(crate::port::CloseOwed {
+                port: owed.port,
+                creates_iteration: false,
+                deferred: 1,
+            });
+            continue;
+        }
+        let port = owed.port;
         let Some(object) = port.object(scope) else {
+            port.mark_closed();
             continue;
         };
         close_event(scope, object);
+        port.mark_closed();
         worked = true;
+    }
+    if !owed_later.is_empty() {
+        crate::port::requeue_closing(owed_later);
     }
 
     worked
@@ -305,6 +349,28 @@ pub fn has_work() -> bool {
 /// nothing queued, while a posted message needs the check phase to run once. The
 /// check handle is started from this predicate, so an idle port does not make the
 /// loop run a phase for nothing.
+/// Whether a delivery is queued for the check phase.
+///
+/// `uv__loop_alive` has three terms, and the runtime has to consult the same
+/// three or it stops the loop before the phase that would drain its queue:
+///
+/// * `uv__has_active_handles` — a ref'd port, which is
+///   [`any_keeps_loop_alive`]'s first two cases.
+/// * `closing_handles` — a port that closed and still owes its `close` event,
+///   which is the third.
+/// * **queued work that has not run yet.** rustnode's stand-in for a
+///   `uv_async_send` is a `PENDING` entry, and unlike libuv's async handle it is
+///   not itself a handle the loop counts. So a queued delivery has to be reported
+///   here, or a worker whose script has returned would end its thread with the
+///   message still in `PENDING` — measured: `parentPort.postMessage` from a worker
+///   script body never reached the parent.
+///
+/// A *close marker on a listener-less port* is the one case where the queue must
+/// not force an iteration. `port2.on('close', f); port1.close()` prints nothing
+/// under Node, because the peer's marker is queued by the close phase and nothing
+/// refs the loop after it; forcing an iteration there would dispatch an event Node
+/// never delivers, and it would also spin, since the drain re-queues nothing and
+/// the predicate stayed true.
 pub fn has_delivery_pending() -> bool {
-    crate::port::has_delivery_pending()
+    crate::port::any_keeps_loop_alive() || crate::port::has_deliverable_message()
 }

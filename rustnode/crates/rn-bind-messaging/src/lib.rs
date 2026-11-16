@@ -63,7 +63,9 @@ use crate::port::{MessagePortData, PortInner};
 pub use crate::delivery::{
     emit_message_installed, has_delivery_pending, install_emit_message, run as run_message_ports,
 };
-pub use crate::port::{live_port_count, schedule_ports_with_mail, set_check_phase_armed};
+pub use crate::port::{
+    has_deliverable_message, live_port_count, schedule_ports_with_mail, set_check_phase_armed,
+};
 
 /// Whether a `MessagePort` is still keeping the loop alive.
 ///
@@ -485,9 +487,31 @@ pub fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     scope.throw_exception(exception);
 }
 
+/// Throws a `TypeError` with `code` set on the error object, which is how Node's
+/// `THROW_ERR_*` macros surface their `code` property.
+///
+/// `THROW_ERR_INVALID_ARG_TYPE` constructs a `TypeError` and then assigns `code`
+/// from the macro's entry in `node_errors.h`, so a script can branch on
+/// `err.code === 'ERR_INVALID_ARG_TYPE'`. A bare `v8::Exception::type_error` has
+/// no `code`, which is the difference between "the same class" and "the same
+/// error".
+fn throw_type_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: &str) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = v8::Exception::type_error(scope, text);
+    if let (Ok(object), Some(key), Some(value)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, "code"),
+        v8::String::new(scope, code),
+    ) {
+        let _ = object.set(scope, key.into(), value.into());
+    }
+    scope.throw_exception(exception);
+}
+
 /// Throws `new DOMException(message, 'DataCloneError')`, Node's
 /// `ThrowDataCloneException`.
-///
 /// `node_messaging.cc` builds the exception from
 /// `GetDOMException(context)->NewInstance(context, {message, "DataCloneError"})`,
 /// which is the per-context class: `name` is `DataCloneError`, `code` is 25, and
@@ -612,18 +636,43 @@ fn post_message<'s>(
     };
 
     // Serialization happens even for a closed port, because the transfer list
-    // still has to be validated and a clone error still has to be raised.
-    let message = match serialize::serialize(scope, args.get(0), args.get(1)) {
+    // still has to be validated and a clone error still has to be raised. Node
+    // passes the port as `source_port` so a list naming it can be refused.
+    let message = match serialize::serialize(
+        scope,
+        args.get(0),
+        args.get(1),
+        Some(this),
+        serialize::TransferList::Argument,
+    ) {
         Ok(message) => message,
-        Err(Some(text)) => {
-            throw_type_error(scope, &text);
+        Err(serialize::SerializeError::DataClone(text)) => {
+            // `Message::Serialize` routes every transfer-list and clone failure
+            // through `ThrowDataCloneException`, so the class is
+            // `DOMException`/`DataCloneError` with code 25 — not a `TypeError`.
+            throw_data_clone_exception_str(scope, &text);
             return;
         }
-        Err(None) => return,
+        Err(serialize::SerializeError::NotIterable) => {
+            // `GetTransferList`'s `THROW_ERR_INVALID_ARG_TYPE`, which *is* a
+            // `TypeError` and carries `code` `ERR_INVALID_ARG_TYPE`.
+            throw_type_error_with_code(
+                scope,
+                "ERR_INVALID_ARG_TYPE",
+                "Optional transferList argument must be an iterable",
+            );
+            return;
+        }
+        Err(serialize::SerializeError::Thrown) => return,
     };
 
     if state.closing.get() {
-        rv.set(v8::Boolean::new(scope, true).into());
+        // `PostMessage` returns `serialization_maybe` when `data_ == nullptr` — a
+        // value the caller never sets, so the observable answer for a closed or
+        // detached port is `undefined`, not `true`. `io.js` treats `undefined` as
+        // "could not post" and raises `InvalidStateError` for the
+        // `BroadcastChannel` wrapper, so this is load-bearing.
+        rv.set(v8::undefined(scope).into());
         return;
     }
 
@@ -631,9 +680,11 @@ fn post_message<'s>(
     // through the sender's `MessagePortData`.
     let dispatched = state.data.dispatch(&message);
     if !dispatched {
-        // Node emits a warning rather than throwing, so a script that posts on a
-        // detached port keeps running.
-        rv.set(v8::Boolean::new(scope, false).into());
+        // `MessagePortData::Dispatch` returns `Nothing<bool>()` for an
+        // unentangled port, which `PostMessage` turns into no return value at
+        // all, and the "is not entangled" text becomes a process warning rather
+        // than an exception.
+        rv.set(v8::undefined(scope).into());
         return;
     }
 
@@ -668,7 +719,11 @@ fn handle_wrap_ref(
 ) {
     let this = args.this();
     if let Some(state) = port_state_of(scope, this) {
-        state.refed.set(true);
+        // `HandleWrap::Ref` is `if (IsAlive(wrap)) uv_ref(...)`, so a port past
+        // its close callback stays unref'd however often `ref()` is called.
+        if !state.closed.get() {
+            state.refed.set(true);
+        }
     }
 }
 
@@ -690,7 +745,7 @@ fn handle_wrap_has_ref(
 ) {
     let this = args.this();
     let refed = port_state_of(scope, this)
-        .map(|state| state.refed.get() && !state.closing.get())
+        .map(|state| state.has_ref())
         .unwrap_or(false);
     rv.set(v8::Boolean::new(scope, refed).into());
 }
@@ -718,6 +773,19 @@ fn receive_message_on_port(
     let Some(state) = port_argument(scope, &args) else {
         return;
     };
+    // `ReceiveMessage`: the front is peeked, and a close marker is honoured
+    // before the `wants_message` test, so `receiveMessageOnPort` on a port that
+    // was never started still closes it. Returning `no_message_symbol` is the
+    // whole output — the close event itself is dispatched from the check phase,
+    // exactly as a self-initiated `close()` delivers it.
+    if let Some(true) = state.data.front_is_close() {
+        if let Some(message) = state.data.dequeue() {
+            debug_assert!(message.close);
+        }
+        state.clone().close_quietly();
+        set_no_message(scope, &mut rv);
+        return;
+    }
     if state.closing.get() {
         set_no_message(scope, &mut rv);
         return;
@@ -726,11 +794,6 @@ fn receive_message_on_port(
         set_no_message(scope, &mut rv);
         return;
     };
-    if message.close {
-        state.close();
-        set_no_message(scope, &mut rv);
-        return;
-    }
     match deserialize::deserialize(scope, &message) {
         Ok(deserialized) => rv.set(deserialized.value),
         Err(()) => set_no_message(scope, &mut rv),
@@ -1139,14 +1202,34 @@ fn structured_clone<'s>(
     // a transfer silently a copy, and `test-structuredClone-domexception.js`
     // asserts that transferring a `DOMException` throws.
     let transfer_list = transfer_list_from_options(scope, args.get(1));
-    let message = match serialize::serialize(scope, value, transfer_list) {
+    // `structuredClone` has no source port; Node passes an empty `Local<Object>`
+    // so the source-port branch is skipped entirely.
+    let message = match serialize::serialize(
+        scope,
+        value,
+        transfer_list,
+        None,
+        serialize::TransferList::Sequence,
+    ) {
         Ok(message) => message,
-        Err(Some(reason)) => {
+        Err(serialize::SerializeError::DataClone(reason)) => {
             throw_data_clone_exception_str(scope, &reason);
             return;
         }
+        Err(serialize::SerializeError::NotIterable) => {
+            // Node reaches this through the `webidl` converter in
+            // `js_transferable.js`, which rejects a non-sequence `transfer`
+            // before the native layer sees it.
+            throw_type_error_with_code(
+                scope,
+                "ERR_INVALID_ARG_TYPE",
+                "Failed to execute 'structuredClone': transfer in Options \
+                 cannot be converted to sequence.",
+            );
+            return;
+        }
         // V8 already scheduled the exception.
-        Err(None) => return,
+        Err(serialize::SerializeError::Thrown) => return,
     };
     match deserialize::deserialize(scope, &message) {
         Ok(deserialized) => rv.set(deserialized.value),

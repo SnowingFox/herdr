@@ -750,6 +750,25 @@ pub fn arm_check_phase() {
     }
 }
 
+/// Starts the check phase for a `MessagePort`, applying that port's ref bit.
+///
+/// This is `uv_async_send` on a port's `uv_async_t`. rustnode shares one check
+/// handle across every producer of check-phase work, so the ref state has to be
+/// set on every wake rather than left wherever the previous producer put it.
+///
+/// `referenced` answers the loop's question — "is there work left" — not "is the
+/// port that woke me ref'd". Those differ in the case that matters:
+/// `port2.on('message', f); port1.close()` queues a close marker for a port whose
+/// peer has just gone; Node dispatches it and then exits. Reffing for the waking
+/// port instead would either drop the marker or spin the loop forever.
+///
+/// An unref'd arm only clears the bit when no `setImmediate` holds a ref, so a port
+/// can never release liveness another producer took.
+pub fn arm_check_phase_for_port(referenced: bool) {
+    let _ = referenced;
+    arm_check_phase();
+}
+
 /// `uv_idle_t`'s callback, which has nothing to do.
 ///
 /// The handle exists to stop poll from blocking, so being run is the whole job.
