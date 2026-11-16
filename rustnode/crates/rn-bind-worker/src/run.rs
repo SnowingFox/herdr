@@ -114,7 +114,13 @@ impl WorkerThread {
             params = params.set_code_range_size_in_bytes(mb(code_range));
         }
 
-        let mut isolate = v8::Isolate::new(params);
+        // Every isolate gets its own counting allocator, not just the main one:
+        // `arrayBuffers` is per `Environment` in Node, and the pinned oracle
+        // reports a worker's own buffers (`0.13` for an empty worker while the
+        // parent holds 64 MiB) rather than the process total. Creating this
+        // isolate without one would leave `process.memoryUsage().arrayBuffers`
+        // reading zero inside every worker.
+        let mut isolate = v8::Isolate::new(rn_core::with_counted_array_buffer_allocator(params));
         // Microtasks are explicit, exactly as on the main thread: Node's tick
         // queue must beat a `.then`, and the default `Auto` policy would invert
         // that.
