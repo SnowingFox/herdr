@@ -44,6 +44,7 @@
 //! private key — `createPublicKey(privateKey)` — free rather than a copy.
 
 mod args;
+mod cryptokey;
 mod errors;
 mod gen;
 mod handle;
@@ -105,11 +106,11 @@ pub fn key_of_handle(
 /// reading of them.
 pub mod constants {
     /// `kKeyTypeSecret`.
-    pub const K_KEY_TYPE_SECRET: i32 = 1;
+    pub const K_KEY_TYPE_SECRET: i32 = 0;
     /// `kKeyTypePublic`.
-    pub const K_KEY_TYPE_PUBLIC: i32 = 2;
+    pub const K_KEY_TYPE_PUBLIC: i32 = 1;
     /// `kKeyTypePrivate`.
-    pub const K_KEY_TYPE_PRIVATE: i32 = 3;
+    pub const K_KEY_TYPE_PRIVATE: i32 = 2;
 
     /// `kCryptoJobAsync`.
     pub const K_CRYPTO_JOB_ASYNC: i32 = 0;

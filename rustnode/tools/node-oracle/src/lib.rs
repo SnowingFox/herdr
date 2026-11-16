@@ -281,8 +281,18 @@ impl Oracle {
 
     /// `node -e <script>`, returning trimmed stdout.
     pub fn eval(&self, script: &str) -> String {
+        self.eval_with_args(&[], script)
+    }
+
+    /// Runs `script` with extra Node CLI arguments before `-e`.
+    ///
+    /// Needed for `--expose-internals`, which is how `internalBinding('crypto')`
+    /// becomes reachable: the constants that crate installs are only observable
+    /// through `internal/test/binding`, and that module is gated behind the flag.
+    pub fn eval_with_args(&self, args: &[&str], script: &str) -> String {
         let output = self
             .command()
+            .args(args)
             .arg("-e")
             .arg(script)
             .output()

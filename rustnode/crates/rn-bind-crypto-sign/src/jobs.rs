@@ -35,14 +35,14 @@ use rn_crypto_openssl::{
 };
 use rn_v8_sys::v8;
 
-/// `kSignJobModeSign`.
-const K_SIGN_JOB_MODE_SIGN: i32 = 1;
+/// `kSignJobModeSign`, from `SignJobMode` in `node_crypto.h`.
+const K_SIGN_JOB_MODE_SIGN: i32 = 0;
 /// `kSignJobModeVerify`.
-const K_SIGN_JOB_MODE_VERIFY: i32 = 2;
-/// `kSigEncDER`.
-const K_SIG_ENC_DER: i32 = 1;
+const K_SIGN_JOB_MODE_VERIFY: i32 = 1;
+/// `kSigEncDER`, from `DSASigEnc` in `node_crypto.h`.
+const K_SIG_ENC_DER: i32 = 0;
 /// `kSigEncP1363`.
-const K_SIG_ENC_P1363: i32 = 2;
+const K_SIG_ENC_P1363: i32 = 1;
 /// `kKeyVariantRSA_SSA_PKCS1_v1_5`.
 const K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5: i32 = 0;
 
@@ -1606,9 +1606,13 @@ mod tests {
 
     #[test]
     fn the_signature_encoding_values_are_stable() {
-        assert_eq!(K_SIG_ENC_DER, 1);
-        assert_eq!(K_SIG_ENC_P1363, 2);
-        assert_eq!(K_SIGN_JOB_MODE_SIGN, 1);
-        assert_eq!(K_SIGN_JOB_MODE_VERIFY, 2);
+        // `DSASigEnc` in `node_crypto.h` is `{ DER, P1363 }` and `SignJobMode` is
+        // `{ kSignJobModeSign, kSignJobModeVerify }`, both exported starting at
+        // zero, so `node --expose-internals` reports 0/1 for each pair. These were
+        // 1/2 and 1/2 until the tables were aligned with Node.
+        assert_eq!(K_SIG_ENC_DER, 0);
+        assert_eq!(K_SIG_ENC_P1363, 1);
+        assert_eq!(K_SIGN_JOB_MODE_SIGN, 0);
+        assert_eq!(K_SIGN_JOB_MODE_VERIFY, 1);
     }
 }
