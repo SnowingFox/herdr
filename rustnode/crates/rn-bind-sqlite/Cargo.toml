@@ -26,3 +26,7 @@ cc = "1"
 
 [dev-dependencies]
 serde_json.workspace = true
+# Resolves the pinned Node binary the differential test compares against, so the
+# comparison can never fall back to whatever `node` is on `PATH`. See
+# `tools/node-pin.toml` and `tools/node-oracle`.
+rn-node-oracle = { path = "../../tools/node-oracle" }

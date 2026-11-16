@@ -342,6 +342,19 @@ else
   exit 1
 fi
 
+step "the sqlite surface tests fail when their fixes are reverted"
+# `tests/differential.rs` in `rn-bind-sqlite` pins `db.limits` as a live accessor
+# view, and `Statement`, `SQLTagStore` and `StatementIterator` instances as coming
+# from their exported templates. The tests were written after their fixes, so
+# passing them says nothing on its own: this puts each defect back, rebuilds, and
+# requires the test named for it to fail.
+#
+# It is here rather than left opt-in because the property under test is exactly
+# "the test can fail", and an opt-in control for that rots in the direction of
+# never having been run. Warm it costs ~30s, which is the three rebuilds.
+./tools/sqlite-surface-negative-control.sh
+
+
 step "formatting"
 cargo fmt --all -- --check
 

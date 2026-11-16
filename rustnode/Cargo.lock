@@ -1229,6 +1229,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "rn-core",
+ "rn-node-oracle",
  "rn-permission",
  "rn-uv",
  "rn-v8-sys",

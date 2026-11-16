@@ -61,6 +61,7 @@ pub fn create<'s>(
     statement_object: v8::Local<'s, v8::Object>,
 ) -> Option<v8::Local<'s, v8::Value>> {
     let object = allocate(scope)?;
+    attach_prototype(scope, object)?;
     // SAFETY: the caller reset and bound this statement, and the rooted object
     // below keeps it alive.
     let generation = unsafe { (*statement).reset_generation };
@@ -111,29 +112,109 @@ fn global_iterator_prototype<'s>(
 /// `GetConstructorTemplate(env)->InstanceTemplate()->NewInstance(...)`, which
 /// never runs the constructor body — that is why `new StatementIterator()`
 /// throws while `iterate()` works.
+///
+/// The template is cached per isolate and the class carries its real name, which
+/// is observable: `Object.getPrototypeOf(iterator).constructor.name` is
+/// `'StatementIterator'` in Node, and a throwaway unnamed template reports
+/// `'Iterator'` here because the instance's prototype chain ends at the global
+/// `Iterator.prototype`.
 fn allocate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    template(scope)?
+        .instance_template(scope)
+        .new_instance(scope)
+}
+
+thread_local! {
+    /// The one `StatementIterator` template this isolate uses, and its isolate.
+    ///
+    /// Cached for the same two reasons the other classes cache theirs: the
+    /// constructor identity has to be shared between iterators, and the
+    /// `IllegalConstructor` body must not run on the allocating path.
+    static TEMPLATE: std::cell::RefCell<Option<CachedTemplate>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+struct CachedTemplate {
+    isolate: usize,
+    template: v8::Global<v8::FunctionTemplate>,
+    /// The prototype object instances get, with `constructor`, `next`, `return`
+    /// and the global `Iterator.prototype` already attached.
+    prototype: v8::Global<v8::Object>,
+}
+
+/// Drops the cached template, called once per namespace install.
+pub fn reset_template_cache() {
+    TEMPLATE.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The `StatementIterator` `FunctionTemplate` for this isolate, built on first
+/// use.
+fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::FunctionTemplate>> {
+    template_and_prototype(scope).map(|(template, _)| template)
+}
+
+/// The template, its prototype object, and the isolate they belong to.
+fn template_and_prototype<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<(
+    v8::Local<'s, v8::FunctionTemplate>,
+    v8::Local<'s, v8::Object>,
+)> {
+    let address = crate::session::isolate_address(scope);
+    let cached = TEMPLATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|cached| cached.isolate == address)
+            .map(|cached| (cached.template.clone(), cached.prototype.clone()))
+    });
+    if let Some((template, prototype)) = cached {
+        return Some((
+            v8::Local::new(scope, template),
+            v8::Local::new(scope, prototype),
+        ));
+    }
+
+    // `rn_core::class`: `StatementIterator` is a `BaseObject` subclass published
+    // as a constructor, and the `IllegalConstructor` body is the guard that
+    // rejects `new`. Its `next`/`return` are `rn_core::method`, since
+    // `SetProtoMethod` gives no `[[Construct]]`.
     let template = rn_core::class(illegal_constructor).length(0).build(scope);
     let instance = template.instance_template(scope);
     instance.set_internal_field_count(INTERNAL_FIELDS);
-    let instance = instance.new_instance(scope)?;
-    let prototype = template.prototype_template(scope);
+
     for (name, method) in [
         ("next", crate::database::method(scope, 0, next)),
         ("return", crate::database::method(scope, 0, ret)),
     ] {
         let key = v8::String::new(scope, name)?;
-        prototype.set(key.into(), method.into());
+        template
+            .prototype_template(scope)
+            .set(key.into(), method.into());
     }
-    // `Iterate` sets the instance's prototype to the *global*
-    // `Iterator.prototype`, and `Iterator.prototype` is what supplies
-    // `map`/`filter`/`take`. Our `next` and `return` have to sit between the
-    // instance and that: a prototype whose own prototype is the global one.
-    let prototype = prototype.new_instance(scope)?;
+    if let Some(name) = v8::String::new(scope, "StatementIterator") {
+        template.set_class_name(name);
+    }
+    let function = template.get_function(scope)?;
+
+    // The prototype is materialized *once* and cached, because that object is
+    // what `Iterate` attaches the global `Iterator.prototype` to and what
+    // `constructor` has to be set on. Materializing a fresh one per instance
+    // would leave every iterator with a prototype whose `constructor` was set on
+    // a different object.
+    let prototype = template.prototype_template(scope).new_instance(scope)?;
     if let Some(iterator_prototype) = global_iterator_prototype(scope) {
         prototype.set_prototype(scope, iterator_prototype);
     }
-    instance.set_prototype(scope, prototype.into())?;
-    Some(instance)
+    crate::database::link_constructor_on(scope, prototype, function, "StatementIterator")?;
+
+    TEMPLATE.with(|slot| {
+        *slot.borrow_mut() = Some(CachedTemplate {
+            isolate: address,
+            template: v8::Global::new(scope, template),
+            prototype: v8::Global::new(scope, prototype),
+        });
+    });
+    Some((template, prototype))
 }
 
 fn illegal_constructor<'s>(
@@ -142,6 +223,16 @@ fn illegal_constructor<'s>(
     _rv: v8::ReturnValue<'s>,
 ) {
     errors::throw_coded(scope, "ERR_ILLEGAL_CONSTRUCTOR", "Illegal constructor");
+}
+
+/// Gives a freshly allocated iterator the prototype chain Node's `Iterate` sets.
+fn attach_prototype<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    instance: v8::Local<'s, v8::Object>,
+) -> Option<()> {
+    let (_, prototype) = template_and_prototype(scope)?;
+    instance.set_prototype(scope, prototype.into())?;
+    Some(())
 }
 
 /// The iterator state behind `this`, or a thrown `ERR_INVALID_THIS`.

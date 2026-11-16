@@ -220,67 +220,96 @@ pub fn create<'s>(
 }
 
 thread_local! {
-    /// The `SQLTagStore` prototype, built once per isolate.
+    /// The one `SQLTagStore` template this isolate uses, and the isolate it
+    /// belongs to.
     ///
     /// `SQLTagStore::GetConstructorTemplate` caches it in the environment, and
     /// `test-sqlite-template-tag.js` asserts two stores share a prototype and a
-    /// constructor, so rebuilding it per store would be observable.
-    static TAG_STORE_PROTOTYPE: std::cell::RefCell<Option<v8::Global<v8::Object>>> =
+    /// constructor, so rebuilding it per store would be observable. The store is
+    /// not exported from the namespace, so `instanceof` has nothing to compare
+    /// against, but `store.constructor.name` is `'SQLTagStore'` in Node and the
+    /// prototype carries a `constructor` entry that names it.
+    static TEMPLATE: std::cell::RefCell<Option<CachedTemplate>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Builds a `SQLTagStore` instance from its object template.
-///
-/// `SQLTagStore::GetConstructorTemplate` uses `IllegalConstructor` and `Create`
-/// takes the instance template directly, so `new SQLTagStore()` throws while
-/// `createTagStore()` works.
-fn allocate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
-    let cached = TAG_STORE_PROTOTYPE.with(|slot| slot.borrow().clone());
-    if let Some(prototype) = cached {
-        let template = rn_core::class(illegal_constructor).length(0).build(scope);
-        let instance_template = template.instance_template(scope);
-        instance_template.set_internal_field_count(INTERNAL_FIELDS);
-        let instance = instance_template.new_instance(scope)?;
-        instance.set_prototype(scope, v8::Local::new(scope, prototype).into())?;
-        return Some(instance);
+/// A `SQLTagStore` template belonging to one isolate, by address.
+struct CachedTemplate {
+    isolate: usize,
+    template: v8::Global<v8::FunctionTemplate>,
+}
+
+/// Drops the cached template, called once per namespace install.
+pub fn reset_template_cache() {
+    TEMPLATE.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The `SQLTagStore` `FunctionTemplate` for this isolate, built on first use.
+fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::FunctionTemplate>> {
+    let address = crate::session::isolate_address(scope);
+    let cached = TEMPLATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|cached| cached.isolate == address)
+            .map(|cached| cached.template.clone())
+    });
+    if let Some(template) = cached {
+        return Some(v8::Local::new(scope, template));
     }
+
+    // `rn_core::class`: `SQLTagStore` is the `BaseObject` subclass
+    // `GetConstructorTemplate` publishes, and `new` reaches it through the
+    // `IllegalConstructor` guard. Its prototype methods below are
+    // `rn_core::method`, matching `SetProtoMethod`.
     let template = rn_core::class(illegal_constructor).length(0).build(scope);
-    let instance_template = template.instance_template(scope);
-    instance_template.set_internal_field_count(INTERNAL_FIELDS);
-    let instance = instance_template.new_instance(scope)?;
+    template
+        .instance_template(scope)
+        .set_internal_field_count(INTERNAL_FIELDS);
+
+    // `GetConstructorTemplate`'s order: the five methods, then the three
+    // side-effect-free getters. The getters go on the instance template, which is
+    // why `Object.keys(store)` is `['capacity', 'db', 'size']`.
     let prototype = template.prototype_template(scope);
     for (name, method) in [
-        ("run", crate::database::method(scope, 1, run)),
         ("get", crate::database::method(scope, 1, get)),
         ("all", crate::database::method(scope, 1, all)),
         ("iterate", crate::database::method(scope, 1, iterate)),
+        ("run", crate::database::method(scope, 1, run)),
         ("clear", crate::database::method(scope, 0, clear)),
     ] {
         let key = v8::String::new(scope, name)?;
         prototype.set(key.into(), method.into());
     }
-    for (name, getter) in [
-        ("size", crate::database::accessor_template!(scope, size)),
-        (
-            "capacity",
-            crate::database::accessor_template!(scope, capacity),
-        ),
-        ("db", crate::database::accessor_template!(scope, db)),
-    ] {
-        let key = v8::String::new(scope, name)?;
-        prototype.set_accessor_property(
-            key.into(),
-            Some(getter),
-            None,
-            v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE,
-        );
+    let _ = crate::database::side_effect_free_getter(scope, template, "capacity", capacity);
+    let _ = crate::database::side_effect_free_getter(scope, template, "db", db);
+    let _ = crate::database::side_effect_free_getter(scope, template, "size", size);
+
+    if let Some(name) = v8::String::new(scope, "SQLTagStore") {
+        template.set_class_name(name);
     }
-    let prototype = prototype.new_instance(scope)?;
-    TAG_STORE_PROTOTYPE.with(|slot| {
-        *slot.borrow_mut() = Some(v8::Global::new(scope, prototype));
+    let function = template.get_function(scope)?;
+    crate::database::link_constructor(scope, &template, function, "SQLTagStore");
+
+    TEMPLATE.with(|slot| {
+        *slot.borrow_mut() = Some(CachedTemplate {
+            isolate: address,
+            template: v8::Global::new(scope, template),
+        });
     });
-    instance.set_prototype(scope, prototype.into())?;
-    Some(instance)
+    Some(template)
+}
+
+/// Builds a `SQLTagStore` instance from the cached constructor template.
+///
+/// `SQLTagStore::GetConstructorTemplate` uses `IllegalConstructor` and `Create`
+/// takes the instance template directly, so `new SQLTagStore()` throws while
+/// `createTagStore()` works. Allocating from the same template `Create` uses is
+/// what gives the store the cached prototype, the shared constructor and the
+/// instance-template getters.
+fn allocate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    template(scope)?
+        .instance_template(scope)
+        .new_instance(scope)
 }
 
 fn illegal_constructor(

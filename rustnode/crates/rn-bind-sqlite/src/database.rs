@@ -54,13 +54,13 @@ pub fn constructor<'s>(
             2,
             method(scope, 2, crate::sqlfn::register_scalar),
         ),
+        ("createTagStore", 0, method(scope, 0, create_tag_store)),
+        ("location", 0, method(scope, 0, location)),
         (
             "aggregate",
             2,
             method(scope, 2, crate::sqlfn::register_aggregate),
         ),
-        ("createTagStore", 0, method(scope, 0, create_tag_store)),
-        ("location", 0, method(scope, 0, location)),
         ("createSession", 0, method(scope, 0, crate::session::create)),
         ("applyChangeset", 1, method(scope, 1, apply_changeset)),
         (
@@ -95,22 +95,15 @@ pub fn constructor<'s>(
         };
     prototype.set(dispose_key, dispose.into());
 
-    // `isOpen`, `isTransaction` and `limits` are accessors, which `Initialize`
-    // installs with `SetSideEffectFreeGetter`.
-    let accessors: [(&str, v8::Local<'_, v8::FunctionTemplate>); 3] = [
-        ("isOpen", accessor_template!(scope, is_open)),
-        ("isTransaction", accessor_template!(scope, is_transaction)),
-        ("limits", accessor_template!(scope, limits)),
-    ];
-    for (name, getter) in accessors {
-        let key = v8::String::new(scope, name).ok_or("cannot allocate an accessor name")?;
-        prototype.set_accessor_property(
-            key.into(),
-            Some(getter),
-            None,
-            v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE,
-        );
-    }
+    // `isOpen`, `isTransaction` and `limits` are instance-template accessors,
+    // not prototype ones; `side_effect_free_getter` records why that distinction
+    // is observable.
+    side_effect_free_getter(scope, template, "isOpen", is_open)
+        .ok_or("cannot install the isOpen accessor")?;
+    side_effect_free_getter(scope, template, "isTransaction", is_transaction)
+        .ok_or("cannot install the isTransaction accessor")?;
+    side_effect_free_getter(scope, template, "limits", limits)
+        .ok_or("cannot install the limits accessor")?;
 
     // `set_class_name` has to run before `get_function`: V8 marks the template
     // instantiated at that point, and renaming it afterwards aborts.
@@ -120,10 +113,48 @@ pub fn constructor<'s>(
     let function = template
         .get_function(scope)
         .ok_or("cannot allocate the Database constructor")?;
-    if let Some(name) = v8::String::new(scope, "Database") {
+    // `SetConstructorFunction` leaves `prototype.constructor` pointing at the
+    // class, which is what makes `db.constructor === Database` true. A template's
+    // prototype object has no `constructor` until it is set.
+    link_constructor(scope, &template, function, "Database");
+    Ok(function.into())
+}
+
+/// Sets `prototype.constructor` back to the class function.
+///
+/// V8 materializes `prototype` as a plain object; `SetConstructorFunction` is
+/// what Node's `Initialize` gets for free and what a bare `get_function` does
+/// not do. Without it `Object.getOwnPropertyNames(Database.prototype)` has no
+/// `constructor` entry and `db.constructor` reads `Object`.
+pub(crate) fn link_constructor(
+    scope: &mut v8::PinScope<'_, '_>,
+    template: &v8::Local<'_, v8::FunctionTemplate>,
+    function: v8::Local<'_, v8::Function>,
+    class_name: &str,
+) {
+    let Some(prototype) = template.prototype_template(scope).new_instance(scope) else {
+        return;
+    };
+    let _ = link_constructor_on(scope, prototype, function, class_name);
+}
+
+/// [`link_constructor`] against a prototype object the caller already holds.
+///
+/// Needed where the instance's prototype is not the template's default one —
+/// `StatementIterator` attaches the global `Iterator.prototype` to its own
+/// intermediary, so that object is the one `constructor` belongs on.
+pub(crate) fn link_constructor_on(
+    scope: &mut v8::PinScope<'_, '_>,
+    prototype: v8::Local<'_, v8::Object>,
+    function: v8::Local<'_, v8::Function>,
+    class_name: &str,
+) -> Option<()> {
+    let key = v8::String::new(scope, "constructor")?;
+    prototype.set(scope, key.into(), function.into())?;
+    if let Some(name) = v8::String::new(scope, class_name) {
         function.set_name(name);
     }
-    Ok(function.into())
+    Some(())
 }
 
 /// `Symbol.dispose`, which the V8 Rust bindings do not expose as a well-known.
@@ -154,19 +185,64 @@ pub fn well_known_dispose<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s,
     v8::undefined(scope).into()
 }
 
-/// Builds the `FunctionTemplate` for one side-effect-free accessor getter.
+/// Installs one `SetSideEffectFreeGetter` accessor on a class.
 ///
-/// `FunctionTemplate::builder` is generic over the callback through `MapFnTo`,
-/// and a bare `fn` item does not satisfy that bound for an accessor callback,
-/// so every accessor goes through this one helper with a concrete parameter
-/// list. The `READ_ONLY | DONT_DELETE` attributes are what
-/// `SetSideEffectFreeGetter` installs.
-macro_rules! accessor_template {
-    ($scope:expr, $getter:expr) => {
-        $crate::database::method($scope, 0, $getter)
-    };
+/// `node_sqlite.cc` puts these on the *instance* template, not the prototype:
+///
+/// ```cpp
+/// static inline void SetSideEffectFreeGetter(
+///     Isolate* isolate, Local<FunctionTemplate> class_template, Local<String> name,
+///     FunctionCallback fn) {
+///   Local<FunctionTemplate> getter = FunctionTemplate::New(
+///       isolate, fn, Local<Value>(), v8::Signature::New(isolate, class_template),
+///       /* length */ 0, ConstructorBehavior::kThrow, SideEffectType::kHasNoSideEffect);
+///   class_template->InstanceTemplate()->SetAccessorProperty(
+///       name, getter, Local<FunctionTemplate>(), DontDelete);
+/// }
+/// ```
+///
+/// The difference from the prototype is observable and Node's own tests read it:
+/// `Object.keys(db)` is `['isOpen', 'isTransaction', 'limits']` and
+/// `Object.getOwnPropertyDescriptor(db, 'limits').get` is a function. On the
+/// prototype all three of those are `[]`, and the property is reachable only
+/// through the chain.
+///
+/// Three details are load-bearing:
+///
+/// * `DontDelete` only — no `DontEnum` and no `ReadOnly`. That produces
+///   `enumerable: true, configurable: false` and a `get` with no `set`, which is
+///   the descriptor Node reports.
+/// * The `Signature` binds the getter to this class, so a borrowed receiver such
+///   as `descriptor.get.call({})` throws `TypeError: Illegal invocation` instead
+///   of running the body against the wrong object.
+/// * `HasNoSideEffect`, which is what lets V8 run the getter in a context that
+///   has forbidden side effects.
+pub(crate) fn side_effect_free_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    class_template: v8::Local<'s, v8::FunctionTemplate>,
+    name: &str,
+    callback: impl v8::MapFnTo<v8::FunctionCallback>,
+) -> Option<()> {
+    let signature = v8::Signature::new(scope, class_template);
+    // `rn_core::method` already passes `ConstructorBehavior::Throw`, which is
+    // what `SetSideEffectFreeGetter` asks for; naming it here keeps the crate on
+    // the one chokepoint #121 introduced instead of repeating the builder call.
+    let getter = rn_core::method(callback)
+        .length(0)
+        .signature(signature)
+        .side_effect_type(v8::SideEffectType::HasNoSideEffect)
+        .build(scope);
+    let key = v8::String::new(scope, name)?;
+    class_template
+        .instance_template(scope)
+        .set_accessor_property(
+            key.into(),
+            Some(getter),
+            None,
+            v8::PropertyAttribute::DONT_DELETE,
+        );
+    Some(())
 }
-pub(crate) use accessor_template;
 
 /// One non-constructible method, matching `SetProtoMethod`.
 pub fn method<'s>(
