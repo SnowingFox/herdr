@@ -91,12 +91,16 @@ consume them. Without a way to produce the bytes there is nothing to store, so a
 entry could never carry a `module` and the cache would silently never hit. A
 cache that never hits is worse than an honest absence.
 
-They are safe to defer at load time: `lib/internal/modules/esm/translators.js`
-destructures both inside `translateWasm`, not at module scope, and destructuring
-an absent member yields `undefined` rather than throwing. `tools/deferred-reach.py`
-flags them because it treats module-scope destructuring as eager use; that is a
-false positive here, and `deferred_members_destructure_cleanly_at_module_scope`
-pins the reasoning.
+They are safe to *load*: `lib/internal/modules/esm/translators.js` destructures
+both at module scope, and destructuring an absent member yields `undefined`
+rather than throwing. They are **not** safe to defer, and this was recorded as a
+finding (F3 in `internal/review-loader.md`): the same file calls
+`getWasmCompileCacheEntry` inside the `wasm` translator, which runs for every
+`.wasm` import, so each one threw `TypeError: getWasmCompileCacheEntry is not a
+function`. `tools/deferred-reach.py` missed it because it only counted
+module-scope calls; it now counts every reach and names unguarded ones, which is
+why both members appear in its `KNOWN_UNGUARDED` list until the import path is
+fixed.
 
 ## The esmodule lexer
 

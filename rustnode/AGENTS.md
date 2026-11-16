@@ -139,13 +139,20 @@ deferrals as a pass and undeclared gaps as a failure, so a deferral is visible a
 a lie is not.
 
 `tools/deferred-reach.py` asks the follow-up question the contract cannot: does
-`lib/**` reach this absent member while a module is still loading? Only *calls*
-count. `const { crc32c } = binding` binds `undefined` and is harmless, and
-feature-detecting with `if (crc32c === undefined)` is legitimate; calling it at
-module scope is what makes `require()` throw, which is the real failure the tool
-exists to catch. The tool rejects a `DEFERRED` block it cannot parse rather than
-reporting zero deferrals, so reword or reformat entries freely but keep them
-parseable `("member", "reason")` pairs.
+`lib/**` reach this absent member without a guard? Only a *call* is a reach.
+`const { crc32c } = binding` binds `undefined` and is harmless, and
+feature-detecting with `if (crc32c === undefined)` is legitimate; calling it
+without such a guard is what throws. **Depth does not matter.** The tool used to
+count only module-scope calls, which is why it reported clean over
+`internal/modules/esm/translators.js:583`, where `getWasmCompileCacheEntry` is
+called inside the `wasm` translator and made every `.wasm` import throw. A
+callback registered at module scope and a function exported at module scope are
+both first-use paths, so every call site now counts, and the gate names the
+reaches that exist today in `KNOWN_UNGUARDED` so "clean" means "nothing new".
+The tool rejects a `DEFERRED` block it cannot parse rather than reporting zero
+deferrals, so reword or reformat entries freely but keep them parseable
+`("member", "reason")` pairs, and keep each `impl BindingModule` returning its
+own const so the entries are attributed to the right namespace.
 
 ## http2 settings indices are not nghttp2's settings ids
 

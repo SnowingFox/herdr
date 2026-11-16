@@ -494,22 +494,38 @@ fn compile_cache_entries_round_trip_through_the_binding() {
 }
 
 #[test]
-fn deferred_members_destructure_cleanly_at_module_scope() {
-    // `tools/deferred-reach.py` flags these two because
-    // `internal/modules/esm/translators.js` destructures them at module scope.
-    // That is a false positive for *destructuring*: reading an absent member
-    // yields `undefined` and cannot throw. It only breaks a module when the
-    // member is *called* during load, which is what made `zlib.crc32c` fatal.
-    // This pins the reason the deferral is safe so the two cannot drift apart.
+fn the_wasm_cache_members_are_absent_and_a_call_below_module_scope_throws() {
+    // This test used to be named `deferred_members_destructure_cleanly_at_module_scope`
+    // and it pinned the false premise that made F3 a defect: it asserted the two
+    // wasm cache members are `undefined` and reasoned that destructuring them is
+    // therefore harmless. The destructuring *is* harmless; the deferral is not.
+    // `internal/modules/esm/translators.js` also calls `getWasmCompileCacheEntry`
+    // inside the `wasm` translator, which runs for every `.wasm` import, so the
+    // absence is observed as a `TypeError` on first use rather than as an
+    // uncached compile.
+    //
+    // So the assertion is inverted where it matters: the members are absent, and
+    // a call to them *below module scope* throws. That second half is the fact
+    // the old test could not express, and it is the reason
+    // `tools/deferred-reach.py` now counts reaches at any depth.
     let source = r#"
         const { getWasmCompileCacheEntry, saveWasmCompileCacheEntry } = modulesBinding;
-        const typeofOk = typeof getWasmCompileCacheEntry === "undefined" &&
-                         typeof saveWasmCompileCacheEntry === "undefined";
-        // A guard of the shape a caller would use before the call site.
-        const guarded = typeof getWasmCompileCacheEntry === "function";
-        __out = JSON.stringify({ typeofOk, guarded });
+        const destructured = typeof getWasmCompileCacheEntry === "undefined" &&
+                             typeof saveWasmCompileCacheEntry === "undefined";
+        // The shape of the real call site: a function body, not module scope.
+        function translateWasm() {
+            return getWasmCompileCacheEntry(new Uint8Array([0]), "file:///m.wasm", {});
+        }
+        let code = "no-throw";
+        try { translateWasm(); } catch (error) { code = error.name; }
+        __out = JSON.stringify({ destructured, code });
     "#;
-    assert_eq!(run(source), r#"{"typeofOk":true,"guarded":false}"#);
+    assert_eq!(
+        run(source),
+        r#"{"destructured":true,"code":"TypeError"}"#,
+        "deferring these members throws on first use, so the deferral is a \
+         defect until the import path is wired"
+    );
 }
 
 #[test]
