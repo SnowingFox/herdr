@@ -173,7 +173,14 @@ fn main() {
     v8::V8::initialize();
     rn_core::profile::mark("V8::initialize");
 
-    let mut isolate = v8::Isolate::new(Default::default());
+    // The allocator is what makes `process.memoryUsage().arrayBuffers` a real
+    // number: V8's default allocator does not count anything, so an isolate
+    // created without one cannot report live backing-store bytes at all. See
+    // `rn_core::array_buffer_allocator` for why this is per isolate rather than
+    // process-wide.
+    let mut isolate = v8::Isolate::new(rn_core::with_counted_array_buffer_allocator(
+        Default::default(),
+    ));
     rn_core::profile::mark("Isolate::new");
     // `import.meta` and `import()` are dispatched by V8 through isolate-level
     // handlers rather than `internalBinding()`, so they are installed here,

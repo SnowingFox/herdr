@@ -6,6 +6,7 @@
 
 pub mod abi;
 pub mod aliased_buffer;
+pub mod array_buffer_allocator;
 pub mod async_wrap;
 pub mod binding;
 pub mod callback_scope;
@@ -28,6 +29,7 @@ pub mod task_queue;
 
 pub use abi::{BindingModule, InstallCtx};
 pub use aliased_buffer::{AliasedUint8Array, Element};
+pub use array_buffer_allocator::{live_array_buffer_bytes, with_counted_array_buffer_allocator};
 pub use async_wrap::{AsyncIds, AsyncWrapState, INVALID_ASYNC_ID};
 pub use binding::{BindingRegistry, Installer, Namespace};
 pub use codec::Encoding;

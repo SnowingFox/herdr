@@ -506,9 +506,15 @@ fn memory_usage(
         statistics.total_heap_size() as f64,
         statistics.used_heap_size() as f64,
         statistics.external_memory() as f64,
-        // Node reports the ArrayBuffer allocator's total, which rustnode does
-        // not instrument; `external_memory` is the closest figure V8 tracks.
-        0.0,
+        // `src/node_process_methods.cc:222-250` reads this field from
+        // `array_buffer_allocator->total_mem_usage()`: the live bytes held in
+        // this isolate's `ArrayBuffer` backing stores, not a high-water mark.
+        // The counter lives in the allocator the isolate was created with, so
+        // it is the same number Node reports and it falls when buffers are
+        // collected. `external` above is untouched: V8 already counts allocator
+        // memory as external, and adding an adjustment here would count it
+        // twice.
+        rn_core::live_array_buffer_bytes() as f64,
     ];
     match v8::Local::<v8::Float64Array>::try_from(args.get(0)) {
         Ok(array) => {
