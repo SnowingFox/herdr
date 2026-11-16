@@ -17,6 +17,7 @@ pub fn install_all() -> Result<BunRegistry, String> {
     rn_bun_encoding::register(&mut registry)?;
     rn_bun_files::register(&mut registry)?;
     rn_bun_hash::register(&mut registry)?;
+    rn_bun_process::register(&mut registry)?;
     rn_bun_text::register(&mut registry)?;
     rn_bun_time::register(&mut registry)?;
     Ok(registry)

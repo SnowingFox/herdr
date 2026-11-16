@@ -14,5 +14,6 @@ rn-bun-compression = { path = "../rn-bun-compression" }
 rn-bun-encoding = { path = "../rn-bun-encoding" }
 rn-bun-files = { path = "../rn-bun-files" }
 rn-bun-hash = { path = "../rn-bun-hash" }
+rn-bun-process = { path = "../rn-bun-process" }
 rn-bun-text = { path = "../rn-bun-text" }
 rn-bun-time = { path = "../rn-bun-time" }

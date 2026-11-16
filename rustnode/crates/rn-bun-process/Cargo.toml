@@ -1,0 +1,47 @@
+[package]
+name = "rn-bun-process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bun-compatible process and system members installed on the Bun global"
+
+[dependencies]
+# `Bun` is a global rather than an `internalBinding` namespace, so the members
+# here are contributed through the Bun registry instead of `BindingModule`.
+rn-bun-api = { path = "../rn-bun-api" }
+# `generateHeapSnapshot`'s `jsc` form is built from V8's own snapshot JSON, so it
+# has to be parsed before the WebKit-shaped arrays can be produced.
+serde_json = "1"
+rn-core.workspace = true
+rn-v8-sys = { path = "../rn-v8-sys" }
+# `Bun.gc` must run V8's real collector, and `Bun.generateHeapSnapshot` must
+# serialise the real heap, so both need the isolate the same way `heap_utils`
+# does. This crate reaches V8 through `rn-core`'s recorded isolate rather than a
+# second recording of its own.
+v8.workspace = true
+# Every member here reads a process-level fact: the environment block a child
+# inherits, the cwd, the entry script. `rn-env` is the one store `process.env`
+# also intercepts, so the two cannot disagree about what a child sees.
+rn-env = { path = "../rn-env" }
+rn-bind-uv = { path = "../rn-bind-uv" }
+rn-errors = { path = "../rn-errors" }
+# `Bun.spawn` and `Bun.spawnSync` run on the process' one libuv loop rather than
+# a private one, so children are reaped by the same loop that drives every
+# socket and timer.
+libuv-sys2.workspace = true
+rn-uv = { path = "../rn-uv" }
+# A spawn under `--permission` is denied by the same model `child_process` and
+# `spawn_sync` consult, so there is one answer to "may this process start".
+rn-permission = { path = "../rn-permission" }
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+# The differential tests run the same probe under Bun 1.4.4 and the pinned Node
+# oracle, neither of which is a runtime dependency.
+rn-node-oracle = { path = "../../tools/node-oracle" }
+serde_json = "1"
