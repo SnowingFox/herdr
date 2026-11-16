@@ -122,19 +122,6 @@ pub const KNOWN_GAPS: &[(&str, &str)] = &[
          it. Repro: respond({ waitForTrailers: true }) + end(), then read \
          `wantTrailers` on the server and `trailers` on the client",
     ),
-    (
-        "a reset or truncated stream reports a clean 'end'",
-        "`on_stream_close` calls `end_readable`, which pushes EOF before the \
-         JavaScript `onStreamClose` runs. Node leaves the readable side un-ended \
-         in that case on purpose (`src/node_http2.cc:1353` only calls \
-         `stream->Close(code)`), which is what lets `core.js` see \
-         `!peerReadableEnded` and raise ERR_HTTP2_STREAM_ABORTED. Here the push \
-         makes `_readableState.ended` true, so a response cut short by \
-         RST_STREAM finishes with `end` and no error: a partial download is \
-         indistinguishable from a complete one. Repro: respond with \
-         content-length 1000, write 100 bytes, destroy(); the client sees \
-         'end' where Node sees 'error:ERR_HTTP2_STREAM_ABORTED'",
-    ),
 ];
 
 /// `SessionUint8Fields` from `node_http2.h`, as the offsets of `SessionJSFields`.
