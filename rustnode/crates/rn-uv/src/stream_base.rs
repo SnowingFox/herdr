@@ -346,18 +346,20 @@ pub fn writev<'s>(
         };
         let encoding = chunk_encoding(scope, chunks, (index * stride + 1) as u32);
         let units = string_units(scope, &text);
-        let mut bytes = rn_core::codec::write(
+        let bytes = rn_core::codec::write(
             &units,
             encoding,
             rn_core::codec::storage_size(&units, encoding),
         );
         storage_size += bytes.len();
+        // The box is created before its address is taken; see
+        // [`crate::stream::buffer_from`]. `codec::write` reserves the worst-case
+        // encoded `max` as capacity, so a string shorter than that worst case
+        // always leaves spare capacity for `into_boxed_slice` to shrink away.
+        let (buffer, storage) = crate::stream::buffer_from(bytes);
         encoded.push(Chunk {
-            buffer: uv::uv_buf_t {
-                base: bytes.as_mut_ptr().cast(),
-                len: bytes.len(),
-            },
-            storage: Some(bytes.into_boxed_slice()),
+            buffer,
+            storage: Some(storage),
         });
     }
     if storage_size > i32::MAX as usize {

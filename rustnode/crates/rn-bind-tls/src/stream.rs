@@ -431,13 +431,13 @@ pub unsafe fn flush<'s>(
     if raw_stream.is_null() {
         return Some(-71);
     }
-    let length = bytes.len();
-    let buffer = rn_uv::sys::uv_buf_t {
-        base: bytes.as_ptr() as *mut std::os::raw::c_char,
-        len: length,
-    };
-    // SAFETY: `raw_stream` is live, and `bytes` is moved into `owned` so its
-    // allocation outlives the libuv completion.
+    // The box is created before its address is taken; see
+    // `rn_uv::stream::buffer_from`. `pending_output` is grown with
+    // `extend_from_slice`, so it always has spare capacity to shrink away.
+    let (buffer, owned) = rn_uv::stream::buffer_from(bytes);
+    let length = buffer.len;
+    // SAFETY: `raw_stream` is live, and `owned` is the allocation `buffer.base`
+    // points into, moved into the completion.
     let status = unsafe {
         rn_uv::stream::queue_write(
             scope,
@@ -446,7 +446,7 @@ pub unsafe fn flush<'s>(
             length,
             request,
             object,
-            vec![bytes.into_boxed_slice()],
+            vec![owned],
         )
     };
     Some(status)
