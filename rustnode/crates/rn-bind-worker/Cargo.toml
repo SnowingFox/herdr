@@ -30,6 +30,11 @@ rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 rn-permission = { path = "../rn-permission" }
 rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
 rn-module-wrap = { path = "../rn-module-wrap" }
+# The worker's isolate is the one `inspector.Session()` in that worker has to
+# connect to. `V8Inspector::create` needs `&mut Isolate`, which a binding cannot
+# obtain, so the worker records its isolate the same way the CLI records the main
+# thread's in `main.rs`.
+rn-bind-inspector = { path = "../rn-bind-inspector" }
 rn-uv = { path = "../rn-uv" }
 # A worker gets its own environment store rather than the process block, so the
 # thread installs it before its realm builds `process.env`.

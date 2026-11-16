@@ -41,9 +41,8 @@ fn expect(source: &str, expected: &str) {
 
 /// The last non-empty line of `text`.
 ///
-/// The runtime's own `tracing` diagnostics share stdout with a script's
-/// `console.log`, so a test that spawns a worker asserts on the final line
-/// rather than the whole stream.
+/// For the cases where the line under test is one of several the process printed
+/// — the permission publication above also reports through `diagnostics_channel`.
 fn last_line(text: &str) -> &str {
     text.lines()
         .rev()
@@ -326,13 +325,10 @@ fn a_worker_gets_its_own_copy_of_the_environment() {
         });
     "#;
     let (code, stdout, stderr) = run(source);
-    // The runtime's own diagnostics (the inspector namespace warning) also reach
-    // stdout, so the assertion is on the last line rather than the whole stream.
-    assert_eq!(
-        last_line(&stdout),
-        r#"["before",null,null]"#,
-        "stderr: {stderr}"
-    );
+    // The whole stream, not the last line: a worker start writes nothing to
+    // stdout of its own, so anything extra here is a runtime line where a program
+    // expected its own bytes.
+    assert_eq!(stdout.trim(), r#"["before",null,null]"#, "stderr: {stderr}");
     assert_eq!(code, 0, "stderr: {stderr}");
 }
 
@@ -352,7 +348,7 @@ fn an_explicit_worker_env_replaces_the_inherited_one() {
     let (code, stdout, stderr) = run(source);
     // The value was a number in the options object and arrives as a string, which
     // is `lib/internal/worker.js`'s `${value}` plus `EnvSetter`'s `ToString`.
-    assert_eq!(last_line(&stdout), r#"["1",null]"#, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), r#"["1",null]"#, "stderr: {stderr}");
     assert_eq!(code, 0, "stderr: {stderr}");
 }
 

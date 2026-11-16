@@ -134,6 +134,15 @@ impl WorkerThread {
         // `process.on('unhandledRejection')` listeners.
         rn_bind_task_queue::install_isolate_callbacks(&mut isolate);
         rn_bind_heap_utils::set_snapshot_isolate(&mut isolate);
+        // Node's inspector is one `V8Inspector` per isolate, and
+        // `inspector.Session()` connects to *this* isolate's inspector. The CLI
+        // records the main thread's isolate for the same reason
+        // (`rn_bind_inspector::set_isolate` in `main.rs`); a worker creates its own
+        // isolate here, so it has to record it here. Without this the worker's
+        // namespace install found no isolate, warned, and every
+        // `new inspector.Session(); session.connect()` in a worker threw
+        // "The inspector is not available: no isolate was recorded".
+        rn_bind_inspector::set_isolate(&mut isolate);
 
         if let Ok(mut slot) = self.isolate.lock() {
             *slot = Some(isolate.thread_safe_handle());

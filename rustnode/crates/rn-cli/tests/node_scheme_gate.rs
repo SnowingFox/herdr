@@ -271,11 +271,10 @@ fn a_worker_applies_the_same_gate() {
     // fix applied only on the main thread would leave a worker as a way around
     // the policy, which is worse than not gating at all.
     //
-    // Each outcome is emitted as one line and read back line by line rather than
-    // compared to the whole of stdout: a worker startup also logs a tracing
-    // `WARN` from `rn_bind_inspector`, and that channel writes to stdout, so an
-    // exact-stdout assertion would fail for a reason that has nothing to do with
-    // the policy under test.
+    // The `OUTCOME ` prefix is this script's own formatting rather than a
+    // workaround: it joins three lines into one `console.log` and reads them back.
+    // There is no runtime line to step around — a worker start writes nothing to
+    // stdout any more, which `worker_inspector` asserts directly.
     let printed = eval(
         &[],
         "const { Worker } = require('node:worker_threads');\n\

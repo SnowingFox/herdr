@@ -1,4 +1,5 @@
 mod args;
+mod diagnostics;
 
 use rn_bindings::install_all;
 use rn_core::Env;
@@ -7,12 +8,7 @@ use rn_v8_sys::v8;
 
 fn main() {
     rn_core::profile::start();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+    diagnostics::install();
     rn_core::profile::mark("tracing init");
 
     if let Err(message) = rn_v8_sys::check_linked_v8() {
