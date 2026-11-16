@@ -157,3 +157,27 @@ impl Readiness {
         }
     }
 }
+
+/// The backend the last `Readiness::install` on this thread really installed.
+///
+/// [`Poller::from_env`] answers a different question: it reports what the
+/// environment *requested*. `install` silently falls back to [`Poller::Epoll`]
+/// when the kernel, a seccomp filter, a missing loop descriptor or a failed
+/// `io_uring_setup(2)` prevents a ring, so the two can disagree and the request
+/// is not evidence about the installed backend. A test that asks `from_env()`
+/// when it means "what is the loop waiting with" compares the request against
+/// itself and passes even when the fallback happened.
+///
+/// Returns `None` before any loop has installed a backend on this thread.
+pub fn installed_backend() -> Option<Poller> {
+    #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+    {
+        linux::installed_backend()
+    }
+    #[cfg(not(all(target_os = "linux", not(target_arch = "wasm32"))))]
+    {
+        // Only Linux installs a readiness backend; everywhere else the platform's
+        // own poller runs and `install` was never called.
+        None
+    }
+}

@@ -162,6 +162,12 @@ impl PollTarget {
 impl Installed {
     /// Installs the readiness backend for `loop_pointer`.
     pub fn install(requested: Poller, loop_pointer: *mut uv::uv_loop_t) -> Self {
+        let installed = Self::install_inner(requested, loop_pointer);
+        record_installed(installed.poller());
+        installed
+    }
+
+    fn install_inner(requested: Poller, loop_pointer: *mut uv::uv_loop_t) -> Self {
         if requested == Poller::Epoll {
             return Self::Epoll;
         }
@@ -241,6 +247,38 @@ pub fn has_ring(backend_fd: i32) -> bool {
     REGISTRY.with(|registry| registry.borrow().contains_key(&backend_fd))
 }
 
+thread_local! {
+    /// The backend the most recent `Readiness::install` on this thread actually
+    /// installed.
+    ///
+    /// This exists because [`crate::poller::Poller::from_env`] answers what the
+    /// environment *requested*, which is not the same question. `install` falls
+    /// back to epoll on a missing ring, a missing loop descriptor, `ENOSYS`,
+    /// `EPERM` and any other `Ring::new` failure, logging a `warn` each time; a
+    /// reader that asked `from_env()` would still be told `IoUring`. A test
+    /// asserting on "the installed backend" was therefore comparing the request
+    /// against itself, and a silent fallback to epoll would have passed it.
+    ///
+    /// Thread-local for the same reason `REGISTRY` is: a loop belongs to one
+    /// thread, and `uv_run` only ever calls into the backend on that thread.
+    static INSTALLED: std::cell::Cell<Option<Poller>> = const { std::cell::Cell::new(None) };
+}
+
+/// Records that `installed` is the backend now serving a loop on this thread.
+pub(crate) fn record_installed(installed: Poller) {
+    INSTALLED.with(|slot| slot.set(Some(installed)));
+}
+
+/// The backend the last `install` on this thread really installed.
+///
+/// `None` before any loop has installed a backend on this thread. Callers that
+/// want the request rather than the outcome want
+/// [`crate::poller::Poller::from_env`] instead; this answers what the loop is
+/// actually waiting with.
+pub fn installed_backend() -> Option<Poller> {
+    INSTALLED.with(std::cell::Cell::get)
+}
+
 /// Runs `body` with the target serving `backend_fd`, if there is one.
 ///
 /// This is the only place a ring is borrowed mutably. It is called from inside
@@ -269,5 +307,30 @@ mod tests {
         assert!(!has_ring(4242));
         let other = std::thread::spawn(|| has_ring(4242)).join();
         assert!(!other.expect("the worker ran"));
+    }
+
+    /// A refused ring records `Epoll`, not the request.
+    ///
+    /// This is the control for the blind spot that made
+    /// `readiness_backends.rs` unable to see a fallback: it asked
+    /// `Poller::from_env()`, which reports what `HERDR_URING` *asked for*. A null
+    /// loop pointer is refused unconditionally (`install` warns "there is no loop
+    /// yet"), so the request can be `IoUring` while the instal is `Epoll` on any
+    /// host — including one whose kernel grants rings, where a real probe would
+    /// otherwise agree with the request and hide the defect.
+    #[test]
+    fn a_refused_ring_is_recorded_as_epoll_not_as_the_request() {
+        record_installed(Poller::Epoll);
+        let installed = Installed::install(Poller::IoUring, std::ptr::null_mut());
+        assert_eq!(
+            installed.poller(),
+            Poller::Epoll,
+            "a null loop cannot serve a ring"
+        );
+        assert_eq!(
+            installed_backend(),
+            Some(Poller::Epoll),
+            "the record must be the installed backend, not the requested one"
+        );
     }
 }
