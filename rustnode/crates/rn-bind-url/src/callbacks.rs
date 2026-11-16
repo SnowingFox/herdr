@@ -11,8 +11,8 @@
 //! `CHECK`-based behaviour by treating it as a programming error and answering
 //! with the failure value instead of corrupting the components buffer.
 
+use ada_url::Url as ParsedUrl;
 use rn_v8_sys::v8;
-use url::Url as ParsedUrl;
 
 use crate::format;
 use crate::idna;
@@ -43,7 +43,7 @@ pub fn parse<'s>(
     // parsing, and Node reports the base in the error. It has to be resolved
     // before the input so the two are not confused.
     if let Some(base) = base.as_deref() {
-        if ParsedUrl::parse(base).is_err() {
+        if ParsedUrl::parse(base, None).is_err() {
             if raise {
                 install::throw_invalid_url(scope, Some(&input), Some(base));
             }
@@ -51,16 +51,15 @@ pub fn parse<'s>(
         }
     }
 
-    match resolve(&input, base.as_deref()) {
-        Some(url) => {
+    match ParsedUrl::parse(&input, base.as_deref()) {
+        Ok(url) => {
             write_components(Offsets::of(&url).as_array());
-            let href = url.as_str();
-            match install::string(scope, href) {
+            match install::string(scope, url.href()) {
                 Ok(text) => rv.set(text.into()),
                 Err(message) => install::throw_error(scope, &message),
             }
         }
-        None => {
+        Err(_) => {
             if raise {
                 install::throw_invalid_url(scope, Some(&input), base.as_deref());
             }
@@ -68,27 +67,12 @@ pub fn parse<'s>(
     }
 }
 
-/// Parses `input`, resolving against `base` when one is given.
-///
-/// `Url::parse` handles the absolute case; `join` is the spec's relative
-/// resolution. A URL that cannot be a base refuses relative input, and so does
-/// this, matching ada.
-fn resolve(input: &str, base: Option<&str>) -> Option<ParsedUrl> {
-    match base {
-        Some(base) => {
-            let base = ParsedUrl::parse(base).ok()?;
-            base.join(input).ok()
-        }
-        None => ParsedUrl::parse(input).ok(),
-    }
-}
-
 /// `canParse(input, base)`.
 ///
 /// Node implements this as `ada::can_parse`, which is defined to agree with
-/// `parse`: it must return true exactly when `parse` would succeed. Implementing
-/// it as `resolve(...).is_some()` keeps that relation true by construction
-/// rather than by two implementations happening to match.
+/// `parse`: it must return true exactly when `parse` would succeed. Calling the
+/// adapter's `can_parse` keeps that relation true by construction rather than by
+/// two implementations happening to match.
 pub fn can_parse<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -100,11 +84,7 @@ pub fn can_parse<'s>(
     let base = install::is_string(&args, 1)
         .then(|| install::argument_string(scope, &args, 1))
         .flatten();
-    let parses = match base.as_deref() {
-        // A base that does not parse makes the answer false, not an error.
-        Some(base) if ParsedUrl::parse(base).is_err() => false,
-        base => resolve(&input, base).is_some(),
-    };
+    let parses = ParsedUrl::can_parse(&input, base.as_deref());
     rv.set(v8::Boolean::new(scope, parses).into());
 }
 
@@ -122,7 +102,7 @@ pub fn get_origin<'s>(
     let Some(input) = install::argument_string(scope, &args, 0) else {
         return;
     };
-    let Some(url) = ParsedUrl::parse(&input).ok() else {
+    let Ok(url) = ParsedUrl::parse(&input, None) else {
         // `GetOrigin` calls `ThrowInvalidURL(env, "Invalid URL")` with no input
         // and no base, so the error carries neither property.
         install::throw_invalid_url(scope, None, None);
@@ -179,7 +159,7 @@ pub fn update<'s>(
     };
 
     match update::update(&href, action, &value) {
-        Ok(href) => match ParsedUrl::parse(&href) {
+        Ok(href) => match ParsedUrl::parse(&href, None) {
             Ok(url) => {
                 write_components(Offsets::of(&url).as_array());
                 match install::string(scope, &href) {
@@ -222,10 +202,10 @@ pub fn path_to_file_url<'s>(
     }
 
     let encoded = path::encode_path(&input, path::PathFlavour::from_windows_flag(windows));
-    match ParsedUrl::parse(&encoded) {
+    match ParsedUrl::parse(&encoded, None) {
         Ok(url) => {
             write_components(Offsets::of(&url).as_array());
-            match install::string(scope, url.as_str()) {
+            match install::string(scope, url.href()) {
                 Ok(text) => rv.set(text.into()),
                 Err(message) => install::throw_error(scope, &message),
             }

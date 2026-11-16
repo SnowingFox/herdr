@@ -10,14 +10,13 @@ description = "internalBinding('url') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
-# Servo's WHATWG URL parser. `src/node_url.cc` is backed by ada, which
-# implements the same standard, so the parser is a spec implementation either
-# way; see the crate docs for the measured agreement with Node and the places
-# it deliberately does not match.
-url = "2.5"
-# The UTS #46 / Punycode half of WHATWG domain parsing. `url` depends on the
-# same crate, so naming it directly pins one copy rather than adding a second.
-idna = "1"
+# ada, the library `src/node_url.cc` is actually built on. Node vendors the
+# same single-header release (`deps/ada/ada.cpp`), and this crate's bundled copy
+# is byte-identical to the one in the Node revision rustnode targets, so the
+# parser, the percent-encode sets and every `set_*` guard are the same code
+# rather than a second implementation of the same standard. See the crate docs
+# for how that equivalence is verified and what it still does not cover.
+ada-url = "4.0"
 
 [dev-dependencies]
 serde_json.workspace = true

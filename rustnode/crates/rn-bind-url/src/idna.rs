@@ -1,32 +1,34 @@
 //! `domainToASCII` / `domainToUnicode`.
 //!
 //! Both members run their input through Node's *host* pipeline rather than
-//! through a bare `idna::domain_to_ascii`. That is what Node does:
-//! `DomainToASCII` in `src/node_url.cc` parses `ws://x` and calls
-//! `set_hostname(input)` on the result, and `set_hostname` is
-//! `url_aggregator::set_host_or_hostname`, which is the WHATWG host parser plus
-//! ada's own `state override` handling.
+//! through a bare UTS #46 call. That is what Node does: `DomainToASCII` in
+//! `src/node_url.cc` parses `ws://x` and calls `set_hostname(input)` on the
+//! result, then reads the hostname back; `DomainToUnicode` does the same and
+//! then decodes the result with `ada::idna::to_unicode`.
 //!
-//! The order of operations inside that pipeline is observable, so it is spelled
-//! out here rather than delegated wholesale:
+//! Going through `set_hostname` is not an optimisation detail, it is the
+//! semantics. The four things it buys, each of which a bare `domain_to_ascii`
+//! gets wrong:
 //!
-//! 1. Cut the view at the first host delimiter. For a special scheme ada scans
-//!    with `find_next_host_delimiter_special`, whose set is `: / \ ? [`, and
-//!    brackets suspend delimiting so `[::1]` survives. `@` is handled by
-//!    `find_authority_delimiter` during parsing and therefore also ends the
-//!    host here.
-//! 2. Strip tab and newline characters from what is left.
-//! 3. Parse it as a host (percent-decoding, UTS #46, IPv4/IPv6) and serialize,
-//!    which lowercases and punycodes.
-//! 4. Report failure when a colon was found. `set_hostname` refuses any value
-//!    containing a `:port` suffix (`override_hostname == true` returns false),
-//!    and Node maps that failure to the empty string.
+//! 1. **The ASCII fast path.** ada's `to_ascii` short-circuits a pure-ASCII
+//!    input to a lowercase mapping and does *no* UTS #46 validity checking, so
+//!    `domainToASCII("xn--a")` is `"xn--a"` in Node even though the label is
+//!    not valid punycode. A strict decoder rejects it and reports `""`.
+//! 2. **Delimiter truncation.** `"a/b"` is `"a"`, because ada cuts the view at
+//!    the first host delimiter before parsing.
+//! 3. **IPv4 and IPv6.** `"0x7f.1"` is `"127.0.0.1"`; `"[::1]"` survives.
+//! 4. **The `:port` refusal.** `set_hostname` passes `override_hostname = true`,
+//!    which returns false as soon as a colon appears outside brackets, and Node
+//!    maps that to the empty string.
 //!
-//! Step 1 is why `domainToASCII("a/b")` is `"a"`, step 3 is why `"a b.com"` and
-//! `"a@b"` report `""`, and step 4 is why every `host:port` form reports `""`.
-//! Calling `idna::domain_to_ascii` on the raw input would get all three wrong.
+//! Implementing this as `parse("ws://x") + set_hostname` is therefore the
+//! smallest correct thing, and it is literally Node's own composition. The
+//! remaining piece is `to_unicode`, which the adapter exposes as
+//! [`ada_url::Idna::unicode`] and which never fails: a label it cannot decode
+//! is kept verbatim, which is why `domainToUnicode("xn--zz")` is `"xn--zz"` and
+//! not `""`.
 
-use url::Host;
+use ada_url::{Idna, Url};
 
 /// The empty string both members report for an invalid domain.
 ///
@@ -34,52 +36,23 @@ use url::Host;
 /// passes it through, so a caller of `url.domainToASCII()` sees `""`.
 pub const INVALID: &str = "";
 
-/// Where a hostname ends and whether a `:port` suffix followed.
+/// Node's `ws://x` seed, and why it is a special scheme.
 ///
-/// Matches `get_host_delimiter_location(is_special = true, view)`: the scan stops
-/// at `: / \ ? [`, a `[...]` range hides any delimiter inside it, and an
-/// unclosed `[` consumes the rest of the input (`location = view_size`).
-fn host_delimiter(input: &str) -> (usize, bool) {
-    let mut brackets = 0u32;
-    for (index, byte) in input.bytes().enumerate() {
-        match byte {
-            b'[' => brackets += 1,
-            b']' => brackets = brackets.saturating_sub(1),
-            b':' if brackets == 0 => return (index, true),
-            b'/' | b'?' if brackets == 0 => return (index, false),
-            b'\\' if brackets == 0 => return (index, false),
-            _ => {}
-        }
-    }
-    (input.len(), false)
-}
+/// `set_hostname` branches on the URL's scheme type: a special scheme takes the
+/// domain parser (percent-decoding, UTS #46, IPv4), a non-special one takes the
+/// opaque-host parser, which forbids far more characters. `DomainToASCII` seeds
+/// a special scheme deliberately, so the domain rules apply.
+const SEED: &str = "ws://x";
 
-/// Removes ASCII tab and newline characters, as `remove_ascii_tab_or_newline`.
-fn strip_tab_and_newline(input: &str) -> String {
-    input
-        .chars()
-        .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
-        .collect()
-}
-
-/// The serialized hostname Node would end up with, or `None` where it reports
-/// the empty string.
+/// Runs `input` through `set_hostname` and answers the serialized hostname.
 fn parsed_host(input: &str) -> Option<String> {
-    let (end, had_port) = host_delimiter(input);
-    // A `:port` suffix makes `set_hostname` fail outright; Node reports "".
-    if had_port {
+    let mut url = Url::parse(SEED, None).ok()?;
+    url.set_hostname(Some(input)).ok()?;
+    let host = url.hostname().to_string();
+    if host.is_empty() {
         return None;
     }
-    let candidate = strip_tab_and_newline(&input[..end]);
-    if candidate.is_empty() {
-        return None;
-    }
-    let host = Host::parse(&candidate).ok()?;
-    let serialized = host.to_string();
-    if serialized.is_empty() {
-        return None;
-    }
-    Some(serialized)
+    Some(host)
 }
 
 /// `domainToASCII`: the ASCII serialization of the parsed host.
@@ -102,16 +75,9 @@ pub fn domain_to_unicode(input: &str) -> String {
 
 /// Decodes one serialized hostname to its Unicode spelling.
 ///
-/// Shared with `format(..., unicode)` and with `getOrigin`'s host, both of which
-/// rewrite a URL's host the same way.
+/// Shared with `format(..., unicode)`, which rewrites a URL's host the same way.
 pub fn host_to_unicode(host: &str) -> String {
-    // Neither an IPv6 literal nor an IPv4 address has a Unicode form, and the
-    // UTS #46 decoder would either reject or mangle them; both pass through.
-    if host.starts_with('[') || host.parse::<std::net::Ipv4Addr>().is_ok() {
-        return host.to_string();
-    }
-    let (decoded, _errors) = idna::domain_to_unicode(host);
-    decoded
+    Idna::unicode(host)
 }
 
 #[cfg(test)]
@@ -142,9 +108,24 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_punycode_label_is_passed_through() {
+        // ada's ASCII fast path lowercases without validating, and Node's
+        // `to_unicode` keeps a label it cannot decode. Neither member reports
+        // the empty string for these.
+        for input in ["xn--a", "xn--zz", "xn--", "xn--a-", "xn--0.com", "a.xn--a"] {
+            assert_eq!(domain_to_ascii(input), input, "ascii {input:?}");
+            assert_eq!(domain_to_unicode(input), input, "unicode {input:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_label_keeps_its_valid_neighbours() {
+        // The unit of failure is the label, not the domain.
+        assert_eq!(domain_to_unicode("xn--a.xn--n3h"), "xn--a.☃");
+    }
+
+    #[test]
     fn a_path_delimiter_truncates_instead_of_failing() {
-        // Node reports "a" for each of these: ada cuts the view at the delimiter
-        // before parsing. A bare `idna::domain_to_ascii` would reject them.
         assert_eq!(domain_to_ascii("a/b"), "a");
         assert_eq!(domain_to_ascii("a?b"), "a");
         assert_eq!(domain_to_ascii("a\\b"), "a");
@@ -153,10 +134,8 @@ mod tests {
 
     #[test]
     fn an_at_sign_ends_the_host() {
-        // `find_authority_delimiter` stops at '@' only while scanning the
-        // userinfo, which `set_hostname` is not doing, so "@b" keeps its '@'
-        // and fails the forbidden-host-code-point check.
         assert_eq!(domain_to_ascii("@b"), "");
+        assert_eq!(domain_to_ascii("a@b"), "");
     }
 
     #[test]
@@ -178,9 +157,7 @@ mod tests {
 
     #[test]
     fn a_forbidden_host_code_point_reports_the_empty_string() {
-        // `@` is not a delimiter for `set_hostname`, so "a@b" stays one view and
-        // the host parser rejects it for containing a forbidden code point.
-        for input in ["a b.com", "a@b", "@b", "a[b]", "a[b]c", ":", "", "xn--"] {
+        for input in ["a b.com", "a@b", "@b", "a[b]", "a[b]c", ":", ""] {
             assert_eq!(domain_to_ascii(input), "", "input {input:?}");
             assert_eq!(domain_to_unicode(input), "", "input {input:?}");
         }
@@ -190,17 +167,17 @@ mod tests {
     fn ipv4_shorthand_is_parsed_as_an_address() {
         assert_eq!(domain_to_ascii("0x7f.1"), "127.0.0.1");
         assert_eq!(domain_to_unicode("0x7f.1"), "127.0.0.1");
+        assert_eq!(domain_to_ascii("1.2.3.4."), "1.2.3.4");
     }
 
     #[test]
     fn percent_escapes_in_the_host_are_decoded() {
         assert_eq!(domain_to_ascii("%41.com"), "a.com");
+        assert_eq!(domain_to_ascii("xn--%41"), "xn--a");
     }
 
     #[test]
-    fn an_ipv6_literal_survives_the_delimiter_scan_and_both_members() {
-        // The brackets suspend delimiting, or "::1" would be cut at the first
-        // colon and then refused for having a port.
+    fn an_ipv6_literal_survives_both_members() {
         assert_eq!(domain_to_ascii("[::1]"), "[::1]");
         assert_eq!(domain_to_unicode("[::1]"), "[::1]");
         assert_eq!(domain_to_ascii("[2001:db8::1]"), "[2001:db8::1]");
@@ -217,7 +194,16 @@ mod tests {
     }
 
     #[test]
-    fn host_to_unicode_leaves_an_ipv4_address_alone() {
+    fn a_sharp_s_uppercase_maps_the_way_ada_maps_it() {
+        // `ẞ` uppercases to `ss` in ada, which is a difference from the `idna`
+        // crate this crate used to use. The crate docs listed it as a known
+        // divergence; it is now simply Node's answer.
+        assert_eq!(domain_to_ascii("ẞ.com"), "xn--zca.com");
+        assert_eq!(domain_to_unicode("xn--n3h.net"), "☃.net");
+    }
+
+    #[test]
+    fn host_to_unicode_passes_an_ipv4_address_through() {
         assert_eq!(host_to_unicode("127.0.0.1"), "127.0.0.1");
     }
 }
