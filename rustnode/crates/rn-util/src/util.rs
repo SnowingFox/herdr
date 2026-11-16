@@ -1388,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn installed_members_are_exactly_the_contract_minus_the_deferrals() {
+    fn parse_env_is_installed_rather_than_deferred() {
         // `rn-compat` trusts `MEMBERS` and subtracts `DEFERRED` without ever
         // looking at the object `install()` builds, so a member listed in one
         // and missing from the other is reported green while `lib/**` reads
