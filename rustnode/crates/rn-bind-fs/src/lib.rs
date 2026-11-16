@@ -32,6 +32,7 @@ pub mod jobs;
 pub mod permission;
 pub mod request;
 pub mod stats;
+pub mod watch;
 
 mod install;
 

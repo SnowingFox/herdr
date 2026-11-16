@@ -923,27 +923,38 @@ fn member_list_tracks_node_minus_documented_deferrals() {
         .into_iter()
         .collect();
 
-    // Not in Node's `fs` namespace: the request constructor the JS instantiates,
-    // and the promise-mode sentinel it forwards.
+    // Not in Node's `SetMethod` list: the request constructor the JS
+    // instantiates, and the promise-mode sentinel it forwards.
     let ns_extras: std::collections::BTreeSet<&str> =
         ["FSReqCallback", "kUsePromises"].into_iter().collect();
 
-    // Constructed by `lib/fs.js`, but registered with `SetConstructorFunction`
-    // rather than `SetMethod`, so they are not in the `SetMethod` list above.
-    // All three are load-bearing: `fs.readFile` and `fs.writeFile` construct the
-    // jobs unconditionally for `options.buffer === undefined`, and
-    // `fs.promises.open` wraps every descriptor in a `FileHandle`.
-    let job_classes: std::collections::BTreeSet<&str> =
-        ["ReadFileJob", "WriteFileJob", "FileHandle"]
-            .into_iter()
-            .collect();
+    // Constructed by `lib/fs.js`, but registered with `SetConstructorFunction`,
+    // a plain `Set` or an accessor rather than `SetMethod`, so they are not in
+    // the `SetMethod` list above. All of them are load-bearing:
+    //
+    // * `ReadFileJob`/`WriteFileJob` are constructed unconditionally for
+    //   `options.buffer === undefined`, i.e. every ordinary `readFile`.
+    // * `FileHandle` is what `fs.promises.open` wraps every descriptor in.
+    // * `StatWatcher` is constructed by `watchers.js`'s
+    //   `[kFSStatWatcherStart]`, so `fs.watchFile` needs it before any syscall.
+    // * `kFsStatsFieldsNumber` is the offset `watchers.js` uses to split a watch
+    //   report into the current and previous `fs.Stats`.
+    let constructor_functions: std::collections::BTreeSet<&str> = [
+        "ReadFileJob",
+        "WriteFileJob",
+        "FileHandle",
+        "StatWatcher",
+        "kFsStatsFieldsNumber",
+    ]
+    .into_iter()
+    .collect();
 
     let ours: std::collections::BTreeSet<&str> = Fs.members().iter().copied().collect();
     let expected: std::collections::BTreeSet<&str> = node
         .difference(&deferred)
         .copied()
         .chain(ns_extras.iter().copied())
-        .chain(job_classes.iter().copied())
+        .chain(constructor_functions.iter().copied())
         .collect();
 
     assert_eq!(ours, expected, "member list drifted from the contract");

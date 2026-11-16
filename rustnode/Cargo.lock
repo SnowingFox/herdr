@@ -926,6 +926,7 @@ dependencies = [
  "rn-permission",
  "rn-uv",
  "rn-v8-sys",
+ "serde_json",
  "tracing",
 ]
 

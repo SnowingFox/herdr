@@ -4,14 +4,21 @@
 //! `lib/internal/fs/**` or `lib/internal/modules/**` reads it. The list was
 //! derived from those call sites and then diffed against the names
 //! `src/node_file.cc` registers with `SetMethod`: it is exactly that set minus
-//! five documented deferrals, plus `FSReqCallback` and `kUsePromises`.
+//! the documented deferrals, plus `FSReqCallback`, `kUsePromises` and the three
+//! constructor functions (`StatWatcher`, `ReadFileJob`, `WriteFileJob`).
 //!
-//! The deferrals are `CpDirJob`, `FileHandle`, `StatWatcher`, `openFileHandle`
-//! and `cpSyncCopyDir`/`cpSyncOverrideFile`'s shared blocker. The `fs.cp` fast
+//! The deferrals are `CpDirJob`, `FileHandle`, `openFileHandle` and
+//! `cpSyncCopyDir`/`cpSyncOverrideFile`'s shared blocker. The `fs.cp` fast
 //! paths only matter when no `filter` callback is supplied, and the
 //! `FileHandle`-shaped members need the handle type. `README.md` explains each
 //! one. A test in `tests/js_contract.rs` pins the set so it cannot drift
 //! silently.
+//!
+//! `StatWatcher` used to be on that list, on the theory that `fs.watchFile`
+//! needed "the timer loop". It never did: `uv_fs_poll` is a polling handle with
+//! its own private libuv timer, and `libuv-sys2` binds it. `watch.rs` implements
+//! it, together with `kFsStatsFieldsNumber`, which the same JavaScript reads as
+//! the offset of the previous `fs.Stats` in a watch report.
 //!
 //! `ReadFileJob` and `WriteFileJob` are installed, not deferred: `lib/fs.js`
 //! constructs them unconditionally for every ordinary `fs.readFile` and
@@ -141,13 +148,11 @@ impl BindingModule for Fs {
 /// member is neither installed nor listed here.
 pub const DEFERRED: &[(&str, &str)] = &[
     ("CpDirJob", "cp -r recursion lives in the lib/ JS layer; the C++ job wrapper is not needed until the copy fast path lands"),
-    ("StatWatcher", "fs.watchFile polling handle, needs the timer loop"),
     ("bigintStatFsValues", "bigint view of statfs fields, follows the BigInt stat surface"),
     ("bigintStatValues", "bigint view of stat fields, follows the BigInt stat surface"),
     ("cpSyncCopyDir", "cp -r directory recursion, lands with cp -r"),
     ("cpSyncOverrideFile", "cp -r overwrite rule, lands with cp -r"),
     ("getFormatOfExtensionlessFile", "ESM format sniffing for extensionless files, owned by the ESM loader"),
-    ("kFsStatsFieldsNumber", "internal field-count constant used only by the native stats layout"),
     ("legacyMainResolve", "deprecated main resolution kept for compatibility, owned by the CJS loader"),
     ("statFsValues", "statfs field layout, lands with the statfs member"),
     ("statValues", "stat field layout, lands with the native stats layout"),
@@ -212,6 +217,9 @@ pub const MEMBERS: &[&str] = &[
     // One-shot open+read+close / open+write+close jobs.
     "ReadFileJob",
     "WriteFileJob",
+    // `fs.watchFile`'s polling handle and the offset its report is indexed by.
+    "StatWatcher",
+    "kFsStatsFieldsNumber",
     "kUsePromises",
 ];
 
@@ -273,6 +281,7 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
         // what `openFileHandle` resolves.
         let handle = crate::filehandle::constructor(self.scope)?;
         self.define("FileHandle", handle)?;
+        self.stat_watcher()?;
         Ok(())
     }
 
@@ -323,6 +332,23 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
             crate::jobs::write_file_run,
         )
     }
+
+    /// Defines `StatWatcher` and `kFsStatsFieldsNumber`.
+    ///
+    /// `src/node_file.cc` registers the class with `SetConstructorFunction` and
+    /// the constant beside it. Both are read by `lib/internal/fs/watchers.js` at
+    /// load time: `StatWatcher` is constructed by `[kFSStatWatcherStart]`, and
+    /// `kFsStatsFieldsNumber` is the offset that splits a watch report into the
+    /// current and previous `fs.Stats`.
+    fn stat_watcher(&mut self) -> Result<(), String> {
+        let constructor = crate::watch::constructor(self.scope)?;
+        self.define("StatWatcher", constructor)?;
+        // `target->Set(..., "kFsStatsFieldsNumber", Integer::New(isolate, 18))`.
+        // A plain number: `watchers.js` reads it as the offset of the previous
+        // `fs.Stats` inside one watch report.
+        let fields = v8::Integer::new(self.scope, crate::watch::stats_fields_number());
+        self.define("kFsStatsFieldsNumber", fields.into())
+    }
 }
 
 /// `new FSReqCallback(useBigint)`.
@@ -358,7 +384,11 @@ fn fs_req_callback_ctor(
 /// Node reaches an internal-field write with the global object as `this` and
 /// aborts the process; this is the `TypeError` `internal/errors` declares for
 /// the code, so the failure is catchable and the class matches.
-fn throw_construct_call_required(scope: &mut v8::PinScope<'_, '_>) {
+///
+/// Public within the crate because `watch.rs`'s `StatWatcher` needs the same
+/// convention: it is a new binding constructor, so it must fail the way the
+/// no-`new` audit expects rather than with a bare `TypeError`.
+pub(crate) fn throw_construct_call_required(scope: &mut v8::PinScope<'_, '_>) {
     let Some(text) = v8::String::new(scope, "Cannot call constructor without `new`") else {
         return;
     };

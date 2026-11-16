@@ -48,6 +48,11 @@ pub const PROVIDER_HTTP2STREAM: u32 = 15;
 /// counting is right — 42 there and 42 here — and `node --expose-internals`'s
 /// `handle.getProviderType()` on a real `tls_wrap.wrap()` reports 68.
 pub const PROVIDER_TLSWRAP: u32 = 68;
+/// `PROVIDER_STATWATCHER`: the `uv_fs_poll_t` behind `fs.watchFile`.
+///
+/// Counted from `NONE` in `NODE_ASYNC_NON_CRYPTO_PROVIDER_TYPES`, which is the
+/// same table the `TCPWRAP`/`TCPSERVERWRAP` pair above is checked against.
+pub const PROVIDER_STATWATCHER: u32 = 38;
 
 /// The `AsyncWrap` fields of a wrapped handle.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,11 +127,14 @@ mod tests {
 
     #[test]
     fn the_provider_ids_match_the_async_wrap_table() {
-        // These two are the only providers this crate names, and they are the
-        // ones `src/tcp_wrap.cc` selects between. A drift here would label every
-        // socket with the wrong kind while still looking like a working id.
+        // These are the providers this crate names, and they are the ones
+        // `src/tcp_wrap.cc`, `src/node_stat_watcher.cc` and `src/tls_wrap.cc`
+        // select. A drift here would label a socket, a stat watcher or a TLS
+        // wrap with the wrong kind while still looking like a working id.
         assert_eq!(PROVIDER_TCPSERVERWRAP, 41);
         assert_eq!(PROVIDER_TCPWRAP, 42);
+        assert_eq!(PROVIDER_STATWATCHER, 38);
+        assert_eq!(PROVIDER_TLSWRAP, 68);
         assert_eq!(PROVIDER_NONE, 0);
     }
 }

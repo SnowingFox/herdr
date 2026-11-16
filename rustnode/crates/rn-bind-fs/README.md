@@ -225,7 +225,6 @@ stubbed so a caller gets a clear missing-member failure instead of a wrong answe
 | --- | --- |
 | `cpSyncCheckPaths`, `cpSyncCopyDir`, `cpSyncOverrideFile`, `CpDirJob` | the `fs.cp` fast paths. `lib/internal/fs/cp/cp-sync.js` only reaches them when no `filter` is supplied; with a `filter` it walks with `opendir`/`stat`/`copyFile`. `opendir` itself needs the `fs_dir` namespace. |
 | `opendir`, and the whole `fs_dir` namespace | `internalBinding('fs_dir')` is a separate binding: it owns `DIR*` handles with async iteration. Out of scope for this crate by namespace, and `Dir` in `lib/internal/fs/dir.js` uses it exclusively. |
-| `StatWatcher` | requires an inotify-backed poller and the double-width stats buffer (`kFsStatsBufferLength`). Watch mode belongs with the event loop. The buffer width is still pinned by a test so the layout cannot drift. |
 | `internalModuleReadJSON`, `legacyMainResolve`, `getFormatOfExtensionlessFile` | read by `lib/internal/modules/helpers.js`. The latter two are helpers over the JSON reader, and `internalModuleReadJSON` has no call site left in this tree, so implementing it would be guesswork. All three belong to the module-loader crate. |
 | `scandir` as a public member | there is no such member in Node's namespace; `readdir` *is* the scandir binding. The syscall name `scandir` is still used in error messages, which is what Node reports. |
 | `FICLONE_FORCE` | `FICLONE` is attempted and honoured, but a forced reflink on a filesystem that supports neither reflink nor a fallback fails with `ENOTSUP` rather than degrading. Ordinary copies are correct. |
@@ -253,6 +252,40 @@ the native side owns only what `promises.js` actually calls: `fd`,
 `getAsyncId()`, `close()` and `closeSync()`. The reference counting, the close
 promise chain, the transfer machinery and the `EventEmitter` are all in the
 vendored JavaScript and needed no change. See `src/filehandle.rs`.
+
+`StatWatcher` was on that list too, with the reason "requires an
+inotify-backed poller and the double-width stats buffer … Watch mode belongs
+with the event loop." Both halves were false. `uv_fs_poll` is a *polling*
+handle: `libuv`'s `fs-poll.c` owns a private unref'd `uv_timer_t` and a
+`uv_fs_stat` request, so it needs neither inotify nor `lib/internal/timers.js`'s
+lists, and `libuv-sys2` binds `uv_fs_poll_init`/`_start`/`_stop` directly. The
+double-width buffer was a layout this crate had already pinned, not machinery
+that was missing. The cost of the false reason was F6: `fs.watchFile` threw
+`TypeError: _StatWatcher is not a constructor` on first use. `watch.rs` owns the
+class now.
+
+## The stat watcher
+
+`watch.rs` implements `StatWatcher`, the `uv_fs_poll_t` behind `fs.watchFile`.
+The parts that are easy to get wrong:
+
+* **`onchange` receives one double-width array, not two stats.** `FillGlobalStatsArray`
+  writes the current stat at offset 0 and the previous at
+  `kFsStatsFieldsNumber` (18) of the *same* array, and `watchers.js` reads both
+  halves from it. So `kFsStatsFieldsNumber` is part of the same contract and is
+  installed beside the class; with it `undefined`, `stats[0 + undefined]` is
+  `stats[NaN]` and every field of the previous `fs.Stats` is `undefined`.
+* **The class is an `AsyncWrap`.** Its constructor runs `AsyncReset`, so a
+  `fs.watchFile` handle has an async id and emits `init` before the call
+  returns, and the poll callback runs inside that resource's
+  `InternalCallbackScope` — which is what makes `async_hooks` `before`/`after`
+  fire and routes a throw from a listener through `process._fatalException`.
+* **A missing path does not throw.** `uv_fs_poll_start` succeeds for a path that
+  does not exist and the first poll reports the failed stat as a `change` event.
+  `onchange`'s suppression test compares `stats[2]` with `stats[16]`, which is
+  the current stat's *birth time* rather than the previous stat's link count
+  despite the comment in Node's source; reproducing that comparison is what
+  keeps `fs.watchFile('/nonexistent')` silent at start-up exactly as Node is.
 
 ## The one-shot file jobs
 
