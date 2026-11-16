@@ -229,6 +229,30 @@ step "the smoke classifier still tells a gap from a defect"
 # feature into a skip, so the rule is pinned rather than trusted.
 python3 tools/smoke.py --self-test
 
+step "every Node-API gap is either exported or declared"
+# F6: 16 entry points the oracle exported were missing from this build *and*
+# absent from `shims::DEFERRED`, so an addon needing one aborted at its first call
+# and nothing reported it. `rn-compat` cannot see this (Node-API is an ABI, not a
+# namespace) and `tests/symbols.rs` cannot either (it compares the binary against
+# `EXPORTED` in both directions, which is consistent for any split as long as every
+# symbol is covered by one side — which was exactly what was false).
+#
+# The self-test runs first and is what makes the gate trustworthy: it removes a
+# declaration, typos one, contradicts one, and empties the block, requiring the
+# specific diagnostic for each. A gate that cannot fail is the defect it guards.
+./tools/napi-symbol-coverage.test.sh
+
+# The oracle lives outside the repository, so it may be absent on a machine that
+# has not fetched it. That is reported as a skip rather than a pass: the gate
+# cannot answer without the reference set, and silently passing would be the
+# failure mode this whole step exists to prevent. A machine that has the oracle
+# runs it, which is every CI image and every maintainer workstation.
+if [ -x "${RUSTNODE_NAPI_ORACLE:-/tmp/oracle-dl/node-v28.0.0-nightly20261111e8c1160d20-linux-x64/bin/node}" ]; then
+  ./tools/napi-symbol-coverage.py
+else
+  echo "napi symbol coverage: no oracle binary; set RUSTNODE_NAPI_ORACLE to run it"
+fi
+
 step "the vendored JavaScript is unchanged"
 ./tools/verify-libjs.sh
 

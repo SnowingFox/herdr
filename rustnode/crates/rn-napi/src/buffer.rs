@@ -135,6 +135,70 @@ pub(crate) unsafe fn external_backing_store(
     }
 }
 
+/// Builds a backing store over memory the addon owns, for a `SharedArrayBuffer`.
+///
+/// The difference from [`external_backing_store`] is the finalizer's shape:
+/// `node_api_create_external_sharedarraybuffer` takes a `node_api_noenv_finalize`,
+/// which is handed no `napi_env`. Node documents that reason — the finalizer may run
+/// on any thread, at any time, including after the environment is gone — so it must
+/// not call back into Node-API. That also means it can run directly from the V8
+/// deleter instead of being parked on the finalizer queue, which is what Node does
+/// in the same spot (`js_native_api_v8.cc:3130-3170`).
+///
+/// # Safety
+///
+/// `data` must point at `length` readable bytes that stay valid until the finalizer
+/// runs.
+pub(crate) unsafe fn external_shared_backing_store(
+    data: *mut c_void,
+    length: usize,
+    finalize: crate::abi::NapiNoEnvFinalize,
+    finalize_hint: *mut c_void,
+) -> v8::UniqueRef<v8::BackingStore> {
+    /// What the deleter needs: the two arguments the addon's finalizer takes.
+    struct SharedFinalizer {
+        data: *mut c_void,
+        finalize: crate::abi::NapiNoEnvFinalize,
+        hint: *mut c_void,
+    }
+
+    unsafe extern "C" fn drop_external_shared(
+        _data: *mut c_void,
+        _length: usize,
+        deleter_data: *mut c_void,
+    ) {
+        if deleter_data.is_null() {
+            return;
+        }
+        // SAFETY: `deleter_data` is the `Box<SharedFinalizer>` created below, and
+        // V8 calls a backing store's deleter exactly once.
+        let boxed = unsafe { Box::from_raw(deleter_data as *mut SharedFinalizer) };
+        if let Some(finalize) = boxed.finalize {
+            // No environment by contract, so no scope is opened and no V8 call is
+            // possible: this runs wherever the collection happened.
+            // SAFETY: the addon's own callback with the pointers it supplied.
+            unsafe { finalize(boxed.data, boxed.hint) };
+        }
+    }
+
+    let boxed = Box::new(SharedFinalizer {
+        data,
+        finalize,
+        hint: finalize_hint,
+    });
+    // SAFETY: the caller guarantees `data` is valid for `length` until the
+    // finalizer runs. V8 takes ownership of the deleter data and calls the
+    // deleter once.
+    unsafe {
+        v8::SharedArrayBuffer::new_backing_store_from_ptr(
+            data,
+            length,
+            drop_external_shared,
+            Box::into_raw(boxed).cast(),
+        )
+    }
+}
+
 /// The element kind a typed array is requested as.
 ///
 /// `napi_typedarray_type` is a C enum, so the shim receives it as an integer and

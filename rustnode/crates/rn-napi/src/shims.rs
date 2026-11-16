@@ -54,8 +54,8 @@ use std::os::raw::c_char;
 use rn_v8_sys::v8;
 
 use crate::abi::{
-    NapiCallbackInfo, NapiEnv, NapiFinalize, NapiRef, NapiStatus, NapiValue, NapiValueType,
-    NAPI_DEFAULT_MODULE_API_VERSION, NAPI_SUPPORTED_VERSION_MAX,
+    NapiBasicFinalize, NapiCallbackInfo, NapiEnv, NapiFinalize, NapiRef, NapiStatus, NapiValue,
+    NapiValueType, NAPI_DEFAULT_MODULE_API_VERSION, NAPI_SUPPORTED_VERSION_MAX,
 };
 use crate::env::{env_from, Env};
 use crate::values::{arg, in_scope, to_napi, type_of};
@@ -206,6 +206,39 @@ fn read_bytes(str: *const c_char, length: usize) -> Option<Vec<u8>> {
     }
 }
 
+/// Reads `length` UTF-16 code units, or to the first NUL when the addon passed
+/// `NAPI_AUTO_LENGTH`.
+///
+/// An explicit length is taken as given: Node-API lets an addon pass a longer
+/// buffer with a shorter length to take a prefix, and a surrogate pair split by
+/// that prefix must reach V8 as the two lone surrogates the addon asked for.
+fn read_units(str: *const u16, length: usize) -> Option<Vec<u16>> {
+    if str.is_null() {
+        return if length == usize::MAX {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
+    if length == usize::MAX {
+        let mut units = Vec::new();
+        let mut index = 0usize;
+        loop {
+            // SAFETY: the addon passed a NUL-terminated UTF-16 string, so it is
+            // readable up to and including the terminator.
+            let unit = unsafe { str.add(index).read() };
+            if unit == 0 {
+                return Some(units);
+            }
+            units.push(unit);
+            index += 1;
+        }
+    }
+    // SAFETY: Node-API's contract is that `str` is readable for `length` units
+    // for the duration of the call.
+    Some(unsafe { std::slice::from_raw_parts(str, length) }.to_vec())
+}
+
 /// Reads a UTF-8 C string argument, with `NAPI_AUTO_LENGTH` support.
 fn read_text(str: *const c_char, length: usize) -> Option<String> {
     read_bytes(str, length).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
@@ -334,6 +367,59 @@ pub unsafe extern "C" fn napi_create_object(
             Ok(to_napi(object))
         },
     )
+}
+
+#[export_name = "node_api_create_object_with_properties"]
+pub unsafe extern "C" fn node_api_create_object_with_properties(
+    env: *mut NapiEnv,
+    prototype_or_null: *mut NapiValue,
+    property_names: *const *mut NapiValue,
+    property_values: *const *mut NapiValue,
+    property_count: usize,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null()
+        || (property_count > 0 && (property_names.is_null() || property_values.is_null()))
+    {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|scope| {
+        // A null prototype argument means "no prototype", which is `null` and not
+        // `undefined`: V8's constructor treats the two differently.
+        let prototype: v8::Local<v8::Value> = if prototype_or_null.is_null() {
+            v8::null(scope).into()
+        } else {
+            // SAFETY: the handle comes from the current scope.
+            unsafe { as_value(prototype_or_null) }?
+        };
+        let mut names = Vec::with_capacity(property_count);
+        let mut values = Vec::with_capacity(property_count);
+        for index in 0..property_count {
+            // SAFETY: the caller declared `property_count` entries in each array.
+            let (name_handle, value_handle) =
+                unsafe { (*property_names.add(index), *property_values.add(index)) };
+            // SAFETY: both handles come from the current scope.
+            let name = unsafe { as_name(name_handle) }.map_err(|_| NapiStatus::NameExpected)?;
+            // SAFETY: as above.
+            let value = unsafe { as_value(value_handle) }?;
+            names.push(name);
+            values.push(value);
+        }
+        // Node rejects a non-name key with `napi_name_expected` rather than
+        // coercing it, because a `napi_value` that is not a name cannot be a
+        // property key without running user JavaScript.
+        let object = v8::Object::with_prototype_and_properties(scope, prototype, &names, &values);
+        Ok(to_napi(object.into()))
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(handle)) => {
+            // SAFETY: the caller passed a writable slot.
+            unsafe { store(result, handle) };
+            status(env, NapiStatus::Ok)
+        }
+    }
 }
 
 #[export_name = "napi_create_array"]
@@ -487,6 +573,236 @@ pub unsafe extern "C" fn napi_create_string_utf8(
     )
 }
 
+#[export_name = "napi_create_string_utf16"]
+pub unsafe extern "C" fn napi_create_string_utf16(
+    env: *mut NapiEnv,
+    str: *const u16,
+    length: usize,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let Some(units) = read_units(str, length) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            let text = v8::String::new_from_two_byte(scope, &units, v8::NewStringType::Normal)
+                .ok_or(NapiStatus::GenericFailure)?;
+            Ok(to_napi(text.into()))
+        },
+    )
+}
+
+/// `node_api_create_external_string_latin1` and its UTF-16 twin.
+///
+/// Node's non-sandbox path hands V8 an `ExternalStringResource` that owns the
+/// addon's buffer and runs the addon's finalizer from its destructor, and reports
+/// `copied = false`. The `v8` crate exposes that shape as
+/// `String::new_external_onebyte_raw`/`new_external_twobyte_raw`, so this does not
+/// copy. Verified against the oracle: `copied` is `false` and the finalizer has not
+/// run by the time the call returns.
+///
+/// The destructor runs on whichever thread collected, so the addon's finalizer is
+/// parked on the environment's finalizer queue exactly as
+/// [`crate::buffer`]'s backing-store deleter is. Node's `TrackedStringResource`
+/// defers for the same reason.
+///
+/// # Safety
+///
+/// `str` must be owned by the addon and readable for `length` units until
+/// `finalize` runs.
+#[allow(clippy::too_many_arguments)] // eight arguments is the header's signature
+unsafe fn external_string(
+    env: *mut NapiEnv,
+    str: *mut c_void,
+    length: usize,
+    finalize: NapiBasicFinalize,
+    finalize_hint: *mut c_void,
+    result: *mut *mut NapiValue,
+    copied: *mut bool,
+    two_byte: bool,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    if str.is_null() && length != usize::MAX {
+        return status(env, NapiStatus::InvalidArg);
+    }
+
+    // `NAPI_AUTO_LENGTH` means "to the NUL", and the units differ by encoding, so
+    // the length is resolved here rather than in V8.
+    let units = if length != usize::MAX {
+        length
+    } else if str.is_null() {
+        0
+    } else if two_byte {
+        let mut count = 0usize;
+        loop {
+            // SAFETY: the addon declared a NUL-terminated UTF-16 string.
+            if unsafe { str.cast::<u16>().add(count).read() } == 0 {
+                break count;
+            }
+            count += 1;
+        }
+    } else {
+        // SAFETY: the addon declared a NUL-terminated string.
+        unsafe { std::ffi::CStr::from_ptr(str.cast::<c_char>()) }
+            .to_bytes()
+            .len()
+    };
+
+    let thread = unsafe { env_from(env) }.map(|environment| environment.owner_thread());
+    let owner = Box::into_raw(Box::new(ExternalStringOwner {
+        env,
+        data: str,
+        hint: finalize_hint,
+        finalize,
+        thread,
+    }));
+    // The destructor receives only the buffer pointer, which is unique for the
+    // life of the string, so that is the table's key.
+    EXTERNAL_STRINGS.with(|table| {
+        if let Ok(mut entries) = table.try_borrow_mut() {
+            entries.push((str as usize, owner));
+        }
+    });
+
+    let outcome = in_scope(|scope| {
+        // SAFETY: the caller guarantees `str` is owned and readable for `units`
+        // units; the destructor below runs the addon's finalizer.
+        unsafe {
+            if two_byte {
+                v8::String::new_external_twobyte_raw(
+                    scope,
+                    str.cast::<u16>(),
+                    units,
+                    drop_external_string_two_byte,
+                )
+            } else {
+                v8::String::new_external_onebyte_raw(
+                    scope,
+                    str.cast::<c_char>(),
+                    units,
+                    drop_external_string_one_byte,
+                )
+            }
+        }
+    });
+
+    let Some(text) = outcome else {
+        // No scope: nothing owns the box, so reclaim it and report the mismatch
+        // rather than leaking.
+        unregister_external_string(str as usize);
+        return status(env, NapiStatus::HandleScopeMismatch);
+    };
+    let Some(text) = text else {
+        unregister_external_string(str as usize);
+        return status(env, NapiStatus::GenericFailure);
+    };
+    if !copied.is_null() {
+        // SAFETY: the caller passed a writable slot or null.
+        unsafe { copied.write(false) };
+    }
+    // SAFETY: the caller passed a writable slot.
+    unsafe { store(result, to_napi(text.into())) };
+    status(env, NapiStatus::Ok)
+}
+
+/// What an external string's destructor needs to run the addon's finalizer.
+struct ExternalStringOwner {
+    env: *mut NapiEnv,
+    data: *mut c_void,
+    hint: *mut c_void,
+    finalize: NapiBasicFinalize,
+    /// The thread whose isolate the finalizer must run against.
+    thread: Option<std::thread::ThreadId>,
+}
+
+thread_local! {
+    /// Live external strings, keyed by the addon's buffer pointer.
+    ///
+    /// The `v8` crate's raw external-string constructors take a destructor that
+    /// receives only the buffer and its length, so the addon's finalizer and its
+    /// `napi_env` have to be recovered from a side table. The buffer pointer is
+    /// unique while the string is alive and is exactly what the destructor is
+    /// handed.
+    static EXTERNAL_STRINGS: std::cell::RefCell<Vec<(usize, *mut ExternalStringOwner)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Removes and frees an external string's owner box without running its finalizer.
+fn unregister_external_string(key: usize) {
+    let owner = EXTERNAL_STRINGS.with(|table| {
+        let mut entries = match table.try_borrow_mut() {
+            Ok(entries) => entries,
+            Err(_) => return None,
+        };
+        let index = entries.iter().position(|(existing, _)| *existing == key)?;
+        Some(entries.remove(index).1)
+    });
+    if let Some(owner) = owner {
+        // SAFETY: the box came from `Box::into_raw` in `external_string` and the
+        // table held the only pointer to it.
+        drop(unsafe { Box::from_raw(owner) });
+    }
+}
+
+/// Runs an external string's finalizer once V8 has collected the string.
+fn finish_external_string(key: usize) {
+    let owner = EXTERNAL_STRINGS.with(|table| {
+        let mut entries = match table.try_borrow_mut() {
+            Ok(entries) => entries,
+            Err(_) => return None,
+        };
+        let index = entries.iter().position(|(existing, _)| *existing == key)?;
+        Some(entries.remove(index).1)
+    });
+    let Some(owner) = owner else {
+        return;
+    };
+    // SAFETY: as in `unregister_external_string`.
+    let owner = unsafe { Box::from_raw(owner) };
+    let Some(finalize) = owner.finalize else {
+        return;
+    };
+    let env = owner.env as usize;
+    let data = owner.data as usize;
+    let hint = owner.hint as usize;
+    let run = move || {
+        crate::scope::with_owner_context(env as *mut NapiEnv, |scope| {
+            let guard = crate::scope::ScopeGuard::enter(scope);
+            // SAFETY: the addon's own callback with the pointers it supplied; it
+            // is being told to release `data` now.
+            unsafe {
+                finalize(
+                    env as *const NapiEnv,
+                    data as *mut c_void,
+                    hint as *mut c_void,
+                )
+            };
+            drop(guard);
+        });
+    };
+    if !rn_core::finalizer::enqueue_for(owner.thread, run) {
+        // A poisoned queue is the only way this fails; report it rather than
+        // passing the loss off as success.
+        tracing::error!("an external string's finalizer could not be queued");
+    }
+}
+
+unsafe extern "C" fn drop_external_string_one_byte(data: *mut c_char, _length: usize) {
+    finish_external_string(data as usize);
+}
+
+unsafe extern "C" fn drop_external_string_two_byte(data: *mut u16, _length: usize) {
+    finish_external_string(data as usize);
+}
+
 #[export_name = "napi_create_string_latin1"]
 pub unsafe extern "C" fn napi_create_string_latin1(
     env: *mut NapiEnv,
@@ -509,6 +825,149 @@ pub unsafe extern "C" fn napi_create_string_latin1(
             // what V8's one-byte string constructor takes.
             let text = v8::String::new_from_one_byte(scope, &bytes, v8::NewStringType::Normal)
                 .ok_or(NapiStatus::GenericFailure)?;
+            Ok(to_napi(text.into()))
+        },
+    )
+}
+
+#[export_name = "node_api_create_external_string_latin1"]
+pub unsafe extern "C" fn node_api_create_external_string_latin1(
+    env: *mut NapiEnv,
+    str: *mut c_char,
+    length: usize,
+    finalize_callback: crate::abi::NapiBasicFinalize,
+    finalize_hint: *mut c_void,
+    result: *mut *mut NapiValue,
+    copied: *mut bool,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe {
+        external_string(
+            env,
+            str.cast(),
+            length,
+            finalize_callback,
+            finalize_hint,
+            result,
+            copied,
+            false,
+        )
+    }
+}
+
+#[export_name = "node_api_create_external_string_utf16"]
+pub unsafe extern "C" fn node_api_create_external_string_utf16(
+    env: *mut NapiEnv,
+    str: *mut u16,
+    length: usize,
+    finalize_callback: crate::abi::NapiBasicFinalize,
+    finalize_hint: *mut c_void,
+    result: *mut *mut NapiValue,
+    copied: *mut bool,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe {
+        external_string(
+            env,
+            str.cast(),
+            length,
+            finalize_callback,
+            finalize_hint,
+            result,
+            copied,
+            true,
+        )
+    }
+}
+
+/// Creates an internalized string, which is what a Node-API property key is.
+///
+/// The only difference from `napi_create_string_*` is `NewStringType::Internalized`
+/// rather than `Normal`: it makes V8 store the copy in its string table, so a later
+/// `napi_set_property` with this key takes the cached-key path. Node's
+/// implementation is the same constructor with the other `NewStringType`
+/// (`js_native_api_v8.cc:1778-1810`).
+///
+/// # Safety
+///
+/// `scope` must be live and `text` readable for `length` units.
+fn internalized<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    text: &[u8],
+    one_byte: bool,
+) -> Result<*mut NapiValue, NapiStatus> {
+    let string = if one_byte {
+        v8::String::new_from_one_byte(scope, text, v8::NewStringType::Internalized)
+    } else {
+        v8::String::new_from_utf8(scope, text, v8::NewStringType::Internalized)
+    }
+    .ok_or(NapiStatus::GenericFailure)?;
+    Ok(to_napi(string.into()))
+}
+
+#[export_name = "node_api_create_property_key_utf8"]
+pub unsafe extern "C" fn node_api_create_property_key_utf8(
+    env: *mut NapiEnv,
+    str: *const c_char,
+    length: usize,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let Some(bytes) = read_bytes(str, length) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| internalized(scope, &bytes, false),
+    )
+}
+
+#[export_name = "node_api_create_property_key_latin1"]
+pub unsafe extern "C" fn node_api_create_property_key_latin1(
+    env: *mut NapiEnv,
+    str: *const c_char,
+    length: usize,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let Some(bytes) = read_bytes(str, length) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| internalized(scope, &bytes, true),
+    )
+}
+
+#[export_name = "node_api_create_property_key_utf16"]
+pub unsafe extern "C" fn node_api_create_property_key_utf16(
+    env: *mut NapiEnv,
+    str: *const u16,
+    length: usize,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let Some(units) = read_units(str, length) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            let text =
+                v8::String::new_from_two_byte(scope, &units, v8::NewStringType::Internalized)
+                    .ok_or(NapiStatus::GenericFailure)?;
             Ok(to_napi(text.into()))
         },
     )
@@ -681,9 +1140,1539 @@ pub unsafe extern "C" fn napi_get_value_bool(
     )
 }
 
-/// The shared body of the two `napi_get_value_string_*` entries.
+#[export_name = "napi_create_bigint_int64"]
+pub unsafe extern "C" fn napi_create_bigint_int64(
+    env: *mut NapiEnv,
+    value: i64,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            // A `BigInt`, not a JS number: `napi_create_int64` is the double one.
+            let big = v8::BigInt::new_from_i64(scope, value);
+            Ok(to_napi(big.into()))
+        },
+    )
+}
+
+#[export_name = "napi_create_bigint_uint64"]
+pub unsafe extern "C" fn napi_create_bigint_uint64(
+    env: *mut NapiEnv,
+    value: u64,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            let big = v8::BigInt::new_from_u64(scope, value);
+            Ok(to_napi(big.into()))
+        },
+    )
+}
+
+#[export_name = "napi_create_bigint_words"]
+pub unsafe extern "C" fn napi_create_bigint_words(
+    env: *mut NapiEnv,
+    sign_bit: i32,
+    word_count: usize,
+    words: *const u64,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // Node rejects a null `words` even for a zero count
+    // (`js_native_api_v8.cc:1891-1893`), which is stricter than the string
+    // constructors and is what an addon's `napi_create_bigint_words(env, 0, 0,
+    // nullptr, ...)` hits.
+    if words.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let Ok(count) = i32::try_from(word_count) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    // SAFETY: the caller declared `word_count` readable words.
+    let limbs = unsafe { std::slice::from_raw_parts(words, word_count) };
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            let _ = count;
+            let big = v8::BigInt::new_from_words(scope, sign_bit != 0, limbs)
+                .ok_or(NapiStatus::GenericFailure)?;
+            Ok(to_napi(big.into()))
+        },
+    )
+}
+
+#[export_name = "napi_get_value_bigint_int64"]
+pub unsafe extern "C" fn napi_get_value_bigint_int64(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut i64,
+    lossless: *mut bool,
+) -> NapiStatus {
+    if value.is_null() || result.is_null() || lossless.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|_| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(value) }?;
+        let big =
+            v8::Local::<v8::BigInt>::try_from(local).map_err(|_| NapiStatus::BigintExpected)?;
+        Ok(big.i64_value())
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok((number, exact))) => {
+            // SAFETY: both caller slots are writable for their types.
+            unsafe {
+                result.write(number);
+                lossless.write(exact);
+            }
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "napi_get_value_bigint_uint64"]
+pub unsafe extern "C" fn napi_get_value_bigint_uint64(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut u64,
+    lossless: *mut bool,
+) -> NapiStatus {
+    if value.is_null() || result.is_null() || lossless.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|_| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(value) }?;
+        let big =
+            v8::Local::<v8::BigInt>::try_from(local).map_err(|_| NapiStatus::BigintExpected)?;
+        Ok(big.u64_value())
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok((number, exact))) => {
+            // SAFETY: both caller slots are writable for their types.
+            unsafe {
+                result.write(number);
+                lossless.write(exact);
+            }
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "napi_get_value_bigint_words"]
+pub unsafe extern "C" fn napi_get_value_bigint_words(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    sign_bit: *mut i32,
+    word_count: *mut usize,
+    words: *mut u64,
+) -> NapiStatus {
+    if value.is_null() || word_count.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // Node requires both out parameters or neither
+    // (`js_native_api_v8.cc:2470-2476`): one without the other is a caller bug,
+    // and the "how many words?" query form is exactly the pair being null.
+    let query = sign_bit.is_null() && words.is_null();
+    if !query && (sign_bit.is_null() || words.is_null()) {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|_| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(value) }?;
+        let big =
+            v8::Local::<v8::BigInt>::try_from(local).map_err(|_| NapiStatus::BigintExpected)?;
+        if query {
+            return Ok((big.word_count(), true, Vec::new()));
+        }
+        // SAFETY: `word_count` was checked non-null above and is an in/out
+        // parameter: on entry it is the caller's buffer capacity.
+        let capacity = unsafe { word_count.read() };
+        let mut buffer = vec![0u64; capacity];
+        // `to_words_array` truncates to the buffer it is given, so a short buffer
+        // yields the low words and the count that fits — which is V8's own
+        // `ToWordsArray` contract, and what Node reports back through
+        // `*word_count`.
+        let (negative, written) = big.to_words_array(&mut buffer);
+        Ok((written.len(), negative, buffer))
+    });
+    let (count, negative, buffer) = match outcome {
+        None => return status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => return status(env, failure),
+        Some(Ok(result)) => result,
+    };
+    // SAFETY: `word_count` is non-null; in the non-query form the caller declared
+    // both remaining slots, and `buffer` holds at most `*word_count` words.
+    unsafe {
+        word_count.write(count);
+        if !query {
+            sign_bit.write(i32::from(negative));
+            std::ptr::copy_nonoverlapping(buffer.as_ptr(), words, count);
+        }
+    }
+    status(env, NapiStatus::Ok)
+}
+
+// ---------------------------------------------------------------------------
+// Coercion, comparison and object identity
+// ---------------------------------------------------------------------------
+
+#[export_name = "napi_coerce_to_bool"]
+pub unsafe extern "C" fn napi_coerce_to_bool(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if value.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            // SAFETY: the handle comes from the current scope.
+            let local = unsafe { as_value(value) }?;
+            // `ToBoolean` cannot run user JavaScript and cannot throw, which is
+            // why Node reaches it before its exception bookkeeping.
+            let boolean = local.to_boolean(scope);
+            Ok(to_napi(boolean.into()))
+        },
+    )
+}
+
+/// `napi_coerce_to_number`, `napi_coerce_to_object` and `napi_coerce_to_string`.
 ///
-/// Node's contract, reproduced exactly: with no buffer the caller is asking for
+/// These three *can* run user JavaScript — a `valueOf`, a `toString`, a `Proxy`
+/// trap — so unlike `napi_coerce_to_bool` they go through `NAPI_PREAMBLE` in Node:
+/// a pending exception must be reported rather than produced as a broken value.
+/// Each returns `napi_pending_exception` in that case, which is what
+/// [`pending_exception_status`] does here.
+///
+/// # Safety
+///
+/// `value` must be a handle from the current scope and `result` writable for one
+/// pointer.
+unsafe fn coerce(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut *mut NapiValue,
+    convert: for<'s> fn(
+        &mut v8::PinScope<'s, '_>,
+        v8::Local<'s, v8::Value>,
+    ) -> Option<v8::Local<'s, v8::Value>>,
+) -> NapiStatus {
+    if value.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(value) }?;
+        convert(scope, local).ok_or(NapiStatus::PendingException)
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        // A `None` from the conversion is V8 refusing, which for these three is
+        // always a thrown exception from the addon's own `valueOf`. Node reports
+        // `napi_pending_exception`; the exception flag is set so
+        // `napi_is_exception_pending` agrees.
+        Some(Err(NapiStatus::PendingException)) => status(env, pending_exception_status(env)),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(converted)) => {
+            // SAFETY: the caller passed a writable slot.
+            unsafe { store(result, to_napi(converted)) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "napi_coerce_to_number"]
+pub unsafe extern "C" fn napi_coerce_to_number(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe {
+        coerce(env, value, result, |scope, local| {
+            local.to_number(scope).map(Into::into)
+        })
+    }
+}
+
+#[export_name = "napi_coerce_to_object"]
+pub unsafe extern "C" fn napi_coerce_to_object(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe {
+        coerce(env, value, result, |scope, local| {
+            local.to_object(scope).map(Into::into)
+        })
+    }
+}
+
+#[export_name = "napi_coerce_to_string"]
+pub unsafe extern "C" fn napi_coerce_to_string(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe {
+        coerce(env, value, result, |scope, local| {
+            local.to_string(scope).map(Into::into)
+        })
+    }
+}
+
+#[export_name = "napi_strict_equals"]
+pub unsafe extern "C" fn napi_strict_equals(
+    env: *mut NapiEnv,
+    lhs: *mut NapiValue,
+    rhs: *mut NapiValue,
+    result: *mut bool,
+) -> NapiStatus {
+    if lhs.is_null() || rhs.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|_| {
+        // SAFETY: both handles come from the current scope.
+        let left = unsafe { as_value(lhs) }?;
+        // SAFETY: as above.
+        let right = unsafe { as_value(rhs) }?;
+        Ok(left.strict_equals(right))
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(same)) => {
+            // SAFETY: the caller passed a writable slot for one bool.
+            unsafe { result.write(same) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "napi_instanceof"]
+pub unsafe extern "C" fn napi_instanceof(
+    env: *mut NapiEnv,
+    object: *mut NapiValue,
+    constructor: *mut NapiValue,
+    result: *mut bool,
+) -> NapiStatus {
+    if object.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // Node coerces the constructor to an object and then requires it to be a
+    // function, throwing a `TypeError` and reporting `napi_function_expected` when
+    // it is not (`js_native_api_v8.cc:3042-3052`). Both halves matter: an addon
+    // checks the status and the message separately.
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let value = unsafe { as_value(object) }?;
+        // SAFETY: as above.
+        let candidate = unsafe { as_value(constructor) }?;
+        let Some(coerced) = candidate.to_object(scope) else {
+            return Err(pending_exception_status(env));
+        };
+        if !coerced.is_function() {
+            throw_coded(
+                env,
+                c"ERR_NAPI_CONS_FUNCTION".as_ptr(),
+                c"Constructor must be a function".as_ptr(),
+                ErrorKind::Type,
+            );
+            return Err(NapiStatus::FunctionExpected);
+        }
+        // `instance_of` runs `[[HasInstance]]`, which can invoke a
+        // `Symbol.hasInstance`; a refusal is again a pending exception.
+        value
+            .instance_of(scope, coerced)
+            .ok_or(NapiStatus::PendingException)
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(NapiStatus::PendingException)) => status(env, pending_exception_status(env)),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(is)) => {
+            // SAFETY: the caller passed a writable slot for one bool.
+            unsafe { result.write(is) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "node_api_set_prototype"]
+pub unsafe extern "C" fn node_api_set_prototype(
+    env: *mut NapiEnv,
+    object: *mut NapiValue,
+    value: *mut NapiValue,
+) -> NapiStatus {
+    if value.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    run_unit(env, |scope| {
+        // SAFETY: both handles come from the current scope.
+        let target = unsafe { as_object(object) }.or_else(|_| {
+            // Node coerces the target to an object first, so a primitive is
+            // wrapped rather than rejected.
+            // SAFETY: as above.
+            let local = unsafe { as_value(object) }?;
+            local.to_object(scope).ok_or(NapiStatus::ObjectExpected)
+        })?;
+        // SAFETY: as above.
+        let prototype = unsafe { as_value(value) }?;
+        match target.set_prototype(scope, prototype) {
+            Some(true) => Ok(()),
+            _ => Err(NapiStatus::GenericFailure),
+        }
+    })
+}
+
+#[export_name = "napi_object_freeze"]
+pub unsafe extern "C" fn napi_object_freeze(
+    env: *mut NapiEnv,
+    object: *mut NapiValue,
+) -> NapiStatus {
+    integrity(env, object, v8::IntegrityLevel::Frozen)
+}
+
+#[export_name = "napi_object_seal"]
+pub unsafe extern "C" fn napi_object_seal(env: *mut NapiEnv, object: *mut NapiValue) -> NapiStatus {
+    integrity(env, object, v8::IntegrityLevel::Sealed)
+}
+
+/// The shared body of `napi_object_freeze` and `napi_object_seal`.
+///
+/// Both are one `SetIntegrityLevel` call in Node
+/// (`js_native_api_v8.cc:1496-1528`), reached after `CHECK_TO_OBJECT`, which is a
+/// coercion rather than a rejection. `set_integrity_level` returns `None` both for
+/// a refusal and for a thrown exception (a `Proxy`'s `preventExtensions` trap can
+/// throw), so a `None` is reported as a pending exception when V8 left one and as
+/// `napi_generic_failure` otherwise — which is how Node's
+/// `RETURN_STATUS_IF_FALSE_WITH_PREAMBLE` behaves.
+fn integrity(env: *mut NapiEnv, object: *mut NapiValue, level: v8::IntegrityLevel) -> NapiStatus {
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(object) }?;
+        let target = local.to_object(scope).ok_or(NapiStatus::ObjectExpected)?;
+        match target.set_integrity_level(scope, level) {
+            Some(true) => Ok(()),
+            _ => Err(NapiStatus::GenericFailure),
+        }
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(())) => status(env, NapiStatus::Ok),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Symbols, dates and promises
+// ---------------------------------------------------------------------------
+
+#[export_name = "napi_create_symbol"]
+pub unsafe extern "C" fn napi_create_symbol(
+    env: *mut NapiEnv,
+    description: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            if description.is_null() {
+                let symbol = v8::Symbol::new(scope, None);
+                return Ok(to_napi(symbol.into()));
+            }
+            // SAFETY: the handle comes from the current scope.
+            let text = unsafe { as_string(description) }.map_err(|_| NapiStatus::StringExpected)?;
+            let symbol = v8::Symbol::new(scope, Some(text));
+            Ok(to_napi(symbol.into()))
+        },
+    )
+}
+
+#[export_name = "node_api_symbol_for"]
+pub unsafe extern "C" fn node_api_symbol_for(
+    env: *mut NapiEnv,
+    utf8description: *const c_char,
+    length: usize,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let Some(bytes) = read_bytes(utf8description, length) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            let text = v8::String::new_from_utf8(scope, &bytes, v8::NewStringType::Normal)
+                .ok_or(NapiStatus::GenericFailure)?;
+            // `for_key`, not `for_api`: `node_api_symbol_for` is
+            // `Symbol.for`'s registry, which JavaScript can also reach. `for_api`
+            // is the separate registry Node uses for its own internal symbols.
+            let symbol = v8::Symbol::for_key(scope, text);
+            Ok(to_napi(symbol.into()))
+        },
+    )
+}
+
+#[export_name = "napi_create_date"]
+pub unsafe extern "C" fn napi_create_date(
+    env: *mut NapiEnv,
+    time: f64,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            // `Date::new` returns `None` for a time value out of the ECMAScript
+            // range, which Node reports as `napi_generic_failure`.
+            let date = v8::Date::new(scope, time).ok_or(NapiStatus::GenericFailure)?;
+            Ok(to_napi(date.into()))
+        },
+    )
+}
+
+#[export_name = "napi_is_date"]
+pub unsafe extern "C" fn napi_is_date(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    is_date: *mut bool,
+) -> NapiStatus {
+    predicate(env, value, is_date, |local| local.is_date())
+}
+
+#[export_name = "napi_get_date_value"]
+pub unsafe extern "C" fn napi_get_date_value(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut f64,
+) -> NapiStatus {
+    if value.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|_| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(value) }?;
+        let date = v8::Local::<v8::Date>::try_from(local).map_err(|_| NapiStatus::DateExpected)?;
+        Ok(date.value_of())
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(time)) => {
+            // SAFETY: the caller passed a writable slot for one double.
+            unsafe { result.write(time) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "napi_create_promise"]
+pub unsafe extern "C" fn napi_create_promise(
+    env: *mut NapiEnv,
+    deferred: *mut *mut crate::abi::NapiDeferred,
+    promise: *mut *mut NapiValue,
+) -> NapiStatus {
+    if deferred.is_null() || promise.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    let outcome = in_scope(|scope| {
+        let resolver = v8::PromiseResolver::new(scope).ok_or(NapiStatus::GenericFailure)?;
+        let handle = to_napi(resolver.get_promise(scope).into());
+        // The resolver is rooted so the addon can settle it after this call
+        // returns, which is the whole point of a deferred: resolved from a promise
+        // executor's escape, a timer, or a thread.
+        let rooted = v8::Global::new(scope, resolver);
+        Ok((handle, rooted))
+    });
+    let Some(Ok((handle, rooted))) = outcome else {
+        return match outcome {
+            None => status(env, NapiStatus::HandleScopeMismatch),
+            Some(Err(failure)) => status(env, failure),
+            Some(Ok(_)) => status(env, NapiStatus::GenericFailure),
+        };
+    };
+    // The resolver is rooted in the environment's deferred table so the addon can
+    // settle it after this call returns, which is the whole point of a deferred:
+    // resolved from a promise executor's escape, a timer, or another thread.
+    let reference = environment.add_deferred(rooted);
+    // SAFETY: both caller slots are writable for one pointer.
+    unsafe {
+        deferred.write(reference);
+        store(promise, handle);
+    }
+    status(env, NapiStatus::Ok)
+}
+
+/// `napi_resolve_deferred` and `napi_reject_deferred`.
+///
+/// Both settle the promise the deferred was created with and release the reference
+/// that kept the resolver alive, which is Node's `ConcludeDeferred`
+/// (`js_native_api_v8.cc:309-334`): `delete deferred_ref` there is the
+/// `delete_ref` here.
+///
+/// # Safety
+///
+/// `deferred` must be a handle from `napi_create_promise` and `resolution` a handle
+/// from the current scope.
+unsafe fn conclude_deferred(
+    env: *mut NapiEnv,
+    deferred: *mut crate::abi::NapiDeferred,
+    resolution: *mut NapiValue,
+    resolve: bool,
+) -> NapiStatus {
+    if deferred.is_null() || resolution.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    // Taking the resolver is what makes a second settle fail rather than silently
+    // do nothing twice: Node deletes the persistent on every path.
+    let Some(resolver) = environment.take_deferred(deferred) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    let outcome = in_scope(|scope| {
+        let resolver = v8::Local::new(scope, &resolver);
+        // SAFETY: the handle comes from the current scope.
+        let value = unsafe { as_value(resolution) }?;
+        let settled = if resolve {
+            resolver.resolve(scope, value)
+        } else {
+            resolver.reject(scope, value)
+        };
+        settled.map(|_| ()).ok_or(NapiStatus::GenericFailure)
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(())) => status(env, NapiStatus::Ok),
+    }
+}
+
+#[export_name = "napi_resolve_deferred"]
+pub unsafe extern "C" fn napi_resolve_deferred(
+    env: *mut NapiEnv,
+    deferred: *mut crate::abi::NapiDeferred,
+    resolution: *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe { conclude_deferred(env, deferred, resolution, true) }
+}
+
+#[export_name = "napi_reject_deferred"]
+pub unsafe extern "C" fn napi_reject_deferred(
+    env: *mut NapiEnv,
+    deferred: *mut crate::abi::NapiDeferred,
+    resolution: *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe { conclude_deferred(env, deferred, resolution, false) }
+}
+
+#[export_name = "napi_is_promise"]
+pub unsafe extern "C" fn napi_is_promise(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    is_promise: *mut bool,
+) -> NapiStatus {
+    predicate(env, value, is_promise, |local| local.is_promise())
+}
+
+#[export_name = "napi_has_own_property"]
+pub unsafe extern "C" fn napi_has_own_property(
+    env: *mut NapiEnv,
+    object: *mut NapiValue,
+    key: *mut NapiValue,
+    result: *mut bool,
+) -> NapiStatus {
+    if key.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|scope| {
+        // Node coerces the target and requires the key to be a name, rejecting a
+        // number with `napi_name_expected` rather than converting it
+        // (`js_native_api_v8.cc:1250-1255`).
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(object) }?;
+        let target = local.to_object(scope).ok_or(NapiStatus::ObjectExpected)?;
+        // SAFETY: as above.
+        let key_local = unsafe { as_value(key) }?;
+        let name =
+            v8::Local::<v8::Name>::try_from(key_local).map_err(|_| NapiStatus::NameExpected)?;
+        target
+            .has_own_property(scope, name)
+            .ok_or(NapiStatus::GenericFailure)
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(has)) => {
+            // SAFETY: the caller passed a writable slot for one bool.
+            unsafe { result.write(has) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "napi_delete_element"]
+pub unsafe extern "C" fn napi_delete_element(
+    env: *mut NapiEnv,
+    object: *mut NapiValue,
+    index: u32,
+    result: *mut bool,
+) -> NapiStatus {
+    // The one entry point in this family whose `result` is genuinely optional:
+    // Node only writes it when it is non-null (`js_native_api_v8.cc:1408`).
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(object) }?;
+        let target = local.to_object(scope).ok_or(NapiStatus::ObjectExpected)?;
+        target
+            .delete_index(scope, index)
+            .ok_or(NapiStatus::GenericFailure)
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(deleted)) => {
+            if !result.is_null() {
+                // SAFETY: the caller passed a writable slot or null.
+                unsafe { result.write(deleted) };
+            }
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "napi_adjust_external_memory"]
+pub unsafe extern "C" fn napi_adjust_external_memory(
+    env: *mut NapiEnv,
+    change_in_bytes: i64,
+    adjusted_value: *mut i64,
+) -> NapiStatus {
+    if adjusted_value.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // V8 answers with the new total, which Node passes straight through. The
+    // negative case is clamped by V8 rather than refused, so there is no failure
+    // path here beyond the scope check.
+    let Some(total) =
+        in_scope(|scope| scope.adjust_amount_of_external_allocated_memory(change_in_bytes))
+    else {
+        return status(env, NapiStatus::HandleScopeMismatch);
+    };
+    // SAFETY: the caller passed a writable slot for one i64.
+    unsafe { adjusted_value.write(total) };
+    status(env, NapiStatus::Ok)
+}
+
+#[export_name = "napi_detach_arraybuffer"]
+pub unsafe extern "C" fn napi_detach_arraybuffer(
+    env: *mut NapiEnv,
+    arraybuffer: *mut NapiValue,
+) -> NapiStatus {
+    if arraybuffer.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|_| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(arraybuffer) }?;
+        if !local.is_array_buffer() {
+            return Err(NapiStatus::ArrayBufferExpected);
+        }
+        let buffer = v8::Local::<v8::ArrayBuffer>::try_from(local)
+            .map_err(|_| NapiStatus::ArrayBufferExpected)?;
+        // Node reports `napi_detachable_arraybuffer_expected` for a buffer V8 has
+        // pinned (one in use by WebAssembly), which is a distinct status an addon
+        // can branch on.
+        if !buffer.is_detachable() {
+            return Err(NapiStatus::DetachableArraybufferExpected);
+        }
+        match buffer.detach(None) {
+            Some(_) => Ok(()),
+            None => Err(NapiStatus::GenericFailure),
+        }
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(())) => status(env, NapiStatus::Ok),
+    }
+}
+
+#[export_name = "napi_is_detached_arraybuffer"]
+pub unsafe extern "C" fn napi_is_detached_arraybuffer(
+    env: *mut NapiEnv,
+    arraybuffer: *mut NapiValue,
+    result: *mut bool,
+) -> NapiStatus {
+    // Node's answer for a non-`ArrayBuffer` is `false`, not an error
+    // (`js_native_api_v8.cc:3744`): the predicate is total.
+    predicate(env, arraybuffer, result, |local| {
+        local.is_array_buffer()
+            && v8::Local::<v8::ArrayBuffer>::try_from(*local)
+                .map(|buffer| buffer.was_detached())
+                .unwrap_or(false)
+    })
+}
+
+#[export_name = "napi_get_property_names"]
+pub unsafe extern "C" fn napi_get_property_names(
+    env: *mut NapiEnv,
+    object: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // `napi_get_property_names` is a fixed argument choice over
+    // `napi_get_all_property_names` in Node (`js_native_api_v8.cc:1066-1076`):
+    // include prototypes, enumerable and skip symbols, numbers to strings.
+    // SAFETY: forwarded with the same contract the caller upholds.
+    unsafe {
+        all_property_names(
+            env,
+            object,
+            KEY_MODE_INCLUDE_PROTOTYPES,
+            (KEY_FILTER_ENUMERABLE | KEY_FILTER_SKIP_SYMBOLS) as i32,
+            KEY_CONVERSION_NUMBERS_TO_STRINGS,
+            result,
+        )
+    }
+}
+
+// `napi_key_collection_mode`, `napi_key_filter` and `napi_key_conversion`'s
+// values, from `js_native_api_types.h`. They are ABI, so they are named rather
+// than inlined as literals.
+const KEY_MODE_INCLUDE_PROTOTYPES: i32 = 0;
+const KEY_MODE_OWN_ONLY: i32 = 1;
+const KEY_FILTER_WRITABLE: u32 = 1 << 0;
+const KEY_FILTER_ENUMERABLE: u32 = 1 << 1;
+const KEY_FILTER_CONFIGURABLE: u32 = 1 << 2;
+const KEY_FILTER_SKIP_STRINGS: u32 = 1 << 3;
+const KEY_FILTER_SKIP_SYMBOLS: u32 = 1 << 4;
+const KEY_CONVERSION_KEEP_NUMBERS: i32 = 0;
+const KEY_CONVERSION_NUMBERS_TO_STRINGS: i32 = 1;
+
+#[export_name = "napi_get_all_property_names"]
+pub unsafe extern "C" fn napi_get_all_property_names(
+    env: *mut NapiEnv,
+    object: *mut NapiValue,
+    key_mode: i32,
+    key_filter: i32,
+    key_conversion: i32,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe { all_property_names(env, object, key_mode, key_filter, key_conversion, result) }
+}
+
+/// The shared body of `napi_get_property_names` and `napi_get_all_property_names`.
+///
+/// The filter bits map one-for-one onto `v8::PropertyFilter`, which is why this is
+/// expressible at all: Node's four `switch`/`if` blocks
+/// (`js_native_api_v8.cc:1092-1140`) only translate the Node-API enumerations.
+/// An unknown enumeration value is `napi_invalid_arg` rather than a guess.
+///
+/// # Safety
+///
+/// `object` must be a handle from the current scope and `result` writable for one
+/// pointer.
+unsafe fn all_property_names(
+    env: *mut NapiEnv,
+    object: *mut NapiValue,
+    key_mode: i32,
+    key_filter: i32,
+    key_conversion: i32,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    use v8::{
+        GetPropertyNamesArgs, IndexFilter, KeyCollectionMode, KeyConversionMode, PropertyFilter,
+    };
+
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let mode = match key_mode {
+        KEY_MODE_INCLUDE_PROTOTYPES => KeyCollectionMode::IncludePrototypes,
+        KEY_MODE_OWN_ONLY => KeyCollectionMode::OwnOnly,
+        _ => return status(env, NapiStatus::InvalidArg),
+    };
+    let conversion = match key_conversion {
+        KEY_CONVERSION_KEEP_NUMBERS => KeyConversionMode::KeepNumbers,
+        KEY_CONVERSION_NUMBERS_TO_STRINGS => KeyConversionMode::ConvertToString,
+        _ => return status(env, NapiStatus::InvalidArg),
+    };
+    // `napi_key_filter` is a bit set, so an unmatched bit is a refusal rather than
+    // something to ignore: silently dropping it would return keys the addon asked
+    // to exclude.
+    let bits = key_filter as u32;
+    const KNOWN: u32 = KEY_FILTER_WRITABLE
+        | KEY_FILTER_ENUMERABLE
+        | KEY_FILTER_CONFIGURABLE
+        | KEY_FILTER_SKIP_STRINGS
+        | KEY_FILTER_SKIP_SYMBOLS;
+    if bits & !KNOWN != 0 {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let mut filter = PropertyFilter::ALL_PROPERTIES;
+    if bits & KEY_FILTER_WRITABLE != 0 {
+        filter = filter | PropertyFilter::ONLY_WRITABLE;
+    }
+    if bits & KEY_FILTER_ENUMERABLE != 0 {
+        filter = filter | PropertyFilter::ONLY_ENUMERABLE;
+    }
+    if bits & KEY_FILTER_CONFIGURABLE != 0 {
+        filter = filter | PropertyFilter::ONLY_CONFIGURABLE;
+    }
+    if bits & KEY_FILTER_SKIP_STRINGS != 0 {
+        filter = filter | PropertyFilter::SKIP_STRINGS;
+    }
+    if bits & KEY_FILTER_SKIP_SYMBOLS != 0 {
+        filter = filter | PropertyFilter::SKIP_SYMBOLS;
+    }
+    let args = GetPropertyNamesArgs {
+        mode,
+        property_filter: filter,
+        index_filter: IndexFilter::IncludeIndices,
+        key_conversion: conversion,
+    };
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(object) }?;
+        let target = local.to_object(scope).ok_or(NapiStatus::ObjectExpected)?;
+        let names = target
+            .get_property_names(scope, args)
+            .ok_or(NapiStatus::GenericFailure)?;
+        Ok(to_napi(names.into()))
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(handle)) => {
+            // SAFETY: the caller passed a writable slot.
+            unsafe { store(result, handle) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+/// The `napi_property_attributes` bits as V8's `PropertyAttribute`.
+///
+/// Two things are easy to get wrong here and both are load-bearing:
+///
+/// * The two enums are **inverted**: Node-API bits mark what a property *has*, V8
+///   bits mark what it *lacks*.
+/// * `napi_writable` is **ignored for accessor descriptors** — a descriptor with a
+///   getter or a setter never gets `READ_ONLY`, even though
+///   `napi_default` (0) has no writable bit. V8 rejects an assignment to a
+///   read-only accessor before consulting the setter, so a "read-only" accessor
+///   silently stops the setter from running. Node's comment says as much:
+///   "V8 would throw `TypeError`s on assignment with nonexistence of a setter"
+///   (`js_native_api_v8.cc:234-238`). Verified against the oracle: with
+///   `napi_default` and this bit mis-set, `o.label = 'x'` left the value unchanged
+///   in rustnode and updated it in Node.
+///
+/// `napi_static` (bit 10) is not a property attribute at all — `napi_define_class`
+/// handles it separately — so it is masked out by the caller.
+fn v8_attributes(attributes: u32) -> v8::PropertyAttribute {
+    use crate::abi::property_attributes as bits;
+    let mut result = v8::PropertyAttribute::NONE;
+    if attributes & bits::WRITABLE == 0 {
+        result = result | v8::PropertyAttribute::READ_ONLY;
+    }
+    if attributes & bits::ENUMERABLE == 0 {
+        result = result | v8::PropertyAttribute::DONT_ENUM;
+    }
+    if attributes & bits::CONFIGURABLE == 0 {
+        result = result | v8::PropertyAttribute::DONT_DELETE;
+    }
+    result
+}
+
+/// The V8 attributes for a **template accessor**, where `napi_writable` is ignored.
+///
+/// See [`v8_attributes`] for why the writable bit must not become `READ_ONLY` here.
+fn accessor_attributes(attributes: u32) -> v8::PropertyAttribute {
+    use crate::abi::property_attributes as bits;
+    v8_attributes(attributes | bits::WRITABLE)
+}
+
+#[export_name = "napi_define_class"]
+pub unsafe extern "C" fn napi_define_class(
+    env: *mut NapiEnv,
+    utf8name: *const c_char,
+    length: usize,
+    constructor: crate::abi::NapiCallback,
+    callback_data: *mut c_void,
+    property_count: usize,
+    properties: *const crate::abi::NapiPropertyDescriptor,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    use crate::abi::property_attributes as bits;
+
+    if result.is_null() || constructor.is_none() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    if property_count > 0 && properties.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let Some(name) = read_text(utf8name, length) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    let outcome = in_scope(|scope| {
+        let template = build_template(scope, constructor, callback_data, env, None);
+        if let Some(class_name) = v8::String::new(scope, &name) {
+            template.set_class_name(class_name);
+        }
+        let prototype = template.prototype_template(scope);
+
+        let mut statics: Vec<crate::abi::NapiPropertyDescriptor> = Vec::new();
+        for index in 0..property_count {
+            // SAFETY: the caller declared `property_count` descriptors, which is
+            // `napi_define_class`'s contract.
+            let descriptor = unsafe { &*properties.add(index) };
+            if descriptor.attributes & bits::STATIC != 0 {
+                // Node collects these and applies them to the constructor with
+                // `napi_define_properties` afterwards, because an `ObjectTemplate`
+                // cannot express a static value on the function itself.
+                statics.push(crate::abi::NapiPropertyDescriptor {
+                    utf8name: descriptor.utf8name,
+                    name: descriptor.name,
+                    method: descriptor.method,
+                    getter: descriptor.getter,
+                    setter: descriptor.setter,
+                    value: descriptor.value,
+                    attributes: descriptor.attributes & !bits::STATIC,
+                    data: descriptor.data,
+                });
+                continue;
+            }
+            let property_name = descriptor_name(scope, descriptor)?;
+            let attributes = v8_attributes(descriptor.attributes);
+            if descriptor.getter.is_some() || descriptor.setter.is_some() {
+                // Node builds a getter/setter `FunctionTemplate` pair and installs
+                // it with `PrototypeTemplate()->SetAccessorProperty`
+                // (`js_native_api_v8.cc:1018-1031`). That is a template-level
+                // accessor whose callbacks are ordinary functions, so no
+                // `PropertyCallbackInfo::This()` binding is needed.
+                let getter = descriptor.getter.map(|callback| {
+                    build_template(scope, Some(callback), descriptor.data, env, None)
+                });
+                let setter = descriptor.setter.map(|callback| {
+                    build_template(scope, Some(callback), descriptor.data, env, None)
+                });
+                if getter.is_none() && setter.is_none() {
+                    return Err(NapiStatus::InvalidArg);
+                }
+                prototype.set_accessor_property(
+                    property_name,
+                    getter,
+                    setter,
+                    accessor_attributes(descriptor.attributes),
+                );
+                continue;
+            }
+            if let Some(method) = descriptor.method {
+                // The signature is what makes an instance method reject a receiver
+                // that was not built from this template, which is Node's
+                // `v8::Signature::New(isolate, tpl)`.
+                let signature = v8::Signature::new(scope, template);
+                let method_template =
+                    build_template(scope, Some(method), descriptor.data, env, Some(signature));
+                prototype.set_with_attr(property_name, method_template.into(), attributes);
+                continue;
+            }
+            // SAFETY: `descriptor.value` is a `napi_value` from the current scope.
+            let value = unsafe { as_value(descriptor.value) }?;
+            prototype.set_with_attr(property_name, value.into(), attributes);
+        }
+
+        let function = template
+            .get_function(scope)
+            .ok_or(NapiStatus::GenericFailure)?;
+        let handle = to_napi(function.into());
+        Ok((handle, statics))
+    });
+    let Some(Ok((handle, statics))) = outcome else {
+        return match outcome {
+            None => status(env, NapiStatus::HandleScopeMismatch),
+            Some(Err(failure)) => status(env, failure),
+            Some(Ok(_)) => status(env, NapiStatus::GenericFailure),
+        };
+    };
+    // SAFETY: the caller passed a writable slot.
+    unsafe { store(result, handle) };
+    // Node applies the static descriptors to the finished constructor, so a static
+    // method can be called as `Class.method()`.
+    if !statics.is_empty() {
+        let status =
+            unsafe { napi_define_properties(env, handle, statics.len(), statics.as_ptr()) };
+        if status != NapiStatus::Ok {
+            return status;
+        }
+    }
+    status(env, NapiStatus::Ok)
+}
+
+#[export_name = "napi_new_instance"]
+pub unsafe extern "C" fn napi_new_instance(
+    env: *mut NapiEnv,
+    constructor: *mut NapiValue,
+    argc: usize,
+    argv: *const *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if constructor.is_null() || result.is_null() || (argc > 0 && argv.is_null()) {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let function = unsafe { as_function(constructor) }?;
+        let mut arguments = Vec::with_capacity(argc);
+        for index in 0..argc {
+            // SAFETY: `argv` holds `argc` handles by the caller's contract.
+            let handle = unsafe { *argv.add(index) };
+            // SAFETY: each is a handle from this scope.
+            arguments.push(unsafe { as_value(handle) }?);
+        }
+        // A constructor that throws returns `None`; Node reports that as a pending
+        // exception rather than a generic failure, so an addon's `NODE_API_CALL`
+        // lets the real error propagate.
+        let instance = function
+            .new_instance(scope, &arguments)
+            .ok_or(NapiStatus::PendingException)?;
+        Ok(to_napi(instance.into()))
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(NapiStatus::PendingException)) => status(env, pending_exception_status(env)),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(handle)) => {
+            // SAFETY: the caller passed a writable slot.
+            unsafe { store(result, handle) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+/// Builds a `FunctionTemplate` around an addon callback.
+///
+/// Every template in this crate carries the same data slot — a boxed
+/// [`crate::callback::CallbackData`] — so `invoke_addon_callback` recovers the
+/// addon's `napi_callback`, its `void* data` and its `napi_env` from whichever
+/// template V8 called through. That is the same mechanism `napi_create_function`
+/// uses, which is why a class constructor and a plain function behave alike.
+fn build_template<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    callback: crate::abi::NapiCallback,
+    data: *mut c_void,
+    env: *mut NapiEnv,
+    signature: Option<v8::Local<'s, v8::Signature>>,
+) -> v8::Local<'s, v8::FunctionTemplate> {
+    let boxed = crate::callback::boxed_callback_data(callback, data, env.cast::<Env>());
+    let external = v8::External::new(scope, boxed.cast());
+    let mut builder = v8::FunctionTemplate::builder_raw(crate::callback::invoke_addon_callback)
+        .data(external.into());
+    if let Some(signature) = signature {
+        builder = builder.signature(signature);
+    }
+    builder.build(scope)
+}
+
+#[export_name = "napi_open_handle_scope"]
+pub unsafe extern "C" fn napi_open_handle_scope(
+    env: *mut NapiEnv,
+    result: *mut *mut crate::abi::NapiHandleScope,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    // The new scope is opened *inside* the one the current entry point established,
+    // which is what makes the addon's handles live in its own scope rather than the
+    // callback's.
+    let opened = in_scope(|scope| environment.scopes().open(scope))
+        .flatten()
+        .ok_or(NapiStatus::HandleScopeMismatch);
+    match opened {
+        Ok(handle) => {
+            // SAFETY: the caller passed a writable slot for one pointer.
+            unsafe { result.write(handle) };
+            status(env, NapiStatus::Ok)
+        }
+        Err(failure) => status(env, failure),
+    }
+}
+
+#[export_name = "napi_close_handle_scope"]
+pub unsafe extern "C" fn napi_close_handle_scope(
+    env: *mut NapiEnv,
+    scope: *mut crate::abi::NapiHandleScope,
+) -> NapiStatus {
+    if scope.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    status(env, environment.scopes().close(scope))
+}
+
+#[export_name = "napi_open_escapable_handle_scope"]
+pub unsafe extern "C" fn napi_open_escapable_handle_scope(
+    env: *mut NapiEnv,
+    result: *mut *mut crate::abi::NapiEscapableHandleScope,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    let opened = in_scope(|scope| environment.scopes().open_escapable(scope))
+        .flatten()
+        .ok_or(NapiStatus::HandleScopeMismatch);
+    match opened {
+        Ok(handle) => {
+            // SAFETY: the caller passed a writable slot for one pointer.
+            unsafe { result.write(handle) };
+            status(env, NapiStatus::Ok)
+        }
+        Err(failure) => status(env, failure),
+    }
+}
+
+#[export_name = "napi_close_escapable_handle_scope"]
+pub unsafe extern "C" fn napi_close_escapable_handle_scope(
+    env: *mut NapiEnv,
+    scope: *mut crate::abi::NapiEscapableHandleScope,
+) -> NapiStatus {
+    if scope.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    status(env, environment.scopes().close(scope.cast()))
+}
+
+#[export_name = "napi_escape_handle"]
+pub unsafe extern "C" fn napi_escape_handle(
+    env: *mut NapiEnv,
+    scope: *mut crate::abi::NapiEscapableHandleScope,
+    escapee: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if scope.is_null() || escapee.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    // SAFETY: `escapee` is a handle from the scope the addon opened.
+    match unsafe { environment.scopes().escape(scope, escapee) } {
+        Ok(escaped) => {
+            // SAFETY: the caller passed a writable slot.
+            unsafe { store(result, escaped) };
+            status(env, NapiStatus::Ok)
+        }
+        Err(failure) => status(env, failure),
+    }
+}
+
+#[export_name = "napi_run_script"]
+pub unsafe extern "C" fn napi_run_script(
+    env: *mut NapiEnv,
+    script: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if script.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(script) }?;
+        // Node rejects a non-string source with `napi_string_expected` rather than
+        // coercing it, so a wrong argument is reported instead of silently run.
+        let source =
+            v8::Local::<v8::String>::try_from(local).map_err(|_| NapiStatus::StringExpected)?;
+        // Compiled in the *current* context, which is the module's: Node's
+        // `env->context()`. `None` for the origin matches
+        // `v8::Script::Compile(context, source)` with no `ScriptOrigin`.
+        let compiled =
+            v8::Script::compile(scope, source, None).ok_or(NapiStatus::GenericFailure)?;
+        // A throwing script leaves a pending exception; Node reports
+        // `napi_generic_failure` there, not `napi_pending_exception`, because
+        // `CHECK_MAYBE_EMPTY` is used rather than the preamble form.
+        let value = compiled.run(scope).ok_or(NapiStatus::GenericFailure)?;
+        Ok(to_napi(value))
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(handle)) => {
+            // SAFETY: the caller passed a writable slot.
+            unsafe { store(result, handle) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "napi_type_tag_object"]
+pub unsafe extern "C" fn napi_type_tag_object(
+    env: *mut NapiEnv,
+    object_or_external: *mut NapiValue,
+    type_tag: *const crate::abi::NapiTypeTag,
+) -> NapiStatus {
+    if object_or_external.is_null() || type_tag.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: the caller passed one tag; both halves are plain integers.
+    let tag = unsafe { *type_tag };
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(object_or_external) }?;
+        if local.is_external() {
+            // A `napi_value` from `napi_create_external` is a plain `v8::External`
+            // here, not Node's `ExternalWrapper`, so there is no slot to hold the
+            // tag. Reporting it keeps the failure visible; a caller that checks the
+            // status learns the tag was not stored.
+            return Err(NapiStatus::InvalidArg);
+        }
+        let target = local.to_object(scope).ok_or(NapiStatus::ObjectExpected)?;
+        let key = type_tag_private_key(scope).ok_or(NapiStatus::GenericFailure)?;
+        // Node rejects re-tagging an object (`napi_invalid_arg`), because a second
+        // tag would make `napi_check_object_type_tag` ambiguous.
+        if target.has_private(scope, key) == Some(true) {
+            return Err(NapiStatus::InvalidArg);
+        }
+        let value = type_tag_value(scope, &tag).ok_or(NapiStatus::GenericFailure)?;
+        match target.set_private(scope, key, value) {
+            Some(true) => Ok(()),
+            _ => Err(NapiStatus::GenericFailure),
+        }
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(())) => status(env, NapiStatus::Ok),
+    }
+}
+
+#[export_name = "napi_check_object_type_tag"]
+pub unsafe extern "C" fn napi_check_object_type_tag(
+    env: *mut NapiEnv,
+    object_or_external: *mut NapiValue,
+    type_tag: *const crate::abi::NapiTypeTag,
+    result: *mut bool,
+) -> NapiStatus {
+    if object_or_external.is_null() || type_tag.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: the caller passed one tag.
+    let tag = unsafe { *type_tag };
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(object_or_external) }?;
+        let target = local.to_object(scope).ok_or(NapiStatus::ObjectExpected)?;
+        let key = type_tag_private_key(scope).ok_or(NapiStatus::GenericFailure)?;
+        let Some(value) = target.get_private(scope, key) else {
+            // No private slot at all: the check simply fails.
+            return Ok(false);
+        };
+        let Some(stored) = v8::Local::<v8::BigInt>::try_from(value).ok() else {
+            return Ok(false);
+        };
+        let mut words = [0u64; 2];
+        let (negative, written) = stored.to_words_array(&mut words);
+        // Node treats a negative or wrongly-sized tag as a failed check rather than
+        // an error, which is what makes `check_object_type_tag` total.
+        if negative || written.len() != 2 {
+            return Ok(false);
+        }
+        Ok(words[0] == tag.lower && words[1] == tag.upper)
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(matches)) => {
+            // SAFETY: the caller passed a writable slot for one bool.
+            unsafe { result.write(matches) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+/// The private key a type tag lives under.
+///
+/// **One key for every tag**, not one per tag, and that is what makes re-tagging
+/// detectable: Node's `NAPI_PRIVATE_KEY(context, type_tag)` expands to
+/// `Environment::napi_type_tag()`, which is the single per-environment private
+/// symbol `"node:napi:type_tag"` registered in `src/env_properties.h:37`. An
+/// object holds one tag at most, and the tag itself is stored *as the value*
+/// (see [`type_tag_value`]) rather than being encoded in the key. Deriving the
+/// key from the tag instead would let one object hold two tags and would make
+/// `napi_type_tag_object`'s duplicate check unreachable — which is what a first
+/// attempt at this did.
+fn type_tag_private_key<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Private>> {
+    let name = v8::String::new(scope, "node:napi:type_tag")?;
+    Some(v8::Private::for_api(scope, Some(name)))
+}
+
+/// The value stored under a type tag's private key: the tag as a 128-bit `BigInt`.
+///
+/// Node stores exactly this — `BigInt::NewFromWords(context, 0, 2, type_tag)` — so
+/// a tag written by one runtime is readable by the other.
+fn type_tag_value<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    tag: &crate::abi::NapiTypeTag,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let words = [tag.lower, tag.upper];
+    Some(v8::BigInt::new_from_words(scope, false, &words)?.into())
+}
+
+#[export_name = "napi_get_uv_event_loop"]
+pub unsafe extern "C" fn napi_get_uv_event_loop(
+    env: *mut NapiEnv,
+    result: *mut *mut c_void,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // `rn-uv` owns the process' one `uv_loop_t`, and it is the same loop async work
+    // and thread-safe functions queue onto, so an addon that drives it directly is
+    // driving this runtime's loop rather than a second one.
+    let Some(pointer) = rn_uv::uv_loop::loop_ptr() else {
+        // `uv_loop_init` failing means the process cannot do I/O at all.
+        return status(env, NapiStatus::GenericFailure);
+    };
+    // SAFETY: the caller passed a writable slot for one pointer.
+    unsafe { result.write(pointer.cast()) };
+    status(env, NapiStatus::Ok)
+}
+
+#[export_name = "napi_add_async_cleanup_hook"]
+pub unsafe extern "C" fn napi_add_async_cleanup_hook(
+    env: *mut NapiEnv,
+    hook: crate::abi::NapiAsyncCleanupHook,
+    arg: *mut c_void,
+    remove_handle: *mut *mut crate::abi::NapiAsyncCleanupHookHandle,
+) -> NapiStatus {
+    if hook.is_none() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    let handle = environment.add_async_cleanup_hook(hook, arg);
+    if !remove_handle.is_null() {
+        // SAFETY: the caller passed a writable slot or null.
+        unsafe { remove_handle.write(handle) };
+    }
+    status(env, NapiStatus::Ok)
+}
+
+#[export_name = "napi_remove_async_cleanup_hook"]
+pub unsafe extern "C" fn napi_remove_async_cleanup_hook(
+    remove_handle: *mut crate::abi::NapiAsyncCleanupHookHandle,
+) -> NapiStatus {
+    if remove_handle.is_null() {
+        return NapiStatus::InvalidArg;
+    }
+    // `napi_remove_async_cleanup_hook` takes no environment, which is why Node's
+    // handle owns its own unlink. Here the handle is process-wide for the same
+    // reason, and freeing it is the removal.
+    // SAFETY: the handle came from `napi_add_async_cleanup_hook` and is freed once.
+    let removed = unsafe { crate::env::remove_async_cleanup_hook(remove_handle) };
+    if removed {
+        NapiStatus::Ok
+    } else {
+        NapiStatus::InvalidArg
+    }
+}
+
+#[export_name = "napi_fatal_exception"]
+pub unsafe extern "C" fn napi_fatal_exception(
+    env: *mut NapiEnv,
+    error: *mut NapiValue,
+) -> NapiStatus {
+    if error.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // Node hands the value to `trigger_fatal_exception`, which is the same path an
+    // uncaught throw from a native callback takes: `process._fatalException` runs
+    // first, then the `uncaughtException` listeners, then the process aborts if
+    // nothing handled it. `rn-errors` owns that order for this runtime, and it is
+    // what a thread-safe function's throwing callback already uses.
+    let outcome = in_scope(|_| {
+        // SAFETY: the handle comes from the current scope.
+        let value = unsafe { as_value(error) }?;
+        Ok::<*mut NapiValue, NapiStatus>(to_napi(value))
+    });
+    let Some(Ok(handle)) = outcome else {
+        return match outcome {
+            None => status(env, NapiStatus::HandleScopeMismatch),
+            Some(Err(failure)) => status(env, failure),
+            Some(Ok(_)) => status(env, NapiStatus::GenericFailure),
+        };
+    };
+    // SAFETY: the handle is a value from the live scope established by this call.
+    unsafe { crate::env::trigger_fatal_exception(env, handle) };
+    status(env, NapiStatus::Ok)
+}
+
+/// The shared body of the two `napi_get_value_string_*` entries. Node's contract, reproduced exactly: with no buffer the caller is asking for
 /// the length and must supply `result`; with a buffer of zero bytes there is
 /// nowhere to write, so the copied length is zero.
 ///
@@ -782,6 +2771,86 @@ pub unsafe extern "C" fn napi_get_value_string_latin1(
     };
     // SAFETY: the caller's buffer contract is `napi_get_value_string_latin1`'s.
     unsafe { copy_string_out(env, bytes, buf, bufsize, result) }
+}
+
+#[export_name = "napi_get_value_string_utf16"]
+pub unsafe extern "C" fn napi_get_value_string_utf16(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    buf: *mut u16,
+    bufsize: usize,
+    result: *mut usize,
+) -> NapiStatus {
+    if value.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let units = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let string = unsafe { as_string(value) }.ok()?;
+        let length = string.length();
+        let mut units = vec![0u16; length];
+        // `WriteV2` writes at most `min(string length, buffer length)` units, and
+        // `write_v2` applies that same clamp, so a caller-provided buffer is never
+        // overrun. No flags: the terminator is written explicitly below, which is
+        // what keeps `bufsize == 0` from writing anything at all.
+        string.write_v2(scope, 0, &mut units, v8::WriteFlags::default());
+        Some(units)
+    })
+    .ok_or(NapiStatus::HandleScopeMismatch)
+    .and_then(|units| units.ok_or(NapiStatus::StringExpected));
+    let Ok(units) = units else {
+        return status(env, units.err().unwrap_or(NapiStatus::GenericFailure));
+    };
+    // SAFETY: the caller's buffer contract is `napi_get_value_string_utf16`'s.
+    unsafe { copy_units_out(env, units, buf, bufsize, result) }
+}
+
+/// Writes UTF-16 code units through `napi_get_value_string_utf16`'s contract.
+///
+/// The rules are the UTF-16 twin of [`copy_string_out`]'s: a null `buf` reports the
+/// full length and requires `result`; `bufsize == 0` writes nothing and reports a
+/// copy of zero; otherwise at most `bufsize - 1` units are copied and the last slot
+/// is NUL-terminated. Returning `bufsize - 1` rather than `bufsize` is what makes an
+/// addon's `buf[result] = 0` harmless and matches
+/// `napi_get_value_string_utf16`'s documented "excluding the null terminator".
+///
+/// # Safety
+///
+/// `buf` must be null or writable for `bufsize` code units, and `result` null or
+/// writable for one `usize`.
+unsafe fn copy_units_out(
+    env: *mut NapiEnv,
+    units: Vec<u16>,
+    buf: *mut u16,
+    bufsize: usize,
+    result: *mut usize,
+) -> NapiStatus {
+    if buf.is_null() {
+        if result.is_null() {
+            return status(env, NapiStatus::InvalidArg);
+        }
+        // SAFETY: the caller passed a writable slot for one usize.
+        unsafe { result.write(units.len()) };
+        return status(env, NapiStatus::Ok);
+    }
+    if bufsize == 0 {
+        if !result.is_null() {
+            // SAFETY: the caller passed a writable slot for one usize.
+            unsafe { result.write(0) };
+        }
+        return status(env, NapiStatus::Ok);
+    }
+    let copied = units.len().min(bufsize - 1);
+    // SAFETY: `buf` is writable for `bufsize` units by the caller's contract.
+    unsafe {
+        std::ptr::copy_nonoverlapping(units.as_ptr(), buf, copied);
+        buf.add(copied).write(0);
+    }
+    if !result.is_null() {
+        // SAFETY: as above.
+        unsafe { result.write(copied) };
+    }
+    status(env, NapiStatus::Ok)
 }
 
 #[export_name = "napi_is_array"]
@@ -1165,14 +3234,43 @@ fn define_one(
     let writable = descriptor.attributes & attributes::WRITABLE != 0;
 
     if descriptor.getter.is_some() || descriptor.setter.is_some() {
-        // An accessor descriptor needs V8's `AccessorNameGetterCallback` shape,
-        // which receives the property name and a `PropertyCallbackInfo` rather
-        // than a `FunctionCallbackInfo`. That is a different wrapper from
-        // `invoke_addon_callback` and is recorded as deferred. Reporting it is
-        // the honest failure: installing a data property here would silently
-        // shadow the getter, and an addon would read a stale value instead of
-        // learning that accessors do not work.
-        return Err(NapiStatus::InvalidArg);
+        // Node builds a getter/setter pair of ordinary V8 functions and defines
+        // them with a `PropertyDescriptor` (`js_native_api_v8.cc:1433-1456`), which
+        // is why it works: the accessor callback shape is a *function* call, not
+        // V8's `AccessorNameGetterCallback`. `PropertyCallbackInfo::This()` is
+        // therefore not needed, and this crate implements the same way.
+        // Either half may be absent, and Node passes an empty `Local<Function>`
+        // for the absent one, which `PropertyDescriptor` reads as "not a
+        // getter/setter".
+        let getter: v8::Local<v8::Value> = match descriptor.getter {
+            Some(callback) => {
+                let boxed =
+                    crate::callback::boxed_callback_data(Some(callback), descriptor.data, env);
+                crate::callback::build_function(scope, "", boxed, 0)
+                    .ok_or(NapiStatus::GenericFailure)?
+                    .into()
+            }
+            None => v8::undefined(scope).into(),
+        };
+        let setter: v8::Local<v8::Value> = match descriptor.setter {
+            Some(callback) => {
+                let boxed =
+                    crate::callback::boxed_callback_data(Some(callback), descriptor.data, env);
+                crate::callback::build_function(scope, "", boxed, 0)
+                    .ok_or(NapiStatus::GenericFailure)?
+                    .into()
+            }
+            None => v8::undefined(scope).into(),
+        };
+        let mut property = v8::PropertyDescriptor::new_from_get_set(getter, setter);
+        property.set_enumerable(enumerable);
+        property.set_configurable(configurable);
+        return match target.define_property(scope, name, &property) {
+            // Node reports a failed accessor definition as `napi_invalid_arg`,
+            // unlike the method and value forms' `napi_generic_failure`.
+            Some(true) => Ok(()),
+            _ => Err(NapiStatus::InvalidArg),
+        };
     }
 
     if let Some(callback) = descriptor.method {
@@ -1319,6 +3417,22 @@ pub unsafe extern "C" fn napi_get_cb_info(
             // SAFETY: `argv` is writable for `capacity` entries.
             unsafe { argv.add(index).write(to_napi(frame.argv[index])) };
         }
+        // Every remaining slot is filled with `undefined`, which is what Node
+        // does (`FunctionCallbackWrapper::Args` in `js_native_api_v8.cc:467-482`).
+        // It is not cosmetic: `napi-rs` decides whether an optional argument was
+        // supplied by testing the slot for null, so leaving the tail null made it
+        // read a missing argument as present and fail conversion. Verified against
+        // the oracle: with one argument and a four-slot buffer, Node writes four
+        // values and rustnode wrote one value and three nulls.
+        if count < capacity {
+            let Some(filled) = in_scope(|scope| to_napi(v8::undefined(scope).into())) else {
+                return status(env, NapiStatus::HandleScopeMismatch);
+            };
+            for index in count..capacity {
+                // SAFETY: as above.
+                unsafe { argv.add(index).write(filled) };
+            }
+        }
     }
     if !argc.is_null() {
         // SAFETY: the caller passed a writable count.
@@ -1418,6 +3532,7 @@ enum ErrorKind {
     Error,
     Type,
     Range,
+    Syntax,
 }
 
 /// `napi_throw_error` / `napi_throw_type_error` / `napi_throw_range_error`.
@@ -1444,6 +3559,7 @@ fn throw_coded(
             ErrorKind::Error => v8::Exception::error(scope, message),
             ErrorKind::Type => v8::Exception::type_error(scope, message),
             ErrorKind::Range => v8::Exception::range_error(scope, message),
+            ErrorKind::Syntax => v8::Exception::syntax_error(scope, message),
         };
         if !code.is_empty() {
             if let (Ok(object), Some(code_value)) = (
@@ -1513,6 +3629,117 @@ pub unsafe extern "C" fn napi_throw_range_error(
     throw_coded(env, code, msg, ErrorKind::Range)
 }
 
+#[export_name = "node_api_throw_syntax_error"]
+pub unsafe extern "C" fn node_api_throw_syntax_error(
+    env: *mut NapiEnv,
+    code: *const c_char,
+    msg: *const c_char,
+) -> NapiStatus {
+    // The `SyntaxError` twin of `napi_throw_type_error`, and the same shape in Node
+    // (`js_native_api_v8.cc:2285-2300`): build the error with `code` set, throw it,
+    // and report success. An addon reads the thrown value through
+    // `napi_get_and_clear_last_exception`, exactly as it would for the other three.
+    throw_coded(env, code, msg, ErrorKind::Syntax)
+}
+
+/// `napi_create_error` and its three siblings: build the error value but do not
+/// throw it.
+///
+/// A different entry point from `napi_throw_error` because the addon decides what
+/// to do with it — return it, store it, or throw it later with `napi_throw`. The
+/// `code` argument is a `napi_value` here rather than a `const char*`, and Node
+/// rejects it unless it is a string (`set_error_code` in
+/// `js_native_api_v8.cc:1965-1989`), which is preserved.
+///
+/// # Safety
+///
+/// `msg` must be a `napi_value` from the current scope and `result` writable for
+/// one pointer.
+unsafe fn create_error(
+    env: *mut NapiEnv,
+    code: *mut NapiValue,
+    msg: *mut NapiValue,
+    result: *mut *mut NapiValue,
+    kind: ErrorKind,
+) -> NapiStatus {
+    if msg.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    run(
+        env,
+        // SAFETY: the caller passed a writable slot.
+        |handle| unsafe { store(result, handle) },
+        |scope| {
+            // SAFETY: both handles come from the current scope.
+            let message = unsafe { as_string(msg) }.map_err(|_| NapiStatus::StringExpected)?;
+            let exception = match kind {
+                ErrorKind::Error => v8::Exception::error(scope, message),
+                ErrorKind::Type => v8::Exception::type_error(scope, message),
+                ErrorKind::Range => v8::Exception::range_error(scope, message),
+                ErrorKind::Syntax => v8::Exception::syntax_error(scope, message),
+            };
+            if !code.is_null() {
+                // SAFETY: as above.
+                let code_value = unsafe { as_value(code) }?;
+                if !code_value.is_string() {
+                    return Err(NapiStatus::StringExpected);
+                }
+                let object = v8::Local::<v8::Object>::try_from(exception)
+                    .map_err(|_| NapiStatus::GenericFailure)?;
+                let key = v8::String::new(scope, "code").ok_or(NapiStatus::GenericFailure)?;
+                if object.set(scope, key.into(), code_value) != Some(true) {
+                    return Err(NapiStatus::GenericFailure);
+                }
+            }
+            Ok(to_napi(exception))
+        },
+    )
+}
+
+#[export_name = "napi_create_error"]
+pub unsafe extern "C" fn napi_create_error(
+    env: *mut NapiEnv,
+    code: *mut NapiValue,
+    msg: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe { create_error(env, code, msg, result, ErrorKind::Error) }
+}
+
+#[export_name = "napi_create_type_error"]
+pub unsafe extern "C" fn napi_create_type_error(
+    env: *mut NapiEnv,
+    code: *mut NapiValue,
+    msg: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe { create_error(env, code, msg, result, ErrorKind::Type) }
+}
+
+#[export_name = "napi_create_range_error"]
+pub unsafe extern "C" fn napi_create_range_error(
+    env: *mut NapiEnv,
+    code: *mut NapiValue,
+    msg: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe { create_error(env, code, msg, result, ErrorKind::Range) }
+}
+
+#[export_name = "node_api_create_syntax_error"]
+pub unsafe extern "C" fn node_api_create_syntax_error(
+    env: *mut NapiEnv,
+    code: *mut NapiValue,
+    msg: *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    // SAFETY: forwarded unchanged; the caller upholds the header's contract.
+    unsafe { create_error(env, code, msg, result, ErrorKind::Syntax) }
+}
+
 #[export_name = "napi_is_exception_pending"]
 pub unsafe extern "C" fn napi_is_exception_pending(
     env: *mut NapiEnv,
@@ -1552,8 +3779,19 @@ pub unsafe extern "C" fn napi_get_and_clear_last_exception(
         .try_borrow_mut()
         .ok()
         .and_then(|mut state| state.take());
+    // Node's contract, from `js_native_api_v8.cc:3078-3094`: with nothing pending
+    // this is **success with `undefined`**, not a failure. That asymmetry is
+    // load-bearing — `node-addon-api`'s `Napi::Error::New` calls this
+    // unconditionally and treats a non-`napi_ok` status as fatal, so reporting
+    // `napi_generic_failure` here aborted the process in an addon that had merely
+    // asked whether anything was pending.
     let Some(taken) = taken else {
-        return status(env, NapiStatus::GenericFailure);
+        return run(
+            env,
+            // SAFETY: the caller passed a writable slot.
+            |handle| unsafe { store(result, handle) },
+            |scope| Ok(to_napi(v8::undefined(scope).into())),
+        );
     };
     let handle =
         in_scope(|scope| to_napi(v8::Local::new(scope, taken))).unwrap_or_else(std::ptr::null_mut);
@@ -2202,19 +4440,94 @@ pub unsafe extern "C" fn napi_add_finalizer(
 ) -> NapiStatus {
     // Node requires the callback here: the whole point of the entry point is to
     // run something when the object dies.
-    if finalize_cb.is_none() {
+    if object.is_null() || finalize_cb.is_none() {
         return status(env, NapiStatus::InvalidArg);
     }
-    // SAFETY: forwarded unchanged; the caller upholds the Node-API contract.
-    unsafe {
-        wrap_shim(
-            env,
-            object,
-            finalize_data,
-            finalize_cb,
-            finalize_hint,
-            result,
-        )
+    // Unlike `napi_wrap`, this may be called repeatedly on one object: Node creates
+    // an independent reference per call, and `node-addon-api`'s class machinery
+    // depends on that. See `crate::wrap::add_finalizer`.
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let target = unsafe { as_object(object) }?;
+        // SAFETY: `target` is live and `finalize_cb` is the addon's callback.
+        unsafe {
+            crate::wrap::add_finalizer(
+                scope,
+                target,
+                env,
+                finalize_data,
+                finalize_cb,
+                finalize_hint,
+                !result.is_null(),
+            )
+        }
+        .ok_or(NapiStatus::GenericFailure)
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        // `None` here means the addon did not ask for a reference, which is the
+        // runtime-owned form `node-addon-api` uses; it is success, not failure.
+        Some(Ok(reference)) => {
+            if !result.is_null() {
+                // SAFETY: the caller passed a writable slot.
+                unsafe { result.write(reference.unwrap_or(std::ptr::null_mut())) };
+            }
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "node_api_post_finalizer"]
+pub unsafe extern "C" fn node_api_post_finalizer(
+    env: *mut NapiEnv,
+    finalize_cb: NapiFinalize,
+    finalize_data: *mut c_void,
+    finalize_hint: *mut c_void,
+) -> NapiStatus {
+    // Node's implementation is one line of queueing (`js_native_api_v8.cc:3658`):
+    // `env->EnqueueFinalizer(...)`, drained from a `SetImmediate` by
+    // `DrainFinalizerQueue`. This runtime has exactly that queue
+    // (`rn_core::finalizer`), drained from the loop's check phase, so a
+    // post-finalizer is enqueued rather than run inline.
+    //
+    // The distinction this preserves is the whole reason the entry point exists: a
+    // finalizer reached through the GC callback runs where V8 collected, and the
+    // experimental policy calls it inline during collection, where any V8 call is a
+    // fatal error. Posting it defers the body past that. Verified against the
+    // oracle: the callback has not run when the call returns, has run by the next
+    // turn of the loop, and further posts from a collection run later still.
+    let Some(finalize) = finalize_cb else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    // SAFETY: `env` is null or one of this crate's environments.
+    let Some(environment) = (unsafe { env_from(env) }) else {
+        return status(env, NapiStatus::InvalidArg);
+    };
+    let owner = environment.owner_thread();
+    let env_address = env as usize;
+    let data = finalize_data as usize;
+    let hint = finalize_hint as usize;
+    let queued = rn_core::finalizer::enqueue_for(Some(owner), move || {
+        crate::scope::with_owner_context(env_address as *mut NapiEnv, |scope| {
+            let guard = crate::scope::ScopeGuard::enter(scope);
+            // SAFETY: the addon's own callback with the pointers it supplied.
+            unsafe {
+                finalize(
+                    env_address as *mut NapiEnv,
+                    data as *mut c_void,
+                    hint as *mut c_void,
+                )
+            };
+            drop(guard);
+        });
+    });
+    if queued {
+        status(env, NapiStatus::Ok)
+    } else {
+        // A poisoned queue means nothing can be guaranteed to run; reporting it is
+        // better than a success whose callback never fires.
+        status(env, NapiStatus::GenericFailure)
     }
 }
 
@@ -2327,6 +4640,80 @@ pub unsafe extern "C" fn napi_remove_env_cleanup_hook(
 // ---------------------------------------------------------------------------
 // ArrayBuffer, Buffer and typed arrays
 // ---------------------------------------------------------------------------
+
+#[export_name = "node_api_create_sharedarraybuffer"]
+pub unsafe extern "C" fn node_api_create_sharedarraybuffer(
+    env: *mut NapiEnv,
+    byte_length: usize,
+    data: *mut *mut c_void,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    run(
+        env,
+        |value| {
+            // SAFETY: the caller passed a writable slot for one pointer.
+            unsafe { store(result, value) };
+        },
+        |scope| {
+            let buffer =
+                v8::SharedArrayBuffer::new(scope, byte_length).ok_or(NapiStatus::GenericFailure)?;
+            if !data.is_null() {
+                // `SharedArrayBuffer` has no `Data()` of its own in this V8
+                // binding, so the pointer comes from the backing store it shares
+                // with every view — the same allocation, not a copy.
+                let store = buffer.get_backing_store();
+                let pointer = store
+                    .data()
+                    .map_or(std::ptr::null_mut(), |pointer| pointer.as_ptr());
+                // SAFETY: the caller passed a writable slot or null.
+                unsafe { data.write(pointer) };
+            }
+            Ok(to_napi(buffer.into()))
+        },
+    )
+}
+
+#[export_name = "node_api_create_external_sharedarraybuffer"]
+pub unsafe extern "C" fn node_api_create_external_sharedarraybuffer(
+    env: *mut NapiEnv,
+    external_data: *mut c_void,
+    byte_length: usize,
+    finalize_cb: crate::abi::NapiNoEnvFinalize,
+    finalize_hint: *mut c_void,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if result.is_null() || (external_data.is_null() && byte_length > 0) {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    run(
+        env,
+        |value| {
+            // SAFETY: the caller passed a writable slot.
+            unsafe { store(result, value) };
+        },
+        |scope| {
+            // The addon owns the memory and supplies a finalizer that takes no
+            // environment; V8 calls the deleter from whichever thread collected,
+            // which is why `NapiNoEnvFinalize` has no `napi_env` to pass back.
+            // SAFETY: the caller guarantees `external_data` is valid for
+            // `byte_length` until the finalizer runs.
+            let store = unsafe {
+                crate::buffer::external_shared_backing_store(
+                    external_data,
+                    byte_length,
+                    finalize_cb,
+                    finalize_hint,
+                )
+            };
+            let shared = store.make_shared();
+            let buffer = v8::SharedArrayBuffer::with_backing_store(scope, &shared);
+            Ok(to_napi(buffer.into()))
+        },
+    )
+}
 
 #[export_name = "napi_create_arraybuffer"]
 pub unsafe extern "C" fn napi_create_arraybuffer(
@@ -2494,6 +4881,97 @@ unsafe fn buffer_from_arraybuffer<'s>(
     length: usize,
 ) -> Option<v8::Local<'s, v8::Uint8Array>> {
     v8::Uint8Array::new(&*scope, buffer, offset, length)
+}
+
+/// Node's `Buffer` view over a range of an existing `ArrayBuffer`.
+///
+/// `Buffer.isBuffer` and `instanceof Buffer` are answered by the object's
+/// prototype, so a plain `Uint8Array` is *not* a Buffer even though every Buffer is
+/// one (verified against the oracle: `Buffer.isBuffer(new Uint8Array(...))` is
+/// `false`, while the same object with `Buffer.prototype` swapped in answers
+/// `true`). `node::Buffer::New` therefore has to hand back a view whose prototype is
+/// `Buffer.prototype`, which is what this does.
+///
+/// Returns `None` when the global `Buffer` is absent or has no prototype, which
+/// keeps the failure visible instead of returning something that claims to be a
+/// Buffer and is not.
+fn node_buffer<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    buffer: v8::Local<'s, v8::ArrayBuffer>,
+    offset: usize,
+    length: usize,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let view = unsafe { buffer_from_arraybuffer(scope, buffer, offset, length) }?;
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "Buffer")?;
+    let constructor = global.get(scope, key.into())?;
+    let function = v8::Local::<v8::Function>::try_from(constructor).ok()?;
+    let prototype_key = v8::String::new(scope, "prototype")?;
+    let prototype = function.get(scope, prototype_key.into())?;
+    let object: v8::Local<v8::Object> = view.into();
+    object.set_prototype(scope, prototype)?.then_some(object)
+}
+
+#[export_name = "node_api_create_buffer_from_arraybuffer"]
+pub unsafe extern "C" fn node_api_create_buffer_from_arraybuffer(
+    env: *mut NapiEnv,
+    arraybuffer: *mut NapiValue,
+    byte_offset: usize,
+    byte_length: usize,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if arraybuffer.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|scope| {
+        // SAFETY: the handle comes from the current scope.
+        let value = unsafe { as_value(arraybuffer) }?;
+        let buffer =
+            v8::Local::<v8::ArrayBuffer>::try_from(value).map_err(|_| NapiStatus::InvalidArg)?;
+        // Node throws `ERR_OUT_OF_RANGE` here rather than returning
+        // `napi_invalid_arg`, and a caller distinguishes the two: the range error is
+        // a pending exception an addon's `napi_is_exception_pending` sees.
+        let end = byte_offset
+            .checked_add(byte_length)
+            .ok_or(NapiStatus::InvalidArg)?;
+        if end > buffer.byte_length() {
+            return Err(throw_range_out_of_range(env));
+        }
+        let view = node_buffer(scope, buffer, byte_offset, byte_length)
+            .ok_or(NapiStatus::GenericFailure)?;
+        Ok(to_napi(view.into()))
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(handle)) => {
+            // SAFETY: the caller passed a writable slot.
+            unsafe { store(result, handle) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+/// Throws Node's `ERR_OUT_OF_RANGE` for a buffer view that runs past its backing
+/// store, and reports the status that throw leaves behind.
+///
+/// Returns `napi_pending_exception`, which is what
+/// `napi_throw_range_error`'s return path produces in Node
+/// (`node_api.cc:1496-1512`) and what the addon sees as the status of the
+/// `node_api_create_buffer_from_arraybuffer` call.
+fn throw_range_out_of_range(env: *mut NapiEnv) -> NapiStatus {
+    // SAFETY: both strings are NUL-terminated literals that outlive the call.
+    let thrown = throw_coded(
+        env,
+        c"ERR_OUT_OF_RANGE".as_ptr(),
+        c"The byte offset + length is out of range".as_ptr(),
+        ErrorKind::Range,
+    );
+    if thrown == NapiStatus::Ok {
+        pending_exception_status(env)
+    } else {
+        thrown
+    }
 }
 
 #[export_name = "napi_create_buffer"]
@@ -2669,6 +5147,70 @@ pub unsafe extern "C" fn napi_is_buffer(
         Some(Err(failure)) => status(env, failure),
         Some(Ok(is)) => {
             // SAFETY: the caller passed a writable slot.
+            unsafe { result.write(is) };
+            status(env, NapiStatus::Ok)
+        }
+    }
+}
+
+#[export_name = "napi_is_typedarray"]
+pub unsafe extern "C" fn napi_is_typedarray(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut bool,
+) -> NapiStatus {
+    // Node's implementation is `val->IsTypedArray()` with no property access and no
+    // coercion, so it cannot run JavaScript and cannot leave an exception pending.
+    // The same is true of `Local::is_typed_array`, which is V8's own predicate.
+    predicate(env, value, result, |local| local.is_typed_array())
+}
+
+#[export_name = "napi_is_dataview"]
+pub unsafe extern "C" fn napi_is_dataview(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut bool,
+) -> NapiStatus {
+    // `IsDataView()`, which is false for a typed array and for a plain
+    // `ArrayBuffer`; verified against the oracle.
+    predicate(env, value, result, |local| local.is_data_view())
+}
+
+#[export_name = "node_api_is_sharedarraybuffer"]
+pub unsafe extern "C" fn node_api_is_sharedarraybuffer(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut bool,
+) -> NapiStatus {
+    // `IsSharedArrayBuffer()`, distinct from `IsArrayBuffer()`: a `SharedArrayBuffer`
+    // answers false to `napi_is_arraybuffer` and true here.
+    predicate(env, value, result, |local| local.is_shared_array_buffer())
+}
+
+/// The shared body of the three predicate shims.
+///
+/// All three are `*result = val->IsX()` in Node with `CHECK_ENV_NOT_IN_GC` rather
+/// than `NAPI_PREAMBLE`, because the predicate cannot throw. Sharing the body keeps
+/// the null handling and the status bookkeeping identical between them.
+fn predicate(
+    env: *mut NapiEnv,
+    value: *mut NapiValue,
+    result: *mut bool,
+    test: impl FnOnce(&v8::Local<'_, v8::Value>) -> bool,
+) -> NapiStatus {
+    if value.is_null() || result.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    let outcome = in_scope(|_| {
+        // SAFETY: the handle comes from the current scope.
+        let local = unsafe { as_value(value) }?;
+        Ok(test(&local))
+    });
+    match outcome {
+        None => status(env, NapiStatus::HandleScopeMismatch),
+        Some(Err(failure)) => status(env, failure),
+        Some(Ok(is)) => {
+            // SAFETY: the caller passed a writable slot for one bool.
             unsafe { result.write(is) };
             status(env, NapiStatus::Ok)
         }
@@ -3017,6 +5559,13 @@ pub const EXPORTED: &[&str] = &[
     "napi_create_int64",
     "napi_create_string_utf8",
     "napi_create_string_latin1",
+    "napi_create_string_utf16",
+    "node_api_create_external_string_latin1",
+    "node_api_create_external_string_utf16",
+    "node_api_create_property_key_utf8",
+    "node_api_create_property_key_latin1",
+    "node_api_create_property_key_utf16",
+    "node_api_create_object_with_properties",
     "napi_create_function",
     "napi_typeof",
     "napi_get_value_double",
@@ -3026,6 +5575,7 @@ pub const EXPORTED: &[&str] = &[
     "napi_get_value_bool",
     "napi_get_value_string_utf8",
     "napi_get_value_string_latin1",
+    "napi_get_value_string_utf16",
     "napi_is_array",
     "napi_get_array_length",
     "napi_is_error",
@@ -3048,8 +5598,58 @@ pub const EXPORTED: &[&str] = &[
     "napi_throw_error",
     "napi_throw_type_error",
     "napi_throw_range_error",
+    "node_api_throw_syntax_error",
+    "napi_create_error",
+    "napi_create_type_error",
+    "napi_create_range_error",
+    "node_api_create_syntax_error",
     "napi_is_exception_pending",
     "napi_get_and_clear_last_exception",
+    "napi_get_value_bigint_int64",
+    "napi_get_value_bigint_uint64",
+    "napi_get_value_bigint_words",
+    "napi_create_bigint_int64",
+    "napi_create_bigint_uint64",
+    "napi_create_bigint_words",
+    "napi_create_symbol",
+    "node_api_symbol_for",
+    "napi_create_date",
+    "napi_is_date",
+    "napi_get_date_value",
+    "napi_create_promise",
+    "napi_resolve_deferred",
+    "napi_reject_deferred",
+    "napi_is_promise",
+    "napi_coerce_to_bool",
+    "napi_coerce_to_number",
+    "napi_coerce_to_object",
+    "napi_coerce_to_string",
+    "napi_strict_equals",
+    "napi_instanceof",
+    "node_api_set_prototype",
+    "napi_object_freeze",
+    "napi_object_seal",
+    "napi_open_handle_scope",
+    "napi_close_handle_scope",
+    "napi_open_escapable_handle_scope",
+    "napi_close_escapable_handle_scope",
+    "napi_escape_handle",
+    "napi_run_script",
+    "napi_type_tag_object",
+    "napi_check_object_type_tag",
+    "napi_get_uv_event_loop",
+    "napi_add_async_cleanup_hook",
+    "napi_remove_async_cleanup_hook",
+    "napi_fatal_exception",
+    "napi_define_class",
+    "napi_new_instance",
+    "napi_get_property_names",
+    "napi_get_all_property_names",
+    "napi_has_own_property",
+    "napi_delete_element",
+    "napi_adjust_external_memory",
+    "napi_detach_arraybuffer",
+    "napi_is_detached_arraybuffer",
     "napi_create_reference",
     "napi_delete_reference",
     "napi_reference_ref",
@@ -3076,12 +5676,17 @@ pub const EXPORTED: &[&str] = &[
     "napi_unwrap",
     "napi_remove_wrap",
     "napi_add_finalizer",
+    "node_api_post_finalizer",
     "napi_add_env_cleanup_hook",
     "napi_remove_env_cleanup_hook",
     "napi_create_arraybuffer",
     "napi_create_external_arraybuffer",
+    "node_api_create_sharedarraybuffer",
+    "node_api_create_external_sharedarraybuffer",
+    "node_api_create_buffer_from_arraybuffer",
     "napi_get_arraybuffer_info",
     "napi_is_arraybuffer",
+    "node_api_is_sharedarraybuffer",
     "napi_create_buffer",
     "napi_create_buffer_copy",
     "napi_create_external_buffer",
@@ -3089,101 +5694,51 @@ pub const EXPORTED: &[&str] = &[
     "napi_is_buffer",
     "napi_create_typedarray",
     "napi_get_typedarray_info",
+    "napi_is_typedarray",
     "napi_create_dataview",
     "napi_get_dataview_info",
+    "napi_is_dataview",
     "napi_create_external",
     "napi_get_value_external",
 ];
 
 /// Entry points this build does not export, each with the reason it waits.
 ///
-/// This is the honest half of the surface: an addon needing one of these fails to
-/// load with a `dlsym` error naming the symbol, which is a clear failure at the
-/// boundary rather than a wrong answer from a stub.
+/// Every name here is a **symbol** the oracle exports. The gate
+/// (`tools/napi-symbol-coverage.py`) diffs the oracle's exported set against
+/// `EXPORTED ∪ DEFERRED` and fails when a name is in neither, so this list is the
+/// only place a gap may be recorded. Two gaps are not whole symbols and are
+/// recorded in [`PARTIAL_GAPS`] instead, because naming a behaviour here would put
+/// a non-symbol in the set the gate compares.
+///
+/// The reason must be **true**, not plausible. This project has already shipped
+/// three deferral reasons that were false, each hiding a blocking defect, so a
+/// reason here is expected to name what was checked and what the check showed.
 pub const DEFERRED: &[(&str, &str)] = &[
     (
         "napi_async_init / napi_async_destroy / napi_make_callback / napi_open_callback_scope / napi_close_callback_scope",
-        "async context plumbing needs the AsyncWrap table reachable from the addon's env",
-    ),
-    (
-        "weak references (napi_create_reference with initial_refcount 0)",
-        "a strong reference is a V8 `Global`; a weak one needs a `v8::Weak` with a callback, and every addon in scope uses a strong count",
-    ),
-    (
-        "napi_define_class / napi_new_instance / napi_instanceof",
-        "class construction needs the FunctionTemplate prototype split and construct-call detection",
-    ),
-    (
-        "napi_define_properties with getter/setter",
-        "the method and value descriptor forms are implemented; an accessor needs the AccessorNameGetterCallback wrapper, which takes the property name instead of a FunctionCallbackInfo",
-    ),
-    (
-        "napi_get_property_names / napi_get_all_property_names / node_api_set_prototype",
-        "property-name filtering (key_filter/key_conversion) has no exact V8 equivalent yet",
-    ),
-    (
-        "napi_has_own_property / napi_delete_element",
-        "thin Object calls; each lands with its first caller rather than ahead of one",
-    ),
-    (
-        "napi_create_promise / napi_resolve_deferred / napi_reject_deferred / napi_is_promise",
-        "needs the microtask queue drained at the right point in a V8 callback",
-    ),
-    (
-        "napi_create_error / napi_create_type_error / napi_create_range_error / node_api_create_syntax_error",
-        "the throw path works; factory-created error values wait on `code` property parity",
-    ),
-    (
-        "napi_create_bigint_int64 / napi_create_bigint_uint64 / napi_create_bigint_words / napi_get_value_bigint_int64 / napi_get_value_bigint_uint64 / napi_get_value_bigint_words",
-        "`v8::BigInt` is available; no core addon in scope needs the word-array form yet",
-    ),
-    (
-        "napi_create_symbol / node_api_symbol_for",
-        "a one-line V8 call, deferred only to keep this slice's surface reviewable",
-    ),
-    (
-        "napi_create_date / napi_is_date / napi_get_date_value",
-        "needs a Date constructor looked up through the context; no caller yet",
-    ),
-    (
-        "napi_coerce_to_bool / napi_coerce_to_number / napi_coerce_to_object / napi_coerce_to_string",
-        "coercions run user JavaScript, so they need the exception-pending bookkeeping to be exact",
-    ),
-    (
-        "napi_run_script",
-        "runs a script in the module's context; needs the unbound-script origin plumbing",
-    ),
-    (
-        "napi_get_uv_event_loop",
-        "rn-uv owns the loop; exposing it as `uv_loop_t*` needs the handle ABI settled",
-    ),
-    (
-        "napi_add_async_cleanup_hook / napi_remove_async_cleanup_hook",
-        "cleanup hooks need an environment teardown path, which this runtime does not have yet",
-    ),
-    (
-        "napi_fatal_exception / napi_adjust_external_memory",
-        "fatal paths need the uncaught-exception handler; external memory needs the allocator hook",
-    ),
-    (
-        "napi_open_handle_scope / napi_close_handle_scope / napi_open_escapable_handle_scope / napi_close_escapable_handle_scope / napi_escape_handle",
-        "a Node-API handle scope is a V8 HandleScope; needs a per-call scope stack rather than one scope per entry point",
-    ),
-    (
-        "napi_type_tag_object / napi_check_object_type_tag / napi_object_freeze / napi_object_seal",
-        "type tags need the private-symbol slot; freeze/seal are one-line V8 calls awaiting a caller",
-    ),
-    (
-        "napi_strict_equals / napi_instanceof",
-        "comparison helpers; no caller in the core addon",
-    ),
-    (
-        "napi_detach_arraybuffer / napi_is_detached_arraybuffer",
-        "detach needs the ArrayBuffer allocator to own the backing store",
+        "an async context is an AsyncWrap with a fresh async id, an EmitAsyncInit and an EmitDestroy; the pieces exist (`rn_bind_async_wrap::emit_async_init`, `emit_destroy`, `push_top_level_context`) but the emit entry points are keyed off the namespace's installed hook functions, not a `napi_env`, and `push_context`/`emit_hook` are private to that crate. Exposing them is a cross-crate API change, not a shim",
     ),
     (
         "napi_module_register",
-        "the legacy self-registration path; `napi_register_module_v1` covers every modern addon",
+        "the legacy `NODE_MODULE()` self-registration path. It needs a `napi_module` struct registered from a `node::Module` the loader builds before `dlopen` returns; this runtime's `process.dlopen` only invokes the `napi_register_module_v1` entry point. Node's own `DLOpenImpl` treats the two as alternatives, so every addon built with `NAPI_MODULE_INIT` is unaffected",
+    ),
+];
+
+/// Gaps this build has that are not whole missing symbols.
+///
+/// `DEFERRED` is compared against a symbol set, so a behavioural gap cannot live
+/// there without a non-symbol name failing the gate. These two are recorded here,
+/// with the same requirement that the reason is true, and each has an oracle
+/// comparison behind it.
+pub const PARTIAL_GAPS: &[(&str, &str)] = &[
+    (
+        "napi_create_reference with initial_refcount 0 (weak references)",
+        "the reference table roots every entry with a `v8::Global`, so a zero-count reference keeps its value alive. Verified against the oracle under `--expose-gc`: after a collection Node's `napi_get_reference_value` reports nothing for a collected value and this build still reports a value. A weak reference needs a `v8::Weak` plus a stored value handle the table does not keep today",
+    ),
+    (
+        "napi_type_tag_object on a napi_external",
+        "Node stores the tag in its own `ExternalWrapper`; this crate's `napi_create_external` is a plain `v8::External`, which has no slot for it. The object form is implemented and matches the oracle; the external form reports `napi_invalid_arg`",
     ),
 ];
 

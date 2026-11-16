@@ -92,6 +92,226 @@ thread_local! {
     static WRAP_KEY: RefCell<Option<v8::Global<v8::Private>>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// Extra finalizers attached with `napi_add_finalizer`, keyed by object identity.
+    ///
+    /// `napi_wrap` allows one wrap per object — a second would mean two finalizers
+    /// for one pointer, which is Node's `napi_invalid_arg` too. `napi_add_finalizer`
+    /// is the other contract entirely: Node creates an independent
+    /// `ReferenceWithFinalizer` per call (`js_native_api_v8.cc:3625-3654`), so an
+    /// object may carry any number. `node-addon-api` relies on that — its
+    /// `ObjectWrap::DefineClass` attaches one finalizer per instance method and
+    /// accessor to the class object — so a single-slot scheme rejects the second
+    /// call and the addon fails to load.
+    ///
+    /// Keyed by the object's V8 identity hash, which is stable for the object's
+    /// lifetime. A collision would attach the wrong finalizer set, so the entry also
+    /// holds a weak handle to the object and the lookup compares identity.
+    static EXTRA_FINALIZERS: RefCell<Vec<ExtraFinalizers>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One object's `napi_add_finalizer` finalizers.
+struct ExtraFinalizers {
+    /// Keeps the object reachable from the finalizer's perspective and answers the
+    /// identity question on lookup.
+    object: v8::Global<v8::Object>,
+    /// The identity hash the entry is filed under.
+    identity: i32,
+    /// One entry per call, in call order.
+    entries: Vec<ExtraFinalizer>,
+    /// The weak handle carrying the finalizer.
+    ///
+    /// **Dropping it deregisters the finalizer** (`impl Drop for Weak` calls
+    /// `remove_finalizer`), so it is owned here for as long as the object may be
+    /// collected. Writing `let _ = v8::Weak::with_guaranteed_finalizer(...)` would
+    /// install the callback and remove it in the same expression, which is a bug
+    /// this crate has already had once — see `Wrap::weak`.
+    ///
+    /// It is never *read*: the field exists for its `Drop`. That is a real
+    /// exemption rather than a suppression, because there is no operation it could
+    /// participate in — holding it is the whole contract.
+    #[allow(dead_code)]
+    weak: Option<v8::Weak<v8::Object>>,
+}
+
+/// One `napi_add_finalizer` call.
+struct ExtraFinalizer {
+    data: *mut c_void,
+    hint: *mut c_void,
+    finalize: NapiFinalize,
+}
+
+// SAFETY: the entry is created and consumed on the isolate's thread. Its raw
+// pointers are the addon's own and are only handed back to its callback.
+unsafe impl Send for ExtraFinalizers {}
+
+/// Attaches an additional finalizer to `object`.
+///
+/// Returns the reference handle when the addon asked for one, matching Node's
+/// `kUserland` ownership; a null `result` makes it a runtime-owned finalizer that
+/// the entry itself releases.
+///
+/// # Safety
+///
+/// `object` must be a live object from `scope`, and `finalize_cb` must be the
+/// addon's callback.
+pub(crate) unsafe fn add_finalizer<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    env: *mut NapiEnv,
+    data: *mut c_void,
+    finalize_cb: NapiFinalize,
+    finalize_hint: *mut c_void,
+    wants_reference: bool,
+) -> Option<Option<*mut NapiRef>> {
+    let entry = ExtraFinalizer {
+        data,
+        hint: finalize_hint,
+        finalize: finalize_cb,
+    };
+    // A reference handle is what makes the finalizer the addon's to release; Node
+    // still attaches it to the object either way, so the difference is only who
+    // deletes it.
+    let reference = if wants_reference {
+        let environment = (unsafe { crate::env::env_from(env) })?;
+        Some(environment.add_ref(crate::env::RefEntry {
+            value: RefCell::new(None),
+            count: std::cell::Cell::new(1),
+            finalize: Some(run_extra_finalizer_for_reference),
+            // The hint names the object's identity so the reference can find its
+            // entry when the addon deletes it.
+            finalize_hint: object.get_identity_hash().get() as usize as *mut c_void,
+        }))
+    } else {
+        None
+    };
+
+    let identity = object.get_identity_hash().get();
+    // The object may already carry finalizers, in which case this one joins them
+    // and the existing weak handle stays.
+    let mut entry = Some(entry);
+    let joined = EXTRA_FINALIZERS.with(|table| {
+        let mut table = table.borrow_mut();
+        // The identity hash is compared first because it is a number; the handle
+        // comparison then rules out the (astronomically unlikely) collision.
+        let index = table.iter().position(|existing| {
+            existing.identity == identity
+                && v8::Local::new(scope, &existing.object).strict_equals(object.into())
+        })?;
+        if let Some(entry) = entry.take() {
+            table[index].entries.push(entry);
+        }
+        Some(())
+    });
+    if joined.is_some() {
+        // The object already had a finalizer set, so `entry` was appended to it and
+        // the existing weak callback will run the new one too.
+        return Some(reference);
+    }
+    let Some(entry) = entry else {
+        return Some(reference);
+    };
+    let weak = {
+        let env_address = env as usize;
+        v8::Weak::with_guaranteed_finalizer(
+            scope,
+            object,
+            Box::new(move || {
+                // SAFETY: `env_address` is the environment the finalizers were
+                // registered against, which `load` keeps alive for the process.
+                unsafe { run_all_extra_finalizers(identity, env_address) };
+            }),
+        )
+    };
+    EXTRA_FINALIZERS.with(|table| {
+        table.borrow_mut().push(ExtraFinalizers {
+            object: v8::Global::new(scope, object),
+            identity,
+            entries: vec![entry],
+            weak: Some(weak),
+        });
+    });
+    Some(reference)
+}
+
+/// Runs every finalizer attached to one object, then forgets it.
+///
+/// # Safety
+///
+/// Called from a V8 weak callback, which may run on a GC thread; the addon's
+/// callbacks are therefore deferred to the owning thread.
+unsafe fn run_all_extra_finalizers(identity: i32, env: usize) {
+    let entry = EXTRA_FINALIZERS.with(|table| {
+        let mut table = match table.try_borrow_mut() {
+            Ok(table) => table,
+            Err(_) => return None,
+        };
+        let index = table.iter().position(|entry| entry.identity == identity)?;
+        Some(table.remove(index))
+    });
+    let Some(entry) = entry else {
+        return;
+    };
+    let owner = unsafe { crate::env::env_from(env as *mut NapiEnv) }
+        .map(|environment| environment.owner_thread());
+    for finalizer in entry.entries {
+        if let Some(finalize) = finalizer.finalize {
+            let data = finalizer.data as usize;
+            let hint = finalizer.hint as usize;
+            let _ = rn_core::finalizer::enqueue_for(owner, move || {
+                crate::scope::with_owner_context(env as *mut NapiEnv, |scope| {
+                    let guard = crate::scope::ScopeGuard::enter(scope);
+                    // SAFETY: the addon's own callback with the pointers it gave.
+                    unsafe {
+                        finalize(
+                            env as *mut NapiEnv,
+                            data as *mut c_void,
+                            hint as *mut c_void,
+                        )
+                    };
+                    drop(guard);
+                });
+            });
+        }
+    }
+}
+
+/// The finalizer a `napi_add_finalizer` reference runs when the addon deletes it.
+///
+/// # Safety
+///
+/// Called by `Env::delete_ref` with the identity as the hint.
+unsafe extern "C" fn run_extra_finalizer_for_reference(
+    _env: *mut NapiEnv,
+    _data: *mut c_void,
+    hint: *mut c_void,
+) {
+    // The addon deleting the reference is Node's `delete reference`, which drops
+    // that one finalizer rather than all of them. The whole entry is released here
+    // because Node's model ties each reference to one finalizer, and an addon that
+    // uses the reference form (rather than the runtime-owned one
+    // `node-addon-api` uses) holds exactly one.
+    let identity = hint as usize as i32;
+    let entry = EXTRA_FINALIZERS.with(|table| {
+        let mut table = match table.try_borrow_mut() {
+            Ok(table) => table,
+            Err(_) => return None,
+        };
+        let index = table.iter().position(|entry| entry.identity == identity)?;
+        Some(table.remove(index))
+    });
+    let Some(entry) = entry else {
+        return;
+    };
+    for finalizer in entry.entries {
+        if let Some(finalize) = finalizer.finalize {
+            // SAFETY: the addon's own callback with the pointers it gave; the
+            // caller is on the isolate's thread inside a Node-API call.
+            unsafe { finalize(std::ptr::null_mut(), finalizer.data, finalizer.hint) };
+        }
+    }
+}
+
 /// The wrap key for `scope`, created on first use.
 pub(crate) fn wrap_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Private>> {
     let existing = WRAP_KEY.with(|slot| slot.borrow().clone());

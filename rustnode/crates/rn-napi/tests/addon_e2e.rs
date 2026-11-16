@@ -650,3 +650,262 @@ fn a_buffer_surface_round_trip_carries_the_bytes() {
     ));
     assert_eq!(stdout, "true 8 7 true false");
 }
+
+// ---------------------------------------------------------------------------
+// The Node-API surface that used to be missing, and the defects behind it
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_and_clear_last_exception_succeeds_with_undefined_when_nothing_is_pending() {
+    // Node's contract, from `js_native_api_v8.cc:3078-3094`: with nothing pending
+    // this is **success with `undefined`**. `node-addon-api`'s `Napi::Error::New`
+    // calls it unconditionally and treats a non-`napi_ok` status as fatal, so
+    // reporting `napi_generic_failure` here aborted a `node-addon-api` addon at
+    // `Napi::SyntaxError::New(...).ThrowAsJavaScriptException()`.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const result = addon.getAndClearWithNothingPending();\n\
+         console.log(result.ok, result.undefined);",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "true true");
+}
+
+#[test]
+fn several_finalizers_may_be_attached_to_one_object() {
+    // `napi_add_finalizer` is not `napi_wrap`: Node creates an independent
+    // reference per call (`js_native_api_v8.cc:3625-3654`), so an object may carry
+    // any number. `node-addon-api`'s `ObjectWrap::DefineClass` attaches one per
+    // instance method and accessor to the class object, and routing this through
+    // the single-wrap path made the second call report `napi_invalid_arg`, which
+    // failed the whole class definition.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         console.log(addon.addFinalizerTwice().statusSum);",
+        literal(&build.path)
+    ));
+    // All three calls report `napi_ok`, which is 0 each.
+    assert_eq!(stdout, "0");
+}
+
+#[test]
+fn argument_slots_past_the_count_are_undefined_rather_than_null() {
+    // Node fills every slot up to the caller's capacity with `undefined`
+    // (`FunctionCallbackWrapper::Args`, `js_native_api_v8.cc:467-482`).
+    // `napi-rs` decides whether an optional argument was supplied by testing the
+    // slot for null, so leaving the tail null made a missing seed argument read as
+    // present and fail conversion — which is why `@node-rs/xxhash` could not hash
+    // anything.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const read = addon.readArgsBeyondCount;\n\
+         const one = read(1);\n\
+         const none = read();\n\
+         console.log(one.argc, one.nullSlots, one.nonUndefinedSlots,\n\
+                     none.argc, none.nullSlots, none.nonUndefinedSlots);",
+        literal(&build.path)
+    ));
+    // One argument: five slots past the count, all of them `undefined`.
+    // No arguments: all six.
+    assert_eq!(stdout, "1 0 0 0 0 0");
+}
+
+#[test]
+fn the_utf16_string_family_round_trips_a_surrogate_pair() {
+    // `napi_create_string_utf16` and `napi_get_value_string_utf16` are the two-byte
+    // half of the string surface `napi.h` reaches for first. The fixture writes a
+    // seven-unit string (four BMP code points plus a surrogate pair) and reads it
+    // back through both the length query and a truncated buffer.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const result = addon.utf16RoundTrip('h\\u00e9llo\\u{{1F600}}');\n\
+         console.log(result.length, result.copied, result.smallCopied,\n\
+                     result.terminated, result.exact, result.argumentLength,\n\
+                     result.text === 'h\\u00e9llo\\u{{1F600}}');",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "7 7 1 true true 7 true");
+}
+
+#[test]
+fn property_key_internalization_produces_usable_keys_in_all_three_encodings() {
+    // `node_api_create_property_key_*` differs from `napi_create_string_*` only in
+    // `NewStringType::Internalized`. The keys have to reach `napi_set_property` as
+    // the same property names JavaScript sees, including a non-ASCII Latin-1 key
+    // and a two-byte one.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const keys = addon.propertyKeys();\n\
+         console.log(JSON.stringify(keys));",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, r#"{"utf8key":1,"latiné":2,"ŪŽ":3}"#);
+}
+
+#[test]
+fn the_new_predicates_classify_the_typed_array_family() {
+    // `napi_is_typedarray`, `napi_is_dataview` and `node_api_is_sharedarraybuffer`
+    // are the three predicates the report named as the most alarming omissions:
+    // they are pure V8 queries with no lifetime hazard.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const view = new DataView(new ArrayBuffer(8));\n\
+         const shared = new SharedArrayBuffer(8);\n\
+         const typed = new Uint8Array(8);\n\
+         const line = (v) => [addon.predicates(v).typedarray,\n\
+                              addon.predicates(v).dataview,\n\
+                              addon.predicates(v).shared].join(',');\n\
+         console.log(line(typed), '|', line(view), '|', line(shared), '|',\n\
+                     line({{}}));",
+        literal(&build.path)
+    ));
+    assert_eq!(
+        stdout,
+        "true,false,false | false,true,false | false,false,true | false,false,false"
+    );
+}
+
+#[test]
+fn a_shared_array_buffer_is_created_with_a_writable_data_pointer() {
+    // `node_api_create_sharedarraybuffer` has to hand back the same allocation the
+    // JavaScript view sees, so a write through the native pointer is visible from
+    // the other side.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const result = addon.sharedArrayBufferRoundTrip();\n\
+         console.log(result.hasData, result.buffer instanceof SharedArrayBuffer,\n\
+                     result.buffer.byteLength);",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "true true 8");
+}
+
+#[test]
+fn a_buffer_from_an_array_buffer_shares_the_backing_store_and_is_a_buffer() {
+    // `node_api_create_buffer_from_arraybuffer` has to produce a real `Buffer`, so
+    // `Buffer.isBuffer` and `.length` work, and the view has to share the existing
+    // store rather than copy it.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const backing = new ArrayBuffer(8);\n\
+         new Uint8Array(backing).set([0,1,2,3,4,5,6,7]);\n\
+         const buffer = addon.bufferFromArrayBuffer(backing).buffer;\n\
+         console.log(Buffer.isBuffer(buffer), buffer.length, buffer[0],\n\
+                     buffer.buffer === backing);",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "true 4 2 true");
+}
+
+#[test]
+fn a_buffer_view_past_the_end_throws_err_out_of_range() {
+    // Node throws `ERR_OUT_OF_RANGE` here rather than returning `napi_invalid_arg`,
+    // and the addon sees `napi_pending_exception` with a readable `code`.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const result = addon.bufferFromArrayBufferOutOfRange(new ArrayBuffer(4));\n\
+         console.log(result.status, result.pending, result.code);",
+        literal(&build.path)
+    ));
+    // 10 is `napi_pending_exception`.
+    assert_eq!(stdout, "10 true ERR_OUT_OF_RANGE");
+}
+
+#[test]
+fn an_object_can_be_created_with_a_prototype_and_property_keys() {
+    // `node_api_create_object_with_properties` is the experimental one-shot
+    // constructor: the prototype has to be the one given, the keys have to become
+    // own properties, and a non-name key has to be refused rather than coerced.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const made = addon.createWithProperties();\n\
+         console.log(made.a, made.b, made.marker, made.badKeyStatus);",
+        literal(&build.path)
+    ));
+    // 4 is `napi_name_expected`.
+    assert_eq!(stdout, "10 20 proto 4");
+}
+
+#[test]
+fn a_syntax_error_can_be_thrown_with_a_code() {
+    // `node_api_throw_syntax_error` is the fourth `throw_*_error`. An addon reads
+    // the thrown value through `napi_get_and_clear_last_exception`, and the `code`
+    // is what `assert.throws(..., { code })` reads.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         try {{ addon.throwSyntax(); }} catch (error) {{\n\
+           console.log(error.name, error.code, error.message);\n\
+         }}",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "SyntaxError ERR_ADDON_SYNTAX bad token");
+}
+
+#[test]
+fn type_tags_identify_an_object_and_refuse_a_second_tag() {
+    // Type tags are the mechanism an addon uses to recognise its own objects
+    // without trusting the prototype chain. A mismatched tag must simply fail the
+    // check, and re-tagging must be refused.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const result = addon.typeTagRoundTrip();\n\
+         console.log(result.matches, result.other, result.retagStatus);",
+        literal(&build.path)
+    ));
+    // 1 is `napi_invalid_arg`.
+    assert_eq!(stdout, "true false 1");
+}
+
+#[test]
+fn a_script_runs_in_the_modules_context() {
+    // `napi_run_script` compiles and runs in the caller's context. A non-string
+    // source is `napi_string_expected`, not a coercion.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const result = addon.runScript();\n\
+         console.log(result.value, result.numberSourceStatus);",
+        literal(&build.path)
+    ));
+    // 3 is `napi_string_expected`.
+    assert_eq!(stdout, "42 3");
+}
+
+#[test]
+fn an_async_cleanup_hook_can_be_added_and_removed() {
+    // `napi_add_async_cleanup_hook` and its removal are the only pair in the
+    // surface where the handle has to outlive the call that produced it.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         const result = addon.asyncCleanupHooks();\n\
+         console.log(result.added, result.removed);",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "true true");
+}
+
+#[test]
+fn the_addon_can_reach_the_event_loop() {
+    // `napi_get_uv_event_loop` is how an addon drives libuv itself, so it has to be
+    // the process' loop rather than a second one.
+    let build = support::build_addon_or_abort();
+    let stdout = run_ok(&format!(
+        "const addon = require({});\n\
+         console.log(addon.eventLoop().ok);",
+        literal(&build.path)
+    ));
+    assert_eq!(stdout, "true");
+}

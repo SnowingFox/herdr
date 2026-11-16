@@ -82,6 +82,15 @@ pub fn build_addon() -> Result<Build, String> {
         .arg(source.join("addon.c"))
         .arg(source.join("addon_async.c"))
         .arg(source.join("addon_wrap.c"))
+        // `addon_surface.c` covers the entry points that used to be missing, and
+        // the three behavioural defects found while implementing them. It defines
+        // `NAPI_EXPERIMENTAL` itself, because seven of those entry points are
+        // gated on it in the pinned headers, so `node_api.h` emits its
+        // "experimental features may be unstable" `#warning`. `-Wno-#warnings`
+        // silences that one diagnostic for the whole compile; nothing else here
+        // uses `#warning`, and `-Werror` still covers every real warning.
+        .arg("-Wno-#warnings")
+        .arg(source.join("addon_surface.c"))
         // `addon_async.c` starts a real producer thread with `pthread_create`, which
         // is the point: the thread-safe function has to be called from a thread
         // that is not the isolate's. Linking pthread is what makes that a real

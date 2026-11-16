@@ -156,6 +156,42 @@ pub type NapiThreadsafeFunctionCallJs = Option<
 pub type NapiFinalize =
     Option<unsafe extern "C" fn(env: *mut NapiEnv, data: *mut c_void, hint: *mut c_void)>;
 
+/// `typedef node_api_nogc_finalize node_api_basic_finalize`, spelled with the
+/// `const napi_env` parameter type `NAPI_EXPERIMENTAL` gives it.
+///
+/// The constness is only a qualifier on the pointer target, so the calling
+/// convention is identical to [`NapiFinalize`]; the distinct name keeps the
+/// `node_api_create_external_*_string` signatures honest.
+pub type NapiBasicFinalize =
+    Option<unsafe extern "C" fn(env: *const NapiEnv, data: *mut c_void, hint: *mut c_void)>;
+
+/// `typedef void (NAPI_CDECL* node_api_noenv_finalize)(void*, void*)`
+///
+/// A finalizer V8 may run on any thread with no environment, so it must not call
+/// back into Node-API. `node_api_create_external_sharedarraybuffer` takes one.
+pub type NapiNoEnvFinalize = Option<unsafe extern "C" fn(data: *mut c_void, hint: *mut c_void)>;
+
+/// The `napi_type_tag` two 64-bit halves, from `js_native_api_types.h`.
+///
+/// `Copy` because the shims read it out of the caller's pointer and pass it by
+/// value; the layout is two plain integers, so copying has no identity meaning.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NapiTypeTag {
+    pub lower: u64,
+    pub upper: u64,
+}
+
+/// `napi_async_cleanup_hook`: a promise-returning or callback cleanup hook.
+pub type NapiAsyncCleanupHook =
+    Option<unsafe extern "C" fn(arg: *mut c_void, handle: *mut NapiAsyncCleanupHookHandle)>;
+
+/// `typedef struct napi_async_cleanup_hook_handle__* napi_async_cleanup_hook_handle;`
+#[repr(C)]
+pub struct NapiAsyncCleanupHookHandle {
+    _private: [u8; 0],
+}
+
 /// `napi_status`, in declaration order.
 ///
 /// The integer values are the ABI: an addon compares against `napi_ok` and
