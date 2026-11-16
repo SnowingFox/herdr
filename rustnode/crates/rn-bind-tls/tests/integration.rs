@@ -169,6 +169,41 @@ fn the_namespace_has_its_five_members() {
     );
 }
 
+/// Calling the `TLSWrap` constructor without `new` returns `undefined`, as Node's
+/// does, rather than throwing.
+///
+/// `FunctionTemplate::New` — what `Initialize` uses — defaults to running nothing
+/// and yielding `undefined` for a plain call, and `tools/no-new-case.js` measures
+/// exactly that against the pinned Node nightly. The audit's rule is to match the
+/// oracle's kind of outcome, and the gate's oracle-free mode only judges crashes,
+/// so a divergent throw here would pass the gate and still be wrong. This pins the
+/// oracle-visible half.
+#[test]
+fn calling_the_tls_wrap_constructor_without_new_returns_undefined() {
+    let script = "\
+        const W = process.binding('tls_wrap'); \
+        const result = W.TLSWrap(); \
+        console.log([ \
+          typeof result, \
+          result === undefined, \
+        ].join(',')); \
+        const instance = new W.TLSWrap(); \
+        console.log('with-new=' + (typeof instance.getAsyncId));";
+    let (stdout, stderr, ok) = run(script);
+    assert!(
+        ok,
+        "a plain call must not throw, because Node's does not; stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("undefined,true"),
+        "a plain call yields undefined; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("with-new=function"),
+        "construction still works afterwards; stdout: {stdout}"
+    );
+}
+
 /// Every prototype method this crate installs is present, and `wrap.js`'s
 /// module-scope assignments succeed.
 ///

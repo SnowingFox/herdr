@@ -568,13 +568,26 @@ fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
 /// the namespace), so the `new` check and the state allocation are both here; a
 /// direct `new TLSWrap()` produces an object with empty state, and every method
 /// on it reports that rather than crashing.
+///
+/// # A call without `new` returns `undefined`, as Node's does
+///
+/// Node's `Initialize` builds this template with `FunctionTemplate::New`, whose
+/// default behaviour for a call without `new` is to return the global object and
+/// run nothing — so `tls_wrap.TLSWrap()` is a silent no-op that yields
+/// `undefined`, not a `TypeError`. `tools/no-new-case.js` measures exactly that
+/// against the pinned Node nightly, and the audit's rule is to match the
+/// oracle's *kind* of outcome. Throwing here was a mismatch the oracle-free gate
+/// run could not see, because that mode only judges crashes.
 fn construct_tls_wrap<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
     if !args.is_construct_call() {
-        throw_type_error(scope, "TLSWrap cannot be invoked without 'new'");
+        // `undefined` rather than a throw: see this function's docs. Returning
+        // early also means no state is allocated, so nothing leaks and the
+        // global object is left untouched.
+        rv.set(v8::undefined(scope).into());
         return;
     }
     let object = args.this();
