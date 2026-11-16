@@ -342,12 +342,24 @@ extern "C" {
     ) -> std::ffi::c_int;
     fn BN_print(bio: *mut ffi::BIO, value: *const ffi::BIGNUM) -> std::ffi::c_int;
     fn i2d_PUBKEY(key: *const ffi::EVP_PKEY, out: *mut *mut u8) -> std::ffi::c_int;
+    /// `size_t EC_POINT_point2buf(group, point, form, pbuf, ctx)`.
+    ///
+    /// The fifth parameter is the optional `BN_CTX`, **not** an out-parameter for
+    /// the length: the length is the return value. Declaring it `*mut usize` and
+    /// passing `&mut length` made every caller hand OpenSSL a pointer to an
+    /// unused stack `usize`, which `ossl_ec_GFp_simple_point2oct` then used as a
+    /// `BN_CTX`: `BN_CTX_start` pushed a bignum stack frame through whatever
+    /// that uninitialised memory happened to contain. It is a silent
+    /// miscompilation on every EC certificate, which is every TLS connection:
+    /// the release build wrote through `0x59454b43494c` (`"LICKEY"`, a reused
+    /// PEM buffer) and died, while the debug build won the memory lottery and
+    /// worked.
     fn EC_POINT_point2buf(
         group: *const ffi::EC_GROUP,
         point: *const ffi::EC_POINT,
         form: std::ffi::c_int,
         buf: *mut *mut u8,
-        len: *mut usize,
+        ctx: *mut std::ffi::c_void,
     ) -> usize;
     fn EVP_PKEY_get0_EC_KEY(key: *const ffi::EVP_PKEY) -> *const ffi::EC_KEY;
     fn EC_KEY_get0_group(key: *const ffi::EC_KEY) -> *const ffi::EC_GROUP;
@@ -425,18 +437,19 @@ unsafe fn ec_public_point(key: *const ffi::EVP_PKEY) -> Option<Vec<u8>> {
         // carries no conversion form.
         const POINT_CONVERSION_UNCOMPRESSED: std::ffi::c_int = 4;
         let mut buffer: *mut u8 = std::ptr::null_mut();
-        let mut length: usize = 0;
+        // A null `BN_CTX` is documented as valid and makes OpenSSL allocate its
+        // own, which is what the old `&mut length` argument was mistaken for.
         let written = EC_POINT_point2buf(
             group,
             point,
             POINT_CONVERSION_UNCOMPRESSED,
             &mut buffer,
-            &mut length,
+            std::ptr::null_mut(),
         );
         if written == 0 || buffer.is_null() {
             return None;
         }
-        let bytes = std::slice::from_raw_parts(buffer, length).to_vec();
+        let bytes = std::slice::from_raw_parts(buffer, written).to_vec();
         ffi::OPENSSL_free(buffer.cast());
         Some(bytes)
     }
