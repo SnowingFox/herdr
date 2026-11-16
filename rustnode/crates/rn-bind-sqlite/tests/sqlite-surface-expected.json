@@ -1,0 +1,381 @@
+{
+  "exports": [
+    "Database",
+    "DatabaseSync",
+    "Session",
+    "Statement",
+    "StatementSync",
+    "backup",
+    "constants"
+  ],
+  "aliases": {
+    "database": true,
+    "statement": true
+  },
+  "limits": {
+    "types": {
+      "length": "number",
+      "sqlLength": "number",
+      "column": "number",
+      "exprDepth": "number",
+      "compoundSelect": "number",
+      "vdbeOp": "number",
+      "functionArg": "number",
+      "attach": "number",
+      "likePatternLength": "number",
+      "variableNumber": "number",
+      "triggerDepth": "number"
+    },
+    "length": 1000000000,
+    "sqlLength": 1000000000,
+    "column": 2000,
+    "exprDepth": 1000,
+    "compoundSelect": 500,
+    "vdbeOp": 250000000,
+    "functionArg": 1000,
+    "attach": 10,
+    "likePatternLength": 50000,
+    "variableNumber": 32766,
+    "triggerDepth": 1000,
+    "keys": [
+      "length",
+      "sqlLength",
+      "column",
+      "exprDepth",
+      "compoundSelect",
+      "vdbeOp",
+      "functionArg",
+      "attach",
+      "likePatternLength",
+      "variableNumber",
+      "triggerDepth"
+    ],
+    "ownNames": [
+      "length",
+      "sqlLength",
+      "column",
+      "exprDepth",
+      "compoundSelect",
+      "vdbeOp",
+      "functionArg",
+      "attach",
+      "likePatternLength",
+      "variableNumber",
+      "triggerDepth"
+    ],
+    "protoNames": [
+      "constructor"
+    ],
+    "sameObjectOnEveryRead": true,
+    "sharedPrototypeAcrossDatabases": true,
+    "memberDescriptors": {
+      "length": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "sqlLength": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "column": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "exprDepth": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "compoundSelect": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "vdbeOp": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "functionArg": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "attach": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "likePatternLength": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "variableNumber": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      },
+      "triggerDepth": {
+        "get": "undefined",
+        "set": "undefined",
+        "valueType": "number",
+        "writable": true,
+        "enumerable": true,
+        "configurable": false
+      }
+    },
+    "deleteReturn": true,
+    "hasOwnAfterDelete": true,
+    "valueAfterDelete": 1000000000,
+    "redefine": "throw:TypeError",
+    "writeReadBack": 0,
+    "writeReachesConnection": "error:ERR_SQLITE_ERROR",
+    "writeReachesPrepare": "error:ERR_SQLITE_ERROR",
+    "setString": "throw:ERR_INVALID_ARG_TYPE",
+    "setFloat": "throw:ERR_INVALID_ARG_TYPE",
+    "setNegative": "throw:ERR_OUT_OF_RANGE",
+    "unknownAfterSet": 3
+  },
+  "instances": {
+    "database": {
+      "ownNames": [
+        "isOpen",
+        "isTransaction",
+        "limits"
+      ],
+      "accessors": {
+        "isOpen": {
+          "get": "function",
+          "set": "undefined",
+          "valueType": "absent",
+          "enumerable": true,
+          "configurable": false
+        },
+        "isTransaction": {
+          "get": "function",
+          "set": "undefined",
+          "valueType": "absent",
+          "enumerable": true,
+          "configurable": false
+        },
+        "limits": {
+          "get": "function",
+          "set": "undefined",
+          "valueType": "absent",
+          "enumerable": true,
+          "configurable": false
+        }
+      }
+    },
+    "statement": {
+      "ownNames": [
+        "expandedSQL",
+        "sourceSQL"
+      ],
+      "accessors": {
+        "sourceSQL": {
+          "get": "function",
+          "set": "undefined",
+          "valueType": "absent",
+          "enumerable": true,
+          "configurable": false
+        },
+        "expandedSQL": {
+          "get": "function",
+          "set": "undefined",
+          "valueType": "absent",
+          "enumerable": true,
+          "configurable": false
+        }
+      }
+    },
+    "tagStore": {
+      "ownNames": [
+        "capacity",
+        "db",
+        "size"
+      ],
+      "accessors": {
+        "size": {
+          "get": "function",
+          "set": "undefined",
+          "valueType": "absent",
+          "enumerable": true,
+          "configurable": false
+        },
+        "capacity": {
+          "get": "function",
+          "set": "undefined",
+          "valueType": "absent",
+          "enumerable": true,
+          "configurable": false
+        },
+        "db": {
+          "get": "function",
+          "set": "undefined",
+          "valueType": "absent",
+          "enumerable": true,
+          "configurable": false
+        }
+      }
+    }
+  },
+  "prototypes": {
+    "database": [
+      "open",
+      "close",
+      "prepare",
+      "exec",
+      "function",
+      "createTagStore",
+      "location",
+      "aggregate",
+      "createSession",
+      "applyChangeset",
+      "enableLoadExtension",
+      "enableDefensive",
+      "loadExtension",
+      "serialize",
+      "deserialize",
+      "setAuthorizer",
+      "createModule",
+      "constructor"
+    ],
+    "statement": [
+      "iterate",
+      "all",
+      "get",
+      "run",
+      "columns",
+      "stat",
+      "resetStats",
+      "setAllowBareNamedParameters",
+      "setAllowUnknownNamedParameters",
+      "setReadBigInts",
+      "setReturnArrays",
+      "close",
+      "constructor"
+    ],
+    "session": [
+      "changeset",
+      "patchset",
+      "close",
+      "constructor"
+    ],
+    "tagStore": [
+      "get",
+      "all",
+      "iterate",
+      "run",
+      "clear",
+      "constructor"
+    ],
+    "databaseHasLimits": false
+  },
+  "instanceof": {
+    "Database": {
+      "database": true,
+      "statement": false,
+      "statement2": false,
+      "session": false,
+      "tagStore": false
+    },
+    "DatabaseSync": {
+      "database": true,
+      "statement": false,
+      "statement2": false,
+      "session": false,
+      "tagStore": false
+    },
+    "Statement": {
+      "database": false,
+      "statement": true,
+      "statement2": true,
+      "session": false,
+      "tagStore": false
+    },
+    "StatementSync": {
+      "database": false,
+      "statement": true,
+      "statement2": true,
+      "session": false,
+      "tagStore": false
+    },
+    "Session": {
+      "database": false,
+      "statement": false,
+      "statement2": false,
+      "session": true,
+      "tagStore": false
+    }
+  },
+  "prototypeIdentity": {
+    "database": true,
+    "statement": true,
+    "session": true,
+    "statementsSharePrototype": true,
+    "tagStoresSharePrototype": true
+  },
+  "iterator": {
+    "prototypeOwnNames": [
+      "next",
+      "return",
+      "constructor"
+    ],
+    "constructorName": "StatementIterator",
+    "parentIsGlobalIteratorPrototype": true,
+    "prototypesShared": true,
+    "constructorsShared": true,
+    "nextType": "function",
+    "returnType": "function",
+    "construct": "ERR_ILLEGAL_CONSTRUCTOR"
+  },
+  "constructorIdentity": {
+    "database": true,
+    "statement": true,
+    "session": true,
+    "tagStoreName": "SQLTagStore",
+    "statementName": "Statement",
+    "databaseName": "Database",
+    "iteratorName": "StatementIterator"
+  },
+  "construct": {
+    "Statement": "ERR_ILLEGAL_CONSTRUCTOR",
+    "StatementSync": "ERR_ILLEGAL_CONSTRUCTOR",
+    "Session": "ERR_ILLEGAL_CONSTRUCTOR"
+  }
+}

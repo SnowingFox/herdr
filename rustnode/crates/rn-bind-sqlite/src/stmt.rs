@@ -943,43 +943,107 @@ pub fn read_options(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
+    Ok(template(scope)
+        .ok_or("cannot allocate the Statement constructor")?
+        .get_function(scope)
+        .ok_or("cannot allocate the Statement constructor")?
+        .into())
+}
+
+thread_local! {
+    /// The one `Statement` `FunctionTemplate` this isolate uses, and the
+    /// isolate it belongs to.
+    ///
+    /// Cached for the same two reasons `session.rs` caches its own, both of
+    /// which are observable:
+    ///
+    /// 1. `Statement::Create` in the C++ allocates from
+    ///    `GetConstructorTemplate(env)->InstanceTemplate()->NewInstance(...)`,
+    ///    which is *the same template* the namespace exposes as `Statement`. A
+    ///    second template per instance answers `false` for
+    ///    `statement instanceof Statement` and gives each statement its own
+    ///    prototype, so `Object.getPrototypeOf(s1) === Object.getPrototypeOf(s2)`
+    ///    breaks too.
+    /// 2. `InstanceTemplate()->NewInstance(...)` never runs the constructor
+    ///    callback, so `prepare` still works while `new Statement()` throws from
+    ///    the same template's `IllegalConstructor`.
+    static TEMPLATE: std::cell::RefCell<Option<CachedTemplate>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A `Statement` template belonging to one isolate, by address.
+struct CachedTemplate {
+    isolate: usize,
+    template: v8::Global<v8::FunctionTemplate>,
+}
+
+/// Drops the cached template, called once per namespace install.
+pub fn reset_template_cache() {
+    TEMPLATE.with(|slot| *slot.borrow_mut() = None);
+}
+
+/// The `Statement` `FunctionTemplate` for this isolate, built on first use.
+fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::FunctionTemplate>> {
+    let address = crate::session::isolate_address(scope);
+    let cached = TEMPLATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|cached| cached.isolate == address)
+            .map(|cached| cached.template.clone())
+    });
+    if let Some(template) = cached {
+        return Some(v8::Local::new(scope, template));
+    }
+
+    // `rn_core::class`, not `rn_core::method`: `Statement` is a real class that
+    // `lib/**` reaches through `db.prepare()` and that `SetConstructorFunction`
+    // publishes as constructible. Its *prototype methods* are `rn_core::method`,
+    // because `SetProtoMethod` passes `ConstructorBehavior::kThrow`.
     let template = rn_core::class(illegal_constructor).length(0).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELDS);
 
-    populate_prototype(scope, &template);
+    populate_prototype(scope, template);
     if let Some(name) = v8::String::new(scope, "Statement") {
         template.set_class_name(name);
     }
-    let function = template
-        .get_function(scope)
-        .ok_or("cannot allocate the Statement constructor")?;
-    if let Some(name) = v8::String::new(scope, "Statement") {
-        function.set_name(name);
-    }
-    Ok(function.into())
+    let function = template.get_function(scope)?;
+    crate::database::link_constructor(scope, &template, function, "Statement");
+
+    TEMPLATE.with(|slot| {
+        *slot.borrow_mut() = Some(CachedTemplate {
+            isolate: address,
+            template: v8::Global::new(scope, template),
+        });
+    });
+    Some(template)
 }
 
-/// Installs every method, accessor and `Symbol.dispose` on a template's
-/// prototype, so [`allocate`] can reuse the exact same surface.
-fn populate_prototype(scope: &mut v8::PinScope<'_, '_>, template: &v8::FunctionTemplate) {
+/// Installs every method, accessor and `Symbol.dispose` on the template.
+///
+/// The order is `Statement::GetConstructorTemplate`'s, because
+/// `Object.getOwnPropertyNames(Statement.prototype)` is ordered by insertion and
+/// Node's own tests compare that list.
+fn populate_prototype<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    template: v8::Local<'s, v8::FunctionTemplate>,
+) {
     let prototype = template.prototype_template(scope);
     let methods: [(&str, i32, v8::Local<'_, v8::FunctionTemplate>); 12] = [
-        ("all", 0, crate::database::method(scope, 0, proto_all)),
-        ("get", 0, crate::database::method(scope, 0, proto_get)),
-        ("run", 0, crate::database::method(scope, 0, proto_run)),
         (
             "iterate",
             0,
             crate::database::method(scope, 0, proto_iterate),
         ),
+        ("all", 0, crate::database::method(scope, 0, proto_all)),
+        ("get", 0, crate::database::method(scope, 0, proto_get)),
+        ("run", 0, crate::database::method(scope, 0, proto_run)),
         (
             "columns",
             0,
             crate::database::method(scope, 0, proto_columns),
         ),
-        ("close", 0, crate::database::method(scope, 0, proto_close)),
         ("stat", 1, crate::database::method(scope, 1, proto_stat)),
         (
             "resetStats",
@@ -1006,6 +1070,7 @@ fn populate_prototype(scope: &mut v8::PinScope<'_, '_>, template: &v8::FunctionT
             1,
             crate::database::method(scope, 1, proto_set_return_arrays),
         ),
+        ("close", 0, crate::database::method(scope, 0, proto_close)),
     ];
     for (name, _length, template) in methods {
         let key = match v8::String::new(scope, name) {
@@ -1014,6 +1079,19 @@ fn populate_prototype(scope: &mut v8::PinScope<'_, '_>, template: &v8::FunctionT
         };
         prototype.set(key.into(), template.into());
     }
+
+    // `sourceSQL` and `expandedSQL` are side-effect-free getters on the
+    // *instance* template, which is why `Object.getOwnPropertyNames(st)` lists
+    // them while the prototype does not.
+    let _ =
+        crate::database::side_effect_free_getter(scope, template, "sourceSQL", proto_source_sql);
+    let _ = crate::database::side_effect_free_getter(
+        scope,
+        template,
+        "expandedSQL",
+        proto_expanded_sql,
+    );
+
     let dispose = crate::database::method(scope, 0, proto_dispose);
     let dispose_key: v8::Local<'_, v8::Name> =
         match v8::Local::<v8::Symbol>::try_from(crate::database::well_known_dispose(scope)) {
@@ -1023,31 +1101,6 @@ fn populate_prototype(scope: &mut v8::PinScope<'_, '_>, template: &v8::FunctionT
                 .into(),
         };
     prototype.set(dispose_key, dispose.into());
-
-    // `sourceSQL` and `expandedSQL` are accessors, and both throw once the
-    // statement is finalized, so they are not plain data properties.
-    let accessors: [(&str, v8::Local<'_, v8::FunctionTemplate>); 2] = [
-        (
-            "sourceSQL",
-            crate::database::accessor_template!(scope, proto_source_sql),
-        ),
-        (
-            "expandedSQL",
-            crate::database::accessor_template!(scope, proto_expanded_sql),
-        ),
-    ];
-    for (name, getter) in accessors {
-        let key = match v8::String::new(scope, name) {
-            Some(key) => key,
-            None => return,
-        };
-        prototype.set_accessor_property(
-            key.into(),
-            Some(getter),
-            None,
-            v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE,
-        );
-    }
 }
 
 /// The body of a class only the runtime may construct.
@@ -1089,46 +1142,22 @@ pub fn create<'s>(
     Some(object.into())
 }
 
-thread_local! {
-    /// The `Statement` prototype, built once per isolate.
-    ///
-    /// `Statement::Create` in the C++ reuses `env->sqlite_statement_sync_constructor_template()`,
-    /// and that caching is observable: `Object.getPrototypeOf(s1) ===
-    /// Object.getPrototypeOf(s2)` holds, and `test-sqlite-template-tag.js`
-    /// asserts it for tag stores too. Rebuilding the template per instance would
-    /// give every statement its own prototype and break that identity.
-    static STATEMENT_PROTOTYPE: std::cell::RefCell<Option<v8::Global<v8::Object>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Allocates a bare `Statement` instance from the cached object template.
+/// Allocates a `Statement` instance from the cached constructor template.
 ///
 /// `Statement::Create` in the C++ calls
 /// `GetConstructorTemplate(env)->InstanceTemplate()->NewInstance(...)`, which
-/// takes the *object* template and never runs the constructor body. Using
-/// `Function::new_instance` here would invoke `IllegalConstructor` instead, so
-/// this installs the cached prototype directly — the same escape the C++ uses,
-/// and the reason `new Statement()` still throws.
+/// takes the *object* template of the very template the namespace exposes. That
+/// is what makes `statement instanceof Statement` true and
+/// `statement.constructor === Statement` hold.
+///
+/// The earlier version built a throwaway `FunctionTemplate` here and copied one
+/// manually cached prototype onto the instance, which answered `false` for
+/// `instanceof` and gave `st.constructor.name` as `"Object"` — the instances were
+/// never touched by the exposed template, so its `has_instance` never matched.
 fn allocate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
-    let cache = STATEMENT_PROTOTYPE.with(|slot| slot.borrow().clone());
-    let prototype = match cache {
-        Some(prototype) => v8::Local::new(scope, prototype),
-        None => {
-            let template = rn_core::class(illegal_constructor).length(0).build(scope);
-            populate_prototype(scope, &template);
-            let prototype = template.prototype_template(scope).new_instance(scope)?;
-            STATEMENT_PROTOTYPE.with(|slot| {
-                *slot.borrow_mut() = Some(v8::Global::new(scope, prototype));
-            });
-            prototype
-        }
-    };
-    let template = rn_core::class(illegal_constructor).length(0).build(scope);
-    let instance_template = template.instance_template(scope);
-    instance_template.set_internal_field_count(INTERNAL_FIELDS);
-    let instance = instance_template.new_instance(scope)?;
-    instance.set_prototype(scope, prototype.into())?;
-    Some(instance)
+    template(scope)?
+        .instance_template(scope)
+        .new_instance(scope)
 }
 
 /// Boxes an existing `StatementState` pointer onto `object`.

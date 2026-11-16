@@ -343,7 +343,10 @@ pub fn reset_template_cache() {
 }
 
 /// The isolate address a scope belongs to, for the identity check above.
-fn isolate_address(scope: &v8::PinScope<'_, '_>) -> usize {
+///
+/// `limits.rs` caches its template the same way and reuses this, so the two
+/// caches cannot drift apart in how they decide which isolate they belong to.
+pub fn isolate_address(scope: &v8::PinScope<'_, '_>) -> usize {
     let isolate: &v8::Isolate = scope.as_ref();
     // SAFETY: reading the address is not a dereference; it is only compared
     // against the address recorded when the cache was filled.
@@ -394,6 +397,8 @@ fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Fu
     if let Some(name) = v8::String::new(scope, "Session") {
         template.set_class_name(name);
     }
+    let function = template.get_function(scope)?;
+    crate::database::link_constructor(scope, &template, function, "Session");
 
     TEMPLATE.with(|slot| {
         *slot.borrow_mut() = Some(CachedTemplate {

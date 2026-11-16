@@ -126,12 +126,16 @@ impl BindingModule for Sqlite {
         scope: &mut v8::PinScope<'s, '_>,
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
-        // A namespace is installed once per isolate, so this is where session's
-        // per-isolate template cache is reset. It matters because that cache is
-        // keyed by isolate address, and a new isolate can be allocated at the
+        // A namespace is installed once per isolate, so this is where the
+        // per-isolate template caches are reset. It matters because those caches
+        // are keyed by isolate address, and a new isolate can be allocated at the
         // address a disposed one had; the address check alone cannot tell the
         // two apart, but "install happened again" can.
         session::reset_template_cache();
+        limits::reset_template_cache();
+        iterator::reset_template_cache();
+        stmt::reset_template_cache();
+        tagstore::reset_template_cache();
 
         let object = v8::Object::new(scope);
 
