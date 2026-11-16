@@ -52,9 +52,10 @@
 //! **Hashing** (`createHash`, `Hash`, `HashJob`, `crypto.hash()` through
 //! `oneShotDigest`), **HMAC** (`createHmac`, `Hmac`, `HmacJob`), **random**
 //! (`randomBytes`, `randomFill`, `randomFillSync`, `randomInt`,
-//! `getRandomValues`), **key derivation** (`pbkdf2`, `scrypt`, `hkdf` through
-//! their job classes), `timingSafeEqual`, the feature queries, and the three
-//! enumeration functions — 62 of the 144 recorded members.
+//! `getRandomValues` with their asynchronous `RandomBytesJob`, `RandomPrimeJob`
+//! and `CheckPrimeJob`), **key derivation** (`pbkdf2`, `scrypt`, `hkdf`,
+//! `argon2` through their job classes), `timingSafeEqual`, the feature queries,
+//! and the three enumeration functions.
 //!
 //! Those 62 members carry the whole surface the task prioritised. Verified
 //! end to end against a real `node` binary: SHA-1/256/512, MD5, SHA-3, BLAKE2,
@@ -62,14 +63,26 @@
 //! `getHashes()`/`getCiphers()`/`getCurves()` set-equal to Node's, PBKDF2, scrypt
 //! and HKDF outputs identical, and SHAKE extension via `outputLength`.
 //!
-//! The other 82 are in [`install::DEFERRED`], each with a written reason. They
-//! are almost entirely the **asymmetric key surface**: `KeyObject`,
-//! `KeyObjectHandle`, `createPublicKey`/`createPrivateKey`, `createSign`/
-//! `createVerify`, RSA encrypt/decrypt, X.509 and WebCrypto. That is the largest
-//! remaining group and the next landing. `CipherBase` (streaming
-//! `createCipheriv`) is deferred separately: the engine has the cipher
-//! primitives and the enumeration is derived from them, but the handle needs an
-//! async completion path.
+//! # The asynchronous job classes
+//!
+//! Every `*Job` class `lib/**` constructs is a `CryptoJob<traits>`: a mode in
+//! slot 0, a `run()` whose meaning depends on that mode, and a completion that
+//! is a tuple (`Sync`), an `ondone` call (`Async`) or a promise (`WebCrypto`).
+//! That machinery is `rn-crypto-job`, shared with `rn-bind-crypto-cipher`,
+//! `rn-bind-crypto-sign` and `rn-bind-crypto-keys`, because four copies is how
+//! the modes drift.
+//!
+//! The random jobs live in [`random_jobs`] and are installed by [`jobs`]. Their
+//! absence was not a missing optimisation: `randomFill` at
+//! `lib/internal/crypto/random.js:229` constructs a `RandomBytesJob`
+//! unconditionally whenever a callback was supplied, so every asynchronous
+//! `randomBytes`, `randomFill`, `randomInt`, `generatePrime` and `checkPrime`
+//! threw `TypeError: RandomBytesJob is not a constructor` while the synchronous
+//! halves worked.
+//!
+//! `Argon2Job` is in [`argon2_job`]. It was previously deferred on the claim
+//! that `openssl-src` does not build OpenSSL's Argon2 provider; it does, and
+//! `openssl::kdf::argon2*` reproduces Node's bytes for all three variants.
 //!
 //! `rn-compat` reports `crypto 144 recorded 0 missing ok`, and
 //! `tools/deferred-reach.py` reports no deferral called at module scope — the
@@ -97,12 +110,15 @@
 //! unique*, so it is the algorithm's index in the enumeration. That is enough to
 //! keep `getCachedHashId()` from returning `-1` for a valid algorithm.
 
+pub mod argon2_job;
 pub mod classes;
 pub mod encoding;
 pub mod engine;
 pub mod enumerate;
 pub mod install;
+pub mod jobs;
 pub mod kdf;
+pub mod random_jobs;
 
 pub use engine::CryptoError;
 pub use install::{Crypto, DEFERRED, MEMBERS};

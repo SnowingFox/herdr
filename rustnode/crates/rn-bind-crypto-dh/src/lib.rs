@@ -40,6 +40,7 @@ use std::cell::RefCell;
 
 use rn_v8_sys::v8;
 
+pub mod ecdh;
 pub mod state;
 
 use state::{check_result, Dh, DhError};
@@ -62,11 +63,38 @@ pub fn install_classes<'s>(
     let group = build_group_class(scope)?;
     let full = build_class(scope)?;
     set(scope, target, "DiffieHellman", full)?;
-    set(scope, target, "DiffieHellmanGroup", group)
+    set(scope, target, "DiffieHellmanGroup", group)?;
+    // `ECDH` and `ECDHConvertKey` are installed by `ECDH::Initialize` in
+    // `src/crypto/crypto_ec.cc`, a different translation unit, but they land on
+    // this same namespace object and the JavaScript wrapper shares
+    // `DiffieHellman.prototype`'s methods, so they belong beside these two.
+    ecdh::install_classes(scope, target)
 }
 
 /// The members this crate installs, for the parent crate's `MEMBERS` list.
-pub const MEMBERS: &[&str] = &["DiffieHellman", "DiffieHellmanGroup"];
+pub const MEMBERS: &[&str] = &[
+    "DiffieHellman",
+    "DiffieHellmanGroup",
+    // From `src/crypto/crypto_ec.cc`, installed beside these because it is the
+    // same `crypto_dh.js` surface and shares their prototype methods.
+    "ECDH",
+    "ECDHConvertKey",
+];
+
+/// The curve-name resolver `ECDH` and `ECDHConvertKey` need.
+///
+/// `OBJ_sn2nid` plus the JWK spellings, which is what `crypto_ec.cc` does. It is
+/// re-exported here rather than reached for through `rn-crypto-openssl` in
+/// `ecdh.rs` so the two callers that need a curve agree on which names resolve.
+pub(crate) fn curve_nid(name: &str) -> Option<openssl::nid::Nid> {
+    Some(match name {
+        "prime256v1" | "secp256r1" | "P-256" => openssl::nid::Nid::X9_62_PRIME256V1,
+        "secp384r1" | "P-384" => openssl::nid::Nid::SECP384R1,
+        "secp521r1" | "P-521" => openssl::nid::Nid::SECP521R1,
+        "secp256k1" => openssl::nid::Nid::SECP256K1,
+        other => return rn_crypto_openssl::nid_of_curve(other),
+    })
+}
 
 /// `new DiffieHellman(sizeOrKey, generator)`.
 ///

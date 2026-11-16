@@ -76,6 +76,7 @@ pub mod evp;
 pub mod evp_binding;
 pub mod info;
 pub mod job;
+pub mod public_key;
 pub mod state;
 
 pub use state::{CipherError, CipherState, ErrorKind, Kind};
@@ -89,7 +90,19 @@ pub use state::{CipherError, CipherState, ErrorKind, Kind};
 /// `rn-bind-crypto` already declares it deferred in its own `DEFERRED` list. The
 /// coordinator's `install.rs` edit moves that one entry; this crate only supplies
 /// the function, so the name is here for that edit to reference.
-pub const MEMBERS: &[&str] = &["CipherBase", "AESCipherJob", "getCipherInfo"];
+/// The four RSA cipher members are here too: `CipherBase::Initialize` installs
+/// them in `src/crypto/crypto_cipher.cc`, immediately after `CipherBase` itself,
+/// because they are one translation unit's `PublicKeyCipher` template. They came
+/// off `rn-bind-crypto`'s deferred list for the same reason `getCipherInfo` did.
+pub const MEMBERS: &[&str] = &[
+    "CipherBase",
+    "AESCipherJob",
+    "getCipherInfo",
+    "publicEncrypt",
+    "privateDecrypt",
+    "privateEncrypt",
+    "publicDecrypt",
+];
 
 /// Installs `CipherBase` and `AESCipherJob` onto `target`, the `crypto`
 /// namespace object.
@@ -119,7 +132,164 @@ pub fn install_classes<'s>(
         .get_function(scope)
         .ok_or("cannot allocate crypto.getCipherInfo")?;
     set(scope, target, "getCipherInfo", info.into())?;
+    // The four `PublicKeyCipher::Cipher<operation, cipher>` instantiations.
+    // `lib/internal/crypto/cipher.js` destructures all four at module scope, so
+    // an absent one binds `undefined` and throws `method is not a function` on
+    // the first call rather than at load.
+    for (name, operation) in [
+        ("publicEncrypt", public_key::Cipher::Encrypt),
+        ("privateDecrypt", public_key::Cipher::Decrypt),
+        ("privateEncrypt", public_key::Cipher::Sign),
+        ("publicDecrypt", public_key::Cipher::Recover),
+    ] {
+        let function = match operation {
+            public_key::Cipher::Encrypt => {
+                v8::FunctionTemplate::builder(public_encrypt).build(scope)
+            }
+            public_key::Cipher::Decrypt => {
+                v8::FunctionTemplate::builder(private_decrypt).build(scope)
+            }
+            public_key::Cipher::Sign => v8::FunctionTemplate::builder(private_encrypt).build(scope),
+            public_key::Cipher::Recover => {
+                v8::FunctionTemplate::builder(public_decrypt).build(scope)
+            }
+        }
+        .get_function(scope)
+        .ok_or_else(|| format!("cannot allocate crypto.{name}"))?;
+        set(scope, target, name, function.into())?;
+    }
     Ok(())
+}
+
+/// One function per member, because `FunctionTemplate::builder` needs the item
+/// type: V8's trampoline is generic over a zero-sized unit type and a `fn`
+/// pointer is not zero-sized, so a single function taking the operation as an
+/// argument cannot be installed four times.
+fn public_encrypt<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    run_public_key(scope, &args, &mut rv, public_key::Cipher::Encrypt);
+}
+
+fn private_decrypt<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    run_public_key(scope, &args, &mut rv, public_key::Cipher::Decrypt);
+}
+
+fn private_encrypt<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    run_public_key(scope, &args, &mut rv, public_key::Cipher::Sign);
+}
+
+fn public_decrypt<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    run_public_key(scope, &args, &mut rv, public_key::Cipher::Recover);
+}
+
+/// Runs one operation and reports its outcome as Node does.
+fn run_public_key(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    rv: &mut v8::ReturnValue,
+    cipher: public_key::Cipher,
+) {
+    match public_key::run(scope, args, cipher) {
+        Ok(bytes) => match public_key::emit(scope, &bytes) {
+            Some(buffer) => rv.set(buffer),
+            None => throw_message(scope, "Could not allocate the result buffer"),
+        },
+        Err(public_key::CryptoFailure::Thrown) => {
+            // The key decoder threw; its exception is the one the caller must
+            // see, so nothing is replaced here.
+        }
+        Err(public_key::CryptoFailure::InvalidArgument(message)) => {
+            throw_coded(scope, &message, "ERR_INVALID_ARG_VALUE");
+        }
+        Err(public_key::CryptoFailure::InvalidDigest) => {
+            throw_coded(scope, "Invalid digest used", "ERR_OSSL_EVP_INVALID_DIGEST");
+        }
+        Err(public_key::CryptoFailure::Message(message)) => throw_message(scope, &message),
+        Err(public_key::CryptoFailure::OpenSsl(packed)) => {
+            // `ThrowCryptoError`: the message is `ERR_error_string_n`'s output
+            // rather than a caller-supplied one.
+            throw_openssl(scope, packed);
+        }
+    }
+}
+
+/// Throws `ThrowCryptoError`'s shape for a packed OpenSSL value.
+///
+/// The value was captured at the failure site because `openssl`'s helpers drain
+/// the queue into an `ErrorStack`: reading `ERR_peek_error` here would see
+/// nothing and every failure would report `ERR_CRYPTO_OPERATION_FAILED`. When
+/// there is no value at all — an operation that failed without a reason — Node's
+/// fallback is exactly that code, so the two paths agree.
+fn throw_openssl(scope: &mut v8::PinScope<'_, '_>, packed: u64) {
+    let Some(detail) = rn_crypto_openssl::openssl_error_for(packed) else {
+        throw_coded(scope, "Unspecified error", "ERR_CRYPTO_OPERATION_FAILED");
+        return;
+    };
+    let message = detail.message.clone();
+    let Some(text) = v8::String::new(scope, &message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    let Ok(object) = v8::Local::<v8::Object>::try_from(exception) else {
+        scope.throw_exception(exception);
+        return;
+    };
+    for (name, value) in [
+        ("code", detail.code()),
+        ("library", detail.library_display.clone()),
+        ("reason", detail.reason.clone()),
+    ] {
+        if let (Some(key), Some(value)) =
+            (v8::String::new(scope, name), v8::String::new(scope, &value))
+        {
+            object.set(scope, key.into(), value.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
+
+/// Throws an `Error` carrying a `.code`.
+fn throw_coded(scope: &mut v8::PinScope<'_, '_>, message: &str, code: &str) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = if code == "ERR_INVALID_ARG_VALUE" {
+        v8::Exception::type_error(scope, text)
+    } else {
+        v8::Exception::error(scope, text)
+    };
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
+        if let (Some(key), Some(value)) =
+            (v8::String::new(scope, "code"), v8::String::new(scope, code))
+        {
+            object.set(scope, key.into(), value.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
+
+/// Throws a plain `Error`.
+fn throw_message(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    scope.throw_exception(exception);
 }
 
 /// Sets a property on the namespace object.

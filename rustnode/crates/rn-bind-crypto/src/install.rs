@@ -49,6 +49,11 @@ pub const MEMBERS: &[&str] = &[
     // are not wired up and are declared deferred.
     "Hash",
     "HashJob",
+    // `crypto.argon2`/`argon2Sync` and the WebCrypto `Argon2` derive-bits path.
+    // `argon2.js` checks `Argon2Job === undefined` to decide whether to throw
+    // `ERR_CRYPTO_ARGON2_NOT_SUPPORTED`, so the class's *presence* is the
+    // feature test and a deferral here would disable the API rather than hide it.
+    "Argon2Job",
     "Hmac",
     "HmacJob",
     "oneShotDigest",
@@ -62,6 +67,12 @@ pub const MEMBERS: &[&str] = &[
     // the namespace Node aggregates them onto.
     "DiffieHellman",
     "DiffieHellmanGroup",
+    // From `src/crypto/crypto_ec.cc`: `ECDH` and its static converter.
+    // `lib/internal/crypto/diffiehellman.js` does `new _ECDH(curve)` at line 232
+    // and `_ECDHConvertKey(...)` in `ECDH.convertKey`, so both are load-bearing
+    // for `createECDH` rather than optional members.
+    "ECDH",
+    "ECDHConvertKey",
     // The cipher surface. Installed by `rn-bind-crypto-cipher`, which owns
     // `src/crypto/crypto_cipher.cc` and `crypto_aes.cc`. `getCipherInfo` is in
     // that translation unit too, not in the enumeration module, so it comes with
@@ -69,6 +80,14 @@ pub const MEMBERS: &[&str] = &[
     "CipherBase",
     "AESCipherJob",
     "getCipherInfo",
+    // The RSA cipher family. `CipherBase::Initialize` in
+    // `src/crypto/crypto_cipher.cc` installs all four as four instantiations of
+    // one `PublicKeyCipher::Cipher<operation, cipher>` template, and
+    // `lib/internal/crypto/cipher.js` destructures them at module scope.
+    "privateDecrypt",
+    "privateEncrypt",
+    "publicDecrypt",
+    "publicEncrypt",
     // The `KeyObject` family. Installed by `rn-bind-crypto-keys`, which owns
     // `src/crypto/crypto_keys.cc`. `KeyObjectHandle` is the handle class and
     // `isKeyObject`/`getKeyObjectSlots` are the two queries over it;
@@ -103,11 +122,24 @@ pub const MEMBERS: &[&str] = &[
     // The `RSAKeyVariant` values `keygen.js` puts in `RsaKeyPairGenJob`'s second
     // slot. Without them the argument is `undefined`, the variant defaults to
     // PKCS#1, and every `rsa-pss` generation silently produces a plain RSA key.
+    // `ncrypto::Argon2Type`'s values, which `argon2.js` maps its three names
+    // onto before passing one to `Argon2Job`. They are installed now that the
+    // job exists; before that a deferral was the only honest answer, because a
+    // constant with no consumer advertises a feature that is not there.
+    "kTypeArgon2d",
+    "kTypeArgon2i",
+    "kTypeArgon2id",
     "kKeyVariantRSA_SSA_PKCS1_v1_5",
     "kKeyVariantRSA_PSS",
     "kKeyVariantRSA_OAEP",
-    // Random.
+    // Random. `randomFillSync` is the synchronous fill; the three job classes
+    // are the asynchronous path `random.js` builds whenever a callback was
+    // supplied, which is every `randomBytes`/`randomFill`/`randomInt`/
+    // `generatePrime`/`checkPrime` call that passes one.
     "randomFillSync",
+    "RandomBytesJob",
+    "RandomPrimeJob",
+    "CheckPrimeJob",
     "secureBuffer",
     "secureHeapUsed",
     // Enumeration, all derived from the linked OpenSSL.
@@ -115,6 +147,10 @@ pub const MEMBERS: &[&str] = &[
     "getCurves",
     "getHashes",
     "getCachedAliases",
+    // The MAC half of the same cache. `crypto.createMac` resolves its algorithm
+    // through `getMacId`, which reads this table, so without it `createMac`
+    // throws "getCachedMacAliases is not a function" on every call.
+    "getCachedMacAliases",
     "getMacs",
     // Reached at module scope by `lib/tls.js` and `lib/internal/crypto/util.js`,
     // so they are load-bearing for `require('crypto')` rather than optional.
@@ -206,40 +242,30 @@ pub const MEMBERS: &[&str] = &[
 /// that and is part of the gate.
 pub const DEFERRED: &[(&str, &str)] = &[
     (
-        "Argon2Job",
-        "Argon2 needs OpenSSL's Argon2 provider, which `openssl-src` does not build; \
-         `crypto.argon2` must report ERR_CRYPTO_ARGON2_NOT_SUPPORTED, as Node does when the \
-         provider is absent.",
-    ),
-    (
         "ChaCha20Poly1305CipherJob",
-        "WebCrypto ChaCha20-Poly1305 is a threadpool job, deferred with the WebCrypto surface.",
-    ),
-    (
-        "CheckPrimeJob",
-        "Prime checking is a threadpool job built on BN primitives; the sync half is deferred \
-         with the rest of the key surface.",
+        "The WebCrypto ChaCha20-Poly1305 job. The algorithm is available \
+         (`getCiphers()` lists `chacha20-poly1305`), so this is the job class and the \
+         WebCrypto key plumbing rather than a missing primitive.",
     ),
     (
         "DHBitsJob",
-        "The async `crypto.diffieHellman()` form is a CryptoJob; the sync `run()` path \
-         and the shared `CryptoJob` machinery land with the rest of the job family.",
+        "`crypto.diffieHellman(options[, callback])`. The `CryptoJob` machinery this \
+         needed now exists (`rn-crypto-job`), so what remains is the job itself: a \
+         two-key `EVP_PKEY_derive` over the DH/EC/X25519 key pairs `prepare*Key` produces, \
+         which is the next landing rather than a missing primitive.",
     ),
     (
         "DhKeyPairGenJob",
-        "Key generation and DH share the asymmetric key surface, deferred with KeyObject.",
+        "`generateKeyPairSync('dh', ...)`. The `KeyObject` surface it was deferred with is \
+         installed (`generateKeyPairSync('ec')` and `('rsa')` both work), so the gap is \
+         this job: `DhKeyGenTraits::Setup`, which builds a `DH` key from a group name, a \
+         prime or a prime length.",
     ),
     (
         "DsaKeyPairGenJob",
-        "Key generation is part of the asymmetric key surface, deferred with KeyObject.",
-    ),
-    (
-        "ECDH",
-        "ECDH is part of the asymmetric key surface, deferred with KeyObject.",
-    ),
-    (
-        "ECDHConvertKey",
-        "ECDH key conversion needs the EC key surface, deferred with KeyObject.",
+        "`generateKeyPairSync('dsa', ...)`. Deferred with `KeyObject` was inaccurate now \
+         that surface works; the gap is `DsaKeyGenTraits::Setup`'s `DSA` parameter \
+         generation, which no other job needs.",
     ),
     (
         "KEMDecapsulateJob",
@@ -255,17 +281,16 @@ pub const DEFERRED: &[(&str, &str)] = &[
     ),
     (
         "KmacJob",
-        "KMAC needs the KeyObject surface for its key and is not in this OpenSSL build.",
-    ),
-    ("Mac", "createMac needs the KeyObject surface for its key."),
-    (
-        "RandomBytesJob",
-        "The async `randomBytes` path needs the event loop; `randomBytes` works because \
-         `lib/internal/crypto/random.js` implements it over the sync fill.",
+        "The job `crypto.subtle` builds for KMAC. It shares the `Mac` handle surface with \
+         `createMac`, which is deferred, so the job has nothing to run against yet; the \
+         algorithm itself is present (EVP_MAC fetches KMAC-128 and KMAC-256 and \
+         KECCAK-KMAC-128), so this is not an OpenSSL gap.",
     ),
     (
-        "RandomPrimeJob",
-        "Prime generation is part of the key surface, deferred with KeyObject.",
+        "Mac",
+        "The `Mac` handle class from `crypto_mac.cc`. `createMac` now gets as far as \
+         constructing one (`getCachedMacAliases` was the missing piece before it), so this \
+         is the `Mac`/`_Mac` handle surface itself rather than the alias table.",
     ),
     (
         "TurboShakeJob",
@@ -282,10 +307,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
     (
         "certVerifySpkac",
         "SPKAC verification needs the certificate surface, deferred with X.509.",
-    ),
-    (
-        "getCachedMacAliases",
-        "`getMacs()` needs the MAC surface; the hash alias cache is installed.",
     ),
     (
         "getCryptoKeySlots",
@@ -368,34 +389,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "WebCrypto AES key variants, deferred with the WebCrypto surface.",
     ),
     (
-        "kTypeArgon2d",
-        "Argon2 is not built into the OpenSSL this crate links.",
-    ),
-    (
-        "kTypeArgon2i",
-        "Argon2 is not built into the OpenSSL this crate links.",
-    ),
-    (
-        "kTypeArgon2id",
-        "Argon2 is not built into the OpenSSL this crate links.",
-    ),
-    (
-        "privateDecrypt",
-        "RSA decryption needs the KeyObject surface.",
-    ),
-    (
-        "privateEncrypt",
-        "RSA encryption needs the KeyObject surface.",
-    ),
-    (
-        "publicDecrypt",
-        "RSA decryption needs the KeyObject surface.",
-    ),
-    (
-        "publicEncrypt",
-        "RSA encryption needs the KeyObject surface.",
-    ),
-    (
         "setFipsCrypto",
         "FIPS mode needs a validated provider; `getFipsCrypto` reports false truthfully and \
          turning it on cannot succeed.",
@@ -459,6 +452,13 @@ mod constants {
     pub const K_KEY_TYPE_PUBLIC: i32 = 2;
     /// `kKeyTypePrivate`.
     pub const K_KEY_TYPE_PRIVATE: i32 = 3;
+
+    /// `kTypeArgon2d`, from `ncrypto::Argon2Type`'s declaration order.
+    pub const K_TYPE_ARGON2D: i32 = 0;
+    /// `kTypeArgon2i`.
+    pub const K_TYPE_ARGON2I: i32 = 1;
+    /// `kTypeArgon2id`.
+    pub const K_TYPE_ARGON2ID: i32 = 2;
 
     /// `kSigEncDER`.
     pub const K_SIG_ENC_DER: i32 = 1;
@@ -583,6 +583,12 @@ impl BindingModule for Crypto {
                     .get_function(scope),
             ),
             (
+                "getCachedMacAliases",
+                v8::FunctionTemplate::builder(get_cached_mac_aliases)
+                    .build(scope)
+                    .get_function(scope),
+            ),
+            (
                 "getSSLCiphers",
                 rn_core::method(crate::classes::get_ssl_ciphers)
                     .build(scope)
@@ -687,6 +693,11 @@ impl BindingModule for Crypto {
         // `instanceof NativeSecureContext`.
         rn_bind_secure_context::install_classes(scope, object)?;
         install_job_class(scope, object, "HashJob", hash_job)?;
+        // The three asynchronous random jobs. `lib/internal/crypto/random.js`
+        // constructs them whenever a callback was supplied, so their absence is
+        // the whole of `crypto.randomBytes(n, cb)` throwing rather than a gap in
+        // one path: `randomFill` has no synchronous fallback.
+        crate::jobs::install_random_jobs(scope, object)?;
         install_job_class(scope, object, "HmacJob", hmac_job)?;
         crate::kdf::install_job_class(scope, object, "PBKDF2Job", crate::kdf::pbkdf2_constructor)?;
         crate::kdf::install_job_class(scope, object, "ScryptJob", crate::kdf::scrypt_constructor)?;
@@ -711,6 +722,9 @@ impl BindingModule for Crypto {
             ("kKeyTypeSecret", constants::K_KEY_TYPE_SECRET),
             ("kKeyTypePublic", constants::K_KEY_TYPE_PUBLIC),
             ("kKeyTypePrivate", constants::K_KEY_TYPE_PRIVATE),
+            ("kTypeArgon2d", constants::K_TYPE_ARGON2D),
+            ("kTypeArgon2i", constants::K_TYPE_ARGON2I),
+            ("kTypeArgon2id", constants::K_TYPE_ARGON2ID),
             ("kSigEncDER", constants::K_SIG_ENC_DER),
             ("kSigEncP1363", constants::K_SIG_ENC_P1363),
             ("kSignJobModeSign", constants::K_SIGN_JOB_MODE_SIGN),
@@ -1328,6 +1342,33 @@ fn get_cached_aliases(
             return;
         };
         // `getCachedHashId` returns `-1` for a miss, so ids start at 0.
+        let value = v8::Integer::new_from_unsigned(scope, index as u32);
+        object.set(scope, key.into(), value.into());
+    }
+    rv.set(object.into());
+}
+
+/// `getCachedMacAliases()`: the same table for the MAC enumeration.
+///
+/// `getMacCache()` in `lib/internal/crypto/util.js` reads this exactly as
+/// `getHashCache()` reads `getCachedAliases()`, and `getCachedMacId` returns `-1`
+/// for a miss — so the contract is identical: a name-to-index object whose ids
+/// are only required to be stable and unique, because nothing here uses them.
+/// Its absence is what made `crypto.createMac` throw
+/// `getCachedMacAliases is not a function`: `Mac`'s constructor resolves the
+/// algorithm through `getMacId`, which calls this.
+fn get_cached_mac_aliases(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    let names = crate::enumerate::mac_names();
+    let object = v8::Object::new(scope);
+    for (index, name) in names.iter().enumerate() {
+        let Some(key) = v8::String::new(scope, name) else {
+            throw(scope, "cannot allocate a MAC alias");
+            return;
+        };
         let value = v8::Integer::new_from_unsigned(scope, index as u32);
         object.set(scope, key.into(), value.into());
     }
@@ -2102,6 +2143,63 @@ mod tests {
                 reason.len() > 20,
                 "{member} has no real reason for being deferred"
             );
+        }
+    }
+
+    #[test]
+    fn the_jobs_this_landing_installed_are_not_deferred() {
+        // The three random jobs, the Argon2 job and the whole RSA/ECDH surface
+        // were each declared `DEFERRED` with a reason that turned out to be
+        // false. Naming them here means the next time one is re-deferred it has
+        // to be re-deferred deliberately, with the reason rewritten — which is
+        // the review question that was missed the first time.
+        for member in [
+            "RandomBytesJob",
+            "RandomPrimeJob",
+            "CheckPrimeJob",
+            "Argon2Job",
+            "kTypeArgon2d",
+            "kTypeArgon2i",
+            "kTypeArgon2id",
+            "privateDecrypt",
+            "privateEncrypt",
+            "publicDecrypt",
+            "publicEncrypt",
+            "ECDH",
+            "ECDHConvertKey",
+            // This one was not in the brief, but `crypto.createMac` failed on it
+            // with "getCachedMacAliases is not a function" once the rest of the
+            // MAC surface was reachable, so it belongs with the group.
+            "getCachedMacAliases",
+        ] {
+            assert!(
+                MEMBERS.contains(&member),
+                "{member} must be installed by this landing"
+            );
+            assert!(
+                !DEFERRED.iter().any(|(name, _)| *name == member),
+                "{member} is both installed and deferred"
+            );
+        }
+    }
+
+    #[test]
+    fn no_deferral_claims_a_missing_feature_that_is_present() {
+        // Two reasons this landing replaced were claims about the linked
+        // OpenSSL, and both were wrong: Argon2 derives Node's exact bytes for
+        // all three variants, and `EVP_MAC_fetch` finds KMAC-128/256 and
+        // KECCAK-KMAC-128. A deferral may name a missing *job*, but a claim that
+        // the primitive is absent has to be measurable — so the reasons that
+        // remain must not assert it for either.
+        for (member, reason) in DEFERRED {
+            if *member != "Argon2Job" && *member != "kTypeArgon2d" {
+                assert!(
+                    !reason.contains("Argon2 is not built")
+                        && !reason.contains("ARGON2")
+                        && !reason.contains("KMAC is not in this OpenSSL"),
+                    "{member} claims an absent primitive that is present: {reason}"
+                );
+            }
         }
     }
 

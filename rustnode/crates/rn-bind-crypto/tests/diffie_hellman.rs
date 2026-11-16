@@ -453,11 +453,20 @@ fn the_installed_members_are_declared_by_the_parent_namespace() {
             "{member} is installed by rn-bind-crypto-dh but is not in rn-bind-crypto's MEMBERS"
         );
     }
-    // And the reverse: a name the parent claims must be one of these two or
-    // installed by rn-bind-crypto itself, which `rn-compat` checks. This guards
-    // only the pair this crate is responsible for.
+    // And the reverse: the set this crate claims is exactly what the parent
+    // lists for it. `ECDH` and `ECDHConvertKey` joined it when `crypto_ec.cc`'s
+    // implementation landed: they are a different translation unit in Node, but
+    // they share `DiffieHellman.prototype`'s methods, are installed from the same
+    // `crypto_dh.js`, and `lib/internal/crypto/diffiehellman.js` constructs both
+    // from the one module. Pinning the set here is what makes a name added to
+    // one side and not the other fail.
     assert_eq!(
         rn_bind_crypto_dh::MEMBERS,
-        &["DiffieHellman", "DiffieHellmanGroup"]
+        &[
+            "DiffieHellman",
+            "DiffieHellmanGroup",
+            "ECDH",
+            "ECDHConvertKey",
+        ]
     );
 }

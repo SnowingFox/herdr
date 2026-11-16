@@ -830,6 +830,8 @@ dependencies = [
  "rn-bind-crypto-x509",
  "rn-bind-secure-context",
  "rn-core",
+ "rn-crypto-job",
+ "rn-crypto-openssl",
  "rn-node-oracle",
  "rn-v8-sys",
  "serde_json",
@@ -839,10 +841,13 @@ dependencies = [
 name = "rn-bind-crypto-cipher"
 version = "0.1.0"
 dependencies = [
+ "foreign-types",
  "libc",
  "openssl",
  "openssl-sys",
+ "rn-bind-crypto-keys",
  "rn-core",
+ "rn-crypto-openssl",
  "rn-v8-sys",
 ]
 
@@ -854,6 +859,7 @@ dependencies = [
  "openssl",
  "openssl-sys",
  "rn-core",
+ "rn-crypto-openssl",
  "rn-v8-sys",
 ]
 
@@ -1590,6 +1596,17 @@ dependencies = [
  "thiserror",
  "tracing",
  "v8",
+]
+
+[[package]]
+name = "rn-crypto-job"
+version = "0.1.0"
+dependencies = [
+ "libuv-sys2",
+ "rn-core",
+ "rn-errors",
+ "rn-uv",
+ "rn-v8-sys",
 ]
 
 [[package]]

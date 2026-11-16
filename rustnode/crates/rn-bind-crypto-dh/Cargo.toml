@@ -21,3 +21,7 @@ openssl-sys = { version = "=0.9.118", features = ["vendored"] }
 # `BigNum` into a pointer have to be imported from the crate directly. Not a new
 # dependency in the graph: `openssl` already depends on exactly this version.
 foreign-types = "0.3"
+# The curve-name resolver and the `PKey` wrapper. `crypto_ec.cc` calls
+# `OBJ_sn2nid`, and the JWK spellings it has to accept are the same ones
+# `rn-crypto-openssl` maps for key import — one table, not two.
+rn-crypto-openssl = { path = "../rn-crypto-openssl" }
