@@ -160,6 +160,20 @@ step "the per-context globals audit"
 ./target/debug/rustnode tools/per-context-audit.js
 RUSTNODE_DEBUG_REALM_PRIMORDIALS=1 ./target/debug/rustnode tools/per-context-audit.js > /dev/null
 
+step "process has no member the oracle lacks, and lacks none it has"
+# The "17 missing process members" finding was a hand count that was wrong twice:
+# eleven of the seventeen had already been implemented, and four of the remaining
+# names exist only in a child process, where Node also lacks them on the main
+# thread. `tools/process-member-audit.py` replaces the count with a measurement
+# across the three populations that matter (main, worker, forked), comparing
+# `Object.getOwnPropertyNames(process)` on both runtimes.
+#
+# A bare statement under `set -e`, like the controls above, so a mismatch turns
+# the gate red. It reads the release binary and the pinned oracle, both of which
+# the build step and the oracle step above have already guaranteed, and exits 2
+# rather than passing when either is missing.
+python3 tools/process-member-audit.py
+
 step "the per-context globals still behave as Node's do"
 # The control for the per-context work: DOMException is a real `Error`, the
 # messaging binding hands back the same class, and `structuredClone` survives the
