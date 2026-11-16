@@ -127,9 +127,16 @@ fn synthetic_module_lifecycle() {
         call_method(scope, wrapper, "instantiate", &[]).is_some(),
         "synthetic instantiate"
     );
+    let evaluation = call_method(scope, wrapper, "evaluate", &[]).expect("synthetic evaluate");
+    // A synthetic module's evaluation steps must answer with a promise. V8
+    // stores it as the module's top-level capability and `ModuleJob.execute`
+    // awaits it, so `undefined` here is what made `import()` of a CommonJS
+    // file fail with "module evaluation did not return a promise" while the
+    // same file imported fine from an ES module.
     assert!(
-        call_method(scope, wrapper, "evaluate", &[]).is_some(),
-        "synthetic evaluate"
+        evaluation.is_promise(),
+        "synthetic evaluate must return a promise, got {}",
+        evaluation.type_of(scope).to_rust_string_lossy(scope)
     );
 
     let namespace_object =
