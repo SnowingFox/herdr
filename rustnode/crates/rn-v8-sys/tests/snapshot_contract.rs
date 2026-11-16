@@ -30,17 +30,38 @@
 //!    obtain one, and they are invoked inside the v8 crate's `FunctionBuilder`,
 //!    which discards the value after handing it to V8.
 //!
-//! 3. **A serializer-enabled isolate has no experimental globals.** V8's
+//! 3. **A serializer-enabled isolate has no experimental globals, and whether
+//!    that matters depends on the V8 version.** V8's
 //!    `Genesis::InitializeGlobal` installs `InitializeExperimentalGlobal()`
-//!    only `if (!isolate->serializer_enabled())`, with the comment
-//!    "Do not include them into the snapshot as we should be able to turn them
-//!    off at runtime". A snapshot creator calls `enable_serializer()` before the
-//!    isolate is initialised, so a from-scratch creator isolate is missing every
-//!    flag-gated intrinsic. On the linked V8 that includes `Float16Array`, and
-//!    `internal/per_context/primordials.js` reads it, so the bootstrap throws
-//!    `TypeError: Reflect.ownKeys called on non-object` before any of Node's own
-//!    code runs. A *deserialised* context gets them back: the load path
-//!    re-runs Genesis with `serializer_enabled()` false.
+//!    only `if (!isolate->serializer_enabled())`, with the comment "Do not
+//!    include them into the snapshot as we should be able to turn them off at
+//!    runtime". A snapshot creator calls `enable_serializer()` before the
+//!    isolate is initialised, so a creator isolate lacks every *flag-gated*
+//!    intrinsic.
+//!
+//!    On the V8 this crate links (15.2, `v8` crate 152.2.0) `Float16Array` is
+//!    one of them: 15.2 keeps it in a separate `TYPED_ARRAYS_FLOAT16` macro and
+//!    installs it from `InitializeGlobal_js_float16array`, which only
+//!    `InitializeExperimentalGlobal` calls. `internal/per_context/primordials.js`
+//!    reads `Float16Array` unconditionally, so on 15.2 the realm bootstrap
+//!    throws `TypeError: Reflect.ownKeys called on non-object` and no snapshot
+//!    of a rustnode realm can be built at all. On V8 15.6 (what Node 28 ships)
+//!    `Float16Array` moved into `TYPED_ARRAYS_BASE` and is installed
+//!    unconditionally in `InitializeGlobal`, so `Float16Array` is present during
+//!    a build — verified against the Oracle binary, whose `--build-snapshot`
+//!    isolate reports `typeof Float16Array === 'function'`. **This wall is
+//!    version skew, not a rustnode defect.** Closing it needs a V8 15.6 build of
+//!    the `v8` crate, and no such crate exists: the newest published `v8` is
+//!    `152.2.0`, which is V8 15.2, while `tools/node-pin.toml` records
+//!    `v8_version = "15.6.75"`. So the smallest next step is either a
+//!    locally-built `v8` crate from a 15.6 tag, or teaching the build path to
+//!    install `Float16Array` (and every other intrinsic 15.2 gates) before
+//!    `primordials.js` runs. The second is not a one-line patch: the global has
+//!    to be a real `JSTypedArray` constructor, which a binding cannot synthesize
+//!    from Rust because `v8::Float16Array::new` needs the intrinsic to exist.
+//!
+//!    A *deserialised* context gets the flag-gated intrinsics back either way,
+//!    because the load path re-runs Genesis with `serializer_enabled()` false.
 //!
 //! 4. **Rust-side `v8::Global` caches are not serialisable.** `CreateBlob` runs
 //!    `SerializedHandleChecker::CheckGlobalAndEternalHandles` and aborts with
