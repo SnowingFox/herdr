@@ -8,11 +8,12 @@ use rn_bun_api::BunModule;
 use rn_v8_sys::v8;
 
 // Each test binary uses a different subset of these helpers, so an unused
-// helper here is expected rather than dead code.
-#[allow(dead_code)]
-mod _unused_marker {}
+// helper here is expected rather than dead code. `#[allow(dead_code)]` goes on
+// each item because this module is compiled once per test binary and the
+// workspace lints deny dead code.
 
 /// Runs `body` with a live isolate, scope and bare context.
+#[allow(dead_code)]
 pub fn with_context<T>(body: impl FnOnce(&mut v8::PinScope<'_, '_>) -> T) -> T {
     use std::sync::Once;
     static INIT: Once = Once::new();
@@ -31,6 +32,7 @@ pub fn with_context<T>(body: impl FnOnce(&mut v8::PinScope<'_, '_>) -> T) -> T {
 }
 
 /// Installs the members on a fresh object and returns it.
+#[allow(dead_code)]
 pub fn install<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object> {
     let bun = v8::Object::new(scope);
     rn_bun_text::Text
@@ -40,6 +42,7 @@ pub fn install<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Object
 }
 
 /// Installs the members and publishes the object as the global `Bun`.
+#[allow(dead_code)]
 pub fn install_as_global(scope: &mut v8::PinScope<'_, '_>) {
     let bun = install(scope);
     let key = v8::String::new(scope, "Bun").expect("key");
@@ -52,6 +55,7 @@ pub fn install_as_global(scope: &mut v8::PinScope<'_, '_>) {
 
 /// Installs the members as a `__bun` global, for scripts that prefer a private
 /// name over the realm's real `Bun`.
+#[allow(dead_code)]
 pub fn install_as_private_global(scope: &mut v8::PinScope<'_, '_>) {
     let bun = install(scope);
     let key = v8::String::new(scope, "__bun").expect("key");
@@ -63,6 +67,7 @@ pub fn install_as_private_global(scope: &mut v8::PinScope<'_, '_>) {
 }
 
 /// Serialises the script's completion value through `JSON.stringify`.
+#[allow(dead_code)]
 pub fn json_of(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> serde_json::Value {
     let json_key = v8::String::new(scope, "JSON").expect("JSON");
     let json = scope

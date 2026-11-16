@@ -203,7 +203,7 @@ fn resolve(start: f64, end: f64, total: usize) -> (usize, usize) {
         return (from as usize, usize::MAX);
     }
     let to = to.min(total as f64);
-    if !(to > from) {
+    if to.is_nan() || to <= from {
         return (from as usize, from as usize);
     }
     (from as usize, to as usize)

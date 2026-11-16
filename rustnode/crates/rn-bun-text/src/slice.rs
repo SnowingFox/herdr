@@ -453,11 +453,10 @@ fn hyperlink_effect(units: &[u16], start: usize, end: usize) -> Option<bool> {
     let mut payload_end = end;
     if payload_end > body {
         let last = units[payload_end - 1];
-        if last == 0x07 {
+        // BEL and the C1 ST both terminate with one unit; `ESC \\` with two.
+        if last == 0x07 || last == 0x9C {
             payload_end -= 1;
-        } else if last == 0x9C {
-            payload_end -= 1;
-        } else if payload_end >= body + 2 && units[payload_end - 1] == u16::from(b'\\') {
+        } else if payload_end >= body + 2 && last == u16::from(b'\\') {
             payload_end -= 2;
         }
     }
@@ -488,7 +487,7 @@ fn hyperlink_payload(units: &[u16], start: usize, end: usize) -> Vec<u16> {
         let last = units[payload_end - 1];
         if last == 0x07 || last == 0x9C {
             payload_end -= 1;
-        } else if payload_end >= body + 2 && units[payload_end - 1] == u16::from(b'\\') {
+        } else if payload_end >= body + 2 && last == u16::from(b'\\') {
             payload_end -= 2;
         }
     }

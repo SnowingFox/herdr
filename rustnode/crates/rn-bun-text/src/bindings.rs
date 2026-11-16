@@ -428,7 +428,10 @@ fn resolve_bounds(start: f64, end: f64, total: usize) -> (usize, usize) {
         return (from as usize, usize::MAX);
     }
     let to = to.min(total as f64);
-    if !(to > from) {
+    // `NaN` compares false against everything, and an empty or reversed range is
+    // an empty slice; both land on the same early return. Written as a positive
+    // test because `!(to > from)` is the comparison clippy objects to on floats.
+    if to.is_nan() || to <= from {
         return (from as usize, from as usize);
     }
     (from as usize, to as usize)

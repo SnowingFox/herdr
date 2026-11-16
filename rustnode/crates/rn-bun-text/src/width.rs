@@ -533,9 +533,7 @@ pub fn consume_ansi(units: &[u16], start: usize) -> usize {
                         state = State::NeedSt;
                     } else if (0x20..=0x2F).contains(&unit) {
                         state = State::IgnoreNext;
-                    } else if (0x30..=0x7E).contains(&unit) {
-                        state = State::Start;
-                    } else if unit == 0x9C {
+                    } else if (0x30..=0x7E).contains(&unit) || unit == 0x9C {
                         state = State::Start;
                     } else {
                         return at;
@@ -557,9 +555,7 @@ pub fn consume_ansi(units: &[u16], start: usize) -> usize {
                 _ => {
                     if (0x20..=0x2F).contains(&unit) {
                         state = State::IgnoreNext;
-                    } else if (0x30..=0x7E).contains(&unit) {
-                        state = State::Start;
-                    } else if unit == 0x9C {
+                    } else if (0x30..=0x7E).contains(&unit) || unit == 0x9C {
                         state = State::Start;
                     } else {
                         return at;

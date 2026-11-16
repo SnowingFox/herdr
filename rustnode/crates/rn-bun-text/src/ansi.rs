@@ -179,13 +179,12 @@ impl StyleState {
             // ECMA-48 §5.4: parameters up to a final byte in 0x40-0x7E; ESC, CAN,
             // SUB and the C1 ST abort the sequence.
             let mut sequence_end = end;
-            for at in body..end {
-                let unit = units[at];
-                if unit == 0x1B {
+            for (at, unit) in units.iter().enumerate().take(end).skip(body) {
+                if *unit == 0x1B {
                     sequence_end = at;
                     break;
                 }
-                if (0x40..=0x7E).contains(&unit) || unit == 0x18 || unit == 0x1A || unit == 0x9C {
+                if (0x40..=0x7E).contains(unit) || *unit == 0x18 || *unit == 0x1A || *unit == 0x9C {
                     sequence_end = at + 1;
                     break;
                 }
