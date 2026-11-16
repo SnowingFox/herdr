@@ -203,6 +203,20 @@ step "binding shapes against the recorded contracts"
 # is a regression. Without it a namespace could silently drop to a placeholder.
 cargo run -q -p rn-compat -- contracts --baseline contracts/complete-namespaces.txt
 
+step "installed namespaces match what they declare"
+# The check above reads `MEMBERS` and `DEFERRED`; it never looks at the object
+# `install()` built. That is how `sqlite` reported `5 0 0 ok` while `backup` was
+# undefined: the member sat in `MEMBERS` *and* `DEFERRED`, so the contract
+# subtraction cancelled it. This compares the declarations against the installed
+# object for every registered namespace, and separately flags an installed member
+# whose first call reports that it is not implemented.
+#
+# Both checks carry an explicit allowlist of the defects that exist today, counted
+# and named per namespace and member, so the gate is enforcing from the first
+# commit without failing on work that is not the author's to fix. Anything not on
+# that list fails. Shrinking the list is the proof a fix landed.
+cargo test -p rn-bindings --test namespace_structure
+
 step "deferred members reached at module scope"
 # A declared deferral passes the contract check by design, so this is the only
 # gate that catches a member `lib/**` calls while a module loads. It is part of
