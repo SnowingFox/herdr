@@ -376,7 +376,7 @@ impl Store {
     }
 
     /// Stores the value `option` receives from one parsed argument.
-    fn assign(&mut self, option: &OptionInfo, negated: bool, value: Option<&str>) {
+    pub(crate) fn assign(&mut self, option: &OptionInfo, negated: bool, value: Option<&str>) {
         let stored = match option.kind {
             kind::BOOLEAN => ParsedValue::Bool(!negated),
             // `std::atoll` semantics: junk parses as 0 rather than failing.
@@ -394,6 +394,12 @@ impl Store {
             }
             kind::HOST_PORT => {
                 let (host, port) = split_host_port(value.unwrap_or_default());
+                // `HostPort::Update` keeps the previous host when the new one
+                // is empty, so `--inspect-port=:1234` changes only the port.
+                let host = match (host.is_empty(), self.value_of(option.name)) {
+                    (true, Some(ParsedValue::HostPort(previous, _))) => previous,
+                    _ => host,
+                };
                 ParsedValue::HostPort(host, port)
             }
             kind::NO_OP | kind::V8_OPTION => {
@@ -413,7 +419,7 @@ impl Store {
     }
 
     /// Merges every `Implies` target recorded for `from`.
-    fn apply_implications(&mut self, from: &str) {
+    pub(crate) fn apply_implications(&mut self, from: &str) {
         for (source, target, value) in IMPLIES {
             if *source == from {
                 self.set(target, ParsedValue::Bool(*value));
@@ -450,7 +456,7 @@ impl Store {
 }
 
 /// Replaces `_` with `-` after the leading dashes, as `Parse` does.
-fn normalize_underscores(name: &str) -> String {
+pub(crate) fn normalize_underscores(name: &str) -> String {
     let mut characters: Vec<char> = name.chars().collect();
     for character in characters.iter_mut().skip(2) {
         if *character == '_' {
@@ -465,7 +471,11 @@ fn normalize_underscores(name: &str) -> String {
 /// Three forms are tried, in `Parse`'s order: the plain name, the name with `=`
 /// when the argument carried an inline value, and the `" <arg>"` form when a
 /// non-flag argument follows.
-fn alias_for(name: &str, had_inline_value: bool, next: Option<&String>) -> Option<Vec<String>> {
+pub(crate) fn alias_for(
+    name: &str,
+    had_inline_value: bool,
+    next: Option<&String>,
+) -> Option<Vec<String>> {
     if let Some(alias) = ALIASES.iter().find(|alias| alias.from == name) {
         return Some(alias.to.iter().map(|item| (*item).to_string()).collect());
     }
@@ -486,19 +496,56 @@ fn alias_for(name: &str, had_inline_value: bool, next: Option<&String>) -> Optio
     None
 }
 
-/// `SplitHostPort`: `host`, `host:port`, or `:port`.
+/// `SplitHostPort`: a bare port, a host name, `host:port`, or a bracketed IPv6
+/// literal (`src/node_options.cc:1874`).
 ///
-/// A missing or unparseable port is 0, and an empty host stays empty, which is
-/// what `HostPort` reports before anything sets it.
+/// Each branch is load-bearing and they are easy to conflate:
+///
+/// * A bracketed literal keeps the default port and never splits, because
+///   `RemoveBrackets` only strips a pair that wraps the *whole* argument.
+/// * An argument with no colon is a port when every character is a digit and a
+///   host name otherwise, and a host name keeps the inspector's default port
+///   rather than becoming port 0.
+/// * `HostPort::Update` then keeps the previous host when the new one is empty,
+///   so `--inspect-port=:1234` changes the port and leaves `127.0.0.1` alone.
+///   That merge happens in [`Store::assign`], not here.
+///
+/// A port that does not parse is 0, which is what `std::from_chars` leaves in
+/// the output on `result_out_of_range` and on any other error.
 fn split_host_port(value: &str) -> (String, u16) {
-    match value.rfind(':') {
-        Some(index) => {
-            let host = &value[..index];
-            let port = value[index + 1..].parse().unwrap_or(0);
-            (host.to_string(), port)
-        }
-        None => (value.to_string(), 0),
+    let stripped = strip_brackets(value);
+    if stripped.len() < value.len() {
+        return (stripped.to_string(), DEFAULT_INSPECTOR_PORT);
     }
+
+    match value.rfind(':') {
+        Some(index) => (
+            strip_brackets(&value[..index]).to_string(),
+            parse_port(&value[index + 1..]),
+        ),
+        None => {
+            if value.bytes().all(|byte| byte.is_ascii_digit()) {
+                (String::new(), parse_port(value))
+            } else {
+                (value.to_string(), DEFAULT_INSPECTOR_PORT)
+            }
+        }
+    }
+}
+
+/// `DebugOptions::kDefaultInspectorPort`.
+const DEFAULT_INSPECTOR_PORT: u16 = 9229;
+
+/// `RemoveBrackets`: only a pair wrapping the whole string is removed.
+fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// `ParseAndValidatePort`: `std::from_chars` into a `uint16_t`.
+fn parse_port(port: &str) -> u16 {
+    port.parse().unwrap_or(0)
 }
 
 /// `Implies(from, to)` and `ImpliesNot(from, to)` from `src/node_options.cc`.
@@ -772,11 +819,14 @@ mod tests {
     fn an_inline_alias_moves_the_value_to_the_target() {
         // `--inspect=PORT` expands to `--inspect-port PORT --inspect`, and the
         // port is what the value belonged to. `--inspect-port` is a
-        // `kHostPort`, so a bare port arrives with an empty host.
+        // `kHostPort`: `SplitHostPort` reads a bare all-digit argument as a
+        // port with an empty host, and `HostPort::Update` then keeps the
+        // existing `127.0.0.1` rather than clearing it. The oracle reports
+        // `{"host":"127.0.0.1","port":9230}` for the same command line.
         let store = parsed(&["--inspect=9230"]);
         assert_eq!(
             store.value_of("--inspect-port"),
-            Some(ParsedValue::HostPort("9230".to_string(), 0))
+            Some(ParsedValue::HostPort("127.0.0.1".to_string(), 9230))
         );
         assert_eq!(store.value_of("--inspect"), Some(ParsedValue::Bool(true)));
     }
@@ -796,6 +846,34 @@ mod tests {
             store.value_of("--inspect-port"),
             Some(ParsedValue::HostPort("127.0.0.1".to_string(), 9230))
         );
+    }
+
+    /// Each case is what the oracle reports for the same `--inspect-port`.
+    ///
+    /// `SplitHostPort` has four branches and they are easy to conflate: a bare
+    /// port and a bare host name both have no colon but differ, a bracketed
+    /// IPv6 literal never splits, and an unparseable port becomes 0 rather than
+    /// failing. The oracle was run for every case below; see
+    /// `rn-cli/tests/node_options.rs` for the same table through the built
+    /// binary.
+    #[test]
+    fn a_host_port_value_follows_node_split_host_port() {
+        let cases = [
+            ("9339", ("127.0.0.1", 9339)),
+            ("myhost", ("myhost", 9229)),
+            ("0.0.0.0:9339", ("0.0.0.0", 9339)),
+            ("[::1]:9339", ("::1", 9339)),
+            ("abc:def", ("abc", 0)),
+            (":9339", ("127.0.0.1", 9339)),
+        ];
+        for (value, (host, port)) in cases {
+            let store = parsed(&[&format!("--inspect-port={value}")]);
+            assert_eq!(
+                store.value_of("--inspect-port"),
+                Some(ParsedValue::HostPort(host.to_string(), port)),
+                "--inspect-port={value}"
+            );
+        }
     }
 
     #[test]
