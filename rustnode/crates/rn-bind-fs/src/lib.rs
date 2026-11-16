@@ -29,6 +29,7 @@ pub mod filehandle;
 pub mod flags;
 pub mod fsops;
 pub mod jobs;
+pub mod legacy_main;
 pub mod permission;
 pub mod request;
 pub mod stats;

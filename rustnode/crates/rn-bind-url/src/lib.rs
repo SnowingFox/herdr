@@ -87,6 +87,7 @@
 //!   at the call site.
 
 pub mod callbacks;
+pub mod file_url;
 pub mod format;
 pub mod idna;
 pub mod install;

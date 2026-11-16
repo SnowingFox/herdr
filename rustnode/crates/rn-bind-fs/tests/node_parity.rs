@@ -354,3 +354,241 @@ fn node_reference_is_reachable() {
     );
     assert!(oracle.is_pinned_version(), "{}", oracle.describe());
 }
+
+/// `legacyMainResolve`'s index table and error codes, cross-checked against a
+/// real Node.
+///
+/// The indices are the part that a plausible implementation gets wrong, and
+/// comparing them against Node is the only way to be sure the table in
+/// `legacy_main.rs` still lines up with the one in `helpers.js`. The oracle is
+/// the binary `tools/node-pin.toml` pins, not whatever `node` is on `PATH`.
+///
+/// It shells out to `node --expose-internals` because neither member is
+/// reachable from userland: `lib/internal/modules/helpers.js` is the only caller
+/// in Node, and it reads them off `internalFsBinding`.
+#[test]
+fn legacy_main_resolve_indices_match_node() {
+    let Some(oracle) = oracle() else {
+        eprintln!("skipping: no pinned Node oracle");
+        return;
+    };
+
+    let dir = TempDir::new("legacy-main-parity");
+    // Index 1 and 7 have the same `.js` suffix, which is the pair worth pinning:
+    // they are the same string in the table and reach different files.
+    for name in [
+        "mainjs", "mainjson", "mainnode", "idxjs", "idxjson", "idxnode", "fbjs",
+    ] {
+        std::fs::create_dir_all(dir.path.join(name)).expect("mkdir");
+    }
+    for name in ["idxjs", "idxjson", "idxnode"] {
+        std::fs::create_dir_all(dir.path.join(name).join("main")).expect("mkdir");
+    }
+    std::fs::write(dir.path.join("mainjs/main.js"), b"x").expect("write");
+    std::fs::write(dir.path.join("mainjson/main.json"), b"{}").expect("write");
+    std::fs::write(dir.path.join("mainnode/main.node"), b"").expect("write");
+    std::fs::write(dir.path.join("idxjs/main/index.js"), b"x").expect("write");
+    std::fs::write(dir.path.join("idxjson/main/index.json"), b"{}").expect("write");
+    std::fs::write(dir.path.join("idxnode/main/index.node"), b"").expect("write");
+    std::fs::write(dir.path.join("fbjs/index.js"), b"x").expect("write");
+    std::fs::write(dir.path.join("wasm"), [0x00u8, 0x61, 0x73, 0x6d, 0x01]).expect("write");
+    std::fs::write(dir.path.join("plain"), b"console.log(1)").expect("write");
+
+    let script = format!(
+        r#"
+const {{ internalBinding }} = require('internal/test/binding');
+const b = internalBinding('fs');
+const root = '{root}';
+const base = 'file:///tmp/x.js';
+const capture = (fn) => {{
+  try {{ return ['ok', fn()]; }}
+  catch (e) {{ return ['threw', e.name, e.code, e.message]; }}
+}};
+const out = {{
+  mainJs: capture(() => b.legacyMainResolve(root + '/mainjs', 'main', base)),
+  mainJson: capture(() => b.legacyMainResolve(root + '/mainjson', 'main', base)),
+  mainNode: capture(() => b.legacyMainResolve(root + '/mainnode', 'main', base)),
+  mainIndexJs: capture(() => b.legacyMainResolve(root + '/idxjs', 'main', base)),
+  mainIndexJson: capture(() => b.legacyMainResolve(root + '/idxjson', 'main', base)),
+  mainIndexNode: capture(() => b.legacyMainResolve(root + '/idxnode', 'main', base)),
+  fallbackJs: capture(() => b.legacyMainResolve(root + '/fbjs', undefined, base)),
+  missingMain: capture(() => b.legacyMainResolve(root + '/fbjs', 'nope', base)),
+  notFound: capture(() => b.legacyMainResolve(root + '/nothing', undefined, base)),
+  notFoundMain: capture(() => b.legacyMainResolve(root + '/nothing', 'zzz', base)),
+  badBaseOnSuccess: capture(() => b.legacyMainResolve(root + '/mainjs', 'main', 'notaurl')),
+  omittedBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, undefined)),
+  invalidBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, 'notaurl')),
+  schemeBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, 'ftp://x/y')),
+  encodedSlashBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, 'file:///a%2Fb/x')),
+  percentBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, 'file:///a%20b/x')),
+  wasm: capture(() => b.getFormatOfExtensionlessFile(root + '/wasm')),
+  plain: capture(() => b.getFormatOfExtensionlessFile(root + '/plain')),
+  missingFile: capture(() => b.getFormatOfExtensionlessFile(root + '/absent')),
+}};
+console.log(JSON.stringify(out));
+"#,
+        root = js_path(&dir.path)
+    );
+    let script_path = dir.path.join("parity.js");
+    std::fs::write(&script_path, &script).expect("write the script");
+
+    let node_out = oracle
+        .command()
+        .arg("--expose-internals")
+        .arg(&script_path)
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
+    assert!(
+        node_out.status.success(),
+        "{} failed: {}",
+        oracle.describe(),
+        String::from_utf8_lossy(&node_out.stderr)
+    );
+    let expected = String::from_utf8_lossy(&node_out.stdout).trim().to_string();
+
+    // The same script under this crate's namespace. Both members are reachable
+    // only through `internalBinding`, so the harness installs the namespace and
+    // runs the script with `internalFsBinding` swapped for it.
+    let actual = eval(&format!(
+        r#"
+        const b = fsBinding;
+        const root = '{root}';
+        const base = 'file:///tmp/x.js';
+        const capture = (fn) => {{
+          try {{ return ['ok', fn()]; }}
+          catch (e) {{ return ['threw', e.name, e.code, e.message]; }}
+        }};
+        globalThis.__out = JSON.stringify({{
+          mainJs: capture(() => b.legacyMainResolve(root + '/mainjs', 'main', base)),
+          mainJson: capture(() => b.legacyMainResolve(root + '/mainjson', 'main', base)),
+          mainNode: capture(() => b.legacyMainResolve(root + '/mainnode', 'main', base)),
+          mainIndexJs: capture(() => b.legacyMainResolve(root + '/idxjs', 'main', base)),
+          mainIndexJson: capture(() => b.legacyMainResolve(root + '/idxjson', 'main', base)),
+          mainIndexNode: capture(() => b.legacyMainResolve(root + '/idxnode', 'main', base)),
+          fallbackJs: capture(() => b.legacyMainResolve(root + '/fbjs', undefined, base)),
+          missingMain: capture(() => b.legacyMainResolve(root + '/fbjs', 'nope', base)),
+          notFound: capture(() => b.legacyMainResolve(root + '/nothing', undefined, base)),
+          notFoundMain: capture(() => b.legacyMainResolve(root + '/nothing', 'zzz', base)),
+          badBaseOnSuccess: capture(() => b.legacyMainResolve(root + '/mainjs', 'main', 'notaurl')),
+          omittedBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, undefined)),
+          invalidBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, 'notaurl')),
+          schemeBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, 'ftp://x/y')),
+          encodedSlashBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, 'file:///a%2Fb/x')),
+          percentBase: capture(() => b.legacyMainResolve(root + '/nothing', undefined, 'file:///a%20b/x')),
+          wasm: capture(() => b.getFormatOfExtensionlessFile(root + '/wasm')),
+          plain: capture(() => b.getFormatOfExtensionlessFile(root + '/plain')),
+          missingFile: capture(() => b.getFormatOfExtensionlessFile(root + '/absent')),
+        }});
+        "#,
+        root = js_path(&dir.path)
+    ));
+
+    assert_eq!(
+        actual, expected,
+        "legacyMainResolve / getFormatOfExtensionlessFile must agree with node"
+    );
+}
+
+/// Invalid UTF-8, a NUL, and valid multi-byte text in a `file:` base URL.
+///
+/// Node has **two** functions called `FileURLToPath`, and they disagree here, so
+/// naming which one is matched is the point of this test:
+///
+/// * `lib/internal/url.js:1623` (`url.fileURLToPath`) decodes with
+///   `decodeURIComponent`, which throws `URIError "URI malformed"` on invalid
+///   UTF-8.
+/// * `src/node_url.cc:770` (`node::url::FileURLToPath`) decodes with
+///   `ada::unicode::percent_decode`, which returns raw bytes and never throws.
+///
+/// `LegacyMainResolve` calls the *second* one (`src/node_file.cc:5548`), so
+/// invalid UTF-8 becomes U+FFFD in the `imported from` text rather than an
+/// error. Asserting the JS function's behaviour here would pin the wrong
+/// contract, so the member is compared against the oracle; the JS function's
+/// throw is asserted in both runtimes too, so this cannot be satisfied by
+/// relaxing decoding globally.
+///
+/// The earlier differential only fed well-formed URLs, which is why it did not
+/// find any of this: a well-formed corpus cannot expose a decoding divergence.
+#[test]
+fn legacy_main_resolve_decodes_invalid_utf8_like_the_cpp_not_like_js() {
+    let Some(oracle) = oracle() else {
+        eprintln!("skipping: no pinned Node oracle");
+        return;
+    };
+
+    let dir = TempDir::new("legacy-main-utf8");
+    std::fs::create_dir_all(dir.path.join("pkg")).expect("mkdir");
+    // `main.js` exists so the `nulInMain` and `nulInPkgPath` cases resolve.
+    std::fs::write(dir.path.join("pkg/main.js"), b"x").expect("write");
+    let root = js_path(&dir.path);
+
+    // The six member calls, written once as a JS expression list so the oracle
+    // and this crate evaluate identical source. `{ROOT}` is substituted.
+    let cases = r#"{
+  invalidUtf8: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/a%FFb/x.js')),
+  validUtf8: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/%C3%A9/x.js')),
+  encodedSlash: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/a%2Fb/x.js')),
+  embeddedNul: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/a%00b/x.js')),
+  multiByteCjk: capture(() => b.legacyMainResolve('{ROOT}/pkg', undefined, 'file:///tmp/%E4%B8%AD/x.js')),
+  nulInMain: capture(() => b.legacyMainResolve('{ROOT}/pkg', 'main.js\u0000zzz', 'file:///tmp/x.js')),
+  nulInPkgPath: capture(() => b.legacyMainResolve('{ROOT}/pkg\u0000junk', 'main.js', 'file:///tmp/x.js')),
+}"#
+        .replace("{ROOT}", &root);
+
+    let preamble = r#"
+const capture = (fn) => {
+  try { const v = fn(); return ['ok', typeof v, v]; }
+  catch (e) { return ['threw', e.name, e.code, e.message]; }
+};
+"#;
+
+    // Oracle: the real `internalBinding`, printing just the case table.
+    let node_script = format!(
+        "{preamble}\n{}\nconst b = internalBinding('fs');\nconsole.log(JSON.stringify({cases}));\n",
+        "const { internalBinding } = require('internal/test/binding');",
+        preamble = preamble,
+        cases = cases,
+    );
+    let script_path = dir.path.join("utf8.js");
+    std::fs::write(&script_path, &node_script).expect("write the script");
+
+    let node_out = oracle
+        .command()
+        .arg("--expose-internals")
+        .arg(&script_path)
+        .output()
+        .unwrap_or_else(|error| panic!("cannot run {}: {error}", oracle.describe()));
+    assert!(
+        node_out.status.success(),
+        "{} failed: {}",
+        oracle.describe(),
+        String::from_utf8_lossy(&node_out.stderr)
+    );
+    let expected: Vec<String> = String::from_utf8_lossy(&node_out.stdout)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(expected.len(), 1, "node printed {expected:?}");
+
+    // This crate: only the member calls. This harness has no bootstrap, so
+    // `require('url')` is not available in-process; the vendored
+    // `url.fileURLToPath` keeps throwing for the same input, which
+    // `js_contract.rs` asserts through the real binary.
+    let rust_source = format!(
+        "{preamble}\nconst b = fsBinding;\nglobalThis.__out = JSON.stringify({cases});",
+        preamble = preamble,
+        cases = cases,
+    );
+    let actual: Vec<String> = eval(&rust_source)
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    assert_eq!(
+        actual, expected,
+        "legacyMainResolve must decode the base URL like the C++ FileURLToPath, \
+         while url.fileURLToPath keeps throwing on the same input"
+    );
+}

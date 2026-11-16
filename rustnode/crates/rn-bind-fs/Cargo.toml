@@ -20,6 +20,11 @@ rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 # loop and the re-enter-V8-from-`uv_run` primitive. Both are that crate's.
 rn-uv.workspace = true
 rn-errors.workspace = true
+# `legacyMainResolve` reports `imported from <path>`, and that path is
+# `node::url::FileURLToPath`'s answer for the base URL. `rn-bind-url` already owns
+# the ada parser and that conversion, so `fs` asks it rather than declaring ada a
+# second time.
+rn-bind-url = { path = "../rn-bind-url" }
 libuv-sys2.workspace = true
 tracing.workspace = true
 
