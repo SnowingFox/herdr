@@ -431,6 +431,209 @@ impl FsJob for WriteFileJob {
     }
 }
 
+/// The outcome of a `CpDirJob`'s threadpool half.
+///
+/// `CopyError::Special` is carried out as a kind and a path rather than as an
+/// error, because `cp.js`'s `copyDirNative` receives `(err, specialFile,
+/// specialFilePath)` and builds `ERR_FS_CP_SOCKET` / `ERR_FS_CP_FIFO_PIPE` /
+/// `ERR_FS_CP_UNKNOWN` itself. Sending a finished error there would lose which of
+/// the three it was supposed to be.
+type CopyOutcome = Result<(), crate::copy_tree::CopyError>;
+
+/// `CpDirJob`: `fs.cp`'s threadpool directory copy.
+///
+/// `lib/internal/fs/cp/cp.js:330` constructs this whenever the destination does
+/// not exist and no `filter`, `dereference` or permission model is involved, so
+/// it is the default path for `fs.promises.cp(src, dest, { recursive: true })`.
+/// The constructor's eight arguments are `(src, dest, force, dereference,
+/// errorOnExist, verbatimSymlinks, preserveTimestamps, mode)`.
+pub struct CpDirJob {
+    parameters: Mutex<Option<CpParams>>,
+}
+
+struct CpParams {
+    src: Vec<u8>,
+    dest: Vec<u8>,
+    /// `dest.ToString()`, the string a failure on the destination reports.
+    display: String,
+    options: crate::copy_tree::CpOptions,
+}
+
+impl CpDirJob {
+    /// `CpDirJob::New` after its arguments have been validated.
+    pub fn new(
+        src: Vec<u8>,
+        dest: Vec<u8>,
+        display: String,
+        options: crate::copy_tree::CpOptions,
+    ) -> Self {
+        Self {
+            parameters: Mutex::new(Some(CpParams {
+                src,
+                dest,
+                display,
+                options,
+            })),
+        }
+    }
+
+    fn take(&self) -> Option<CpParams> {
+        self.parameters.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// The permission refusal `run()` returns instead of queueing.
+    ///
+    /// `CpDirJob` needs `fs.read` on the source and `fs.write` on the
+    /// destination, which is `deny_copy`'s pair rather than `open`'s flag word.
+    fn denied(&self) -> Option<rn_permission::AccessDeniedError> {
+        let guard = self.parameters.lock().ok()?;
+        let parameters = guard.as_ref()?;
+        crate::permission::deny_copy(&parameters.src, &parameters.dest)
+    }
+}
+
+impl FsJob for CpDirJob {
+    type Outcome = CopyOutcome;
+
+    /// The copy opens its source for reading and its destination for writing, so
+    /// both scopes apply and neither is implied by a single flag word.
+    fn flags(&self) -> i32 {
+        crate::flags::uv_flags::O_RDWR
+    }
+
+    fn perform(&self) -> Self::Outcome {
+        match self.take() {
+            Some(parameters) => crate::copy_tree::copy_dir_recursive(
+                &parameters.src,
+                &parameters.dest,
+                &parameters.display,
+                parameters.options,
+            ),
+            // `run()` takes the parameters, so a second call has nothing left.
+            // Node's `CHECK(!job->scheduled_)` aborts the process; reporting an
+            // error keeps a JavaScript caller alive to see it.
+            None => Err(crate::copy_tree::CopyError::Uv {
+                errno: libc::EINVAL,
+                syscall: "cp",
+                path: Vec::new(),
+            }),
+        }
+    }
+
+    fn deliver<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        outcome: Self::Outcome,
+    ) -> Vec<v8::Local<'s, v8::Value>> {
+        let null: v8::Local<'s, v8::Value> = v8::null(scope).into();
+        let undefined: v8::Local<'s, v8::Value> = v8::undefined(scope).into();
+        match outcome {
+            Ok(()) => vec![null, undefined, undefined],
+            Err(crate::copy_tree::CopyError::Special { kind, path }) => {
+                // `copyDirNative` turns these three into the error it rejects
+                // with, so the kind travels as a string and the path alongside.
+                let kind_value =
+                    v8::String::new(scope, kind).map_or_else(|| undefined, |text| text.into());
+                let path_value = v8::String::new(scope, &String::from_utf8_lossy(&path))
+                    .map_or_else(|| undefined, |text| text.into());
+                vec![null, kind_value, path_value]
+            }
+            Err(error) => {
+                let value = crate::request::copy_error_object(scope, &error).unwrap_or(undefined);
+                vec![value, undefined, undefined]
+            }
+        }
+    }
+}
+
+/// `new CpDirJob(src, dest, force, dereference, errorOnExist, verbatimSymlinks,
+/// preserveTimestamps, mode)`.
+///
+/// `cp.js:332` constructs it with eight arguments. Node `CHECK`s the shape; a
+/// `TypeError` is more useful than a crash when a direct binding caller gets it
+/// wrong, so that is what a bad shape produces here.
+pub fn cp_dir_constructor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    if !args.is_construct_call() {
+        throw_invalid_arguments(scope);
+        return;
+    }
+    let (Some(src), Some(dest)) = (
+        crate::args::path_bytes(scope, args.get(0)),
+        crate::args::path_bytes(scope, args.get(1)),
+    ) else {
+        throw_invalid_arguments(scope);
+        return;
+    };
+    // `CHECK(args[7]->IsInt32())`: the mode is a real operand rather than a
+    // boolean, and it is only used for a fresh destination.
+    let Some(mode) = crate::args::int32(scope, args.get(7)) else {
+        throw_invalid_arguments(scope);
+        return;
+    };
+
+    let options = crate::copy_tree::CpOptions::for_fresh(
+        args.get(2).is_true(),
+        args.get(3).is_true(),
+        args.get(4).is_true(),
+        args.get(5).is_true(),
+        args.get(6).is_true(),
+        mode,
+    );
+    let display = args.get(1).to_rust_string_lossy(scope);
+
+    let this: v8::Local<v8::Object> = args.this();
+    install_job(scope, this, CpDirJob::new(src, dest, display, options));
+    rv.set(this.into());
+}
+
+/// `CpDirJob.prototype.run()`.
+///
+/// Unlike the two file jobs this takes no path operand: the constructor already
+/// received both paths, and `cp.js` calls `job.run()` with no arguments. The
+/// permission check is `deny_copy`, which is the pair `CpDirJob` actually needs.
+pub fn cp_dir_run<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    let this: v8::Local<v8::Object> = args.this();
+    // SAFETY: `run` is on the prototype of the class whose constructor installed
+    // the job, so `this` is an instance of it.
+    let Some(job) = (unsafe { take_job::<CpDirJob>(this) }) else {
+        if let Some(text) = v8::String::new(scope, "the job already ran") {
+            rv.set(v8::Exception::type_error(scope, text));
+        }
+        return;
+    };
+
+    if let Some(denied) = job.denied() {
+        rv.set(denied.to_value(scope));
+        return;
+    }
+
+    let Some(ondone) = property_function(scope, this, "ondone") else {
+        if let Some(text) = v8::String::new(scope, "the file job has no ondone callback") {
+            rv.set(v8::Exception::type_error(scope, text));
+        }
+        return;
+    };
+
+    let receiver = v8::Global::new(scope.as_ref(), this);
+    let ondone = v8::Global::new(scope.as_ref(), ondone);
+    match schedule(scope, job, receiver, ondone) {
+        Ok(()) => rv.set_undefined(),
+        Err(message) => {
+            if let Some(text) = v8::String::new(scope, &message) {
+                rv.set(v8::Exception::error(scope, text));
+            }
+        }
+    }
+}
+
 /// Builds the error value a completion carries.
 ///
 /// Distinct from `request::throw_error`, which throws: here the error is an

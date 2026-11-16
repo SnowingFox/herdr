@@ -4,12 +4,12 @@
 //! `lib/internal/fs/**` or `lib/internal/modules/**` reads it. The list was
 //! derived from those call sites and then diffed against the names
 //! `src/node_file.cc` registers with `SetMethod`: it is exactly that set minus
-//! the documented deferrals, plus `FSReqCallback`, `kUsePromises` and the three
-//! constructor functions (`StatWatcher`, `ReadFileJob`, `WriteFileJob`).
+//! the documented deferrals, plus `FSReqCallback`, `kUsePromises` and the
+//! constructor functions (`StatWatcher`, `ReadFileJob`, `WriteFileJob`,
+//! `CpDirJob`, `FileHandle`).
 //!
-//! The deferrals are `CpDirJob`/`cpSyncCopyDir`/`cpSyncOverrideFile`, whose
-//! shared blocker is `fs.cp`'s native recursion, plus the stats-layout members
-//! that follow the BigInt stat surface. `README.md` explains each one. A test in
+//! The remaining deferrals are the `statValues`/`statFsValues` layouts, which
+//! follow the native stats surface. `README.md` explains each one. A test in
 //! `tests/js_contract.rs` pins the set so it cannot drift silently.
 //!
 //! `legacyMainResolve` and `getFormatOfExtensionlessFile` used to be deferred as
@@ -20,7 +20,15 @@
 //! resolved. A loader having a call site is not the same as a loader owning the
 //! binding. `legacy_main.rs` owns both now.
 //!
-//! `StatWatcher` used to be on that list, on the theory that `fs.watchFile`
+//! `fs.cp`'s three members used to be on that list, on the theory that
+//! recursion lived in `lib/`. It does, but only behind a `filter`:
+//! `cp-sync.js:148` returns `fsBinding.cpSyncCopyDir(...)` with no fallback when
+//! no filter was supplied, and `cp.js:319` takes `CpDirJob` for every
+//! destination that does not exist yet. So the deferral was a `TypeError` on the
+//! most common call, not a slower copy. `copy_tree.rs` implements the walk once
+//! for both.
+//!
+//! `StatWatcher` used to be on that list too, on the theory that `fs.watchFile`
 //! needed "the timer loop". It never did: `uv_fs_poll` is a polling handle with
 //! its own private libuv timer, and `libuv-sys2` binds it. `watch.rs` implements
 //! it, together with `kFsStatsFieldsNumber`, which the same JavaScript reads as
@@ -153,13 +161,22 @@ impl BindingModule for Fs {
 /// entry says why it waits, and `rn-compat` fails the build when a recorded
 /// member is neither installed nor listed here.
 pub const DEFERRED: &[(&str, &str)] = &[
-    ("CpDirJob", "cp -r recursion lives in the lib/ JS layer; the C++ job wrapper is not needed until the copy fast path lands"),
-    ("bigintStatFsValues", "bigint view of statfs fields, follows the BigInt stat surface"),
-    ("bigintStatValues", "bigint view of stat fields, follows the BigInt stat surface"),
-    ("cpSyncCopyDir", "cp -r directory recursion, lands with cp -r"),
-    ("cpSyncOverrideFile", "cp -r overwrite rule, lands with cp -r"),
-    ("statFsValues", "statfs field layout, lands with the statfs member"),
-    ("statValues", "stat field layout, lands with the native stats layout"),
+    (
+        "bigintStatFsValues",
+        "bigint view of statfs fields, follows the BigInt stat surface",
+    ),
+    (
+        "bigintStatValues",
+        "bigint view of stat fields, follows the BigInt stat surface",
+    ),
+    (
+        "statFsValues",
+        "statfs field layout, lands with the statfs member",
+    ),
+    (
+        "statValues",
+        "stat field layout, lands with the native stats layout",
+    ),
 ];
 
 /// Members exposed on the namespace object.
@@ -195,6 +212,8 @@ pub const MEMBERS: &[&str] = &[
     "access",
     "copyFile",
     "cpSyncCheckPaths",
+    "cpSyncCopyDir",
+    "cpSyncOverrideFile",
     "chmod",
     "fchmod",
     "chown",
@@ -226,6 +245,8 @@ pub const MEMBERS: &[&str] = &[
     // One-shot open+read+close / open+write+close jobs.
     "ReadFileJob",
     "WriteFileJob",
+    // `fs.cp`'s threadpool directory copy.
+    "CpDirJob",
     // `fs.watchFile`'s polling handle and the offset its report is indexed by.
     "StatWatcher",
     "kFsStatsFieldsNumber",
@@ -240,6 +261,8 @@ struct Installer<'a, 's, 'i> {
 impl<'a, 's, 'i> Installer<'a, 's, 'i> {
     fn install_all(&mut self) -> Result<(), String> {
         mkfn!(self, "cpSyncCheckPaths", cp_sync_check_paths_binding);
+        mkfn!(self, "cpSyncCopyDir", cp_sync_copy_dir_binding);
+        mkfn!(self, "cpSyncOverrideFile", cp_sync_override_file_binding);
         mkfn!(self, "open", open_binding);
         mkfn!(self, "openFileHandle", open_file_handle_binding);
         mkfn!(self, "close", close_binding);
@@ -349,6 +372,16 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
             "WriteFileJob",
             crate::jobs::write_file_constructor,
             crate::jobs::write_file_run,
+        )?;
+        // `fs.cp`'s directory copy. Installed here rather than deferred: the
+        // constructor has eight operands and no path, and `cp.js` calls it for
+        // every destination that does not exist yet.
+        crate::jobs::install_job_class(
+            self.scope,
+            self.object,
+            "CpDirJob",
+            crate::jobs::cp_dir_constructor,
+            crate::jobs::cp_dir_run,
         )
     }
 
@@ -1387,13 +1420,18 @@ fn cp_sync_check_paths_binding<'a, 's, 'i>(
 
     let src_path = path_from_bytes(&src);
     let dest_path = path_from_bytes(&dest);
-    // The C++ stats `src` first and throws on failure, so a missing source is
-    // reported before anything is compared.
-    if std::fs::symlink_metadata(&src_path).is_err() {
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::ENOENT);
-        throw_error(scope, &FsError::from_errno("stat", errno));
+
+    // `CpSyncCheckPaths` stats `src` before comparing anything, and reports that
+    // failure as the stat itself: `ENOENT: no such file or directory, lstat
+    // '/nope'`, with the syscall following `dereference` and the operand in both
+    // the message and `path`.
+    let src_stat = if dereference {
+        std::fs::metadata(&src_path)
+    } else {
+        std::fs::symlink_metadata(&src_path)
+    };
+    if src_stat.is_err() {
+        throw_error(scope, &crate::cp::missing_source(&src_path, dereference));
         return;
     }
 
@@ -1404,7 +1442,210 @@ fn cp_sync_check_paths_binding<'a, 's, 'i>(
             &src_path.to_string_lossy(),
             &dest_path.to_string_lossy(),
         );
+        return;
     }
+
+    // The two checks that follow the identity ones: a directory without
+    // `recursive`, and a special-file source. `cp-sync.js` has no fallback for
+    // either, so without them the caller sees an internal assertion instead of
+    // Node's error.
+    if let Err(error) = crate::copy_tree::check_tail(&src, &dest, dereference, recursive) {
+        throw_copy_error(scope, &error);
+    }
+}
+
+/// `cpSyncCopyDir(src, dest, force, dereference, errorOnExist, verbatimSymlinks,
+/// preserveTimestamps)`.
+///
+/// `lib/internal/fs/cp/cp-sync.js:148` calls this from `copyDir` whenever no
+/// `filter` was supplied, which is the default path for a directory tree. There
+/// is no JavaScript fallback on that branch, so its absence was a `TypeError`
+/// on every plain `fs.cpSync(src, dest, { recursive: true })`.
+fn cp_sync_copy_dir_binding<'a, 's, 'i>(
+    scope: &'a mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let (Some(src), Some(dest)) = (
+        crate::args::path_bytes(scope, args.get(0)),
+        crate::args::path_bytes(scope, args.get(1)),
+    ) else {
+        throw_error(scope, &FsError::from_errno("cp", libc::EINVAL));
+        return;
+    };
+
+    if let Some(denied) = crate::permission::deny_copy(&src, &dest) {
+        denied.throw(scope);
+        return;
+    }
+
+    let options = crate::copy_tree::CpOptions::for_sync(
+        args.get(2).is_true(),
+        args.get(3).is_true(),
+        args.get(4).is_true(),
+        args.get(5).is_true(),
+        args.get(6).is_true(),
+    );
+    // `dest.ToString()`: the destination as the caller spelled it, which is what
+    // a failure on the destination itself reports.
+    let display = args.get(1).to_rust_string_lossy(scope);
+    if let Err(error) = crate::copy_tree::copy_dir_recursive(&src, &dest, &display, options) {
+        throw_copy_error(scope, &error);
+    }
+}
+
+/// `cpSyncOverrideFile(src, dest, mode, preserveTimestamps)`.
+///
+/// `cp-sync.js`'s `onFile` calls this when the destination already exists and
+/// `force` is on, which is another branch with no JavaScript fallback.
+fn cp_sync_override_file_binding<'a, 's, 'i>(
+    scope: &'a mut v8::PinScope<'s, 'i>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let (Some(src), Some(dest)) = (
+        crate::args::path_bytes(scope, args.get(0)),
+        crate::args::path_bytes(scope, args.get(1)),
+    ) else {
+        throw_error(scope, &FsError::from_errno("cp", libc::EINVAL));
+        return;
+    };
+    let mode = crate::args::int32(scope, args.get(2)).unwrap_or(0);
+    let preserve_timestamps = args.get(3).is_true();
+
+    if let Some(denied) = crate::permission::deny_copy(&src, &dest) {
+        denied.throw(scope);
+        return;
+    }
+
+    if let Err(error) = crate::copy_tree::override_file(&src, &dest, mode, preserve_timestamps) {
+        throw_copy_error(scope, &error);
+    }
+}
+
+/// Throws the error a `copy_tree` walk produced, for the synchronous entry
+/// points.
+///
+/// The synchronous path is `THROW_ERR_FS_CP_*`, whose expansion is a plain
+/// `Error` with a `code` and nothing else — no `errno`, no `syscall`. The oracle
+/// reports `Object.getOwnPropertyNames` as `["code", "message", "stack"]` for
+/// every one of them, including the special-file cases, and a caller that
+/// branches on `err.syscall` depends on the absence.
+///
+/// This is deliberately *not* shared with the threadpool job: `fs.cp` rejects
+/// with a `SystemError` that carries `errno`, `syscall` and `path`, so the two
+/// conventions are different shapes of the same code rather than one shape with
+/// optional fields.
+fn throw_copy_error(scope: &mut v8::PinScope<'_, '_>, error: &crate::copy_tree::CopyError) {
+    use crate::copy_tree::CopyError;
+    let (code, message, errno) = match error {
+        CopyError::Errno {
+            errno,
+            syscall,
+            path,
+            ..
+        } => {
+            // `ErrnoException`: `CODE, strerror 'path'`, with a positive errno
+            // and the syscall as a property rather than in the text.
+            let raw = errno.abs().max(1);
+            let mut message = String::from(crate::error::code_for_errno(raw));
+            message.push_str(", ");
+            message.push_str(crate::error::description_for_errno(raw));
+            message.push_str(" '");
+            message.push_str(&String::from_utf8_lossy(path));
+            message.push('\'');
+            throw_errno_exception(scope, raw, syscall, &message, path);
+            return;
+        }
+        CopyError::Uv {
+            errno,
+            syscall,
+            path,
+            ..
+        } => {
+            throw_error(
+                scope,
+                &FsError::from_errno(syscall, errno.abs()).path(path.clone()),
+            );
+            return;
+        }
+        CopyError::Einval(message) => ("ERR_FS_CP_EINVAL", message.clone(), libc::EINVAL),
+        CopyError::SymlinkToSubdirectory(message) => (
+            "ERR_FS_CP_SYMLINK_TO_SUBDIRECTORY",
+            message.clone(),
+            libc::EINVAL,
+        ),
+        CopyError::Eexist(message) => ("ERR_FS_CP_EEXIST", message.clone(), libc::EEXIST),
+        CopyError::Eisdir(message) => ("ERR_FS_EISDIR", message.clone(), libc::EISDIR),
+        CopyError::Special { kind, path } => {
+            let (code, prefix) = match *kind {
+                "socket" => ("ERR_FS_CP_SOCKET", "Cannot copy a socket file: "),
+                "fifo" => ("ERR_FS_CP_FIFO_PIPE", "Cannot copy a FIFO pipe: "),
+                _ => ("ERR_FS_CP_UNKNOWN", "Cannot copy an unknown file type: "),
+            };
+            let message = format!("{prefix}{}", String::from_utf8_lossy(path));
+            (code, message, libc::EINVAL)
+        }
+    };
+    throw_code_only(scope, code, &message, errno);
+}
+
+/// A `ERR_FS_CP_*` error as the synchronous path reports it: `code` and no more.
+fn throw_code_only(scope: &mut v8::PinScope<'_, '_>, code: &str, message: &str, errno: i32) {
+    let _ = errno;
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
+        if let Some(value) = v8::String::new(scope, code) {
+            if let Some(key) = v8::String::new(scope, "code") {
+                object.set(scope, key.into(), value.into());
+            }
+        }
+    }
+    scope.throw_exception(exception);
+}
+
+/// The `ErrnoException` shape: `CODE, strerror 'path'`, positive `errno`,
+/// `code`, `syscall` and `path` as properties.
+fn throw_errno_exception(
+    scope: &mut v8::PinScope<'_, '_>,
+    errno: i32,
+    syscall: &str,
+    message: &str,
+    path: &[u8],
+) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    let Ok(object) = v8::Local::<v8::Object>::try_from(exception) else {
+        return;
+    };
+    for (name, value) in [
+        ("errno", v8::Integer::new(scope, errno).into()),
+        (
+            "code",
+            v8::String::new(scope, crate::error::code_for_errno(errno))
+                .map_or_else(|| v8::undefined(scope).into(), |text| text.into()),
+        ),
+        (
+            "syscall",
+            v8::String::new(scope, syscall)
+                .map_or_else(|| v8::undefined(scope).into(), |text| text.into()),
+        ),
+        (
+            "path",
+            v8::String::new(scope, &String::from_utf8_lossy(path))
+                .map_or_else(|| v8::undefined(scope).into(), |text| text.into()),
+        ),
+    ] {
+        if let Some(key) = v8::String::new(scope, name) {
+            object.set(scope, key.into(), value);
+        }
+    }
+    scope.throw_exception(exception);
 }
 
 /// A byte path as a `Path`, matching how the rest of this crate handles paths.
@@ -1469,7 +1710,7 @@ fn copy_file_binding<'a, 's, 'i>(
     };
     let completion = match crate::permission::deny_copy(&source, &destination) {
         Some(denied) => Completion::denied(denied),
-        None => Completion::from_result(fsops::copy_file(&source, &destination, mode)),
+        None => Completion::from_result(fsops::uv_copy_file(&source, &destination, mode)),
     };
     conclude!(scope, args, rv, completion);
 }

@@ -88,7 +88,6 @@ DEFERRED = (
     "crypto.KmacJob",
     "crypto.Mac",
     "crypto.TurboShakeJob",
-    "fs.CpDirJob",
     # (`performance.Histogram` and `performance.SlidingWindowHistogram` were here.
     # Both ship now, so deleting their lines is what proves the class landed rather
     # than merely being declared: an entry that is installed fails this audit as
@@ -96,6 +95,10 @@ DEFERRED = (
     # This is the only change this branch makes to this file; everything #135 added
     # — the prototype walk, the fixtures and the non-zero-comparison guard — is
     # master's, untouched.)
+    #
+    # `fs.CpDirJob` was here for the same reason and left the same way: it ships
+    # now, so the line is gone. Covered by
+    # `crates/rn-bind-fs/tests/cp_parity.rs`.
     "sqlite.backup",
 )
 
