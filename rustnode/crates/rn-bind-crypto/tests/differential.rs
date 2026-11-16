@@ -18,23 +18,35 @@ use rn_bind_crypto::{engine, enumerate};
 
 /// The `node` binary this test compares against, if any.
 ///
-/// `RUSTNODE_NODE_ORACLE` wins when set, because the `node` on `PATH` is often a
-/// different release built against a different OpenSSL, and comparing cipher and
-/// digest *lists* across OpenSSL versions is only meaningful when the two agree on
-/// the library. The value tests below are version-independent and run either way.
+/// `RUSTNODE_PARITY_NODE` wins when set — the same variable
+/// `rn-bind-v8`'s contract test uses, so one export points every parity test at
+/// the pinned oracle. It matters more here than there: the `node` on `PATH` is
+/// often a different release built against a different OpenSSL, and comparing
+/// cipher and digest *lists* across OpenSSL versions is only meaningful when the
+/// two agree on the library. The value tests below are version-independent and
+/// run against whichever binary is found.
 fn node_binary() -> Option<String> {
-    if let Ok(oracle) = std::env::var("RUSTNODE_NODE_ORACLE") {
-        let output = Command::new(&oracle).arg("--version").output().ok()?;
-        if output.status.success() {
-            return Some(oracle);
-        }
+    let requested = std::env::var("RUSTNODE_PARITY_NODE").ok();
+    let candidate = requested.clone().unwrap_or_else(|| "node".to_string());
+    let usable = Command::new(&candidate)
+        .arg("--version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if usable {
+        return Some(candidate);
     }
-    let output = Command::new("node").arg("--version").output().ok()?;
-    if output.status.success() {
-        Some("node".to_string())
-    } else {
-        None
-    }
+    // An explicitly requested oracle that does not run is a misconfiguration, not
+    // an absent optional dependency. Skipping here would report a green run that
+    // measured nothing — the exact false pass this test exists to prevent — so it
+    // fails instead.
+    assert!(
+        requested.is_none(),
+        "RUSTNODE_PARITY_NODE={} does not run; refusing to skip a comparison \
+         that was explicitly requested",
+        candidate
+    );
+    None
 }
 
 /// Runs a one-line `node -e` and returns stdout, trimmed.
@@ -53,18 +65,18 @@ fn node_eval(script: &str) -> Option<String> {
 /// Whether the comparison binary is the pinned oracle rather than whatever
 /// `node` is on `PATH`.
 ///
-/// Only the oracle is built against the OpenSSL this workspace vendors, so only
-/// against it is a *spelling* comparison meaningful. A v22 on `PATH` reports
-/// `id-aes128-CCM` where this build and the oracle report `id-aes128-ccm`, which
-/// is a difference in the other Node's OpenSSL, not a defect here.
+/// Only a binary built against the OpenSSL this workspace vendors supports a
+/// *spelling* comparison. A v22 reports `id-aes128-CCM` where this build and the
+/// pinned oracle report `id-aes128-ccm`, which is a difference in the other
+/// Node's OpenSSL, not a defect here.
 fn comparison_is_pinned_oracle() -> bool {
-    std::env::var("RUSTNODE_NODE_ORACLE").is_ok_and(|value| !value.is_empty())
+    std::env::var("RUSTNODE_PARITY_NODE").is_ok_and(|value| !value.is_empty())
 }
 
 #[test]
 fn digests_match_node_for_every_published_vector() {
     let Some(_) = node_binary() else {
-        eprintln!("skipping: no `node` binary on PATH");
+        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
         return;
     };
 
@@ -112,7 +124,7 @@ fn digests_match_node_for_every_published_vector() {
 #[test]
 fn hmac_matches_node_for_every_published_vector() {
     let Some(_) = node_binary() else {
-        eprintln!("skipping: no `node` binary on PATH");
+        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
         return;
     };
 
@@ -157,7 +169,7 @@ fn hmac_matches_node_for_every_published_vector() {
 #[test]
 fn get_hashes_covers_what_node_reports() {
     let Some(_) = node_binary() else {
-        eprintln!("skipping: no `node` binary on PATH");
+        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
         return;
     };
     let Some(raw) =
@@ -221,7 +233,7 @@ fn get_hashes_covers_what_node_reports() {
     } else if !misspelled.is_empty() {
         eprintln!(
             "note: {misspelled:?} differ in spelling from the `node` on PATH; set \
-             RUSTNODE_NODE_ORACLE to the pinned binary to assert this"
+             RUSTNODE_PARITY_NODE to the pinned binary to assert this"
         );
     }
 }
@@ -229,7 +241,7 @@ fn get_hashes_covers_what_node_reports() {
 #[test]
 fn get_ciphers_matches_node_within_the_shared_set() {
     let Some(_) = node_binary() else {
-        eprintln!("skipping: no `node` binary on PATH");
+        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
         return;
     };
     let Some(raw) =
@@ -278,7 +290,7 @@ fn get_ciphers_matches_node_within_the_shared_set() {
     } else if !misspelled.is_empty() {
         eprintln!(
             "note: {misspelled:?} differ in spelling from the `node` on PATH; set \
-             RUSTNODE_NODE_ORACLE to the pinned binary to assert this"
+             RUSTNODE_PARITY_NODE to the pinned binary to assert this"
         );
     }
 }
@@ -286,7 +298,7 @@ fn get_ciphers_matches_node_within_the_shared_set() {
 #[test]
 fn get_curves_covers_what_node_reports() {
     let Some(_) = node_binary() else {
-        eprintln!("skipping: no `node` binary on PATH");
+        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
         return;
     };
     let Some(raw) =
@@ -323,7 +335,7 @@ fn random_bytes_are_not_repeated() {
 #[test]
 fn pbkdf2_and_scrypt_match_node() {
     let Some(_) = node_binary() else {
-        eprintln!("skipping: no `node` binary on PATH");
+        eprintln!("skipping: no node binary found (set RUSTNODE_PARITY_NODE)");
         return;
     };
 
