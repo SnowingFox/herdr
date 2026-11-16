@@ -10,4 +10,5 @@ description = "Aggregates every Bun.* contribution crate implemented in Rust"
 
 [dependencies]
 rn-bun-api = { path = "../rn-bun-api" }
+rn-bun-hash = { path = "../rn-bun-hash" }
 rn-bun-time = { path = "../rn-bun-time" }
