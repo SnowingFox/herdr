@@ -9,3 +9,4 @@
 # workspace glob would otherwise try to load `__pycache__` as a crate, which
 # fails the whole build with a missing Cargo.toml.
 __pycache__/
+isolate-*.v8.log
