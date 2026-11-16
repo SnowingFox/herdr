@@ -417,10 +417,11 @@ pub fn install_class<'s>(
     // `SetProtoMethod` in Node: the *template* goes on the prototype template, not
     // an instantiated function. V8 rejects anything else with "Invalid value, must
     // be a primitive or a Template" and aborts the process, which is a hard crash
-    // rather than a compile error.
+    // rather than a compile error. `kThrow` as well, so `dispatch` and
+    // `disconnect` are not constructible even though the class is.
     let methods = [
-        ("dispatch", rn_core::class(dispatch).build(scope)),
-        ("disconnect", rn_core::class(disconnect).build(scope)),
+        ("dispatch", rn_core::method(dispatch).build(scope)),
+        ("disconnect", rn_core::method(disconnect).build(scope)),
     ];
     for (method, function) in methods {
         let key = v8::String::new(scope, method)

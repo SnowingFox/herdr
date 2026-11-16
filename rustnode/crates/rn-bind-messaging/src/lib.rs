@@ -305,7 +305,11 @@ fn install_method<'s>(
     name: &str,
     method: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = rn_core::class(method).build(scope);
+    // `SetProtoMethod` in Node, which is `ConstructorBehavior::kThrow`. Both the
+    // `MessagePort` pair and the four `HandleWrap` methods `io.js` copies back
+    // onto `MessagePort.prototype` come through here, so this is the one place
+    // that decides their constructibility.
+    let template = rn_core::method(method).build(scope);
     if let Some(key) = v8::String::new(scope, name) {
         template.set_class_name(key);
     }

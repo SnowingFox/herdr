@@ -106,7 +106,9 @@ fn install_method<'s>(
     name: &str,
     method: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = rn_core::class(method).build(scope);
+    // `SetProtoMethod` in Node, which is `ConstructorBehavior::kThrow`: the
+    // prototype methods are not constructible even though `Worker` is.
+    let template = rn_core::method(method).build(scope);
     if let Some(key) = v8::String::new(scope, name) {
         template.set_class_name(key);
     }
