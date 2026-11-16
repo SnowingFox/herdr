@@ -8,3 +8,8 @@ rev = "c1ab78921dd592c4e343e6eb0e6f798910726f62"
 
 [[lean_lib]]
 name = "Zeta"
+moreLeanArgs = ["-DautoImplicit=false"]
+
+[[lean_lib]]
+name = "EulerMaclaurin"
+moreLeanArgs = ["-DautoImplicit=false"]
