@@ -46,7 +46,11 @@ fn install_class<'s>(
     name: &str,
     constructor: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(constructor).build(scope);
+    // `rn_core::class`: these four (`RandomBytesJob`, `RandomPrimeJob`,
+    // `CheckPrimeJob`, `Argon2Job`) are `CryptoJob` subclasses that `lib/**`
+    // writes `new` against, so they keep `[[Construct]]` — Node publishes them
+    // through `SetConstructorFunction`.
+    let template = rn_core::class(constructor).build(scope);
     // One internal field, holding the mode and the job, exactly as
     // `CryptoJob::kInternalFieldCount` is 1.
     template
@@ -56,10 +60,12 @@ fn install_class<'s>(
     let Some(key) = v8::String::new(scope, "run") else {
         return Err(format!("cannot allocate {name}.run"));
     };
-    prototype.set(
-        key.into(),
-        v8::FunctionTemplate::builder(run).build(scope).into(),
-    );
+    // `run` is a prototype method, so `rn_core::method` and not `class`:
+    // `SetProtoMethod` is `ConstructorBehavior::kThrow`, and Node makes
+    // `new job.run()` a `TypeError` even though `new RandomBytesJob(...)` is
+    // fine. Using `class` here would leave `run` constructible, which is a
+    // different defect in the other direction.
+    prototype.set(key.into(), rn_core::method(run).build(scope).into());
     let Some(class_name) = v8::String::new(scope, name) else {
         return Err(format!("cannot allocate the {name} class name"));
     };

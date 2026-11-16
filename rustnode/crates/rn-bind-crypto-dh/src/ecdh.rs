@@ -721,7 +721,11 @@ pub fn install_classes<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(constructor).build(scope);
+    // `rn_core::class`: `ECDH` is a `BaseObject` subclass that `lib/**` writes
+    // `new` against (`new _ECDH(curve)`), so it keeps `[[Construct]]`. Named
+    // explicitly rather than left to the builder's default so the intent is
+    // visible next to the six prototype methods above, which are `method`.
+    let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELD_COUNT);
@@ -733,7 +737,12 @@ pub fn install_classes<'s>(
         ($($name:literal => $callback:path),* $(,)?) => {
             $(
                 {
-                    let built = v8::FunctionTemplate::builder($callback).build(scope);
+                    // `rn_core::method`: Node installs these with
+                    // `SetProtoMethod`, which is `ConstructorBehavior::kThrow`,
+                    // so `new ecdh.generateKeys()` is a `TypeError` there. A
+                    // bare builder defaults to `Allow` and made all six
+                    // constructible here.
+                    let built = rn_core::method($callback).build(scope);
                     let method = $name;
                     let key = v8::String::new(scope, method)
                         .ok_or_else(|| format!("cannot allocate ECDH.{method}"))?;
@@ -758,7 +767,10 @@ pub fn install_classes<'s>(
     let key = v8::String::new(scope, "ECDH").ok_or("cannot allocate the ECDH name")?;
     target.set(scope, key.into(), function.into());
 
-    let convert = v8::FunctionTemplate::builder(convert_key)
+    // `ECDH::Initialize` installs this with `SetMethodNoSideEffect`, which is
+    // the same `ConstructorBehavior::kThrow` as `SetMethod`, so a bare builder
+    // made it constructible here where Node throws.
+    let convert = rn_core::method(convert_key)
         .build(scope)
         .get_function(scope)
         .ok_or("cannot allocate crypto.ECDHConvertKey")?;
