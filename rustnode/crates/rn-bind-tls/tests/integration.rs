@@ -1600,6 +1600,138 @@ fn a_second_connection_resumes_the_first_session() {
     assert_eq!(code, 0, "the process must exit 0; stderr: {stderr}");
 }
 
+/// A TLS body larger than one `kClearOutChunkSize` (64 KiB) is delivered in
+/// full, not truncated at a chunk boundary.
+///
+/// # The defect this pins
+///
+/// `ClearOut` accumulates consecutive application-data records into a 64 KiB
+/// chunk before handing them up, which is `crypto_tls.cc:838`'s
+/// `kClearOutChunkSize`. `SSL_read` returns at most one record per call and a
+/// record is at most 16 KiB, so a chunk is filled by four of them and any body
+/// past that needs **several** batches.
+///
+/// Node emits the accumulated batch inside its read loop and keeps looping
+/// (`if (!emit()) return;` after the record-type check in `ClearOut`). rustnode
+/// used to accumulate into one buffer and emit only after the loop ended, so a
+/// pass that filled the chunk and then found `length >= CHUNK` emitted the first
+/// 64 KiB and returned with every remaining record still buffered in `enc_in_`.
+/// Nothing re-enters `ClearOut` for those bytes: the socket has no read pending,
+/// so `uv__io_poll` never wakes and the process waits forever on a response it
+/// has already partly received.
+///
+/// That is why this test is deterministic rather than a coin flip. It is not
+/// measuring a race: the server writes the whole response in one call, so every
+/// TLS record arrives in a single socket read and `ClearOut` sees all of them in
+/// one pass. Measured on the pre-fix binary: 3/3 fail. Writing record-by-record
+/// instead lets the socket split the reads across several `ClearOut` passes, and
+/// the same test then passes 3/3 on the broken binary — so **the shape of the
+/// server's write is part of the test**, not incidental.
+///
+/// The user-visible consequence is the `npm install` cold-cache hang:
+/// `@npmcli/agent` fetches tarballs over keep-alive HTTPS, and a response that
+/// stalls mid-body never emits `'end'`, so the socket stays referenced, the loop
+/// never empties, and the process sits in `ep_poll` until npm's own 300 s idle
+/// timeout kills it. Measured on the pre-fix binary: 8 of 20 cold
+/// `npm install express` runs hung; after the fix, 40 of 40 completed.
+///
+/// 100 000 is chosen because it is comfortably more than 64 KiB without being a
+/// multiple of it, so at least one record is left over after the second chunk
+/// fills — the exact shape the old code dropped. Sizes that happen to leave the
+/// last record starting a fresh `ClearOut` pass (70 000 and 200 000 were both
+/// measured) do not reproduce it.
+#[test]
+fn a_body_larger_than_one_clear_out_chunk_is_delivered_in_full() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl is not available to generate a certificate");
+        return;
+    };
+    // 100 000 bytes: more than one 64 KiB chunk, not a multiple of a record size.
+    const BODY: usize = 100_000;
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        const key = fs.readFileSync({key:?});
+        const cert = fs.readFileSync({cert:?});
+        const BODY = {body};
+
+        const server = tls.createServer({{ key, cert }}, (sock) => {{
+          sock.on('data', () => {{
+            // The whole response in one write. That is what makes this
+            // deterministic: every TLS record lands in a single socket read, so
+            // `ClearOut` sees all of them in one pass and must produce more than
+            // one batch. Writing record-by-record instead lets the socket split
+            // the reads, which hides the defect — measured, 3/3 pass on the
+            // pre-fix binary — so the shape of the write is part of the test.
+            const head = 'HTTP/1.1 200 OK\r\n' +
+              'Content-Type: application/octet-stream\r\n' +
+              'Content-Length: ' + BODY + '\r\n' +
+              'Connection: keep-alive\r\n\r\n';
+            sock.write(Buffer.concat([Buffer.from(head), Buffer.alloc(BODY, 0x61)]));
+          }});
+        }});
+        server.on('tlsClientError', (e) => console.log('S:ERR ' + e.message));
+        server.listen(0, '127.0.0.1', () => {{
+          const c = tls.connect({{
+            port: server.address().port,
+            host: '127.0.0.1',
+            rejectUnauthorized: false,
+          }});
+          c.on('error', (e) => console.log('C:ERR ' + e.message));
+          const got = 0;
+          const st = {{ buf: undefined, header: -1, got: 0, done: false }};
+          c.on('data', (chunk) => {{
+            if (st.done) return;
+            // Count body bytes only. The header is variable-length, so splitting
+            // on `\r\n\r\n` is what makes the count comparable to Content-Length
+            // instead of to "whatever the headers happened to be".
+            if (st.header < 0) {{
+              const joined = Buffer.concat([st.buf || Buffer.alloc(0), chunk]);
+              const idx = joined.indexOf('\r\n\r\n');
+              if (idx < 0) {{ st.buf = joined; return; }}
+              st.buf = undefined;
+              st.header = idx + 4;
+              st.got += joined.length - st.header;
+            }} else {{
+              st.got += chunk.length;
+            }}
+            // Stop at the end of the body: the connection is keep-alive, so
+            // waiting for 'end' would measure the server's lifetime instead.
+            if (st.got >= BODY) {{
+              st.done = true;
+              console.log('GOT:' + st.got);
+              server.close(() => console.log('CLOSED'));
+              c.end();
+            }}
+          }});
+          c.on('connect', () => c.write('GET /blob HTTP/1.1\r\nHost: x\r\n\r\n'));
+        }});
+        "#,
+        key = key.display(),
+        cert = cert.display(),
+        body = BODY,
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    let context = format!("stdout: {stdout} stderr: {stderr}");
+    assert!(
+        !stdout.contains("C:ERR") && !stdout.contains("S:ERR"),
+        "neither side may report an error; {context}"
+    );
+    // The assertion that fails on the old code: it prints no `GOT` at all,
+    // because the response stalls 1_696 bytes short of its Content-Length.
+    assert!(
+        stdout.contains(&format!("GOT:{BODY}")),
+        "all {BODY} body bytes must arrive; a truncated count here is a batch \
+         left unemitted in `enc_in_`; {context}"
+    );
+    assert!(
+        code == 0,
+        "the process must exit 0 within the bound rather than blocking on a \
+         socket whose response never finished; {context}"
+    );
+}
+
 /// The `AsyncWrap` surface `TLSWrap` inherits answers, and the wrap has an async
 /// id from construction.
 ///

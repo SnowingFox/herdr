@@ -269,6 +269,30 @@ pub unsafe fn run(cell: *mut RefCell<WrapState>) -> CycleOutcome {
 /// not a plain application record so a callback a record type would trigger runs
 /// after the preceding data rather than in the middle of it.
 ///
+/// # The batch is emitted *inside* the loop, and that is load-bearing
+///
+/// Node's `ClearOut` calls `emit()` from three places (`src/crypto/crypto_tls.cc`
+/// at this pin): after the record-type check inside `for (;;)`, in the
+/// `read <= 0` arms, and once more after the switch. The first of those is the one
+/// that matters here. When the chunk fills, `length == kClearOutChunkSize`, so
+/// `SSL_read` may no longer be called with a positive length and the loop has to
+/// emit what it accumulated before it can accumulate any more — and it keeps
+/// looping afterwards, because the bytes it has not decrypted yet are still in
+/// `enc_in_` (`SSL_read` returns at most one record, and a 64 KiB chunk holds
+/// four 16 KiB ones).
+///
+/// An earlier version of this function had no in-loop emission: it accumulated
+/// into one buffer and emitted only after the loop ended, so a pass that filled
+/// the chunk and then hit `length >= CHUNK` emitted the first 64 KiB and
+/// **returned**, leaving every further record buffered in `enc_in_`. Nothing
+/// re-enters `ClearOut` for those bytes — the socket has no read completion
+/// pending, so `uv__io_poll` never wakes — and the peer's response is truncated
+/// at a chunk multiple. Measured on a 100 000-byte TLS body written in one go:
+/// 98 304 bytes delivered (3 × 32 768), 1 696 stranded, process alive forever.
+/// That is the `npm install` cold-cache hang: `@npmcli/agent` fetches tarballs
+/// over keep-alive HTTPS, and a response that stalls mid-body never emits
+/// `'end'`, so the socket stays referenced and the loop never empties.
+///
 /// # Safety
 ///
 /// `ssl` must be the live `SSL` of the wrap that owns `state`, and `state` must be
@@ -286,6 +310,7 @@ pub unsafe fn clear_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
     }
     let mut buffer = vec![0u8; CHUNK];
     let mut length = 0usize;
+    let mut total = 0usize;
     loop {
         // SAFETY: `ssl` is live and `buffer[length..]` is `CHUNK - length` bytes.
         let read = unsafe {
@@ -323,36 +348,50 @@ pub unsafe fn clear_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
         let count = read as usize;
         length += count;
 
-        // Stop accumulating if the next buffered record is not application data,
-        // or if it is too short to be one — `crypto_tls.cc:903`. Without this, a
-        // renegotiation or a session ticket would be processed before the data
-        // that preceded it was emitted.
-        if length >= CHUNK {
-            break;
+        // Keep accumulating only while the batch has room and the next buffered
+        // record is application data that is long enough to be one — the
+        // condition Node's `continue` tests (`crypto_tls.cc:900-906`). Anything
+        // else means it is time to hand this batch up, which Node does with
+        // `emit()` and then loops anyway.
+        //
+        // The "then loops anyway" is the part that has to be preserved: a batch
+        // is flushed to make room, never to end the function. `SSL_read` returns
+        // at most one record, so a full chunk is the normal case for any body
+        // over 64 KiB and the remaining records are still in `enc_in_`.
+        if length < CHUNK {
+            if let Some(enc_in) = state.enc_in() {
+                let pending = enc_in.pending();
+                if pending >= TLS_RECORD_HEADER {
+                    let header = enc_in.peek(TLS_RECORD_HEADER);
+                    let more_application_data = matches!(
+                        header,
+                        Some(bytes)
+                            if bytes.len() == TLS_RECORD_HEADER
+                                && bytes[0] == TLS_RECORD_APPLICATION_DATA
+                    );
+                    if more_application_data {
+                        continue;
+                    }
+                }
+            }
         }
-        let Some(enc_in) = state.enc_in() else {
-            break;
-        };
-        let pending = enc_in.pending();
-        if pending < TLS_RECORD_HEADER {
-            break;
-        }
-        let header = enc_in.peek(TLS_RECORD_HEADER);
-        match header {
-            Some(bytes)
-                if bytes.len() == TLS_RECORD_HEADER && bytes[0] == TLS_RECORD_APPLICATION_DATA => {}
-            _ => break,
-        }
+        total += length;
+        state
+            .pending_cleartext_output
+            .extend_from_slice(&buffer[..length]);
+        length = 0;
     }
     if length > 0 {
-        buffer.truncate(length);
+        total += length;
         // Cleartext goes **up**, not out: this is the data `lib/net.js` emits as
         // `'data'`. `pending_output` is the other direction — ciphertext on its way
         // to the socket — and putting cleartext there would send plaintext over
         // the wire inside the TLS record framing.
-        state.pending_cleartext_output.extend_from_slice(&buffer);
+        state
+            .pending_cleartext_output
+            .extend_from_slice(&buffer[..length]);
     }
-    length
+    total
 }
 
 /// `TLSWrap::ClearIn` (`crypto_tls.cc:1014`): `SSL_write`, cleartext **in**.
