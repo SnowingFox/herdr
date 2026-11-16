@@ -14,6 +14,7 @@ pub mod env;
 pub mod env_proxy;
 pub mod error;
 pub mod finalizer;
+pub mod function;
 pub mod handle;
 pub mod hook_slot;
 pub mod host_object;
@@ -32,6 +33,7 @@ pub use binding::{BindingRegistry, Installer, Namespace};
 pub use codec::Encoding;
 pub use env::Env;
 pub use error::KernelError;
+pub use function::{class, method, method_function, method_function_raw};
 pub use per_context::{
     per_context_exports, per_isolate_symbols_object, private_symbols_object,
     set_per_context_exports, PER_CONTEXT_EXPORTS,

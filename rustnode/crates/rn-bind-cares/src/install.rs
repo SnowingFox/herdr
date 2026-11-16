@@ -381,7 +381,7 @@ fn string_array<'s>(
 /// `bindingName` in `createResolverClass`'s map, plus `getServers`,
 /// `setServers`, `setLocalAddress` and `cancel`.
 fn channel_wrap<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(channel_constructor).build(scope);
+    let template = rn_core::class(channel_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -392,7 +392,7 @@ fn channel_wrap<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8
         macro_rules! install_method {
             ($($name:literal => $callback:path),* $(,)?) => {
                 $(
-                    let method = v8::FunctionTemplate::builder($callback).build(scope);
+                    let method = rn_core::method($callback).build(scope);
                     let key = v8::String::new(scope, $name)
                         .ok_or_else(|| format!("cannot allocate ChannelWrap.{}", $name))?;
                     prototype.set(key.into(), method.into());
@@ -431,7 +431,7 @@ fn install_query_methods<'s>(
     macro_rules! install {
         ($($name:literal => $callback:path),* $(,)?) => {
             $(
-                let method = v8::FunctionTemplate::builder($callback).build(scope);
+                let method = rn_core::class($callback).build(scope);
                 let key = v8::String::new(scope, $name)
                     .ok_or_else(|| format!("cannot allocate ChannelWrap.{}", $name))?;
                 prototype.set(key.into(), method.into());
@@ -1040,7 +1040,7 @@ fn request_wrap<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(request_wrap_constructor)
+    let template = rn_core::class(request_wrap_constructor)
         .length(0)
         .build(scope);
     template
@@ -1090,10 +1090,7 @@ fn method<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(callback)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let template = rn_core::method(callback).length(0).build(scope);
     let function = template
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate cares_wrap.{name}"))?;

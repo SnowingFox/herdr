@@ -546,67 +546,59 @@ impl BindingModule for Crypto {
         for (name, callback) in [
             (
                 "randomFillSync",
-                v8::FunctionTemplate::builder(random_fill_sync)
+                rn_core::method(random_fill_sync)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "secureBuffer",
-                v8::FunctionTemplate::builder(secure_buffer)
+                rn_core::method(secure_buffer)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "getHashes",
-                v8::FunctionTemplate::builder(get_hashes)
-                    .build(scope)
-                    .get_function(scope),
+                rn_core::method(get_hashes).build(scope).get_function(scope),
             ),
             (
                 "getCiphers",
-                v8::FunctionTemplate::builder(get_ciphers)
+                rn_core::method(get_ciphers)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "getCurves",
-                v8::FunctionTemplate::builder(get_curves)
-                    .build(scope)
-                    .get_function(scope),
+                rn_core::method(get_curves).build(scope).get_function(scope),
             ),
             (
                 "getCachedAliases",
-                v8::FunctionTemplate::builder(get_cached_aliases)
+                rn_core::method(get_cached_aliases)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "getMacs",
-                v8::FunctionTemplate::builder(crate::classes::get_macs)
+                rn_core::method(crate::classes::get_macs)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "getSSLCiphers",
-                v8::FunctionTemplate::builder(crate::classes::get_ssl_ciphers)
+                rn_core::method(crate::classes::get_ssl_ciphers)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "getCertificateCompressionAlgorithms",
-                v8::FunctionTemplate::builder(
-                    crate::classes::get_certificate_compression_algorithms,
-                )
-                .build(scope)
-                .get_function(scope),
+                rn_core::method(crate::classes::get_certificate_compression_algorithms)
+                    .build(scope)
+                    .get_function(scope),
             ),
             (
                 "startLoadingCertificatesOffThread",
-                v8::FunctionTemplate::builder(
-                    crate::classes::start_loading_certificates_off_thread,
-                )
-                .build(scope)
-                .get_function(scope),
+                rn_core::method(crate::classes::start_loading_certificates_off_thread)
+                    .build(scope)
+                    .get_function(scope),
             ),
             // `createNativeKeyObjectClass` is not here: `rn-bind-crypto-keys`
             // installs the real one, and installing a base-class stand-in first
@@ -614,43 +606,43 @@ impl BindingModule for Crypto {
             // later one is reachable.
             (
                 "createCryptoKeyClass",
-                v8::FunctionTemplate::builder(crate::classes::create_crypto_key_class)
+                rn_core::method(crate::classes::create_crypto_key_class)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "timingSafeEqual",
-                v8::FunctionTemplate::builder(timing_safe_equal)
+                rn_core::method(timing_safe_equal)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "secureHeapUsed",
-                v8::FunctionTemplate::builder(secure_heap_used)
+                rn_core::method(secure_heap_used)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "getFipsCrypto",
-                v8::FunctionTemplate::builder(get_fips_crypto)
+                rn_core::method(get_fips_crypto)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "getFipsCryptoGeneration",
-                v8::FunctionTemplate::builder(get_fips_crypto_generation)
+                rn_core::method(get_fips_crypto_generation)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "getOpenSSLSecLevelCrypto",
-                v8::FunctionTemplate::builder(get_openssl_sec_level)
+                rn_core::method(get_openssl_sec_level)
                     .build(scope)
                     .get_function(scope),
             ),
             (
                 "oneShotDigest",
-                v8::FunctionTemplate::builder(one_shot_digest)
+                rn_core::method(one_shot_digest)
                     .build(scope)
                     .get_function(scope),
             ),
@@ -1013,7 +1005,7 @@ fn install_hash_class<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(hash_constructor).build(scope);
+    let template = rn_core::class(hash_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -1022,8 +1014,8 @@ fn install_hash_class<'s>(
     // primitive or a Template".
     let prototype = template.prototype_template(scope);
     for (name, callback) in [
-        ("update", v8::FunctionTemplate::builder(hash_update)),
-        ("digest", v8::FunctionTemplate::builder(hash_digest)),
+        ("update", rn_core::method(hash_update)),
+        ("digest", rn_core::method(hash_digest)),
     ] {
         let Some(key) = v8::String::new(scope, name) else {
             return Err(format!("cannot allocate the Hash method name {name}"));
@@ -1191,16 +1183,16 @@ fn install_hmac_class<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(hmac_constructor).build(scope);
+    let template = rn_core::class(hmac_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
     // As in `install_hash_class`: a prototype template needs a `Template`.
     let prototype = template.prototype_template(scope);
     for (name, callback) in [
-        ("init", v8::FunctionTemplate::builder(hmac_init)),
-        ("update", v8::FunctionTemplate::builder(hmac_update)),
-        ("digest", v8::FunctionTemplate::builder(hmac_digest)),
+        ("init", rn_core::method(hmac_init)),
+        ("update", rn_core::method(hmac_update)),
+        ("digest", rn_core::method(hmac_digest)),
     ] {
         let Some(key) = v8::String::new(scope, name) else {
             return Err(format!("cannot allocate the Hmac method name {name}"));
@@ -1684,7 +1676,7 @@ fn install_job_class<'s>(
     name: &str,
     constructor: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(constructor).build(scope);
+    let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -1692,10 +1684,7 @@ fn install_job_class<'s>(
     let Some(key) = v8::String::new(scope, "run") else {
         return Err(format!("cannot allocate {name}.run"));
     };
-    prototype.set(
-        key.into(),
-        v8::FunctionTemplate::builder(job_run).build(scope).into(),
-    );
+    prototype.set(key.into(), rn_core::method(job_run).build(scope).into());
     let Some(class_name) = v8::String::new(scope, name) else {
         return Err(format!("cannot allocate the {name} class name"));
     };

@@ -112,19 +112,16 @@ pub fn install_classes<'s>(
     for (name, built) in [
         (
             "createNativeKeyObjectClass",
-            v8::FunctionTemplate::builder(create_native_key_object_class).build(scope),
+            rn_core::method(create_native_key_object_class).build(scope),
         ),
         (
             "getKeyObjectSlots",
-            v8::FunctionTemplate::builder(get_key_object_slots).build(scope),
+            rn_core::method(get_key_object_slots).build(scope),
         ),
-        (
-            "isKeyObject",
-            v8::FunctionTemplate::builder(is_key_object).build(scope),
-        ),
+        ("isKeyObject", rn_core::method(is_key_object).build(scope)),
         (
             "isKeyAlgorithmAvailable",
-            v8::FunctionTemplate::builder(is_key_algorithm_available).build(scope),
+            rn_core::method(is_key_algorithm_available).build(scope),
         ),
     ] {
         let function = built
@@ -144,7 +141,7 @@ pub(crate) fn handle_constructor<'s>(
     if let Some(constructor) = with_classes(|classes| classes.handle.clone()) {
         return Some(v8::Local::new(scope, &constructor));
     }
-    let template = v8::FunctionTemplate::builder(crate::handle::constructor).build(scope);
+    let template = rn_core::class(crate::handle::constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELD_COUNT);
@@ -208,8 +205,7 @@ fn create_native_key_object_class<'s>(
     let template = match with_classes(|classes| classes.base.clone()) {
         Some(template) => v8::Local::new(scope, &template),
         None => {
-            let template =
-                v8::FunctionTemplate::builder(native_key_object_constructor).build(scope);
+            let template = rn_core::class(native_key_object_constructor).build(scope);
             template
                 .instance_template(scope)
                 .set_internal_field_count(INTERNAL_FIELD_COUNT);

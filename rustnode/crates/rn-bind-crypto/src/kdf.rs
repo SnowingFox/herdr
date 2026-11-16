@@ -448,7 +448,7 @@ pub(crate) fn install_job_class<'s>(
     name: &str,
     constructor: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(constructor).build(scope);
+    let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -456,10 +456,7 @@ pub(crate) fn install_job_class<'s>(
     let Some(key) = v8::String::new(scope, "run") else {
         return Err(format!("cannot allocate {name}.run"));
     };
-    prototype.set(
-        key.into(),
-        v8::FunctionTemplate::builder(run).build(scope).into(),
-    );
+    prototype.set(key.into(), rn_core::method(run).build(scope).into());
     let Some(class_name) = v8::String::new(scope, name) else {
         return Err(format!("cannot allocate the {name} class name"));
     };

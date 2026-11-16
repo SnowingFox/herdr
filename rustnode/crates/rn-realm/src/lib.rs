@@ -1897,7 +1897,7 @@ fn node_platform() -> &'static str {
 fn internal_binding_dispatcher<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(get_internal_binding).build(scope);
+    let template = rn_core::class(get_internal_binding).build(scope);
     let function = template
         .get_function(scope)
         .ok_or("cannot allocate getInternalBinding")?;
@@ -2051,7 +2051,7 @@ fn function_of<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(callback).build(scope);
+    let template = rn_core::class(callback).build(scope);
     let function = template
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate {name}"))?;
@@ -2174,7 +2174,7 @@ fn make_stream_object<'s>(
     stream: StdStream,
 ) -> Result<v8::Local<'s, v8::Object>, String> {
     let external = v8::External::new(scope, Box::into_raw(Box::new(stream)).cast());
-    let template = v8::FunctionTemplate::builder(stream_write_callback)
+    let template = rn_core::class(stream_write_callback)
         .data(external.into())
         .build(scope);
     let function = template

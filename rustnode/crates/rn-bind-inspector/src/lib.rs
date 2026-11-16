@@ -405,7 +405,8 @@ fn set_function<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let function = v8::Function::new(scope, callback)
+    let function = rn_core::method_function(callback)
+        .build(scope)
         .ok_or_else(|| format!("cannot allocate inspector.{name}"))?;
     let key = v8::String::new(scope, name).ok_or_else(|| format!("cannot allocate {name}"))?;
     object.set(scope, key.into(), function.into());

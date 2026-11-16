@@ -533,9 +533,7 @@ fn sandbox_enumerate_index<'s>(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(script_new)
-        .length(2)
-        .build(scope);
+    let template = rn_core::class(script_new).length(2).build(scope);
     let class_name =
         v8::String::new(scope, "ContextifyScript").ok_or("cannot allocate the class name")?;
     template.set_class_name(class_name);
@@ -559,7 +557,7 @@ pub fn constructor<'s>(
 
     macro_rules! method {
         ($name:literal, $callback:expr) => {{
-            let method = v8::FunctionTemplate::builder($callback).build(scope);
+            let method = rn_core::method($callback).build(scope);
             if let (Some(function), Some(key)) =
                 (method.get_function(scope), v8::String::new(scope, $name))
             {

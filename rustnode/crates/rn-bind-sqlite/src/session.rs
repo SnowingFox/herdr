@@ -363,9 +363,7 @@ fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Fu
         return Some(v8::Local::new(scope, template));
     }
 
-    let template = v8::FunctionTemplate::builder(illegal_constructor)
-        .length(0)
-        .build(scope);
+    let template = rn_core::class(illegal_constructor).length(0).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELDS);

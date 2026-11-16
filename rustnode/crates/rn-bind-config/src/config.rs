@@ -124,7 +124,7 @@ impl BindingModule for Config {
 
         // Node installs this with `SetMethodNoSideEffect`, so the function is a
         // plain data property rather than an accessor.
-        let function = match v8::Function::builder(get_default_locale)
+        let function = match rn_core::method_function(get_default_locale)
             .length(0)
             .build(scope)
         {

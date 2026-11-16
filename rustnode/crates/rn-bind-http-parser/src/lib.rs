@@ -210,7 +210,7 @@ fn install_http_parser<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(parser_constructor).build(scope);
+    let template = rn_core::class(parser_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(2);
@@ -223,67 +223,67 @@ fn install_http_parser<'s>(
         scope,
         prototype,
         "close",
-        v8::FunctionTemplate::builder(parser_close).build(scope),
+        rn_core::method(parser_close).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "free",
-        v8::FunctionTemplate::builder(parser_free).build(scope),
+        rn_core::method(parser_free).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "remove",
-        v8::FunctionTemplate::builder(parser_remove).build(scope),
+        rn_core::method(parser_remove).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "execute",
-        v8::FunctionTemplate::builder(parser_execute).build(scope),
+        rn_core::method(parser_execute).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "finish",
-        v8::FunctionTemplate::builder(parser_finish).build(scope),
+        rn_core::method(parser_finish).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "initialize",
-        v8::FunctionTemplate::builder(parser_initialize).build(scope),
+        rn_core::method(parser_initialize).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "pause",
-        v8::FunctionTemplate::builder(parser_pause).build(scope),
+        rn_core::method(parser_pause).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "resume",
-        v8::FunctionTemplate::builder(parser_resume).build(scope),
+        rn_core::method(parser_resume).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "consume",
-        v8::FunctionTemplate::builder(parser_consume).build(scope),
+        rn_core::method(parser_consume).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "unconsume",
-        v8::FunctionTemplate::builder(parser_unconsume).build(scope),
+        rn_core::method(parser_unconsume).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "getCurrentBuffer",
-        v8::FunctionTemplate::builder(parser_get_current_buffer).build(scope),
+        rn_core::method(parser_get_current_buffer).build(scope),
     )?;
 
     let Some(class_name) = v8::String::new(scope, "HTTPParser") else {
@@ -836,7 +836,7 @@ fn install_connections_list<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
 ) -> Result<(), String> {
-    let template = v8::FunctionTemplate::builder(connections_list_constructor).build(scope);
+    let template = rn_core::class(connections_list_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -846,25 +846,25 @@ fn install_connections_list<'s>(
         scope,
         prototype,
         "all",
-        v8::FunctionTemplate::builder(connections_all).build(scope),
+        rn_core::method(connections_all).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "idle",
-        v8::FunctionTemplate::builder(connections_idle).build(scope),
+        rn_core::method(connections_idle).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "active",
-        v8::FunctionTemplate::builder(connections_active).build(scope),
+        rn_core::method(connections_active).build(scope),
     )?;
     set_method(
         scope,
         prototype,
         "expired",
-        v8::FunctionTemplate::builder(connections_expired).build(scope),
+        rn_core::method(connections_expired).build(scope),
     )?;
 
     let Some(class_name) = v8::String::new(scope, "ConnectionsList") else {

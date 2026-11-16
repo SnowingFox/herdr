@@ -47,22 +47,19 @@ const NO_AUTH_TAG_LENGTH: i32 = -1;
 pub fn build_cipher_base_class<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
-    let template = v8::FunctionTemplate::builder(constructor).build(scope);
+    let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELD_COUNT);
 
     let prototype = template.prototype_template(scope);
     for (name, callback) in [
-        ("update", v8::FunctionTemplate::builder(update)),
-        ("final", v8::FunctionTemplate::builder(finalize)),
-        (
-            "setAutoPadding",
-            v8::FunctionTemplate::builder(set_auto_padding),
-        ),
-        ("getAuthTag", v8::FunctionTemplate::builder(get_auth_tag)),
-        ("setAuthTag", v8::FunctionTemplate::builder(set_auth_tag)),
-        ("setAAD", v8::FunctionTemplate::builder(set_aad)),
+        ("update", rn_core::method(update)),
+        ("final", rn_core::method(finalize)),
+        ("setAutoPadding", rn_core::method(set_auto_padding)),
+        ("getAuthTag", rn_core::method(get_auth_tag)),
+        ("setAuthTag", rn_core::method(set_auth_tag)),
+        ("setAAD", rn_core::method(set_aad)),
     ] {
         let key = v8::String::new(scope, name)
             .ok_or_else(|| format!("cannot allocate the CipherBase method {name}"))?;

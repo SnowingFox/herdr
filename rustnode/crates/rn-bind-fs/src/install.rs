@@ -43,7 +43,7 @@ use crate::stats::{Follow, StatFields, StatFsFields};
 /// Binds a Rust callback as a namespace function.
 macro_rules! mkfn {
     ($installer:expr, $name:expr, $callback:expr) => {{
-        let template = v8::FunctionTemplate::builder($callback).build($installer.scope);
+        let template = rn_core::method($callback).build($installer.scope);
         let function = template
             .get_function($installer.scope)
             .ok_or_else(|| format!("cannot allocate fs.{}", $name))?;
@@ -302,7 +302,7 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
     /// to produce a plain, extensible object; all the binding needs from it later
     /// is the `oncomplete` property.
     fn fs_req_callback(&mut self) -> Result<(), String> {
-        let template = v8::FunctionTemplate::builder(fs_req_callback_ctor).build(self.scope);
+        let template = rn_core::class(fs_req_callback_ctor).build(self.scope);
         let function = template
             .get_function(self.scope)
             .ok_or("cannot allocate fs.FSReqCallback")?;

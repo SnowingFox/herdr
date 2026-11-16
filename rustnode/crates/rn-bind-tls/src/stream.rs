@@ -46,10 +46,7 @@ pub fn install_accessor<'s>(
             // `set_accessor_property` takes `FunctionTemplate`s, not `Function`s,
             // because it installs the accessor on a *template* rather than on an
             // existing object.
-            let function = v8::FunctionTemplate::builder($callback)
-                .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope);
+            let function = rn_core::method($callback).length(0).build(scope);
             prototype.set_accessor_property(
                 crate::wrap::key(scope, name)?.into(),
                 Some(function),
@@ -79,9 +76,7 @@ pub fn install_method<'s>(
     macro_rules! method {
         ($callback:path) => {{
             // A `FunctionTemplate`, for the reason `crate::methods` documents.
-            let template = v8::FunctionTemplate::builder($callback)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope);
+            let template = rn_core::method($callback).build(scope);
             prototype.set(crate::wrap::key(scope, name)?.into(), template.into());
         }};
     }

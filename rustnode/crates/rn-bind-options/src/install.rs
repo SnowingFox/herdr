@@ -85,7 +85,7 @@ pub(crate) fn define_method(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let function = v8::FunctionTemplate::builder(callback)
+    let function = rn_core::method(callback)
         .build(scope)
         .get_function(scope)
         .ok_or_else(|| format!("could not create options.{name}"))?;

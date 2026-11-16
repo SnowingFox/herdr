@@ -149,7 +149,7 @@ impl v8::ValueDeserializerImpl for Hooks {
 pub fn install<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, String> {
     // `des->SetLength(1)`: the one difference from `Serializer`, and it is
     // visible as `Deserializer.length`.
-    let template = v8::FunctionTemplate::builder(new).length(1).build(scope);
+    let template = rn_core::class(new).length(1).build(scope);
     let name = v8::String::new(scope, "Deserializer")
         .ok_or("cannot allocate the Deserializer class name")?;
     template.set_class_name(name);
@@ -162,8 +162,7 @@ pub fn install<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
     macro_rules! install_methods {
         ($($method_name:literal => $method:expr),* $(,)?) => {
             $(
-                let method_template = v8::FunctionTemplate::builder($method)
-                    .constructor_behavior(v8::ConstructorBehavior::Throw)
+                let method_template = rn_core::method($method)
                     .build(scope);
                 let key = v8::String::new(scope, $method_name)
                     .ok_or_else(|| format!("cannot allocate the name {}", $method_name))?;

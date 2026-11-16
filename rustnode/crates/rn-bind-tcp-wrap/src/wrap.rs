@@ -19,9 +19,7 @@ use rn_v8_sys::v8;
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(connect_wrap_new)
-        .length(0)
-        .build(scope);
+    let template = rn_core::class(connect_wrap_new).length(0).build(scope);
     // `AsyncWrap::MakeLazilyInitializedJSTemplate` produces a class with one
     // internal field and no methods.
     template

@@ -122,7 +122,7 @@ pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     // `new TTY(fd, ctx)`.
-    let template = v8::FunctionTemplate::builder(new).length(2).build(scope);
+    let template = rn_core::class(new).length(2).build(scope);
 
     let instance = template.instance_template(scope);
     instance.set_internal_field_count(1);
@@ -136,32 +136,19 @@ pub fn constructor<'s>(
     let prototype = template.prototype_template(scope);
 
     // `HandleWrap`.
-    let close = v8::FunctionTemplate::builder(methods::close)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let close = rn_core::class(methods::close).length(0).build(scope);
     prototype.set(crate::key(scope, "close")?.into(), close.into());
-    let reference = v8::FunctionTemplate::builder(methods::reference)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let reference = rn_core::class(methods::reference).length(0).build(scope);
     prototype.set(crate::key(scope, "ref")?.into(), reference.into());
-    let unreference = v8::FunctionTemplate::builder(methods::unreference)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let unreference = rn_core::class(methods::unreference).length(0).build(scope);
     prototype.set(crate::key(scope, "unref")?.into(), unreference.into());
-    let has_reference = v8::FunctionTemplate::builder(methods::has_reference)
+    let has_reference = rn_core::class(methods::has_reference)
         .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
         .build(scope);
     prototype.set(crate::key(scope, "hasRef")?.into(), has_reference.into());
     // `AsyncWrap`'s id. `tty.WriteStream` inherits from `net.Socket`, and
     // `net.js` reads `this._handle.getAsyncId()` unconditionally.
-    let get_async_id = v8::FunctionTemplate::builder(methods::get_async_id)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let get_async_id = rn_core::class(methods::get_async_id).length(0).build(scope);
     prototype.set(crate::key(scope, "getAsyncId")?.into(), get_async_id.into());
 
     // `LibuvStreamWrap` / `StreamBase`.
@@ -213,15 +200,12 @@ pub fn constructor<'s>(
     ] {
         let _ = getter;
         let template = match name {
-            "fd" => v8::FunctionTemplate::builder(methods::get_fd),
-            "bytesRead" => v8::FunctionTemplate::builder(methods::get_bytes_read),
-            "bytesWritten" => v8::FunctionTemplate::builder(methods::get_bytes_written),
-            _ => v8::FunctionTemplate::builder(methods::get_write_queue_size),
+            "fd" => rn_core::class(methods::get_fd),
+            "bytesRead" => rn_core::method(methods::get_bytes_read),
+            "bytesWritten" => rn_core::method(methods::get_bytes_written),
+            _ => rn_core::method(methods::get_write_queue_size),
         };
-        let template = template
-            .length(0)
-            .constructor_behavior(v8::ConstructorBehavior::Throw)
-            .build(scope);
+        let template = template.length(0).build(scope);
         prototype.set_accessor_property(
             crate::key(scope, name)?.into(),
             Some(template),
@@ -239,25 +223,18 @@ pub fn constructor<'s>(
     );
 
     // `TTYWrap`'s own methods.
-    let get_window_size = v8::FunctionTemplate::builder(methods::get_window_size)
+    let get_window_size = rn_core::class(methods::get_window_size)
         .length(1)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
         .build(scope);
     prototype.set(
         crate::key(scope, "getWindowSize")?.into(),
         get_window_size.into(),
     );
-    let set_raw_mode = v8::FunctionTemplate::builder(methods::set_raw_mode)
-        .length(1)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let set_raw_mode = rn_core::class(methods::set_raw_mode).length(1).build(scope);
     prototype.set(crate::key(scope, "setRawMode")?.into(), set_raw_mode.into());
     // `LibuvStreamWrap::SetBlocking`, which `lib/net.js` calls for a stdio fd on
     // Windows; harmless and expected to exist everywhere.
-    let set_blocking = v8::FunctionTemplate::builder(methods::set_blocking)
-        .length(1)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let set_blocking = rn_core::class(methods::set_blocking).length(1).build(scope);
     prototype.set(
         crate::key(scope, "setBlocking")?.into(),
         set_blocking.into(),
@@ -278,10 +255,7 @@ fn stream_callback<'s>(
     arity: i32,
     function: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::Local<'s, v8::FunctionTemplate> {
-    v8::FunctionTemplate::builder(function)
-        .length(arity)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope)
+    rn_core::method(function).length(arity).build(scope)
 }
 
 /// The shape every method callback has.

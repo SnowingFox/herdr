@@ -118,7 +118,7 @@ pub(crate) fn deliver<'s>(
     let boxed = Box::new(Delivery { request, payload });
     let pointer = Box::into_raw(boxed);
     let external = v8::External::new(scope, pointer.cast());
-    let template = v8::FunctionTemplate::builder(trampoline)
+    let template = rn_core::class(trampoline)
         .data(external.into())
         .build(scope);
     let Some(function) = template.get_function(scope) else {

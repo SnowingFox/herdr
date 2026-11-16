@@ -62,7 +62,7 @@ pub(crate) fn install<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
 ) -> Result<(), String> {
-    let crc32_function = v8::Function::builder(crc32_callback).build(scope);
+    let crc32_function = rn_core::method_function(crc32_callback).build(scope);
     let Some(crc32_function) = crc32_function else {
         return Err("cannot allocate zlib crc32".to_string());
     };
@@ -71,7 +71,7 @@ pub(crate) fn install<'s>(
     };
     target.set(scope, key.into(), crc32_function.into());
 
-    let crc32c_function = v8::Function::builder(crc32c_callback).build(scope);
+    let crc32c_function = rn_core::method_function(crc32c_callback).build(scope);
     let Some(crc32c_function) = crc32c_function else {
         return Err("cannot allocate zlib crc32c".to_string());
     };

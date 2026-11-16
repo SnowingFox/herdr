@@ -146,7 +146,7 @@ pub fn with_handle<R>(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = v8::FunctionTemplate::builder(new).length(0).build(scope);
+    let template = rn_core::class(new).length(0).build(scope);
 
     // `src/udp_wrap.cc` sets `UDPWrapBase::kInternalFieldCount`, which is one
     // more than `HandleWrap`'s so the base pointer fits alongside the handle.
@@ -160,53 +160,36 @@ pub fn constructor<'s>(
     for (name, template) in [
         (
             "close",
-            v8::FunctionTemplate::builder(methods::close)
-                .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope),
+            rn_core::method(methods::close).length(0).build(scope),
         ),
         (
             "ref",
-            v8::FunctionTemplate::builder(methods::reference)
-                .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope),
+            rn_core::method(methods::reference).length(0).build(scope),
         ),
         (
             "unref",
-            v8::FunctionTemplate::builder(methods::unreference)
-                .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope),
+            rn_core::method(methods::unreference).length(0).build(scope),
         ),
         (
             "hasRef",
-            v8::FunctionTemplate::builder(methods::has_reference)
+            rn_core::method(methods::has_reference)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         (
             "getAsyncId",
-            v8::FunctionTemplate::builder(methods::get_async_id)
+            rn_core::method(methods::get_async_id)
                 .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
                 .build(scope),
         ),
         // `UDPWrapBase::AddMethods`.
         (
             "recvStart",
-            v8::FunctionTemplate::builder(methods::recv_start)
-                .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope),
+            rn_core::method(methods::recv_start).length(0).build(scope),
         ),
         (
             "recvStop",
-            v8::FunctionTemplate::builder(methods::recv_stop)
-                .length(0)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope),
+            rn_core::method(methods::recv_stop).length(0).build(scope),
         ),
     ] {
         prototype.set(crate::key(scope, name)?.into(), template.into());
@@ -286,10 +269,7 @@ pub fn constructor<'s>(
     }
 
     // `t->PrototypeTemplate()->SetAccessorProperty(fd, GetFD, …)`.
-    let get_fd = v8::FunctionTemplate::builder(methods::get_fd)
-        .length(0)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope);
+    let get_fd = rn_core::method(methods::get_fd).length(0).build(scope);
     prototype.set_accessor_property(
         crate::key(scope, "fd")?.into(),
         Some(get_fd),
@@ -316,10 +296,7 @@ fn callback<'s>(
     arity: i32,
     function: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::Local<'s, v8::FunctionTemplate> {
-    v8::FunctionTemplate::builder(function)
-        .length(arity)
-        .constructor_behavior(v8::ConstructorBehavior::Throw)
-        .build(scope)
+    rn_core::method(function).length(arity).build(scope)
 }
 
 /// The shape every method callback has, so the table above can name them.

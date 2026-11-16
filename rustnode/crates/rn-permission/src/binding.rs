@@ -100,7 +100,7 @@ fn install_member<'s>(
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<(), String> {
-    let function = v8::FunctionTemplate::builder(callback)
+    let function = rn_core::method(callback)
         .build(scope)
         .get_function(scope)
         .ok_or_else(|| format!("cannot allocate permission.{name}"))?;

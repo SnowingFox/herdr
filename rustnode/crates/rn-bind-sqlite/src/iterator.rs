@@ -112,9 +112,7 @@ fn global_iterator_prototype<'s>(
 /// never runs the constructor body — that is why `new StatementIterator()`
 /// throws while `iterate()` works.
 fn allocate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
-    let template = v8::FunctionTemplate::builder(illegal_constructor)
-        .length(0)
-        .build(scope);
+    let template = rn_core::class(illegal_constructor).length(0).build(scope);
     let instance = template.instance_template(scope);
     instance.set_internal_field_count(INTERNAL_FIELDS);
     let instance = instance.new_instance(scope)?;

@@ -1170,15 +1170,12 @@ fn define_class<'s>(
 
     let prototype = template.prototype_template(scope);
     for (method_name, method) in [
-        ("init", v8::FunctionTemplate::builder(init).build(scope)),
-        ("write", v8::FunctionTemplate::builder(write).build(scope)),
-        (
-            "writeSync",
-            v8::FunctionTemplate::builder(write_sync).build(scope),
-        ),
-        ("params", v8::FunctionTemplate::builder(params).build(scope)),
-        ("reset", v8::FunctionTemplate::builder(reset).build(scope)),
-        ("close", v8::FunctionTemplate::builder(close).build(scope)),
+        ("init", rn_core::method(init).build(scope)),
+        ("write", rn_core::method(write).build(scope)),
+        ("writeSync", rn_core::method(write_sync).build(scope)),
+        ("params", rn_core::method(params).build(scope)),
+        ("reset", rn_core::method(reset).build(scope)),
+        ("close", rn_core::method(close).build(scope)),
     ] {
         let Some(key) = v8::String::new(scope, method_name) else {
             return Err(format!("cannot allocate zlib method name {method_name}"));
@@ -1211,31 +1208,31 @@ pub(crate) fn install_constructors<'s>(
         scope,
         target,
         "Zlib",
-        v8::FunctionTemplate::builder(zlib_constructor).build(scope),
+        rn_core::class(zlib_constructor).build(scope),
     )?;
     define_class(
         scope,
         target,
         "BrotliEncoder",
-        v8::FunctionTemplate::builder(brotli_encoder_constructor).build(scope),
+        rn_core::class(brotli_encoder_constructor).build(scope),
     )?;
     define_class(
         scope,
         target,
         "BrotliDecoder",
-        v8::FunctionTemplate::builder(brotli_decoder_constructor).build(scope),
+        rn_core::class(brotli_decoder_constructor).build(scope),
     )?;
     define_class(
         scope,
         target,
         "ZstdCompress",
-        v8::FunctionTemplate::builder(zstd_compress_constructor).build(scope),
+        rn_core::class(zstd_compress_constructor).build(scope),
     )?;
     define_class(
         scope,
         target,
         "ZstdDecompress",
-        v8::FunctionTemplate::builder(zstd_decompress_constructor).build(scope),
+        rn_core::class(zstd_decompress_constructor).build(scope),
     )?;
     Ok(())
 }

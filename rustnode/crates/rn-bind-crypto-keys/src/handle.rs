@@ -90,7 +90,7 @@ pub fn install_methods<'s>(
         ($($name:literal => $callback:path),* $(,)?) => {
             $(
                 {
-                    let template = v8::FunctionTemplate::builder($callback).build(scope);
+                    let template = rn_core::method($callback).build(scope);
                     let key = v8::String::new(scope, $name)?;
                     prototype.set(key.into(), template.into());
                 }
