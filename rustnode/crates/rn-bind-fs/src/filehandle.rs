@@ -93,7 +93,7 @@ impl HandleState {
 pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<Local<'s, v8::Value>, String> {
     // No `ConstructorBehavior::Throw` here: the default is `Call`, which allows
     // `new`, and `Throw` makes the function non-constructible entirely.
-    let template = rn_core::class(new_handle).length(0).build(scope);
+    let template = rn_core::class(new_handle).build(scope);
     let name = v8::String::new(scope, "FileHandle").ok_or("cannot allocate the FileHandle name")?;
     template.set_class_name(name);
     template
@@ -102,15 +102,9 @@ pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<Local<'s, v8:
 
     let prototype = template.prototype_template(scope);
     for (name, template) in [
-        ("close", rn_core::method(close).length(0).build(scope)),
-        (
-            "closeSync",
-            rn_core::method(close_sync).length(0).build(scope),
-        ),
-        (
-            "getAsyncId",
-            rn_core::method(get_async_id).length(0).build(scope),
-        ),
+        ("close", rn_core::method(close).build(scope)),
+        ("closeSync", rn_core::method(close_sync).build(scope)),
+        ("getAsyncId", rn_core::method(get_async_id).build(scope)),
     ] {
         let key = v8::String::new(scope, name)
             .ok_or_else(|| format!("cannot allocate the name {name}"))?;
@@ -122,7 +116,7 @@ pub fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<Local<'s, v8:
     // once the descriptor has been taken: `promises.js` caches the descriptor in
     // its own `kFd` and only re-reads `handle.fd` on the deserialize path, but a
     // stale value there would point at a descriptor the process may have reused.
-    let fd_getter = rn_core::method(get_fd).length(0).build(scope);
+    let fd_getter = rn_core::method(get_fd).build(scope);
     let fd_key = v8::String::new(scope, "fd").ok_or("cannot allocate the fd accessor name")?;
     prototype.set_accessor_property(
         fd_key.into(),

@@ -122,7 +122,9 @@ pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     // `new TTY(fd, ctx)`.
-    let template = rn_core::class(new).length(2).build(scope);
+    // Node: `NewFunctionTemplate` into `target->Set(context, ttyString, func)`,
+    // i.e. length 0, not the two arguments.
+    let template = rn_core::class(new).build(scope);
 
     let instance = template.instance_template(scope);
     instance.set_internal_field_count(1);
@@ -138,60 +140,44 @@ pub fn constructor<'s>(
     // `HandleWrap`. Node publishes these with `SetProtoMethod`, i.e.
     // `ConstructorBehavior::kThrow`, so `new tty.prototype.close()` is a
     // `TypeError` there.
-    let close = rn_core::method(methods::close).length(0).build(scope);
+    let close = rn_core::method(methods::close).build(scope);
     prototype.set(crate::key(scope, "close")?.into(), close.into());
-    let reference = rn_core::method(methods::reference).length(0).build(scope);
+    let reference = rn_core::method(methods::reference).build(scope);
     prototype.set(crate::key(scope, "ref")?.into(), reference.into());
-    let unreference = rn_core::method(methods::unreference).length(0).build(scope);
+    let unreference = rn_core::method(methods::unreference).build(scope);
     prototype.set(crate::key(scope, "unref")?.into(), unreference.into());
-    let has_reference = rn_core::method(methods::has_reference)
-        .length(0)
-        .build(scope);
+    let has_reference = rn_core::method(methods::has_reference).build(scope);
     prototype.set(crate::key(scope, "hasRef")?.into(), has_reference.into());
     // `AsyncWrap`'s id. `tty.WriteStream` inherits from `net.Socket`, and
     // `net.js` reads `this._handle.getAsyncId()` unconditionally.
-    let get_async_id = rn_core::method(methods::get_async_id)
-        .length(0)
-        .build(scope);
+    let get_async_id = rn_core::method(methods::get_async_id).build(scope);
     prototype.set(crate::key(scope, "getAsyncId")?.into(), get_async_id.into());
 
     // `LibuvStreamWrap` / `StreamBase`.
-    let stream_methods: [(&str, i32, v8::Local<v8::FunctionTemplate>); 9] = [
-        (
-            "readStart",
-            0,
-            stream_callback(scope, 0, methods::read_start),
-        ),
-        ("readStop", 0, stream_callback(scope, 0, methods::read_stop)),
-        ("shutdown", 1, stream_callback(scope, 1, methods::shutdown)),
-        (
-            "writeBuffer",
-            2,
-            stream_callback(scope, 2, methods::write_buffer),
-        ),
-        ("writev", 3, stream_callback(scope, 3, methods::writev)),
+    let stream_methods: [(&str, v8::Local<v8::FunctionTemplate>); 9] = [
+        ("readStart", stream_callback(scope, methods::read_start)),
+        ("readStop", stream_callback(scope, methods::read_stop)),
+        ("shutdown", stream_callback(scope, methods::shutdown)),
+        ("writeBuffer", stream_callback(scope, methods::write_buffer)),
+        ("writev", stream_callback(scope, methods::writev)),
         (
             "writeUtf8String",
-            2,
-            stream_callback(scope, 2, methods::write_utf8),
+            stream_callback(scope, methods::write_utf8),
         ),
         (
             "writeAsciiString",
-            2,
-            stream_callback(scope, 2, methods::write_ascii),
+            stream_callback(scope, methods::write_ascii),
         ),
         (
             "writeLatin1String",
-            2,
-            stream_callback(scope, 2, methods::write_latin1),
+            stream_callback(scope, methods::write_latin1),
         ),
         (
             "writeUcs2String",
-            2,
-            stream_callback(scope, 2, methods::write_ucs2),
+            stream_callback(scope, methods::write_ucs2),
         ),
     ];
-    for (name, _arity, template) in stream_methods {
+    for (name, template) in stream_methods {
         prototype.set(crate::key(scope, name)?.into(), template.into());
     }
 
@@ -209,7 +195,7 @@ pub fn constructor<'s>(
             "bytesWritten" => rn_core::method(methods::get_bytes_written),
             _ => rn_core::method(methods::get_write_queue_size),
         };
-        let template = template.length(0).build(scope);
+        let template = template.build(scope);
         prototype.set_accessor_property(
             crate::key(scope, name)?.into(),
             Some(template),
@@ -227,22 +213,16 @@ pub fn constructor<'s>(
     );
 
     // `TTYWrap`'s own methods. `SetProtoMethod` in Node, so not constructible.
-    let get_window_size = rn_core::method(methods::get_window_size)
-        .length(1)
-        .build(scope);
+    let get_window_size = rn_core::method(methods::get_window_size).build(scope);
     prototype.set(
         crate::key(scope, "getWindowSize")?.into(),
         get_window_size.into(),
     );
-    let set_raw_mode = rn_core::method(methods::set_raw_mode)
-        .length(1)
-        .build(scope);
+    let set_raw_mode = rn_core::method(methods::set_raw_mode).build(scope);
     prototype.set(crate::key(scope, "setRawMode")?.into(), set_raw_mode.into());
     // `LibuvStreamWrap::SetBlocking`, which `lib/net.js` calls for a stdio fd on
     // Windows; harmless and expected to exist everywhere.
-    let set_blocking = rn_core::method(methods::set_blocking)
-        .length(1)
-        .build(scope);
+    let set_blocking = rn_core::method(methods::set_blocking).build(scope);
     prototype.set(
         crate::key(scope, "setBlocking")?.into(),
         set_blocking.into(),
@@ -258,12 +238,15 @@ pub fn constructor<'s>(
 }
 
 /// Builds one stream method template.
+///
+/// No arity parameter: `SetProtoMethod` builds through `NewFunctionTemplate`,
+/// so Node reports `length` 0 for these however many arguments the JavaScript
+/// side passes.
 fn stream_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    arity: i32,
     function: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::Local<'s, v8::FunctionTemplate> {
-    rn_core::method(function).length(arity).build(scope)
+    rn_core::method(function).build(scope)
 }
 
 /// The shape every method callback has.

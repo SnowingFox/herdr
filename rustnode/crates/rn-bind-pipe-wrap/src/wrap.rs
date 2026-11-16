@@ -11,7 +11,7 @@ use rn_v8_sys::v8;
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(new).length(0).build(scope);
+    let template = rn_core::class(new).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);

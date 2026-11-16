@@ -146,7 +146,7 @@ pub fn with_handle<R>(
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(new).length(0).build(scope);
+    let template = rn_core::class(new).build(scope);
 
     // `src/udp_wrap.cc` sets `UDPWrapBase::kInternalFieldCount`, which is one
     // more than `HandleWrap`'s so the base pointer fits alongside the handle.
@@ -158,118 +158,85 @@ pub fn constructor<'s>(
 
     // `HandleWrap` plus `AsyncWrap::GetAsyncId`.
     for (name, template) in [
-        (
-            "close",
-            rn_core::method(methods::close).length(0).build(scope),
-        ),
-        (
-            "ref",
-            rn_core::method(methods::reference).length(0).build(scope),
-        ),
-        (
-            "unref",
-            rn_core::method(methods::unreference).length(0).build(scope),
-        ),
+        ("close", rn_core::method(methods::close).build(scope)),
+        ("ref", rn_core::method(methods::reference).build(scope)),
+        ("unref", rn_core::method(methods::unreference).build(scope)),
         (
             "hasRef",
-            rn_core::method(methods::has_reference)
-                .length(0)
-                .build(scope),
+            rn_core::method(methods::has_reference).build(scope),
         ),
         (
             "getAsyncId",
-            rn_core::method(methods::get_async_id)
-                .length(0)
-                .build(scope),
+            rn_core::method(methods::get_async_id).build(scope),
         ),
         // `UDPWrapBase::AddMethods`.
         (
             "recvStart",
-            rn_core::method(methods::recv_start).length(0).build(scope),
+            rn_core::method(methods::recv_start).build(scope),
         ),
-        (
-            "recvStop",
-            rn_core::method(methods::recv_stop).length(0).build(scope),
-        ),
+        ("recvStop", rn_core::method(methods::recv_stop).build(scope)),
     ] {
         prototype.set(crate::key(scope, name)?.into(), template.into());
     }
 
-    // `UDPWrap`'s own methods, with the arities `SetProtoMethod` gives them.
+    // `UDPWrap`'s own methods. `SetProtoMethod` builds through
+    // `NewFunctionTemplate`, so Node reports `length` 0 for every one of them
+    // however many arguments the JavaScript side passes.
     //
     // Each has to be named rather than reached through a `fn` pointer: V8 stores
     // the callback in a statically sized slot, which requires a zero-sized type,
     // and a `fn` pointer is not one.
-    let methods: [(&str, i32, v8::Local<v8::FunctionTemplate>); 22] = [
-        ("open", 1, callback(scope, 1, methods::open)),
-        ("bind", 3, callback(scope, 3, methods::bind)),
-        ("connect", 2, callback(scope, 2, methods::connect)),
-        ("send", 4, callback(scope, 4, methods::send)),
-        ("bind6", 3, callback(scope, 3, methods::bind6)),
-        ("connect6", 2, callback(scope, 2, methods::connect6)),
-        ("send6", 4, callback(scope, 4, methods::send6)),
-        ("disconnect", 0, callback(scope, 0, methods::disconnect)),
-        ("getpeername", 1, callback(scope, 1, methods::getpeername)),
-        ("getsockname", 1, callback(scope, 1, methods::getsockname)),
-        (
-            "addMembership",
-            2,
-            callback(scope, 2, methods::add_membership),
-        ),
-        (
-            "dropMembership",
-            2,
-            callback(scope, 2, methods::drop_membership),
-        ),
+    let methods: [(&str, v8::Local<v8::FunctionTemplate>); 22] = [
+        ("open", callback(scope, methods::open)),
+        ("bind", callback(scope, methods::bind)),
+        ("connect", callback(scope, methods::connect)),
+        ("send", callback(scope, methods::send)),
+        ("bind6", callback(scope, methods::bind6)),
+        ("connect6", callback(scope, methods::connect6)),
+        ("send6", callback(scope, methods::send6)),
+        ("disconnect", callback(scope, methods::disconnect)),
+        ("getpeername", callback(scope, methods::getpeername)),
+        ("getsockname", callback(scope, methods::getsockname)),
+        ("addMembership", callback(scope, methods::add_membership)),
+        ("dropMembership", callback(scope, methods::drop_membership)),
         (
             "addSourceSpecificMembership",
-            3,
-            callback(scope, 3, methods::add_source_membership),
+            callback(scope, methods::add_source_membership),
         ),
         (
             "dropSourceSpecificMembership",
-            3,
-            callback(scope, 3, methods::drop_source_membership),
+            callback(scope, methods::drop_source_membership),
         ),
         (
             "setMulticastInterface",
-            1,
-            callback(scope, 1, methods::set_multicast_interface),
+            callback(scope, methods::set_multicast_interface),
         ),
         (
             "setMulticastTTL",
-            1,
-            callback(scope, 1, methods::set_multicast_ttl),
+            callback(scope, methods::set_multicast_ttl),
         ),
         (
             "setMulticastLoopback",
-            1,
-            callback(scope, 1, methods::set_multicast_loopback),
+            callback(scope, methods::set_multicast_loopback),
         ),
-        (
-            "setBroadcast",
-            1,
-            callback(scope, 1, methods::set_broadcast),
-        ),
-        ("setTTL", 1, callback(scope, 1, methods::set_ttl)),
-        ("bufferSize", 3, callback(scope, 3, methods::buffer_size)),
+        ("setBroadcast", callback(scope, methods::set_broadcast)),
+        ("setTTL", callback(scope, methods::set_ttl)),
+        ("bufferSize", callback(scope, methods::buffer_size)),
         (
             "getSendQueueSize",
-            0,
-            callback(scope, 0, methods::get_send_queue_size),
+            callback(scope, methods::get_send_queue_size),
         ),
         (
             "getSendQueueCount",
-            0,
-            callback(scope, 0, methods::get_send_queue_count),
+            callback(scope, methods::get_send_queue_count),
         ),
     ];
-    for (name, _arity, template) in methods {
+    for (name, template) in methods {
         prototype.set(crate::key(scope, name)?.into(), template.into());
     }
 
     // `t->PrototypeTemplate()->SetAccessorProperty(fd, GetFD, …)`.
-    let get_fd = rn_core::method(methods::get_fd).length(0).build(scope);
+    let get_fd = rn_core::method(methods::get_fd).build(scope);
     prototype.set_accessor_property(
         crate::key(scope, "fd")?.into(),
         Some(get_fd),
@@ -289,14 +256,14 @@ pub fn constructor<'s>(
 
 /// Builds one non-constructible method template, matching `SetProtoMethod`.
 ///
-/// The arity is a builder parameter rather than a later mutation: `FunctionTemplate`
-/// exposes no setter for it once built.
+/// No arity parameter, because `SetProtoMethod` reports 0: Node builds the
+/// template through `NewFunctionTemplate`, which passes an explicit 0 for the
+/// length whatever the callback actually reads.
 fn callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    arity: i32,
     function: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::Local<'s, v8::FunctionTemplate> {
-    rn_core::method(function).length(arity).build(scope)
+    rn_core::method(function).build(scope)
 }
 
 /// The shape every method callback has, so the table above can name them.

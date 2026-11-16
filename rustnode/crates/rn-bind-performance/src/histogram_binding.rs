@@ -497,15 +497,14 @@ pub(crate) fn int64_from_value(
 
 pub(crate) fn method<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    length: i32,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::Local<'s, v8::FunctionTemplate> {
     // `rn_core::method` is the chokepoint for "Node publishes this through
-    // `SetMethod`, so it is not constructible". It sets
-    // `ConstructorBehavior::Throw`, which is what this helper spelled out before
-    // the chokepoint existed; going through it keeps the audit in
-    // `tools/constructible-audit.py` able to see this crate.
-    rn_core::method(callback).length(length).build(scope)
+    // `SetMethod`, so it is not constructible **and** its `length` is 0". Both
+    // halves come from the same helper call in `src/util.cc`; going through it
+    // keeps `tools/constructible-audit.py` and `tools/function-name-audit.py`
+    // able to see this crate.
+    rn_core::method(callback).build(scope)
 }
 
 /// Installs the handle methods every histogram-shaped object offers.
@@ -521,49 +520,46 @@ pub(crate) fn add_histogram_methods<'s>(
 ) -> Result<(), String> {
     let prototype = template.prototype_template(scope);
     let methods: [(&str, v8::Local<'s, v8::FunctionTemplate>); 34] = [
-        ("count", method(scope, 0, histogram_count)),
-        ("countBigInt", method(scope, 0, histogram_count_bigint)),
-        ("min", method(scope, 0, histogram_min)),
-        ("minBigInt", method(scope, 0, histogram_min_bigint)),
-        ("max", method(scope, 0, histogram_max)),
-        ("maxBigInt", method(scope, 0, histogram_max_bigint)),
-        ("mean", method(scope, 0, histogram_mean)),
-        ("stddev", method(scope, 0, histogram_stddev)),
-        ("exceeds", method(scope, 0, histogram_exceeds)),
-        ("exceedsBigInt", method(scope, 0, histogram_exceeds_bigint)),
-        ("percentile", method(scope, 1, histogram_percentile)),
+        ("count", method(scope, histogram_count)),
+        ("countBigInt", method(scope, histogram_count_bigint)),
+        ("min", method(scope, histogram_min)),
+        ("minBigInt", method(scope, histogram_min_bigint)),
+        ("max", method(scope, histogram_max)),
+        ("maxBigInt", method(scope, histogram_max_bigint)),
+        ("mean", method(scope, histogram_mean)),
+        ("stddev", method(scope, histogram_stddev)),
+        ("exceeds", method(scope, histogram_exceeds)),
+        ("exceedsBigInt", method(scope, histogram_exceeds_bigint)),
+        ("percentile", method(scope, histogram_percentile)),
         (
             "percentileBigInt",
-            method(scope, 1, histogram_percentile_bigint),
+            method(scope, histogram_percentile_bigint),
         ),
-        ("percentiles", method(scope, 1, histogram_percentiles)),
+        ("percentiles", method(scope, histogram_percentiles)),
         (
             "percentilesBigInt",
-            method(scope, 1, histogram_percentiles_bigint),
+            method(scope, histogram_percentiles_bigint),
         ),
-        ("percentilesAt", method(scope, 2, histogram_percentiles_at)),
-        ("countAt", method(scope, 1, histogram_count_at)),
-        ("cdf", method(scope, 1, histogram_cdf)),
-        ("linearBuckets", method(scope, 2, histogram_linear_buckets)),
-        ("logBuckets", method(scope, 3, histogram_log_buckets)),
-        ("skewness", method(scope, 0, histogram_skewness)),
-        ("kurtosis", method(scope, 0, histogram_kurtosis)),
-        ("ewmaMean", method(scope, 0, histogram_ewma_mean)),
-        ("ewmaStddev", method(scope, 0, histogram_ewma_stddev)),
-        ("ewmaErrorRate", method(scope, 0, histogram_ewma_error_rate)),
-        ("record", method(scope, 1, histogram_record)),
-        ("recordDelta", method(scope, 0, histogram_record_delta)),
-        (
-            "recordCorrected",
-            method(scope, 2, histogram_record_corrected),
-        ),
-        ("add", method(scope, 1, histogram_add)),
-        ("subtract", method(scope, 1, histogram_subtract)),
-        ("reset", method(scope, 0, histogram_reset)),
-        ("resetCount", method(scope, 0, histogram_reset_count)),
-        ("snapshot", method(scope, 0, histogram_snapshot)),
-        ("diff", method(scope, 1, histogram_diff)),
-        ("export", method(scope, 0, histogram_export)),
+        ("percentilesAt", method(scope, histogram_percentiles_at)),
+        ("countAt", method(scope, histogram_count_at)),
+        ("cdf", method(scope, histogram_cdf)),
+        ("linearBuckets", method(scope, histogram_linear_buckets)),
+        ("logBuckets", method(scope, histogram_log_buckets)),
+        ("skewness", method(scope, histogram_skewness)),
+        ("kurtosis", method(scope, histogram_kurtosis)),
+        ("ewmaMean", method(scope, histogram_ewma_mean)),
+        ("ewmaStddev", method(scope, histogram_ewma_stddev)),
+        ("ewmaErrorRate", method(scope, histogram_ewma_error_rate)),
+        ("record", method(scope, histogram_record)),
+        ("recordDelta", method(scope, histogram_record_delta)),
+        ("recordCorrected", method(scope, histogram_record_corrected)),
+        ("add", method(scope, histogram_add)),
+        ("subtract", method(scope, histogram_subtract)),
+        ("reset", method(scope, histogram_reset)),
+        ("resetCount", method(scope, histogram_reset_count)),
+        ("snapshot", method(scope, histogram_snapshot)),
+        ("diff", method(scope, histogram_diff)),
+        ("export", method(scope, histogram_export)),
     ];
     for (name, function) in methods {
         let key = v8::String::new(scope, name).ok_or("cannot allocate a method name")?;
@@ -1324,7 +1320,8 @@ fn histogram_new(
 pub fn histogram_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(histogram_new).length(5).build(scope);
+    // Node: `NewFunctionTemplate` + `SetConstructorFunction`, i.e. length 0.
+    let template = rn_core::class(histogram_new).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -1342,7 +1339,7 @@ pub fn histogram_constructor<'s>(
     let import_key = v8::String::new(scope, "import").ok_or("cannot allocate `import`")?;
     template.set(
         import_key.into(),
-        method(scope, 1, histogram_import_static).into(),
+        method(scope, histogram_import_static).into(),
     );
 
     HISTOGRAM_TEMPLATE.with(|slot| *slot.borrow_mut() = Some(v8::Global::new(scope, template)));
@@ -1665,7 +1662,8 @@ fn sliding_new(
 pub fn sliding_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(sliding_new).length(6).build(scope);
+    // Node: `NewFunctionTemplate` + `SetConstructorFunction`, i.e. length 0.
+    let template = rn_core::class(sliding_new).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -1675,9 +1673,9 @@ pub fn sliding_constructor<'s>(
 
     let prototype = template.prototype_template(scope);
     let methods: [(&str, v8::Local<'s, v8::FunctionTemplate>); 3] = [
-        ("record", method(scope, 1, sliding_record)),
-        ("snapshot", method(scope, 0, sliding_snapshot)),
-        ("reset", method(scope, 0, sliding_reset)),
+        ("record", method(scope, sliding_record)),
+        ("snapshot", method(scope, sliding_snapshot)),
+        ("reset", method(scope, sliding_reset)),
     ];
     for (name, function) in methods {
         let key = v8::String::new(scope, name).ok_or("cannot allocate a method name")?;

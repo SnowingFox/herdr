@@ -55,22 +55,17 @@ use crate::wrap::{key, throw_coded, throw_error, throw_type_error};
 /// The code every pending method throws.
 pub const NOT_IMPLEMENTED: &str = "ERR_TLS_NOT_IMPLEMENTED";
 
-/// The `.length` of a prototype method, which is observable.
+/// The `.length` of a prototype method, always 0.
 ///
-/// Node's `SetProtoMethod` uses the callback's own arity, so the numbers here are
-/// the argument counts in `crypto_tls.cc`.
-pub fn length_of(name: &str) -> i32 {
-    match name {
-        "setServername" | "setSession" | "setOCSPResponse" => 1,
-        "setKeyCert"
-        | "setVerifyMode"
-        | "setALPNProtocols"
-        | "exportKeyingMaterial"
-        | "setMaxSendFragment"
-        | "setPskIdentityHint" => 2,
-        "loadSession" => 3,
-        _ => 0,
-    }
+/// `SetProtoMethod` builds its template through `NewFunctionTemplate`, which
+/// passes an explicit `0` for the length (`src/util.cc`, and `crypto_tls.cc`
+/// calls `SetProtoMethod` for every one of these). V8 honours whatever length it
+/// is handed, so passing the callback's real arity — 1 for `setServername`, 3
+/// for `loadSession` — reported a function Node does not have. The
+/// argument-count knowledge is still in the table below as documentation of the
+/// callback's shape, but it no longer reaches the published function.
+pub fn length_of(_name: &str) -> i32 {
+    0
 }
 
 /// Declares one prototype method that throws, naming the increment that lands it.
@@ -204,15 +199,14 @@ pub fn install_into<'s>(
     prototype: &v8::Template,
     name: &'static str,
 ) -> Result<(), String> {
-    let length = length_of(name);
-
     macro_rules! method {
         ($callback:path) => {{
             // A `FunctionTemplate` rather than a `Function`: `Template::Set` on a
             // prototype template accepts a primitive or a *Template*, and a
             // `Function` is neither. Node's `SetProtoMethod` installs the template
-            // directly for the same reason.
-            let template = rn_core::method($callback).length(length).build(scope);
+            // directly for the same reason, and reports the length 0 that
+            // `rn_core::method` carries.
+            let template = rn_core::method($callback).build(scope);
             prototype.set(key(scope, name)?.into(), template.into());
         }};
     }
@@ -1416,19 +1410,18 @@ pub fn install_async_wrap_into<'s>(
     prototype: &v8::Template,
     name: &'static str,
 ) -> Result<(), String> {
+    // `async_wrap.cc` installs these with `SetProtoMethod`, so all three report
+    // `length` 0 even though `asyncReset` takes an argument.
     macro_rules! method {
-        ($callback:path, $length:literal) => {{
-            let template = v8::FunctionTemplate::builder($callback)
-                .length($length)
-                .constructor_behavior(v8::ConstructorBehavior::Throw)
-                .build(scope);
+        ($callback:path) => {{
+            let template = rn_core::method($callback).build(scope);
             prototype.set(key(scope, name)?.into(), template.into());
         }};
     }
     match name {
-        "getAsyncId" => method!(get_async_id, 0),
-        "asyncReset" => method!(async_reset, 1),
-        "getProviderType" => method!(get_provider_type, 0),
+        "getAsyncId" => method!(get_async_id),
+        "asyncReset" => method!(async_reset),
+        "getProviderType" => method!(get_provider_type),
         other => return Err(format!("{other} is not an AsyncWrap method")),
     }
     Ok(())
@@ -1531,10 +1524,10 @@ mod tests {
     fn every_listed_method_is_known() {
         for name in crate::wrap::PROTO_METHODS {
             // The installer needs a scope, so the reachable check here is the
-            // arity table and the name set: a name in `PROTO_METHODS` that this
-            // module does not match would be rejected at namespace install, which
+            // name set: a name in `PROTO_METHODS` that this module does not
+            // match would be rejected at namespace install, which
             // `tests/prototype.rs` exercises against the real binary.
-            assert!((0..=3).contains(&length_of(name)));
+            assert_eq!(length_of(name), 0, "{name}");
         }
         assert_eq!(crate::wrap::PROTO_METHODS.len(), 42);
     }
@@ -1616,15 +1609,18 @@ mod tests {
         assert_eq!(deferred.len(), 13);
     }
 
-    /// `length_of` matches the argument counts `crypto_tls.cc` uses.
+    /// Every prototype method reports `length` 0, whatever its arity.
+    ///
+    /// `SetProtoMethod` builds through `NewFunctionTemplate`, so Node reports 0
+    /// for all of them. Asserting it by name pins the rule rather than leaving a
+    /// table that looks like it should have per-name values.
     #[test]
     fn the_arity_table_is_node_s() {
-        assert_eq!(length_of("setServername"), 1);
-        assert_eq!(length_of("setSession"), 1);
-        assert_eq!(length_of("setOCSPResponse"), 1);
-        assert_eq!(length_of("setVerifyMode"), 2);
-        assert_eq!(length_of("loadSession"), 3);
+        for name in crate::wrap::PROTO_METHODS {
+            assert_eq!(length_of(name), 0, "{name}");
+        }
+        assert_eq!(length_of("setServername"), 0);
+        assert_eq!(length_of("loadSession"), 0);
         assert_eq!(length_of("start"), 0);
-        assert_eq!(length_of("destroySSL"), 0);
     }
 }

@@ -148,8 +148,10 @@ impl v8::ValueDeserializerImpl for Hooks {
 /// Installs the `Deserializer` constructor and returns it.
 pub fn install<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8::Value>, String> {
     // `des->SetLength(1)`: the one difference from `Serializer`, and it is
-    // visible as `Deserializer.length`.
-    let template = rn_core::class(new).length(1).build(scope);
+    // visible as `Deserializer.length`. `src/node_serdes.cc` line 520 is the
+    // only `SetLength` on a published template in `src/**`, which is why this is
+    // `class_with_length` and every other constructor is `class`.
+    let template = rn_core::class_with_length(1, new).build(scope);
     let name = v8::String::new(scope, "Deserializer")
         .ok_or("cannot allocate the Deserializer class name")?;
     template.set_class_name(name);

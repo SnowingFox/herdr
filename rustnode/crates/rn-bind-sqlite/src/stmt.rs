@@ -999,7 +999,7 @@ fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Fu
     // `lib/**` reaches through `db.prepare()` and that `SetConstructorFunction`
     // publishes as constructible. Its *prototype methods* are `rn_core::method`,
     // because `SetProtoMethod` passes `ConstructorBehavior::kThrow`.
-    let template = rn_core::class(illegal_constructor).length(0).build(scope);
+    let template = rn_core::class(illegal_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELDS);
@@ -1030,49 +1030,36 @@ fn populate_prototype<'s>(
     template: v8::Local<'s, v8::FunctionTemplate>,
 ) {
     let prototype = template.prototype_template(scope);
-    let methods: [(&str, i32, v8::Local<'_, v8::FunctionTemplate>); 12] = [
-        (
-            "iterate",
-            0,
-            crate::database::method(scope, 0, proto_iterate),
-        ),
-        ("all", 0, crate::database::method(scope, 0, proto_all)),
-        ("get", 0, crate::database::method(scope, 0, proto_get)),
-        ("run", 0, crate::database::method(scope, 0, proto_run)),
-        (
-            "columns",
-            0,
-            crate::database::method(scope, 0, proto_columns),
-        ),
-        ("stat", 1, crate::database::method(scope, 1, proto_stat)),
+    let methods: [(&str, v8::Local<'_, v8::FunctionTemplate>); 12] = [
+        ("iterate", crate::database::method(scope, proto_iterate)),
+        ("all", crate::database::method(scope, proto_all)),
+        ("get", crate::database::method(scope, proto_get)),
+        ("run", crate::database::method(scope, proto_run)),
+        ("columns", crate::database::method(scope, proto_columns)),
+        ("stat", crate::database::method(scope, proto_stat)),
         (
             "resetStats",
-            0,
-            crate::database::method(scope, 0, proto_reset_stats),
+            crate::database::method(scope, proto_reset_stats),
         ),
         (
             "setAllowBareNamedParameters",
-            1,
-            crate::database::method(scope, 1, proto_set_allow_bare),
+            crate::database::method(scope, proto_set_allow_bare),
         ),
         (
             "setAllowUnknownNamedParameters",
-            1,
-            crate::database::method(scope, 1, proto_set_allow_unknown),
+            crate::database::method(scope, proto_set_allow_unknown),
         ),
         (
             "setReadBigInts",
-            1,
-            crate::database::method(scope, 1, proto_set_read_big_ints),
+            crate::database::method(scope, proto_set_read_big_ints),
         ),
         (
             "setReturnArrays",
-            1,
-            crate::database::method(scope, 1, proto_set_return_arrays),
+            crate::database::method(scope, proto_set_return_arrays),
         ),
-        ("close", 0, crate::database::method(scope, 0, proto_close)),
+        ("close", crate::database::method(scope, proto_close)),
     ];
-    for (name, _length, template) in methods {
+    for (name, template) in methods {
         let key = match v8::String::new(scope, name) {
             Some(key) => key,
             None => return,
@@ -1092,7 +1079,7 @@ fn populate_prototype<'s>(
         proto_expanded_sql,
     );
 
-    let dispose = crate::database::method(scope, 0, proto_dispose);
+    let dispose = crate::database::method(scope, proto_dispose);
     let dispose_key: v8::Local<'_, v8::Name> =
         match v8::Local::<v8::Symbol>::try_from(crate::database::well_known_dispose(scope)) {
             Ok(symbol) => symbol.into(),

@@ -178,13 +178,13 @@ fn template_and_prototype<'s>(
     // as a constructor, and the `IllegalConstructor` body is the guard that
     // rejects `new`. Its `next`/`return` are `rn_core::method`, since
     // `SetProtoMethod` gives no `[[Construct]]`.
-    let template = rn_core::class(illegal_constructor).length(0).build(scope);
+    let template = rn_core::class(illegal_constructor).build(scope);
     let instance = template.instance_template(scope);
     instance.set_internal_field_count(INTERNAL_FIELDS);
 
     for (name, method) in [
-        ("next", crate::database::method(scope, 0, next)),
-        ("return", crate::database::method(scope, 0, ret)),
+        ("next", crate::database::method(scope, next)),
+        ("return", crate::database::method(scope, ret)),
     ] {
         let key = v8::String::new(scope, name)?;
         template

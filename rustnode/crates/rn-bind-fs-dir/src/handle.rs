@@ -108,12 +108,12 @@ pub fn constructor<'s>(
         .set_internal_field_count(1);
 
     let prototype = template.prototype_template(scope);
+    // No arity: `SetProtoMethod` builds through `NewFunctionTemplate`, so
+    // `read(options, callback)` reports `length` 0 on Node like `close()` does.
     macro_rules! install_methods {
-        ($($method_name:literal => $method:expr => $length:expr),* $(,)?) => {
+        ($($method_name:literal => $method:expr),* $(,)?) => {
             $(
-                let method_template = rn_core::method($method)
-                    .length($length)
-                    .build(scope);
+                let method_template = rn_core::method($method).build(scope);
                 let key = v8::String::new(scope, $method_name)
                     .ok_or_else(|| format!("cannot allocate the name {}", $method_name))?;
                 prototype.set(key.into(), method_template.into());
@@ -121,8 +121,8 @@ pub fn constructor<'s>(
         };
     }
     install_methods! {
-        "read" => read => 2,
-        "close" => close => 0,
+        "read" => read,
+        "close" => close,
     }
 
     let constructor = template

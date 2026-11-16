@@ -107,7 +107,7 @@ pub fn constructor<'s>(
         .set_internal_field_count(1);
 
     let prototype = template.prototype_template(scope);
-    let start = rn_core::method(start).length(4).build(scope);
+    let start = rn_core::method(start).build(scope);
     let key = v8::String::new(scope, "start").ok_or("cannot allocate start")?;
     prototype.set(key.into(), start.into());
 
@@ -116,7 +116,6 @@ pub fn constructor<'s>(
         ($($method_name:literal => $method:expr),* $(,)?) => {
             $(
                 let method_template = rn_core::method($method)
-                    .length(0)
                     .build(scope);
                 let key = v8::String::new(scope, $method_name)
                     .ok_or_else(|| format!("cannot allocate the name {}", $method_name))?;
@@ -133,7 +132,7 @@ pub fn constructor<'s>(
 
     // `SetAccessorProperty("initialized", get_initialized_templ, ...,
     // ReadOnly | DontDelete | DontEnum)`.
-    let initialized = rn_core::method(get_initialized).length(0).build(scope);
+    let initialized = rn_core::method(get_initialized).build(scope);
     let key = v8::String::new(scope, "initialized").ok_or("cannot allocate initialized")?;
     prototype.set_accessor_property(
         key.into(),

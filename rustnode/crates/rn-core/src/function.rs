@@ -31,7 +31,7 @@
 //! the exact set of members and prototype methods that accept `new` against the
 //! pinned oracle in both directions.
 //!
-//! # Naming is the same decision, one field over
+//! # Name and length are one decision, two fields
 //!
 //! `SetMethod(context, target, "open", Open)` names the function after the
 //! property it publishes it under: the last line of that helper is
@@ -42,15 +42,35 @@
 //! `tools/function-name-audit.py` measures against the oracle for every member
 //! and prototype method in every namespace.
 //!
-//! The publish helpers below are the chokepoint for that. [`set_method`] and
-//! [`named_method`] are `SetMethod`, name included, so a call site that uses
-//! them cannot publish an unnamed function. The exceptions are explicit and
-//! named after the Node helper they mirror:
+//! The same helper call also decides `f.length`, and it decides it **zero**.
+//! Every `SetMethod` variant builds its template through `NewFunctionTemplate`,
+//! which passes an explicit `0` for the length (`src/util.cc`), and
+//! `SetConstructorFunction` takes the template as given — also `0` for the
+//! `NewFunctionTemplate` every class in `src/**` is built from. V8's
+//! `FunctionTemplate::New` honours whatever length it is handed, so a binding
+//! that passes the callback's real arity reports a longer function than Node's.
+//! `f.length` is observable to `lib/**` and to anything inspecting a binding, so
+//! this is a real divergence and not a cosmetic one.
+//!
+//! The publish helpers below are the chokepoint for both fields. [`set_method`]
+//! and [`named_method`] are `SetMethod` complete — name *and* length 0 — so a
+//! call site that uses them cannot publish a function that differs from Node's
+//! on either. The exceptions are explicit and named after what Node does:
 //!
 //! * [`set_fast_method`] is `SetFastMethod`/`SetFastMethodNoSideEffect`, whose
 //!   slow-path function Node leaves **unnamed** — `SetFastMethod` is the one
 //!   `SetMethod` variant that omits `SetName`, so `binding.copy.name` is `""`
-//!   on Node too. Naming those would be its own divergence.
+//!   on Node too. Naming those would be its own divergence. Its length is still
+//!   0, like every other `SetMethod` member.
+//! * [`set_extras_method`] / [`named_extras_method`] are V8's own
+//!   `SimpleInstallFunction(isolate, base, name, builtin, len, kAdapt)`, the
+//!   only publisher in this tree that records a **non-zero** length. It is what
+//!   installs the extras binding `async_context_frame` and `trace_events`
+//!   republish from (`deps/v8/src/init/bootstrapper.cc`), so those three members
+//!   genuinely report 1, 1 and 5.
+//! * [`class_with_length`] is `FunctionTemplate::SetLength(n)` before
+//!   `SetConstructorFunction`, which `src/node_serdes.cc` does once, for
+//!   `Deserializer`. No other constructor in `src/**` sets a length.
 //! * Templates placed in an `ObjectTemplate` (a `PrototypeTemplate`, or an
 //!   `InstanceTemplate`) are named by V8 from the property key, so
 //!   [`method`]/[`class`] are correct there without a name. Extracted with
@@ -59,12 +79,21 @@
 
 use rn_v8_sys::v8;
 
-/// Builder for a **method**, matching Node's `SetMethod`: not constructible.
+/// Builder for a **method**, matching Node's `SetMethod`: not constructible, and
+/// `length` **0**.
 ///
 /// `new fn()` on the result throws `TypeError: … is not a constructor`, which is
 /// what Node does for every member published through `SetMethod`,
 /// `SetMethodNoSideEffect`, `SetFastMethod`, `SetProtoMethod` or
 /// `SetInstanceMethod`.
+///
+/// The length is 0 because every one of those helpers builds its template
+/// through `NewFunctionTemplate(isolate, callback, …, /*length=*/0, …)`. Node
+/// never passes a binding callback's real arity, so neither does this: a call
+/// site that reaches for `.length(n)` on the result reports a function Node does
+/// not have. The only non-zero lengths in the binding surface come from V8's own
+/// `SimpleInstallFunction` ([`extras_method`]) and from `src/node_serdes.cc`'s
+/// single `SetLength` ([`class_with_length`]).
 ///
 /// The builder carries no name. That is only correct when the template is placed
 /// in an `ObjectTemplate` under a key, where V8 names the function from the key.
@@ -73,36 +102,61 @@ use rn_v8_sys::v8;
 pub fn method<'s>(
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::FunctionBuilder<'s, v8::FunctionTemplate> {
-    v8::FunctionTemplate::builder(callback).constructor_behavior(v8::ConstructorBehavior::Throw)
+    v8::FunctionTemplate::builder(callback)
+        .constructor_behavior(v8::ConstructorBehavior::Throw)
+        .length(0)
 }
 
-/// Builder for a **class**, matching Node's `SetConstructorFunction`.
+/// Builder for a **class**, matching Node's `SetConstructorFunction`: length **0**.
 ///
 /// Only for a member Node itself publishes as a constructor — a `BaseObject`
 /// subclass whose JavaScript side writes `new`. Everything else, including every
 /// method on such a class's prototype, is [`method`].
+///
+/// The length is 0 for the same reason as [`method`]: every constructor in
+/// `src/**` is a `NewFunctionTemplate`, and `SetConstructorFunction` takes that
+/// template as it is. The one exception is named [`class_with_length`].
 pub fn class<'s>(
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::FunctionBuilder<'s, v8::FunctionTemplate> {
-    v8::FunctionTemplate::builder(callback)
+    v8::FunctionTemplate::builder(callback).length(0)
+}
+
+/// [`class`] with a length Node sets explicitly, for `FunctionTemplate::SetLength`.
+///
+/// `src/node_serdes.cc` is the only place in `src/**` that calls `SetLength` on
+/// a template it publishes (`des->SetLength(1)`), which is why
+/// `binding.Deserializer.length` is 1 while every other constructor Node
+/// installs is 0. Reach for this only for a member Node does that to; otherwise
+/// the length is 0 and [`class`] is right.
+pub fn class_with_length<'s>(
+    length: i32,
+    callback: impl v8::MapFnTo<v8::FunctionCallback>,
+) -> v8::FunctionBuilder<'s, v8::FunctionTemplate> {
+    v8::FunctionTemplate::builder(callback).length(length)
 }
 
 /// [`method`] for the `v8::Function` builder, for call sites that want a
 /// function object without an intermediate `FunctionTemplate`.
 ///
-/// Same constructor behaviour, and the same reason: `FunctionBuilder` defaults
-/// to `ConstructorBehavior::Allow`, Node's `SetMethod` passes `kThrow`.
+/// Same constructor behaviour and length, and the same reason: `FunctionBuilder`
+/// defaults to `ConstructorBehavior::Allow` and length 0 only by accident, while
+/// Node's `SetMethod` passes `kThrow` and an explicit 0 on purpose.
 pub fn method_function<'s>(
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::FunctionBuilder<'s, v8::Function> {
-    v8::Function::builder(callback).constructor_behavior(v8::ConstructorBehavior::Throw)
+    v8::Function::builder(callback)
+        .constructor_behavior(v8::ConstructorBehavior::Throw)
+        .length(0)
 }
 
 /// [`method_function`] with a callback the caller already has as a raw pointer.
 pub fn method_function_raw<'s>(
     callback: v8::FunctionCallback,
 ) -> v8::FunctionBuilder<'s, v8::Function> {
-    v8::Function::builder_raw(callback).constructor_behavior(v8::ConstructorBehavior::Throw)
+    v8::Function::builder_raw(callback)
+        .constructor_behavior(v8::ConstructorBehavior::Throw)
+        .length(0)
 }
 
 /// Builds a method and names it `name`, without publishing it anywhere.
@@ -113,6 +167,8 @@ pub fn method_function_raw<'s>(
 /// function itself — to store it in a thread-local for later instantiation, to
 /// publish it on a prototype *object* rather than a prototype *template*, or to
 /// hand it to a `set` that takes a `Value`.
+///
+/// The length is [`method`]'s, i.e. 0.
 pub fn named_method<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
@@ -121,14 +177,20 @@ pub fn named_method<'s>(
     named_method_with_length(scope, name, 0, callback)
 }
 
-/// [`named_method`] with Node's `length`, which most bindings pass explicitly.
+/// [`named_method`] with an explicit `length`.
+///
+/// Only two callers may pass a non-zero length, and both mirror a Node publisher
+/// that really records one — see [`extras_method`] and [`class_with_length`].
+/// Every other member Node publishes is 0 through `NewFunctionTemplate`, so a
+/// non-zero length here is a divergence to justify at the call site.
 pub fn named_method_with_length<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
     length: i32,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
-    let function = method(callback)
+    let function = v8::FunctionTemplate::builder(callback)
+        .constructor_behavior(v8::ConstructorBehavior::Throw)
         .length(length)
         .build(scope)
         .get_function(scope)
@@ -137,6 +199,29 @@ pub fn named_method_with_length<'s>(
         v8::String::new(scope, name).ok_or_else(|| format!("cannot allocate the name {name}"))?;
     function.set_name(key);
     Ok(function)
+}
+
+/// A function shaped like V8's own `SimpleInstallFunction`, which records a length.
+///
+/// `async_context_frame` and `trace_events` do not build their members with
+/// `SetMethod` at all: both copy them off `context->GetExtrasBindingObject()`,
+/// and V8 installed those with
+/// `SimpleInstallFunction(isolate, base, name, builtin, len, kAdapt)`. That
+/// helper passes `len` to the function's `shared_function_info`, so the published
+/// function really does report it — `trace.length` is 5 and
+/// `isTraceCategoryEnabled.length` is 1, while `getContinuationPreservedEmbedderData`
+/// is 0 and `setContinuationPreservedEmbedderData` is 1.
+///
+/// This is the one place in the binding surface where a non-zero length is
+/// correct, so it says so in its name instead of leaving a `.length(n)` to look
+/// like an arity someone typed.
+pub fn extras_method<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    length: i32,
+    callback: impl v8::MapFnTo<v8::FunctionCallback>,
+) -> Result<v8::Local<'s, v8::Function>, String> {
+    named_method_with_length(scope, name, length, callback)
 }
 
 /// Names a template that the caller already shaped, and returns its function.
@@ -174,6 +259,9 @@ pub fn set_method<'s>(
 }
 
 /// [`set_method`] with an explicit `length`, still named after the property.
+///
+/// Non-zero is reserved for a member Node copies out of the V8 extras binding,
+/// where `SimpleInstallFunction` recorded the length. See [`extras_method`].
 pub fn set_named_method_with_length<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,

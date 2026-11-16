@@ -437,7 +437,8 @@ fn family_argument(
 fn socket_address_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(socket_address_new).length(4).build(scope);
+    // Node: `NewFunctionTemplate` + `SetConstructorFunction`, i.e. length 0.
+    let template = rn_core::class(socket_address_new).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -450,12 +451,9 @@ fn socket_address_constructor<'s>(
 
     let prototype = template.prototype_template(scope);
     let methods: [(&str, v8::Local<v8::FunctionTemplate>); 3] = [
-        ("detail", method(scope, 1, socket_address_detail)),
-        (
-            "legacyDetail",
-            method(scope, 0, socket_address_legacy_detail),
-        ),
-        ("flowlabel", method(scope, 0, socket_address_flow_label)),
+        ("detail", method(scope, socket_address_detail)),
+        ("legacyDetail", method(scope, socket_address_legacy_detail)),
+        ("flowlabel", method(scope, socket_address_flow_label)),
     ];
     for (name, template) in methods {
         prototype.set(key(scope, name)?.into(), template.into());
@@ -474,15 +472,19 @@ fn socket_address_constructor<'s>(
 
 /// Builds one non-constructible method, matching `SetProtoMethod`.
 ///
+/// No arity parameter: `SetProtoMethod` builds through `NewFunctionTemplate`,
+/// so every prototype method Node publishes reports `length` 0 whatever it is
+/// called with. `detail` takes an argument and `flowlabel` takes none, and both
+/// read 0 on Node.
+///
 /// The callback is a generic parameter rather than a stored function pointer
 /// because `MapFnTo` needs the concrete zero-sized function item to select its
 /// impl; a `fn` pointer would satisfy no impl at all.
 fn method<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    length: i32,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::Local<'s, v8::FunctionTemplate> {
-    rn_core::method(callback).length(length).build(scope)
+    rn_core::method(callback).build(scope)
 }
 
 /// `new SocketAddress(address, port, family, flowlabel)`.
@@ -609,7 +611,7 @@ fn socket_address_flow_label(
 fn block_list_constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(block_list_new).length(0).build(scope);
+    let template = rn_core::class(block_list_new).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(1);
@@ -622,18 +624,18 @@ fn block_list_constructor<'s>(
 
     let prototype = template.prototype_template(scope);
     let methods: [(&str, v8::Local<v8::FunctionTemplate>); 12] = [
-        ("addAddress", method(scope, 1, add_address)),
-        ("addAddresses", method(scope, 1, add_addresses)),
-        ("addRange", method(scope, 2, add_range)),
-        ("addSubnet", method(scope, 2, add_subnet)),
-        ("removeAddress", method(scope, 1, remove_address)),
-        ("removeRange", method(scope, 2, remove_range)),
-        ("removeSubnet", method(scope, 2, remove_subnet)),
-        ("check", method(scope, 1, check)),
-        ("checkString", method(scope, 2, check_string)),
-        ("getRules", method(scope, 0, get_rules)),
-        ("clear", method(scope, 0, clear)),
-        ("getSize", method(scope, 0, get_size)),
+        ("addAddress", method(scope, add_address)),
+        ("addAddresses", method(scope, add_addresses)),
+        ("addRange", method(scope, add_range)),
+        ("addSubnet", method(scope, add_subnet)),
+        ("removeAddress", method(scope, remove_address)),
+        ("removeRange", method(scope, remove_range)),
+        ("removeSubnet", method(scope, remove_subnet)),
+        ("check", method(scope, check)),
+        ("checkString", method(scope, check_string)),
+        ("getRules", method(scope, get_rules)),
+        ("clear", method(scope, clear)),
+        ("getSize", method(scope, get_size)),
     ];
     for (name, template) in methods {
         prototype.set(key(scope, name)?.into(), template.into());

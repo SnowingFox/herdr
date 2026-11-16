@@ -157,9 +157,14 @@ impl BindingModule for TraceEvents {
             ),
             (
                 "isTraceCategoryEnabled",
-                function(scope, "isTraceCategoryEnabled", is_trace_category_enabled)?,
+                extras_function(
+                    scope,
+                    "isTraceCategoryEnabled",
+                    1,
+                    is_trace_category_enabled,
+                )?,
             ),
-            ("trace", function(scope, "trace", trace)?),
+            ("trace", extras_function(scope, "trace", 5, trace)?),
             (
                 "setTraceCategoryStateUpdateHandler",
                 function(
@@ -565,6 +570,27 @@ fn function<'s>(
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     Ok(rn_core::named_method(scope, name, callback)?.into())
+}
+
+/// The two members Node copies off V8's extras binding rather than building
+/// with `SetMethod`, so their lengths are V8's and not zero.
+///
+/// `NodeCategorySet::Initialize` (`src/node_trace_events.cc`) does
+/// `target->Set(context, isTraceCategoryEnabled, binding->Get(...))` where
+/// `binding` is `context->GetExtrasBindingObject()`. V8 installed those with
+/// `SimpleInstallFunction(isolate, extras_binding, name, builtin, len, kAdapt)`,
+/// and that helper records `len` on the function — 1 for
+/// `isTraceCategoryEnabled`, 5 for `trace`
+/// (`deps/v8/src/init/bootstrapper.cc`). Going through
+/// `named_method` here would report 0 for both, which is the divergence this
+/// fixes in the other direction.
+fn extras_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    name: &str,
+    length: i32,
+    callback: impl v8::MapFnTo<v8::FunctionCallback>,
+) -> Result<v8::Local<'s, v8::Value>, String> {
+    Ok(rn_core::extras_method(scope, name, length, callback)?.into())
 }
 
 fn set(

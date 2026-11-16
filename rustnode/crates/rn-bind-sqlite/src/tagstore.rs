@@ -261,7 +261,7 @@ fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Fu
     // `GetConstructorTemplate` publishes, and `new` reaches it through the
     // `IllegalConstructor` guard. Its prototype methods below are
     // `rn_core::method`, matching `SetProtoMethod`.
-    let template = rn_core::class(illegal_constructor).length(0).build(scope);
+    let template = rn_core::class(illegal_constructor).build(scope);
     template
         .instance_template(scope)
         .set_internal_field_count(INTERNAL_FIELDS);
@@ -271,11 +271,11 @@ fn template<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Fu
     // why `Object.keys(store)` is `['capacity', 'db', 'size']`.
     let prototype = template.prototype_template(scope);
     for (name, method) in [
-        ("get", crate::database::method(scope, 1, get)),
-        ("all", crate::database::method(scope, 1, all)),
-        ("iterate", crate::database::method(scope, 1, iterate)),
-        ("run", crate::database::method(scope, 1, run)),
-        ("clear", crate::database::method(scope, 0, clear)),
+        ("get", crate::database::method(scope, get)),
+        ("all", crate::database::method(scope, all)),
+        ("iterate", crate::database::method(scope, iterate)),
+        ("run", crate::database::method(scope, run)),
+        ("clear", crate::database::method(scope, clear)),
     ] {
         let key = v8::String::new(scope, name)?;
         prototype.set(key.into(), method.into());

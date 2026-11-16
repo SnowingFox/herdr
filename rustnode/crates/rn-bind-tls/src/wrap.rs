@@ -159,8 +159,8 @@ pub fn install<'s>(
     let object = v8::Object::new(scope);
 
     // `SetMethod` in `crypto_tls.cc`: published under its property name, with
-    // that name on the function.
-    rn_core::set_named_method_with_length(scope, object, "wrap", 4, wrap)?;
+    // that name on the function and `NewFunctionTemplate`'s length 0.
+    rn_core::set_method(scope, object, "wrap", wrap)?;
     rn_core::set_named_method_with_length(
         scope,
         object,
@@ -480,9 +480,7 @@ fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
 
     // `writeQueueSize`, an accessor with `ReadOnly | DontDelete`. Node installs it
     // before the prototype methods, which is why it comes first here.
-    let queue_size = rn_core::method(crate::methods::get_write_queue_size)
-        .length(0)
-        .build(scope);
+    let queue_size = rn_core::method(crate::methods::get_write_queue_size).build(scope);
     prototype.set_accessor_property(
         key(scope, "writeQueueSize")?.into(),
         Some(queue_size),
@@ -523,12 +521,8 @@ fn constructor<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8:
     // `onread`, the accessor `AddMethods` installs last. `lib/net.js` assigns it
     // (`Socket.prototype._handle.onread = onStreamRead`) and the read path calls
     // it, so it has to be a real property that round-trips.
-    let onread_getter = rn_core::method(crate::stream::get_onread)
-        .length(0)
-        .build(scope);
-    let onread_setter = rn_core::method(crate::stream::set_onread)
-        .length(1)
-        .build(scope);
+    let onread_getter = rn_core::method(crate::stream::get_onread).build(scope);
+    let onread_setter = rn_core::method(crate::stream::set_onread).build(scope);
     prototype.set_accessor_property(
         key(scope, "onread")?.into(),
         Some(onread_getter),

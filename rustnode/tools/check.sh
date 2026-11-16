@@ -236,24 +236,41 @@ step "binding members accept new exactly when node's do"
 # A bare statement, so its status is the gate's.
 python3 tools/constructible-audit.py --recorded tools/constructible-members.json
 
-step "binding functions are named as node names them"
+step "binding functions are named as node names them, with node's length"
 # `SetMethod(context, target, "open", Open)` ends with
 # `function->SetName(name_string)`, so a Node binding member reports its property
 # name as `f.name`. V8's `FunctionTemplate::builder` leaves it `""`, and every
 # crate used that builder, so 403 of 527 members were nameless here — visible in
 # stack traces and `util.inspect`, and reported twice before this guard existed.
 #
-# The audit judges both directions, which is why it stores Node's actual name
-# rather than a "should be named" flag: `SetFastMethod*` is the one `SetMethod`
-# variant that omits `SetName` (so `buffer.copy.name` is `""` on Node too), and
+# The same helper call also decides `f.length`, and it decides it **zero**: every
+# `SetMethod` variant builds through `NewFunctionTemplate`, which passes an
+# explicit 0, and V8 honours whatever length it is handed. So a binding that
+# passed its callback's real arity reported a longer function than Node's — 14
+# namespace members and 97 prototype methods. The exceptions are real and named:
+# V8's own `SimpleInstallFunction` records a length (`trace_events.trace` is 5),
+# and `src/node_serdes.cc` calls `SetLength(1)` once. Both invariants come from
+# one fixture and one walk, because they are two fields of the same publication.
+#
+# The audit judges both directions, which is why it stores Node's actual name and
+# length rather than a "should be named" flag or "should be zero": `SetFastMethod*`
+# omits `SetName` (so `buffer.copy.name` is `""` on Node too),
 # `util.getSharedArrayBufferGrowable` is `"get growable"` because it republishes
-# V8's own accessor. Naming either of those would be a fresh divergence.
+# V8's own accessor, and `serdes.Deserializer` really is length 1.
 #
 # `--recorded` needs no Node binary: `tools/function-name-members.json` and
-# `tools/function-name-prototypes.json` are the pinned oracle's answers. Both
-# halves are counted separately, because an emptied member fixture leaves 435
-# prototype methods that would otherwise report a clean result about a
-# comparison it had not made.
+# `tools/function-name-prototypes.json` are the pinned oracle's answers. Every
+# half is counted separately — members, prototype methods, member lengths,
+# prototype method lengths — because an emptied member fixture leaves 435
+# prototype methods that would otherwise report a clean result about a comparison
+# it had not made.
+#
+# The summary also prints the skip accounting: recorded, compared, skipped
+# because a crate declared the member deferred, and skipped for no declared
+# reason. That last bucket is an error rather than a skip, because a member that
+# silently fell out of the install path is exactly what this audit is best placed
+# to notice, and printing only the compared count would have hidden it inside a
+# number nobody checks.
 #
 # The control runs first because the audit's own exit status is what the gate
 # enforces.
