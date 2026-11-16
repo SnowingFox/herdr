@@ -534,11 +534,23 @@ fn evaluate(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Option<String> {
 }
 
 #[test]
-fn installed_members_are_the_two_classes_and_get_cipher_info() {
+fn installed_members_are_the_classes_and_the_rsa_cipher_family() {
     // `getCiphers` and `getSSLCiphers` are `rn-bind-crypto`'s, not this crate's:
-    // registering them twice would replace a working function. `getCipherInfo`
-    // *is* this crate's because it lives in `crypto_cipher.cc`, but the parent
-    // crate's `DEFERRED` list still names it, so the coordinator moves that one
-    // entry at merge time.
-    assert_eq!(MEMBERS, &["CipherBase", "AESCipherJob", "getCipherInfo"]);
+    // registering them twice would replace a working function. The four RSA
+    // members *are* this crate's — `CipherBase::Initialize` in
+    // `src/crypto/crypto_cipher.cc` installs them as four instantiations of one
+    // `PublicKeyCipher::Cipher<operation, cipher>` template, immediately after
+    // `CipherBase` itself.
+    assert_eq!(
+        MEMBERS,
+        &[
+            "CipherBase",
+            "AESCipherJob",
+            "getCipherInfo",
+            "publicEncrypt",
+            "privateDecrypt",
+            "privateEncrypt",
+            "publicDecrypt",
+        ]
+    );
 }

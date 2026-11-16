@@ -14,6 +14,16 @@ rn-v8-sys.workspace = true
 # artifact in the dependency graph, so this is a new edge onto one library, not a
 # second linkage: cargo resolves `openssl-sys` once and every crate calls the
 # symbols of that one build.
+# The shared `EVP_PKEY` decode, error shape and digest lookup. `crypto_cipher.cc`
+# calls `KeyObjectData::GetPublicOrPrivateKeyFromJs` and `Digest::FromName`, which
+# live in the key and util translation units; using the same helpers here is what
+# keeps a key accepted by `publicEncrypt` accepted by `createSign`.
+rn-crypto-openssl = { path = "../rn-crypto-openssl" }
+# `read_key_from_js` is the one key decoder, and it belongs to the crate that
+# owns `crypto_keys.cc`. A second decoder would accept a different set of formats.
+rn-bind-crypto-keys = { path = "../rn-bind-crypto-keys" }
+# `PkeyCtx::as_ptr` for the one control the safe crate does not wrap.
+foreign-types = "0.3"
 openssl = { version = "=0.10.82", features = ["vendored"] }
 openssl-sys = { version = "=0.9.118", features = ["vendored"] }
 libc = { workspace = true }

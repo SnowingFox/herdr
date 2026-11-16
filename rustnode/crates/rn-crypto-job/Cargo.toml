@@ -1,0 +1,18 @@
+[package]
+name = "rn-crypto-job"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Node's CryptoJob machinery: the three modes, threadpool dispatch and completion shapes"
+
+[dependencies]
+rn-core.workspace = true
+# The completion re-enters V8 from inside `uv_run`, which has no scope of its
+# own. `rn_uv::callback` is the one primitive in this workspace that does that,
+# and it is what the fs, socket and key-generation jobs already use.
+rn-uv.workspace = true
+rn-errors.workspace = true
+rn-v8-sys.workspace = true
+libuv-sys2.workspace = true
