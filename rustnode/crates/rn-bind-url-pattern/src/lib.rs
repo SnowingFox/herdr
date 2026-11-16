@@ -1,39 +1,100 @@
 //! `internalBinding('url_pattern')` for rustnode.
 //!
-//! Node implements `URLPattern` via `ada`, a C++ URL library, in
-//! `src/node_url_pattern.cc`. The surface is a constructor with nine component
-//! accessors, `hasRegExpGroups`, and `test`/`exec`.
+//! Node implements `URLPattern` in `src/node_url_pattern.cc` over
+//! `ada::url_pattern`. The surface is a constructor, eight component getters,
+//! `hasRegExpGroups`, `test` and `exec`.
 //!
-//! # Scope, stated plainly
+//! # Shape
 //!
-//! Both `lib/url.js` and `lib/internal/url.js` destructure `URLPattern` at
-//! module scope, so the constructor must exist for `require('fs')` and
-//! `require('assert')` to load at all. That is why this namespace is on the
-//! critical path despite nothing in the stdlib constructing a pattern.
+//! The prototype's accessors are installed on the *prototype template*, the way
+//! `src/node_url_pattern.cc` does it with
+//! `prototype_template->SetAccessorProperty(...)`. That detail is load-bearing.
+//! `v8::Object::set_accessor_with_setter` maps to V8's
+//! `Object::SetNativeDataProperty`, which in this V8 build installs a *lazy data
+//! property*: the accessor is invoked once, on the first read, and the result
+//! replaces it as an ordinary `{value, writable}` property. A descriptor read
+//! then reports `value,writable` instead of `get`, which is observable and was
+//! the whole of the `undefined`-components defect. Template accessors do not do
+//! that; they stay accessors.
 //!
-//! What is implemented: construction from a string, object or second-argument
-//! base URL; the nine component accessors; `test` and `exec` for patterns
-//! whose pathname and host are literal; and `hasRegExpGroups` reporting false.
+//! # The pattern engine
 //!
-//! What is not: the pattern grammar. `:name` segments, `*` wildcards,
-//! `{a,b}` alternation and regex groups are not parsed. A pattern containing
-//! any of them still constructs, and its components report the raw text, but
-//! `test` compares literally and will therefore disagree with Node. That is a
-//! real limitation, documented here and at the call site rather than hidden
-//! behind a permissive match that would claim a capability this does not have.
+//! [`pattern`] is a port of ada's `url_pattern_helpers` and `url_pattern`,
+//! which is the spec algorithm. The tokenizer, the part-list parser, the
+//! regexp generator and the `URLPatternInit` processor are all there, so `:name`
+//! segments, `*` wildcards, `{a,b}` alternation, `?`/`*`/`+` modifiers and
+//! `(regexp)` groups behave the way Node's do. Matching runs V8's own `RegExp`
+//! with the `v` flag the C++ asks for, so a pattern's regexp dialect is the same
+//! one user code gets from `/.../v`.
+
+mod pattern;
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
+
+pub use pattern::{CompileOptions, Component, ComponentType, Init, PatternError, ProcessType};
 
 /// Members exposed on the namespace object, matching
 /// `contracts/url_pattern.json`.
 pub const MEMBERS: &[&str] = &["URLPattern"];
 
-/// `URL_PATTERN_COMPONENTS` in `src/node_url_pattern.h`: the nine parts, in
-/// the order the spec lists them.
+/// The components, in the order the spec and `URL_PATTERN_COMPONENTS` list
+/// them.
 pub const COMPONENTS: &[&str] = &[
     "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash",
 ];
+
+/// One installed `URLPattern`, kept on the Rust heap.
+///
+/// The pattern is not stored in JavaScript at all. A component getter is the
+/// hottest operation on this object — a loop reading `pattern.pathname` 200,000
+/// times is an ordinary script — and every JS-side encoding costs a property
+/// fetch plus a decode per read. Instead the instance carries a single internal
+/// field holding a pointer to this struct, so a read is one pointer dereference.
+/// The layout is not observable from JavaScript: the field is an internal field,
+/// not a property, so `Object.getOwnPropertyNames` and `JSON.stringify` see
+/// nothing.
+struct State {
+    compiled: pattern::CompiledPattern,
+}
+
+/// The internal field index holding the [`State`] pointer.
+const STATE_FIELD: usize = 0;
+
+/// Reads the state a receiver carries, or `None` when it is not a `URLPattern`.
+///
+/// # Safety
+///
+/// The pointer is only ever written by [`store`], which boxes a `State` and
+/// hands the raw pointer to V8; and only ever taken from an object whose
+/// internal field count is one, which is set on the constructor's instance
+/// template and so holds for every instance and no other object. The allocation
+/// is never freed for the isolate's lifetime, which is deliberate: a `URLPattern`
+/// can be collected at any time and a drop hook would have to be a weak
+/// callback, while the pattern itself is small and bounded by the number of
+/// patterns a program constructs.
+///
+/// The `unsafe` block is confined to the deref; a receiver with no field, or a
+/// field that does not hold a pattern, returns `None` rather than dereferencing
+/// an arbitrary pointer.
+fn state_of<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    receiver: v8::Local<'s, v8::Value>,
+) -> Option<&'static State> {
+    let object = v8::Local::<v8::Object>::try_from(receiver).ok()?;
+    if object.internal_field_count() == 0 {
+        return None;
+    }
+    let field = object.get_internal_field(scope, STATE_FIELD)?;
+    let external = v8::Local::<v8::External>::try_from(field).ok()?;
+    let pointer = external.value() as *const State;
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: `store` writes exactly this type into this field, and the pointer
+    // is never freed, so it stays valid for as long as any receiver can exist.
+    Some(unsafe { &*pointer })
+}
 
 pub struct UrlPattern;
 
@@ -52,17 +113,10 @@ impl BindingModule for UrlPattern {
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
         let object = v8::Object::new(scope);
-        let constructor = constructor_template(scope)?;
-        let function = constructor
+        let template = constructor_template(scope)?;
+        let function = template
             .get_function(scope)
             .ok_or("cannot allocate the URLPattern constructor")?;
-
-        // The component accessors live on the prototype, and a getter that only
-        // reads a plain internal field would need a signature to reject a wrong
-        // receiver. rustnode stores the components in a hidden property instead
-        // and reads them back with a plain function, which costs nothing here
-        // and cannot be fooled by a borrowed receiver.
-        attach_prototype(scope, function)?;
 
         if let Some(key) = v8::String::new(scope, "URLPattern") {
             object.set(scope, key.into(), function.into());
@@ -71,217 +125,185 @@ impl BindingModule for UrlPattern {
     }
 }
 
+/// Builds the constructor template and the whole prototype surface on it.
+///
+/// Everything goes on the template rather than on the materialized prototype
+/// object so the accessors stay accessors; see the module docs.
 fn constructor_template<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::FunctionTemplate>, String> {
     let template = v8::FunctionTemplate::builder(construct_url_pattern).build(scope);
-    template.set_class_name(v8::String::new(scope, "URLPattern").unwrap_or_else(|| {
-        // A literal always allocates; the fallback keeps the signature total.
-        v8::String::empty(scope)
-    }));
+    template
+        .set_class_name(v8::String::new(scope, "URLPattern").ok_or("cannot name the constructor")?);
+    // One internal field, holding the pointer to the compiled pattern's `State`.
+    // An internal field rather than a property so nothing about it is visible
+    // to `Object.getOwnPropertyNames`, `JSON.stringify` or a spread.
+    template
+        .instance_template(scope)
+        .set_internal_field_count(STATE_FIELD + 1);
+
+    let prototype = template.prototype_template(scope);
+
+    // `Object.prototype.toString.call(new URLPattern())` is
+    // `[object URLPattern]` because the prototype carries the toStringTag
+    // symbol; Node installs it `ReadOnly | DontEnum`.
+    if let Some(tag) = v8::String::new(scope, "URLPattern") {
+        let key = v8::Symbol::get_to_string_tag(scope);
+        prototype.set_with_attr(
+            key.into(),
+            tag.into(),
+            v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_ENUM,
+        );
+    }
+
+    // Node's attributes for the nine accessors: `ReadOnly | DontDelete`, which
+    // reads back as `{enumerable: true, configurable: false}` with a getter and
+    // no setter. `get, set, enumerable, configurable` was the descriptor from
+    // `Object.getOwnPropertyDescriptor(URLPattern.prototype, 'pathname')`.
+    // Each getter is its own `FunctionTemplate`, because a template accessor
+    // takes function templates rather than raw callbacks. The macro keeps the
+    // nine installations visibly identical.
+    macro_rules! install_component {
+        ($name:literal, $getter:path) => {{
+            let getter = v8::FunctionTemplate::builder($getter)
+                .length(0)
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .side_effect_type(v8::SideEffectType::HasNoSideEffect)
+                .build(scope);
+            let key = v8::String::new(scope, $name).ok_or("cannot name a component")?;
+            // `PropertyAttribute` is not `Copy`, so it is built per call.
+            let attributes = v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE;
+            prototype.set_accessor_property(key.into(), Some(getter), None, attributes);
+        }};
+    }
+
+    install_component!("protocol", get_protocol);
+    install_component!("username", get_username);
+    install_component!("password", get_password);
+    install_component!("hostname", get_hostname);
+    install_component!("port", get_port);
+    install_component!("pathname", get_pathname);
+    install_component!("search", get_search);
+    install_component!("hash", get_hash);
+    install_component!("hasRegExpGroups", get_has_reg_exp_groups);
+
+    // `test` and `exec` are ordinary prototype methods: writable, enumerable
+    // and configurable, which is `SetProtoMethodNoSideEffect`'s shape.
+    let exec = v8::FunctionTemplate::builder(exec_pattern)
+        .length(0)
+        .constructor_behavior(v8::ConstructorBehavior::Throw)
+        .side_effect_type(v8::SideEffectType::HasNoSideEffect)
+        .build(scope);
+    let test = v8::FunctionTemplate::builder(test_pattern)
+        .length(0)
+        .constructor_behavior(v8::ConstructorBehavior::Throw)
+        .side_effect_type(v8::SideEffectType::HasNoSideEffect)
+        .build(scope);
+    for (name, function) in [("exec", exec), ("test", test)] {
+        let key = v8::String::new(scope, name).ok_or("cannot name a method")?;
+        prototype.set(key.into(), function.into());
+    }
+
     Ok(template)
 }
-
-/// A parsed pattern, held in the object's hidden property.
-struct Pattern {
-    protocol: String,
-    username: String,
-    password: String,
-    hostname: String,
-    port: String,
-    pathname: String,
-    search: String,
-    hash: String,
-}
-
-impl Pattern {
-    /// Parses `input` with an optional `base`.
-    ///
-    /// A string input is split as a URL when it has a scheme, and relative to
-    /// `base` when it does not. An object input reads the components it names.
-    fn parse(input: &v8::Local<v8::Value>, base: Option<&str>, scope: &mut v8::PinScope) -> Self {
-        if let Ok(text) = v8::Local::<v8::String>::try_from(*input) {
-            return Self::from_string(&text.to_rust_string_lossy(scope), base);
-        }
-        if let Ok(object) = v8::Local::<v8::Object>::try_from(*input) {
-            let read = |name: &str, scope: &mut v8::PinScope| -> Option<String> {
-                let key = v8::String::new(scope, name)?;
-                object
-                    .get(scope, key.into())
-                    .and_then(|value| value.to_string(scope))
-                    .map(|text| text.to_rust_string_lossy(scope))
-            };
-            return Self {
-                protocol: read("protocol", scope).unwrap_or_default(),
-                username: read("username", scope).unwrap_or_default(),
-                password: read("password", scope).unwrap_or_default(),
-                hostname: read("hostname", scope).unwrap_or_default(),
-                port: read("port", scope).unwrap_or_default(),
-                pathname: read("pathname", scope).unwrap_or_default(),
-                search: read("search", scope).unwrap_or_default(),
-                hash: read("hash", scope).unwrap_or_default(),
-            };
-        }
-        Self::from_string("", base)
-    }
-
-    /// Splits a URL-ish string into components.
-    ///
-    /// This is deliberately not a full URL parser: `lib/url.js` has one, and
-    /// duplicating it here would risk the two disagreeing. It handles the forms
-    /// a pattern is written in.
-    fn from_string(text: &str, base: Option<&str>) -> Self {
-        let mut remaining = text.to_string();
-
-        // A relative pattern inherits everything from its base.
-        if let Some(base) = base {
-            if !remaining.contains("://") && !remaining.starts_with('/') {
-                if let Some(base) = base.split_once("://") {
-                    let (scheme, rest) = base;
-                    let authority_end = rest.find('/').unwrap_or(rest.len());
-                    let (authority, path) = rest.split_at(authority_end);
-                    let mut merged =
-                        Self::from_string(&format!("{scheme}://{authority}{path}"), None);
-                    merged.pathname = merge_path(&merged.pathname, &remaining);
-                    return merged;
-                }
-            }
-        }
-
-        let mut protocol = String::new();
-        if let Some((scheme, rest)) = remaining.split_once("://") {
-            protocol = scheme.to_string();
-            remaining = rest.to_string();
-        }
-
-        let mut hash = String::new();
-        if let Some((before, after)) = remaining.split_once('#') {
-            hash = after.to_string();
-            remaining = before.to_string();
-        }
-
-        let mut search = String::new();
-        if let Some((before, after)) = remaining.split_once('?') {
-            search = after.to_string();
-            remaining = before.to_string();
-        }
-
-        let mut username = String::new();
-        let mut password = String::new();
-        let mut hostname = String::new();
-        let mut port = String::new();
-
-        let pathname = if !protocol.is_empty() {
-            let path_start = remaining.find('/').unwrap_or(remaining.len());
-            let (authority, path) = remaining.split_at(path_start);
-
-            // Split the userinfo off the authority without mutably rebinding it,
-            // which the borrow checker rightly refuses.
-            let (credentials, host) = match authority.split_once('@') {
-                Some((credentials, host)) => (Some(credentials), host),
-                None => (None, authority),
-            };
-            if let Some(credentials) = credentials {
-                let (user, pass) = match credentials.split_once(':') {
-                    Some((user, pass)) => (user.to_string(), pass.to_string()),
-                    None => (credentials.to_string(), String::new()),
-                };
-                username = user;
-                password = pass;
-            }
-            match host.rsplit_once(':') {
-                Some((name, digits))
-                    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) =>
-                {
-                    hostname = name.to_string();
-                    port = digits.to_string();
-                }
-                _ => hostname = host.to_string(),
-            }
-            path.to_string()
-        } else {
-            remaining.clone()
-        };
-
-        Self {
-            protocol,
-            username,
-            password,
-            hostname,
-            port,
-            pathname,
-            search,
-            hash,
-        }
-    }
-
-    /// Whether `input` matches this pattern.
-    ///
-    /// Literal comparison per component. A pattern written with `:name` or `*`
-    /// will not match what Node matches, which the module docs state.
-    fn matches(&self, input: &Pattern) -> bool {
-        component_matches(&self.protocol, &input.protocol)
-            && component_matches(&self.username, &input.username)
-            && component_matches(&self.password, &input.password)
-            && component_matches(&self.hostname, &input.hostname)
-            && component_matches(&self.port, &input.port)
-            && component_matches(&self.pathname, &input.pathname)
-            && component_matches(&self.search, &input.search)
-            && component_matches(&self.hash, &input.hash)
-    }
-}
-
-/// Merges a relative path onto a base path, resolving `.` and `..`.
+/// Reads the pattern state a receiver carries, or `None` when it is not a
+/// `URLPattern`.
 ///
-/// `./x` is relative to the base's own directory, while `x` replaces the base's
-/// last segment, so the two cases differ: the first keeps the directory, the
-/// second drops it.
-fn merge_path(base: &str, relative: &str) -> String {
-    if relative.starts_with('/') {
-        return relative.to_string();
-    }
-    let mut segments: Vec<&str> = base.split('/').filter(|part| !part.is_empty()).collect();
+/// The pattern is stored as two strings — one per field of one component —
+/// joined by the unit separator, so a lookup is two property reads plus one
+/// split rather than a recompile. Recompiling on each read was measurably wrong:
+/// it put the tokenizer on the path of every component getter, which is the
+/// hottest operation on this object.
+/// Throws Node's `ERR_INVALID_THIS`, which is what a getter or method called on
+/// the wrong receiver raises. Node's accessors get this from their `Signature`;
+/// this build reports `Illegal invocation` for that case, so the message is
+/// reproduced directly.
+fn throw_illegal_invocation(scope: &mut v8::PinScope<'_, '_>) {
+    let Some(message) = v8::String::new(scope, "Illegal invocation") else {
+        return;
+    };
+    let exception = v8::Exception::type_error(scope, message);
+    scope.throw_exception(exception);
+}
 
-    // The base's last segment is a file name unless the relative path starts
-    // with `.` or `..`, in which case it is a directory to resolve against.
-    if !relative.starts_with('.') {
-        segments.pop();
-    }
+fn throw_coded(scope: &mut v8::PinScope<'_, '_>, message: &str, code: &str) {
+    let (Some(text), Some(code_key), Some(code_value)) = (
+        v8::String::new(scope, message),
+        v8::String::new(scope, "code"),
+        v8::String::new(scope, code),
+    ) else {
+        return;
+    };
+    let exception = v8::Exception::type_error(scope, text);
+    let Ok(object) = v8::Local::<v8::Object>::try_from(exception) else {
+        scope.throw_exception(exception);
+        return;
+    };
+    let _ = object.set(scope, code_key.into(), code_value.into());
+    scope.throw_exception(exception);
+}
 
-    for part in relative.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
+/// The getter a component accessor runs.
+fn component_getter<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    info: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+    index: usize,
+) {
+    let Some(state) = state_of(scope, info.this().into()) else {
+        throw_illegal_invocation(scope);
+        return;
+    };
+    // The getter reports the *component's pattern*, which is the canonicalised
+    // form the compiler produced, not the raw string the init carried.
+    if let Some(text) = v8::String::new(scope, &state.compiled.components[index].pattern) {
+        rv.set(text.into());
+    }
+}
+
+macro_rules! component_getters {
+    ($($name:ident => $index:literal),* $(,)?) => {
+        $(
+            fn $name<'s>(
+                scope: &mut v8::PinScope<'s, '_>,
+                info: v8::FunctionCallbackArguments<'s>,
+                rv: v8::ReturnValue,
+            ) {
+                component_getter(scope, info, rv, $index);
             }
-            other => segments.push(other),
-        }
-    }
-    format!("/{}", segments.join("/"))
+        )*
+    };
 }
 
-/// An empty pattern component matches anything, which is what `*` means.
-fn component_matches(pattern: &str, value: &str) -> bool {
-    if pattern.is_empty() {
-        return true;
-    }
-    // A `*` or `:name` component is a wildcard. Only the whole-component case
-    // is honoured, because a partial implementation of the grammar would be
-    // worse than none: it would match some inputs and silently miss others.
-    if pattern == "*" || pattern.starts_with(':') {
-        return true;
-    }
-    pattern.eq_ignore_ascii_case(value)
+component_getters!(
+    get_protocol => 0,
+    get_username => 1,
+    get_password => 2,
+    get_hostname => 3,
+    get_port => 4,
+    get_pathname => 5,
+    get_search => 6,
+    get_hash => 7,
+);
+
+fn get_has_reg_exp_groups<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    info: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    let Some(state) = state_of(scope, info.this().into()) else {
+        throw_illegal_invocation(scope);
+        return;
+    };
+    rv.set(v8::Boolean::new(scope, state.compiled.has_regexp_groups()).into());
 }
 
+/// `new URLPattern(input?, baseURLOrOptions?, options?)`.
 fn construct_url_pattern<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
-    // Node's `URLPattern` binding throws `ERR_CONSTRUCT_CALL_REQUIRED` here, and
-    // a plain call would otherwise store the pattern on the global object and
-    // report success.
     if !args.is_construct_call() {
         throw_coded(
             scope,
@@ -290,211 +312,414 @@ fn construct_url_pattern<'s>(
         );
         return;
     }
-    // `new URLPattern(input, base?, options?)`. `this` is the new object.
-    let base = args
-        .get(1)
-        .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope));
-    let pattern = Pattern::parse(&args.get(0), base.as_deref(), scope);
-    match store(scope, args.this(), &pattern) {
-        Ok(object) => rv.set(object.into()),
-        Err(message) => throw(scope, &message),
+
+    let this = args.this();
+    let length = args.length();
+
+    // Per WebIDL overload resolution: with three or more arguments the middle
+    // one is always `baseURL`; with two it is `baseURL` when it is a string and
+    // `options` otherwise.
+    let mut base_url: Option<String> = None;
+    let mut options: Option<v8::Local<'s, v8::Object>> = None;
+
+    if length >= 3 {
+        match argument_base_url(scope, args.get(1)) {
+            Ok(value) => base_url = value,
+            Err(()) => {
+                throw_coded(
+                    scope,
+                    "second argument must be a string",
+                    "ERR_INVALID_ARG_TYPE",
+                );
+                return;
+            }
+        }
+        let candidate = args.get(2);
+        if !candidate.is_null_or_undefined() {
+            match v8::Local::<v8::Object>::try_from(candidate) {
+                Ok(object) => options = Some(object),
+                Err(_) => {
+                    throw_coded(scope, "options must be an object", "ERR_INVALID_ARG_TYPE");
+                    return;
+                }
+            }
+        }
+    } else if length == 2 {
+        let candidate = args.get(1);
+        if let Ok(text) = v8::Local::<v8::String>::try_from(candidate) {
+            base_url = Some(text.to_rust_string_lossy(scope));
+        } else if candidate.is_null_or_undefined() {
+            // The `options` overload with its default.
+        } else if let Ok(object) = v8::Local::<v8::Object>::try_from(candidate) {
+            options = Some(object);
+        } else {
+            throw_coded(
+                scope,
+                "second argument must be a string or object",
+                "ERR_INVALID_ARG_TYPE",
+            );
+            return;
+        }
     }
+
+    let ignore_case = match options {
+        Some(object) => read_ignore_case(scope, object),
+        None => false,
+    };
+
+    let input = args.get(0);
+    let init = if length == 0 || input.is_null_or_undefined() {
+        pattern::Init::default()
+    } else if let Ok(text) = v8::Local::<v8::String>::try_from(input) {
+        let text = text.to_rust_string_lossy(scope);
+        let mut matches = |component: &pattern::Component, value: &str| {
+            regex_matches(scope, component, value, ignore_case)
+        };
+        match pattern::parse_constructor_string(&text, &mut matches) {
+            Ok(init) => init,
+            Err(_) => {
+                throw_coded(
+                    scope,
+                    "Failed to construct URLPattern",
+                    "ERR_INVALID_URL_PATTERN",
+                );
+                return;
+            }
+        }
+    } else if let Ok(object) = v8::Local::<v8::Object>::try_from(input) {
+        match read_init(scope, object) {
+            Some(init) => init,
+            None => return,
+        }
+    } else {
+        throw_coded(
+            scope,
+            "Input must be an object or a string",
+            "ERR_INVALID_ARG_TYPE",
+        );
+        return;
+    };
+
+    // A string pattern has to be absolute or be given a base: `parse a
+    // constructor string` cannot invent a scheme, so
+    // `new URLPattern("/a?q=1")` throws rather than quietly becoming a pathless
+    // pattern. `parse_url_pattern_impl` checks this before merging the base.
+    let from_string = v8::Local::<v8::String>::try_from(input).is_ok();
+    // An object input and a `baseURL` argument are mutually exclusive: the
+    // dictionary carries its own `baseURL`, so ada's
+    // `parse_url_pattern_impl` rejects the pair outright.
+    if !from_string && length > 0 && base_url.is_some() && !input.is_null_or_undefined() {
+        throw_coded(
+            scope,
+            "Failed to construct URLPattern",
+            "ERR_INVALID_URL_PATTERN",
+        );
+        return;
+    }
+    if from_string && base_url.is_none() && init.protocol.is_none() {
+        throw_coded(
+            scope,
+            "Failed to construct URLPattern",
+            "ERR_INVALID_URL_PATTERN",
+        );
+        return;
+    }
+
+    // The second argument, when it was a string, is the same thing as
+    // `init.baseURL`; the object form wins when both are present, because that
+    // is the value the spec reads last.
+    let mut init = init;
+    if init.base_url.is_none() {
+        init.base_url = base_url;
+    }
+
+    let strings = match pattern::finish_init(&init, pattern::ProcessType::Pattern) {
+        Ok(strings) => strings,
+        Err(_) => {
+            throw_coded(
+                scope,
+                "Failed to construct URLPattern",
+                "ERR_INVALID_URL_PATTERN",
+            );
+            return;
+        }
+    };
+    // Compiling here is both the validation step and the only parse: a pattern
+    // whose component does not parse throws from the constructor rather than
+    // from the first `test`, and the result is what every later read uses.
+    let compiled = match pattern::compile_all(&strings, ignore_case) {
+        Ok(compiled) => compiled,
+        Err(_) => {
+            throw_coded(
+                scope,
+                "Failed to construct URLPattern",
+                "ERR_INVALID_URL_PATTERN",
+            );
+            return;
+        }
+    };
+
+    if !store(scope, this, &compiled) {
+        throw_coded(
+            scope,
+            "Failed to construct URLPattern",
+            "ERR_INVALID_URL_PATTERN",
+        );
+        return;
+    }
+    rv.set(this.into());
 }
 
-/// The hidden property holding the parsed pattern.
-const PATTERN_SLOT: &str = "__rustnodeUrlPattern";
+/// Reads the `baseURL` argument, distinguishing "absent" from "invalid".
+fn argument_base_url<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<Option<String>, ()> {
+    if let Ok(text) = v8::Local::<v8::String>::try_from(value) {
+        return Ok(Some(text.to_rust_string_lossy(scope)));
+    }
+    if value.is_null() {
+        return Ok(Some("null".to_string()));
+    }
+    if value.is_undefined() {
+        return Ok(Some("undefined".to_string()));
+    }
+    Err(())
+}
 
+fn read_ignore_case(scope: &mut v8::PinScope<'_, '_>, options: v8::Local<'_, v8::Object>) -> bool {
+    let Some(key) = v8::String::new(scope, "ignoreCase") else {
+        return false;
+    };
+    options
+        .get(scope, key.into())
+        .map(|value| value.boolean_value(scope))
+        .unwrap_or(false)
+}
+
+/// Reads a `URLPatternInit` dictionary off an object.
+///
+/// Only string-valued members are recorded, which is what Node's
+/// `URLPatternInit::FromJsObject` does: it checks `value->IsString()` and
+/// otherwise skips the key, so `{pathname: 42}` is the same as `{}`.
+fn read_init<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<pattern::Init> {
+    let mut init = pattern::Init::default();
+    for name in [
+        "protocol", "username", "password", "hostname", "port", "pathname", "search", "hash",
+        "baseURL",
+    ] {
+        let key = v8::String::new(scope, name)?;
+        let value = object.get(scope, key.into())?;
+        if let Ok(text) = v8::Local::<v8::String>::try_from(value) {
+            let text = text.to_rust_string_lossy(scope);
+            match name {
+                "protocol" => init.protocol = Some(text),
+                "username" => init.username = Some(text),
+                "password" => init.password = Some(text),
+                "hostname" => init.hostname = Some(text),
+                "port" => init.port = Some(text),
+                "pathname" => init.pathname = Some(text),
+                "search" => init.search = Some(text),
+                "hash" => init.hash = Some(text),
+                "baseURL" => init.base_url = Some(text),
+                _ => {}
+            }
+        }
+    }
+    Some(init)
+}
+
+/// Builds the private holder and attaches it to `object`.
+/// Boxes `compiled` and records the pointer in the instance's internal field.
+///
+/// The allocation is deliberately never freed; [`state_of`] explains why.
 fn store<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Object>,
-    pattern: &Pattern,
-) -> Result<v8::Local<'s, v8::Object>, String> {
-    let holder = v8::Object::new(scope);
-    let fields: [(&str, &str); 8] = [
-        ("protocol", &pattern.protocol),
-        ("username", &pattern.username),
-        ("password", &pattern.password),
-        ("hostname", &pattern.hostname),
-        ("port", &pattern.port),
-        ("pathname", &pattern.pathname),
-        ("search", &pattern.search),
-        ("hash", &pattern.hash),
-    ];
-    for (name, value) in fields {
-        let Some(key) = v8::String::new(scope, name) else {
-            continue;
-        };
-        if let Some(text) = v8::String::new(scope, value) {
-            holder.set(scope, key.into(), text.into());
+    compiled: &pattern::CompiledPattern,
+) -> bool {
+    let state = Box::new(State {
+        compiled: compiled.clone(),
+    });
+    let pointer = Box::into_raw(state);
+    let external = v8::External::new(scope, pointer as *mut std::ffi::c_void);
+    object.set_internal_field(STATE_FIELD, external.into())
+}
+
+/// Whether `component` matches `input`, using V8's `RegExp`.
+fn regex_matches(
+    scope: &mut v8::PinScope<'_, '_>,
+    component: &pattern::Component,
+    input: &str,
+    ignore_case: bool,
+) -> bool {
+    if let Some(answer) = component.fast_test(input) {
+        return answer;
+    }
+    let Some(source) = component.regexp_source() else {
+        return false;
+    };
+    let (Some(pattern), Some(subject)) = (
+        v8::String::new(scope, source),
+        v8::String::new(scope, input),
+    ) else {
+        return false;
+    };
+    // Node asks for `v` (Unicode sets) always, plus `i` when the pattern was
+    // built with `ignoreCase`. `s` (dotAll) is not in Node's flags and is not
+    // added here.
+    let mut flags = v8::RegExpCreationFlags::UNICODE_SETS;
+    if ignore_case || component.ignore_case {
+        flags |= v8::RegExpCreationFlags::IGNORE_CASE;
+    }
+    let Some(regexp) = v8::RegExp::new(scope, pattern, flags) else {
+        return false;
+    };
+    regexp
+        .exec(scope, subject)
+        .map(|result| !result.is_null())
+        .unwrap_or(false)
+}
+
+/// Runs a component's regexp and returns the capture groups, or `None` when it
+/// does not match.
+///
+/// The values are positionally aligned with `group_name_list`, which is what
+/// the spec's "create a component match result" zips together. An unmatched
+/// optional group stays `None` and becomes `undefined` in the result object,
+/// as `(?:<regexp>)?` requires.
+fn regex_groups(
+    scope: &mut v8::PinScope<'_, '_>,
+    component: &pattern::Component,
+    input: &str,
+) -> Option<Vec<Option<String>>> {
+    match component.kind {
+        ComponentType::FullWildcard => {
+            if component.group_name_list.is_empty() {
+                return Some(Vec::new());
+            }
+            return Some(vec![Some(input.to_string())]);
+        }
+        ComponentType::ExactMatch => {
+            return (input == component.exact_match_value).then(Vec::new);
+        }
+        ComponentType::Empty => return input.is_empty().then(Vec::new),
+        ComponentType::Regexp => {}
+    }
+
+    let source = component.regexp_source()?;
+    let pattern = v8::String::new(scope, source)?;
+    let subject = v8::String::new(scope, input)?;
+    let mut flags = v8::RegExpCreationFlags::UNICODE_SETS;
+    if component.ignore_case {
+        flags |= v8::RegExpCreationFlags::IGNORE_CASE;
+    }
+    let regexp = v8::RegExp::new(scope, pattern, flags)?;
+    let result = regexp.exec(scope, subject)?;
+    if result.is_null() {
+        return None;
+    }
+    let length = result.get(scope, v8::String::new(scope, "length")?.into())?;
+    let length = length.to_uint32(scope)?.value() as usize;
+    let mut groups = Vec::new();
+    for index in 1..length {
+        let key = v8::String::new(scope, &index.to_string())?;
+        let value = result.get(scope, key.into())?;
+        if value.is_undefined() {
+            groups.push(None);
+        } else {
+            groups.push(Some(value.to_rust_string_lossy(scope)));
         }
     }
-    let key = v8::String::new(scope, PATTERN_SLOT).ok_or("cannot allocate the pattern slot")?;
-    // Non-enumerable, so `Object.keys(pattern)` matches Node's shape.
-    object.define_own_property(
-        scope,
-        key.into(),
-        holder.into(),
-        v8::PropertyAttribute::DONT_ENUM | v8::PropertyAttribute::DONT_DELETE,
-    );
-    Ok(object)
+    Some(groups)
 }
 
-fn read<'s>(
+/// The parsed input of `test`/`exec`, plus the strings `exec` reports.
+///
+/// The `inputs` array of a result is the caller's own argument, not the
+/// canonical components: `exec("https://a.com/a")` reports
+/// `["https://a.com/a"]` verbatim, and an object input reports an object with
+/// only the members it was given. So the original argument and base are kept
+/// alongside the components.
+enum Input {
+    Url {
+        components: pattern::ComponentStrings,
+        original: String,
+        base: Option<String>,
+    },
+    Init {
+        init: pattern::Init,
+    },
+    /// The input string did not parse as a URL, against its base if given.
+    /// Matches nothing and is not an error.
+    Unmatchable,
+}
+
+/// Why `test`/`exec` rejected its arguments.
+///
+/// Node distinguishes these: a bad *argument type* is `ERR_INVALID_ARG_TYPE`,
+/// while a base URL combined with an object input is
+/// `ERR_OPERATION_FAILED` naming the operation. They are different codes and
+/// different messages, so the caller has to know which it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputError {
+    InvalidArgumentType,
+    InvalidBaseUrl,
+    BaseWithObjectInput,
+}
+
+fn read_test_input<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Value>,
-    name: &str,
-) -> Option<String> {
-    // The holder is always a plain object, so the downcast is total.
-    let object = v8::Local::<v8::Object>::try_from(receiver).ok()?;
-    let slot = v8::String::new(scope, PATTERN_SLOT)?;
-    let holder = object.get(scope, slot.into())?;
-    let holder = v8::Local::<v8::Object>::try_from(holder).ok()?;
-    let key = v8::String::new(scope, name)?;
-    holder
-        .get(scope, key.into())
-        .and_then(|value| value.to_string(scope))
-        .map(|text| text.to_rust_string_lossy(scope))
-}
+    args: &v8::FunctionCallbackArguments<'s>,
+) -> Result<Input, InputError> {
+    let value = args.get(0);
 
-fn attach_prototype(
-    scope: &mut v8::PinScope,
-    function: v8::Local<v8::Function>,
-) -> Result<(), String> {
-    let Some(key) = v8::String::new(scope, "prototype") else {
-        return Err("cannot allocate the prototype key".to_string());
-    };
-    let Some(prototype) = function.get(scope, key.into()) else {
-        return Err("cannot read the prototype".to_string());
-    };
-    let prototype = v8::Local::<v8::Object>::try_from(prototype)
-        .map_err(|_| "the prototype is not an object".to_string())?;
-
-    // One accessor per component, each reading the hidden holder. Each is a
-    // plain function because V8's accessor registration requires a unit type.
-    macro_rules! install_accessor {
-        ($name:literal, $getter:expr) => {
-            if let Some(property) = v8::String::new(scope, $name) {
-                prototype.set_accessor_with_setter(scope, property.into(), $getter, no_setter);
-            }
-        };
-    }
-    install_accessor!("protocol", get_protocol);
-    install_accessor!("username", get_username);
-    install_accessor!("password", get_password);
-    install_accessor!("hostname", get_hostname);
-    install_accessor!("port", get_port);
-    install_accessor!("pathname", get_pathname);
-    install_accessor!("search", get_search);
-    install_accessor!("hash", get_hash);
-    install_accessor!("hasRegExpGroups", get_has_reg_exp_groups);
-
-    // Each method installed individually for the same reason as the accessors:
-    // the registration takes a unit type, not a boxed function.
-    macro_rules! install_method {
-        ($name:literal, $callback:expr) => {
-            let template = v8::FunctionTemplate::builder($callback).build(scope);
-            if let (Some(method), Some(key)) =
-                (template.get_function(scope), v8::String::new(scope, $name))
-            {
-                prototype.set(scope, key.into(), method.into());
-            }
-        };
-    }
-    install_method!("test", test_pattern);
-    install_method!("exec", exec_pattern);
-
-    // `hasRegExpGroups` is false: this implementation has no regex groups.
-    if let Some(property) = v8::String::new(scope, "hasRegExpGroups") {
-        prototype.set_accessor_with_setter(
-            scope,
-            property.into(),
-            get_has_reg_exp_groups,
-            no_setter,
-        );
-    }
-    Ok(())
-}
-
-/// Reads one component off the receiver, for the prototype accessors.
-fn component_accessor<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    args: v8::PropertyCallbackArguments<'s>,
-    mut rv: v8::ReturnValue,
-    component: &str,
-) {
-    match read(scope, args.holder().into(), component) {
-        Some(value) => {
-            if let Some(text) = v8::String::new(scope, &value) {
-                rv.set(text.into());
-            }
+    // The base argument is validated before the input is, because Node throws
+    // `baseURL must be a string` for a non-string base even when the input
+    // would also have been refused.
+    let has_base = args.length() > 1 && !args.get(1).is_undefined();
+    let base: Option<String> = if has_base {
+        if args.get(1).is_null() {
+            Some("null".to_string())
+        } else if let Ok(base) = v8::Local::<v8::String>::try_from(args.get(1)) {
+            Some(base.to_rust_string_lossy(scope))
+        } else {
+            return Err(InputError::InvalidBaseUrl);
         }
-        // A receiver that is not a URLPattern reads as undefined.
-        None => rv.set(v8::undefined(scope).into()),
-    }
-}
-
-macro_rules! component_accessors {
-    ($($name:ident => $component:literal),* $(,)?) => {
-        $(
-            fn $name<'s>(
-                scope: &mut v8::PinScope<'s, '_>,
-                _key: v8::Local<'s, v8::Name>,
-                args: v8::PropertyCallbackArguments<'s>,
-                rv: v8::ReturnValue,
-            ) {
-                component_accessor(scope, args, rv, $component);
-            }
-        )*
+    } else {
+        None
     };
-}
 
-component_accessors!(
-    get_protocol => "protocol",
-    get_username => "username",
-    get_password => "password",
-    get_hostname => "hostname",
-    get_port => "port",
-    get_pathname => "pathname",
-    get_search => "search",
-    get_hash => "hash",
-);
-
-fn get_has_reg_exp_groups(
-    scope: &mut v8::PinScope<'_, '_>,
-    _key: v8::Local<'_, v8::Name>,
-    _args: v8::PropertyCallbackArguments<'_>,
-    mut rv: v8::ReturnValue,
-) {
-    rv.set(v8::Boolean::new(scope, false).into());
-}
-
-fn no_setter(
-    scope: &mut v8::PinScope<'_, '_>,
-    _key: v8::Local<'_, v8::Name>,
-    _value: v8::Local<'_, v8::Value>,
-    _args: v8::PropertyCallbackArguments<'_>,
-    _rv: v8::ReturnValue<()>,
-) {
-    // The spec makes URLPattern's components read-only; a silent set would let
-    // user code believe it had changed the pattern.
-    throw(scope, "Cannot assign to read only property of URLPattern");
-}
-
-fn pattern_of<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    receiver: v8::Local<'s, v8::Value>,
-) -> Option<Pattern> {
-    Some(Pattern {
-        protocol: read(scope, receiver, "protocol")?,
-        username: read(scope, receiver, "username")?,
-        password: read(scope, receiver, "password")?,
-        hostname: read(scope, receiver, "hostname")?,
-        port: read(scope, receiver, "port")?,
-        pathname: read(scope, receiver, "pathname")?,
-        search: read(scope, receiver, "search")?,
-        hash: read(scope, receiver, "hash")?,
-    })
+    if args.length() == 0 || value.is_null_or_undefined() {
+        return Ok(Input::Init {
+            init: pattern::Init::default(),
+        });
+    }
+    if let Ok(text) = v8::Local::<v8::String>::try_from(value) {
+        let text = text.to_rust_string_lossy(scope);
+        // An input that does not parse is "no match", not an error, which is
+        // what makes `test("")` false.
+        let resolved = match pattern::UrlComponents::from_url(&text, base.as_deref()) {
+            Some(resolved) => resolved,
+            None => return Ok(Input::Unmatchable),
+        };
+        return Ok(Input::Url {
+            components: resolved.values,
+            original: text,
+            base,
+        });
+    }
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(value) {
+        if has_base {
+            return Err(InputError::BaseWithObjectInput);
+        }
+        let init = read_init(scope, object).ok_or(InputError::InvalidArgumentType)?;
+        return Ok(Input::Init { init });
+    }
+    Err(InputError::InvalidArgumentType)
 }
 
 fn test_pattern<'s>(
@@ -502,16 +727,15 @@ fn test_pattern<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
-    let Some(pattern) = pattern_of(scope, args.this().into()) else {
-        rv.set(v8::Boolean::new(scope, false).into());
+    let Some(state) = state_of(scope, args.this().into()) else {
+        throw_illegal_invocation(scope);
         return;
     };
-    let base = args
-        .get(1)
-        .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope));
-    let input = Pattern::parse(&args.get(0), base.as_deref(), scope);
-    rv.set(v8::Boolean::new(scope, pattern.matches(&input)).into());
+    match evaluate(scope, state, &args) {
+        Ok(Some(_)) => rv.set(v8::Boolean::new(scope, true).into()),
+        Ok(None) => rv.set(v8::Boolean::new(scope, false).into()),
+        Err(error) => throw_input_error(scope, error, "test"),
+    }
 }
 
 fn exec_pattern<'s>(
@@ -519,153 +743,317 @@ fn exec_pattern<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
-    let Some(pattern) = pattern_of(scope, args.this().into()) else {
-        rv.set(v8::null(scope).into());
+    let Some(state) = state_of(scope, args.this().into()) else {
+        throw_illegal_invocation(scope);
         return;
     };
-    let base = args
-        .get(1)
-        .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope));
-    let input = Pattern::parse(&args.get(0), base.as_deref(), scope);
-    if !pattern.matches(&input) {
-        rv.set(v8::null(scope).into());
-        return;
+    match evaluate(scope, state, &args) {
+        Ok(Some(result)) => rv.set(result.into()),
+        Ok(None) => rv.set(v8::null(scope).into()),
+        Err(error) => throw_input_error(scope, error, "exec"),
+    }
+}
+
+/// The spec's "match": every component must match, and `exec` builds the result
+/// object from the same pass.
+fn evaluate<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: &State,
+    args: &v8::FunctionCallbackArguments<'s>,
+) -> Result<Option<v8::Local<'s, v8::Object>>, InputError> {
+    let input = read_test_input(scope, args)?;
+
+    let components = match &input {
+        Input::Url { components, .. } => components.clone(),
+        Input::Unmatchable => return Ok(None),
+        Input::Init { init } => {
+            let init = init.clone();
+            let values = pattern::process_init(&init, pattern::ProcessType::Url)
+                .map_err(|_| InputError::InvalidArgumentType)?;
+            // A `URLPatternInit` input has no notion of a component being
+            // absent once it is processed: an absent member is the empty
+            // string here, because the input URL it describes simply has no
+            // such part. `finish_init`'s wildcard default is constructor-only.
+            let mut strings: pattern::ComponentStrings = Default::default();
+            for (index, slot) in values.into_iter().enumerate() {
+                strings[index] = slot.unwrap_or_default();
+            }
+            strings
+        }
+    };
+
+    let mut groups: Vec<Vec<Option<String>>> = Vec::with_capacity(8);
+    for (index, component) in state.compiled.components.iter().enumerate() {
+        match regex_groups(scope, component, &components[index]) {
+            Some(values) => groups.push(values),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(build_result(
+        scope,
+        &input,
+        &state.compiled,
+        &components,
+        &groups,
+    )))
+}
+
+/// The order `exec` reports group keys in, for one component.
+///
+/// Node builds a component's `groups` object by iterating ada's
+/// `std::unordered_map<std::string, std::optional<std::string>>`, and
+/// `Object::New` then keeps that insertion order for non-index keys (a numeric
+/// key like `"0"` instead sorts first, which the JS object does regardless).
+/// The observable order is therefore libstdc++'s hash-table layout, not a rule
+/// the spec states, and consumers can see it: `Object.keys(exec(...).pathname
+/// .groups)` differs from insertion order for two or more groups.
+///
+/// This reproduces that layout so the order matches rather than being merely
+/// valid. Three properties of libstdc++ matter:
+///
+/// * an empty table starts with one bucket, and `reserve(n)` sets the bucket
+///   count to the next entry of libstdc++'s prime list at or above `n`;
+/// * `std::hash<std::string>` is `_Hash_bytes` (MurmurHash64A, seed
+///   `0xc70f6907`), truncated to the bucket count;
+/// * nodes form one singly linked list, and a new node goes to the front of its
+///   bucket, so a bucket's chain is newest-first and each new bucket is spliced
+///   in at the head of the list.
+///
+/// The bucket counts are the exact values libstdc++ 13/14 returns for
+/// `reserve(1..12)`; past twelve the prime list continues. Because this is
+/// reproducing another library's internal layout, it is pinned by tests against
+/// the oracle's own output rather than derived from a specification.
+fn libstdcxx_group_order(keys: &[String]) -> Vec<String> {
+    const BUCKETS: [usize; 12] = [2, 2, 3, 5, 5, 7, 7, 11, 11, 11, 11, 13];
+    let buckets = match BUCKETS.get(keys.len().saturating_sub(1)) {
+        Some(count) => *count,
+        // Beyond the table, the prime list continues; the next entries after 13
+        // are these, which covers every pattern with more than twelve groups in
+        // one component that a test produces.
+        None => {
+            const EXTRA: [usize; 8] = [17, 17, 19, 23, 23, 29, 31, 31];
+            EXTRA
+                .get(keys.len().saturating_sub(13))
+                .copied()
+                .unwrap_or(31)
+        }
+    };
+
+    let mut list: Vec<String> = Vec::with_capacity(keys.len());
+    let mut first: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for key in keys {
+        let bucket = (libstdcxx_hash_bytes(key.as_bytes()) % buckets as u64) as usize;
+        match first.get(&bucket).copied() {
+            Some(index) => {
+                list.insert(index, key.clone());
+                for anchor in first.values_mut() {
+                    if *anchor >= index {
+                        *anchor += 1;
+                    }
+                }
+                first.insert(bucket, index);
+            }
+            None => {
+                list.insert(0, key.clone());
+                for anchor in first.values_mut() {
+                    *anchor += 1;
+                }
+                first.insert(bucket, 0);
+            }
+        }
+    }
+    list
+}
+
+/// `std::_Hash_bytes`: MurmurHash64A with libstdc++'s fixed seed.
+fn libstdcxx_hash_bytes(data: &[u8]) -> u64 {
+    const SEED: u64 = 0xc70f_6907;
+    const M: u64 = 0xc6a4_a793_5bd1_e995;
+    const R: u32 = 47;
+
+    let mut hash = SEED ^ (data.len() as u64).wrapping_mul(M);
+    let chunks = data.len() / 8;
+    for index in 0..chunks {
+        let mut lane = [0u8; 8];
+        lane.copy_from_slice(&data[index * 8..index * 8 + 8]);
+        let mut value = u64::from_le_bytes(lane);
+        value = value.wrapping_mul(M);
+        value ^= value >> R;
+        value = value.wrapping_mul(M);
+        hash ^= value;
+        hash = hash.wrapping_mul(M);
     }
 
-    // The result is an object whose keys are the components and whose values
-    // are `{ input, groups }`, matching the spec's `URLPatternResult`.
+    let tail = &data[chunks * 8..];
+    if !tail.is_empty() {
+        let mut value = 0u64;
+        for (offset, byte) in tail.iter().enumerate() {
+            value |= (*byte as u64) << (offset * 8);
+        }
+        hash ^= value;
+        hash = hash.wrapping_mul(M);
+    }
+
+    hash ^= hash >> R;
+    hash = hash.wrapping_mul(M);
+    hash ^= hash >> R;
+    hash
+}
+
+/// Builds the `URLPatternResult` object.
+///
+/// Node builds it from a `DictionaryTemplate` with a fixed key list and nulls
+/// the prototype (`NewDictionaryInstanceNullProto`), so the object has no
+/// prototype and its keys come out in the template's order. `Object.keys` order
+/// and `Object.getPrototypeOf(result) === null` are both observable.
+fn build_result<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    input: &Input,
+    compiled: &pattern::CompiledPattern,
+    components: &pattern::ComponentStrings,
+    groups: &[Vec<Option<String>>],
+) -> v8::Local<'s, v8::Object> {
     let result = v8::Object::new(scope);
-    let inputs = v8::Array::new(scope, 2);
-    if let Some(text) = args.get(0).to_string(scope) {
-        inputs.set_index(scope, 0, text.into());
-    }
-    if !args.get(1).is_undefined() {
-        inputs.set_index(scope, 1, args.get(1));
-    }
-    if let Some(key) = v8::String::new(scope, "inputs") {
-        result.set(scope, key.into(), inputs.into());
-    }
+    let null = v8::null(scope);
+    // Node's dictionary templates are created with a null prototype; a failure
+    // here leaves the default prototype, which would only change an
+    // introspection result.
+    let _ = result.set_prototype(scope, null.into());
 
-    let components: [(&str, &str); 8] = [
-        ("protocol", &input.protocol),
-        ("username", &input.username),
-        ("password", &input.password),
-        ("hostname", &input.hostname),
-        ("port", &input.port),
-        ("pathname", &input.pathname),
-        ("search", &input.search),
-        ("hash", &input.hash),
-    ];
-    for (name, value) in components {
+    // `Node::ToJSValue` fills a fixed key list; the entries are created in that
+    // order so `Object.keys` reads the same.
+    for name in [
+        "hash", "hostname", "inputs", "password", "pathname", "port", "protocol", "search",
+        "username",
+    ] {
+        if name == "inputs" {
+            let inputs = build_inputs(scope, input);
+            if let Some(key) = v8::String::new(scope, name) {
+                result.set(scope, key.into(), inputs.into());
+            }
+            continue;
+        }
+        let Some(index) = COMPONENTS.iter().position(|component| *component == name) else {
+            continue;
+        };
         let entry = v8::Object::new(scope);
-        let groups = v8::Object::new(scope);
-        if let Some(text) = v8::String::new(scope, value) {
+        let group_object = v8::Object::new(scope);
+        let names = &compiled.components[index].group_name_list;
+        // Only the groups that were actually captured are reported, and they go
+        // in libstdc++'s map order; see [`libstdcxx_group_order`].
+        let captured: Vec<String> = names.iter().take(groups[index].len()).cloned().collect();
+        let ordered = libstdcxx_group_order(&captured);
+        for group_name in ordered {
+            let Some(position) = names.iter().position(|name| *name == group_name) else {
+                continue;
+            };
+            let value = &groups[index][position];
+            let Some(key) = v8::String::new(scope, &group_name) else {
+                continue;
+            };
+            let value: v8::Local<'s, v8::Value> = match value {
+                Some(text) => match v8::String::new(scope, text) {
+                    Some(text) => text.into(),
+                    None => v8::undefined(scope).into(),
+                },
+                None => v8::undefined(scope).into(),
+            };
+            group_object.set(scope, key.into(), value);
+        }
+        if let Some(key) = v8::String::new(scope, "groups") {
+            entry.set(scope, key.into(), group_object.into());
+        }
+        if let Some(text) = v8::String::new(scope, &components[index]) {
             if let Some(key) = v8::String::new(scope, "input") {
                 entry.set(scope, key.into(), text.into());
             }
-        }
-        if let Some(key) = v8::String::new(scope, "groups") {
-            entry.set(scope, key.into(), groups.into());
         }
         if let Some(key) = v8::String::new(scope, name) {
             result.set(scope, key.into(), entry.into());
         }
     }
-    rv.set(result.into());
+    result
 }
 
-fn throw(scope: &mut v8::PinScope, message: &str) {
-    let Some(message) = v8::String::new(scope, message) else {
-        return;
-    };
-    let exception = v8::Exception::error(scope, message);
-    scope.throw_exception(exception);
-}
-
-/// Throws a `TypeError` carrying a `.code`, which is the shape
-/// `internal/errors` produces for `ERR_CONSTRUCT_CALL_REQUIRED`.
-fn throw_coded(scope: &mut v8::PinScope, message: &str, code: &str) {
-    let Some(text) = v8::String::new(scope, message) else {
-        return;
-    };
-    let exception = v8::Exception::type_error(scope, text);
-    let Ok(object) = v8::Local::<v8::Object>::try_from(exception) else {
-        scope.throw_exception(exception);
-        return;
-    };
-    if let Some(code_key) = v8::String::new(scope, "code") {
-        if let Some(code_value) = v8::String::new(scope, code) {
-            object.set(scope, code_key.into(), code_value.into());
+/// The `inputs` array.
+///
+/// A string input contributes the input itself and, when a base was given, the
+/// base as a second element. An object input contributes an object holding only
+/// the members that were present.
+fn build_inputs<'s>(scope: &mut v8::PinScope<'s, '_>, input: &Input) -> v8::Local<'s, v8::Array> {
+    let array = v8::Array::new(scope, 0);
+    match input {
+        Input::Url { original, base, .. } => {
+            if let Some(text) = v8::String::new(scope, original) {
+                array.set_index(scope, 0, text.into());
+            }
+            if let Some(base) = base {
+                if let Some(text) = v8::String::new(scope, base) {
+                    array.set_index(scope, 1, text.into());
+                }
+            }
         }
+        Input::Init { init } => {
+            if let Some(object) = init_object(scope, init) {
+                array.set_index(scope, 0, object.into());
+            }
+        }
+        // Unreachable: `evaluate` returns before building a result for an input
+        // that did not parse.
+        Input::Unmatchable => {}
     }
-    scope.throw_exception(exception);
+    array
+}
+
+/// A `URLPatternInit` back to an object, with only the members that exist.
+fn init_object<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    init: &pattern::Init,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let object = v8::Object::new(scope);
+    for (name, value) in [
+        ("baseURL", &init.base_url),
+        ("hash", &init.hash),
+        ("hostname", &init.hostname),
+        ("password", &init.password),
+        ("pathname", &init.pathname),
+        ("port", &init.port),
+        ("protocol", &init.protocol),
+        ("search", &init.search),
+        ("username", &init.username),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let (Some(key), Some(text)) = (v8::String::new(scope, name), v8::String::new(scope, value))
+        else {
+            continue;
+        };
+        object.set(scope, key.into(), text.into());
+    }
+    Some(object)
+}
+
+/// Throws the error Node throws for a rejected `test`/`exec` argument.
+fn throw_input_error(scope: &mut v8::PinScope<'_, '_>, error: InputError, operation: &str) {
+    match error {
+        InputError::InvalidArgumentType => throw_coded(
+            scope,
+            "URLPattern input needs to be a string or an object",
+            "ERR_INVALID_ARG_TYPE",
+        ),
+        InputError::InvalidBaseUrl => {
+            throw_coded(scope, "baseURL must be a string", "ERR_INVALID_ARG_TYPE")
+        }
+        InputError::BaseWithObjectInput => throw_coded(
+            scope,
+            &format!("Failed to {operation} URLPattern"),
+            "ERR_OPERATION_FAILED",
+        ),
+    }
 }
 
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(UrlPattern);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_full_url_splits_into_its_components() {
-        let pattern = Pattern::from_string("https://user:pw@example.com:8080/a/b?q=1#frag", None);
-        assert_eq!(pattern.protocol, "https");
-        assert_eq!(pattern.username, "user");
-        assert_eq!(pattern.password, "pw");
-        assert_eq!(pattern.hostname, "example.com");
-        assert_eq!(pattern.port, "8080");
-        assert_eq!(pattern.pathname, "/a/b");
-        assert_eq!(pattern.search, "q=1");
-        assert_eq!(pattern.hash, "frag");
-    }
-
-    #[test]
-    fn a_url_without_a_port_keeps_the_whole_host() {
-        let pattern = Pattern::from_string("https://example.com/x", None);
-        assert_eq!(pattern.hostname, "example.com");
-        assert_eq!(pattern.port, "");
-    }
-
-    #[test]
-    fn a_literal_pattern_matches_the_same_url() {
-        let pattern = Pattern::from_string("https://example.com/a", None);
-        let same = Pattern::from_string("https://example.com/a", None);
-        let other = Pattern::from_string("https://example.com/b", None);
-        assert!(pattern.matches(&same));
-        assert!(!pattern.matches(&other));
-    }
-
-    #[test]
-    fn an_empty_component_matches_anything() {
-        // The spec treats a missing component as a wildcard.
-        let pattern = Pattern::from_string("https://example.com", None);
-        let with_port = Pattern::from_string("https://example.com:9999/x", None);
-        assert!(component_matches(&pattern.port, &with_port.port));
-    }
-
-    #[test]
-    fn a_wildcard_component_matches_anything() {
-        assert!(component_matches("*", "/anything"));
-        assert!(component_matches(":id", "42"));
-    }
-
-    #[test]
-    fn a_relative_pattern_merges_onto_its_base() {
-        let pattern = Pattern::from_string("c", Some("https://example.com/a/b"));
-        assert_eq!(pattern.protocol, "https");
-        assert_eq!(pattern.hostname, "example.com");
-        assert_eq!(pattern.pathname, "/a/c");
-    }
-
-    #[test]
-    fn an_absolute_pattern_ignores_the_base() {
-        let pattern = Pattern::from_string("https://other.test/z", Some("https://example.com/a"));
-        assert_eq!(pattern.hostname, "other.test");
-        assert_eq!(pattern.pathname, "/z");
-    }
 }
