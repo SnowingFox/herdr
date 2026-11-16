@@ -319,6 +319,124 @@ the same C sources Node bundles at the same version (`+zstd.1.5.7`), so
 `crates/rn-bind-zlib/tests/zstd_parity.rs`. The divergence above is specific to
 `libz-rs-sys` and to `deflate`/`gzip`, and this change does not touch it.
 
+### `params()` after a flush is racy on the oracle
+
+Not a rustnode divergence, and not a to-do: this entry exists so nobody
+"fixes" rustnode against a single oracle run.
+
+`zlib` exposes `params(level, strategy)` on a live stream. Node implements it as
+an async flush whose callback applies the change (`vendor/libnode-js/lib/zlib.js:877-889`
+calls `this.flush(Z_SYNC_FLUSH, paramsAfterFlushCallback)`, and the callback at
+`:792-795` calls the native `handle.params`). The native call is synchronous on
+the main thread while the compression it is being sequenced against runs on a
+libuv worker thread. Node's own comment says that must not happen
+(`lib/zlib.js:788-791`):
+
+```js
+// This callback is used by `.params()` to wait until a full flush happened
+// before adjusting the parameters. In particular, the call to the native
+// `params()` function should not happen while a write is currently in progress
+// on the threadpool.
+```
+
+The ordering `params()` produces reaches exactly that state anyway whenever the
+next write has already been queued — which it always has, because
+`Transform._write` calls the transform callback, letting `this.push()` and the
+follow-on `processCallback` dispatch the next chunk, before the flush callback
+that calls `params()` runs. So the two touch one `z_stream` concurrently.
+
+Measured on the pinned oracle (`v28.0.0-nightly20261111e8c1160d20`) with a
+script that drains the readable side, so `OK` is actually reachable (see
+below). Two 100-run samples on an otherwise idle machine, load average 1.1 and
+2.1:
+
+| outcome | run A | run B |
+| --- | --- | --- |
+| `OK` — level change applied, stream completes | 77 | 89 |
+| `Z_STREAM_ERROR` on the stream | 12 | 2 |
+| segfault (SIGSEGV, exit 139) | 6 | 6 |
+| `Z_OK` / "buffer error" | 5 | 2 |
+| `Z_BUF_ERROR` | 0 | 1 |
+
+The two idle samples disagree by 12 points on the *majority* outcome, which is
+the whole point: there is no stable "correct" answer to quote. rustnode was
+`OK` in every run of every sample (30, 60 and 100 runs, idle and loaded).
+
+It is a scheduling race, not a stream-state rule, and the distribution moves
+with scheduling pressure and in the direction the mechanism predicts:
+
+- 16-24 busy-loop workers saturating all 8 CPUs: 13/30 `Z_STREAM_ERROR` against
+  ~2/30 quiet, and the `OK` share falling to 17/30.
+- `UV_THREADPOOL_SIZE=1`: 53/60 `Z_STREAM_ERROR`. With one pool thread the
+  queued `Z_FINISH` step is picked up promptly and reliably finishes before
+  `params()` arrives, so the *losing* ordering becomes the common one.
+- `UV_THREADPOOL_SIZE=4` (the default): 37/40 `OK`.
+- `UV_THREADPOOL_SIZE=8`: 35/40 `OK`, 4 segfaults.
+
+Two of those runs also **hung** — one at 100% CPU for over ten minutes until
+killed. So the outcome set is `OK` / `Z_STREAM_ERROR` / `Z_OK` / `Z_BUF_ERROR` /
+segfault / hang, not the four outcomes the earlier write-up recorded.
+
+### The recorded repro cannot report `OK` at all
+
+The repro in circulation ends the stream without ever consuming the readable
+side:
+
+```js
+d.on('end', () => console.log('OK'));
+// no 'data' listener, no pipe, no read()
+```
+
+A `Transform` emits `'end'` only once its buffered output has been read, so with
+no consumer `'end'` never fires and `OK` is unreachable. 60 runs of that exact
+script: 49 silent (writable side finished, `readableEnded: false`,
+`readableLength` still 56-57), 11 `Z_STREAM_ERROR`, 0 `OK`. Any count of `OK`
+from that script measures something other than what it claims. The repro used
+for the numbers above adds a `data` listener; that one change is what makes the
+distribution meaningful, and it is why the earlier 24/30-vs-2/30-vs-4/30 figures
+should not be compared directly with these.
+
+
+The segfault is on a **libuv worker thread**, and the fault is an out-of-bounds
+read in `deflate_fast`. From a core dump taken from a crashing run
+(`core.libuv-worker.*`, worker stack
+`uv worker → ThreadPoolWork::ScheduleWork lambda → CompressionStream<ZlibContext>::DoThreadPoolWork → deflate → deflate_fast`):
+
+- `%rip` is `deflate_fast+0x2a7`, the instruction `movzbl (%rax,%rcx,1),%eax` —
+  a byte load from `window[strstart]`.
+- `%rbx` is the `deflate_state`, `%rax` the window base, `%rcx` `strstart`
+  (`0x44c80`).
+- The computed address is **exactly the end of the mapping** that holds the
+  window: it is the first byte past the last valid one. This is a genuine
+  out-of-bounds read, not a null dereference.
+
+So the worker is compressing with a `strstart` that is already past the end of
+the window it is indexing. The plausible and consistent explanation is that the
+main thread's `params()` was in `deflateParams()` at that moment, which calls
+`deflate(strm, Z_BLOCK)` and mutates the same `deflate_state` — `strstart`,
+`lookahead`, the level/strategy tables and the block bookkeeping — while the
+worker reads it. I did not prove that lockstep instruction by instruction; what
+the core establishes is that the crash is a concurrent-state read on a pool
+thread, which is only reachable on this ordering.
+
+rustnode takes the **majority** outcome: it keeps the async step queued across
+`params()`, so the change lands on a stream that has not consumed the queued
+input, and the call succeeds deterministically. See the module docs in
+`crates/rn-bind-zlib/src/handle.rs`. That is a deliberate choice, not parity
+debt — reproducing the crash would mean reproducing the data race, and the
+`OK` path is what the API is documented to do.
+
+**If you diff against the oracle here**, run it more than once. A single
+`Z_STREAM_ERROR` or segfault from the oracle is not the correct answer; a
+`lib/zlib.js` behaviour that depends on this ordering cannot be validated with a
+single run, and a test that asserts on one is a flake. `lib/zlib.js` is vendored
+byte-identical and `verify-libjs.sh` freezes it, so the fix — if there is one —
+belongs upstream in Node, not here.
+
+`tools/zlib-params-race.sh` reproduces the distribution. It is deliberately
+**not** a step in `tools/check.sh`: a nondeterministic oracle must never be a
+gate step.
+
 ### Web Streams globals are not installed
 
 `ReadableStream`, `WritableStream`, `TransformStream` and their friends are
