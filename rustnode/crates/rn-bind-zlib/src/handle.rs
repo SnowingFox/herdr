@@ -17,13 +17,22 @@
 //! # Asynchronous writes
 //!
 //! Node runs `write()` on the libuv threadpool and reports completion from
-//! `AfterThreadPoolWork`. There is no threadpool here, so the compression step
-//! runs inline and only the *completion* is deferred, onto a microtask. That
-//! keeps the two properties `processCallback()` relies on:
+//! `AfterThreadPoolWork`. There is no threadpool here, so the whole step — the
+//! compression *and* the completion — is deferred onto a microtask, which
+//! preserves the two properties the native protocol relies on:
 //!
-//! 1. `writeState` holds this step's offsets before the callback runs.
-//! 2. The callback never runs inside `write()`, so `processCallback`'s
-//!    "output buffer full, call `this.write()` again" path re-enters through the
+//! 1. Between `write()` returning and its completion running, the zlib state
+//!    has not advanced. Node's threadpool hop gives it exactly that window, and
+//!    `lib/zlib.js` depends on it: `params()` is called through
+//!    `paramsAfterFlushCallback` from the flush write's callback, at which point
+//!    the stream that was already queued behind that flush (`d.end(...)`, a
+//!    second chunk) may have had its own `write()` called but not yet run. If
+//!    the step ran inline, `params()` would see a stream that had already
+//!    consumed that queued input — `Z_FINISH` in the common case — and
+//!    `deflateParams()` would fail with `Z_STREAM_ERROR`.
+//! 2. `writeState` holds this step's offsets before `processCallback` runs, and
+//!    the callback never runs inside `write()`, so `processCallback`'s "output
+//!    buffer full, call `this.write()` again" path re-enters through the
 //!    microtask queue instead of growing the native stack.
 
 use std::cell::RefCell;
@@ -72,8 +81,40 @@ pub(crate) struct HandleState {
     /// The last step's error, reported through `onerror` instead of the write
     /// callback, like `EmitError()`.
     pending_error: Option<StreamError>,
+    /// The step a queued async `write()` accepted but has not run yet.
+    ///
+    /// Node's async `write()` returns having only *scheduled* the compression
+    /// on the libuv threadpool; the zlib stream does not move until
+    /// `DoThreadPoolWork` runs. Inside that window `lib/zlib.js` calls
+    /// `params()` — `paramsAfterFlushCallback` runs while the next write is
+    /// already queued — and Node answers it against the stream state *before*
+    /// that queued write. Reproducing the window is what makes `deflateParams`
+    /// succeed through the async path.
+    pending_step: Option<DeferredStep>,
+    /// `pending_close_`: a `close()` that arrived while a step was queued.
+    ///
+    /// Node's `CompressionStream::Close()` records the request and returns;
+    /// `AfterThreadPoolWork` performs the close after the step and the write
+    /// callback. Ending the zlib stream earlier would leave the queued step
+    /// running against a finished stream.
+    pending_close: bool,
     write_in_progress: bool,
     closed: bool,
+}
+
+/// A compression step that `write()` accepted but has not run yet.
+struct DeferredStep {
+    flush: i32,
+    /// A copy of the input bytes: `lib/zlib.js` may reuse or drop its buffer
+    /// once `write()` returns, but the deferred step must see the bytes the
+    /// call was made with.
+    input: Vec<u8>,
+    /// `(pointer, length)` into the caller's output `Buffer`, exactly as
+    /// `node_zlib.cc` keeps `next_out_` across the threadpool hop.
+    output: (*mut u8, usize),
+    /// The output view, pinned so V8 cannot collect its backing store while
+    /// the step is queued.
+    output_keepalive: Option<v8::Global<v8::Value>>,
 }
 
 impl HandleState {
@@ -85,6 +126,8 @@ impl HandleState {
             write_cb: None,
             receiver: None,
             pending_error: None,
+            pending_step: None,
+            pending_close: false,
             write_in_progress: false,
             closed: false,
         }
@@ -106,6 +149,21 @@ impl HandleState {
         unsafe {
             *self.write_state = after.avail_out;
             *self.write_state.add(1) = after.avail_in;
+        }
+    }
+
+    /// Records the output buffer a queued async write was given.
+    ///
+    /// `node_zlib.cc` calls `SetBuffers()` inside `Write()` before the step is
+    /// scheduled, so `strm_.next_out`/`avail_out` already point at this write's
+    /// buffer while `params()` may still run. Replaying that here keeps
+    /// `deflateParams`' block flush writing where Node writes it.
+    fn set_pending_output(&mut self, output: (*mut u8, usize)) {
+        match &mut self.backend {
+            Backend::Zlib(stream) => stream.set_out_cursor(output),
+            // Brotli has no `params()` and zstd's is a no-op, so neither reads
+            // this cursor.
+            Backend::Brotli(_) | Backend::ZstdCompress(_) | Backend::ZstdDecompress(_) => {}
         }
     }
 
@@ -156,8 +214,25 @@ impl HandleState {
 
     /// `CompressionStream::Close()`: ends the compressor state, leaves the
     /// wrapper alive so a late callback cannot use freed memory.
+    ///
+    /// A queued step keeps the stream alive: `node_zlib.cc`'s `Close()` records
+    /// `pending_close_` and returns while `write_in_progress_` is set, and
+    /// `AfterThreadPoolWork` closes once the step and its callback are done.
+    /// Closing here instead would leave the queued step compressing into a
+    /// finished stream, which is how a flush write followed by `close()` used to
+    /// produce a spurious `Z_STREAM_ERROR`.
     fn close(&mut self) {
+        if self.write_in_progress {
+            self.pending_close = true;
+            return;
+        }
+        self.close_now();
+    }
+
+    /// The part of `close()` that actually ends the stream.
+    fn close_now(&mut self) {
         self.closed = true;
+        self.pending_close = false;
         match &mut self.backend {
             Backend::Zlib(stream) => stream.close(),
             Backend::Brotli(stream) => stream.close(),
@@ -165,6 +240,7 @@ impl HandleState {
             Backend::ZstdDecompress(stream) => stream.close(),
         }
         self.pending_error = None;
+        self.pending_step = None;
         // `write_cb` and `receiver` are *not* cleared here. Node's
         // `AfterThreadPoolWork` still calls the write callback after a close, and
         // `processCallback` handles it by checking `self.destroyed`. Clearing them
@@ -759,8 +835,14 @@ fn dictionary_bytes(value: v8::Local<v8::Value>) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(data, length) }.to_vec()
 }
 
-/// The shared body of `write`/`writeSync`: one compression step, then either
-/// the offsets published or `onerror` called.
+/// The shared body of `write`/`writeSync`.
+///
+/// `writeSync` runs the step inline, as `node_zlib.cc`'s `Write<false>` does.
+/// `write` only *accepts* the step and queues it: Node schedules it on the libuv
+/// threadpool and runs `DoThreadPoolWork` later, and that delay is load-bearing
+/// — `lib/zlib.js` calls `params()` from a write callback while the next write
+/// is already queued, so the parameter change has to reach a stream the queued
+/// step has not touched yet.
 fn run_step<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: &v8::FunctionCallbackArguments<'s>,
@@ -771,45 +853,72 @@ fn run_step<'s>(
     let Ok(input) = input_bytes(scope, args) else {
         return;
     };
+    let output_value = args.get(4);
     let Ok((output_pointer, output_length)) = output_range(scope, args) else {
         return;
     };
-    // SAFETY: `output_range` validated `output` against the caller's live
-    // backing store. The slice is created here and dropped at the end of this
-    // function, and `state.step` cannot run JavaScript, so nothing can alias it.
-    let output = unsafe { std::slice::from_raw_parts_mut(output_pointer, output_length) };
 
-    let outcome = with_state(object, |state| {
-        if state.closed {
-            return Err(StreamError::closed());
-        }
-        if asynchronous && state.write_in_progress {
-            return Err(StreamError::Zlib(ZlibError {
-                message: "write in progress".to_string(),
-                code: "Z_STREAM_ERROR",
-                err: Z_STREAM_ERROR,
-            }));
-        }
-
-        let after = state.step(flush, &input, output);
-        match state.error() {
-            // `writeSync` reports failures through `onerror`, which is where
-            // `processChunkSync` picks them up; `writeState` stays untouched.
-            Some(error) => Err(error),
-            None => {
-                state.store_after_write(after);
-                if asynchronous {
-                    // The queued completion reaches the state through a raw
-                    // pointer, so pin the wrapper until that microtask has run.
-                    // `complete_write` releases it, which is what keeps this
-                    // from becoming a reference cycle.
-                    state.write_in_progress = true;
-                    state.receiver = Some(v8::Global::new(scope, object));
-                }
-                Ok(())
+    let outcome = if asynchronous {
+        with_state(object, |state| {
+            if state.closed {
+                return Err(StreamError::closed());
             }
-        }
-    });
+            if state.write_in_progress {
+                // Node `CHECK`s this rather than reporting it, so a caller that
+                // reaches it is already outside the supported protocol. Throw
+                // instead of aborting the process.
+                return Err(StreamError::Zlib(ZlibError {
+                    message: "write in progress".to_string(),
+                    code: "Z_STREAM_ERROR",
+                    err: Z_STREAM_ERROR,
+                }));
+            }
+            // `node_zlib.cc` calls `SetBuffers()` before scheduling, so the
+            // cursor `params()` may use is already the queued write's.
+            state.set_pending_output((output_pointer, output_length));
+            state.pending_step = Some(DeferredStep {
+                flush,
+                input,
+                output: (output_pointer, output_length),
+                output_keepalive: Some(v8::Global::new(scope, output_value)),
+            });
+            state.write_in_progress = true;
+            // The queued completion reaches the state through a raw pointer, so
+            // pin the wrapper until that microtask has run. `complete_write`
+            // releases it, which is what keeps this from being a cycle.
+            state.receiver = Some(v8::Global::new(scope, object));
+            Ok(())
+        })
+    } else {
+        // SAFETY: `output_range` validated `output` against the caller's live
+        // backing store. The slice is created here and dropped at the end of
+        // this function, and `state.step` cannot run JavaScript, so nothing can
+        // alias it.
+        let output = unsafe { std::slice::from_raw_parts_mut(output_pointer, output_length) };
+        with_state(object, |state| {
+            if state.closed {
+                return Err(StreamError::closed());
+            }
+            if state.write_in_progress {
+                return Err(StreamError::Zlib(ZlibError {
+                    message: "write in progress".to_string(),
+                    code: "Z_STREAM_ERROR",
+                    err: Z_STREAM_ERROR,
+                }));
+            }
+            let after = state.step(flush, &input, output);
+            match state.error() {
+                // `writeSync` reports failures through `onerror`, which is
+                // where `processChunkSync` picks them up; `writeState` stays
+                // untouched.
+                Some(error) => Err(error),
+                None => {
+                    state.store_after_write(after);
+                    Ok(())
+                }
+            }
+        })
+    };
 
     match outcome {
         None => throw(scope, "zlib binding closed"),
@@ -863,8 +972,8 @@ fn schedule_completion<'s>(
     true
 }
 
-/// The deferred half of `write()`: `AfterThreadPoolWork` plus the callback
-/// invocation from `processCallback`.
+/// The deferred half of `write()`: `DoThreadPoolWork` plus `AfterThreadPoolWork`
+/// and the callback invocation from `processCallback`.
 fn complete_write<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -885,8 +994,29 @@ fn complete_write<'s>(
         return;
     };
 
+    // The step `write()` deferred. `close()` on a queued write leaves the stream
+    // open (`pending_close_`), so the state is still usable here; only
+    // `close_now` clears `pending_step`, and it cannot run while
+    // `write_in_progress` is set.
+    if let Some(step) = state.pending_step.take() {
+        // SAFETY: `run_step` validated this range against the caller's live
+        // backing store and `output_keepalive` kept that view reachable, so the
+        // bytes are still the caller's output buffer.
+        let output = unsafe { std::slice::from_raw_parts_mut(step.output.0, step.output.1) };
+        let after = state.step(step.flush, &step.input, output);
+        // The keepalive is dropped here, before any JavaScript runs again.
+        drop(step.output_keepalive);
+        if let Some(error) = state.error() {
+            state.pending_error = Some(error);
+        } else {
+            state.store_after_write(after);
+        }
+    }
+
     state.write_in_progress = false;
 
+    // `CompressionStream::AfterThreadPoolWork` reports the step's error before
+    // it finishes a close that arrived while the step was queued.
     if let Some(error) = state.pending_error.take() {
         let receiver = state
             .receiver
@@ -897,7 +1027,20 @@ fn complete_write<'s>(
         if let Some(object) = receiver {
             emit_error(scope, object, error);
         }
+        // `EmitError()` ends with the same `pending_close_` handling as
+        // `AfterThreadPoolWork`. `close_now` is idempotent, and in practice the
+        // JS `onerror` has already destroyed the engine, which closed the handle
+        // through `_destroy`.
+        if let Ok(mut state) = cell.try_borrow_mut() {
+            if state.pending_close {
+                state.close_now();
+            }
+        }
         return;
+    }
+
+    if state.pending_close {
+        state.close_now();
     }
 
     let callback = state

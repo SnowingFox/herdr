@@ -202,9 +202,14 @@ pub struct BrotliDecoder {
     dictionary: Vec<u8>,
     params: Vec<(i32, u32)>,
     result: BrotliResult,
-    /// The decoder's error code, rendered on arrival because
-    /// `BrotliDecoderErrorCode` is not part of the crate's public API.
-    error: Option<String>,
+    /// The decoder's error, as `(BrotliDecoderErrorString, errno)`.
+    ///
+    /// Both halves are captured when the failure happens, because they are what
+    /// `CompressionError` reports and `zlibOnError` puts on the JS `Error`.
+    /// `BrotliDecoderErrorCode` is not part of the crate's public API, so the
+    /// name is looked up from the numeric code in
+    /// [`brotli_decoder_error_code`].
+    error: Option<(&'static str, i32)>,
     flush: i32,
     closed: bool,
 }
@@ -256,7 +261,12 @@ impl BrotliDecoder {
         );
 
         if matches!(self.result, BrotliResult::ResultFailure) && self.error.is_none() {
-            self.error = Some(format!("{:?}", self.state.error_code));
+            // `node_zlib.cc` records both the numeric code and the string here,
+            // in `DoThreadPoolWork`, because `BrotliDecoderErrorString` is a C
+            // API the Rust crate does not export. `BrotliDecoderErrorCode` is
+            // `#[repr(C)]` and the field is public, so the numeric value is
+            // readable and the name follows from it.
+            self.error = Some(brotli_decoder_error_code(self.state.error_code as i32));
         }
 
         AfterWrite {
@@ -266,12 +276,17 @@ impl BrotliDecoder {
     }
 
     fn error_info(&self) -> Option<BrotliError> {
-        if let Some(code) = &self.error {
+        if let Some((code, err)) = &self.error {
             return Some(BrotliError {
                 message: "Decompression failed".to_string(),
-                // Node formats this as `"ERR_" + BrotliDecoderErrorString(code)`.
+                // `BrotliDecoderContext::DoThreadPoolWork` builds this as
+                // `std::string("ERR_") + BrotliDecoderErrorString(code)`, and
+                // `BrotliDecoderErrorString` returns `#PREFIX #NAME`. For the
+                // format errors the prefix is `_ERROR_FORMAT_`, so the code
+                // really is `ERR__ERROR_FORMAT_PADDING_2` — the doubled
+                // underscore is upstream's, not a typo.
                 code: format!("ERR_{code}"),
-                err: 0,
+                err: *err,
             });
         }
         // Brotli has no "unexpected end of file" code; Node maps a FINISH that
@@ -295,6 +310,58 @@ impl BrotliDecoder {
         self.params = params;
         None
     }
+}
+
+/// `BrotliDecoderErrorString(code)` from `deps/brotli/c/dec/decode.c`, which
+/// renders each entry of `BROTLI_DECODER_ERROR_CODES_LIST` as `#PREFIX #NAME`.
+///
+/// The table is transcribed from the vendored `decode.h` rather than derived
+/// from the Rust enum because two things differ between them: the crate has no
+/// `BLOCK_SWITCH` or `COMPOUND_DICTIONARY`, and its `BrotliDecoderErrorStr`
+/// misspells `CL_SPACE` as `FL_SPACE`. Node's `Error.code` is built from the C
+/// string, so the C spelling is what has to be reproduced.
+///
+/// A code outside the table yields Node's `default` branch, `"INVALID"`.
+fn brotli_decoder_error_name(code: i32) -> &'static str {
+    match code {
+        0 => "_NO_ERROR",
+        1 => "_SUCCESS",
+        2 => "_NEEDS_MORE_INPUT",
+        3 => "_NEEDS_MORE_OUTPUT",
+        -1 => "_ERROR_FORMAT_EXUBERANT_NIBBLE",
+        -2 => "_ERROR_FORMAT_RESERVED",
+        -3 => "_ERROR_FORMAT_EXUBERANT_META_NIBBLE",
+        -4 => "_ERROR_FORMAT_SIMPLE_HUFFMAN_ALPHABET",
+        -5 => "_ERROR_FORMAT_SIMPLE_HUFFMAN_SAME",
+        -6 => "_ERROR_FORMAT_CL_SPACE",
+        -7 => "_ERROR_FORMAT_HUFFMAN_SPACE",
+        -8 => "_ERROR_FORMAT_CONTEXT_MAP_REPEAT",
+        -9 => "_ERROR_FORMAT_BLOCK_LENGTH_1",
+        -10 => "_ERROR_FORMAT_BLOCK_LENGTH_2",
+        -11 => "_ERROR_FORMAT_TRANSFORM",
+        -12 => "_ERROR_FORMAT_DICTIONARY",
+        -13 => "_ERROR_FORMAT_WINDOW_BITS",
+        -14 => "_ERROR_FORMAT_PADDING_1",
+        -15 => "_ERROR_FORMAT_PADDING_2",
+        -16 => "_ERROR_FORMAT_DISTANCE",
+        -17 => "_ERROR_FORMAT_BLOCK_SWITCH",
+        -18 => "_ERROR_COMPOUND_DICTIONARY",
+        -19 => "_ERROR_DICTIONARY_NOT_SET",
+        -20 => "_ERROR_INVALID_ARGUMENTS",
+        -21 => "_ERROR_ALLOC_CONTEXT_MODES",
+        -22 => "_ERROR_ALLOC_TREE_GROUPS",
+        -25 => "_ERROR_ALLOC_CONTEXT_MAP",
+        -26 => "_ERROR_ALLOC_RING_BUFFER_1",
+        -27 => "_ERROR_ALLOC_RING_BUFFER_2",
+        -30 => "_ERROR_ALLOC_BLOCK_TYPE_TREES",
+        -31 => "_ERROR_UNREACHABLE",
+        _ => "INVALID",
+    }
+}
+
+/// The pair `BrotliDecoderContext` records for a failure.
+fn brotli_decoder_error_code(code: i32) -> (&'static str, i32) {
+    (brotli_decoder_error_name(code), code)
 }
 
 fn param_set_failed() -> BrotliError {
@@ -401,14 +468,43 @@ mod tests {
         assert_eq!(error.message, "unexpected end of file");
     }
 
+    /// `node -e 'try{zlib.brotliDecompressSync(Buffer.from("notbrotli"))}catch(e){...}'`
+    /// on the pinned oracle prints
+    /// `ERR__ERROR_FORMAT_PADDING_2 -15 Decompression failed`. The doubled
+    /// underscore is Node's: it prefixes `ERR_` to a string that already starts
+    /// with `_ERROR_FORMAT_`.
     #[test]
-    fn brotli_invalid_input_reports_decompression_failed() {
+    fn brotli_invalid_input_reports_node_error_code_and_errno() {
         let mut stream = BrotliStream::decoder(&[]);
         let mut out = vec![0u8; 1024];
-        stream.write(BROTLI_OPERATION_FINISH, &[0xff; 32], &mut out);
+        stream.write(BROTLI_OPERATION_FINISH, b"notbrotli", &mut out);
         let error = stream.error_info().expect("garbage must fail");
         assert_eq!(error.message, "Decompression failed");
-        assert!(error.code.starts_with("ERR_BROTLI"), "{}", error.code);
+        assert_eq!(error.code, "ERR__ERROR_FORMAT_PADDING_2");
+        assert_eq!(error.err, -15);
+    }
+
+    /// Every name in the table, checked against the C list in
+    /// `deps/brotli/c/include/brotli/decode.h`. The Rust crate's own
+    /// `BrotliDecoderErrorStr` cannot be used for this: it misspells
+    /// `CL_SPACE` as `FL_SPACE` and is missing the two entries below.
+    #[test]
+    fn decoder_error_names_match_the_c_list() {
+        assert_eq!(brotli_decoder_error_name(0), "_NO_ERROR");
+        assert_eq!(brotli_decoder_error_name(2), "_NEEDS_MORE_INPUT");
+        assert_eq!(
+            brotli_decoder_error_name(-1),
+            "_ERROR_FORMAT_EXUBERANT_NIBBLE"
+        );
+        // The crate's own string table says ERROR_FORMAT_FL_SPACE.
+        assert_eq!(brotli_decoder_error_name(-6), "_ERROR_FORMAT_CL_SPACE");
+        assert_eq!(brotli_decoder_error_name(-15), "_ERROR_FORMAT_PADDING_2");
+        // Present in the C list, absent from the Rust enum.
+        assert_eq!(brotli_decoder_error_name(-17), "_ERROR_FORMAT_BLOCK_SWITCH");
+        assert_eq!(brotli_decoder_error_name(-18), "_ERROR_COMPOUND_DICTIONARY");
+        assert_eq!(brotli_decoder_error_name(-31), "_ERROR_UNREACHABLE");
+        // Node's `default` branch.
+        assert_eq!(brotli_decoder_error_name(-99), "INVALID");
     }
 
     #[test]
