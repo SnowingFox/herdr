@@ -354,18 +354,18 @@ fn cache_version_tag(portable: bool) -> String {
     }
 }
 
-/// Stands in for `ScriptCompiler::CachedDataVersionTag`.
+/// `ScriptCompiler::CachedDataVersionTag`, which is the value V8 itself uses to
+/// decide whether cached data is compatible.
 ///
-/// The `v8` crate does not expose that call, and the value only has to
-/// distinguish incompatible caches, so it is derived from the pinned V8 version
-/// instead. Two runtimes with different V8 versions therefore never share a
-/// cache directory, which is the property that matters.
+/// The old code derived a tag by hashing a hardcoded version string, with a
+/// comment saying the `v8` crate did not expose this call. It does:
+/// `v8::script_compiler::cached_data_version_tag()`. Asking V8 is strictly
+/// better than imitating it, because V8's tag also moves when a build-time
+/// feature changes, which a version string cannot see — the v8 header is
+/// explicit that the tag guards "the same version with different features
+/// enabled".
 fn v8_cache_tag() -> u32 {
-    let mut hash = 0u32;
-    for byte in crate::V8_VERSION.as_bytes() {
-        hash = hash.wrapping_mul(31).wrapping_add(u32::from(*byte));
-    }
-    hash
+    rn_v8_sys::v8::script_compiler::cached_data_version_tag()
 }
 
 /// Cache key: `crc32(type_byte ++ filename)`.
@@ -720,5 +720,48 @@ mod tests {
     fn uid() -> u32 {
         // SAFETY: `getuid` takes no arguments and cannot fail.
         unsafe { libc::getuid() }
+    }
+}
+
+#[cfg(test)]
+mod cache_tag_tests {
+    use super::*;
+
+    /// The tag must come from V8, not from a transcribed version string.
+    ///
+    /// The constant it replaced said `"15.6.75"` — the version Node's pin names —
+    /// while the linked engine reports `15.2.124.1-rusty`. A tag is supposed to
+    /// keep two engines' caches apart, so a value naming neither engine defeats
+    /// the property it exists for.
+    #[test]
+    fn the_cache_tag_is_v8s_own_and_not_the_transcribed_hash() {
+        let tag = v8_cache_tag();
+        assert_ne!(tag, 0, "V8's cached-data version tag must not be zero");
+
+        let mut from_old_constant = 0u32;
+        for byte in "15.6.75".as_bytes() {
+            from_old_constant = from_old_constant
+                .wrapping_mul(31)
+                .wrapping_add(u32::from(*byte));
+        }
+        assert_ne!(
+            tag, from_old_constant,
+            "the real V8 tag must differ from the hash of the old hardcoded version"
+        );
+    }
+
+    /// The linked engine is not the pin's engine, which is why the constant was
+    /// wrong. This fails if that ever stops being true, so the reasoning above
+    /// does not quietly go stale.
+    #[test]
+    fn the_linked_engine_is_not_the_pinned_one() {
+        let linked = crate::v8_version();
+        assert!(!linked.is_empty(), "V8 reports a version string");
+        assert_ne!(
+            linked, "15.6.75",
+            "if the linked engine ever matches the pin, revisit whether deriving \
+             the tag from a string is acceptable again; when this constant was \
+             written the engine was 15.2.x against a 15.6 pin"
+        );
     }
 }
