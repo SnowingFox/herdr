@@ -473,7 +473,28 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
 /// Delivers one staged chunk to `stream_id`'s readable side.
 ///
 /// Only called from [`flush_inbound`], once `nghttp2_session_mem_recv` returned.
+///
+/// The destroyed check happens here and not only where the bytes were staged:
+/// staging defers delivery across the tick `'response'` was queued on, and that
+/// tick is exactly where `core.js` can destroy the stream. Emitting into a
+/// destroyed readable side is what makes `onStreamRead` read a stale positive byte
+/// count as errno (7616, `ERR_OUT_OF_RANGE`) — the hazard `Http2Stream::Destroy`
+/// documents and `deliver_data` already guards at its own entry.
 fn emit_read(session: &SessionState, stream_id: i32, payload: Vec<u8>) {
+    // Only a stream `core.js` has destroyed must be skipped. A missing record is
+    // not by itself that signal — `on_stream_close` retires the record for a normal
+    // end too, and dropping those reads is what emptied an ordinary response.
+    if session
+        .streams
+        .borrow()
+        .get(&stream_id)
+        .is_some_and(|record| record.destroyed)
+    {
+        return;
+    }
+    if session.destroyed_streams.borrow().contains(&stream_id) {
+        return;
+    }
     let _ = rn_uv::callback::with_context(|scope| {
         // Without a handle there is nothing to deliver to, and `in_stream_scope`
         // below would find nothing anyway.
@@ -930,6 +951,7 @@ fn destroy(
         if let Some(record) = state.streams.borrow_mut().get_mut(&id) {
             record.destroyed = true;
         }
+        state.destroyed_streams.borrow_mut().insert(id);
         submit_rst(state, id, ffi::NGHTTP2_CANCEL_CODE);
     }
 }

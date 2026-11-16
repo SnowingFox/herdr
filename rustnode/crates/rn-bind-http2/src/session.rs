@@ -247,6 +247,14 @@ pub struct SessionState {
     /// the same defect increment 6 fixed at the RST site, one layer down. A
     /// `Vec` is therefore correct and a set or a per-kind slot is not.
     pub deferred_submits: RefCell<Vec<DeferredSubmit>>,
+    /// Streams JavaScript has destroyed, remembered past the record's removal.
+    ///
+    /// `Http2Stream::Destroy` marks the record, and `on_stream_close` removes that
+    /// record. Staged body delivery happens after both, so it needs a signal that
+    /// survives the removal: emitting into a destroyed readable side makes
+    /// `onStreamRead` read a stale byte count as errno (7616, `ERR_OUT_OF_RANGE`),
+    /// which is the hazard `src/node_http2.cc` documents at `Http2Stream::Destroy`.
+    pub destroyed_streams: RefCell<std::collections::BTreeSet<i32>>,
     /// Readable-side events staged during `mem_recv`, in arrival order.
     ///
     /// See [`InboundEvent`] for why this exists and why it is one ordered queue.
@@ -376,6 +384,7 @@ impl SessionState {
             pending_dispose: Cell::new(false),
             pending_destroy: Cell::new(None),
             deferred_submits: RefCell::new(Vec::new()),
+            destroyed_streams: RefCell::new(std::collections::BTreeSet::new()),
             inbound: RefCell::new(Vec::new()),
             graceful_close: Cell::new(false),
             graceful_close_notified: Cell::new(false),
