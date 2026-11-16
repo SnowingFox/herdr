@@ -1227,6 +1227,8 @@ dependencies = [
  "foreign-types",
  "openssl",
  "openssl-sys",
+ "rn-bind-crypto-x509",
+ "rn-bind-options",
  "rn-core",
  "rn-v8-sys",
 ]

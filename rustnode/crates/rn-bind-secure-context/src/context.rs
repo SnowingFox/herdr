@@ -38,6 +38,19 @@ use openssl_sys as ffi;
 
 use crate::ffi_extra;
 
+/// Whether a boolean CLI option was passed.
+///
+/// `rn-bind-options` stores parsed values per process; before the CLI installs a
+/// store there is none, and the answer is then "not set", which is also the
+/// option's default. Reading it through this helper keeps the two flags
+/// `add_root_certs` consults from being spelled differently.
+fn option_is_set(name: &str) -> bool {
+    matches!(
+        rn_bind_options::parsed::value_of(name),
+        Some(rn_bind_options::parsed::ParsedValue::Bool(true))
+    )
+}
+
 /// `kMaxSupportedVersion` in `crypto_context.h`: what `max_version == 0` means.
 ///
 /// It is `TLS1_3_VERSION`, not "whatever OpenSSL supports", because a future
@@ -638,17 +651,65 @@ impl Context {
         }
     }
 
-    /// `addRootCerts`: load the system trust store into this context.
+    /// `addRootCerts`: load the trust store this context verifies against.
     ///
-    /// Node merges a bundled root store, the system store and an optional
-    /// user-configured extra store. Only the system store exists here, which
-    /// [`crate::stubs`] records rather than implying.
+    /// Node's `SetRootCerts` calls `UseDefaultRootCertStore`, which is
+    /// `NewRootCertStore`: the bundled roots by default, the system store as
+    /// well only under `--use-system-ca` (or alone under `--use-openssl-ca`,
+    /// which is `X509_STORE_set_default_paths`). `NODE_EXTRA_CA_CERTS` and a
+    /// reset user store are applied by `lib/tls.js` and the other getters, not
+    /// here.
+    ///
+    /// Installing the bundled roots is what makes a default `https.get` verify
+    /// at all. Until this landed, `addRootCerts` called `set_default_paths`,
+    /// i.e. the system store only: on a host with no OpenSSL default CA file
+    /// that is zero anchors, so every chain failed with
+    /// `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` no matter which roots Node ships.
     pub fn add_root_certs(&mut self) -> Result<(), ContextError> {
+        let openssl_ca = option_is_set("--use-openssl-ca");
+        let system_ca = option_is_set("--use-system-ca");
+
         let context = self.context()?;
         let store = context.cert_store_mut();
-        store
-            .set_default_paths()
-            .map_err(|error| ContextError::Install(error.to_string()))
+
+        if openssl_ca {
+            // `X509_STORE_set_default_paths`: the whole store is the OS trust
+            // store, and the bundled roots are deliberately *not* added, which
+            // is the documented meaning of the flag.
+            return store
+                .set_default_paths()
+                .map_err(|error| ContextError::Install(error.to_string()));
+        }
+
+        // A duplicate CA is not an error: Node ignores the return value of
+        // `X509_STORE_add_cert` for exactly that reason, and the bundled set
+        // holds no duplicates to begin with.
+        for pem in rn_bind_crypto_x509::root_store::bundled() {
+            match X509::from_pem(pem.as_bytes()) {
+                Ok(certificate) => {
+                    let _ = store.add_cert(certificate);
+                }
+                // `InitializeBundledRootCertificates` calls `CHECK(x509)` on
+                // each of these, so an unparseable bundled root aborts a Node
+                // process. That is a defect in the generated blob rather than
+                // something a caller can respond to, and a test pins every
+                // root parsing, so this cannot fire in a correct build.
+                Err(error) => {
+                    return Err(ContextError::Install(format!(
+                        "bundled root certificate failed to parse: {error}"
+                    )));
+                }
+            }
+        }
+
+        if system_ca {
+            // `X509_STORE_load_locations` in Node; `set_default_paths` is the
+            // same OpenSSL call chain and is additive to what is already there.
+            store
+                .set_default_paths()
+                .map_err(|error| ContextError::Install(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// `getTicketKeys`.
@@ -1027,5 +1088,73 @@ mod tests {
         assert!(context
             .add_ca_cert(b"-----BEGIN CERTIFICATE-----\nnot a cert\n")
             .is_err());
+    }
+
+    /// `addRootCerts` installs the bundled roots, not the OS store.
+    ///
+    /// This is the difference the bundled blob is for. Counting alone is not
+    /// enough — an empty system store and a populated bundle are the same
+    /// observable failure from JavaScript — so the store's actual certificates
+    /// are collected and compared to [`BUNDLED_ROOTS`] by DER.
+    #[test]
+    fn add_root_certs_installs_the_bundled_roots() {
+        use foreign_types::ForeignTypeRef;
+        use openssl::x509::X509Ref;
+        use openssl_sys as ffi;
+
+        use rn_bind_crypto_x509::root_certs::BUNDLED_ROOTS;
+
+        let mut context = Context::default();
+        context.init(None, 0, 0).expect("init");
+        context.add_root_certs().expect("add root certs");
+
+        // SAFETY: `inner` owns a live `SSL_CTX`; the store and its object stack
+        // are borrowed from it. Each `X509_OBJECT` in the stack, and the `X509`
+        // inside it, are owned by the store: `X509_OBJECT_get0_X509` returns a
+        // *borrowed* pointer, so it is read through `X509Ref` and never freed
+        // here.
+        let installed: Vec<Vec<u8>> = unsafe {
+            let inner = context.inner.as_ref().expect("initialised");
+            let store = ffi::SSL_CTX_get_cert_store(inner.as_ptr());
+            assert!(!store.is_null(), "no cert store on the context");
+            let stack = ffi::X509_STORE_get0_objects(store);
+            assert!(!stack.is_null(), "no objects stack in the cert store");
+            let count = ffi::OPENSSL_sk_num(stack.cast());
+            let mut encoded = Vec::with_capacity(count.max(0) as usize);
+            for index in 0..count {
+                let object = ffi::OPENSSL_sk_value(stack.cast(), index);
+                assert!(!object.is_null(), "null X509_OBJECT in the store");
+                let certificate = ffi::X509_OBJECT_get0_X509(object.cast());
+                if certificate.is_null() {
+                    continue;
+                }
+                let borrowed = X509Ref::from_ptr(certificate as *mut _);
+                encoded.push(borrowed.to_der().expect("store certificate DER"));
+            }
+            encoded
+        };
+
+        assert_eq!(
+            installed.len(),
+            BUNDLED_ROOTS.len(),
+            "the store should hold exactly the bundled roots"
+        );
+
+        let mut installed = installed;
+        let mut expected: Vec<Vec<u8>> = BUNDLED_ROOTS
+            .iter()
+            .map(|pem| {
+                X509::from_pem(pem.as_bytes())
+                    .expect("bundled root parses")
+                    .to_der()
+                    .expect("bundled root encodes")
+            })
+            .collect();
+        installed.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            installed, expected,
+            "the stored anchors are not the bundled certificates"
+        );
     }
 }

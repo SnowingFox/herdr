@@ -51,6 +51,7 @@ pub mod extras;
 pub mod legacy;
 pub mod names;
 pub mod pkcs12;
+pub mod root_certs;
 pub mod root_store;
 pub mod snapshot;
 

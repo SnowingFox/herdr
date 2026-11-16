@@ -25,12 +25,12 @@
 //!
 //! # The root store
 //!
-//! `getBundledRootCertificates()` returns the PEM of Node's compiled-in roots.
-//! rustnode has no compiled-in root bundle (that is a 200 KB blob generated from
-//! `node_root_certs.h`), so this returns an empty list rather than inventing
-//! one: `lib/tls.js` stores whatever comes back and `tls.getCACertificates`
-//! reports it, so an empty list is an honest "no bundled roots" instead of a
-//! fabricated trust anchor. The user and system stores are real.
+//! `getBundledRootCertificates()` returns the PEM of Node's compiled-in roots,
+//! which are `crate::root_certs::BUNDLED_ROOTS`: the same 118 certificates, in
+//! the same order, that `src/node_root_certs.h` holds at the pinned revision.
+//! `lib/tls.js` stores whatever comes back and `tls.getCACertificates` reports
+//! it, so this is now Node's list rather than an empty one. The user and system
+//! stores are real as well.
 
 use std::sync::{Mutex, OnceLock};
 
