@@ -807,6 +807,13 @@ pub fn read_file_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    // `install_job` writes an internal field on `this`, which a plain call does
+    // not make an instance of this class, so the receiver has to be rejected
+    // before the write rather than after it.
+    if !args.is_construct_call() {
+        throw_invalid_arguments(scope);
+        return;
+    }
     // `CHECK_GE(args.Length(), 3)`, `CHECK(args[1]->IsInt32())` and
     // `CHECK(args[2]->IsNumber())` in Node abort on a bad shape. The JS layer
     // always passes them, so a mismatch means a direct binding caller got it
@@ -816,7 +823,7 @@ pub fn read_file_constructor<'s>(
         crate::args::int32(scope, args.get(1)),
         args.get(2).number_value(scope),
     ) else {
-        throw_invalid_arguments(scope, &mut rv);
+        throw_invalid_arguments(scope);
         return;
     };
     let track_fd = args.length() > 3 && args.get(3).is_true();
@@ -831,18 +838,22 @@ pub fn write_file_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw_invalid_arguments(scope);
+        return;
+    }
     let (Some(path), Some(flags), Some(mode)) = (
         crate::args::path_bytes(scope, args.get(0)),
         crate::args::int32(scope, args.get(1)),
         crate::args::uint32(scope, args.get(2)),
     ) else {
-        throw_invalid_arguments(scope, &mut rv);
+        throw_invalid_arguments(scope);
         return;
     };
     // `CHECK(args[3]->IsArrayBufferView())`: the buffer is required, because
     // `lib/fs.js` converts a string to a Buffer before constructing the job.
     let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(3)) else {
-        throw_invalid_arguments(scope, &mut rv);
+        throw_invalid_arguments(scope);
         return;
     };
     let mut data = vec![0u8; view.byte_length()];
@@ -857,9 +868,16 @@ pub fn write_file_constructor<'s>(
 }
 
 /// Reports a constructor call whose arguments do not fit the class.
-fn throw_invalid_arguments(scope: &mut v8::PinScope<'_, '_>, rv: &mut v8::ReturnValue) {
+///
+/// `scope.throw_exception`, not `rv.set`: returning an exception object from a
+/// callback makes it the call's *value*, so a caller sees a `TypeError` instance
+/// where it expected an error to be thrown. That is what this function used to
+/// do, and it made the two job constructors answer a plain call with a returned
+/// error instead of a thrown one.
+fn throw_invalid_arguments(scope: &mut v8::PinScope<'_, '_>) {
     if let Some(text) = v8::String::new(scope, "invalid arguments for the file job") {
-        rv.set(v8::Exception::type_error(scope, text));
+        let exception = v8::Exception::type_error(scope, text);
+        scope.throw_exception(exception);
     }
 }
 

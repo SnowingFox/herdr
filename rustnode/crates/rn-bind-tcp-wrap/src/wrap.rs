@@ -45,10 +45,14 @@ pub fn constructor<'s>(
 /// `lib/net.js` only ever writes properties onto the result, so there is nothing
 /// to do here.
 fn connect_wrap_new(
-    _scope: &mut v8::PinScope<'_, '_>,
+    scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
+    if !args.is_construct_call() {
+        crate::handle::throw_type_error(scope, "TCPConnectWrap cannot be invoked without 'new'");
+        return;
+    }
     let object = args.this();
     rv.set(object.into());
 }

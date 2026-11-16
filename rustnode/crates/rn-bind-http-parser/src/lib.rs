@@ -394,6 +394,10 @@ fn parser_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw(scope, "HTTPParser cannot be invoked without 'new'");
+        return;
+    }
     // SAFETY: `args.this()` is the object the template's instance template
     // produced, so it has the internal field this constructor fills.
     let Some(raw) = (unsafe { Parser::create(scope, args.this()) }) else {
@@ -862,6 +866,10 @@ fn connections_list_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue,
 ) {
+    if !args.is_construct_call() {
+        throw(scope, "ConnectionsList cannot be invoked without 'new'");
+        return;
+    }
     let raw: *mut Rc<RefCell<ConnectionsList>> =
         Box::into_raw(Box::new(Rc::new(RefCell::new(ConnectionsList::new()))));
     args.this().set_aligned_pointer_in_internal_field(

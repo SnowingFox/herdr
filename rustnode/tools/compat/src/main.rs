@@ -83,6 +83,7 @@ struct Row {
 const USAGE: &str = "\
 usage: rn-compat contracts [<contracts-dir>] [--report] [--fail-on-unimplemented] [--quiet]
                            [--baseline <file>] [--write-baseline <file>]
+       rn-compat namespaces
 
   contracts                  check the Rust registry against contracts/
   contracts <dir>            check against another directory
@@ -95,7 +96,63 @@ usage: rn-compat contracts [<contracts-dir>] [--report] [--fail-on-unimplemented
                              no longer is; the ratchet that stops coverage
                              sliding backwards while unregistered namespaces
                              are still tolerated
-  --write-baseline <file>    record the currently complete namespaces";
+  --write-baseline <file>    record the currently complete namespaces
+  namespaces                 print every registered namespace as JSON
+  deferred                   print every declared deferral as JSON
+
+  The `namespaces` and `deferred` subcommands exist so the without-`new` audit
+  derives its input from the same registry `internalBinding()` resolves through,
+  rather than from lists someone maintains by hand. `namespaces` prints the
+  namespaces this build can install, which is the set a JavaScript probe can
+  reach; `deferred` prints the member gaps each crate declared for itself.";
+
+/// `rn-compat namespaces`: the registry's installable namespaces, one per line
+/// of a JSON array.
+///
+/// A namespace registered with a contract but no installer is omitted: the
+/// audit calls `internalBinding(name)` and cannot reach one of those, so
+/// listing it would only produce a fake "missing binding" row.
+fn print_namespaces() {
+    let mut registry = rn_core::BindingRegistry::new();
+    rn_bindings::install_all(&mut registry);
+    let names: Vec<&str> = registry
+        .names()
+        .filter(|name| registry.can_install(name))
+        .collect();
+    match serde_json::to_string(&names) {
+        Ok(json) => println!("{json}"),
+        Err(error) => {
+            eprintln!("cannot serialise the namespace list: {error}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// `rn-compat deferred`: every member each namespace declares it does not
+/// install yet, as `{"namespace": {"member": "reason"}}`.
+///
+/// The without-`new` audit uses this to explain a constructor it could not
+/// exercise. Reading the reasons from the registry is what keeps the audit from
+/// growing a second, hand-maintained list of gaps that would drift out of step
+/// with the crates' own declarations.
+fn print_deferred() {
+    let mut registry = rn_core::BindingRegistry::new();
+    rn_bindings::install_all(&mut registry);
+    let mut out: BTreeMap<&str, &BTreeMap<String, String>> = BTreeMap::new();
+    for namespace in registry.namespaces() {
+        if namespace.deferred.is_empty() {
+            continue;
+        }
+        out.insert(&namespace.name, &namespace.deferred);
+    }
+    match serde_json::to_string(&out) {
+        Ok(json) => println!("{json}"),
+        Err(error) => {
+            eprintln!("cannot serialise the deferral list: {error}");
+            std::process::exit(2);
+        }
+    }
+}
 
 /// Options for the coverage ratchet.
 #[derive(Debug, Default)]
@@ -297,6 +354,16 @@ impl Row {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `namespaces` takes no options, so it is answered before the contracts
+    // option parser, which would otherwise treat it as a contracts directory.
+    if args.first().map(String::as_str) == Some("namespaces") {
+        print_namespaces();
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("deferred") {
+        print_deferred();
+        return Ok(());
+    }
     let options = match parse_args(&args) {
         Ok(options) => options,
         Err(message) => {

@@ -80,6 +80,29 @@ pub fn install_classes<'s>(
     Ok(())
 }
 
+/// Rejects a call that did not use `new`.
+///
+/// Node's job constructors are entered through `NewFunctionTemplate` with
+/// `ConstructorBehavior::kAllow`, and every one of them reaches a
+/// `set_aligned_pointer_in_internal_field` on `args.This()`. Called as a plain
+/// function, `This()` is the global object, that write is out of bounds, and V8
+/// aborts the process. Node does abort here too, so this is not a divergence in
+/// the strict sense; it is a divergence from what a caller can survive, and the
+/// tree's policy (see `rn-bind-stream-wrap`) is that a misuse is a catchable
+/// `TypeError` rather than a crash. Returning `undefined` instead would be
+/// worse than throwing: the caller would get a value where Node gave it a dead
+/// process, and `new Job()` would still work.
+pub(crate) fn require_new(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+) -> bool {
+    if args.is_construct_call() {
+        return true;
+    }
+    throw(scope, &KeyError::ConstructCallRequired);
+    false
+}
+
 /// The parameters a key-pair job generates from.
 struct KeyPairSpec {
     algorithm: KeyAlgorithm,
@@ -529,6 +552,9 @@ fn secret_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !require_new(scope, &args) {
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let Some(mode) = JobMode::from_raw(args.get(0).int32_value(scope).unwrap_or(-1)) else {
         throw(scope, &KeyError::InvalidKeyType);
@@ -556,6 +582,9 @@ fn rsa_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !require_new(scope, &args) {
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let Some(mode) = JobMode::from_raw(args.get(0).int32_value(scope).unwrap_or(-1)) else {
         throw(scope, &KeyError::InvalidKeyType);
@@ -622,6 +651,9 @@ fn ec_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !require_new(scope, &args) {
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let Some(mode) = JobMode::from_raw(args.get(0).int32_value(scope).unwrap_or(-1)) else {
         throw(scope, &KeyError::InvalidKeyType);
@@ -665,6 +697,9 @@ fn named_constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    if !require_new(scope, &args) {
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let Some(mode) = JobMode::from_raw(args.get(0).int32_value(scope).unwrap_or(-1)) else {
         throw(scope, &KeyError::InvalidKeyType);

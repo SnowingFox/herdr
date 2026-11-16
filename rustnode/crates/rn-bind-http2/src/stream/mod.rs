@@ -144,9 +144,16 @@ pub fn constructor<'s>(
 /// state and every method on it reports the "no state" case rather than crashing.
 fn new(
     _scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
 ) {
+    // Node's template has no `New` callback at all, so V8 applies the default
+    // return: the value of `this`. Called with `new` that is the fresh instance,
+    // which is why the receiver is echoed here rather than left as `undefined`.
+    // Called without `new` it is the global object, which is also exactly what
+    // Node yields - the one constructor in this namespace where a plain call is
+    // legal and the answer is observable.
+    rv.set(args.this().into());
 }
 
 /// The state behind a stream handle object.

@@ -46,6 +46,25 @@ pub const MEMBERS: &[&str] = &[
     "uvMetricsInfo",
 ];
 
+/// The members this namespace declares it does not install yet, with the reason.
+///
+/// `perf_hooks` constructs both classes, so a namespace that published
+/// `undefined` under these names looked complete to `rn-compat` while failing at
+/// the first `new`. They are declared here instead, and the install leaves the
+/// names off rather than setting them to `undefined`.
+pub const DEFERRED: &[(&str, &str)] = &[
+    (
+        "Histogram",
+        "the histogram subsystem and the hdr-histogram it measures do not exist; \
+         perf_hooks builds one through this binding, so the class is deferred \
+         with the rest of that surface",
+    ),
+    (
+        "SlidingWindowHistogram",
+        "built on the same histogram subsystem as Histogram, deferred with it",
+    ),
+];
+
 /// `NODE_PERFORMANCE_MILESTONES` in `src/node_perf_common.h`, in enum order.
 pub const MILESTONES: &[(&str, usize)] = &[
     ("TIME_ORIGIN_TIMESTAMP", 0),
@@ -160,6 +179,17 @@ impl BindingModule for Performance {
         MEMBERS
     }
 
+    fn deferred(&self) -> &'static [(&'static str, &'static str)] {
+        // Installing these as `undefined` is not the same as not installing
+        // them: `members()` claimed the names, so `rn-compat` counted them as
+        // covered and the without-`new` audit saw an absent constructor with no
+        // declared reason. `perf_hooks` reads both as classes, so a namespace
+        // that publishes `undefined` under those names fails at the first
+        // `new Histogram()` with a message about `undefined` not being a
+        // constructor. Declaring the gap is what keeps that visible.
+        DEFERRED
+    }
+
     fn install<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
@@ -197,7 +227,7 @@ impl BindingModule for Performance {
         });
 
         let object = v8::Object::new(scope);
-        let values: [(&str, v8::Local<v8::Value>); 15] = [
+        let values: [(&str, v8::Local<v8::Value>); 13] = [
             ("milestones", milestone_array),
             ("observerCounts", observer_array),
             ("uvMetricsBuffer", uv_array),
@@ -235,18 +265,16 @@ impl BindingModule for Performance {
             ),
             // The two histogram constructors need the histogram subsystem in
             // `internal/histogram.js`, which drives them through this binding.
-            ("Histogram", undefined_value(scope)),
-            ("SlidingWindowHistogram", undefined_value(scope)),
+            // They are declared in `DEFERRED` and deliberately not set here: an
+            // own property holding `undefined` still answers `'Histogram' in
+            // performance`, which reads as present to `lib/**` and to
+            // `rn-compat`, so the honest shape is the missing one.
         ];
         for (name, value) in values {
             set(scope, object, name, value)?;
         }
         Ok(object)
     }
-}
-
-fn undefined_value<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
-    v8::undefined(scope).into()
 }
 
 /// Registers the namespace with the runtime.

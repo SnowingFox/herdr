@@ -192,11 +192,10 @@ fn construct<'s>(
     mut rv: v8::ReturnValue<'s>,
 ) {
     if !args.is_construct_call() {
-        errors::throw_coded(
-            scope,
-            "ERR_CONSTRUCT_CALL_REQUIRED",
-            "Class constructor Database cannot be invoked without 'new'",
-        );
+        // `THROW_ERR_CONSTRUCT_CALL_REQUIRED`, which is a `TypeError` in
+        // `internal/errors`. The message and code were already right; the class
+        // was not.
+        errors::throw_construct_call_required(scope);
         return;
     }
     let Some(location) = db::path_argument(scope, args.get(0), "path") else {

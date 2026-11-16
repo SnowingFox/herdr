@@ -65,6 +65,20 @@ pub fn throw_type(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     throw_with_code(scope, exception, "ERR_INVALID_ARG_TYPE");
 }
 
+/// Throws the `TypeError` `internal/errors` builds for
+/// `ERR_CONSTRUCT_CALL_REQUIRED`.
+///
+/// `Database::New` uses `THROW_ERR_CONSTRUCT_CALL_REQUIRED`, and that macro's
+/// entry in `node_errors.h` is a `TypeError`, so the class is part of the
+/// observable contract: `assert.throws(fn, TypeError)` passes on it.
+pub fn throw_construct_call_required(scope: &mut v8::PinScope<'_, '_>) {
+    let Some(text) = v8::String::new(scope, "Cannot call constructor without `new`") else {
+        return;
+    };
+    let exception = v8::Exception::type_error(scope, text);
+    throw_with_code(scope, exception, "ERR_CONSTRUCT_CALL_REQUIRED");
+}
+
 /// Throws a `RangeError` carrying `code: 'ERR_OUT_OF_RANGE'`.
 pub fn throw_range(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     let Some(text) = v8::String::new(scope, message) else {

@@ -115,6 +115,14 @@ fn constructor<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
+    // A call without `new` gets the global object as `this`, which has no
+    // embedder fields, so the write below would abort inside V8. Node aborts
+    // here too (`Sign::New` is `CHECK(args.IsConstructCall())`); throwing keeps
+    // the misuse catchable without changing what a correct call does.
+    if !args.is_construct_call() {
+        throw_construct_call_required(scope);
+        return;
+    }
     let this: v8::Local<v8::Object> = args.this();
     let pointer = Box::into_raw(Box::new(RefCell::new(SignState::new())));
     this.set_aligned_pointer_in_internal_field(
@@ -789,6 +797,29 @@ fn throw_coded(scope: &mut v8::PinScope<'_, '_>, message: &str, code: &str) {
     };
     if let Some(code_key) = v8::String::new(scope, "code") {
         if let Some(code_value) = v8::String::new(scope, code) {
+            object.set(scope, code_key.into(), code_value.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
+
+/// `ERR_CONSTRUCT_CALL_REQUIRED`, which `internal/errors` declares as a
+/// `TypeError`.
+///
+/// `Sign::New` has `CHECK(args.IsConstructCall())`, so Node aborts the process
+/// here. rustnode throws instead: the caller's mistake stays catchable, and the
+/// error class matches what Node throws for the codes it does not abort on.
+fn throw_construct_call_required(scope: &mut v8::PinScope<'_, '_>) {
+    let Some(text) = v8::String::new(scope, "Cannot call constructor without `new`") else {
+        return;
+    };
+    let exception = v8::Exception::type_error(scope, text);
+    let Ok(object) = v8::Local::<v8::Object>::try_from(exception) else {
+        scope.throw_exception(exception);
+        return;
+    };
+    if let Some(code_key) = v8::String::new(scope, "code") {
+        if let Some(code_value) = v8::String::new(scope, "ERR_CONSTRUCT_CALL_REQUIRED") {
             object.set(scope, code_key.into(), code_value.into());
         }
     }
