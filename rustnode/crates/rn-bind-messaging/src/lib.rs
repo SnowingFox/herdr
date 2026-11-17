@@ -72,7 +72,8 @@ pub use crate::delivery::{
     emit_message_installed, has_delivery_pending, install_emit_message, run as run_message_ports,
 };
 pub use crate::port::{
-    has_deliverable_message, live_port_count, schedule_ports_with_mail, set_check_phase_armed,
+    has_deliverable_message, live_port_count, refresh_owner_tokens, schedule_ports_with_mail,
+    set_check_phase_armed,
 };
 
 /// Whether a `MessagePort` is still keeping the loop alive.
