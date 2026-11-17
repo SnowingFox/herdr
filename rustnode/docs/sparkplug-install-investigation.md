@@ -13,11 +13,16 @@ All runs were executed from `/tmp/rustnode-node-src` with:
 - release `rustnode` binary
 - target: `test/parallel/test-diagnostics-channel-child-process.js`
 
-## Before/after counts (30-run samples)
+## Before/after counts (30-run samples, reproduced by the coordinator)
 
-- before fix (`2b07ea18`): **18/30 pass, 12/30 segfault**
+- before fix: **14/30 pass, 16/30 segfault** (the worker's own sample: 18/30)
 - before-fix control (`--no-baseline-batch-compilation`): **30/30 pass**
-- after fix (`922a1189`): **30/30 pass, 0/30 segfault**
+- after fix: **30/30 pass, 0/30 segfault**, on both machines
+
+The two pre-fix samples differ (14/30 and 18/30) because the rate is roughly
+1 in 2 rather than fixed; both are far from 30/30, and the post-fix sample is
+30/30 on two independent machines. That is the comparison that matters, and it
+is why the pre-fix control run is included.
 
 ## Root cause
 
