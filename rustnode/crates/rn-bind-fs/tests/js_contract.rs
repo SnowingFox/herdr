@@ -146,6 +146,54 @@ fn open_write_read_close_round_trip_through_javascript() {
 }
 
 #[test]
+fn write_file_utf8_accepts_an_existing_fd() {
+    let dir = TempDir::new("write-file-utf8-fd");
+    let file = js_path(&dir.joined("data.txt"));
+
+    let out = run(&format!(
+        r#"
+        const path = '{file}';
+        // O_RDWR | O_CREAT | O_TRUNC in libuv's numeric encoding.
+        const openFlags = 0x0002 | 0x0040 | 0x0200;
+        const fd = fsBinding.open(path, openFlags, 0o644);
+        // The fast path must treat the first argument as an fd and skip open().
+        fsBinding.writeFileUtf8(fd, 'fast-path', 0, 0o666);
+        fsBinding.close(fd);
+        globalThis.__out = JSON.stringify({{ ok: true }});
+        "#
+    ));
+    assert_eq!(out, r#"{"ok":true}"#);
+    assert_eq!(
+        std::fs::read_to_string(dir.joined("data.txt")).expect("read"),
+        "fast-path"
+    );
+}
+
+#[test]
+fn read_file_utf8_accepts_an_existing_fd_without_closing_it() {
+    let dir = TempDir::new("read-file-utf8-fd");
+    let file = dir.joined("data.txt");
+    std::fs::write(&file, b"fd-text").expect("write");
+
+    let out = run(&format!(
+        r#"
+        const path = '{}';
+        const fd = fsBinding.open(path, 0, 0);
+        const text = fsBinding.readFileUtf8(fd, 0);
+        let closeCode = null;
+        try {{
+          fsBinding.close(fd);
+        }} catch (error) {{
+          closeCode = error.code;
+        }}
+        globalThis.__out = JSON.stringify({{ text, closeCode }});
+        "#,
+        js_path(&file),
+    ));
+    assert_eq!(out, r#"{"text":"fd-text","closeCode":null}"#);
+}
+
+#[test]
 fn stat_returns_the_field_layout_the_js_unpacks() {
     let dir = TempDir::new("stat");
     let file = dir.joined("sized.bin");

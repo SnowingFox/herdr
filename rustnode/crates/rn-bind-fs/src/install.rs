@@ -1994,6 +1994,17 @@ fn read_file_utf8_binding<'a, 's, 'i>(
     mut rv: v8::ReturnValue<'s>,
 ) {
     let flags = crate::args::int32(scope, args.get(1)).unwrap_or(0);
+    if let Some(fd) = crate::args::int32(scope, args.get(0)) {
+        match fsops::read_file_utf8_fd(fd) {
+            Ok(text) => {
+                if let Some(value) = v8::String::new(scope, &text) {
+                    rv.set(value.into());
+                }
+            }
+            Err(error) => throw_error(scope, &error),
+        }
+        return;
+    }
     let Some(path) = required_path(scope, &args, 0, "open") else {
         return;
     };
@@ -2021,6 +2032,18 @@ fn write_file_utf8_binding<'a, 's, 'i>(
 ) {
     let flags = crate::args::int32(scope, args.get(2)).unwrap_or(1);
     let mode = crate::args::uint32(scope, args.get(3)).unwrap_or(0o666);
+    let Ok(text) = Local::<v8::String>::try_from(args.get(1)) else {
+        throw_error(scope, &FsError::from_errno("write", libc::EINVAL));
+        return;
+    };
+    let text = text.to_rust_string_lossy(scope);
+    if let Some(fd) = crate::args::int32(scope, args.get(0)) {
+        match fsops::write_file_utf8_fd(fd, &text) {
+            Ok(()) => rv.set_undefined(),
+            Err(error) => throw_error(scope, &error),
+        }
+        return;
+    }
     let Some(path) = required_path(scope, &args, 0, "open") else {
         return;
     };
@@ -2028,11 +2051,6 @@ fn write_file_utf8_binding<'a, 's, 'i>(
         denied.throw(scope);
         return;
     }
-    let Ok(text) = Local::<v8::String>::try_from(args.get(1)) else {
-        throw_error(scope, &FsError::from_errno("write", libc::EINVAL));
-        return;
-    };
-    let text = text.to_rust_string_lossy(scope);
     match fsops::write_file_utf8(&path, &text, flags, mode) {
         Ok(()) => rv.set_undefined(),
         Err(error) => throw_error(scope, &error),

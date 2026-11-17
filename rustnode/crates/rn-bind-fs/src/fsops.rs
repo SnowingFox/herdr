@@ -810,6 +810,12 @@ pub fn read_file_utf8(path: &PathBytes, uv_open_flags: i32) -> Result<String, Fs
     }
 }
 
+/// Reads UTF-8 text from an existing descriptor, for `binding.readFileUtf8(fd, ...)`.
+pub fn read_file_utf8_fd(fd: i32) -> Result<String, FsError> {
+    let bytes = read_all_fd(fd)?;
+    String::from_utf8(bytes).map_err(|_| FsError::from_errno("read", libc::EILSEQ))
+}
+
 /// Writes UTF-8 text to a file, for `binding.writeFileUtf8`.
 pub fn write_file_utf8(
     path: &PathBytes,
@@ -821,6 +827,11 @@ pub fn write_file_utf8(
     let result = write_all_fd(fd, text.as_bytes());
     let close_result = close(fd);
     result.and(close_result)
+}
+
+/// Writes UTF-8 text to an existing descriptor, for `binding.writeFileUtf8(fd, ...)`.
+pub fn write_file_utf8_fd(fd: i32, text: &str) -> Result<(), FsError> {
+    write_all_fd(fd, text.as_bytes())
 }
 
 fn read_all_fd(fd: i32) -> Result<Vec<u8>, FsError> {
