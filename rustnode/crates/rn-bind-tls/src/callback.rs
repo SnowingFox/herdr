@@ -1154,10 +1154,11 @@ pub unsafe fn set_sni_context(ssl: *mut ffi::SSL, ctx: *mut ffi::SSL_CTX) -> boo
             return false;
         }
         let mut chain: *mut openssl_sys::stack_st_X509 = std::ptr::null_mut();
-        if crate::ffi_extra::ssl_ctx_get0_chain_certs(ctx, &mut chain) == 1 && !chain.is_null() {
-            if crate::ffi_extra::ssl_set1_chain(ssl, chain) != 1 {
-                return false;
-            }
+        if crate::ffi_extra::ssl_ctx_get0_chain_certs(ctx, &mut chain) == 1
+            && !chain.is_null()
+            && crate::ffi_extra::ssl_set1_chain(ssl, chain) != 1
+        {
+            return false;
         }
     }
     // `SSL_set_SSL_CTX` before the certificates, because installing them on the
