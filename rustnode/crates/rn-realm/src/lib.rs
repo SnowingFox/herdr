@@ -1937,54 +1937,66 @@ fn process_object<'s>(
     // `delete process.exitCode`, which Node refuses.
 
     // `process.config` is serialized `config.gypi`: `internal/bootstrap/node.js`
-    // parses `internalBinding('builtins').config` and freezes the result. The
-    // whole of `test/common/index.js` reads `process.config.variables`
-    // immediately, so a missing `config` aborts every test in the suite.
-    //
-    // The object is built here rather than by parsing that JSON again because
-    // the `builtins` namespace's `config` string is the same one this
-    // reproduces, and doing it natively means it is available before any
-    // builtin that might read it.
-    let config = v8::Object::new(scope);
-    let config_variables = v8::Object::new(scope);
-    // The keys `test/common` and `lib/**` actually branch on. A key that is
-    // present but wrong is worse than an absent one, so only what this build
-    // genuinely has is listed.
-    for (name, value) in [
-        // ICU data is linked through `rn-bind-icu`.
-        ("v8_enable_i18n_support", 1),
-        // OpenSSL is linked, and not the BoringSSL fork.
-        ("node_use_openssl", 1),
-        ("node_shared_openssl", 0),
-        ("node_use_bundled_ca", 1),
-        ("node_shareable_openssl", 0),
-        ("node_target_type", 0),
-        // Neither tracing backend is compiled in.
-        ("node_use_dtrace", 0),
-        ("node_use_etw", 0),
-        ("node_use_perfetto", 0),
-        ("node_enable_v8_vtune_profiling", 0),
-        // V8 builds with the sandbox, matching the linked `v8` crate default.
-        ("v8_enable_sandbox", 1),
-        // Temporal is not compiled into this V8.
-        ("v8_enable_temporal_support", 0),
-    ] {
-        if let Some(key) = v8::String::new(scope, name) {
-            config_variables.set(scope, key.into(), v8::Integer::new(scope, value).into());
-        }
-    }
-    // `node_target_type` is the string `"executable"` in a real gyp file.
-    if let Some(key) = v8::String::new(scope, "node_target_type") {
-        if let Some(value) = v8::String::new(scope, "executable") {
-            config_variables.set(scope, key.into(), value.into());
-        }
-    }
-    set(scope, config, "variables", config_variables.into())?;
+    // parses `internalBinding('builtins').config` and freezes the result. Keep
+    // this object sourced from the same string so `process.config` and
+    // `internalBinding('builtins').config` cannot drift.
+    let config_source = v8::String::new(scope, rn_builtins::build_config_json())
+        .ok_or("cannot allocate process.config source")?;
+    let config = v8::json::parse(scope, config_source).ok_or("cannot parse process.config JSON")?;
+    let config =
+        v8::Local::<v8::Object>::try_from(config).map_err(|_| "process.config is not an object")?;
+    apply_v8_config_overrides(scope, config)?;
     define_read_only(scope, process, "config", config.into())?;
 
     install_process_state(scope, process, state)?;
 
     Ok(process)
+}
+
+// The linked v8 crate's build flags are what the corresponding
+// `process.config.variables` keys represent.
+//
+// `v8-152.2.0/build.rs` only flips these with
+// `CARGO_FEATURE_V8_ENABLE_SANDBOX` / `CARGO_FEATURE_V8_ENABLE_POINTER_COMPRESSION`.
+// This workspace enables `v8/default` + `v8/use_custom_libcxx` only, so both
+// features are off (`cargo tree -e features -p rn-cli -i v8`).
+const V8_ENABLE_SANDBOX: i32 = 0;
+const V8_ENABLE_POINTER_COMPRESSION: i32 = 0;
+const V8_ENABLE_EXTERNAL_CODE_SPACE: i32 = if V8_ENABLE_SANDBOX == 1 { 1 } else { 0 };
+const V8_ENABLE_POINTER_COMPRESSION_SHARED_CAGE: i32 = 0;
+
+fn apply_v8_config_overrides(
+    scope: &mut v8::PinScope<'_, '_>,
+    config: v8::Local<'_, v8::Object>,
+) -> Result<(), String> {
+    let variables_key = v8::String::new(scope, "variables")
+        .ok_or("cannot allocate process.config.variables key")?;
+    let variables = config
+        .get(scope, variables_key.into())
+        .ok_or("missing process.config.variables")?;
+    let variables = v8::Local::<v8::Object>::try_from(variables)
+        .map_err(|_| "process.config.variables is not an object")?;
+
+    for (name, value) in [
+        ("v8_enable_sandbox", V8_ENABLE_SANDBOX),
+        (
+            "v8_enable_pointer_compression",
+            V8_ENABLE_POINTER_COMPRESSION,
+        ),
+        (
+            "v8_enable_external_code_space",
+            V8_ENABLE_EXTERNAL_CODE_SPACE,
+        ),
+        (
+            "v8_enable_pointer_compression_shared_cage",
+            V8_ENABLE_POINTER_COMPRESSION_SHARED_CAGE,
+        ),
+    ] {
+        let key = v8::String::new(scope, name).ok_or("cannot allocate process.config key")?;
+        variables.set(scope, key.into(), v8::Integer::new(scope, value).into());
+    }
+
+    Ok(())
 }
 
 /// The `process` properties `node.cc`'s `PatchProcessObject` and
@@ -2959,4 +2971,60 @@ fn make_stream_object<'s>(
     let key = v8::String::new(scope, "write").ok_or("cannot allocate key")?;
     object.set(scope, key.into(), function.into());
     Ok(object)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_scope<R>(body: impl for<'s> FnOnce(&mut v8::PinScope<'s, '_>) -> R) -> R {
+        static V8: std::sync::Once = std::sync::Once::new();
+        V8.call_once(|| {
+            let platform = v8::new_default_platform(0, false).make_shared();
+            v8::V8::initialize_platform(platform);
+            v8::V8::initialize();
+        });
+
+        let mut isolate = v8::Isolate::new(Default::default());
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        body(scope)
+    }
+
+    fn object_field<'s>(
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+        name: &str,
+    ) -> v8::Local<'s, v8::Value> {
+        let key = v8::String::new(scope, name).expect("field name allocates");
+        object
+            .get(scope, key.into())
+            .unwrap_or_else(|| panic!("object field `{name}` is readable"))
+    }
+
+    #[test]
+    fn process_config_variables_matches_oracle_snapshot() {
+        with_scope(|scope| {
+            let process = process_object(scope, &[], &[], ProcessState::main_thread(9229))
+                .expect("process object is buildable");
+            let config = object_field(scope, process, "config");
+            let config =
+                v8::Local::<v8::Object>::try_from(config).expect("process.config is an object");
+            let variables = object_field(scope, config, "variables");
+            let json = v8::json::stringify(scope, variables)
+                .expect("config variables stringify")
+                .to_rust_string_lossy(scope);
+
+            let actual: serde_json::Value =
+                serde_json::from_str(&json).expect("actual variables parse as JSON");
+            let expected: serde_json::Value = serde_json::from_str(include_str!(
+                "../../rn-builtins/src/build_config_variables.json"
+            ))
+            .expect("expected fixture parses");
+
+            assert_eq!(actual, expected);
+        });
+    }
 }

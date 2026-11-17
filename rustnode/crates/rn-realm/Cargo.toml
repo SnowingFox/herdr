@@ -46,3 +46,6 @@ rn-permission = { path = "../rn-permission" }
 rn-uv = { path = "../rn-uv" }
 rn-v8-sys = { path = "../rn-v8-sys" }
 v8.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
