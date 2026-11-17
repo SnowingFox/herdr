@@ -1740,10 +1740,32 @@ pub(crate) fn export_jwk_fields(
             ("pub", base64url_encode(&public)),
         ];
         if data.key_type() == KeyType::Private {
-            let private = key
-                .raw_seed()
-                .or_else(|| key.raw_private_key())
-                .ok_or(KeyError::OperationFailed("Failed to export JWK"))?;
+            // Node's rule, from `deps/ncrypto/ncrypto.cc`:
+            //   `seedSize()` is 32 for ML-DSA, 64 for ML-KEM, and 0 for SLH-DSA.
+            //   `exportRawJwk` uses `GetRawSeed(...)` when `seed_len != 0`, and
+            //   `rawPrivateKey()` otherwise.
+            // A missing seed is `RawExportError::MISSING_SEED`, which
+            // `ExportJWKRawKey` turns into `OperationError` ("key does not have
+            // an available seed").
+            //
+            // So the decision is per algorithm, not "prefer a seed":
+            //   * ML-DSA/ML-KEM must have a seed, and a priv-only PEM has none —
+            //     that key must reject, which is what
+            //     `test-webcrypto-seedless-jwk-export` asserts.
+            //   * SLH-DSA has no seed at all and legitimately exports its raw
+            //     private key, which `test-crypto-pqc-keygen-slh-dsa` asserts.
+            //
+            // Using `raw_seed().or_else(raw_private_key)` for every PQC algorithm
+            // satisfied neither: it made a seedless ML-DSA key export when Node
+            // rejects it.
+            let private = if algorithm.seed_size() != 0 {
+                key.raw_seed().ok_or(KeyError::OperationFailed(
+                    "key does not have an available seed",
+                ))?
+            } else {
+                key.raw_private_key()
+                    .ok_or(KeyError::OperationFailed("Failed to export JWK"))?
+            };
             fields.push(("priv", base64url_encode(&private)));
         }
         return Ok(fields);
@@ -2166,6 +2188,53 @@ mod tests {
         let private = KeyData::asymmetric(KeyType::Private, key).expect("private");
         let private = export_jwk_fields(&private, false).expect("private AKP JWK");
         assert!(private.iter().any(|(name, _)| *name == "priv"));
+    }
+
+    /// A generated SLH-DSA private key exports its raw private key, because
+    /// `seedSize()` is 0 for that family (`deps/ncrypto/ncrypto.cc:3523`).
+    ///
+    /// This is the case that a blanket "PQC keys must have a seed" rule breaks:
+    /// SLH-DSA has no seed at all, so requiring one would make every SLH-DSA JWK
+    /// export fail. `test-crypto-pqc-keygen-slh-dsa` asserts the `priv` field is
+    /// present.
+    #[test]
+    fn slh_dsa_private_jwk_uses_the_raw_private_key() {
+        let Some(key) = maybe_named_key("SLH-DSA-SHA2-128f") else {
+            return;
+        };
+        let private = KeyData::asymmetric(KeyType::Private, key).expect("private");
+        let private = export_jwk_fields(&private, false).expect("private AKP JWK");
+        assert!(
+            private.iter().any(|(name, _)| *name == "priv"),
+            "SLH-DSA has no seed, so its private half is the raw private key"
+        );
+    }
+
+    /// A private key loaded from a priv-only PEM has no seed, and Node rejects its
+    /// JWK export rather than substituting the raw private key.
+    ///
+    /// `ExportJWKRawKey` maps `RawExportError::MISSING_SEED` to `OperationError`
+    /// ("key does not have an available seed"), and
+    /// `test-webcrypto-seedless-jwk-export` asserts exactly that for the six
+    /// ML-KEM/ML-DSA priv-only fixtures. Falling back to `raw_private_key()` when
+    /// `raw_seed()` was absent made that export succeed and broke the test.
+    #[test]
+    fn a_seedless_ml_dsa_private_jwk_is_refused() {
+        // The same fixture `test-webcrypto-seedless-jwk-export` uses: a priv-only
+        // PEM carries no seed, so `raw_seed()` is `None` for it.
+        let Ok(key) = openssl::pkey::PKey::private_key_from_pem(
+            include_str!("../tests/data/ml_dsa_44_private_priv_only.pem").as_bytes(),
+        ) else {
+            // No ML-DSA support in this OpenSSL build.
+            return;
+        };
+        let data = KeyData::asymmetric(KeyType::Private, PKey::from_private(key)).expect("private");
+        let refused = export_jwk_fields(&data, false);
+        assert!(
+            refused.is_err(),
+            "a seedless ML-DSA key must not export a JWK; Node reports \
+             OperationError because there is no seed to put in `priv`"
+        );
     }
 
     /// An RSA private JWK carries the CRT components, which is what makes it
