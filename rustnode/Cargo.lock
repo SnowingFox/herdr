@@ -1796,6 +1796,7 @@ dependencies = [
  "libuv-sys2",
  "rn-bind-uv",
  "rn-bun-api",
+ "rn-bun-text",
  "rn-core",
  "rn-env",
  "rn-errors",

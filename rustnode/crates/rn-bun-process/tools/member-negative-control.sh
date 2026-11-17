@@ -103,11 +103,20 @@ import pathlib
 p = pathlib.Path("crates/rn-bun-process/src/values.rs")
 s = p.read_text()
 # Publish a copy: the identity assertion is the only check that sees this.
-s = s.replace(
-    '    crate::define_value(\n        scope,\n        target,\n        "argv",\n        argv,\n        Attr::DONT_DELETE,\n    )?;',
-    '    let mut copy = String::new();\n    if let Ok(array) = v8::Local::<v8::Array>::try_from(argv) {\n        for index in 0..array.length() {\n            if let Some(value) = array.get_index(scope, index) {\n                copy.push_str(&value.to_rust_string_lossy(scope));\n                copy.push(\',\');\n            }\n        }\n    }\n    let copy_array = v8::Array::new(scope, 0);\n    if let Some(first) = v8::String::new(scope, copy.trim_end_matches(\',\')) {\n        copy_array.set_index(scope, 0, first.into());\n    }\n    crate::define_value(\n        scope,\n        target,\n        "argv",\n        copy_array.into(),\n        Attr::DONT_DELETE,\n    )?;',
+before = '    crate::define_value(scope, target, "argv", argv, Attr::DONT_DELETE)?;'
+after = (
+    '    let copy_array = v8::Array::new(scope, 0);\n'
+    '    if let Ok(source) = v8::Local::<v8::Array>::try_from(argv) {\n'
+    '        for index in 0..source.length() {\n'
+    '            if let Some(value) = source.get_index(scope, index) {\n'
+    '                copy_array.set_index(scope, index, value);\n'
+    '            }\n'
+    '        }\n'
+    '    }\n'
+    '    crate::define_value(scope, target, "argv", copy_array.into(), Attr::DONT_DELETE)?;'
 )
-p.write_text(s)
+assert before in s, "the argv mutation did not match; the control is stale"
+p.write_text(s.replace(before, after))
 PY
 expect_failure "argv-copy" "the_process_members" || true
 restore
@@ -131,11 +140,10 @@ python3 - <<'PY'
 import pathlib
 p = pathlib.Path("crates/rn-bun-process/src/color.rs")
 s = p.read_text()
-s = s.replace(
-    'Format::Hex => set_string(scope, rv, &format!("#{:02x}{:02x}{:02x}", rgba.red, rgba.green, rgba.blue)),',
-    'Format::Hex => set_string(scope, rv, &format!("#{:02x}{:02x}{:02x}{:02x}", rgba.red, rgba.green, rgba.blue, rgba.alpha)),',
-)
-p.write_text(s)
+before = '            &format!("#{:02x}{:02x}{:02x}", rgba.red, rgba.green, rgba.blue),'
+after = '            &format!("#{:02x}{:02x}{:02x}{:02x}", rgba.red, rgba.green, rgba.blue, rgba.alpha),'
+assert before in s, "the hex mutation did not match; the control is stale"
+p.write_text(s.replace(before, after))
 PY
 expect_failure "color-hex" "the_color_members" || true
 restore
@@ -221,6 +229,34 @@ s = s.replace(
 p.write_text(s)
 PY
 expect_failure "udp-arity" "the_udp_socket" || true
+restore
+
+echo "== Bun.version reports the marker, not undefined or a release number =="
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("crates/rn-bun-process/src/version.rs")
+s = p.read_text()
+# Drop the install call: the property stays declared, so the *registry* refuses
+# it, and the differential probe would see `undefined` under a name that exists.
+before = '    let version = v8::String::new(scope, COMPAT_MARKER).ok_or("cannot allocate the version")?;\n    crate::define_value(\n        scope,\n        target,\n        "version",\n        version.into(),\n        v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE,\n    )?;\n\n'
+assert before in s, "the version mutation did not match; the control is stale"
+p.write_text(s.replace(before, ''))
+PY
+expect_failure "version-missing" "the_process_members" || true
+restore
+
+echo "== Bun.version is not a bare Bun release number =="
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("crates/rn-bun-process/src/version.rs")
+s = p.read_text()
+# The one value that must never ship: it makes `startsWith('1.')` a lie and it
+# makes `>= "1.4.4"` claim a release this is not.
+before = 'pub const COMPAT_MARKER: &str = "1.4.4-rsnode";'
+assert before in s, "the marker mutation did not match; the control is stale"
+p.write_text(s.replace(before, 'pub const COMPAT_MARKER: &str = "1.4.4";'))
+PY
+expect_failure "version-bare-release" "the_marker" || true
 restore
 
 echo

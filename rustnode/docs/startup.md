@@ -247,9 +247,10 @@ see the note after the table, because that phase has grown a great deal since.
 
 That difference is worth knowing before anyone budgets against 0.04. The number
 above was measured at `2d7ac642`, which carried only `Bun.nanoseconds`; the
-surface is now 78 members across seven crates, and one of them does measurable
-work at startup. Measured by building each commit and taking a median of 9-15
-runs of `-e '0'` per build:
+surface at the commit measured below was 78 members across seven crates, and one
+of them does measurable work at startup. It is 79 today: `Bun.version` was added
+since, and it is a string constant rather than another eager compile. Measured by
+building each commit and taking a median of 9-15 runs of `-e '0'` per build:
 
 | commit | `install_bun` | what it added |
 | --- | --- | --- |

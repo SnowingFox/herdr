@@ -293,7 +293,39 @@ which is usually enough to name the missing member.
 
 Recorded differences from Node that are real, measured, and not yet fixed.
 Each names why it exists, so it is not mistaken for a bug report or a to-do
-without context.
+without context. The `Bun` entry is a deliberate difference from *Bun* rather
+than from Node, and it says so.
+
+### `Bun.version` reports a compatibility marker, not a Bun release
+
+rustnode exposes a `Bun` global for scripts written against Bun, and Tier 1 of
+that surface is complete: `tools/bun-surface-guard.py` reports
+**79 implemented, 38 absent, 0 declared-deferred** of the 117 members recorded
+from Bun 1.4.4, which is all 78 Tier 1 members and no deferral.
+
+One of those members cannot be a measurement, because the value is about identity
+rather than behaviour. `Bun.version` reports **`"1.4.4-rsnode"`**, not `"1.4.4"`.
+Reporting a Bun release number would be a false claim about the running process
+and would let `Bun.version.startsWith('1.')` take a Bun code path silently under
+V8, so the value is a semver prerelease of the surface it tracks:
+
+| comparison | result | why |
+| --- | --- | --- |
+| `Bun.version >= "1.4.4"` | `false` | this is not that release |
+| `Bun.version >= "1.0"`, `>= "1.0.0"` | `true` | the 1.4.4 surface is present |
+| `typeof Bun.version` | `"string"` | the shape §6.1 pins |
+| `Bun.version_with_sha` | `"v1.4.4-rsnode (<sha>)"` | same constant as its version half |
+
+Those comparisons are semantic, through `Bun.semver.order`; JavaScript's `<`/`>=`
+on two strings is lexicographic and puts `"1.4.4-rsnode"` *above* `"1.4.4"`
+(`'-'` sorts after `'.'`), which is the wrong answer. `Bun.semver.satisfies` is
+not the right check either, because npm-style range matching excludes
+prereleases from `>=1.0` by design.
+
+This is not a gap to close and it is reversible: the value lives in
+`rn_bun_process::version::COMPAT_MARKER`, so preferring a different one
+(`"0.1.0"`, a bare `"rsnode"`, or a real Bun number) is a one-constant change.
+The alternatives and what each breaks are recorded in that module's docs.
 
 ### `zlib` level 4-6 compress less than Node
 

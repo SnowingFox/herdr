@@ -2,8 +2,7 @@
 //!
 //! `rn-bun` owns the `Bun` object itself; this crate contributes seventeen members
 //! to it through [`rn_bun_api::BunModule`], so it never creates or publishes the
-//! global. Sixteen are implemented and one — `version` — is deferred with the
-//! reason recorded in [`DEFERRED`].
+//! global. All seventeen are implemented; nothing here is deferred.
 //!
 //! | member | where |
 //! | --- | --- |
@@ -12,7 +11,7 @@
 //! | `argv`, `env`, `main`, `cwd`, `origin`, `isMainThread`, `isStandaloneExecutable`, `enableANSIColors` | [`values`] |
 //! | `color` | [`color`] |
 //! | `gc`, `generateHeapSnapshot` | [`gc`] |
-//! | `revision`, `version_with_sha` | [`version`] |
+//! | `version`, `revision`, `version_with_sha` | [`version`] |
 //!
 //! # The rule this crate is built on
 //!
@@ -47,13 +46,13 @@
 //! `get.length` is 0 and `set.length` is 1 and which accepts assignment;
 //! everything is non-configurable.
 //!
-//! # The one thing this crate cannot settle
+//! # `Bun.version` is a compatibility marker
 //!
-//! `Bun.version` is deferred, because its value is a product decision rather than
-//! a measurement: this is not Bun, so a Bun release number would be false, and
-//! `Bun.version.startsWith('1.')` would take a Bun branch for code running on V8.
-//! See [`version`] for the alternatives and [`DEFERRED`] for the exact wording the
-//! gate reports.
+//! `Bun.version` reports `"1.4.4-rsnode"`: the 1.4.4 surface as a semver
+//! prerelease, so `>= "1.4.4"` is `false` and `>= "1.0"` is `true` under a real
+//! semver comparison without ever claiming to be a Bun release. `Bun.version_with_sha`
+//! derives its version half from the same constant, so the two agree by
+//! construction. See [`version`] for the candidates and why this one was chosen.
 
 use rn_bun_api::BunModule;
 use rn_v8_sys::v8;
@@ -88,23 +87,16 @@ pub const MEMBERS: &[&str] = &[
     "spawn",
     "spawnSync",
     "udpSocket",
+    "version",
     "version_with_sha",
 ];
 
 /// Members this crate needs but does not install, each with its reason.
 ///
-/// `version` is the only one, and it is deferred rather than absent because this
-/// crate owes the member and the value is a decision someone has to make — the
-/// deferral is what makes that visible instead of an `undefined` nobody notices.
-pub const DEFERRED: &[(&str, &str)] = &[(
-    "version",
-    "the value this runtime should report is a product decision, not a measurement: \
-     rsnode is not Bun, so returning a Bun release number would be false and \
-     `Bun.version.startsWith('1.')` would silently take a Bun branch on a V8 \
-     runtime; a bare rsnode version fails every `>= \"1.x\"` gate; and \
-     `Bun.version_with_sha` derives from the same constant, so both wait on it. \
-     See `rn_bun_process::version::COMPAT_MARKER` for the candidates",
-)];
+/// Empty: every member in [`MEMBERS`] is installed. The list stays because
+/// [`rn_bun_api::BunModule`] requires an answer to the question, and an empty one
+/// says "none" out loud where a missing method would leave a reader guessing.
+pub const DEFERRED: &[(&str, &str)] = &[];
 
 /// The `Bun` contribution for process and system members.
 pub struct Process;
@@ -289,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn registering_contributes_every_declared_member_and_the_deferral() {
+    fn registering_contributes_every_declared_member_and_no_deferral() {
         let mut registry = rn_bun_api::BunRegistry::new();
         register(&mut registry).expect("registration succeeds");
         let declared: Vec<&str> = registry
@@ -300,9 +292,12 @@ mod tests {
         let mut expected = MEMBERS.to_vec();
         expected.sort_unstable();
         assert_eq!(declared, expected);
-        assert_eq!(registry.deferrals().len(), 1);
-        assert_eq!(registry.deferrals()[0].member, "version");
-        assert_eq!(registry.deferrals()[0].contributor, "rn-bun-process");
-        assert!(registry.deferrals()[0].reason.contains("product decision"));
+        // `version` used to be the one deferral; it is installed now, and a
+        // reintroduced deferral here would be a member the object no longer has.
+        assert!(
+            registry.deferrals().is_empty(),
+            "rn-bun-process defers nothing: {:?}",
+            registry.deferrals()
+        );
     }
 }
