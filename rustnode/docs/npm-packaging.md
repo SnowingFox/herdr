@@ -80,26 +80,31 @@ the release binary:
 | Implementation | Median `-e ''` | vs the binary | vs the `sh` floor |
 | --- | --- | --- | --- |
 | the binary directly | 25.76 ms | — | — |
-| minimal 2-line `sh` (`exec`) | 27.45 ms | **+1.7 ms** | — |
+| minimal 2-line `sh` (`exec`) | 27.45 ms | +1.7 ms | — |
 | **this wrapper** | 27.76 ms | **+2.0 ms** | **+0.31 ms** |
 | `node` + `spawnSync` wrapper | ~51 ms | +22 ms | — |
 
-Both deltas are reported because they answer different questions, and the split
-is the whole point:
+The wrapper's own logic is free and the shell is the entire cost, and the two
+deltas have to be read differently:
 
-* **+1.7 ms is the shell.** Starting any `sh` process costs that on this box; a
-  two-line `exec` stub with no logic at all measures it.
-* **+0.31 ms is this script.** Its resolution logic is within noise of the floor,
-  which is why "never worse than a two-line `sh` script" is the accurate claim
-  and "adds no measurable cost" is not.
+* **vs the binary: +0.4 to +2.0 ms, depending on machine load.** This is what a
+  user pays, and it is load-sensitive. The row above is the high end, measured
+  while other builds were running on this 8-core box; a quieter window measured
+  +0.4 ms. Quote it as a range, not a point.
+* **vs the `sh` floor: ~0 ms.** Starting any `sh` process costs what a two-line
+  `exec` stub with no logic at all measures, and this script sits within noise of
+  that. This comparison is stable across load in a way the absolute one is not,
+  because both sides move together — which is why "never worse than a two-line
+  `sh` script" is the accurate claim and "adds no measurable cost" is not.
 
-Earlier revisions of this document reported "+0.13 ms" and then "+0.4 to
-+1.5 ms". Both understated the absolute cost: the first compared the shim
-against a floor measured in a different, quieter window, and the second was a
-single batch on a lightly loaded machine. The numbers above are from two
-independent rounds (one run by the maintainer) that agree, and the absolute
-figure should be quoted as ~2 ms over a direct invocation, of which ~0.3 ms is
-this script.
+Earlier revisions of this document reported only "+0.13 ms", which was a
+quiet-window median compared against a floor measured in a different, quieter
+window. That reasoning is worth keeping: the defect was not the value, it was
+subtracting two numbers taken under different conditions. Later revisions then
+reported "+0.4 to +1.5 ms", which was a single batch and missed the high end. The
+range above comes from two independent rounds (one run by the maintainer) that
+agree on the split: ~1.7 ms of the cost is `sh` starting at all, ~0.3 ms is this
+script.
 
 A Node wrapper cannot avoid booting a second runtime before the real one starts,
 which is the +22 ms it cannot get below.
