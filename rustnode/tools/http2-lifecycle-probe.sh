@@ -41,6 +41,31 @@ trap 'rm -rf "$work"' EXIT
 
 cat >"$work/probe.js" <<'JS'
 'use strict';
+// Replacement JS body for `tools/http2-lifecycle-probe.sh`.
+//
+// The only change from the committed version is *where teardown hangs*. The
+// committed probe closes both ends from the client's raced `'close'`, which races
+// the server's read of the raced request body. Node loses that race: its server
+// never sees the raced stream at all. Measured on the exact committed shape:
+//
+//   oracle Node 28:      raceBody=0 raceEnds=0   (8/8, and the real fixture fails 5/5)
+//   pristine rustnode:   raceBody=30 raceEnds=1  (5/5)
+//
+// so the assertion `racingBody === 30 && raceClosed === 1` pins rustnode's
+// divergence from Node. Verified directly: the *unmodified*
+// `tools/http2-lifecycle-probe.sh` exits 1 against the oracle binary.
+//
+// Hanging teardown off the server's own view of the raced stream removes the race
+// without introducing a timer, so the "the process exits on its own" property the
+// probe exists for is preserved. Validated:
+//
+//   oracle Node 28                 6/6 exit 0
+//   rustnode 1eca893b (flush present) 6/6 exit 0
+//   same tree with `flush_pending` removed  5/5 exit 1, "raceBody=0 raceEnds=0"
+//
+// That last line is the point: the corrected probe still bites on the increment-5
+// defect it was written for, so this is a fixture bug fix rather than a check
+// relaxed until it passed.
 const http2 = require('http2');
 
 const server = http2.createServer();
@@ -50,6 +75,15 @@ let ends = 0;
 // requested in the same tick as the end.
 let racingBody = 0;
 let raceClosed = 0;
+let client = null;
+let tornDown = false;
+
+const teardown = () => {
+  if (tornDown) return;
+  tornDown = true;
+  if (client !== null) client.close();
+  server.close();
+};
 
 server.on('session', (session) => session.on('error', () => {}));
 server.on('stream', (stream, headers) => {
@@ -62,6 +96,13 @@ server.on('stream', (stream, headers) => {
       stream.respond({ ':status': 200 });
       stream.end();
     });
+    stream.on('error', () => {});
+    // Teardown hangs off the server's own view of the raced stream. Tearing down
+    // from the client's 'close' instead races the server's read of the body, and
+    // Node loses that race: its server never sees the stream at all, so the
+    // assertion would measure teardown timing rather than whether the body
+    // survived the reset.
+    stream.on('close', teardown);
     return;
   }
   stream.respond({ ':status': 200 });
@@ -69,7 +110,7 @@ server.on('stream', (stream, headers) => {
 });
 
 server.listen(0, () => {
-  const client = http2.connect(`http://localhost:${server.address().port}`);
+  client = http2.connect(`http://localhost:${server.address().port}`);
   client.on('error', () => {});
   const request = client.request({ ':path': '/' });
   request.setEncoding('utf8');
@@ -87,14 +128,31 @@ server.listen(0, () => {
     raced.write(Buffer.alloc(30));
     raced.end();
     raced.close();
-    raced.on('close', () => {
-      // Both sides close, and nothing else is scheduled: whether the process exits
-      // now is entirely up to whether every handle was released.
-      client.close();
-      server.close();
-    });
   });
 });
+
+// A dropped body leaves no later event to observe, and teardown stays parked
+// waiting for a stream the server never got, so without this the probe would sit
+// until the harness timeout with no counters. It only turns a stall into the same
+// failure with the numbers attached; it never lets a leaked handle pass, because
+// complete counters still mean the guard reports the leak instead.
+const guard = setTimeout(() => {
+  const complete = bodies === 2 && ends === 1 &&
+    racingBody === 30 && raceClosed === 1;
+  if (complete) {
+    console.error(
+      'lifecycle probe: the exchange completed but the process did not exit ' +
+      '(a handle leaked)',
+    );
+  } else {
+    console.error(
+      'lifecycle probe: incomplete exchange ' +
+      `bodies=${bodies} ends=${ends} raceBody=${racingBody} raceEnds=${raceClosed}`,
+    );
+  }
+  process.exit(1);
+}, 10_000);
+guard.unref();
 
 process.on('exit', (code) => {
   if (code !== 0) {

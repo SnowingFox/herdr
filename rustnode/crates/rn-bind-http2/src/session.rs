@@ -121,6 +121,42 @@ pub struct StreamRecord {
     pub wants_write: bool,
 }
 
+/// Readable-side work that arrived inside `nghttp2_session_mem_recv`.
+///
+/// The frame callbacks cannot deliver it as it arrives: reaching JavaScript there
+/// drains the tick queue, and the `core.js` code that drain runs closes streams
+/// while nghttp2 is still walking the receive. It is queued here and handed over
+/// by [`crate::stream::flush_inbound`] once the receive has returned.
+///
+/// # Why one ordered queue
+///
+/// nghttp2 delivers a stream's DATA before `END_STREAM` closes it, so a stream's
+/// body, then its EOF, then its close callback arrive in that order. Keeping them
+/// in one queue preserves it. Staging only the body and delivering the close
+/// immediately was the first attempt, and it made `core.js` see
+/// `_readableState.ended == false`: a clean end was reported as
+/// `ERR_HTTP2_STREAM_ABORTED`. Staging the close on the stream record instead
+/// stalled a graceful `session.close(cb)`, because `HasPendingData` — which
+/// `core.js`'s `kMaybeDestroy` consults — counts the open records.
+#[derive(Debug)]
+pub struct InboundEvent {
+    /// The stream this belongs to.
+    pub stream_id: i32,
+    /// What arrived.
+    pub kind: InboundKind,
+}
+
+/// The three things a receive can produce for a stream's readable side.
+#[derive(Debug)]
+pub enum InboundKind {
+    /// Body bytes (`OnDataChunkReceived`).
+    Data(Vec<u8>),
+    /// `END_STREAM` arrived on a DATA frame (`HandleDataFrame`).
+    Eof,
+    /// `OnStreamClose` fired, with its `(code, peer_reset)` arguments.
+    Close { code: u32, peer_reset: bool },
+}
+
 /// One `nghttp2_submit_*` call that had to wait for `mem_recv` to return.
 ///
 /// Every variant carries what the submit needs and owns its buffers, so replaying
@@ -211,6 +247,18 @@ pub struct SessionState {
     /// the same defect increment 6 fixed at the RST site, one layer down. A
     /// `Vec` is therefore correct and a set or a per-kind slot is not.
     pub deferred_submits: RefCell<Vec<DeferredSubmit>>,
+    /// Streams JavaScript has destroyed, remembered past the record's removal.
+    ///
+    /// `Http2Stream::Destroy` marks the record, and `on_stream_close` removes that
+    /// record. Staged body delivery happens after both, so it needs a signal that
+    /// survives the removal: emitting into a destroyed readable side makes
+    /// `onStreamRead` read a stale byte count as errno (7616, `ERR_OUT_OF_RANGE`),
+    /// which is the hazard `src/node_http2.cc` documents at `Http2Stream::Destroy`.
+    pub destroyed_streams: RefCell<std::collections::BTreeSet<i32>>,
+    /// Readable-side events staged during `mem_recv`, in arrival order.
+    ///
+    /// See [`InboundEvent`] for why this exists and why it is one ordered queue.
+    pub inbound: RefCell<Vec<InboundEvent>>,
     /// A dispose that was requested while `mem_recv` was on the stack.
     ///
     /// `nghttp2_session_del` must not run until nghttp2 has returned from the
@@ -336,6 +384,8 @@ impl SessionState {
             pending_dispose: Cell::new(false),
             pending_destroy: Cell::new(None),
             deferred_submits: RefCell::new(Vec::new()),
+            destroyed_streams: RefCell::new(std::collections::BTreeSet::new()),
+            inbound: RefCell::new(Vec::new()),
             graceful_close: Cell::new(false),
             graceful_close_notified: Cell::new(false),
             receiving: Cell::new(false),
@@ -766,6 +816,7 @@ impl rn_uv::listener::StreamListener for SessionListener {
         };
         let bytes = bytes.to_vec();
         let _ = rn_uv::callback::with_context(|scope| receive_scope(scope, state, &bytes));
+        crate::stream::flush_inbound(state);
     }
 }
 

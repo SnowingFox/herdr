@@ -471,7 +471,7 @@ fn handle_data_frame(
         // that means by asking whether the readable side ended. Emitting it
         // anywhere else — `on_stream_close` in particular — answers that question
         // before it is asked and hides every early close.
-        crate::stream::emit_eof(state, hd.stream_id);
+        crate::stream::stage_eof(state, hd.stream_id);
     }
     0
 }
@@ -517,19 +517,30 @@ unsafe extern "C" fn on_stream_close(
             None => false,
         }
     };
-    let _ = rn_uv::callback::with_context(|scope| {
-        let args = [
-            v8::Integer::new(scope, error_code as i32).into(),
-            v8::Boolean::new(scope, peer_reset).into(),
-        ];
-        crate::stream::call_stream_callback(
-            scope,
-            state,
-            stream_id,
-            |callbacks| callbacks.stream_close.clone(),
-            &args,
-        );
-    });
+    // Queued behind this stream's body and EOF, which nghttp2 delivered before it
+    // closed the stream. `core.js`'s `onStreamClose` asks
+    // `_readableState.ended`, so draining the close first would report a clean end
+    // as `ERR_HTTP2_STREAM_ABORTED`.
+    //
+    // The record is removed above rather than later: `HasPendingData`, which
+    // `core.js`'s `kMaybeDestroy` consults, counts open records, so keeping it
+    // would stall a graceful `session.close(cb)`.
+    // Queued behind this stream's body and EOF when the close arrives inside a
+    // receive — nghttp2 delivers DATA before `END_STREAM` closes the stream, and
+    // `core.js`'s `onStreamClose` asks `_readableState.ended`, so a close drained
+    // first reports a clean end as `ERR_HTTP2_STREAM_ABORTED`.
+    //
+    // A close that arrives outside any receive has nothing ahead of it in this
+    // queue, so it is delivered at once. That is the case for the *remote* end of
+    // a connection in the same process: its `on_stream_close` runs from the write
+    // path, and Node reports it before the local end's next event. Staging it
+    // delayed `session.close(cb)` past the point where `core.js` still accepted a
+    // graceful close, so the callback was dropped.
+    if state.receiving.get() {
+        crate::stream::stage_close(state, stream_id, error_code, peer_reset);
+    } else {
+        crate::stream::deliver_close_now(state, stream_id, error_code, peer_reset);
+    }
     0
 }
 

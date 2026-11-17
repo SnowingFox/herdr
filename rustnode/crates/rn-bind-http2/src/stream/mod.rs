@@ -457,7 +457,44 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
             record.paused_unconsumed += bytes.len();
         }
     }
-    let payload = bytes.to_vec();
+    // Staged rather than delivered: this runs inside `nghttp2_session_mem_recv`,
+    // and reaching JavaScript there drains `core.js` teardown for streams nghttp2
+    // is still walking. `flush_inbound` hands it over once the receive returns,
+    // which is also the tick that separates `'response'` from the body.
+    session
+        .inbound
+        .borrow_mut()
+        .push(crate::session::InboundEvent {
+            stream_id,
+            kind: crate::session::InboundKind::Data(bytes.to_vec()),
+        });
+}
+
+/// Delivers one staged chunk to `stream_id`'s readable side.
+///
+/// Only called from [`flush_inbound`], once `nghttp2_session_mem_recv` returned.
+///
+/// The destroyed check happens here and not only where the bytes were staged:
+/// staging defers delivery across the tick `'response'` was queued on, and that
+/// tick is exactly where `core.js` can destroy the stream. Emitting into a
+/// destroyed readable side is what makes `onStreamRead` read a stale positive byte
+/// count as errno (7616, `ERR_OUT_OF_RANGE`) — the hazard `Http2Stream::Destroy`
+/// documents and `deliver_data` already guards at its own entry.
+fn emit_read(session: &SessionState, stream_id: i32, payload: Vec<u8>) {
+    // Only a stream `core.js` has destroyed must be skipped. A missing record is
+    // not by itself that signal — `on_stream_close` retires the record for a normal
+    // end too, and dropping those reads is what emptied an ordinary response.
+    if session
+        .streams
+        .borrow()
+        .get(&stream_id)
+        .is_some_and(|record| record.destroyed)
+    {
+        return;
+    }
+    if session.destroyed_streams.borrow().contains(&stream_id) {
+        return;
+    }
     let _ = rn_uv::callback::with_context(|scope| {
         // Without a handle there is nothing to deliver to, and `in_stream_scope`
         // below would find nothing anyway.
@@ -552,7 +589,9 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
 /// fix: `core.js` waits for `'end'`/`'finish'` and calls `stream.read(0)` to
 /// drive the readable side, which works as soon as EOF is only sent when the
 /// peer actually ended the stream.
-pub fn emit_eof(session: &SessionState, stream_id: i32) {
+///
+/// Delivered by [`flush_inbound`] once `nghttp2_session_mem_recv` has returned.
+fn deliver_eof(session: &SessionState, stream_id: i32) {
     let _ = rn_uv::callback::with_context(|scope| {
         let Some(object) = object_for(scope, session, stream_id) else {
             return;
@@ -607,6 +646,141 @@ pub fn emit_eof(session: &SessionState, stream_id: i32) {
 
 /// `UV_EOF`.
 const EOF: i32 = -4095;
+
+/// Stages `END_STREAM` for `stream_id`, for [`flush_inbound`] to deliver.
+///
+/// Called from inside `nghttp2_session_mem_recv`, where reaching JavaScript runs
+/// `core.js` teardown for streams nghttp2 is still walking.
+pub fn stage_eof(session: &SessionState, stream_id: i32) {
+    session
+        .inbound
+        .borrow_mut()
+        .push(crate::session::InboundEvent {
+            stream_id,
+            kind: crate::session::InboundKind::Eof,
+        });
+}
+
+/// Stages `on_stream_close` for `stream_id`, for [`flush_inbound`] to deliver.
+///
+/// Queued behind that stream's body and EOF because nghttp2 delivers DATA before
+/// `END_STREAM` closes the stream. `core.js`'s `onStreamClose` asks
+/// `stream._readableState.ended`, so a close drained first reports a clean end as
+/// `ERR_HTTP2_STREAM_ABORTED`.
+pub fn stage_close(session: &SessionState, stream_id: i32, code: u32, peer_reset: bool) {
+    session
+        .inbound
+        .borrow_mut()
+        .push(crate::session::InboundEvent {
+            stream_id,
+            kind: crate::session::InboundKind::Close { code, peer_reset },
+        });
+}
+
+/// Delivers `on_stream_close` for `stream_id` immediately, outside any receive.
+///
+/// Used when the close arrives with `receiving == false`: nothing is queued ahead
+/// of it, so there is nothing to preserve order against, and `core.js` expects it
+/// in the turn it happened. Staging it there delayed a graceful
+/// `session.close(cb)` past the point where `core.js` still accepted one.
+pub fn deliver_close_now(session: &SessionState, stream_id: i32, code: u32, peer_reset: bool) {
+    deliver_stream_close(session, stream_id, code, peer_reset);
+}
+
+/// Delivers every event the last receive staged, in arrival order.
+///
+/// `OnDataChunkReceived`, `HandleDataFrame` and `OnStreamClose` all run inside
+/// `nghttp2_session_mem_recv`. Reaching JavaScript from there is not safe: the
+/// tick queue it drains runs `core.js` teardown for streams nghttp2 is still
+/// walking, and the drain can re-enter `nghttp2_session_mem_send` from the
+/// deferred write flush. Every one of them stages instead, and this drains the
+/// queue once `mem_recv` has returned.
+///
+/// Delivering here is also what puts `'end'` on a later tick than `'response'`.
+/// `core.js` queues the `'response'` emission with `process.nextTick`, so a body
+/// delivered from inside the receive arrived in the same turn as the headers and
+/// `'response'`/`'data'`/`'end'` were reported together — which is why a listener
+/// attached after `await once(req, 'response')` missed `'end'` and hung.
+pub fn flush_inbound(session: &SessionState) {
+    // The tick drain comes first, before any of these events reach JavaScript.
+    // `core.js` queues `'response'` on `process.nextTick`, so `'end'` must not be
+    // delivered until that tick has run — otherwise `'response'`/`'data'`/`'end'`
+    // share a turn and a listener attached after `await once(req, 'response')`
+    // misses `'end'` and hangs.
+    //
+    // Draining explicitly rather than relying on a scope closing above is what makes
+    // this transport-independent: a `TLSWrap` runs its whole state machine inside
+    // one scope, so a session consuming a TLS socket finishes nested and no scope
+    // closes.
+    let _ = rn_uv::callback::with_context(|scope| {
+        rn_core::task_queue::checkpoint_now(scope, rn_uv::uv_loop::in_run());
+    });
+    // Then everything queued, in arrival order: body, EOF, then the close nghttp2
+    // delivers after `END_STREAM`. That order is the contract — `core.js`'s
+    // `onStreamClose` asks `stream._readableState.ended`, so a close drained before
+    // its EOF reports a clean end as `ERR_HTTP2_STREAM_ABORTED`.
+    drain_staged(session);
+    // Every staged event has now been delivered, so the destroyed-stream marks have
+    // done their job. Dropping them here is what keeps the set bounded: without it,
+    // one entry per destroyed stream accumulates for the life of the session — a
+    // slow leak on any long-lived connection.
+    //
+    // Clearing is sound because every staged event is delivered before this point,
+    // so no mark is still load-bearing. A stream destroyed during the drain above
+    // has its remaining staged events delivered in the same drain, and the marks are
+    // only read by `emit_read` — which runs inside the drain. Staging itself cannot
+    // produce a *new* event for a destroyed stream in a later receive: `deliver_data`
+    // bails on a destroyed and on a missing record, and `stage_eof`/`stage_close`
+    // are reached only from `mem_recv` frame callbacks, which a stream that has
+    // already closed no longer produces.
+    session.destroyed_streams.borrow_mut().clear();
+}
+
+/// Delivers every queued event for this session, in arrival order.
+fn drain_staged(session: &SessionState) {
+    loop {
+        // One event at a time: delivering runs JavaScript that can stage more.
+        let next = {
+            let mut queue = session.inbound.borrow_mut();
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        };
+        let Some(event) = next else {
+            return;
+        };
+        match event.kind {
+            crate::session::InboundKind::Data(bytes) => {
+                if !bytes.is_empty() {
+                    emit_read(session, event.stream_id, bytes);
+                }
+            }
+            crate::session::InboundKind::Eof => deliver_eof(session, event.stream_id),
+            crate::session::InboundKind::Close { code, peer_reset } => {
+                deliver_stream_close(session, event.stream_id, code, peer_reset);
+            }
+        }
+    }
+}
+
+/// Calls `core.js`'s per-stream close callback.
+fn deliver_stream_close(session: &SessionState, stream_id: i32, code: u32, peer_reset: bool) {
+    let _ = rn_uv::callback::with_context(|scope| {
+        let args = [
+            v8::Integer::new(scope, code as i32).into(),
+            v8::Boolean::new(scope, peer_reset).into(),
+        ];
+        call_stream_callback(
+            scope,
+            session,
+            stream_id,
+            |callbacks| callbacks.stream_close.clone(),
+            &args,
+        );
+    });
+}
 
 /// Runs `body` inside `stream_id`'s captured async context.
 ///
@@ -791,6 +965,7 @@ fn destroy(
         if let Some(record) = state.streams.borrow_mut().get_mut(&id) {
             record.destroyed = true;
         }
+        state.destroyed_streams.borrow_mut().insert(id);
         submit_rst(state, id, ffi::NGHTTP2_CANCEL_CODE);
     }
 }
