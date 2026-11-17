@@ -303,3 +303,131 @@ for (const [name, run] of cases) {
 }
 process.stdout.write(JSON.stringify(out));
 "#;
+
+/// `Bun.markdown.render`'s callback protocol, compared against Bun 1.4.4.
+///
+/// Kept out of the fixed corpus because the corpus is a frozen recording with a
+/// regenerated `expected.json`, and this needs a *driver* rather than an
+/// expression: it records the callback order, every meta object, and each
+/// argument count. Those are what the implementation had wrong — `em`/`del`
+/// instead of `emphasis`/`strikethrough`, `softbreak` callbacks that Bun never
+/// consults, and a `code` callback that never received `text` children.
+#[test]
+fn the_markdown_render_protocol_matches_bun_1_4_4() {
+    let Some(oracle) = bun_oracle() else {
+        return;
+    };
+    let script = r#"
+const keys = [
+  'blockquote','code','codespan','emphasis','heading','hr','html','image','link',
+  'list','listItem','paragraph','strikethrough','strong','table','tbody','td',
+  'text','th','thead','tr','softbreak','linebreak','em','del','bogus',
+];
+function record(source) {
+  const seen = [];
+  const handlers = {};
+  for (const key of keys) {
+    handlers[key] = function (children, meta) {
+      seen.push([key, meta === undefined ? 'U' : JSON.stringify(meta), arguments.length, children]);
+      return '<' + key + ':' + children + '>';
+    };
+  }
+  let out;
+  try {
+    out = Bun.markdown.render(source, handlers);
+  } catch (error) {
+    out = 'THREW ' + error.message;
+  }
+  return { seen, out };
+}
+const sources = {
+  heading: '# hi\n\n### three',
+  paragraph: 'plain para',
+  list: '- a\n- b',
+  ordered: '3. a\n4. b',
+  nested: '- a\n  - b',
+  task: '- [x] done\n- [ ] todo\n- [X] caps',
+  codeLang: '```js\nlet x=1\n```',
+  codePlain: '```\nraw\n```',
+  codespan: 'a `b` c',
+  tableAligned: '| a | b | c |\n|:-|:-:|-:|\n| 1 | 2 | 3 |',
+  tablePlain: '| a | b |\n|---|---|\n| 1 | 2 |',
+  link: '[t](u "title")',
+  linkNoTitle: '[t](u)',
+  image: '![alt](s "t")',
+  blockquote: '> q',
+  hr: '---',
+  strong: '**b**',
+  emphasis: '*i*',
+  strikethrough: '~~s~~',
+  htmlBlock: '<div>x</div>',
+  htmlLonger: '<div>\ny\n</div>',
+  softbreak: 'a\nb',
+  hardbreak: 'a  \nb',
+};
+const out = {};
+for (const [name, source] of Object.entries(sources)) out[name] = record(source);
+out.plainNoCallbacks = {
+  para: Bun.markdown.render('p1\n\np2'),
+  break: Bun.markdown.render('a\nb'),
+  code: Bun.markdown.render('```js\nx\n```'),
+  html: Bun.markdown.render('<div>x</div>'),
+  table: Bun.markdown.render('| a | b |\n|---|---|\n| 1 | 2 |'),
+  hr: Bun.markdown.render('a\n\n---\n\nb'),
+};
+out.unknownKeyIgnored = Bun.markdown.render('# h', { bogus: () => 'X' });
+process.stdout.write(JSON.stringify(out));
+"#;
+    let run = |binary: &std::path::Path| {
+        let output = Command::new(binary)
+            .args(["-e", script])
+            .output()
+            .unwrap_or_else(|error| panic!("cannot run {}: {error}", binary.display()));
+        assert!(
+            output.status.success(),
+            "{} failed ({}): {}",
+            binary.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    let ours = run(&rustnode());
+    let theirs = run(std::path::Path::new(&oracle));
+    assert_eq!(
+        ours, theirs,
+        "Bun.markdown.render's callback protocol differs from Bun 1.4.4.\n\
+         (the first differing case is easier to see with `diff <(echo theirs) <(echo ours)`)"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&ours).expect("the probe emits JSON");
+    // A probe that recorded nothing would compare equal against itself.
+    for field in [
+        "heading",
+        "list",
+        "ordered",
+        "task",
+        "codeLang",
+        "codespan",
+        "tableAligned",
+        "link",
+        "image",
+        "htmlBlock",
+    ] {
+        let seen = parsed[field]["seen"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} has no recorded callbacks"));
+        assert!(
+            !seen.is_empty(),
+            "{field} recorded no callbacks, so its comparison measured nothing: {ours}"
+        );
+    }
+    // `softbreak` and `linebreak` are never consulted, and `em`/`del` are not
+    // callback names — asserted directly so a rename back cannot pass.
+    for wrong in ["softbreak", "linebreak", "em", "del"] {
+        assert!(
+            !ours.contains(&format!("[\"{wrong}\"")),
+            "the callbacks must not include `{wrong}`: Bun consults `emphasis` and \
+             `strikethrough` instead, and reports a break as a text node: {ours}"
+        );
+    }
+}

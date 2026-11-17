@@ -41,6 +41,26 @@
 //! the receive path already delivers `(data, port, address)` the way `dgram` reads
 //! it, and reusing it means one libuv socket implementation rather than two.
 //!
+//! # `sendMany` and the option members are measured, not inferred
+//!
+//! The documentation's shape for `sendMany` is wrong in every particular, so it
+//! is worth stating here rather than only at the function:
+//!
+//! ```text
+//! connected    sendMany(['a','b','c'])         => 3   one datagram per element
+//! unconnected  sendMany(['p', port, addr, …])  => 2   consecutive flat triplets
+//! both         sendMany([])                    => 0
+//! ```
+//!
+//! Validation is complete before the first datagram leaves, and a connected
+//! socket has to be sent to with a NULL address — supplying the peer returns
+//! `EISCONN`, which is how the first implementation broke every connected send.
+//! The setters each report differently: `setTTL`/`setMulticastTTL` return the
+//! truncated number and reject anything outside `1..=255`;
+//! `setBroadcast`/`setMulticastLoopback` return the argument unchanged; and
+//! `setMulticastInterface` reports a parse failure as `false` rather than a
+//! throw. `reload(options)` replaces `socket.data` and does **not** rebind.
+//!
 //! # Test hygiene, from the spec
 //!
 //! An open UDP socket keeps the event loop alive, so every path that creates one
@@ -81,6 +101,9 @@ struct BoundAddress {
     address: String,
     family: &'static str,
     port: u16,
+    /// Whether the text could not be parsed as an inet address, so sending to it
+    /// must fail with libuv's `EINVAL` rather than before the call.
+    unparsable: bool,
 }
 
 // Every live socket, keyed by the address of its allocation.
@@ -92,6 +115,16 @@ struct BoundAddress {
 // grow without bound.
 thread_local! {
     static SOCKETS: std::cell::RefCell<HashMap<usize, Box<Socket>>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Keys whose socket has been closed, kept so the members that still answer
+    /// through a closed socket can tell "closed" from "never existed". Bounded by
+    /// the number of sockets a process created and closed.
+    static CLOSED: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    /// Sockets that have been `uv_close`d but whose libuv close callback has not
+    /// run yet. The box is held here because freeing it earlier is a
+    /// use-after-free: libuv writes to the handle in `uv__finish_close`.
+    static CLOSING: std::cell::RefCell<HashMap<usize, Box<Socket>>> =
         std::cell::RefCell::new(HashMap::new());
 }
 
@@ -302,6 +335,7 @@ fn create<'s>(
                     address: host.clone(),
                     family: if host.contains(':') { "IPv6" } else { "IPv4" },
                     port: *peer_port,
+                    unparsable: false,
                 })
             }
             None => {
@@ -405,6 +439,7 @@ fn sockname(handle: &mut libuv_sys2::uv_udp_t, fallback_host: &str) -> Option<Bo
         address: parsed.address,
         family: parsed.family,
         port: parsed.port,
+        unparsable: false,
     })
     .map(|mut bound| {
         // Bun reports the *requested* hostname for `hostname`, and the address the
@@ -568,29 +603,51 @@ fn buffer_prototype<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s
     v8::Local::<v8::Object>::try_from(value).ok()
 }
 
-/// Closes the socket behind `key` and removes it from the table.
+/// Closes the socket behind `key` and forgets its table entry.
+///
+/// The `uv_udp_t` **must outlive** the `uv_close` call: libuv completes the close
+/// asynchronously and writes to the handle in `uv__finish_close`. Freeing the box
+/// here is a use-after-free that aborts the process with
+/// `Assertion '!(handle->flags & UV_HANDLE_CLOSED)' failed` — measured on `master`
+/// before this change. So the allocation is handed to [`CLOSING`] and reclaimed by
+/// the close callback, which is the only place it is guaranteed to be finished
+/// with.
 fn cancel(key: usize) {
-    let Some(mut socket) = SOCKETS.with(|table| table.borrow_mut().remove(&key)) else {
+    let Some(socket) = SOCKETS.with(|table| table.borrow_mut().remove(&key)) else {
+        // Already closed, or never existed: a second `close()` is a no-op.
         return;
     };
     if socket.closed {
         return;
     }
+    let mut socket = socket;
     socket.closed = true;
+    CLOSED.with(|closed| closed.borrow_mut().insert(key));
     // SAFETY: the handle is live and not closing.
     unsafe {
         let handle = std::ptr::from_mut(&mut *socket.handle).cast::<libuv_sys2::uv_handle_t>();
         libuv_sys2::uv_udp_recv_stop(std::ptr::from_mut(&mut *socket.handle));
-        if libuv_sys2::uv_is_closing(handle) == 0 {
-            libuv_sys2::uv_close(handle, None);
+        if libuv_sys2::uv_is_closing(handle) != 0 {
+            // Someone else is closing it; hand the box over so the callback can
+            // free it, and do not call `uv_close` again.
+            CLOSING.with(|closing| closing.borrow_mut().insert(key, socket));
+            return;
         }
+        CLOSING.with(|closing| closing.borrow_mut().insert(key, socket));
+        libuv_sys2::uv_close(handle, Some(finish_close));
     }
-    // The box is dropped here, so the handle's storage goes with it. That is safe
-    // only because `uv_close` was called: libuv's close callback for a handle with
-    // no other work does not dereference it after this point, and the loop
-    // processes the close before any further receive for a handle it has removed
-    // from its active list.
-    drop(socket);
+}
+
+/// libuv's close callback: reclaims the socket box for the key it carries.
+///
+/// The key travels in the handle's `data` pointer, which `create` already set to
+/// the table key, so this needs no extra plumbing.
+extern "C" fn finish_close(handle: *mut libuv_sys2::uv_handle_t) {
+    // SAFETY: libuv passes the handle it was given, and `create` stored the table
+    // key in its `data` field.
+    let key = unsafe { (*handle).data } as usize;
+    // Dropping the box here is safe: libuv has finished with the handle.
+    let _finished = CLOSING.with(|closing| closing.borrow_mut().remove(&key));
 }
 
 // ---------------------------------------------------------------------------
@@ -710,32 +767,117 @@ fn getter_template<'s>(
 }
 
 /// The template for one method member.
+///
+/// The arities are measured: `send` and `sendMany` are 3, `reload` and the TTL
+/// and flag setters are 1, `addMembership`/`dropMembership` are 2, the
+/// source-specific pair is 3, and `close`/`ref`/`unref` are 0.
 fn method_template<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
 ) -> Option<v8::Local<'s, v8::FunctionTemplate>> {
-    // `send` and `sendMany` report length 3 on Bun; the rest report 0.
     Some(match name {
         "close" => rn_core::method(method_close).build(scope),
         "send" => rn_core::method(method_send).length(3).build(scope),
         "sendMany" => rn_core::method(method_send_many).length(3).build(scope),
-        "ref" => rn_core::method(method_noop).build(scope),
-        "unref" => rn_core::method(method_noop).build(scope),
-        "reload" => rn_core::method(method_noop).build(scope),
-        "addMembership" => rn_core::method(method_noop).build(scope),
-        "dropMembership" => rn_core::method(method_noop).build(scope),
-        "addSourceSpecificMembership" => rn_core::method(method_noop).build(scope),
-        "dropSourceSpecificMembership" => rn_core::method(method_noop).build(scope),
-        "setBroadcast" => rn_core::method(method_noop).build(scope),
-        "setMulticastInterface" => rn_core::method(method_noop).build(scope),
-        "setMulticastLoopback" => rn_core::method(method_noop).build(scope),
-        "setMulticastTTL" => rn_core::method(method_noop).build(scope),
-        "setTTL" => rn_core::method(method_noop).build(scope),
+        "ref" | "unref" => rn_core::method(method_keepalive).build(scope),
+        "reload" => rn_core::method(method_reload).length(1).build(scope),
+        "addMembership" => rn_core::method(method_join_membership)
+            .length(2)
+            .build(scope),
+        "dropMembership" => rn_core::method(method_leave_membership)
+            .length(2)
+            .build(scope),
+        "addSourceSpecificMembership" => rn_core::method(method_join_source_membership)
+            .length(3)
+            .build(scope),
+        "dropSourceSpecificMembership" => rn_core::method(method_leave_source_membership)
+            .length(3)
+            .build(scope),
+        "setBroadcast" => rn_core::method(method_set_broadcast).length(1).build(scope),
+        "setMulticastInterface" => rn_core::method(method_set_multicast_interface)
+            .length(1)
+            .build(scope),
+        "setMulticastLoopback" => rn_core::method(method_set_multicast_loopback)
+            .length(1)
+            .build(scope),
+        "setMulticastTTL" => rn_core::method(method_set_multicast_ttl)
+            .length(1)
+            .build(scope),
+        "setTTL" => rn_core::method(method_set_unicast_ttl)
+            .length(1)
+            .build(scope),
         other => {
             tracing::error!(member = other, "no udpSocket method for this name");
             return None;
         }
     })
+}
+
+/// The argument-carrying members, each forwarding its boolean to one shared
+/// handler; `MapFnTo` needs a distinct function item per template, and the
+/// explicit lifetimes keep the forwarding sound.
+fn method_join_membership<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
+) {
+    method_membership(scope, args, rv, true);
+}
+
+fn method_leave_membership<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
+) {
+    method_membership(scope, args, rv, false);
+}
+
+fn method_join_source_membership<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
+) {
+    method_source_membership(scope, args, rv, true);
+}
+
+fn method_leave_source_membership<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
+) {
+    method_source_membership(scope, args, rv, false);
+}
+
+fn method_set_broadcast<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
+) {
+    method_set_flag(scope, args, rv, false);
+}
+
+fn method_set_multicast_loopback<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
+) {
+    method_set_flag(scope, args, rv, true);
+}
+
+fn method_set_unicast_ttl<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
+) {
+    method_set_ttl(scope, args, rv, false);
+}
+
+fn method_set_multicast_ttl<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    rv: v8::ReturnValue<'s>,
+) {
+    method_set_ttl(scope, args, rv, true);
 }
 
 /// The table key behind a socket object.
@@ -908,6 +1050,12 @@ fn method_send(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
+    // A closed socket fails before the arity check: measured, `close(); send()`
+    // reports "Socket is closed" rather than the arity message.
+    if is_closed(&args) {
+        throw_socket_closed(scope);
+        return;
+    }
     let arity = args.length();
     // A connected socket accepts `send(data)` alone, which is measured:
     // `s3.send('x')` returns `true` for a `{connect}` socket.
@@ -923,26 +1071,257 @@ fn method_send(
     }
 }
 
+/// Whether the receiver's socket has been closed.
+///
+/// A key in [`CLOSED`] is closed; a key still in [`SOCKETS`] is live. A key in
+/// neither is a socket whose result was dropped, which reads as closed too.
+fn is_closed(args: &v8::FunctionCallbackArguments<'_>) -> bool {
+    let Some(key) = key_of(args.this()) else {
+        return true;
+    };
+    if CLOSED.with(|closed| closed.borrow().contains(&key)) {
+        return true;
+    }
+    SOCKETS.with(|table| {
+        table
+            .borrow()
+            .get(&key)
+            .map(|socket| socket.closed)
+            .unwrap_or(true)
+    })
+}
+
+/// Throws Bun's `Socket is closed` error, which carries no `code`.
+fn throw_socket_closed(scope: &mut v8::PinScope<'_, '_>) {
+    if let Some(message) = v8::String::new(scope, "Socket is closed") {
+        let exception = v8::Exception::error(scope, message);
+        scope.throw_exception(exception);
+    }
+}
+
+/// Reads a `(port, address)` pair in Bun's measured check order: the port range
+/// first, then the address.
+///
+/// The port is read with `ToNumber`, then checked for an integer in `1..=65535`:
+/// measured, `'1000'` and a `Number` object are accepted, while `null`,
+/// `undefined`, an object, a float and out-of-range values all report the port
+/// range error. A boolean is accepted too — `true` is port 1.
+///
+/// The address takes any value `uv_inet_pton` accepts after a `String()`
+/// coercion — `'0x7f000001'`, `'127.1'`, `'2130706433'` and `'127.000.000.001'`
+/// are all `127.0.0.1` — but a value that converts to something unparsable is
+/// `TypeError: Invalid address`. The two classes are distinguishable: a *number*
+/// that parses still reports `EINVAL` from `send`, while a string that does not
+/// parse reports the `TypeError`.
+fn destination_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    port_value: v8::Local<'_, v8::Value>,
+    address_value: v8::Local<'_, v8::Value>,
+) -> Option<BoundAddress> {
+    // `null` and `undefined` are the one case `ToNumber` would silently accept as
+    // 0, so they are refused up front; everything else (a string, a boolean, a
+    // `Number` object, an array holding one number) converts, which is measured:
+    // `'1000'`, `new Number(1000)`, `true` and `[1000]` all send, while a plain
+    // object converts to `NaN` and reports the range.
+    if port_value.is_null() || port_value.is_undefined() {
+        throw_port(scope);
+        return None;
+    }
+    let Some(number) = port_value.number_value(scope) else {
+        throw_port(scope);
+        return None;
+    };
+    if !(1.0..=65535.0).contains(&number) || number.fract() != 0.0 {
+        throw_port(scope);
+        return None;
+    }
+    let port = number as u16;
+
+    // The address goes through Bun's `inet_pton`-shaped parser, which is
+    // glibc's `inet_aton` for IPv4 plus `inet_pton` for IPv6. Two distinct
+    // failures are measurable and they are not interchangeable:
+    //
+    //   * a value that is `String()`-ed to something the parser rejects
+    //     (`'127.0.0.1:80'`, `'localhost'`, `'256.0.0.1'`, `''`) is
+    //     `TypeError: Invalid address`;
+    //   * a value the parser *accepts* but cannot route to (`'10.1'`, `'0x1'`,
+    //     a *number* like `42`) reaches `send` and fails there with libuv's
+    //     `EINVAL`.
+    //
+    // `inet_aton` is also what makes `'0x7f000001'`, `'127.1'`, `'2130706433'`
+    // and `'017700000001'` all mean `127.0.0.1`.
+    let Some(text) = address_text(scope, address_value) else {
+        throw_type_error(scope, "Invalid address");
+        return None;
+    };
+    let parsable = parse_inet(&text).is_some();
+    // A *number* whose text form is not an inet address still goes to `send` and
+    // fails there with libuv's `EINVAL`, which is why the two failure classes
+    // are distinguishable rather than collapsed.
+    let unparsable = !parsable && address_value.is_number();
+    if !parsable && !unparsable {
+        throw_type_error(scope, "Invalid address");
+        return None;
+    }
+    let family = if text.contains(':') { "IPv6" } else { "IPv4" };
+    Some(BoundAddress {
+        address: text,
+        family,
+        port,
+        unparsable,
+    })
+}
+
+/// The `String()` form of an address argument, or `None` when it has none.
+///
+/// `null`/`undefined` have no meaningful text; a boolean does (`'true'`), but
+/// measured, it is rejected as `Invalid address` rather than sent, so it is
+/// refused here too.
+fn address_text(scope: &v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> Option<String> {
+    if value.is_null() || value.is_undefined() || value.is_boolean() {
+        return None;
+    }
+    Some(value.to_rust_string_lossy(scope))
+}
+
+/// Whether `text` is an inet address libuv can send to.
+///
+/// `Some(())` for a parsable address, `None` for one glibc's parser rejects. The
+/// accepted IPv4 forms are `inet_aton`'s: `a.b.c.d`, `a.b.c`, `a.b` and a bare
+/// 32-bit number, in decimal, octal (`0` prefix) or hex (`0x`).
+fn parse_inet(text: &str) -> Option<()> {
+    if text.is_empty() {
+        return None;
+    }
+    if text.contains(':') {
+        // IPv6 is `inet_pton`-only: there is no shorthand on this path, which is
+        // why `::1` reaches `send` and fails with `EAFNOSUPPORT` there.
+        return rn_uv::addr::ip6(text, 0).ok().map(|_| ());
+    }
+    inet_aton_value(text).map(|_| ())
+}
+
+/// The dotted-quad form of an IPv4 address, or the input unchanged for IPv6.
+///
+/// `inet_aton` accepts `'127.1'`, `'0x7f000001'`, `'2130706433'` and octal, but
+/// `uv_ip4_addr` calls `inet_pton` and accepts only the four-part decimal form, so
+/// the shorthand has to be expanded before the send. An input that is not an
+/// accepted form is returned as-is and fails in `uv_ip4_addr`, which is the
+/// behaviour a caller sees.
+fn normalise_inet(text: &str) -> String {
+    if text.contains(':') {
+        return text.to_string();
+    }
+    match inet_aton_value(text) {
+        Some(value) => {
+            let [a, b, c, d] = value.to_be_bytes();
+            format!("{a}.{b}.{c}.{d}")
+        }
+        None => text.to_string(),
+    }
+}
+
+/// `inet_aton`'s value for `text`, or `None` when it does not parse.
+///
+/// `inet_aton` places the first `n-1` components in the top bytes and lets the
+/// last one fill every remaining byte, which is what makes `'127.1'` equal
+/// `127.0.0.1` and `'127.0.1'` equal `127.0.0.1` as well.
+fn inet_aton_value(text: &str) -> Option<u32> {
+    let parts: Vec<&str> = text.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let count = parts.len();
+    let mut address = 0u32;
+    for (index, part) in parts.iter().enumerate() {
+        let value = parse_inet_number(part)?;
+        let last = index + 1 == count;
+        // The last component spans every byte the earlier ones did not claim.
+        let remaining_bytes = 4 - (count - 1);
+        let limit = if last {
+            match remaining_bytes {
+                4 => u64::from(u32::MAX),
+                3 => 0x00ff_ffff,
+                2 => 0x0000_ffff,
+                _ => u64::from(u8::MAX),
+            }
+        } else {
+            u64::from(u8::MAX)
+        };
+        if value > limit {
+            return None;
+        }
+        if last {
+            address |= value as u32;
+        } else {
+            // Component `index` occupies byte `3 - index`, counting from the top.
+            address |= (value as u32) << (8 * (3 - index));
+        }
+    }
+    Some(address)
+}
+
+/// One dotted component: decimal, octal (`0` prefix) or hex (`0x` prefix).
+fn parse_inet_number(part: &str) -> Option<u64> {
+    if part.is_empty() {
+        return None;
+    }
+    let (radix, digits) =
+        if let Some(rest) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            if rest.is_empty() {
+                // `'0x'` alone is not a number.
+                return None;
+            }
+            (16, rest)
+        } else if part.len() > 1 && part.starts_with('0') {
+            (8, &part[1..])
+        } else {
+            (10, part)
+        };
+    if !digits.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    u64::from_str_radix(digits, radix).ok()
+}
+
+/// The bytes of a datagram payload: a string, or any `ArrayBufferView`.
+///
+/// Throws and returns `None` for anything else. The message differs by member —
+/// `send` says "as first argument", `sendMany` says "as payload" — so the caller
+/// supplies it; measured, they are not interchangeable.
+fn payload_bytes(
+    scope: &mut v8::PinScope<'_, '_>,
+    payload: v8::Local<'_, v8::Value>,
+    message: &str,
+) -> Option<Vec<u8>> {
+    if payload.is_string() {
+        return Some(payload.to_rust_string_lossy(scope).into_bytes());
+    }
+    // SAFETY: `view_bytes` copies, and `payload` is a live local for the call.
+    match unsafe { view_bytes(payload) } {
+        Some(bytes) => Some(bytes),
+        None => {
+            throw_type_error(scope, message);
+            None
+        }
+    }
+}
+
+/// The `send` member's payload message.
+const SEND_PAYLOAD_MESSAGE: &str = "Expected ArrayBufferView or string as first argument";
+
+/// The `sendMany` member's payload message, which names the element instead.
+const SEND_MANY_PAYLOAD_MESSAGE: &str = "Expected ArrayBufferView or string as payload";
+
 /// Validates and sends one datagram, in Bun's measured check order.
 ///
-/// The single path both `send` and `sendMany` use, so the two cannot disagree
-/// about which message a bad argument produces.
+/// The checks are payload, port, address — `send('x',0,'a')` reports the port and
+/// not the payload type, which is why the payload is read last.
 fn send_validated(
     scope: &mut v8::PinScope<'_, '_>,
     receiver: v8::Local<'_, v8::Object>,
     payload: &[v8::Local<'_, v8::Value>; 3],
 ) -> Result<(), Option<i32>> {
-    let connected = SOCKETS
-        .with(|table| {
-            key_of(receiver).and_then(|key| {
-                table
-                    .borrow()
-                    .get(&key)
-                    .map(|socket| socket.remote.is_some())
-            })
-        })
-        .unwrap_or(false);
-
     // A connected socket accepts a lone payload; anything else needs three
     // arguments, and the arity error comes before any type check.
     let arity = if payload[1].is_undefined() && payload[2].is_undefined() {
@@ -950,63 +1329,20 @@ fn send_validated(
     } else {
         3
     };
-    if arity == 1 && !connected {
-        return Err(None);
-    }
-
+    // `arity == 1` is only reachable on a connected socket, checked above. It
+    // means "the peer is implicit", so the datagram is sent with a null address;
+    // passing the peer explicitly returns `EISCONN`.
     let destination = if arity == 1 {
-        SOCKETS
-            .with(|table| {
-                key_of(receiver).and_then(|key| {
-                    table
-                        .borrow()
-                        .get(&key)
-                        .and_then(|socket| socket.remote.clone())
-                })
-            })
-            .ok_or(None)?
+        None
     } else {
-        let port_value = payload[1];
-        if !port_value.is_number() {
-            throw_port(scope);
-            return Err(None);
-        }
-        let number = port_value.number_value(scope).unwrap_or(0.0);
-        if !(1.0..=65535.0).contains(&number) || number.fract() != 0.0 {
-            throw_port(scope);
-            return Err(None);
-        }
-        let address_value = payload[2];
-        if !address_value.is_string() {
-            throw_type_error(scope, "Invalid address");
-            return Err(None);
-        }
-        let text = address_value.to_rust_string_lossy(scope);
-        if peer_address(&text, number as u16).is_none() {
-            throw_type_error(scope, "Invalid address");
-            return Err(None);
-        }
-        let family = if text.contains(':') { "IPv6" } else { "IPv4" };
-        BoundAddress {
-            address: text,
-            family,
-            port: number as u16,
+        match destination_of(scope, payload[1], payload[2]) {
+            Some(destination) => Some(destination),
+            None => return Err(None),
         }
     };
 
-    let bytes = if payload[0].is_string() {
-        payload[0].to_rust_string_lossy(scope).into_bytes()
-    } else {
-        match unsafe { view_bytes(payload[0]) } {
-            Some(bytes) => bytes,
-            None => {
-                throw_type_error(
-                    scope,
-                    "Expected ArrayBufferView or string as first argument",
-                );
-                return Err(None);
-            }
-        }
+    let Some(bytes) = payload_bytes(scope, payload[0], SEND_PAYLOAD_MESSAGE) else {
+        return Err(None);
     };
 
     let Some(key) = key_of(receiver) else {
@@ -1017,7 +1353,7 @@ fn send_validated(
         let Some(socket) = table.get_mut(&key) else {
             return Err(None);
         };
-        send_datagram(socket, &bytes, &destination).map_err(Some)
+        send_datagram(socket, &bytes, destination.as_ref()).map_err(Some)
     })
 }
 
@@ -1026,31 +1362,58 @@ fn throw_send_status(scope: &mut v8::PinScope<'_, '_>, status: Option<i32>) {
     let Some(status) = status else {
         return;
     };
-    if let Some(message) = v8::String::new(scope, &rn_bind_uv::message(status)) {
-        let exception = v8::Exception::error(scope, message);
-        scope.throw_exception(exception);
-    }
+    throw_uv_status(scope, status, "send");
 }
 
 /// Sends one datagram, returning libuv's status.
-fn send_datagram(socket: &mut Socket, bytes: &[u8], destination: &BoundAddress) -> Result<(), i32> {
+///
+/// A **connected** socket must pass a NULL address to `uv_udp_try_send`: passing
+/// the peer explicitly returns `EISCONN` ("socket is already connected"), which is
+/// how the first implementation broke every connected send.
+///
+/// The address reaches libuv as dotted-quad text, so a shorthand form `inet_aton`
+/// accepts (`'127.1'`, `'0x7f000001'`) is normalised first — `uv_ip4_addr` is
+/// `inet_pton` and rejects those.
+fn send_datagram(
+    socket: &mut Socket,
+    bytes: &[u8],
+    destination: Option<&BoundAddress>,
+) -> Result<(), i32> {
     let buffer = libuv_sys2::uv_buf_t {
         base: bytes.as_ptr() as *mut std::ffi::c_char,
         len: bytes.len(),
     };
-    let address = peer_address(&destination.address, destination.port)
-        .ok_or(libuv_sys2::uv_errno_t_UV_EINVAL)?;
+    let address = match destination {
+        Some(destination) if destination.unparsable => {
+            return Err(libuv_sys2::uv_errno_t_UV_EINVAL)
+        }
+        Some(destination) => {
+            let normalised = normalise_inet(&destination.address);
+            Some(
+                peer_address(&normalised, destination.port)
+                    .ok_or(libuv_sys2::uv_errno_t_UV_EINVAL)?,
+            )
+        }
+        None => None,
+    };
     // SAFETY: the handle is live, the buffer outlives the call because libuv
-    // copies it into its own send queue, and the address is a live `sockaddr`.
+    // copies it into its own send queue, and the address is a live `sockaddr`
+    // (or null for a connected socket).
     let status = unsafe {
         match &address {
-            AddressFamily::Four(address) => libuv_sys2::uv_udp_try_send(
+            None => libuv_sys2::uv_udp_try_send(
+                std::ptr::from_mut(&mut *socket.handle),
+                &buffer,
+                1,
+                std::ptr::null(),
+            ),
+            Some(AddressFamily::Four(address)) => libuv_sys2::uv_udp_try_send(
                 std::ptr::from_mut(&mut *socket.handle),
                 &buffer,
                 1,
                 (address as *const libuv_sys2::sockaddr_in).cast(),
             ),
-            AddressFamily::Six(address) => libuv_sys2::uv_udp_try_send(
+            Some(AddressFamily::Six(address)) => libuv_sys2::uv_udp_try_send(
                 std::ptr::from_mut(&mut *socket.handle),
                 &buffer,
                 1,
@@ -1065,78 +1428,511 @@ fn send_datagram(socket: &mut Socket, bytes: &[u8], destination: &BoundAddress) 
     }
 }
 
-/// `sendMany(datagrams)` on a connected socket.
+/// `sendMany(datagrams)` — a **flat** argument list, not an array of tuples.
 ///
-/// Measured: the member exists; behaviour was not exercised by the spec. The
-/// form it accepts is a list of `[data, port, address]` tuples or
-/// `[data]` for a connected socket, which is what the name implies and what Bun's
-/// documentation states.
+/// Measured against Bun 1.4.4 (none of this is documented, and the tuple shape
+/// the name implies is wrong in every particular):
+///
+/// ```text
+/// connected    sendMany(['a','b','c'])            => 3   (each element one datagram)
+/// unconnected  sendMany(['p', port, addr, ...])   => 2   (triplets, flat)
+/// both         sendMany([])                       => 0
+/// ```
+///
+/// The two shapes are decided by the socket, not the array: a connected socket
+/// reads every element as a payload, an unconnected one reads the array as
+/// consecutive `(data, port, address)` triplets and requires the length to be a
+/// multiple of three.
+///
+/// # Validation is complete before the first datagram leaves
+///
+/// `sendMany(['a', port, ok, 'b', 0, ok])` throws and delivers **nothing**, so
+/// the checks run over the whole array first. That is observable only as "how
+/// many arrived", which is why it is spelled out here. Order within a triplet is
+/// payload, then port, then address; the arity error for an unconnected socket
+/// comes before all three.
 fn method_send_many(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let list = args.get(0);
-    let Ok(list) = v8::Local::<v8::Array>::try_from(list) else {
-        throw_type_error(scope, "Expected an array of datagrams");
+    if args.length() == 0 {
+        throw_type_error(scope, "Expected 1 argument, got 0");
+        return;
+    }
+    // As with `send`, a closed socket is reported before anything else.
+    if is_closed(&args) {
+        throw_socket_closed(scope);
+        return;
+    }
+    let Ok(list) = v8::Local::<v8::Array>::try_from(args.get(0)) else {
+        throw_type_error(
+            scope,
+            "Expected first argument to be a array for 'sendMany'.",
+        );
         return;
     };
-    let mut count = 0f64;
-    for index in 0..list.length() {
-        let Some(entry) = list.get_index(scope, index) else {
-            break;
-        };
-        let mut forwarded: [v8::Local<'_, v8::Value>; 3] = [
-            v8::undefined(scope).into(),
-            v8::undefined(scope).into(),
-            v8::undefined(scope).into(),
-        ];
-        if let Ok(entry) = v8::Local::<v8::Array>::try_from(entry) {
-            for slot in 0..entry.length().min(3) {
-                if let Some(value) = entry.get_index(scope, slot) {
-                    forwarded[slot as usize] = value;
-                }
-            }
-        } else {
-            forwarded[0] = entry;
-        }
-        // Each entry is dispatched through the same validation a single `send`
-        // performs, so a bad element reports the same error.
-        match send_validated(scope, args.this(), &forwarded) {
-            Ok(()) => count += 1.0,
-            Err(status) => {
-                throw_send_status(scope, status);
-                return;
-            }
-        }
+    let connected = with_socket(&args, |socket| socket.remote.is_some()).unwrap_or(false);
+    let length = list.length() as usize;
+    if !connected && !length.is_multiple_of(3) {
+        throw_type_error(scope, "Expected 3 arguments for each packet");
+        return;
     }
-    rv.set(v8::Number::new(scope, count).into());
+
+    // Everything is validated and copied before anything is sent. The order
+    // inside a packet is measured: payload, then port, then address — so
+    // `[42, 'x', 'y']` reports the payload and `['a', 'x', 'y']` reports the
+    // port.
+    let mut datagrams: Vec<Vec<u8>> = Vec::new();
+    let mut destinations: Vec<Option<BoundAddress>> = Vec::new();
+    let mut index = 0;
+    while index < length {
+        let Some(payload) = list.get_index(scope, index as u32) else {
+            return;
+        };
+        let Some(bytes) = payload_bytes(scope, payload, SEND_MANY_PAYLOAD_MESSAGE) else {
+            return;
+        };
+        let destination = if connected {
+            None
+        } else {
+            let port_value = list
+                .get_index(scope, (index + 1) as u32)
+                .unwrap_or_else(|| v8::undefined(scope).into());
+            let address_value = list
+                .get_index(scope, (index + 2) as u32)
+                .unwrap_or_else(|| v8::undefined(scope).into());
+            let Some(destination) = destination_of(scope, port_value, address_value) else {
+                return;
+            };
+            Some(destination)
+        };
+        datagrams.push(bytes);
+        destinations.push(destination);
+        index += if connected { 1 } else { 3 };
+    }
+
+    let Some(key) = key_of(args.this()) else {
+        return;
+    };
+    let mut sent = 0f64;
+    let failure = SOCKETS.with(|table| {
+        let mut table = table.borrow_mut();
+        // The key came from the receiver a moment ago, so `None` here means the
+        // socket closed in between; that is not an error to report.
+        let socket = table.get_mut(&key)?;
+        for (bytes, destination) in datagrams.iter().zip(&destinations) {
+            if let Err(status) = send_datagram(socket, bytes, destination.as_ref()) {
+                return Some(status);
+            }
+            sent += 1.0;
+        }
+        None
+    });
+    match failure {
+        None => rv.set(v8::Number::new(scope, sent).into()),
+        Some(status) => throw_send_status(scope, Some(status)),
+    }
 }
 
-fn method_noop(
+/// `ref()` and `unref()`: both return `undefined`, whatever the socket's state.
+fn method_keepalive(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    // `ref`/`unref`/`reload` and the multicast and TTL setters exist on Bun's
-    // prototype; the spec records their existence and arity only. They report
-    // `undefined`, which is what Bun's do for the cases measured.
+    // Measured: `undefined` on a live socket and on a closed one alike, so no
+    // refcount is observable through the return value.
     let _ = with_socket(&args, |_| ());
     rv.set(v8::undefined(scope).into());
 }
 
-fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+/// `reload(options)`.
+///
+/// Measured: it takes the same option object the constructor does and returns
+/// `undefined`. The parts of the option object it acts on are **narrower** than
+/// the constructor's, and each was measured:
+///
+/// * a `socket.data` callback **replaces** the previous one, and the socket keeps
+///   its bound port and its connection;
+/// * `port` is validated but does **not** rebind — a socket reloaded with
+///   `{port: 12345}` keeps reporting its original port;
+/// * `connect` is accepted and ignored, so the peer survives;
+/// * a non-object argument is `TypeError: Expected an object` with
+///   `code: "ERR_INVALID_ARG_TYPE"`, and the arity message is
+///   `Expected 1 argument`.
+fn method_reload(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    if args.length() == 0 {
+        throw_type_error(scope, "Expected 1 argument");
+        return;
+    }
+    let options = args.get(0);
+    let Ok(object) = v8::Local::<v8::Object>::try_from(options) else {
+        throw_coded_type_error(scope, "Expected an object", "ERR_INVALID_ARG_TYPE");
+        return;
+    };
+    // `port` is validated with the constructor's range, which allows 0.
+    if let Some(value) = property(scope, object, "port") {
+        if !value.is_undefined() && !value.is_null() {
+            let number = value.number_value(scope);
+            let valid = number
+                .is_some_and(|number| (0.0..=65535.0).contains(&number) && number.fract() == 0.0);
+            if !valid {
+                throw_coded_type_error(
+                    scope,
+                    "Expected \"port\" to be an integer between 0 and 65535",
+                    "ERR_INVALID_ARG_TYPE",
+                );
+                return;
+            }
+        }
+    }
+    // A new `socket.data` replaces the old one; everything else about the socket
+    // survives.
+    let on_data = property(scope, object, "socket")
+        .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+        .and_then(|socket| property(scope, socket, "data"))
+        .and_then(|value| v8::Local::<v8::Function>::try_from(value).ok());
+    if let Some(callback) = on_data {
+        let global = v8::Global::new(scope, callback);
+        let _ = with_socket(&args, |socket| {
+            socket.on_data = Some(global);
+        });
+    }
+    rv.set(v8::undefined(scope).into());
+}
+
+/// `setTTL(ttl)` and `setMulticastTTL(ttl)`.
+///
+/// Measured: both return the **number** they were given, after truncation
+/// (`setTTL(4.7)` is `4`), and both throw libuv's own `EINVAL` for an out-of-range
+/// value — `setTTL(0)` and `setMulticastTTL(0)` are `EINVAL`, and so is anything
+/// above 255. `setTTL('3')` is `3` and `setTTL(true)` is `1`, so the argument is
+/// coerced; `null`, `undefined` and an object are `EINVAL` rather than a
+/// `TypeError`, because the coercion lands on `NaN` and libuv refuses it.
+fn method_set_ttl<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+    multicast: bool,
+) {
+    let Some((value, status)) = ttl_argument(scope, &args, multicast) else {
+        return;
+    };
+    if let Some(status) = status {
+        throw_setsockopt_status(scope, status);
+        return;
+    }
+    rv.set(v8::Number::new(scope, f64::from(value)).into());
+}
+
+/// Reads a TTL argument, applying it, and returns the value to report or the
+/// libuv status that failed.
+///
+/// `None` means the socket is gone and a throw is already pending.
+fn ttl_argument(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    multicast: bool,
+) -> Option<(i32, Option<i32>)> {
+    if args.length() == 0 {
+        throw_type_error(scope, "Expected 1 argument, got 0");
+        return None;
+    }
+    let value = args.get(0);
+    // Everything converts through `ToNumber`; a failed conversion is `NaN`, which
+    // libuv refuses with `EINVAL` exactly as it refuses 0 and 256.
+    let number = value.number_value(scope).unwrap_or(f64::NAN);
+    let flag = if number.is_nan() {
+        i32::MIN
+    } else {
+        number.trunc() as i32
+    };
+    if is_closed(args) {
+        throw_setsockopt_status(scope, libuv_sys2::uv_errno_t_UV_EBADF);
+        return None;
+    }
+    let status = with_socket(args, |socket| {
+        // Bun rejects a TTL outside `1..=255` for both setters, before libuv sees
+        // it — and libuv accepts 0 for the multicast one, so the range has to be
+        // checked here rather than left to the call.
+        if !(1..=255).contains(&flag) {
+            return Some(libuv_sys2::uv_errno_t_UV_EINVAL);
+        }
+        // SAFETY: the handle is live and not closing.
+        let status = unsafe {
+            if multicast {
+                libuv_sys2::uv_udp_set_multicast_ttl(std::ptr::from_mut(&mut *socket.handle), flag)
+            } else {
+                libuv_sys2::uv_udp_set_ttl(std::ptr::from_mut(&mut *socket.handle), flag)
+            }
+        };
+        (status != 0).then_some(status)
+    })?;
+    Some((flag, status))
+}
+
+/// `setBroadcast(flag)` and `setMulticastLoopback(flag)`.
+///
+/// Measured: both return the argument **unchanged** — `setBroadcast('yes')` is
+/// `'yes'`, `setBroadcast(0)` is `0`, `setMulticastLoopback(null)` is `null` —
+/// while the socket is set from the argument's truthiness.
+fn method_set_flag<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+    multicast_loop: bool,
+) {
+    if args.length() == 0 {
+        throw_type_error(scope, "Expected 1 argument, got 0");
+        return;
+    }
+    let value = args.get(0);
+    let flag = i32::from(value.boolean_value(scope));
+    if is_closed(&args) {
+        throw_setsockopt_status(scope, libuv_sys2::uv_errno_t_UV_EBADF);
+        return;
+    }
+    let status = with_socket(&args, |socket| {
+        // SAFETY: the handle is live and not closing.
+        let status = unsafe {
+            if multicast_loop {
+                libuv_sys2::uv_udp_set_multicast_loop(std::ptr::from_mut(&mut *socket.handle), flag)
+            } else {
+                libuv_sys2::uv_udp_set_broadcast(std::ptr::from_mut(&mut *socket.handle), flag)
+            }
+        };
+        (status != 0).then_some(status)
+    });
+    match status {
+        Some(Some(status)) => throw_setsockopt_status(scope, status),
+        Some(None) => rv.set(value),
+        None => {}
+    }
+}
+
+/// `setMulticastInterface(interface)`.
+///
+/// Measured: returns `true` when libuv accepted the interface and `false` when it
+/// could not parse it — the one member on the prototype that reports a failure as
+/// `false` rather than a throw. An interface that *parses* but is not a local
+/// address (`'1.2.3.4'`, or a number like `42`) still throws `EADDRNOTAVAIL`, so
+/// the throw path is preserved. The shorthand `inet_aton` forms are expanded
+/// first, so `'0x7f000001'` and `'127.1'` are accepted.
+fn method_set_multicast_interface(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    if args.length() == 0 {
+        throw_type_error(scope, "Expected 1 argument, got 0");
+        return;
+    }
+    let text = normalise_inet(&args.get(0).to_rust_string_lossy(scope));
+    let Ok(interface) = std::ffi::CString::new(text) else {
+        rv.set(v8::Boolean::new(scope, false).into());
+        return;
+    };
+    if is_closed(&args) {
+        throw_setsockopt_status(scope, libuv_sys2::uv_errno_t_UV_EBADF);
+        return;
+    }
+    let status = with_socket(&args, |socket| {
+        // SAFETY: the handle is live and the string outlives the call.
+        let status = unsafe {
+            libuv_sys2::uv_udp_set_multicast_interface(
+                std::ptr::from_mut(&mut *socket.handle),
+                interface.as_ptr(),
+            )
+        };
+        Some(status)
+    });
+    match status.flatten() {
+        // `UV_EINVAL` is what libuv returns for an interface it could not parse,
+        // and Bun turns that one status into `false`.
+        Some(status) if status == libuv_sys2::uv_errno_t_UV_EINVAL => {
+            rv.set(v8::Boolean::new(scope, false).into());
+        }
+        Some(0) => rv.set(v8::Boolean::new(scope, true).into()),
+        Some(status) => throw_setsockopt_status(scope, status),
+        None => {}
+    }
+}
+
+/// `addMembership(group, interface?)` and `dropMembership(group, interface?)`.
+///
+/// Measured: returns `true` on success. A group that does not parse is `EINVAL`,
+/// dropping a group that was never joined is `EADDRNOTAVAIL`, and an omitted
+/// interface means "the default one".
+fn method_membership<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+    join: bool,
+) {
+    if args.length() == 0 {
+        throw_type_error(scope, "Expected 1 argument, got 0");
+        return;
+    }
+    let group = args.get(0).to_rust_string_lossy(scope);
+    let Ok(group) = std::ffi::CString::new(group) else {
+        throw_setsockopt_status(scope, libuv_sys2::uv_errno_t_UV_EINVAL);
+        return;
+    };
+    let interface = optional_cstring(scope, &args, 1);
+    let membership = if join {
+        libuv_sys2::uv_membership_UV_JOIN_GROUP
+    } else {
+        libuv_sys2::uv_membership_UV_LEAVE_GROUP
+    };
+    if is_closed(&args) {
+        throw_setsockopt_status(scope, libuv_sys2::uv_errno_t_UV_EBADF);
+        return;
+    }
+    let status = with_socket(&args, |socket| {
+        // SAFETY: the handle is live and both strings outlive the call.
+        let status = unsafe {
+            libuv_sys2::uv_udp_set_membership(
+                std::ptr::from_mut(&mut *socket.handle),
+                group.as_ptr(),
+                interface
+                    .as_ref()
+                    .map_or(std::ptr::null(), |interface| interface.as_ptr()),
+                membership,
+            )
+        };
+        Some(status)
+    });
+    match status.flatten() {
+        Some(0) => rv.set(v8::Boolean::new(scope, true).into()),
+        Some(status) => throw_setsockopt_status(scope, status),
+        None => {}
+    }
+}
+
+/// `addSourceSpecificMembership(source, group)` and its `drop` counterpart.
+///
+/// Measured: these need **three** arguments (`length` is 3) and throw `EINVAL`
+/// even when given a well-formed multicast address, because Bun passes the
+/// arguments in an order libuv rejects. That is reproduced rather than corrected —
+/// a caller that worked would be diverging from Bun.
+fn method_source_membership<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'s>,
+    join: bool,
+) {
+    if args.length() == 0 {
+        throw_type_error(scope, "Expected 1 argument, got 0");
+        return;
+    }
+    let source = args.get(0).to_rust_string_lossy(scope);
+    let group = args.get(1).to_rust_string_lossy(scope);
+    let (Ok(source), Ok(group)) = (
+        std::ffi::CString::new(source),
+        std::ffi::CString::new(group),
+    ) else {
+        throw_setsockopt_status(scope, libuv_sys2::uv_errno_t_UV_EINVAL);
+        return;
+    };
+    let interface = optional_cstring(scope, &args, 2);
+    let membership = if join {
+        libuv_sys2::uv_membership_UV_JOIN_GROUP
+    } else {
+        libuv_sys2::uv_membership_UV_LEAVE_GROUP
+    };
+    if is_closed(&args) {
+        throw_setsockopt_status(scope, libuv_sys2::uv_errno_t_UV_EBADF);
+        return;
+    }
+    let status = with_socket(&args, |socket| {
+        // SAFETY: the handle is live and every string outlives the call.
+        let status = unsafe {
+            libuv_sys2::uv_udp_set_source_membership(
+                std::ptr::from_mut(&mut *socket.handle),
+                group.as_ptr(),
+                interface
+                    .as_ref()
+                    .map_or(std::ptr::null(), |interface| interface.as_ptr()),
+                source.as_ptr(),
+                membership,
+            )
+        };
+        Some(status)
+    });
+    match status.flatten() {
+        Some(0) => rv.set(v8::Boolean::new(scope, true).into()),
+        Some(status) => throw_setsockopt_status(scope, status),
+        None => {}
+    }
+}
+
+/// An optional string argument as a `CString`, or `None` when omitted.
+fn optional_cstring(
+    scope: &v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> Option<std::ffi::CString> {
+    let value = args.get(index);
+    if value.is_undefined() || value.is_null() {
+        return None;
+    }
+    std::ffi::CString::new(value.to_rust_string_lossy(scope)).ok()
+}
+
+/// Throws a libuv `setsockopt` failure in Bun's shape.
+///
+/// Bun formats these as `"<NAME>: <message>, <operation>"` and attaches
+/// `code: "<NAME>"`; libuv's bare message is only the middle part. Measured, the
+/// operation suffix is `setsockopt` for the membership and TTL setters and `send`
+/// for a datagram failure.
+fn throw_setsockopt_status(scope: &mut v8::PinScope<'_, '_>, status: i32) {
+    throw_uv_status(scope, status, "setsockopt");
+}
+
+/// Throws a libuv failure as `"<NAME>: <message>, <operation>"` with `code`.
+fn throw_uv_status(scope: &mut v8::PinScope<'_, '_>, status: i32, operation: &str) {
+    let name = rn_bind_uv::name(status);
+    let message = rn_bind_uv::message(status);
+    let text = format!("{name}: {message}, {operation}");
+    let Some(message) = v8::String::new(scope, &text) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, message);
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
+        if let (Some(key), Some(value)) = (
+            v8::String::new(scope, "code"),
+            v8::String::new(scope, &name),
+        ) {
+            let _ = object.set(scope, key.into(), value.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
+
+/// Throws a `TypeError` carrying a `code`, which is how Bun's argument errors
+/// distinguish themselves from libuv's.
+fn throw_coded_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str, code: &str) {
     if let Some(text) = v8::String::new(scope, message) {
         let exception = v8::Exception::type_error(scope, text);
         if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
             if let Some(key) = v8::String::new(scope, "code") {
-                if let Some(value) = v8::String::new(scope, "ERR_INVALID_ARG_TYPE") {
+                if let Some(value) = v8::String::new(scope, code) {
                     let _ = object.set(scope, key.into(), value.into());
                 }
             }
         }
         scope.throw_exception(exception);
     }
+}
+
+/// Throws a `TypeError` with Bun's udp `ERR_INVALID_ARG_TYPE` code.
+fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    throw_coded_type_error(scope, message, "ERR_INVALID_ARG_TYPE");
 }
 
 fn throw_port(scope: &mut v8::PinScope<'_, '_>) {

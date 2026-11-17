@@ -273,30 +273,49 @@ pub fn is_main_thread() -> bool {
 
 /// Whether Bun-style ANSI colours are enabled, from the environment.
 ///
-/// Measured precedence, all under a real pty and with `env -i`:
+/// This is **not** the same question as `color(x, 'ansi')`, and the two disagree;
+/// each was measured separately under `env -i`, both with and without a pty.
 ///
-/// | environment | `enableANSIColors` | `color('red','ansi')` |
-/// | --- | --- | --- |
-/// | no tty, clean env | false | `""` |
-/// | pty, clean env | **true** | `""` (empty because `TERM` is unset, not because colours are off) |
-/// | `NO_COLOR=1` (any tty) | false | `""` |
-/// | `FORCE_COLOR=1` | true | `"\u{1b}[91m"` |
-/// | `FORCE_COLOR=0`, pty | **true** | — (`FORCE_COLOR=0` does not disable a tty here) |
-/// | `TERM=dumb`, no tty | false | `""` |
+/// `FORCE_COLOR` comes first and is read as a *boolean-ish string*, not as the
+/// numeric level `ansi` uses — so `FORCE_COLOR=2` is true here while its level is
+/// 256 there, and `FORCE_COLOR=4` is true here but level 16 there. The false set
+/// is `false`, `no`, `off` (case-insensitive) and the integers that parse to
+/// zero (`0`, `00`, `-0`, `+0`); `FORCE_COLOR=(empty)`, `1`, `true` and every
+/// other string are true.
 ///
-/// So: `NO_COLOR` wins over `FORCE_COLOR`, `FORCE_COLOR` wins over a tty, and a
-/// tty alone is enough. `FORCE_COLOR=0` was measured **not** to disable colours
-/// when the descriptor is a tty, which is the one rule that is easy to guess
-/// wrong; it is applied as measured rather than as documented.
+/// | environment | `enableANSIColors` |
+/// | --- | --- |
+/// | no tty, clean env | false |
+/// | pty, clean env | **true** (even with `TERM` unset, where `ansi` is `""`) |
+/// | `NO_COLOR=1`, no `FORCE_COLOR` | false |
+/// | `NO_COLOR=1 FORCE_COLOR=1` | **true** — `NO_COLOR` does *not* beat `FORCE_COLOR` |
+/// | `FORCE_COLOR=0`, pty | **false** — unlike `ansi`, which a tty still colours |
+/// | `TERM=dumb`, no tty | false |
+///
+/// So: `FORCE_COLOR` wins over `NO_COLOR` and over a tty, and a tty alone is
+/// enough. The two rules that are easy to guess wrong are that `NO_COLOR` loses
+/// to `FORCE_COLOR` and that `FORCE_COLOR=0` really does disable a tty here; both
+/// are applied as measured rather than as documented.
 #[must_use]
 pub fn enable_ansi_colors() -> bool {
+    if let Some(force) = std::env::var_os("FORCE_COLOR") {
+        return force_color_is_truthy(&force.to_string_lossy());
+    }
     if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
         return false;
     }
-    if std::env::var_os("FORCE_COLOR").is_some() {
-        return true;
-    }
     std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
+/// `FORCE_COLOR` read as a boolean: the false set is `false`/`no`/`off` in any
+/// case and the integer zero, and everything else is true.
+fn force_color_is_truthy(force: &str) -> bool {
+    if matches!(force.to_ascii_lowercase().as_str(), "false" | "no" | "off") {
+        return false;
+    }
+    // `0`, `00`, `-0`, `+0` are all false; `0.0`, `0x0` and `0 ` are true, which
+    // is what an integer parse rather than a float or a trim gives.
+    !matches!(force.parse::<i64>(), Ok(0))
 }
 
 #[cfg(test)]
@@ -329,13 +348,32 @@ mod tests {
     }
 
     #[test]
-    fn no_color_beats_force_color() {
-        // Measured: `NO_COLOR=1 FORCE_COLOR=1` reports false. Checked
-        // structurally here so the rule survives a refactor; the live
-        // environment case is covered by the binary test, which can set both.
+    fn force_color_beats_no_color() {
+        // Measured: `NO_COLOR=1 FORCE_COLOR=1` reports **true** — `FORCE_COLOR`
+        // wins, which is the opposite of what the environment-variable
+        // documentation implies and what this test asserted before the behaviour
+        // was measured. `NO_COLOR` only applies when `FORCE_COLOR` is absent.
         let no_color = |value: Option<&str>| value.is_some_and(|text| !text.is_empty());
         assert!(no_color(Some("1")));
         assert!(!no_color(Some("")));
         assert!(!no_color(None));
+        // And the `FORCE_COLOR` reading itself, which is a boolean-ish string
+        // rather than the numeric level `color(x, 'ansi')` uses.
+        assert!(force_color_is_truthy(""));
+        assert!(force_color_is_truthy("1"));
+        assert!(force_color_is_truthy("2"));
+        assert!(force_color_is_truthy("4"));
+        assert!(force_color_is_truthy("true"));
+        assert!(force_color_is_truthy("yes"));
+        // `0.0`, `0x0` and `0 ` are true, which is what an integer parse gives.
+        assert!(force_color_is_truthy("0.0"));
+        assert!(!force_color_is_truthy("0"));
+        assert!(!force_color_is_truthy("00"));
+        assert!(!force_color_is_truthy("-0"));
+        assert!(!force_color_is_truthy("+0"));
+        assert!(!force_color_is_truthy("false"));
+        assert!(!force_color_is_truthy("FALSE"));
+        assert!(!force_color_is_truthy("no"));
+        assert!(!force_color_is_truthy("off"));
     }
 }

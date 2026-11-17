@@ -554,43 +554,150 @@ enum AnsiDepth {
 
 /// `OutputSource::color_depth()`: what `color(x, 'ansi')` resolves to.
 ///
-/// Measured under `env -i`, which is the only way to separate the four inputs:
+/// Measured under `env -i`, which is the only way to separate the inputs. Three
+/// separate rules, and the order between them is load-bearing:
 ///
-/// | environment | `ansi` output |
+/// **1. `FORCE_COLOR` wins over everything**, including `NO_COLOR` (`NO_COLOR=1
+/// FORCE_COLOR=1` is 16-colour, not none) and including a tty. Its value is a
+/// level, and the parse is not a plain integer parse:
+///
+/// | value | depth |
 /// | --- | --- |
-/// | clean, no tty | `""` |
-/// | clean, pty | `""` (`TERM` unset) |
-/// | `TERM=dumb` | `""` |
-/// | `TERM=xterm` | `"\u{1b}[91m"` (16) |
-/// | `TERM=xterm-256color` | `"\u{1b}[38;5;196m"` (256) |
-/// | `FORCE_COLOR=1` | `"\u{1b}[91m"` (16) |
-/// | `FORCE_COLOR=3` | `"\u{1b}[38;2;255;0;0m"` (16m) |
-/// | `NO_COLOR=1` with any `TERM` | `""` |
+/// | unset | fall through to rule 2 |
+/// | `""`, `1`, `true`, any unparsable text | 16 |
+/// | `2` | 256 |
+/// | `3`, `4`, `…`, `9223372036854775807` | 16m |
+/// | `0`, `00`, `-0`, `+0`, `false`, `no`, `off` (case-insensitive) | none |
+///
+/// `18446744073709551615` and above fall back to 16: the level is read into a
+/// signed 64-bit integer, so the value stops being ">= 3" once it overflows.
+///
+/// **2. With no `FORCE_COLOR`, the terminator decides from the environment, not
+/// from whether stdout is a tty.** A pty with `TERM` unset is none; a *pipe* with
+/// `TERM=xterm` is 16. `NO_COLOR` (present, any value including empty) and
+/// `TERM=dumb` are none, and `dumb` vetoes **everything** below it —
+/// `TERM=dumb COLORTERM=truecolor TERM_PROGRAM=ghostty` is none.
+/// `NODE_DISABLE_COLORS` is **not** consulted here: it suppresses
+/// `enableANSIColors` but leaves `ansi` colouring intact, which is a divergence
+/// between the two members rather than an oversight to unify.
+///
+/// **3. Otherwise `TERM_PROGRAM` and `COLORTERM` are checked before `TERM`,** so
+/// either beats the `TERM` table: `TERM=vt220 TERM_PROGRAM=ghostty` is 16m and
+/// `COLORTERM=truecolor TERM=zzz` is 16m. `COLORTERM` wins over `TERM_PROGRAM`,
+/// which is only observable when the two disagree, and `iTerm.app` is always 16m
+/// whatever `TERM_PROGRAM_VERSION` holds.
+///
+/// **4. Otherwise `TERM`**, case-sensitively:
+///
+/// | `TERM` | depth |
+/// | --- | --- |
+/// | `mosh`, `terminator`, `xterm-ghostty`, `rxvt-unicode-24bit` (exact) | 16m |
+/// | starts with `xterm-256` | 256 |
+/// | contains `ansi`, `color`, `linux`, `con`, `rxvt`, `screen`, `xterm` or `vt100`; or is one of `eterm cons25 console cygwin dtterm gnome hurd jfbterm konsole kterm mlterm putty st` | 16 |
+/// | anything else, including `vt220`, `tmux`, `direct`, `XTERM` | none |
+///
+/// Those are unanchored substrings, measured: `xrxvt`, `xvt100`, `ansiX`,
+/// `Xansi`, `axterm`, `xconx` and plain `con` are all 16.
 fn ansi_depth() -> AnsiDepth {
-    if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
-        return AnsiDepth::None;
-    }
     if let Some(force) = std::env::var_os("FORCE_COLOR") {
-        // `FORCE_COLOR` carries a level: 1 is 16 colours, 2 is 256, 3 is 16m.
-        // An empty value is level 1, which is what `FORCE_COLOR=` measured.
-        return match force.to_string_lossy().as_ref() {
-            "0" => AnsiDepth::None,
-            "2" => AnsiDepth::C256,
-            "3" => AnsiDepth::C16m,
-            _ => AnsiDepth::C16,
-        };
+        return forced_depth(&force.to_string_lossy());
+    }
+    if std::env::var_os("NO_COLOR").is_some() {
+        return AnsiDepth::None;
     }
     let term = std::env::var("TERM").unwrap_or_default();
-    if term.is_empty() || term == "dumb" {
+    if term == "dumb" {
         return AnsiDepth::None;
     }
-    if term.contains("256color") {
-        return AnsiDepth::C256;
-    }
-    if term.contains("truecolor") || term.contains("24bit") {
+    if color_term_says_24bit() {
         return AnsiDepth::C16m;
     }
-    AnsiDepth::C16
+    if let Some(depth) = program_depth() {
+        return depth;
+    }
+    term_depth(&term)
+}
+
+/// `FORCE_COLOR`'s level, as measured.
+fn forced_depth(force: &str) -> AnsiDepth {
+    // A disabled level is a small fixed set of words, matched case-insensitively,
+    // plus the integers that parse to zero.
+    let lowered = force.to_ascii_lowercase();
+    if matches!(lowered.as_str(), "false" | "no" | "off") {
+        return AnsiDepth::None;
+    }
+    // `str::parse::<i64>` is the measured parse: it accepts `+2` and `02`, and
+    // rejects `2.0`, `0x2` and anything past `i64::MAX` — each of which was
+    // measured to fall back to 16 rather than to the parsed value. An empty value
+    // is level 1, which is what `FORCE_COLOR=` measured.
+    let level = if force.is_empty() {
+        Some(1)
+    } else {
+        force.parse::<i64>().ok()
+    };
+    match level {
+        Some(0) => AnsiDepth::None,
+        Some(2) => AnsiDepth::C256,
+        Some(value) if value >= 3 => AnsiDepth::C16m,
+        _ => AnsiDepth::C16,
+    }
+}
+
+/// `TERM_PROGRAM`'s contribution, if the program names a 24-bit terminal.
+///
+/// Measured: every one of these is 16m regardless of `TERM_PROGRAM_VERSION`,
+/// including `iTerm.app` with a 1.x version — the version split that Node's
+/// `tty` module has is not present in Bun 1.4.4.
+fn program_depth() -> Option<AnsiDepth> {
+    match std::env::var("TERM_PROGRAM").ok()?.as_str() {
+        "ghostty" | "WezTerm" | "MacTerm" | "HyperTerm" | "iTerm.app" => Some(AnsiDepth::C16m),
+        _ => None,
+    }
+}
+
+/// `COLORTERM`'s contribution: `truecolor` and `24bit`, exactly.
+///
+/// Measured: it creates 16m on its own (`COLORTERM=truecolor` with no `TERM` is
+/// 16m) and is checked *after* `TERM`, so it cannot be the reason `TERM=vt220`
+/// stays none.
+fn color_term_says_24bit() -> bool {
+    matches!(
+        std::env::var("COLORTERM").unwrap_or_default().as_str(),
+        "truecolor" | "24bit"
+    )
+}
+
+/// The depth `TERM` alone selects, case-sensitively.
+///
+/// The three "24-bit" names are exact matches; the 16-colour patterns are
+/// **unanchored substring** matches, which is measured (`xrxvt`, `xvt100`,
+/// `ansiX`, `Xansi`, `axterm` all select 16) and is why they cannot be written as
+/// `starts_with`.
+fn term_depth(term: &str) -> AnsiDepth {
+    match term {
+        "mosh" | "terminator" | "xterm-ghostty" | "rxvt-unicode-24bit" => return AnsiDepth::C16m,
+        // These are the exact-name entries of Bun's `TERM_ENVS` table; the rest
+        // of the table's keys are matched by the substrings below.
+        "eterm" | "cons25" | "console" | "cygwin" | "dtterm" | "gnome" | "hurd" | "jfbterm"
+        | "konsole" | "kterm" | "mlterm" | "putty" | "st" => return AnsiDepth::C16,
+        _ => {}
+    }
+    if term.starts_with("xterm-256") {
+        return AnsiDepth::C256;
+    }
+    let coloured = term.contains("ansi")
+        || term.contains("color")
+        || term.contains("linux")
+        || term.contains("con")
+        || term.contains("rxvt")
+        || term.contains("screen")
+        || term.contains("xterm")
+        || term.contains("vt100");
+    if coloured {
+        AnsiDepth::C16
+    } else {
+        AnsiDepth::None
+    }
 }
 
 /// The CSS printer's output for a colour.

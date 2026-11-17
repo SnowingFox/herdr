@@ -1718,16 +1718,31 @@ fn method_unref(
     rv.set(v8::undefined(scope).into());
 }
 
+/// `p.resourceUsage()`.
+///
+/// Measured: an empty object once the child has exited, and `undefined` while it
+/// is still running — `Bun.spawn(['sleep','5']).resourceUsage()` is `undefined`
+/// before `exited` settles. That split is the whole behaviour: the child's
+/// `rusage` only exists after `wait`, and Bun reports the absence rather than a
+/// placeholder. `spawnSync`'s `resourceUsage` is the same empty object, because
+/// `spawnSync` waits.
+///
+/// `{}` and not a populated struct in either case: measured across
+/// `process.resourceUsage`'s sixteen real fields, Bun's subprocess result stays
+/// empty even with `{resourceUsage: true}`, `{rusage: true}` and
+/// `{resource_usage: true}` — none of those options exists. So the object is the
+/// thing to reproduce, and a filled-in struct would be a divergence.
 fn method_resource_usage(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    // Measured: a function that returns `undefined` (the spec's table records the
-    // key as `{}`; the oracle reports a function, and a function is what a caller
-    // can call).
-    let _ = with_subprocess(&args, |_| ());
-    rv.set(v8::undefined(scope).into());
+    let exited = with_subprocess(&args, |state| state.exit_code.is_some()).unwrap_or(false);
+    if exited {
+        rv.set(v8::Object::new(scope).into());
+    } else {
+        rv.set(v8::undefined(scope).into());
+    }
 }
 
 fn method_send(
