@@ -140,19 +140,27 @@ a wrapper that forgot `exec` shows up as the latter.
 
 ## What the version story is
 
-The binary reports `v28.0.0` for `process.version` **on purpose**: it is the Node
-API level the vendored `lib/**` and bindings target, and Node libraries branch on
-it. `process.versions.v8` is `15.2.124.1-rusty`, where the substitution is
-visible. The npm package version (`0.1.0`) is rustnode's own and is deliberately
+The binary reports `v28.0.0-nightly20261111e8c1160d20` for `process.version` **on
+purpose**: it is the Node API level the vendored `lib/**` and bindings target,
+together with the pinned revision's own pre-release identity, and Node libraries
+branch on it. The long string is not a claim that this is a Node release; it is
+the identity the pinned tree derives from `src/node_version.h`, which is why
+`rsnode --version` can be byte-identical to the reference binary. Reporting a
+shortened `v28.0.0` would put `process.version` and `--version` out of step
+inside one process. `napi_get_node_version` still carries the three integers
+(`28.0.0`) because that ABI field has no room for a suffix.
+`process.versions.v8` is `15.2.124.1-rusty`, where the substitution is visible.
+The npm package version (`0.1.0`) is rustnode's own and is deliberately
 different; `tools/npm-pack.py` reads it from `[workspace.package]` so the two
 cannot drift.
 
-`--version` is **not implemented**: the CLI rejects unknown flags, so
-`rsnode --version` exits 9. The wrapper forwards this rather than intercepting
-the flag, because a second entry point reporting a version the runtime does not
-is the misleading thing to avoid. `README.md` says this in the
-`--version` section and gives `rsnode -p 'process.versions'` as the honest
-inventory.
+`--version` and `--help` **are implemented**: `--version` answers after the V8
+argument vector is applied, the way `src/node.cc:1282` does, and `--help` runs
+`internal/main/print_help` so the text comes from the option table. The wrapper
+forwards both rather than intercepting them, because a second entry point
+reporting a version the runtime does not is the misleading thing to avoid.
+`README.md` says this in the `--version` and `--help` section and gives
+`rsnode -p 'process.versions'` as the honest inventory.
 
 ## Packages, step by step
 

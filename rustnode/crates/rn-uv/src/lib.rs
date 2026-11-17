@@ -117,3 +117,18 @@ pub fn uv_version_string() -> Option<String> {
             .into_owned(),
     )
 }
+
+/// Whether a descriptor is a terminal, by libuv's own definition.
+///
+/// `src/node.cc:404` decides between the REPL and `internal/main/eval_stdin`
+/// with `uv_guess_handle(STDIN_FILENO) == UV_TTY`, so this has to be the same
+/// question rather than `isatty(3)`: a `/dev/null` redirect is neither a tty
+/// nor a pipe, and Node still reads it as a (empty) script. `uv_guess_handle`
+/// only inspects the descriptor and owns no state, so no loop is needed.
+pub fn is_terminal(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: `uv_guess_handle` only inspects the descriptor.
+    unsafe { libuv_sys2::uv_guess_handle(fd) == libuv_sys2::uv_handle_type_UV_TTY }
+}

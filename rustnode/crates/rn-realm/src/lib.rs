@@ -981,24 +981,24 @@ fn install_allowed_node_environment_flags<'s>(
     else {
         return;
     };
-    let Some(flags) = build.call(scope, v8::undefined(scope).into(), &[]) else {
-        return;
-    };
-
-    // Bind the built set as a closure variable so the getter still has it after
-    // this call returns, and have the getter replace itself with a data property
-    // on first read — that is what Node's `get() { ...; process.allowedNodeEnvironmentFlags = flags; }`
-    // does, and it is observable through `getOwnPropertyDescriptor`.
+    // `buildAllowedFlags` is deliberately **not** called here. It mutates the
+    // alias expansion it walks — `per_thread.js:410` splices the self-referencing
+    // `--prof-process` expansion in place — so building the set eagerly rewrites
+    // the alias map every later reader sees, and `--help` then prints
+    // `--prof-process, --` on the option-terminator row. Node builds it on first
+    // read for that reason.
     let global = scope.get_current_context().global(scope);
-    let Some(slot) = v8::String::new(scope, "__rustnodeAllowedFlags") else {
+    let Some(slot) = v8::String::new(scope, "__rustnodeAllowedFlagsBuilder") else {
         return;
     };
-    let _ = global.set(scope, slot.into(), flags);
+    let _ = global.set(scope, slot.into(), build.into());
     let getter = run_expression(
         scope,
-        "(function (flags) {\n\
+        "(function (build) {\n\
+           let flags;\n\
            return {\n\
              get: function get() {\n\
+               flags ??= build();\n\
                Object.defineProperty(process, 'allowedNodeEnvironmentFlags', {\n\
                  __proto__: null, value: flags, configurable: true,\n\
                  enumerable: true, writable: true,\n\
@@ -1012,7 +1012,7 @@ fn install_allowed_node_environment_flags<'s>(
                });\n\
              },\n\
            };\n\
-         })(globalThis.__rustnodeAllowedFlags)",
+         })(globalThis.__rustnodeAllowedFlagsBuilder)",
     );
     let _ = global.delete(scope, slot.into());
     let Some(pair) = getter.and_then(|value| v8::Local::<v8::Object>::try_from(value).ok()) else {
@@ -1149,6 +1149,22 @@ pub fn run_main_script(scope: &mut v8::PinScope<'_, '_>, id: &str) -> Option<Str
     run_bootstrap_script(scope, id)
 }
 
+/// Runs one `internal/main/**` script from substituted source under its own id.
+///
+/// The only caller is `--help`: `internal/main/print_help.js` writes its usage
+/// header as the literal `'Usage: node [options] ...'`, and the vendored tree
+/// must stay byte-identical to Node's (`tools/verify-libjs.sh` pins it). So the
+/// program name is substituted in the source at load time rather than by editing
+/// the vendored file, and the id — which is also the script's `sourceURL` — stays
+/// Node's, so a throw from inside it still names `node:internal/main/print_help`.
+pub fn run_main_script_with_source(
+    scope: &mut v8::PinScope<'_, '_>,
+    id: &str,
+    source: &str,
+) -> Option<String> {
+    run_bootstrap_script_from(scope, id, source)
+}
+
 /// Runs one `internal/bootstrap/**` script with the parameters its kind declares.
 ///
 /// Returns the script's error message when it threw, which is more useful than
@@ -1156,7 +1172,17 @@ pub fn run_main_script(scope: &mut v8::PinScope<'_, '_>, id: &str) -> Option<Str
 /// worse than a reported gap.
 pub fn run_bootstrap_script(scope: &mut v8::PinScope<'_, '_>, id: &str) -> Option<String> {
     let builtin = rn_js2c::builtin_by_id(id)?;
-    let function = rn_builtins::compile(scope, builtin.id(), builtin.source(), builtin.kind())?;
+    run_bootstrap_script_from(scope, id, builtin.source())
+}
+
+/// The body of [`run_bootstrap_script`], over explicit source.
+fn run_bootstrap_script_from(
+    scope: &mut v8::PinScope<'_, '_>,
+    id: &str,
+    source: &str,
+) -> Option<String> {
+    let builtin = rn_js2c::builtin_by_id(id)?;
+    let function = rn_builtins::compile(scope, builtin.id(), source, builtin.kind())?;
     let global = scope.get_current_context().global(scope);
     let process = get_property(scope, global.into(), "process")?;
     let require = rn_core::hook_slot::require(scope)?;
@@ -1796,7 +1822,8 @@ fn process_object<'s>(
     }
     define_read_only(scope, process, "versions", versions.into())?;
 
-    let version = v8::String::new(scope, "v28.0.0").ok_or("cannot allocate a version")?;
+    let version = v8::String::new(scope, &versions::process_version_string())
+        .ok_or("cannot allocate a version")?;
     define_read_only(scope, process, "version", version.into())?;
 
     // These are the platform facts `os.arch()`, `os.platform()` and

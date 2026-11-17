@@ -31,8 +31,29 @@
 
 use rn_v8_sys::v8;
 
-/// The Node version this runtime reports.
-pub const NODE_VERSION: &str = "28.0.0";
+/// The Node version this runtime reports, without the leading `v`.
+///
+/// This is the pin's own release identity, not a shortened form of it:
+/// `src/node_version.h` at the pinned revision defines `NODE_VERSION_IS_RELEASE
+/// 0`, `NODE_VERSION_TAG "nightly"` and the date-and-SHA suffix, so the binary
+/// `tools/node-pin.toml` names reports `v28.0.0-nightly20261111e8c1160d20` for
+/// `--version`, `process.version` and `process.versions.node` alike. Reporting a
+/// bare `28.0.0` here made `rsnode --version` disagree with the reference binary
+/// byte for byte, which is the one thing that output exists to settle.
+pub const NODE_VERSION: &str = "28.0.0-nightly20261111e8c1160d20";
+
+/// The `MAJOR.MINOR.PATCH` part of [`NODE_VERSION`].
+///
+/// `napi_get_node_version` fills a struct of three integers, so it cannot carry
+/// the pre-release suffix. Kept next to the full string and asserted against it
+/// by a test, rather than retyped where it is used.
+pub const NODE_VERSION_RELEASE: &str = "28.0.0";
+
+/// What `process.version` and `--version` report: [`NODE_VERSION`] with the `v`
+/// Node prints in front of it.
+pub fn process_version_string() -> String {
+    format!("v{NODE_VERSION}")
+}
 
 /// llhttp, from `vendor/llhttp/include/llhttp.h`, which is copied byte-identical
 /// from the pin (`LLHTTP_VERSION_MAJOR/MINOR/PATCH`). Node parses HTTP with this
@@ -445,5 +466,47 @@ mod tests {
             rn_bind_sqlite::sqlite_version().expect("a linked SQLite reports a version")
         );
         assert_eq!(sqlite.value, "3.54.1");
+    }
+
+    #[test]
+    fn the_published_node_version_is_the_pins_release_identity() {
+        // `--version`, `process.version` and `process.versions.node` all come
+        // from here, and the differential tests compare `--version` against the
+        // pinned oracle byte for byte. A nightly's identity includes the date and
+        // short SHA, so the pin is the only source: `oracle_version` in
+        // `tools/node-pin.toml` is the string the reference binary prints, and
+        // this asserts the constant is exactly that minus the leading `v`.
+        let pin = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/node-pin.toml"),
+        )
+        .expect("the pin is readable");
+        let oracle_version = pin
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("oracle_version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("the pin records oracle_version");
+        assert_eq!(
+            process_version_string(),
+            oracle_version,
+            "the reported version must be the one the pinned oracle prints"
+        );
+    }
+
+    #[test]
+    fn the_release_form_is_the_prefix_of_the_full_version() {
+        // `napi_get_node_version` takes three integers, so it uses the
+        // three-component form. It has to be a prefix of the published string
+        // rather than an independent literal, or the two would drift and an addon
+        // would compare its ABI against a version this runtime does not report
+        // anywhere else.
+        assert!(
+            NODE_VERSION.starts_with(NODE_VERSION_RELEASE),
+            "{NODE_VERSION} does not start with {NODE_VERSION_RELEASE}"
+        );
+        assert_eq!(
+            NODE_VERSION.strip_prefix(NODE_VERSION_RELEASE),
+            Some("-nightly20261111e8c1160d20"),
+            "the suffix is the pin's pre-release identity"
+        );
     }
 }

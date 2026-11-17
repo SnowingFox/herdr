@@ -51,6 +51,24 @@ def load(path: pathlib.Path) -> dict:
         return json.load(handle)
 
 
+def node_version_constant() -> str | None:
+    """The `NODE_VERSION` the binary reports, read from the crate that owns it.
+
+    `--version` and `process.version` both come from
+    `crates/rn-realm/src/versions.rs`, so that constant is the only honest source
+    for "what the binary prints". Reading it keeps this check from restating the
+    value a third time, which is how the README came to name a string the binary
+    no longer printed.
+    """
+    path = RUSTNODE_DIR / "crates" / "rn-realm" / "src" / "versions.rs"
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r'^pub const NODE_VERSION: &str = "([^"]+)";', source, re.MULTILINE)
+    return match.group(1) if match else None
+
+
 def main() -> int:
     failures: list[str] = []
 
@@ -142,6 +160,20 @@ def main() -> int:
     expect(binary == command, f"platforms.json binary {binary!r} is the file the wrapper execs")
     expect(platforms["node_compat"] in (NPM_DIR / "README.md").read_text(encoding="utf-8"),
            f"README documents the Node API level {platforms['node_compat']}")
+
+    # `node_compat` is the API level (`28.0.0`), which is not the whole identity
+    # the binary prints. `process.version` reports the pinned revision's release
+    # identity, `v28.0.0-nightly<date><sha>`, and the README's `process.version`
+    # section quotes that string. A substring test on the API level cannot see
+    # the difference — `28.0.0` is inside the longer string — so it passed while
+    # the documented value was stale. This reads the constant the binary is built
+    # from and requires the README to name it exactly.
+    node_version = node_version_constant()
+    expect(node_version is not None,
+           "crates/rn-realm/src/versions.rs declares pub const NODE_VERSION")
+    if node_version is not None:
+        expect(f"v{node_version}" in (NPM_DIR / "README.md").read_text(encoding="utf-8"),
+               f"README documents the reported process.version, v{node_version}")
 
     if failures:
         print(f"\nnpm-manifest-check: {len(failures)} problem(s)", file=sys.stderr)

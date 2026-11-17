@@ -17,9 +17,11 @@ What this proves, and why each check is here rather than assumed:
 * **The wrapper adds no measurable startup cost**, measured against invoking the
   binary directly, interleaved so drift in machine load does not favour either.
 
-`--version` is expected to *fail* on this runtime today (the CLI rejects unknown
-flags with exit 9). The check asserts that shape deliberately, so this test does
-not quietly start passing if someone later fakes the flag in the wrapper.
+`--version` and `--help` are answered by the runtime, not by the wrapper, and the
+checks assert that shape: `--version` must print the same string the runtime's
+`process.version` reports, and `--help` must print a usage header naming the
+binary. A wrapper that started faking either flag would make the two disagree,
+which is the failure these assertions exist to catch.
 """
 
 from __future__ import annotations
@@ -189,6 +191,10 @@ def main(argv: list[str]) -> int:
         check(result.returncode == 0, f"-e exited 0 ({result.stderr.strip()[:120]})")
         print(f"    {command} -e 'console.log(process.version)' -> {result.stdout.strip()}")
         check(result.stdout.strip().startswith("v"), "process.version printed a version")
+        # Kept for the `--version` comparison below: the two entry points have to
+        # report one identity, and that is only checkable against a value this
+        # run actually observed.
+        version_from_process = result.stdout.strip()
 
         script = clean / "script.js"
         script.write_text("console.log('from-script', 6 * 7);\n")
@@ -204,12 +210,25 @@ def main(argv: list[str]) -> int:
         print(f"    require('node:fs') -> {result.stdout.strip()}")
 
         result = run([command, "--version"], cwd=clean, env=env)
-        print(f"    {command} --version -> exit {result.returncode}: {result.stderr.strip()}")
-        # The runtime rejects the flag; the wrapper must forward that, not
-        # invent a version. If this ever starts printing a version, someone
-        # added the flag and this expectation should be revisited deliberately.
-        check(result.returncode == 9 and "unsupported option" in result.stderr,
-              "--version is forwarded unchanged (runtime rejects it, exit 9)")
+        print(f"    {command} --version -> exit {result.returncode}: {result.stdout.strip()}")
+        # The runtime answers the flag; the wrapper must forward it rather than
+        # inventing an answer. The strongest statement available is that the two
+        # entry points agree: `--version` and `process.version` are the same
+        # identity, so a wrapper that started faking one would be visible here.
+        check(result.returncode == 0, f"--version exits 0 (exit {result.returncode})")
+        check(result.stdout.strip() == version_from_process,
+              f"--version prints the same identity as process.version "
+              f"({result.stdout.strip()!r} vs {version_from_process!r})")
+
+        result = run([command, "--help"], cwd=clean, env=env)
+        print(f"    {command} --help -> exit {result.returncode}: {result.stdout.splitlines()[:1]}")
+        check(result.returncode == 0, f"--help exits 0 (exit {result.returncode})")
+        # The usage lines name the program, and the name is the runtime's fixed
+        # `rustnode` rather than argv[0]: the text describes the program, not the
+        # path it was invoked by, and `rsnode` is only this package's command
+        # name for the same binary.
+        check(result.stdout.startswith("Usage: rustnode [options]"),
+              f"--help names the program ({result.stdout.splitlines()[:1]})")
 
         section("the wrapper preserves exit codes, streams and signals")
         result = run([command, "-e", "process.exit(42)"], cwd=clean, env=env)
