@@ -144,11 +144,13 @@ $ rsnode -e 'process.kill(process.pid, "SIGINT")'; echo $?
 ```
 
 The wrapper is a small POSIX `sh` script that `exec`s the binary. It costs what
-starting one shell costs — about **2 ms over invoking the binary directly**, of
-which roughly 0.3 ms is this script and the rest is `sh` itself. That is no more
-than a two-line `sh` script costs, and far less than a Node-based wrapper, which
-would add ~22 ms by starting a second runtime first. The measurements are in
-`rustnode/docs/npm-packaging.md` in the repository.
+starting one shell costs: **+0.4 to +2.0 ms over invoking the binary directly,
+depending on machine load**, of which roughly 0.3 ms is this script and the rest
+is `sh` itself. The size of that absolute figure moves with load; what does not
+move is that it is never worse than a two-line `sh` script, because both sides
+pay the same shell start. A Node-based wrapper would add ~22 ms by starting a
+second runtime first. Measurements are in `rustnode/docs/npm-packaging.md` in the
+repository.
 
 ## Reporting bugs
 
