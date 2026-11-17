@@ -667,4 +667,20 @@ if [ -z "$options_node_src" ]; then
 fi
 python3 tools/check-options-drift.py --node-src "$options_node_src"
 
+step "the npm package manifest matches the binary and the workspace version"
+# The npm packages repeat facts that already exist elsewhere: the version lives
+# in `[workspace.package]`, the platform list lives in `npm/platforms.json`, and
+# the command name has to agree with what the wrapper resolves. Each copy is a
+# chance to drift, and the failure mode is nasty because it is silent — a
+# version mismatch publishes a package whose optional dependency never resolves,
+# and an `os`/`cpu` typo publishes a package npm installs on the wrong host.
+#
+# This checks the manifests against their sources without needing a release
+# binary: no build, no network, no `npm` install. `npm-pack.py`'s own `pack`
+# command does the stronger end-to-end check (it reads each tarball back and
+# hashes the binary inside), but that needs a release build, which is CI's job
+# and not this per-commit gate's. What runs here is the cheap half that catches
+# the drift.
+python3 tools/npm-manifest-check.py
+
 printf '\nall checks passed\n'

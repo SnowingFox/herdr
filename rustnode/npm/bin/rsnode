@@ -1,0 +1,146 @@
+#!/bin/sh
+# The `rsnode` command: find the platform package that carries the real binary
+# and hand the process over to it with `exec`.
+#
+# Why a shell script rather than Node. This runs on the startup path of every
+# invocation, so its own cost is the one thing it must not add. Measured on this
+# machine, 3 rotations x 40 rounds of `-e ''` with the release binary, each round
+# running all three cases in a rotated order so drift hits all of them:
+#
+#   direct binary                  25.76 ms
+#   minimal 2-line `sh` + exec     27.45 ms   (+1.7 ms)
+#   this shim                      27.76 ms   (+2.0 ms)
+#   node + spawnSync shim          ~51 ms      (+22 ms)
+#
+# The split is the whole point, and both numbers have to be quoted together:
+#
+#   +1.7 ms   the shell. Starting any `sh` costs this; the two-line stub with no
+#             logic at all measures it.
+#   +0.31 ms  this script. Its resolution is within noise of that floor.
+#
+# So the defensible claim is "never worse than a two-line `sh` script", NOT
+# "adds no measurable cost": the wrapper really does cost ~2 ms over a direct
+# invocation, and this is the startup path of a runtime whose pitch is startup
+# time, so an understated number here would be quoted back at us. Earlier
+# versions of this comment carried +0.13 ms, which compared the shim against a
+# floor measured in a different, quieter window and understated the shell cost.
+#
+# A Node shim cannot avoid booting a whole second runtime before the real one
+# starts, which is why esbuild/biome/deno pay that cost to resolve a path that
+# needs JavaScript. Ours does not: npm links *this package's* bin into the
+# prefix, the optional platform package lands at a fixed offset from it, and the
+# shell can resolve that itself. There is no JavaScript to run.
+#
+# Cost discipline, because every millisecond here is added to every invocation:
+#
+#   * Only shell builtins run on the common path: no `dirname`, no `cd`, no
+#     `pwd`, no `readlink`. The first version used
+#     `$(cd "$(dirname "$0")" && pwd)`, which forked two subshells and measured
+#     +3.3 ms (11%) on top of the direct binary; parameter expansion removed
+#     those forks, and `readlink` alone accounted for 0.4 ms of what remained.
+#   * Candidate paths are computed from `$0` arithmetically, and `readlink` runs
+#     only when none of them hit — the fallback for a tree npm does not produce,
+#     such as a hand-made link on PATH.
+#   * `..` components are left in the paths: the kernel resolves them, and
+#     folding them would need a subshell.
+#
+# `exec` is what makes argv, stdio, signals and the exit status pass through
+# untouched: the shell is replaced rather than left in the middle, so the binary
+# *is* the process the caller sees. `"$@"` is quoted so arguments keep their
+# spaces and globs.
+set -eu
+
+binary=rsnode
+scope=@example
+package=rsnode
+platform=rsnode-linux-x64
+
+# `$0` is the path the shell was invoked with. A shell that found the command on
+# PATH passes the bare name (bash and sh both keep `$0` as typed), so turn it
+# into the path `command -v` resolved — also a builtin, no fork.
+case $0 in
+    */*) self=$0 ;;
+    *) self=$(command -v -- "$0" || echo "$0") ;;
+esac
+
+# Resolve ONE level of symlink arithmetically when possible. npm's links are
+# relative (`../lib/node_modules/...`), so the common case needs no `readlink`.
+# Returns non-zero when the link target cannot be read without forking, which is
+# the signal to take the slow path below.
+resolve_link() {
+    target=$1
+    [ -L "$target" ] || return 1
+    link=$(readlink "$target") || return 1
+    case $link in
+        /*) REPLY=$link ;;
+        *) REPLY=${target%/*}/$link ;;
+    esac
+    return 0
+}
+
+# Where npm puts the platform package. `$0` is the *symlink* npm created, so the
+# candidates are expressed relative to the directory holding that link. That is
+# one `-x` test per layout and no fork, which is why all of them are tried
+# before `readlink` is considered.
+#
+#   local    node_modules/.bin/rsnode -> ../@scope/rsnode/bin/rsnode
+#   global   <prefix>/bin/rsnode      -> ../lib/node_modules/@scope/rsnode/bin/rsnode
+#
+# In each, the platform package is either hoisted beside the main package or
+# nested in its own `node_modules` (which is what npm does for a global install
+# in practice).
+find_binary() {
+    bindir=${1%/*}
+    [ "$bindir" = "$1" ] && bindir=.
+    for candidate in \
+        "$bindir/../$scope/$package/node_modules/$scope/$platform/$binary" \
+        "$bindir/../$scope/$platform/$binary" \
+        "$bindir/../lib/node_modules/$scope/$package/node_modules/$scope/$platform/$binary" \
+        "$bindir/../lib/node_modules/$scope/$platform/$binary" \
+        "$bindir/../../../$scope/$platform/$binary"
+    do
+        if [ -x "$candidate" ]; then
+            FOUND=$candidate
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! find_binary "$self"; then
+    # Slow path. Follows a chain of links to the real script, then retries.
+    steps=0
+    while [ -L "$self" ] && [ "$steps" -lt 16 ]; do
+        resolve_link "$self" || break
+        self=$REPLY
+        steps=$((steps + 1))
+    done
+    if ! find_binary "$self"; then
+        # Reaching here means the optional dependency was not installed. npm
+        # skips optional dependencies whose `os`/`cpu`/`libc` do not match the
+        # host, and ignores them under `--omit=optional`, so this is a normal
+        # outcome on an unsupported platform rather than a corrupt install.
+        # Name the platform and exit non-zero; falling back to another runtime
+        # would misreport what ran.
+        cat >&2 <<'MESSAGE'
+rsnode: the native binary for this platform is not installed.
+
+The runtime is installed through an optional dependency, which npm omits
+silently when the host does not match. The published build covers:
+
+    linux x64 (glibc)
+
+If that is your platform, the dependency was skipped during install (an
+`--omit=optional`/`--no-optional` setting, or an offline or filtered registry).
+Reinstall without those flags:
+
+    npm install -g @example/rsnode
+
+Otherwise this platform is not packaged yet. Build it from source with
+`cargo build --release -p rn-cli` in the rustnode tree.
+MESSAGE
+        exit 1
+    fi
+fi
+
+exec "$FOUND" "$@"

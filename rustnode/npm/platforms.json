@@ -1,0 +1,14 @@
+{
+  "scope": "@example",
+  "command": "rsnode",
+  "binary": "rsnode",
+  "node_compat": "28.0.0",
+  "platforms": [
+    {
+      "target": "linux-x64",
+      "os": "linux",
+      "cpu": "x64",
+      "libc": "glibc"
+    }
+  ]
+}

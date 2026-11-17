@@ -1,0 +1,47 @@
+{
+  "name": "@example/rsnode",
+  "version": "0.1.0",
+  "description": "The rustnode runtime: a Node-compatible JavaScript runtime with its native layer rewritten in Rust. Installs the command `rsnode`.",
+  "keywords": [
+    "rustnode",
+    "rsnode",
+    "node",
+    "javascript",
+    "runtime",
+    "v8"
+  ],
+  "homepage": "https://github.com/SnowingFox/herdr/tree/master/rustnode",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SnowingFox/herdr.git",
+    "directory": "rustnode"
+  },
+  "bugs": {
+    "url": "https://github.com/SnowingFox/herdr/issues"
+  },
+  "license": "MIT",
+  "bin": {
+    "rsnode": "bin/rsnode"
+  },
+  "files": [
+    "bin/rsnode",
+    "LICENSE",
+    "README.md",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@example/rsnode-linux-x64": "0.1.0"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "glibc"
+  ]
+}
