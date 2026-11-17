@@ -340,8 +340,8 @@ fn module_wrap_new<'s>(
         })
     };
 
-    let module = if synthetic {
-        create_synthetic(scope, url, args.get(2))
+    let (module, compile_threw) = if synthetic {
+        (create_synthetic(scope, url, args.get(2)), false)
     } else {
         // `ModuleWrap::New` uses `args[5]` as *user* cached data only when it is
         // an `ArrayBufferView`, which is `vm.SourceTextModule`'s own code cache.
@@ -350,16 +350,23 @@ fn module_wrap_new<'s>(
         let user_cached_data = v8::Local::<v8::ArrayBufferView>::try_from(args.get(5))
             .ok()
             .map(|view| view_bytes(&view));
-        create_source_text(
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let scope = &mut try_catch.init();
+        let module = create_source_text(
             scope,
             url,
             args.get(2),
             id_symbol,
             user_cached_data.as_deref(),
-        )
+        );
+        let compile_threw = module.is_none() && scope.has_caught() && !scope.has_terminated();
+        if compile_threw {
+            scope.rethrow();
+        }
+        (module, compile_threw)
     };
     let Some(module) = module else {
-        if !scope.is_execution_terminating() {
+        if !compile_threw && !scope.is_execution_terminating() {
             throw_error(scope, "failed to compile module");
         }
         return;
