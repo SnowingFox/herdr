@@ -42,7 +42,9 @@ pub struct ProcessHandle {
     ///
     /// It starts false: `ProcessWrap`'s constructor calls
     /// `MarkAsUninitialized()`, and `uv_spawn` is what registers the handle with
-    /// the loop.
+    /// the loop. Like Node, this flips as soon as `uv_spawn` is called, even
+    /// when `uv_spawn` returns an error, because libuv may still require the
+    /// handle to be closed on that path.
     pub spawned: bool,
     /// `uv_close` has been called.
     pub closing: bool,
@@ -72,13 +74,13 @@ impl ProcessHandle {
         })
     }
 
-    /// The initialised handle, once `uv_spawn` has succeeded.
+    /// The initialised handle, once `uv_spawn` has run.
     pub fn raw(&mut self) -> Option<*mut uv::uv_process_t> {
         if !self.spawned {
             return None;
         }
-        // SAFETY: `spawned` is only set after `uv_spawn` returned success, which
-        // is what initialises the storage.
+        // SAFETY: `spawned` is only set after calling `uv_spawn`, which is the
+        // call that initialises the storage when libuv keeps the handle alive.
         Some(unsafe { self.process.as_mut_ptr().as_mut()? })
     }
 
