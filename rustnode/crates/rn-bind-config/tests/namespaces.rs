@@ -216,8 +216,10 @@ fn config_member_list_matches_installed_properties() {
 fn config_values_match_a_default_linux_release_build() {
     assert_eq!(
         Config::get("isDebugBuild"),
-        Some(Value::Bool(false)),
-        "release builds define neither DEBUG nor NDEBUG"
+        Some(Value::Bool(cfg!(debug_assertions))),
+        "isDebugBuild answers whether this binary carries debug assertions, which is \
+         Node's `#if defined(DEBUG) && DEBUG`; hard-coding false made a debug build \
+         disagree with process.features.debug, which Node derives from this value"
     );
     assert_eq!(Config::get("hasOpenSSL"), Some(Value::Bool(true)));
     assert_eq!(
@@ -291,7 +293,7 @@ fn config_values_match_a_live_node_recording() {
     // and confirmed against src/node_config.cc. Keeping the captured values
     // here means a change to the table has to be a deliberate edit.
     for (name, expected) in [
-        ("isDebugBuild", Value::Bool(false)),
+        ("isDebugBuild", Value::Bool(cfg!(debug_assertions))),
         ("openSSLIsBoringSSL", Value::Bool(false)),
         ("hasOpenSSL", Value::Bool(true)),
         ("hasIntl", Value::Bool(true)),
@@ -337,12 +339,19 @@ fn config_installs_readonly_enumerable_booleans() {
         // properties are writable:false but still configurable:true. This is
         // the opposite of `constants`, which uses NODE_DEFINE_CONSTANT with
         // `ReadOnly | DontDelete` and is therefore non-configurable.
+        //
+        // `debug` is read from `cfg!` rather than pinned to false: it is Node's
+        // `#if defined(DEBUG) && DEBUG`, so a debug build legitimately reports
+        // true, and pinning it made the test pass only in release.
         assert_eq!(
             result,
-            concat!(
-                r#"{"proto":true,"debug":false,"intl":true,"bits":64,"bitsType":"number","#,
-                r#""desc":{"value":true,"writable":false,"enumerable":true,"configurable":true},"#,
-                r#""locale":"function","localeLength":0,"localeValue":"string"}"#
+            format!(
+                concat!(
+                    r#"{{"proto":true,"debug":{},"intl":true,"bits":64,"bitsType":"number","#,
+                    r#""desc":{{"value":true,"writable":false,"enumerable":true,"configurable":true}},"#,
+                    r#""locale":"function","localeLength":0,"localeValue":"string"}}"#
+                ),
+                cfg!(debug_assertions)
             )
         );
     });
