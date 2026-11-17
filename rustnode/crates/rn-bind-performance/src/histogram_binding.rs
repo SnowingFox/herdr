@@ -267,6 +267,72 @@ impl HistogramState {
         (m4 / n) / s4 - 3.0
     }
 
+    /// `Histogram::MeanCI`: confidence interval for the mean.
+    pub fn mean_ci(&self, confidence: f64) -> (f64, f64, f64) {
+        let count = self.histogram.count();
+        let mean = self.histogram.mean();
+        if count < 2 {
+            return (mean, f64::NAN, f64::NAN);
+        }
+
+        let stddev = self.histogram.stddev();
+        if stddev == 0.0 {
+            return (mean, mean, mean);
+        }
+
+        // `hdr_stddev` is population stddev (divides by N), while the confidence
+        // interval uses sample variance (divides by N-1).
+        let variance = stddev * stddev * count as f64 / (count - 1) as f64;
+        let standard_error = (variance / count as f64).sqrt();
+        let alpha = 1.0 - confidence;
+        let t_crit = student_t_upper_quantile(alpha / 2.0, (count - 1) as f64);
+        let margin = t_crit * standard_error;
+        (mean, mean - margin, mean + margin)
+    }
+
+    /// `Histogram::PercentileCI`: exact binomial confidence interval.
+    pub fn percentile_ci(&self, percentile: f64, confidence: f64) -> (f64, f64, f64) {
+        let value = self.histogram.value_at_percentile(percentile);
+        let n = self.histogram.count();
+        if n < 2 {
+            let value = value as f64;
+            return (value, value, value);
+        }
+
+        let p = percentile / 100.0;
+        let alpha = 1.0 - confidence;
+
+        // Lower rank: largest j such that BinomialCdf(j - 1, n, p) <= alpha/2.
+        let mut lo = 0_i64;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            if binomial_cdf(mid - 1, n, p) <= alpha / 2.0 {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let lower_pct = lo as f64 / n as f64 * 100.0;
+
+        // Upper rank: smallest k such that BinomialCdf(k - 1, n, p) >= 1-alpha/2.
+        lo = 0;
+        hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if binomial_cdf(mid - 1, n, p) >= 1.0 - alpha / 2.0 {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let upper_pct = lo as f64 / n as f64 * 100.0;
+
+        let lower = self.histogram.value_at_percentile(lower_pct);
+        let upper = self.histogram.value_at_percentile(upper_pct);
+        (value as f64, lower as f64, upper as f64)
+    }
+
     /// An independent copy, as `Histogram::Clone` builds for `snapshot()`.
     ///
     /// The recorded data and every counter that survives a copy travel; the
@@ -307,6 +373,174 @@ pub fn cdf(histogram: &HdrHistogram, value: i64) -> f64 {
         }
     }
     1.0
+}
+
+// ---------------------------------------------------------------------------
+// The statistical helpers `meanCI` and friends are built on.
+// ---------------------------------------------------------------------------
+
+/// Continued fraction for the regularized incomplete beta function.
+///
+/// Port of Node's `BetaContinuedFraction` in `src/histogram.cc`.
+fn beta_continued_fraction(a: f64, b: f64, x: f64) -> f64 {
+    const FPMIN: f64 = 1e-30;
+    const MAXIT: usize = 200;
+    const EPS: f64 = 3e-12;
+
+    let qab = a + b;
+    let qap = a + 1.0;
+    let qam = a - 1.0;
+    let mut c = 1.0;
+    let mut d = 1.0 - qab * x / qap;
+    if d.abs() < FPMIN {
+        d = FPMIN;
+    }
+    d = 1.0 / d;
+    let mut h = d;
+
+    for m in 1..=MAXIT {
+        let m2 = 2.0 * m as f64;
+        let mut aa = m as f64 * (b - m as f64) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        h *= d * c;
+
+        aa = -(a + m as f64) * (qab + m as f64) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if d.abs() < FPMIN {
+            d = FPMIN;
+        }
+        c = 1.0 + aa / c;
+        if c.abs() < FPMIN {
+            c = FPMIN;
+        }
+        d = 1.0 / d;
+        let delta = d * c;
+        h *= delta;
+        if (delta - 1.0).abs() <= EPS {
+            break;
+        }
+    }
+    h
+}
+
+/// Regularized incomplete beta function `I_x(a, b)`.
+///
+/// Port of Node's scalar `RegularizedIncompleteBeta(a, b, x)` path, which
+/// powers `StudentTCdf` and therefore `meanCI`.
+fn regularized_incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x >= 1.0 {
+        return 1.0;
+    }
+
+    let sum = a + b;
+    let log_normalization = log_gamma(sum) - log_gamma(a) - log_gamma(b);
+    let log_front = log_normalization + a * x.ln() + b * (1.0 - x).ln();
+    let front = log_front.exp();
+    let symmetry_point = (a + 1.0) / (sum + 2.0);
+
+    if x < symmetry_point {
+        front * beta_continued_fraction(a, b, x) / a
+    } else {
+        1.0 - front * beta_continued_fraction(b, a, 1.0 - x) / b
+    }
+}
+
+/// Natural logarithm of the gamma function.
+///
+/// The incomplete-beta front term needs `lgamma` for `a`, `b` and `a+b`; this
+/// Lanczos form keeps the implementation self-contained in Rust and numerically
+/// stable for the positive inputs histogram statistics use.
+fn log_gamma(x: f64) -> f64 {
+    const COEFFICIENTS: [f64; 9] = [
+        0.999_999_999_999_809_9,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+
+    if x < 0.5 {
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * x).sin().ln()
+            - log_gamma(1.0 - x);
+    }
+
+    let shifted = x - 1.0;
+    let mut sum = COEFFICIENTS[0];
+    for (index, coefficient) in COEFFICIENTS.iter().enumerate().skip(1) {
+        sum += coefficient / (shifted + index as f64);
+    }
+    let g = 7.0;
+    let t = shifted + g + 0.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (shifted + 0.5) * t.ln() - t + sum.ln()
+}
+
+/// Student's t CDF, `P(T <= t)` for `df` degrees of freedom.
+fn student_t_cdf(t: f64, df: f64) -> f64 {
+    let squared = t * t;
+    let denominator = df + squared;
+    if squared < df {
+        let x = squared / denominator;
+        let ibeta = regularized_incomplete_beta(0.5, df / 2.0, x);
+        if t >= 0.0 {
+            0.5 + 0.5 * ibeta
+        } else {
+            0.5 - 0.5 * ibeta
+        }
+    } else {
+        let x = df / denominator;
+        let ibeta = regularized_incomplete_beta(df / 2.0, 0.5, x);
+        if t >= 0.0 {
+            1.0 - 0.5 * ibeta
+        } else {
+            0.5 * ibeta
+        }
+    }
+}
+
+/// Positive Student's t quantile for an upper-tail probability.
+fn student_t_upper_quantile(p: f64, df: f64) -> f64 {
+    let mut lo = 0.0_f64;
+    let mut hi = 1.0_f64;
+    while student_t_cdf(-hi, df) > p {
+        hi *= 2.0;
+    }
+
+    for _ in 0..100 {
+        let mid = (lo + hi) / 2.0;
+        if student_t_cdf(-mid, df) > p {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (lo + hi) / 2.0
+}
+
+/// Binomial CDF `P(X <= k)` for `X ~ Binomial(n, p)`.
+fn binomial_cdf(k: i64, n: i64, p: f64) -> f64 {
+    if k < 0 {
+        return 0.0;
+    }
+    if k >= n {
+        return 1.0;
+    }
+    regularized_incomplete_beta((n - k) as f64, (k + 1) as f64, 1.0 - p)
 }
 
 // ---------------------------------------------------------------------------
@@ -519,7 +753,7 @@ pub(crate) fn add_histogram_methods<'s>(
     template: v8::Local<'s, v8::FunctionTemplate>,
 ) -> Result<(), String> {
     let prototype = template.prototype_template(scope);
-    let methods: [(&str, v8::Local<'s, v8::FunctionTemplate>); 34] = [
+    let methods: [(&str, v8::Local<'s, v8::FunctionTemplate>); 36] = [
         ("count", method(scope, histogram_count)),
         ("countBigInt", method(scope, histogram_count_bigint)),
         ("min", method(scope, histogram_min)),
@@ -527,6 +761,7 @@ pub(crate) fn add_histogram_methods<'s>(
         ("max", method(scope, histogram_max)),
         ("maxBigInt", method(scope, histogram_max_bigint)),
         ("mean", method(scope, histogram_mean)),
+        ("meanCI", method(scope, histogram_mean_ci)),
         ("stddev", method(scope, histogram_stddev)),
         ("exceeds", method(scope, histogram_exceeds)),
         ("exceedsBigInt", method(scope, histogram_exceeds_bigint)),
@@ -535,6 +770,7 @@ pub(crate) fn add_histogram_methods<'s>(
             "percentileBigInt",
             method(scope, histogram_percentile_bigint),
         ),
+        ("percentileCI", method(scope, histogram_percentile_ci)),
         ("percentiles", method(scope, histogram_percentiles)),
         (
             "percentilesBigInt",
@@ -641,6 +877,26 @@ bigint_accessor!(histogram_max_bigint, scope, args, rv, |state| state
 number_accessor!(histogram_mean, scope, args, rv, |state| state
     .histogram
     .mean());
+fn histogram_mean_ci(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Some(confidence) = args.get(0).number_value(scope) else {
+        throw_type_error(scope, "meanCI confidence must be a number");
+        return;
+    };
+    let Some((mean, lower, upper)) = with_this(&args, |state| state.mean_ci(confidence)) else {
+        throw_illegal_invocation(scope);
+        return;
+    };
+    let values = [mean, lower, upper];
+    let result = v8::Array::new(scope, values.len() as i32);
+    for (index, value) in values.iter().enumerate() {
+        result.set_index(scope, index as u32, v8::Number::new(scope, *value).into());
+    }
+    rv.set(result.into());
+}
 number_accessor!(histogram_stddev, scope, args, rv, |state| state
     .histogram
     .stddev());
@@ -733,6 +989,41 @@ fn histogram_percentile_bigint(
         return;
     };
     rv.set(v8::BigInt::new_from_i64(scope, value).into());
+}
+
+fn histogram_percentile_ci(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Some(percentile) = args.get(0).number_value(scope) else {
+        throw_type_error(scope, "percentileCI percentile must be a number");
+        return;
+    };
+    if !(percentile > 0.0 && percentile <= 100.0) {
+        throw_out_of_range(scope, "percentile must be > 0 && <= 100");
+        return;
+    }
+    let Some(confidence) = args.get(1).number_value(scope) else {
+        throw_type_error(scope, "percentileCI confidence must be a number");
+        return;
+    };
+    if !(confidence > 0.0 && confidence < 1.0) {
+        throw_out_of_range(scope, "confidence must be > 0 && < 1");
+        return;
+    }
+    let Some((value, lower, upper)) =
+        with_this(&args, |state| state.percentile_ci(percentile, confidence))
+    else {
+        throw_illegal_invocation(scope);
+        return;
+    };
+    let values = [value, lower, upper];
+    let result = v8::Array::new(scope, values.len() as i32);
+    for (index, value) in values.iter().enumerate() {
+        result.set_index(scope, index as u32, v8::Number::new(scope, *value).into());
+    }
+    rv.set(result.into());
 }
 
 fn histogram_percentiles(
@@ -1811,5 +2102,31 @@ mod tests {
         let snapshot = state.snapshot();
         assert_eq!(snapshot.count(), 3);
         assert_eq!(snapshot.min(), 30);
+    }
+
+    /// `meanCI` needs at least two samples; with one, only the mean is defined.
+    #[test]
+    fn mean_ci_requires_at_least_two_samples() {
+        let layout = Layout::new(1, 1000, 3).expect("valid");
+        let mut state = HistogramState::new(HdrHistogram::new(layout), 0.0, 0);
+        state.record(42);
+        let (mean, lower, upper) = state.mean_ci(0.95);
+        assert_eq!(mean, state.histogram.mean());
+        assert!(lower.is_nan());
+        assert!(upper.is_nan());
+    }
+
+    /// A zero-variance histogram has no uncertainty around its mean.
+    #[test]
+    fn mean_ci_collapses_when_stddev_is_zero() {
+        let layout = Layout::new(1, 1000, 3).expect("valid");
+        let mut state = HistogramState::new(HdrHistogram::new(layout), 0.0, 0);
+        for _ in 0..10 {
+            state.record(100);
+        }
+        let (mean, lower, upper) = state.mean_ci(0.95);
+        assert_eq!(mean, 100.0);
+        assert_eq!(lower, 100.0);
+        assert_eq!(upper, 100.0);
     }
 }

@@ -255,6 +255,26 @@ fn the_ewma_counters_match_the_oracle() {
 }
 
 #[test]
+fn mean_ci_matches_the_oracle() {
+    let Some(oracle) = rn_node_oracle::require_oracle("the perf_hooks mean CI helper") else {
+        return;
+    };
+    let output = same_as_oracle(
+        &oracle,
+        r#"
+        const { createHistogram } = require('perf_hooks');
+        const h = createHistogram();
+        for (let i = 1; i <= 100; i++) h.record(i);
+        const render = ({ mean, lower, upper }) =>
+          `${mean.toFixed(12)},${lower.toFixed(12)},${upper.toFixed(12)}`;
+        console.log(render(h.meanCI({ confidence: 0.95 })));
+        console.log(render(h.meanCI({ confidence: 0.5 })));"#,
+    );
+    assert!(output.contains("50.500000000000"), "{output}");
+    assert!(output.lines().count() == 2, "{output}");
+}
+
+#[test]
 fn the_arithmetic_operations_match_the_oracle() {
     let Some(oracle) = rn_node_oracle::require_oracle("the perf_hooks histogram arithmetic") else {
         return;
