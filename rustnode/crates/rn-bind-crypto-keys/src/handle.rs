@@ -1730,6 +1730,24 @@ pub(crate) fn export_jwk_fields(
         }
         return Ok(fields);
     }
+    if algorithm.is_pqc() {
+        let Some(public) = key.raw_public_key() else {
+            return Err(KeyError::OperationFailed("Failed to export JWK"));
+        };
+        let mut fields = vec![
+            ("kty", "AKP".to_string()),
+            ("alg", algorithm.name().to_string()),
+            ("pub", base64url_encode(&public)),
+        ];
+        if data.key_type() == KeyType::Private {
+            let private = key
+                .raw_seed()
+                .or_else(|| key.raw_private_key())
+                .ok_or(KeyError::OperationFailed("Failed to export JWK"))?;
+            fields.push(("priv", base64url_encode(&private)));
+        }
+        return Ok(fields);
+    }
     if algorithm.is_okp() {
         let Some(public) = key.raw_public_key() else {
             return Err(KeyError::OperationFailed("Failed to export JWK"));
@@ -1757,6 +1775,7 @@ fn jwk_curve_name(group: &openssl::ec::EcGroupRef) -> Option<&'static str> {
         openssl::nid::Nid::X9_62_PRIME256V1 => "P-256",
         openssl::nid::Nid::SECP384R1 => "P-384",
         openssl::nid::Nid::SECP521R1 => "P-521",
+        openssl::nid::Nid::SECP256K1 => "secp256k1",
         _ => return None,
     })
 }
@@ -1968,6 +1987,7 @@ fn emit_buffer(scope: &mut v8::PinScope<'_, '_>, rv: &mut v8::ReturnValue, bytes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use foreign_types::ForeignType;
     use rn_crypto_openssl::PKey;
 
     fn ec_key() -> PKey {
@@ -1981,6 +2001,26 @@ mod tests {
             )
             .expect("the fixture parses"),
         )
+    }
+
+    fn maybe_named_key(name: &str) -> Option<PKey> {
+        let name = std::ffi::CString::new(name).ok()?;
+        let raw = unsafe {
+            openssl_sys::EVP_PKEY_CTX_new_from_name(
+                std::ptr::null_mut(),
+                name.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        if raw.is_null() {
+            unsafe { openssl_sys::ERR_clear_error() };
+            return None;
+        }
+        let mut context: openssl::pkey_ctx::PkeyCtx<openssl::pkey::Private> =
+            unsafe { openssl::pkey_ctx::PkeyCtx::from_ptr(raw) };
+        context.keygen_init().ok()?;
+        let key = context.keygen().ok()?;
+        Some(PKey::from_private(key))
     }
 
     #[test]
@@ -2093,6 +2133,39 @@ mod tests {
         let data = KeyData::asymmetric(KeyType::Public, ec_key()).expect("public");
         let fields = export_jwk_fields(&data, false).expect("an EC JWK");
         assert!(fields.iter().all(|(name, _)| *name != "d"));
+    }
+
+    #[test]
+    fn secp256k1_jwk_exports_with_the_curve_name_node_reports() {
+        let key = openssl::pkey::PKey::ec_gen("secp256k1").expect("secp256k1 generates");
+        let data = KeyData::asymmetric(KeyType::Private, PKey::from_private(key)).expect("private");
+        let fields = export_jwk_fields(&data, false).expect("an EC JWK");
+        assert!(
+            fields
+                .iter()
+                .any(|(name, value)| *name == "crv" && value == "secp256k1"),
+            "secp256k1 must round-trip as secp256k1"
+        );
+    }
+
+    #[test]
+    fn pqc_jwk_exports_with_akp_fields() {
+        let Some(key) = maybe_named_key("ML-DSA-44") else {
+            return;
+        };
+        let public = KeyData::asymmetric(KeyType::Public, key.clone()).expect("public");
+        let public = export_jwk_fields(&public, false).expect("public AKP JWK");
+        assert!(public
+            .iter()
+            .any(|(name, value)| *name == "kty" && value == "AKP"));
+        assert!(public
+            .iter()
+            .any(|(name, value)| *name == "alg" && value == "ML-DSA-44"));
+        assert!(public.iter().all(|(name, _)| *name != "priv"));
+
+        let private = KeyData::asymmetric(KeyType::Private, key).expect("private");
+        let private = export_jwk_fields(&private, false).expect("private AKP JWK");
+        assert!(private.iter().any(|(name, _)| *name == "priv"));
     }
 
     /// An RSA private JWK carries the CRT components, which is what makes it

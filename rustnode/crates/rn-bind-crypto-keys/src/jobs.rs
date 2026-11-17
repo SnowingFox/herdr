@@ -29,7 +29,7 @@
 
 use openssl::pkey::PKey as OpenSslPKey;
 use rn_crypto_job::{dispatch, Completion, CryptoJobError, JobMode, Runnable};
-use rn_crypto_openssl::{KeyAlgorithm, PKey, PrivateKeyEncoding, PublicKeyEncoding};
+use rn_crypto_openssl::{KeyAlgorithm, KeyFormat, PKey, PrivateKeyEncoding, PublicKeyEncoding};
 use rn_v8_sys::v8;
 
 use crate::args::{read_format_and_type, read_private_key_tail, EncodingContext, Values};
@@ -256,6 +256,22 @@ fn crypto_key<'s>(
 /// algorithm's public key bytes, and `raw-private`/`raw-seed` are the private
 /// scalar or seed. `write_public` answers `Ok(None)` for them, which the caller
 /// would otherwise turn into a missing array element.
+fn encode_jwk<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    key: &PKey,
+    key_type: KeyType,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let data = KeyData::asymmetric(key_type, key.clone())?;
+    let fields = crate::handle::export_jwk_fields(&data, false).ok()?;
+    let object = v8::Object::new(scope);
+    for (name, value) in fields {
+        let field = v8::String::new(scope, name)?;
+        let value = v8::String::new(scope, &value)?;
+        object.set(scope, field.into(), value.into())?;
+    }
+    Some(object.into())
+}
+
 fn encode_public<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     key: &PKey,
@@ -279,6 +295,9 @@ fn encode_public<'s>(
         };
         return crate::install::buffer_from(scope, &bytes);
     }
+    if encoding.format == Some(KeyFormat::Jwk) {
+        return encode_jwk(scope, key, key_type);
+    }
     let encoded = key.write_public(encoding).ok()??;
     emit_encoded(scope, &encoded)
 }
@@ -295,6 +314,7 @@ fn encode_private<'s>(
         return create_handle(scope, data).map(v8::Local::into);
     }
     match encoding.format {
+        Some(KeyFormat::Jwk) => encode_jwk(scope, key, key_type),
         Some(rn_crypto_openssl::KeyFormat::RawPrivate) => {
             let bytes = match key.algorithm() {
                 Some(algorithm) if algorithm == rn_crypto_openssl::EC => key.ec_private_scalar()?,
@@ -1240,5 +1260,32 @@ mod tests {
             Some(openssl::nid::Nid::X9_62_PRIME256V1)
         );
         assert_eq!(curve_nid("not-a-curve"), None);
+    }
+
+    #[test]
+    fn generated_ec_keys_export_jwk_fields_for_both_halves() {
+        let key = openssl::pkey::PKey::ec_gen("prime256v1").expect("P-256 generates");
+        let key = PKey::from_private(key);
+
+        let public = KeyData::asymmetric(KeyType::Public, key.clone()).expect("public key data");
+        let public = crate::handle::export_jwk_fields(&public, false).expect("public JWK fields");
+        assert!(
+            public
+                .iter()
+                .any(|(name, value)| *name == "kty" && value == "EC"),
+            "public JWK must carry kty=EC"
+        );
+        assert!(
+            public.iter().all(|(name, _)| *name != "d"),
+            "public JWK must not include the private scalar"
+        );
+
+        let private = KeyData::asymmetric(KeyType::Private, key).expect("private key data");
+        let private =
+            crate::handle::export_jwk_fields(&private, false).expect("private JWK fields");
+        assert!(
+            private.iter().any(|(name, _)| *name == "d"),
+            "private JWK must include the private scalar"
+        );
     }
 }
