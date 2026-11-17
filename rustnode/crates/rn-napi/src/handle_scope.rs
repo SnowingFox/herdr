@@ -44,6 +44,92 @@ use crate::abi::{NapiEscapableHandleScope, NapiHandleScope, NapiStatus, NapiValu
 type PlainStorage = v8::ScopeStorage<v8::HandleScope<'static>>;
 /// An escapable scope's storage, with both lifetimes erased.
 type EscapableStorage = v8::ScopeStorage<v8::EscapableHandleScope<'static, 'static>>;
+/// The detached root's outer `HandleScope<'static, ()>` storage.
+type DetachedHandleStorage = v8::ScopeStorage<v8::HandleScope<'static, ()>>;
+/// The entered detached root handle scope (`HandleScope<'static, ()>`).
+type DetachedEntered = v8::PinnedRef<'static, v8::HandleScope<'static, ()>>;
+/// The entered detached context scope over that handle scope.
+type DetachedContextScope = v8::ContextScope<'static, 'static, v8::HandleScope<'static>>;
+
+/// One detached root used by bare-libuv Node-API calls.
+///
+/// `napi_open_handle_scope` may be called from a `uv_check`/`uv_queue_work`
+/// callback with no entered Node-API scope. Node's shims still have `env->isolate`
+/// there; this root recreates that by owning an entered isolate and context for as
+/// long as the addon's handle scopes stay open.
+///
+/// # Drop order
+///
+/// Field order is deliberate:
+/// - `guard` clears the detached-scope thread-local first.
+/// - `context_scope` drops before `entered`, matching V8 nesting.
+/// - `entered` drops before `handle_storage`, like every pinned ref in this file.
+/// - `context` (the root) and finally `isolate` outlive both scopes.
+struct DetachedRoot {
+    guard: crate::scope::DetachedScopeGuard,
+    context_scope: Pin<Box<DetachedContextScope>>,
+    entered: Pin<Box<DetachedEntered>>,
+    handle_storage: Pin<Box<DetachedHandleStorage>>,
+    context: v8::Global<v8::Context>,
+    isolate: v8::Isolate,
+}
+
+impl DetachedRoot {
+    fn new() -> Option<Self> {
+        let (isolate_pointer, context) = rn_uv::callback::isolate_and_context()?;
+        // SAFETY: `remember_context` recorded the real isolate pointer; the loop
+        // only runs while that isolate is alive.
+        let mut isolate = unsafe { v8::Isolate::from_raw_isolate_ptr(isolate_pointer) };
+        let handle_storage = Box::pin(v8::HandleScope::new(&mut isolate));
+        // SAFETY: pinned storage with erased lifetime, as in `erase_plain`.
+        let (handle_storage, entered) =
+            unsafe { erase_detached_plain_with_entered(handle_storage) };
+        let mut entered = Box::pin(entered);
+        let local_context: v8::Local<v8::Context> = v8::Local::new(&entered, &context);
+        // SAFETY: `entered` is pinned for the life of `DetachedRoot`, so extending
+        // this borrow to match that ownership is sound.
+        let entered_ref: &mut DetachedEntered = unsafe { entered.as_mut().get_unchecked_mut() };
+        let context_scope = v8::ContextScope::new(entered_ref, local_context);
+        // SAFETY: as above — `context_scope` borrows `entered`, which this root owns
+        // and keeps pinned until drop.
+        let context_scope = unsafe { erase_detached_context_scope(context_scope) };
+        let mut context_scope = Box::pin(context_scope);
+        let guard = crate::scope::DetachedScopeGuard::enter(&mut context_scope);
+        Some(Self {
+            guard,
+            context_scope,
+            entered,
+            handle_storage,
+            context,
+            isolate,
+        })
+    }
+
+    fn with_scope<R>(
+        &mut self,
+        body: impl FnOnce(&mut v8::PinScope<'_, '_, v8::Context>) -> R,
+    ) -> R {
+        // These fields are intentional lifetime anchors: they keep the detached
+        // isolate/context/scope chain alive for the duration of every shim call.
+        let _ = (
+            &self.guard,
+            &self.entered,
+            &self.handle_storage,
+            &self.context,
+            &self.isolate,
+        );
+        let scope: &mut v8::PinScope<'static, 'static, v8::Context> = &mut self.context_scope;
+        // SAFETY: `scope` is borrowed from `&mut self`, so shrinking `'static` to
+        // that borrow's lifetime is sound and cannot outlive the root.
+        let scope = unsafe {
+            std::mem::transmute::<
+                &mut v8::PinScope<'static, 'static, v8::Context>,
+                &mut v8::PinScope<'_, '_, v8::Context>,
+            >(scope)
+        };
+        body(scope)
+    }
+}
 
 /// One open Node-API handle scope.
 enum OpenScope {
@@ -80,6 +166,7 @@ impl OpenScope {
 #[derive(Default)]
 pub(crate) struct ScopeStack {
     scopes: RefCell<Vec<OpenScope>>,
+    detached: RefCell<Option<DetachedRoot>>,
 }
 
 impl ScopeStack {
@@ -102,6 +189,22 @@ impl ScopeStack {
         Some(handle)
     }
 
+    /// Opens a plain scope while running from a bare libuv callback.
+    ///
+    /// This first ensures there is one detached entered context alive, then opens
+    /// the addon-visible handle scope inside it.
+    pub(crate) fn open_detached(&self) -> Option<*mut NapiHandleScope> {
+        let storage = self.with_detached_scope(|scope| {
+            let storage = Box::pin(v8::HandleScope::new(scope));
+            // SAFETY: same reasoning as `open`.
+            let storage = unsafe { erase_plain(storage) };
+            OpenScope::Plain { storage }
+        })?;
+        let handle = storage.handle();
+        self.scopes.try_borrow_mut().ok()?.push(storage);
+        Some(handle)
+    }
+
     /// Opens an escapable handle scope, returning the handle the addon uses.
     pub(crate) fn open_escapable(
         &self,
@@ -115,6 +218,23 @@ impl ScopeStack {
             entered,
             escaped: false,
         };
+        let handle = open.handle();
+        self.scopes.try_borrow_mut().ok()?.push(open);
+        Some(handle.cast::<NapiEscapableHandleScope>())
+    }
+
+    /// Opens an escapable scope while running from a bare libuv callback.
+    pub(crate) fn open_escapable_detached(&self) -> Option<*mut NapiEscapableHandleScope> {
+        let open = self.with_detached_scope(|scope| {
+            let storage = Box::pin(v8::EscapableHandleScope::new(scope));
+            // SAFETY: same reasoning as `open_escapable`.
+            let (storage, entered) = unsafe { erase_escapable(storage) };
+            OpenScope::Escapable {
+                storage,
+                entered,
+                escaped: false,
+            }
+        })?;
         let handle = open.handle();
         self.scopes.try_borrow_mut().ok()?.push(open);
         Some(handle.cast::<NapiEscapableHandleScope>())
@@ -135,6 +255,15 @@ impl ScopeStack {
         // Dropping the entry runs the V8 destructor, which rewinds the isolate's
         // handle allocation to where it was when the scope opened.
         scopes.pop();
+        let should_clear_detached = scopes.is_empty();
+        drop(scopes);
+        if should_clear_detached {
+            // Clearing this also drops the detached-scope guard, which removes the
+            // thread-local pointer before the backing V8 scopes are destroyed.
+            if let Ok(mut detached) = self.detached.try_borrow_mut() {
+                detached.take();
+            }
+        }
         NapiStatus::Ok
     }
 
@@ -187,6 +316,21 @@ impl ScopeStack {
         if let Ok(mut scopes) = self.scopes.try_borrow_mut() {
             while scopes.pop().is_some() {}
         }
+        if let Ok(mut detached) = self.detached.try_borrow_mut() {
+            detached.take();
+        }
+    }
+
+    fn with_detached_scope<R>(
+        &self,
+        f: impl FnOnce(&mut v8::PinScope<'_, '_, v8::Context>) -> R,
+    ) -> Option<R> {
+        let mut detached = self.detached.try_borrow_mut().ok()?;
+        if detached.is_none() {
+            *detached = DetachedRoot::new();
+        }
+        let root = detached.as_mut()?;
+        Some(root.with_scope(f))
     }
 
     /// How many scopes are open, for tests and for an environment teardown that
@@ -218,6 +362,24 @@ unsafe fn erase_plain<'i>(
     unsafe { std::mem::transmute::<Pin<Box<_>>, Pin<Box<PlainStorage>>>(storage) }
 }
 
+/// Initialises a pinned plain storage, returning the erased storage and entered ref.
+///
+/// # Safety
+///
+/// Same as [`erase_plain`], plus the returned reference must not outlive the box.
+unsafe fn erase_detached_plain_with_entered<'i>(
+    mut storage: Pin<Box<v8::ScopeStorage<v8::HandleScope<'i, ()>>>>,
+) -> (Pin<Box<DetachedHandleStorage>>, DetachedEntered) {
+    let entered: v8::PinnedRef<'_, v8::HandleScope<'_, ()>> = storage.as_mut().init();
+    // SAFETY: as in `erase_plain`.
+    let entered = unsafe {
+        std::mem::transmute::<v8::PinnedRef<'_, v8::HandleScope<'_, ()>>, DetachedEntered>(entered)
+    };
+    let storage =
+        unsafe { std::mem::transmute::<Pin<Box<_>>, Pin<Box<DetachedHandleStorage>>>(storage) };
+    (storage, entered)
+}
+
 /// Initialises a pinned escapable storage and erases its lifetimes.
 ///
 /// # Safety
@@ -242,6 +404,18 @@ unsafe fn erase_escapable<'i>(
     let storage =
         unsafe { std::mem::transmute::<Pin<Box<_>>, Pin<Box<EscapableStorage>>>(storage) };
     (storage, entered)
+}
+
+/// Erases the borrow lifetime on a detached context scope.
+///
+/// # Safety
+///
+/// The caller must guarantee the referenced handle scope is pinned and outlives
+/// the returned value.
+unsafe fn erase_detached_context_scope<'s>(
+    scope: v8::ContextScope<'s, 'static, v8::HandleScope<'static>>,
+) -> DetachedContextScope {
+    unsafe { std::mem::transmute::<_, DetachedContextScope>(scope) }
 }
 
 #[cfg(test)]
