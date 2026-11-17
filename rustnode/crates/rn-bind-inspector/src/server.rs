@@ -43,6 +43,75 @@ use crate::agent;
 /// The default port, matching `process.debugPort`.
 pub const DEFAULT_PORT: u16 = 9229;
 
+/// What a client is told about the target it can attach to.
+///
+/// Node's counterpart is `InspectorIoDelegate` (`src/inspector_io.cc:424-432`),
+/// which answers `GetTargetIds`/`GetTargetTitle`/`GetTargetUrl` from the script
+/// path it was started with. `/json`, `/json/list` and the `ws://` address all
+/// report the same three facts, which is why they live together here rather than
+/// being recomputed per route.
+#[derive(Debug, Clone)]
+pub struct Target {
+    /// The UUID in the WebSocket path.
+    ///
+    /// `GenerateID` in `src/inspector_io.cc:53` renders eight CSPRNG words as
+    /// `%04x%04x-%04x-%04x-%04x-%04x%04x%04x` with version 4 and RFC 4122
+    /// variant bits. Clients key their session on it — `test-inspector.js`
+    /// matches `/ws:\/\/localhost:\d+\/[0-9A-Fa-f]{8}-/` — so it has to be in
+    /// the path, not merely in the JSON.
+    pub id: String,
+    /// The entry point as the debugger reports it: `process.argv[1]` verbatim.
+    pub script_name: String,
+    /// The `realpath` of `script_name`, or empty when it does not resolve.
+    ///
+    /// Node's `ScriptPath` calls `uv_fs_realpath` and leaves the result empty on
+    /// failure, which is why `/json/list` reports `url: "file://"` for `-e`.
+    pub script_path: String,
+}
+
+impl Target {
+    /// Builds the identity for a run whose entry point is `script_name`.
+    ///
+    /// `script_name` is empty for `-e`, `-p` and an interactive session, which is
+    /// the case Node reports as a process name rather than a file.
+    pub fn new(script_name: &str) -> Self {
+        let script_path = if script_name.is_empty() {
+            String::new()
+        } else {
+            std::fs::canonicalize(script_name)
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        Self {
+            id: generate_id(),
+            script_name: script_name.to_string(),
+            script_path,
+        }
+    }
+
+    /// `GetTargetTitle`: the script's name, or `Node.js[pid]` when there is none.
+    ///
+    /// Node's `GetHumanReadableProcessName` is `SPrintF("%s[%d]",
+    /// GetProcessTitle("Node.js"), uv_os_getpid())` (`src/util.cc:221`), and the
+    /// title it reads is whatever `process.title` last set.
+    pub fn title(&self) -> String {
+        if self.script_name.is_empty() {
+            format!("{}[{}]", process_title(), std::process::id())
+        } else {
+            self.script_name.clone()
+        }
+    }
+
+    /// `GetTargetUrl`: `file://` plus the resolved path.
+    ///
+    /// The concatenation is Node's, including for an empty path — `/json/list`
+    /// reports `"url": "file://"` for `node -e`, which is not a valid URL and is
+    /// what the oracle returns.
+    pub fn url(&self) -> String {
+        format!("file://{}", self.script_path)
+    }
+}
+
 /// One message from a frontend, waiting to be dispatched on the isolate thread.
 pub struct Incoming {
     /// The connection that received it.
@@ -63,17 +132,39 @@ pub struct Shared {
     stopping: AtomicBool,
     /// The next connection index, so indices are unique for the server's life.
     next: AtomicUsize,
+    /// The address a client should dial, since a `Host`-less request needs one.
+    host: String,
+    port: u16,
+    /// The target the HTTP routes and the printed address describe.
+    target: Target,
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(host: String, port: u16, target: Target) -> Self {
         Self {
             incoming: Mutex::new(Vec::new()),
             writers: Mutex::new(HashMap::new()),
             attached: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             next: AtomicUsize::new(0),
+            host,
+            port,
+            target,
         }
+    }
+
+    /// The target this server publishes.
+    pub fn target(&self) -> &Target {
+        &self.target
+    }
+
+    /// The port the listener bound.
+    ///
+    /// `Shared` carries it because a caller that has only the shared half — a
+    /// reader thread that outlives the `Server` value, or a test helper that
+    /// cannot hold a `Server` across threads — still needs to dial the listener.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// Takes everything a frontend has sent since the last drain.
@@ -127,13 +218,23 @@ impl Server {
     /// `port` 0 asks the OS for one, which is what `--inspect-port=0` does and what
     /// the tests use so two runs cannot collide.
     pub fn start(host: &str, port: u16) -> Result<Self, String> {
+        Self::start_for_target(host, port, Target::new(""))
+    }
+
+    /// [`Self::start`] with an explicit target, so the printed address and the
+    /// `/json` routes name the entry point rather than an empty script.
+    pub fn start_for_target(host: &str, port: u16, target: Target) -> Result<Self, String> {
         let listener = TcpListener::bind((host, port))
             .map_err(|error| format!("cannot bind the inspector to {host}:{port}: {error}"))?;
         let bound = listener
             .local_addr()
             .map_err(|error| format!("cannot read the bound inspector address: {error}"))?;
 
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::new(
+            advertised_host(host).to_string(),
+            bound.port(),
+            target,
+        ));
         let accept_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("inspector-listener".to_string())
@@ -153,12 +254,23 @@ impl Server {
         self.port
     }
 
-    /// The `ws://` URL a client connects to.
+    /// The `ws://` address a client connects to, including the target id.
     ///
-    /// Node's `FormatWsAddress` brackets a v6 literal and leaves a v4 one bare, and
-    /// the address has no target id — `test/inspector/test-inspector.js` matches
-    /// `ws://[...]:port/` exactly.
+    /// Node's `GetWsUrl` (`src/inspector_io.cc:332`) is
+    /// `FormatWsAddress(host, port, id_, true)`, so the printed address carries
+    /// the UUID in the path. `test/common/inspector-helper.js` discovers the port
+    /// with `/Debugger listening on ws:\/\/.+:(\d+)\/.+/`, and the client that
+    /// reads `/json` then upgrades at the same path.
     pub fn ws_url(&self) -> String {
+        format_ws_address(&self.host, self.port, &self.shared.target.id)
+    }
+
+    /// The address without a target id, which is what a bare `GET` answers with.
+    ///
+    /// Kept separate from [`Self::ws_url`] because the two are different facts:
+    /// this is the listener, and that is a session. `Server::start`'s tests bind
+    /// a target of their own and would otherwise have to know the UUID.
+    pub fn listen_url(&self) -> String {
         format_ws_address(&self.host, self.port, "")
     }
 
@@ -257,9 +369,21 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                 if shared.is_stopping() {
                     return;
                 }
-                let Ok(stream) = upgrade(stream) else {
+                // A `GET` that is not an upgrade is answered here and the
+                // connection closes; only an accepted upgrade comes back as a
+                // stream to frame. Both are one request per connection, which is
+                // what Node's `InspectorSocket` does — it switches protocol once
+                // and never returns to HTTP.
+                let Ok(stream) = serve(stream, &shared) else {
                     continue;
                 };
+                // `StartSession` prints this once per accepted WebSocket, which
+                // is how `test/common/debugger.js` and
+                // `test-inspector-wait.mjs` learn that the target is reachable.
+                // It goes to stderr because that is where Node's `fprintf`
+                // puts it, and the debugger client forwards its child's stderr
+                // line by line.
+                eprintln!("Debugger attached.");
                 let connection = shared.next.fetch_add(1, Ordering::SeqCst);
                 let (sender, receiver) = mpsc::channel();
                 shared
@@ -282,13 +406,24 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     continue;
                 }
 
+                // Set before the reader thread starts: a command that arrives in
+                // the first read is dispatched on the isolate thread, and a pause it
+                // requests must see a frontend. Setting it afterwards leaves a
+                // window in which the pause refuses and JavaScript continues.
                 shared.attached.store(true, Ordering::SeqCst);
+                // The paused state has its own notion of attachment, and it is the
+                // one `pause::should_run` consults. Without this the pause loop
+                // returns immediately because it believes no frontend is there,
+                // which is exactly the defect that made `Debugger.pause` a no-op:
+                // `pause::set_attached` had no production caller at all.
+                crate::pause::set_attached(true);
                 let reader_shared = Arc::clone(&shared);
                 let reader = std::thread::Builder::new()
                     .name("inspector-reader".to_string())
                     .spawn(move || read_loop(connection, stream, reader_shared));
                 if reader.is_err() {
                     shared.attached.store(false, Ordering::SeqCst);
+                    crate::pause::set_attached(false);
                 }
             }
             Err(error) => {
@@ -299,26 +434,33 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     }
 }
 
-/// Reads the HTTP request, answers the upgrade, and returns the stream.
-fn upgrade(mut stream: TcpStream) -> Result<TcpStream, String> {
+/// One connection's request: either answered here, or upgraded to a session.
+///
+/// This is `InspectorSocketServer::HandleGetRequest` plus `OnSocketUpgrade`
+/// (`src/inspector_socket_server.cc:315-345`), which are two callbacks from the
+/// same parsed request. They are one function here because the request head is
+/// the only thing either needs and reading it twice is not possible.
+fn serve(mut stream: TcpStream, shared: &Arc<Shared>) -> Result<TcpStream, String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|error| format!("cannot set the inspector read timeout: {error}"))?;
 
     let request = read_http_request(&mut stream)?;
-    let Some(key) = header_value(&request, "sec-websocket-key") else {
-        // A browser GET on the endpoint is what happens when someone pastes the URL
-        // into an address bar. Answering is better than hanging; the JSON target
-        // list DevTools needs is not implemented, and a 400 says so.
-        let body = "Not a WebSocket request\n";
-        let _ = stream.write_all(
-            format!(
-                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        );
-        return Err("not a websocket upgrade".to_string());
+    let key = header_value(&request, "sec-websocket-key").map(str::to_string);
+
+    if key.is_none() {
+        // A plain `GET` is what DevTools and `node inspect` do first: they read
+        // the target list and then upgrade at the path it names. Answering it
+        // here is the whole difference between "the endpoint exists" and "the
+        // endpoint only speaks WebSocket".
+        let response = http_response(&request, shared);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        return Err("the request was answered without an upgrade".to_string());
+    }
+    // SAFETY-equivalent check: `key` was just tested.
+    let Some(key) = key else {
+        return Err("no websocket key".to_string());
     };
 
     let accept = websocket_accept(key.trim());
@@ -332,6 +474,229 @@ fn upgrade(mut stream: TcpStream) -> Result<TcpStream, String> {
         .set_read_timeout(None)
         .map_err(|error| format!("cannot clear the inspector read timeout: {error}"))?;
     Ok(stream)
+}
+
+/// The HTTP response for one non-upgrade request.
+///
+/// Node's routes are `/json`, `/json/list`, `/json/protocol` and `/json/version`,
+/// matched case-insensitively on the path segments and only for `GET`
+/// (`MatchPathSegment`, `src/inspector_socket_server.cc:77-86`). Anything else —
+/// a different method, an unknown path, a path with no `Host` — gets the
+/// handshake failure body, which is what `test-inspector.js` asserts for
+/// `/json/activate`, `/json/activate/boom` and `/json/badpath`:
+///
+/// ```text
+/// assert.match(err.body, /WebSockets request was expected/);
+/// ```
+///
+/// `Host` is part of the contract, not decoration: `/json/list` echoes it into
+/// `webSocketDebuggerUrl`, so `test-inspector-reported-host.js` sends a made-up
+/// value and asserts it comes back verbatim. A request without one is refused the
+/// way `IsAllowedHost` refuses an empty host in Node's HTTP handler.
+fn http_response(request: &str, shared: &Arc<Shared>) -> String {
+    let Some((method, path)) = request_line(request) else {
+        return handshake_failed();
+    };
+    if method != "GET" {
+        return handshake_failed();
+    }
+    // The query string is not part of any route Node defines; dropping it keeps
+    // `/json/list?foo` behaving like `/json/list` rather than 400.
+    let path = path.split('?').next().unwrap_or(path);
+    if !path.starts_with("/json") {
+        return handshake_failed();
+    }
+    let command = &path["/json".len()..];
+    let target = shared.target();
+
+    match command {
+        "" | "/" | "/list" | "/list/" => {
+            let host = match header_value(request, "host") {
+                Some(host) if !host.trim().is_empty() => host.trim().to_string(),
+                _ => format_host_port(&shared.host, shared.port),
+            };
+            json_response(200, &target_list_json(target, &host))
+        }
+        "/version" | "/version/" => json_response(200, &version_json()),
+        _ => handshake_failed(),
+    }
+}
+
+/// The parsed method and path of a request head.
+fn request_line(request: &str) -> Option<(&str, &str)> {
+    let mut parts = request.lines().next()?.split_whitespace();
+    let method = parts.next()?;
+    let path = parts.next()?;
+    Some((method, path))
+}
+
+/// `/json` and `/json/list`: one target, formatted the way Node formats it.
+///
+/// The shape is `MapsToString`/`MapToString` in `src/inspector_socket_server.cc`,
+/// which is why the JSON has a leading `[ {`, two-space indentation, sorted keys
+/// and a trailing `\n\n`. `test-inspector.js` only checks `devtoolsFrontendUrl`
+/// and the `webSocketDebuggerUrl` pattern, but `MapToString`'s exact bytes are
+/// cheap to reproduce and a client that diffs the document gets the same text.
+pub fn target_list_json(target: &Target, host: &str) -> String {
+    let address = format!("ws://{host}/{}", target.id);
+    let bare = format!("{host}/{}", target.id);
+    let entries = [
+        ("description", "node.js instance".to_string()),
+        ("devtoolsFrontendUrl", frontend_url(false, &bare)),
+        ("devtoolsFrontendUrlCompat", frontend_url(true, &bare)),
+        (
+            "faviconUrl",
+            "https://nodejs.org/static/images/favicons/favicon.ico".to_string(),
+        ),
+        ("id", target.id.clone()),
+        ("title", target.title()),
+        ("type", "node".to_string()),
+        ("url", target.url()),
+        ("webSocketDebuggerUrl", address),
+    ];
+    let mut out = String::from("[ {\n");
+    for (index, (key, value)) in entries.iter().enumerate() {
+        if index > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str("  \"");
+        out.push_str(key);
+        out.push_str("\": \"");
+        escape_into(&mut out, value);
+        out.push('"');
+    }
+    out.push_str("\n} ]\n\n");
+    out
+}
+
+/// `GetFrontendURL`: the DevTools URL, which embeds the address without a scheme.
+fn frontend_url(compat: bool, bare_address: &str) -> String {
+    let page = if compat {
+        "inspector.html"
+    } else {
+        "js_app.html"
+    };
+    format!("devtools://devtools/bundled/{page}?experiments=true&v8only=true&ws={bare_address}")
+}
+
+/// `/json/version`.
+///
+/// `test-inspector.js` compares this document with `JSON.stringify` against
+/// `{Browser, 'Protocol-Version'}`, so the key order and the trailing space are
+/// part of the contract: `MapToString` writes `"\n} "` with no newline after it.
+pub fn version_json() -> String {
+    format!(
+        "{{\n  \"Browser\": \"node.js/{}\",\n  \"Protocol-Version\": \"1.1\"\n}} ",
+        crate::node_version()
+    )
+}
+
+/// A 200 response carrying a JSON document.
+fn json_response(code: u16, body: &str) -> String {
+    format!(
+        "HTTP/1.0 {code} OK\r\nContent-Type: application/json; charset=UTF-8\r\nCache-Control: no-cache\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The 400 a non-WebSocket request gets, byte-identical to `CancelHandshake`.
+fn handshake_failed() -> String {
+    let body = "WebSockets request was expected\r\n";
+    format!("HTTP/1.0 400 Bad Request\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n{body}")
+}
+
+/// `FormatHostPort` (`src/inspector_socket_server.cc:33`).
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Escapes a string for a JSON document.
+///
+/// Node's `Escape` covers the same set. The values here are a path and a process
+/// title, so only a quote, a backslash and a control character can appear, but a
+/// path with a quote in it would otherwise produce a document no client can parse.
+fn escape_into(out: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if (other as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", other as u32);
+            }
+            other => out.push(other),
+        }
+    }
+}
+
+/// The name `process.title` currently reports.
+///
+/// Node's `GetHumanReadableProcessName` reads the process title rather than a
+/// constant, so `--title` and a script that sets `process.title` both reach
+/// `/json/list`. `rn_uv::process_title::process_title` is the same source
+/// `process.title` reads; before `uv_setup_args` it answers Node's `"node"`
+/// fallback, which is what the oracle reports for `node -e`.
+fn process_title() -> String {
+    rn_uv::process_title::process_title().unwrap_or_else(|| "node".to_string())
+}
+
+/// The UUID a client attaches with, per `GenerateID`.
+///
+/// Eight CSPRNG words rendered as `%04x%04x-%04x-%04x-%04x-%04x%04x%04x`, with
+/// the version-4 and RFC 4122 variant bits overwritten. `uv_random` is called
+/// with a null loop and a null callback, which libuv documents as the synchronous
+/// form, so this needs no loop handle.
+fn generate_id() -> String {
+    let mut words = [0u16; 8];
+    let filled = {
+        // SAFETY: `words` is `8 * 2` bytes of writable stack, which is exactly
+        // what `uv_random` is told is available. A null loop and null callback
+        // select libuv's synchronous path, so no request struct is stored.
+        unsafe {
+            libuv_sys2::uv_random(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                words.as_mut_ptr().cast(),
+                std::mem::size_of_val(&words),
+                0,
+                None,
+            ) == 0
+        }
+    };
+    if !filled {
+        // A failed CSPRNG is not something to paper over with a predictable id:
+        // the id is what a client's session is keyed on. The clock and the pid
+        // are not random, but they are the best a failed syscall leaves, and a
+        // duplicate is impossible within one process.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or_default();
+        let pid = u64::from(std::process::id());
+        for (index, word) in words.iter_mut().enumerate() {
+            let shift = (index as u32 * 8) % 64;
+            *word =
+                ((nanos.rotate_left(shift) ^ pid.wrapping_mul(index as u64 + 1)) & 0xffff) as u16;
+        }
+    }
+    format!(
+        "{:04x}{:04x}-{:04x}-{:04x}-{:04x}-{:04x}{:04x}{:04x}",
+        words[0],
+        words[1],
+        words[2],
+        (words[3] & 0x0fff) | 0x4000,
+        (words[4] & 0x3fff) | 0x8000,
+        words[5],
+        words[6],
+        words[7]
+    )
 }
 
 /// Reads one HTTP request head.
@@ -483,9 +848,12 @@ fn read_loop(connection: usize, mut stream: TcpStream, shared: Arc<Shared>) {
                         connection,
                         message: text,
                     });
-                // The isolate is asleep in `uv_run`; this asks it for one check
-                // phase, which is where the queue is drained.
+                // The isolate is asleep in `uv_run` — or inside the pause loop —
+                // and this asks it to look at the queue. Requesting the loop's
+                // check phase only helps the first case; the pause loop reads the
+                // queue itself, and `pause::wake` is what tells it to.
                 request_drain();
+                crate::pause::wake();
             }
             // CDP over WebSocket is text. A binary frame is dropped rather than
             // guessed at, so a client using the CBOR form fails visibly.
@@ -494,26 +862,41 @@ fn read_loop(connection: usize, mut stream: TcpStream, shared: Arc<Shared>) {
             }
             Ok(Some(Frame::Close)) => {
                 send_close(&mut stream);
-                shared.attached.store(false, Ordering::SeqCst);
+                detach(&shared);
                 return;
             }
             Ok(Some(Frame::Ping(payload))) => {
                 if write_server_frame(&mut stream, 0xA, &payload).is_err() {
-                    shared.attached.store(false, Ordering::SeqCst);
+                    detach(&shared);
                     return;
                 }
             }
             Ok(Some(Frame::Pong)) => {}
             Ok(None) => {
-                shared.attached.store(false, Ordering::SeqCst);
+                detach(&shared);
                 return;
             }
-            Err(_) => {
-                shared.attached.store(false, Ordering::SeqCst);
+            Err(error) => {
+                // A read error is an ordinary disconnect: the client closed the
+                // socket, or the network dropped it. Logged rather than silent so
+                // a connection that keeps failing is visible.
+                tracing::debug!(%error, "the inspector reader stopped");
+                detach(&shared);
                 return;
             }
         }
     }
+}
+
+/// Records that a connection ended, in both attachment trackers.
+///
+/// The two are separate facts with different readers: `Shared::attached` is what
+/// keeps the process alive (`Agent::IsActive`), and the pause module's flag is what
+/// `shouldRunMessageLoop` consults. A disconnect has to clear both, or a pause waits
+/// for a client that is gone.
+fn detach(shared: &Arc<Shared>) {
+    shared.attached.store(false, Ordering::SeqCst);
+    crate::pause::set_attached(false);
 }
 
 /// Writes replies for one connection.

@@ -53,6 +53,21 @@ use crate::pause;
 /// through to V8 rather than being silently swallowed.
 pub const DOMAINS: &[&str] = &["NodeRuntime", "NodeTracing", "NodeWorker"];
 
+/// One `Runtime` method this module answers before V8 sees it.
+///
+/// `Runtime.runIfWaitingForDebugger` is normally V8's: it calls
+/// `V8InspectorClient::runIfWaitingForDebugger`, which is how Node's agent clears
+/// `waiting_for_frontend_`. V8 only makes that call when the *session* was told it is
+/// waiting (`ChannelImpl::setWaitingForDebugger`, from
+/// `inspector_agent.cc:626`), and the v8 crate exposes no way to set that flag. So
+/// `--inspect-brk` in rustnode waits on the agent's own flag and this handler clears
+/// it, which is the same flag and the same event.
+///
+/// The method still has to reach V8 afterwards — a client uses the reply to know the
+/// target is running — so the caller dispatches to V8 as well. This returns a reply
+/// only, never `None` for a V8-owned method otherwise.
+pub const RUNTIME_WAKE_METHOD: &str = "Runtime.runIfWaitingForDebugger";
+
 /// One reply to send back to the frontend.
 pub struct Reply {
     /// The `id` from the request.
@@ -127,6 +142,24 @@ pub fn owns(method: &str) -> bool {
 pub fn dispatch(message: &str) -> Option<Reply> {
     let parsed: Value = serde_json::from_str(message).ok()?;
     let method = parsed.get("method")?.as_str()?;
+    if method == RUNTIME_WAKE_METHOD {
+        // `--inspect-brk` is holding the process before user code. Two things have
+        // to happen, in this order:
+        //
+        // 1. the agent's wait ends, which is `waiting_for_frontend_ = false`;
+        // 2. the first line is armed, which is `PauseOnNextJavascriptStatement`.
+        //
+        // V8 does both itself when the session is marked as waiting, but the `v8`
+        // crate exposes no `setWaitingForDebugger`, so the agent does them here.
+        // Arming *after* clearing the flag is what makes the very next statement
+        // stop: V8 only installs the interrupt when it compiles a statement, and
+        // the entry point has not been compiled at this point.
+        crate::pause::run_if_waiting_for_debugger();
+        if crate::take_pending_start_break() {
+            crate::schedule_start_break_now();
+        }
+        return None;
+    }
     if !owns(method) {
         return None;
     }
@@ -141,9 +174,22 @@ pub fn dispatch(message: &str) -> Option<Reply> {
         // `NodeRuntime.waitingForDebugger`. That event is emitted by the pause
         // machinery, not here, so the handler's job is to record that the frontend
         // wants it — which is what `notify_when_waiting` does.
+        // `enable` is the one that matters: `test-inspector.js` and
+        // `test-inspector-debug-brk-flag.js` both send it, then wait for
+        // `NodeRuntime.waitingForDebugger`. Node's agent emits that event from the
+        // V8 channel's `setWaitingForDebugger`, which fires when the channel is
+        // created *while* `waiting_for_frontend_` is set — so the event belongs to
+        // the reply here, not to the pause callback. Emitting it from the pause
+        // would miss it entirely for a client that enables the domain after the
+        // wait began, which is exactly `node inspect`.
         "NodeRuntime.enable" => {
             runtime_events(true);
-            Reply::ok(id, json!({}))
+            let reply = Reply::ok(id, json!({}));
+            if pause::is_paused() || pause::waiting_for_frontend() {
+                reply.notify("NodeRuntime.waitingForDebugger", json!({}))
+            } else {
+                reply
+            }
         }
         "NodeRuntime.disable" => {
             runtime_events(false);

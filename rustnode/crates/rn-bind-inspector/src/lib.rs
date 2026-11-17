@@ -46,14 +46,25 @@ pub mod agent;
 pub mod domains;
 mod pause;
 mod profiler;
-mod server;
+pub mod server;
 mod session;
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
 pub use agent::{ensure_inspector, set_isolate};
-pub use server::{format_ws_address, Server};
+pub use server::{format_ws_address, target_list_json, version_json, Server, Shared, Target};
+
+/// The version string `/json/version` reports, matching `process.version`.
+///
+/// Node's `SendVersionResponse` writes `"node.js/" NODE_VERSION`, so the two must
+/// agree or a client that compares `/json/version` with `process.version` — which
+/// `test-inspector.js` does — sees a mismatch it cannot explain. `rn-realm` is the
+/// one place that decides what this build reports, and it is quoted here rather
+/// than duplicated: a change there has to reach this document too.
+pub fn node_version() -> &'static str {
+    "28.0.0"
+}
 
 /// `Sec-WebSocket-Accept` for a client key, exposed for the socket test.
 pub fn websocket_accept_value(client_key: &str) -> String {
@@ -314,13 +325,39 @@ pub fn has_pending_messages() -> bool {
 /// Returns the URL a client should dial, which is what the CLI prints. `port` 0 asks
 /// the OS for a free one, so the returned URL names the port that was really bound.
 pub fn start_server(host: &str, port: u16) -> Result<String, String> {
+    let script_name = SCRIPT_NAME.with(|slot| slot.borrow().clone());
+    start_server_for_script(host, port, &script_name)
+}
+
+/// [`start_server`] with an explicit entry point.
+///
+/// `script_name` is the entry point as `process.argv[1]` reports it, or empty for
+/// `-e`/`-p`. `/json/list`'s `title` and `url` come from it, so a run that reports
+/// `file://` for a script has the wrong entry point rather than a formatting bug.
+pub fn start_server_for_script(host: &str, port: u16, script_name: &str) -> Result<String, String> {
     if SERVER.with(|slot| slot.borrow().is_some()) {
         return Err("Inspector is already activated".to_string());
     }
-    let server = Server::start(host, port)?;
+    let server = Server::start_for_target(host, port, Target::new(script_name))?;
     let url = server.ws_url();
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
     Ok(url)
+}
+
+/// Records the entry point a later `inspector.open()` should publish.
+///
+/// Node's `Agent::Start` is handed `argv_[1]` once, during bootstrap
+/// (`src/node.cc:203`), and every later `open()` reuses it. The CLI knows the
+/// value — it resolved `process.argv` — while `open()` is reached from JavaScript,
+/// so it is recorded here rather than re-derived from `std::env::args`, which
+/// cannot tell a flag's value from a script path.
+pub fn set_script_name(script_name: &str) {
+    SCRIPT_NAME.with(|slot| *slot.borrow_mut() = script_name.to_string());
+}
+
+thread_local! {
+    /// The entry point `open()` reports, recorded by the CLI.
+    static SCRIPT_NAME: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// Blocks until a CDP client attaches, or gives up.
@@ -330,6 +367,62 @@ pub fn wait_for_client() -> bool {
             .as_ref()
             .is_some_and(|server| server.wait_for_client())
     })
+}
+
+/// Blocks until a client sends `Runtime.runIfWaitingForDebugger`, dispatching its
+/// commands in the meantime.
+///
+/// This is `--inspect-brk`'s wait, and it is a message loop rather than an
+/// attachment check for a reason the previous shape got wrong: a client that has
+/// attached has not yet said "run", and the commands it sends first —
+/// `Debugger.enable`, `Debugger.setBreakpointByUrl`, `Debugger.setPauseOnExceptions`
+/// — have to be dispatched *before* it can send the one that ends the wait. Polling
+/// for attachment and then waiting for a separate signal deadlocks, because nothing
+/// dispatches in between.
+///
+/// Returns whether it waited at all. With no client attached it returns immediately,
+/// which is Node's behaviour when nothing is listening.
+pub fn wait_for_frontend(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    pause::wait_for_frontend_loop(scope, drain_pending_messages, pause::ATTACH_TIMEOUT)
+}
+
+/// Asks every attached session to pause before its next statement.
+///
+/// `--inspect-brk`'s break on start, and `callAndPauseOnStart`'s. This is
+/// `Agent::PauseOnNextJavascriptStatement` (`inspector_agent.cc:1098`), which is
+/// `client_->schedulePauseOnNextStatement(reason)`, forwarded to every live session.
+///
+/// The request is also recorded, because `--inspect-brk` has to make it before the
+/// entry point's first statement and the client's session may not exist yet. The
+/// server asks [`take_pending_start_break`] after it creates a session, which is the
+/// moment V8 can be told.
+pub fn schedule_start_break() {
+    START_BREAK_PENDING.with(|flag| flag.set(true));
+    request_pause("Break on start");
+}
+
+/// Whether `--inspect-brk` still owes its first-line break.
+pub fn start_break_pending() -> bool {
+    START_BREAK_PENDING.with(std::cell::Cell::get)
+}
+
+/// Arms the break-on-start interrupt on every live session.
+///
+/// Separate from [`schedule_start_break`] because the two happen at different
+/// moments: that one records the request, and this one applies it once V8 has a
+/// debugger agent for the session. Called from `Runtime.runIfWaitingForDebugger`.
+pub fn schedule_start_break_now() {
+    request_pause("Break on start");
+}
+
+/// Consumes the pending break-on-start request.
+pub fn take_pending_start_break() -> bool {
+    START_BREAK_PENDING.with(|flag| flag.replace(false))
+}
+
+thread_local! {
+    /// Set by `--inspect-brk` until `Runtime.runIfWaitingForDebugger` has been seen.
+    static START_BREAK_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Marks a frontend as attached, which is what makes a pause wait.
@@ -360,12 +453,45 @@ pub fn arm_pause_for_test() {
     pause::arm();
 }
 
-/// Runs the pause loop, for a test that needs to observe it blocking.
+/// Whether a pause loop is on the stack, which a nested pause must observe.
+pub fn pause_on_stack() -> bool {
+    pause::pause_on_stack()
+}
+
+/// Runs the pause loop from a test, with a scope to dispatch through.
 ///
 /// Returns whether it waited. Production code reaches this through V8's
 /// `runMessageLoopOnPause`, which is the only caller that should exist outside tests.
-pub fn run_pause_loop_for_test() -> bool {
-    pause::run_pause_loop()
+///
+/// The scope is not optional: the loop dispatches frontend messages while it waits,
+/// which is how `Debugger.resume` arrives, and a test that wanted to observe the
+/// blocking without one would be testing a loop that cannot be resumed.
+pub fn run_pause_loop_for_test(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    pause::run_pause_loop(scope, drain_pending_messages)
+}
+
+/// [`run_pause_loop_for_test`] dispatching through a caller's own server.
+///
+/// A test that owns a `Server` would otherwise have its messages queued where the
+/// pause loop cannot see them: the loop drains the CLI's server, and a test's is a
+/// different one. That is the shape the production path has — one server, reached
+/// through a thread-local — so a test that could not substitute its own could only
+/// be written against the CLI.
+pub fn run_pause_loop_draining(
+    scope: &mut v8::PinScope<'_, '_>,
+    shared: &std::sync::Arc<server::Shared>,
+) -> bool {
+    pause::run_pause_loop(scope, |scope| server::drain(scope, shared))
+}
+
+/// Dispatches every queued frontend message with an open V8 scope.
+///
+/// This is what the pause loop calls while waiting. It is separate from
+/// [`server::drain`] because it has to reach the server the CLI installed rather
+/// than one a caller holds, and it returns the count so the loop can tell "nothing
+/// arrived" from "a message was handled and may have queued more".
+pub fn drain_pending_messages(scope: &mut v8::PinScope<'_, '_>) -> usize {
+    drain_attached(scope)
 }
 
 /// Sends one notification to every attached frontend.
@@ -550,7 +676,8 @@ fn open_callback(
     };
 
     // `0` means "any free port", which is what the tests use.
-    match Server::start(&host, port) {
+    let script_name = SCRIPT_NAME.with(|slot| slot.borrow().clone());
+    match Server::start_for_target(&host, port, Target::new(&script_name)) {
         Ok(server) => {
             tracing::info!(
                 url = %server.ws_url(),

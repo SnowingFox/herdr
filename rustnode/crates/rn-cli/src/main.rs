@@ -319,12 +319,45 @@ fn main() {
             std::process::exit(1);
         }
         let request = &options.debug_port;
+        // The entry point `/json/list` reports is the *unresolved* `argv[1]`, as
+        // `Agent::Start` receives it (`src/node.cc:203`): the oracle titles a
+        // relative `app.js` as `"app.js"` while resolving `url` itself. The CLI
+        // knows which argument that was, so it is recorded here rather than
+        // re-read from `std::env::args`, which cannot tell a flag's value from a
+        // script path.
+        match &options.source {
+            args::Source::File(path) => rn_bind_inspector::set_script_name(path),
+            args::Source::Inspect => rn_bind_inspector::set_script_name(args::INSPECT_SUBCOMMAND),
+            _ => {}
+        }
         match rn_bind_inspector::start_server(request.host.as_str(), request.port) {
             Ok(url) => {
                 eprintln!("Debugger listening on {url}");
                 eprintln!("For help, see: https://nodejs.org/learn/getting-started/debugging");
-                if options.inspect_wait && !rn_bind_inspector::wait_for_client() {
-                    eprintln!("rustnode: --inspect-brk found no client; running without waiting");
+                // `--inspect-brk` blocks here until a client sends
+                // `Runtime.runIfWaitingForDebugger`, which is
+                // `Agent::WaitForConnectByOptions` plus `waitForFrontend`.
+                //
+                // It cannot be a sleep-and-poll: the client's first commands —
+                // `Debugger.enable`, `Debugger.setBreakpointByUrl`, then
+                // `runIfWaitingForDebugger` — all arrive *while* the process is
+                // stopped, so the wait has to dispatch them. That is why this goes
+                // through the same message loop an ordinary pause uses rather than
+                // blocking on an attachment flag; the flag-only version deadlocked
+                // as soon as a client tried to say "run".
+                if options.inspect_wait {
+                    if !rn_bind_inspector::wait_for_frontend(scope) {
+                        eprintln!(
+                            "rustnode: --inspect-brk found no client; running without waiting"
+                        );
+                    }
+                    // `PauseOnNextJavascriptStatement("Break at bootstrap")` runs
+                    // *after* the wait, which is `src/node.cc:231-232`: the client has
+                    // said "run", the session exists, and `Debugger.enable` has
+                    // created the agent that `schedulePauseOnNextStatement` needs.
+                    // Scheduling it before the wait is accepted by V8 and then has
+                    // no effect, because there is no debugger agent to arm yet.
+                    rn_bind_inspector::schedule_start_break();
                 }
             }
             Err(message) => {
@@ -374,6 +407,13 @@ fn main() {
         // an argument starting with `-`. A bare `node` with a pipe publishes no
         // `argv[1]` at all.
         args::Source::Stdin { marker: true } => argv_rest.push("-".to_string()),
+        // `inspect` keeps its own name in `argv[1]` rather than being resolved
+        // to a path, which is what `internal/main/inspect`'s
+        // `process.argv.slice(2)` expects: the debugger's arguments start at
+        // index 2 either way. Node's `StartExecution` reads the same slot from
+        // `env->argv()[1]` before any expansion, so the word itself is the
+        // entry point's name.
+        args::Source::Inspect => argv_rest.push(args::INSPECT_SUBCOMMAND.to_string()),
         _ => {}
     }
     argv_rest.extend(options.script_args.iter().cloned());
@@ -596,23 +636,30 @@ fn main() {
             print_result = *print;
             value = evaluate_script(scope, code).map(|value| v8::Global::new(scope, value));
         }
-        // `internal/main/eval_stdin` and `internal/main/print_help` are Node's
-        // own entry points, run as main scripts. They are not reimplemented
-        // here for the same reason a file is not: `eval_stdin` reads stdin
-        // through `process.stdin`, honours `--input-type`, `--print` and
-        // `--strip-types`, and hands the code to `evalScript`, which is what
-        // gives the module `module`/`exports`/`require`/`__filename` and makes
-        // `require.main` undefined — reproducing that by hand would be a second
-        // copy of `evalScript`'s semantics.
+        // `internal/main/eval_stdin`, `internal/main/print_help` and
+        // `internal/main/inspect` are Node's own entry points, run as main
+        // scripts. They are not reimplemented here for the same reason a file is
+        // not: `eval_stdin` reads stdin through `process.stdin`, honours
+        // `--input-type`, `--print` and `--strip-types`, and hands the code to
+        // `evalScript`, which is what gives the module
+        // `module`/`exports`/`require`/`__filename` and makes `require.main`
+        // undefined — reproducing that by hand would be a second copy of
+        // `evalScript`'s semantics.
         //
         // `print_help` is the same argument one surface over: the usage text is
         // generated from the option table at run time, so a Rust-side copy
         // would silently drift from the table `getOptionValue` reports.
-        args::Source::Stdin { .. } | args::Source::Help => {
+        //
+        // `inspect` likewise *is* `internal/debugger/*`: the client, the REPL
+        // and the probe mode all live there, and the script requires `events`,
+        // `util`, `timers/promises`, `child_process`, `net`, `http` and
+        // `internal/url`, so it has to run after the loaders are installed —
+        // which is where this arm is.
+        args::Source::Stdin { .. } | args::Source::Help | args::Source::Inspect => {
             let id = options
                 .source
                 .main_script_id()
-                .expect("both sources name a main script");
+                .expect("every main-script source names one");
             // The main scripts call `prepareMainThreadExecution()` themselves,
             // which is why the CLI skipped its own call above. A failure is
             // reported through the same uncaught path a file entry point uses:

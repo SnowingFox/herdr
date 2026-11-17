@@ -358,6 +358,21 @@ pub enum Source {
     /// that builds `internalBinding`. Reproducing the text as a constant would
     /// be a second copy of the table that could silently disagree with it.
     Help,
+    /// `inspect`: Node's own debugger client, run from
+    /// `internal/main/inspect`.
+    ///
+    /// This is `StartExecution`'s `first_argv == "inspect"` branch
+    /// (`src/node.cc:367`), which is checked before the entry point is treated
+    /// as a file. Without it the word became a script path, so every
+    /// `test/debugger/*` invocation died with
+    /// `Cannot find module '<cwd>/inspect'` before reaching any assertion.
+    ///
+    /// The arguments after it are the debugger's own (`--port=`, `--probe`, the
+    /// script to launch, `host:port`, `-p <pid>`). `internal/main/inspect` reads
+    /// them from `process.argv` rather than from the option table — Node's own
+    /// parser stops at the first non-flag, so they were never options — which is
+    /// why they travel in [`Options::script_args`] and are not interpreted here.
+    Inspect,
 }
 
 impl Source {
@@ -365,12 +380,12 @@ impl Source {
     /// which run pre-execution themselves.
     ///
     /// `-e`, a file and the empty program are driven by the CLI, so the CLI
-    /// calls `prepareMainThreadExecution` for them. The two below are not: the
-    /// first line of `print_help.js` and `eval_stdin.js` is
+    /// calls `prepareMainThreadExecution` for them. The three below are not: the
+    /// first line of `print_help.js`, `eval_stdin.js` and `inspect.js` is
     /// `prepareMainThreadExecution()`, and running it twice trips
     /// `initializeModuleLoaders`' assertion that no user module has executed.
     pub fn uses_main_script(&self) -> bool {
-        matches!(self, Self::Stdin { .. } | Self::Help)
+        matches!(self, Self::Stdin { .. } | Self::Help | Self::Inspect)
     }
 
     /// The main script id this source runs, when it is one.
@@ -378,6 +393,7 @@ impl Source {
         match self {
             Self::Stdin { .. } => Some("internal/main/eval_stdin"),
             Self::Help => Some("internal/main/print_help"),
+            Self::Inspect => Some("internal/main/inspect"),
             _ => None,
         }
     }
@@ -420,6 +436,12 @@ pub enum StdinKind {
     /// Piped, redirected from a file, or `/dev/null` — anything but a tty.
     Redirected,
 }
+
+/// The bare word that selects Node's debugger client.
+///
+/// Matched exactly: `./inspect` and `inspect.js` are files, and Node's own
+/// `first_argv == "inspect"` comparison is exact too.
+pub const INSPECT_SUBCOMMAND: &str = "inspect";
 
 /// Flags that take no separate value and that rustnode deliberately ignores.
 ///
@@ -1113,7 +1135,20 @@ pub fn parse_with_env(
     // before `-e` is (`:371` against `:380`), which is why `node -e 1 --help`
     // prints the usage text instead of running the code.
     let positional = &args[index..];
-    options.source = if options.print_help {
+    options.source = if positional.first().map(String::as_str) == Some(INSPECT_SUBCOMMAND) {
+        // `StartExecution` checks `first_argv == "inspect"` (`src/node.cc:367`)
+        // before it looks at `print_help` (`:371`) or `has_eval_string` (`:384`),
+        // and `first_argv` is `argv[1]` *after* the option walk has erased the
+        // flags it consumed (`ArgsInfo::pop_first`). That is why
+        // `node --help inspect` prints the debugger's usage rather than the
+        // runtime's, and why `node -e 'x' inspect` does not evaluate anything.
+        // Both are what the oracle does, so the check comes first here too.
+        //
+        // `--version` is the one thing that beats it, because Node answers that
+        // in `ProcessGlobalArgs` before dispatch is reached at all.
+        options.script_args = positional[1..].to_vec();
+        Source::Inspect
+    } else if options.print_help {
         // `internal/main/print_help` is a main script rather than a flag
         // answer, so the realm has to be up before it runs.
         options.script_args = positional.to_vec();
@@ -1741,6 +1776,119 @@ mod tests {
     fn no_arguments_means_nothing_to_run() {
         let options = parse_of(&[]).expect("parses");
         assert!(matches!(options.source, Source::Empty));
+    }
+
+    /// `node inspect` selects Node's debugger client, not a file named `inspect`.
+    ///
+    /// The defect this pins: the word was consumed as a script path, so every
+    /// `test/debugger/*` invocation — all of which spell it this way — died with
+    /// `Cannot find module '<cwd>/inspect'` before reaching an assertion. Node's
+    /// `StartExecution` checks `first_argv == "inspect"` (`src/node.cc:367`)
+    /// before it looks at the entry point at all.
+    #[test]
+    fn the_inspect_word_selects_the_debugger_client() {
+        let options = parse_of(&["inspect"]).expect("parses");
+        assert!(
+            matches!(options.source, Source::Inspect),
+            "inspect must select the debugger client, got {:?}",
+            options.source
+        );
+        assert!(
+            options.script_args.is_empty(),
+            "a bare inspect has no arguments"
+        );
+        // It is not a flag and not part of `execArgv`: Node reports neither.
+        assert!(options.exec_argv.is_empty(), "{:?}", options.exec_argv);
+    }
+
+    /// The debugger's own arguments follow `inspect` as script arguments.
+    ///
+    /// They belong in `process.argv[2..]` because `internal/main/inspect` reads
+    /// them from there. Node's parser stops at the first non-flag, so `--port=0`
+    /// is never an option of the *runtime*, and treating it as one would reject
+    /// every `node inspect --port=0 script.js` with `bad option`.
+    #[test]
+    fn inspect_arguments_are_not_runtime_options() {
+        let options = parse_of(&["inspect", "--port=0", "/tmp/app.js", "a"]).expect("parses");
+        assert!(matches!(options.source, Source::Inspect));
+        assert_eq!(options.script_args, ["--port=0", "/tmp/app.js", "a"]);
+        // `--port` is not a runtime flag, so it must not reach `execArgv` or V8.
+        assert!(options.exec_argv.is_empty(), "{:?}", options.exec_argv);
+        assert!(options.v8_args.is_empty(), "{:?}", options.v8_args);
+        assert!(
+            options.unimplemented.is_empty(),
+            "{:?}",
+            options.unimplemented
+        );
+    }
+
+    /// Runtime flags before `inspect` are still runtime flags.
+    ///
+    /// `NODE_DEBUG=inspect node --no-warnings inspect x.js` and the suite's own
+    /// `node --expose-internals inspect ...` both rely on this: the option walk
+    /// ends at `inspect`, and everything after it belongs to the debugger.
+    #[test]
+    fn flags_before_inspect_keep_their_meaning() {
+        let options = parse_of(&["--no-warnings", "--expose-internals", "inspect", "--help"])
+            .expect("parses");
+        assert!(matches!(options.source, Source::Inspect));
+        assert!(options.expose_internals(), "the flag must still be seen");
+        assert_eq!(options.exec_argv, ["--no-warnings", "--expose-internals"]);
+        assert_eq!(options.script_args, ["--help"]);
+    }
+
+    /// `inspect` wins over `-e`, which is `StartExecution`'s order.
+    ///
+    /// The oracle prints the debugger's usage for `node -e 'x' inspect` rather
+    /// than evaluating anything, because the `inspect` branch comes before the
+    /// `has_eval_string` one (`src/node.cc:367` versus `:384`).
+    #[test]
+    fn inspect_wins_over_eval() {
+        let options = parse_of(&["-e", "console.log(1)", "inspect", "--help"]).expect("parses");
+        assert!(
+            matches!(options.source, Source::Inspect),
+            "inspect must win over -e, got {:?}",
+            options.source
+        );
+        assert_eq!(options.script_args, ["--help"]);
+        // `-e` and its source stay in `execArgv`; Node records them before the
+        // walk reaches `inspect`.
+        assert_eq!(options.exec_argv, ["-e", "console.log(1)"]);
+    }
+
+    /// A file whose name merely contains `inspect` is a file.
+    ///
+    /// `StartExecution` compares the whole argument, so `./inspect`,
+    /// `inspect.js` and `/path/to/inspect` are all entry points. Matching on a
+    /// prefix would have broken the ordinary case of running a script called
+    /// `inspect.js`.
+    #[test]
+    fn only_the_bare_word_is_the_subcommand() {
+        for path in ["inspect.js", "./inspect", "/tmp/inspect", "inspect/"] {
+            let options =
+                parse_of(&[path]).unwrap_or_else(|error| panic!("{path} must parse: {error}"));
+            assert!(
+                matches!(options.source, Source::File(ref chosen) if chosen == path),
+                "{path} must be a file, got {:?}",
+                options.source
+            );
+        }
+    }
+
+    /// An explicit `--` still ends flag parsing, and `inspect` after it is
+    /// subject to the same rule.
+    ///
+    /// `node -- inspect` is the debugger client in Node, because `--` ends the
+    /// options and the next word is the entry point.
+    #[test]
+    fn inspect_after_a_terminator_is_the_subcommand() {
+        let options = parse_of(&["--", "inspect", "--help"]).expect("parses");
+        assert!(
+            matches!(options.source, Source::Inspect),
+            "{:?}",
+            options.source
+        );
+        assert_eq!(options.script_args, ["--help"]);
     }
 
     #[test]
