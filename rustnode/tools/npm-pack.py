@@ -186,11 +186,79 @@ def write_json(path: pathlib.Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def npm_pack(package_dir: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
+def npm_version() -> str:
+    """The npm version, for error messages. Never raises.
+
+    A `--json` shape change is an npm-version fact, so any failure to parse that
+    output has to name the version it came from. A report that says "unexpected
+    JSON" without it sends the reader to diff npm's changelog by hand.
+    """
+    try:
+        result = subprocess.run(["npm", "--version"], capture_output=True, text=True, check=False)
+    except OSError:
+        return "unknown"
+    text = result.stdout.strip()
+    return text or "unknown"
+
+
+def extract_pack_filename(report, package_name: str) -> str:
+    """Pull the tarball filename out of `npm pack --json`, in either shape.
+
+    The shape changed and both are in the wild, so both are accepted rather than
+    pinning to one:
+
+    * npm <= 11 prints an **array**: `[{"filename": ...}]`.
+    * npm 12 prints an **object keyed by package name**: `{"@scope/x": {...}}`.
+
+    The dict form is resolved *by the package's own name*. Falling back to "the
+    first value" would work on a single-package directory and fail confusingly
+    the day something packs more than one, which is the same class of bug as the
+    `report[0]` this replaced — so a dict that does not contain the expected key
+    is an error naming the keys that were there.
+    """
+    if isinstance(report, list):
+        if not report:
+            raise PackError("`npm pack --json` returned an empty array, so no tarball was written")
+        entry = report[0]
+        if not isinstance(entry, dict) or "filename" not in entry:
+            raise PackError(
+                f"`npm pack --json` returned an array whose first entry has no `filename` "
+                f"(npm {npm_version()}); saw keys {sorted(entry) if isinstance(entry, dict) else type(entry).__name__}"
+            )
+        return entry["filename"]
+
+    if isinstance(report, dict):
+        entry = report.get(package_name)
+        if entry is None:
+            # A single-package directory that printed one unrelated key is more
+            # likely an npm bug or a different npm than a legitimate multi-pack,
+            # so name the mismatch in full rather than guessing.
+            raise PackError(
+                f"`npm pack --json` (npm {npm_version()}) returned an object keyed by package "
+                f"name, but {package_name!r} is not one of its keys: {sorted(report)}"
+            )
+        if not isinstance(entry, dict) or "filename" not in entry:
+            raise PackError(
+                f"`npm pack --json` (npm {npm_version()}) keyed {package_name!r} to an entry "
+                f"with no `filename`: {entry!r}"
+            )
+        return entry["filename"]
+
+    raise PackError(
+        f"`npm pack --json` (npm {npm_version()}) returned {type(report).__name__}, "
+        f"expected a list (npm <= 11) or an object keyed by package name (npm 12+); "
+        f"got {report!r:.200}"
+    )
+
+
+def npm_pack(package_dir: pathlib.Path, out_dir: pathlib.Path, package_name: str) -> pathlib.Path:
     """Run `npm pack` and return the tarball it wrote.
 
     `--pack-destination` keeps the tarball out of the package directory, which
     matters because a tarball left there would be picked up by the next pack.
+    `package_name` is the manifest's own name, used to read npm 12's keyed
+    output; passing it in rather than re-reading the staged manifest keeps the
+    two from disagreeing.
     """
     result = subprocess.run(
         ["npm", "pack", "--pack-destination", str(out_dir), "--json"],
@@ -200,14 +268,17 @@ def npm_pack(package_dir: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
         check=False,
     )
     if result.returncode != 0:
-        raise PackError(f"npm pack failed in {package_dir}:\n{result.stderr or result.stdout}")
+        raise PackError(
+            f"npm pack failed in {package_dir} (npm {npm_version()}):\n"
+            f"{result.stderr or result.stdout}"
+        )
     try:
         report = json.loads(result.stdout)
     except json.JSONDecodeError as error:
-        raise PackError(f"npm pack in {package_dir} printed unparseable JSON: {error}") from error
-    if not report:
-        raise PackError(f"npm pack in {package_dir} reported no tarball")
-    filename = report[0]["filename"]
+        raise PackError(
+            f"npm pack in {package_dir} (npm {npm_version()}) printed unparseable JSON: {error}"
+        ) from error
+    filename = extract_pack_filename(report, package_name)
     tarball = out_dir / filename
     if not tarball.is_file():
         raise PackError(f"npm pack reported {filename} but {tarball} does not exist")
@@ -305,7 +376,7 @@ def command_pack(args: argparse.Namespace) -> int:
         shutil.copy2(MAIN_README_SRC, main_stage / "README.md")
         stage_common(main_stage)
         write_json(main_stage / "package.json", main_manifest(table, version))
-        main_tarball = npm_pack(main_stage, out_dir)
+        main_tarball = npm_pack(main_stage, out_dir, main_package_name(table))
         manifest = verify_tarball(
             main_tarball,
             required=[
@@ -333,7 +404,7 @@ def command_pack(args: argparse.Namespace) -> int:
             (stage / table["binary"]).chmod(0o755)
             stage_common(stage)
             write_json(stage / "package.json", platform_manifest(table, entry, version))
-            tarball = npm_pack(stage, out_dir)
+            tarball = npm_pack(stage, out_dir, platform_package_name(table, entry))
             manifest = verify_tarball(
                 tarball,
                 # The binary is required by name: this is the assertion that a

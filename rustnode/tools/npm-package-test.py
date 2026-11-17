@@ -337,12 +337,23 @@ def main(argv: list[str]) -> int:
         # shell shim, so its resolution logic is free. This is the stable
         # assertion; the absolute delta below varies with machine load.
         overhead = shim_median - floor_median
-        check(overhead < 2.0, f"resolution logic adds nothing over a minimal shim ({overhead:+.2f} ms)")
-        # And the absolute cost stays in shell-startup territory next to a ~26 ms
-        # boot. The bound is loose on purpose: the real number is `sh`'s cost on
-        # a loaded box, and a Node-based shim (+22 ms) is what this excludes.
-        check(shim_median - direct_median < 5.0,
-              f"total wrapper cost stays small ({shim_median - direct_median:+.2f} ms)")
+        # A measurement only means something with enough samples: a median of 3
+        # is noise, and it failed on a loaded box during a `--runs 3` smoke run
+        # that was checking behaviour, not timing. Below this floor the numbers
+        # are printed for information and the assertions are skipped, because a
+        # noisy failure here trains the reader to ignore the check.
+        enough_samples = args.runs >= 15
+        if not enough_samples:
+            print(f"    (timing assertions skipped: {args.runs} runs is too few; "
+                  f"use --runs 15 or more)")
+        else:
+            check(overhead < 2.0, f"resolution logic adds nothing over a minimal shim ({overhead:+.2f} ms)")
+            # And the absolute cost stays in shell-startup territory next to a
+            # ~26 ms boot. The bound is loose on purpose: the real number is
+            # `sh`'s cost on a loaded box, and a Node-based shim (+22 ms) is what
+            # this excludes.
+            check(shim_median - direct_median < 5.0,
+                  f"total wrapper cost stays small ({shim_median - direct_median:+.2f} ms)")
 
         print("\nall npm package checks passed")
         return 0

@@ -683,4 +683,18 @@ step "the npm package manifest matches the binary and the workspace version"
 # the drift.
 python3 tools/npm-manifest-check.py
 
+step "the npm pack output still has a shape the packer reads"
+# The step above is about manifests and deliberately avoids running `npm` at
+# all, which left the packer itself unexercised: npm 12 changed
+# `npm pack --json` from an array to an object keyed by package name, and
+# `tools/npm-pack.py` indexed `report[0]`, so packing died with `KeyError: 0`
+# on npm 12 while the gate stayed green on npm 10. The bug was found by hand.
+#
+# This runs the packer against a throwaway manifest in a temp dir: no release
+# binary, no network, no repository state, about 3s. It asserts npm's output is
+# one of the two accepted shapes and drives `npm_pack` itself, because testing
+# only the parser let the original defect back in unnoticed — the function that
+# had the bug was never called.
+python3 tools/npm-pack-shape.test.py
+
 printf '\nall checks passed\n'
