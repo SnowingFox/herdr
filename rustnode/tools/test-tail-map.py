@@ -256,17 +256,46 @@ def command_run(args):
     if not files:
         return "no tests selected"
 
+    # A full-suite run takes tens of minutes, and the sequential suites alone can
+    # exceed an hour because every hanging file costs the whole timeout. Writing
+    # only at the end means an interrupted run loses all of it, so results are
+    # appended one file at a time and `--resume` skips what is already recorded.
+    results = []
+    already = set()
+    if args.resume and os.path.isfile(args.out):
+        try:
+            with open(args.out) as handle:
+                results = json.load(handle)
+            already = {result["file"] for result in results}
+        except (OSError, ValueError, KeyError):
+            # A truncated file from a killed run is the case `--resume` exists to
+            # recover from, so an unreadable one starts over rather than failing.
+            results = []
+            already = set()
+        files = [f for f in files if f not in already]
+        if not files:
+            print(f"nothing to do: {args.out} already covers every selected file")
+            return None
+
     parallel = [f for f in files if f.split("/")[0] in PARALLEL_SAFE]
     serial = [f for f in files if f.split("/")[0] not in PARALLEL_SAFE]
-    print(f"{len(files)} file(s), {args.jobs} job(s), {args.timeout}s timeout", flush=True)
+    print(
+        f"{len(files)} file(s) to run ({len(already)} already recorded), "
+        f"{args.jobs} job(s), {args.timeout}s timeout",
+        flush=True,
+    )
 
     started = time.monotonic()
     done = 0
-    results = []
 
-    def note(relative):
+    def record(result):
         nonlocal done
         done += 1
+        results.append(result)
+        # `pool.map` yields here on the main thread, so this is the only writer and
+        # the file is valid JSON at every point a `--resume` could read it.
+        with open(args.out, "w") as handle:
+            json.dump(results, handle)
         if done % 250 == 0 or done == len(files):
             elapsed = time.monotonic() - started
             print(f"  [{done}/{len(files)}] {elapsed:.0f}s", flush=True)
@@ -278,17 +307,14 @@ def command_run(args):
             ),
             parallel,
         ):
-            note(result["file"])
-            results.append(result)
+            record(result)
     for relative in serial:
         result = run_one(node, checkout_root, tests_root, relative, args.timeout, args.serial_id)
-        note(relative)
-        results.append(result)
+        record(result)
 
-    with open(args.out, "w") as handle:
-        json.dump(results, handle)
     elapsed = time.monotonic() - started
     print(f"wrote {args.out} in {elapsed:.0f}s")
+    return None
     return None
 
 
@@ -435,6 +461,13 @@ def main():
     run.add_argument("--jobs", type=int, default=8)
     run.add_argument("--timeout", type=int, default=30)
     run.add_argument("--limit", type=int, default=0)
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help="keep the results already in --out and run only the files it lacks; "
+        "a full suite takes tens of minutes and a sequential file that hangs "
+        "costs the whole timeout, so an interrupted run must be resumable",
+    )
     run.add_argument(
         "--serial-id",
         type=int,
