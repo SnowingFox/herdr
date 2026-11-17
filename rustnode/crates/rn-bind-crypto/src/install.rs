@@ -979,7 +979,7 @@ fn hash_update(
     };
 
     let updated = with_hash_state(this, |state| match state.digest.as_mut() {
-        Some(digest) => digest.update(&bytes).is_ok(),
+        Some(digest) => digest.update(bytes.as_slice()).is_ok(),
         None => false,
     });
     match updated {
@@ -1146,6 +1146,9 @@ fn hmac_init(
     let Some(key) = data_argument(scope, &args, 1, 2) else {
         return;
     };
+    // The key outlives this callback: `HmacState` keeps it so the handle can be
+    // re-initialised, so this is the one path that must own its bytes.
+    let key = key.into_owned();
 
     match Hmac::new(&algorithm, &key) {
         Ok(hmac) => {
@@ -1172,7 +1175,7 @@ fn hmac_update(
         return;
     };
     let updated = with_hmac_state(this, |state| match state.hmac.as_mut() {
-        Some(hmac) => hmac.update(&bytes).is_ok(),
+        Some(hmac) => hmac.update(bytes.as_slice()).is_ok(),
         None => false,
     });
     match updated {
@@ -1391,9 +1394,9 @@ fn get_cached_mac_aliases(
 /// uses it to compare key material. A length mismatch throws
 /// `ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH`, which the JavaScript layer maps from
 /// the message.
-fn timing_safe_equal(
+fn timing_safe_equal<'s>(
     scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue,
 ) {
     let left = args.get(0);
@@ -1515,7 +1518,7 @@ fn one_shot_digest(
     };
     let output_encoding = digest_encoding(scope, &args, 4);
 
-    match engine::digest_once(&algorithm, &input_bytes) {
+    match engine::digest_once(&algorithm, input_bytes.as_slice()) {
         Ok(bytes) => emit_digest(scope, &mut rv, &bytes, output_encoding.as_deref()),
         Err(error) => throw_crypto_error(scope, &error),
     }
@@ -1563,7 +1566,9 @@ fn hash_job<'s>(
         this,
         JobState::Digest {
             algorithm,
-            data: data_bytes,
+            // The job runs after this callback returns, so the bytes cannot stay
+            // a borrow of the caller's view.
+            data: data_bytes.into_owned(),
             output_length,
         },
     );
@@ -1607,9 +1612,10 @@ fn hmac_job<'s>(
         JobState::Hmac {
             algorithm,
             key: key_bytes,
-            data: data_bytes,
+            // As in `hash_job`: the job outlives the callback.
+            data: data_bytes.into_owned(),
             verify: mode == constants::K_SIGN_JOB_MODE_VERIFY as u32,
-            signature,
+            signature: signature.map(CryptoBytes::into_owned),
         },
     );
     rv.set(this.into());
@@ -1642,7 +1648,7 @@ fn secret_key_bytes(
     let export = handle.get(scope, export.into())?;
     let export = v8::Local::<v8::Function>::try_from(export).ok()?;
     let exported = export.call(scope, handle.into(), &[])?;
-    string_or_view_bytes(scope, exported)
+    string_or_view_bytes(scope, exported).map(CryptoBytes::into_owned)
 }
 
 /// The work a job handle will run.
@@ -1855,17 +1861,51 @@ fn string_argument(
     Some(text.to_rust_string_lossy(scope))
 }
 
+/// Argument bytes that may borrow the caller's view instead of copying it.
+///
+/// Node's `Hash::Update` hands the view's raw pointer straight to
+/// `EVP_DigestUpdate`; it never materialises a second copy of the input. The
+/// binding used to `to_vec()` every view, which cost a full copy of the input —
+/// 94 MB of peak RSS for a 94 MB buffer, and the difference showed up as a
+/// hash-of-a-large-`Buffer` retaining far more memory than the same hash in
+/// Node. Most callers only need the bytes inside the callback, so they take the
+/// borrow; the ones that must outlive the callback (a job that runs later) ask
+/// for an owned `Vec` explicitly.
+enum CryptoBytes<'a> {
+    /// The bytes live in a V8 backing store that outlives this borrow.
+    Borrowed(&'a [u8]),
+    /// The bytes were decoded from a string, so they had to be materialised.
+    Owned(Vec<u8>),
+}
+
+impl CryptoBytes<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    /// Copies the bytes out, for a caller that must keep them past the callback.
+    fn into_owned(self) -> Vec<u8> {
+        match self {
+            Self::Borrowed(bytes) => bytes.to_vec(),
+            Self::Owned(bytes) => bytes,
+        }
+    }
+}
+
 /// Reads the bytes of a `Buffer`/`TypedArray`/`ArrayBuffer` argument.
 ///
 /// A string is decoded according to the encoding argument at `encoding_index`,
 /// mirroring `ParseEncoding` in `node_crypto.cc`: `update('abc', 'hex')` means
 /// the string is hex, not that the digest output is hex.
-fn data_argument(
+fn data_argument<'s>(
     scope: &mut v8::PinScope<'_, '_>,
-    args: &v8::FunctionCallbackArguments<'_>,
+    args: &v8::FunctionCallbackArguments<'s>,
     index: i32,
     encoding_index: i32,
-) -> Option<Vec<u8>> {
+) -> Option<CryptoBytes<'s>> {
     let value = args.get(index);
     if value.is_string() {
         let text = value.to_string(scope)?;
@@ -1874,24 +1914,27 @@ fn data_argument(
         return match encoding.as_deref() {
             None | Some("utf8") | Some("utf-8") => Some(text.into_bytes()),
             Some(name) => encoding::decode_string(&text, name),
-        };
+        }
+        .map(CryptoBytes::Owned);
     }
     let length = view_length(value);
-    view_bytes(value, 0, length).map(<[u8]>::to_vec)
+    view_bytes(value, 0, length).map(CryptoBytes::Borrowed)
 }
 
 /// Reads a `string` or view as bytes, for the one-shot paths where no separate
 /// input encoding exists.
-fn string_or_view_bytes(
+fn string_or_view_bytes<'a>(
     scope: &mut v8::PinScope<'_, '_>,
-    value: v8::Local<v8::Value>,
-) -> Option<Vec<u8>> {
+    value: v8::Local<'a, v8::Value>,
+) -> Option<CryptoBytes<'a>> {
     if value.is_string() {
         let text = value.to_string(scope)?;
-        return Some(text.to_rust_string_lossy(scope).into_bytes());
+        return Some(CryptoBytes::Owned(
+            text.to_rust_string_lossy(scope).into_bytes(),
+        ));
     }
     let length = view_length(value);
-    view_bytes(value, 0, length).map(<[u8]>::to_vec)
+    view_bytes(value, 0, length).map(CryptoBytes::Borrowed)
 }
 
 /// The byte length of a view or `ArrayBuffer`, or 0 for anything else.
@@ -1909,7 +1952,17 @@ fn view_length(value: v8::Local<v8::Value>) -> usize {
 ///
 /// Returns `None` when the range falls outside the backing store, rather than
 /// reading past it.
-fn view_bytes(value: v8::Local<v8::Value>, offset: usize, length: usize) -> Option<&'static [u8]> {
+///
+/// The returned slice borrows `value`: the handle keeps the backing store alive,
+/// so the slice cannot outlive it. Callers that hand bytes to OpenSSL inside the
+/// same callback use it directly; the ones that must keep the bytes (a job that
+/// runs later, an encoding conversion) copy explicitly, which is what makes the
+/// copy visible at the call site instead of buried in this helper.
+fn view_bytes<'a>(
+    value: v8::Local<'a, v8::Value>,
+    offset: usize,
+    length: usize,
+) -> Option<&'a [u8]> {
     let (pointer, total) = view_pointer(value)?;
     let end = offset.checked_add(length)?;
     if end > total {
@@ -1918,10 +1971,9 @@ fn view_bytes(value: v8::Local<v8::Value>, offset: usize, length: usize) -> Opti
     if pointer.is_null() {
         return if length == 0 { Some(&[]) } else { None };
     }
-    // SAFETY: the bounds check proves `offset..offset + length` lies inside a
-    // live backing store. The returned slice is tied to that store by the
-    // caller's V8 scope; the `'static` lifetime is narrowed immediately by the
-    // callers, which copy out of it before returning to JavaScript.
+    // SAFETY: the bounds check proves `offset..offset + length` lies inside the
+    // backing store, and `value` is a handle into the live isolate, so the store
+    // cannot be collected for as long as the returned borrow is usable.
     Some(unsafe { std::slice::from_raw_parts(pointer.add(offset), length) })
 }
 
