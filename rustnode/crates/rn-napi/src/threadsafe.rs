@@ -583,6 +583,18 @@ unsafe fn call_into_module<R>(
         let try_catch = std::pin::pin!(v8::TryCatch::new(outer));
         let scope = &mut try_catch.init();
         let result = body(scope);
+        // `Env::CallIntoModule`'s tail (`src/js_native_api_v8.h:96-99`). A `napi_*`
+        // call inside the addon records a throw on the environment instead of
+        // leaving it pending in V8 — `napi_call_function` does that through its own
+        // preamble `TryCatch`, whose destructor consumed the V8 exception — so
+        // nothing is pending here and `scope.has_caught()` is false for a callback
+        // that threw. Node re-throws the recorded value at this boundary, which is
+        // what makes it visible to this outer `TryCatch` and then to
+        // `trigger_fatal_exception`.
+        // SAFETY: `env` is null or one of this crate's environments.
+        if let Some(environment) = unsafe { crate::env::env_from(env) } {
+            crate::callback::rethrow_recorded_exception(scope, environment);
+        }
         // Node's order, from `InternalMakeCallback`: a callback that threw takes
         // `scope.MarkAsFailed(); return MaybeLocal<Value>();` *before*
         // `scope.Close()`, and the destructor's `Close()` then returns at

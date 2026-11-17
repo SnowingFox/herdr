@@ -1995,6 +1995,7 @@ dependencies = [
  "libc",
  "libloading",
  "libuv-sys2",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-errors",
  "rn-uv",

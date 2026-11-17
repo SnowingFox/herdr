@@ -102,9 +102,15 @@ def symbols(binary):
 def declared():
     """`{name: reason}` for every name in `shims::DEFERRED`.
 
-    Raises `Unreadable` when the block cannot be found or parses to nothing: a
-    regex that quietly matches nothing would report a clean bill of health for a
-    file full of declarations, which is the failure mode this whole tool guards.
+    Raises `Unreadable` when the block cannot be found, or when its body has
+    content that no entry matches: a regex that quietly matches nothing would
+    report a clean bill of health for a file full of declarations, which is the
+    failure mode this whole tool guards.
+
+    An empty body is **not** that failure. Every Node-API symbol being exported is
+    the goal, and refusing the empty list would make reaching it impossible. So
+    the two cases are distinguished by the body: whitespace only means there is
+    genuinely nothing deferred, anything else must parse.
     """
     try:
         with open(SHIMS, encoding="utf-8") as handle:
@@ -114,11 +120,12 @@ def declared():
     block = DEFERRED_DECL.search(source)
     if block is None:
         raise Unreadable(f"no `pub const DEFERRED` block found in {SHIMS}")
-    entries = DEFERRED_ENTRY.findall(block.group(1))
-    if not entries:
+    body = block.group(1)
+    entries = DEFERRED_ENTRY.findall(body)
+    if not entries and body.strip():
         raise Unreadable(
-            f"the DEFERRED block in {SHIMS} parsed to zero entries; the pattern no "
-            "longer matches the declaration format"
+            f"the DEFERRED block in {SHIMS} has content but no entry matched; the "
+            "pattern no longer matches the declaration format"
         )
     names = {}
     for member, reason in entries:

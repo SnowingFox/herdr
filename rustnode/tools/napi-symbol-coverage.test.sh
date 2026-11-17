@@ -69,6 +69,11 @@ expect "the current tree passes" "none undeclared" 0
 
 # 1. Remove one declaration. The gate must name that exact symbol as undeclared,
 #    which is the finding F6 recorded 16 examples of.
+#
+#    This leaves the block empty when `napi_module_register` is the only remaining
+#    entry, which is the intended end state of the list. Removing it is therefore
+#    also the case that proves an empty block reads as "nothing deferred" rather
+#    than as an unparsable one.
 python3 - "$shims" <<'PY'
 import sys, pathlib
 path = pathlib.Path(sys.argv[1])
@@ -95,18 +100,24 @@ sed -i 's/"napi_module_register",/"napi_is_array",/' "$shims"
 expect "a declared name this build exports is reported" "napi_is_array" 1
 restore
 
-# 4. An unparsable block must be a refusal, not a clean bill of health. This is the
-#    failure `deferred-reach.py` shipped once: a regex that matched nothing reported
-#    zero problems for a file full of declarations.
+# 4. A block whose content does not parse must be a refusal, not a clean bill of
+#    health. This is the failure `deferred-reach.py` shipped once: a regex that
+#    matched nothing reported zero problems for a file full of declarations. The
+#    body below is deliberately *not* empty, because an empty list is the goal the
+#    list exists to reach, not a parse failure.
 python3 - "$shims" <<'PY'
 import sys, pathlib
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
 start = text.index('pub const DEFERRED: &[(&str, &str)] = &[')
 end = text.index('];', start) + 2
-path.write_text(text[:start] + 'pub const DEFERRED: &[(&str, &str)] = &[\n];' + text[end:])
+path.write_text(
+    text[:start]
+    + 'pub const DEFERRED: &[(&str, &str)] = &[\n    ("napi_x",),\n];'
+    + text[end:]
+)
 PY
-expect "an empty DEFERRED block is refused, not passed" "parsed to zero entries" 2
+expect "an unparsable DEFERRED block is refused, not passed" "no entry matched" 2
 restore
 
 if ! cmp -s "$backup" "$shims"; then

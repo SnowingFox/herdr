@@ -917,6 +917,31 @@ pub fn emit_async_init(
     async_id: f64,
     trigger_async_id: f64,
 ) {
+    let Some(name) = provider_name(provider) else {
+        // An id outside `Providers` is a programming error, and Node's
+        // `provider_string` would index out of bounds. Reporting nothing is the
+        // only safe answer here.
+        tracing_error_unknown_provider(provider);
+        return;
+    };
+    emit_async_init_named(scope, resource, name, async_id, trigger_async_id);
+}
+
+/// `AsyncWrap::EmitAsyncInit` with the type string supplied by the caller.
+///
+/// Node's `v8impl::AsyncContext` does exactly this: it takes the
+/// `async_resource_name` the addon passed to `napi_async_init` and hands it to
+/// `EmitAsyncInit` as the type, so an addon can report a type like `'test_async'`
+/// that no provider id names. [`emit_async_init`] derives its name from a
+/// `Providers` id; this one takes it verbatim, which is the only way to reproduce
+/// an addon's own string.
+pub fn emit_async_init_named(
+    scope: &mut v8::PinScope<'_, '_>,
+    resource: v8::Local<v8::Object>,
+    name: &str,
+    async_id: f64,
+    trigger_async_id: f64,
+) {
     // `if (async_hooks->fields()[AsyncHooks::kInit] == 0) return;`. The count is
     // maintained by `lib/internal/async_hooks.js` as hooks are enabled, so this
     // is the same short circuit Node takes on the hot path.
@@ -930,13 +955,6 @@ pub fn emit_async_init(
     if enabled == 0 {
         return;
     }
-    let Some(name) = provider_name(provider) else {
-        // An id outside `Providers` is a programming error, and Node's
-        // `provider_string` would index out of bounds. Reporting nothing is the
-        // only safe answer here.
-        tracing_error_unknown_provider(provider);
-        return;
-    };
     let Some(init) = HOOKS.with(|hooks| {
         hooks
             .borrow()

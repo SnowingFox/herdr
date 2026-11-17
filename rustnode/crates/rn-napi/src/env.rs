@@ -253,6 +253,12 @@ pub struct Env {
     /// same way a stack unwinds, so a hook registered last can still use what an
     /// earlier one set up.
     cleanup_hooks: RefCell<Vec<(NapiCleanupHook, *mut std::ffi::c_void)>>,
+    /// How many `napi_open_callback_scope` calls have not been closed.
+    ///
+    /// Node's `napi_close_callback_scope` reports `napi_callback_scope_mismatch`
+    /// when the count is zero (`src/node_api.cc:961`), so the counter has to exist
+    /// even though the scopes themselves live on the addon's stack.
+    open_callback_scopes: Cell<usize>,
     /// The thread whose isolate this environment belongs to.
     ///
     /// With `worker_threads` there is one isolate per worker thread, and a
@@ -278,6 +284,7 @@ impl Env {
             async_cleanup_hooks: RefCell::new(Vec::new()),
             exceptions: RefCell::new(ExceptionState::default()),
             cleanup_hooks: RefCell::new(Vec::new()),
+            open_callback_scopes: Cell::new(0),
             owner_thread: std::thread::current().id(),
         }
     }
@@ -630,6 +637,46 @@ impl Env {
             state.mark_pending();
         }
     }
+
+    /// Whether an exception is pending, which a closing callback scope reads to
+    /// decide between `after` and `failed_` (`src/api/callback.cc:154`).
+    pub(crate) fn exception_is_pending(&self) -> bool {
+        self.exceptions
+            .try_borrow()
+            .map(|state| state.is_pending())
+            .unwrap_or(false)
+    }
+
+    /// Records one more open `napi_callback_scope`.
+    pub(crate) fn note_callback_scope_opened(&self) {
+        self.open_callback_scopes
+            .set(self.open_callback_scopes.get() + 1);
+    }
+
+    /// Records one closed `napi_callback_scope`, or reports the imbalance.
+    ///
+    /// Node's check is `if (env->open_callback_scopes == 0) return
+    /// napi_callback_scope_mismatch;` (`src/node_api.cc:961`), so closing with
+    /// none open is a reported mismatch rather than an underflow.
+    pub(crate) fn note_callback_scope_closed(&self) -> bool {
+        match self.open_callback_scopes.get().checked_sub(1) {
+            Some(remaining) => {
+                self.open_callback_scopes.set(remaining);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// One open `napi_callback_scope`.
+///
+/// The addon opens a scope, runs arbitrary JavaScript, and closes it in a later
+/// call, so the state `rn_core::callback_scope::close_scope` needs cannot live on
+/// a Rust stack frame. Node boxes the same thing (`HeapAllocatedCallbackScope` in
+/// `src/node_api.cc:668`).
+pub(crate) struct CallbackScopeState {
+    pub(crate) open: rn_core::callback_scope::OpenScope,
 }
 
 /// Whether a registered hook is the one a `(fun, arg)` pair names.
@@ -726,6 +773,77 @@ pub(crate) fn c_string(value: *const c_char) -> String {
     unsafe { CStr::from_ptr(value) }
         .to_string_lossy()
         .into_owned()
+}
+
+/// One `napi_async_init` registration.
+///
+/// Node's `v8impl::AsyncContext` is an async id pair plus the resource it rooted
+/// so `EmitAsyncInit` can name it. Only the pair is kept here: `emit_async_init`
+/// is called once, at creation, and the resource's job after that is only to be
+/// the `executionAsyncResource()` of callbacks made through this context — which
+/// `ScopeArgs::resource` supplies per call rather than rooting a second time.
+pub struct AsyncContextState {
+    pub(crate) async_id: f64,
+    pub(crate) trigger_async_id: f64,
+    /// The resource the addon handed to `napi_async_init`, rooted.
+    ///
+    /// Node's `AsyncContext` roots this and returns it as `resource()` so
+    /// `MakeCallback` can hand it to `InternalMakeCallback`, which is what makes
+    /// `executionAsyncResource()` inside the callback the addon's own object.
+    /// Without it the scope has no resource and callbacks see `undefined`.
+    pub(crate) resource: Option<v8::Global<v8::Object>>,
+}
+
+/// Creates an async context, as `napi_async_init` does.
+///
+/// Node's constructor is `new_async_id()`, the default trigger id, and an
+/// `EmitAsyncInit` — and its destructor is `EmitDestroy`, which is why
+/// [`destroy_async_context`] queues one rather than merely freeing.
+pub fn create_async_context(
+    scope: &mut v8::PinScope<'_, '_>,
+    resource: Option<v8::Local<v8::Object>>,
+    resource_name: &str,
+) -> *mut AsyncContextState {
+    let async_id = rn_bind_async_wrap::next_async_id();
+    let trigger_async_id = rn_bind_async_wrap::default_trigger_async_id();
+    if let Some(resource) = resource {
+        // The type the `init` hook sees is the `async_resource_name` the addon
+        // passed to `napi_async_init`, not a provider id — Node's `AsyncContext`
+        // hands that string straight to `EmitAsyncInit`. An addon reporting
+        // `'test_async'` is therefore matched by a hook filtering on that string,
+        // and passing `PROVIDER_NONE` here made every such hook miss.
+        rn_bind_async_wrap::emit_async_init_named(
+            scope,
+            resource,
+            resource_name,
+            async_id,
+            trigger_async_id,
+        );
+    }
+    Box::into_raw(Box::new(AsyncContextState {
+        async_id,
+        trigger_async_id,
+        // Rooted for the context's lifetime: `napi_make_callback` re-reads it on
+        // every call, which is how Node's `resource()` works.
+        resource: resource.map(|object| v8::Global::new(scope, object)),
+    }))
+}
+
+/// Destroys an async context, queuing its `destroy` hook.
+///
+/// # Safety
+///
+/// `context` must be one [`create_async_context`] produced and must not have been
+/// destroyed already.
+pub unsafe fn destroy_async_context(context: *mut AsyncContextState) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes a pointer `create_async_context` boxed.
+    let boxed = unsafe { Box::from_raw(context) };
+    // Node's `~AsyncContext` is `EmitDestroy`. Not a no-op when no `destroy`
+    // hook is registered — `emit_destroy` short-circuits itself in that case.
+    rn_bind_async_wrap::emit_destroy(boxed.async_id);
 }
 
 #[cfg(test)]
