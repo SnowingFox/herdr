@@ -24,7 +24,7 @@ use openssl::rsa::Padding;
 
 use crate::algorithm::{KeyAlgorithm, EC};
 use crate::encode::{KeyEncoding, KeyFormat, PrivateKeyEncoding, PublicKeyEncoding};
-use crate::error::{failure, ParseFailure, ParseResult};
+use crate::error::{failure, failure_with_passphrase, ParseFailure, ParseResult};
 
 /// The EC point conversion form, from `internalBinding('constants').crypto`.
 ///
@@ -284,6 +284,11 @@ impl PKey {
         if config.output_key_object {
             return Ok(None);
         }
+        // `passphrase: ''` is still a supplied passphrase. Node reports the
+        // OpenSSL error (`ERR_OSSL_*`) for that case and reserves
+        // `ERR_MISSING_PASSPHRASE` for the option being absent entirely.
+        let had_passphrase = config.passphrase.is_some();
+        let failed = || failure_with_passphrase(false, had_passphrase);
         let format = config.format.unwrap_or(KeyFormat::Pem);
         if matches!(
             format,
@@ -313,7 +318,7 @@ impl PKey {
                 if !self.is_a(crate::algorithm::RSA) {
                     return Err(failure(true));
                 }
-                let rsa = self.inner.rsa().map_err(|_| failure(false))?;
+                let rsa = self.inner.rsa().map_err(|_| failed())?;
                 match cipher {
                     Some(cipher) => rsa.private_key_to_pem_passphrase(cipher, passphrase),
                     None => rsa.private_key_to_pem(),
@@ -323,7 +328,7 @@ impl PKey {
                 if !self.is_a(EC) {
                     return Err(failure(true));
                 }
-                let ec = self.inner.ec_key().map_err(|_| failure(false))?;
+                let ec = self.inner.ec_key().map_err(|_| failed())?;
                 match cipher {
                     Some(cipher) => ec.private_key_to_pem_passphrase(cipher, passphrase),
                     None => ec.private_key_to_pem(),
@@ -339,7 +344,7 @@ impl PKey {
                 if !self.is_a(crate::algorithm::RSA) {
                     return Err(failure(true));
                 }
-                let rsa = self.inner.rsa().map_err(|_| failure(false))?;
+                let rsa = self.inner.rsa().map_err(|_| failed())?;
                 // DER PKCS#1 does not permit encryption; OpenSSL's
                 // `i2d_RSAPrivateKey_bio` has no cipher argument at all, and
                 // Node's `GetPrivateKeyEncodingFromJs` rejects the pair before
@@ -350,7 +355,7 @@ impl PKey {
                 if !self.is_a(EC) {
                     return Err(failure(true));
                 }
-                let ec = self.inner.ec_key().map_err(|_| failure(false))?;
+                let ec = self.inner.ec_key().map_err(|_| failed())?;
                 ec.private_key_to_der()
             }
             (KeyFormat::Der, _) => match cipher {
@@ -363,7 +368,7 @@ impl PKey {
         };
         match bytes {
             Ok(bytes) => Ok(Some(EncodedKey::new(format, bytes))),
-            Err(_) => Err(failure(false)),
+            Err(_) => Err(failed()),
         }
     }
 

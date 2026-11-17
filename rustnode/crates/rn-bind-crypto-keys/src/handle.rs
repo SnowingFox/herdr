@@ -33,7 +33,7 @@
 //! the properties off the live argument at that index.
 
 use rn_crypto_openssl::{
-    import_raw, import_raw_private_key, import_raw_public_key, parse_private_key,
+    import_raw, import_raw_private_key, import_raw_public_key, import_raw_seed, parse_private_key,
     parse_public_or_private_key, EcPointForm, EqualResult, KeyAlgorithm, KeyFormat, KeyFormatError,
     PKey, PrivateKeyEncoding, PublicKeyEncoding,
 };
@@ -829,12 +829,8 @@ fn report_key_format_error(
 ///
 /// # Which families this covers
 ///
-/// `RSA`, `EC` and `OKP` are the three the RFC 7518/8037 formats define, and they
-/// are what every Node test in the crypto selection uses. `AKP` (the
-/// post-quantum `ML-DSA`/`ML-KEM` form) is a different shape — `alg` and `pub`
-/// rather than `crv` and `x` — and its import needs a provider this build has but
-/// that no test here exercises for JWK. It reports rather than silently reading
-/// the wrong fields as empty.
+/// `RSA`, `EC` and `OKP` are the RFC 7518/8037 families, while `AKP` is Node's
+/// post-quantum shape (`alg` + `pub`/`priv`).
 fn import_jwk(
     scope: &mut v8::PinScope<'_, '_>,
     jwk: v8::Local<v8::Object>,
@@ -849,10 +845,7 @@ fn import_jwk(
         "RSA" => import_jwk_rsa(scope, jwk, target),
         "EC" => import_jwk_ec(scope, jwk, target),
         "OKP" => import_jwk_okp(scope, jwk, target),
-        "AKP" => {
-            throw(scope, &KeyError::InvalidJwk("Unsupported JWK AKP \"alg\""));
-            None
-        }
+        "AKP" => import_jwk_akp(scope, jwk, target),
         _ => {
             let message = format_jwk_unsupported(&kty);
             let _ = message;
@@ -1095,6 +1088,72 @@ fn import_jwk_okp(
             Ok(key) => KeyData::asymmetric(KeyType::Public, key),
             Err(_) => {
                 throw(scope, &KeyError::InvalidJwk("Invalid JWK OKP key"));
+                None
+            }
+        },
+    }
+}
+
+/// `AKP`: post-quantum JWK (`alg`, `pub`, `priv`) used by ML-DSA/ML-KEM/SLH-DSA.
+fn import_jwk_akp(
+    scope: &mut v8::PinScope<'_, '_>,
+    jwk: v8::Local<v8::Object>,
+    target: KeyType,
+) -> Option<KeyData> {
+    let Some(alg) = property_string(scope, jwk, "alg") else {
+        throw(scope, &KeyError::InvalidJwk("Invalid JWK AKP key"));
+        return None;
+    };
+    let Some(algorithm) = KeyAlgorithm::from_name(&alg) else {
+        throw(scope, &KeyError::InvalidJwk("Unsupported JWK AKP \"alg\""));
+        return None;
+    };
+    // AKP `alg` is exact-name and availability checked: case-folding a string
+    // into a known algorithm is still invalid JWK input.
+    if !algorithm.is_pqc() || !algorithm.is_available() || alg != algorithm.name() {
+        throw(scope, &KeyError::InvalidJwk("Unsupported JWK AKP \"alg\""));
+        return None;
+    }
+    let Some(public) =
+        property_string(scope, jwk, "pub").and_then(|value| base64url_decode(&value))
+    else {
+        throw(scope, &KeyError::InvalidJwk("Invalid JWK AKP key"));
+        return None;
+    };
+    let private = if target == KeyType::Private {
+        property_string(scope, jwk, "priv")
+    } else {
+        None
+    };
+    match private {
+        Some(private) => {
+            let Some(private) = base64url_decode(&private) else {
+                throw(scope, &KeyError::InvalidJwk("Invalid JWK AKP key"));
+                return None;
+            };
+            let imported = if algorithm.seed_size() != 0 {
+                import_raw_seed(algorithm, &private)
+            } else {
+                import_raw_private_key(algorithm, &private, None)
+            };
+            let Ok(key) = imported else {
+                throw(scope, &KeyError::InvalidJwk("Invalid JWK AKP key"));
+                return None;
+            };
+            let Some(derived_public) = key.raw_public_key() else {
+                throw(scope, &KeyError::InvalidJwk("Invalid JWK AKP key"));
+                return None;
+            };
+            if derived_public != public {
+                throw(scope, &KeyError::InvalidJwk("Invalid JWK AKP key"));
+                return None;
+            }
+            KeyData::asymmetric(KeyType::Private, key)
+        }
+        None => match import_raw_public_key(algorithm, &public, None) {
+            Ok(key) => KeyData::asymmetric(KeyType::Public, key),
+            Err(_) => {
+                throw(scope, &KeyError::InvalidJwk("Invalid JWK AKP key"));
                 None
             }
         },
