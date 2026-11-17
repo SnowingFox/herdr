@@ -34,8 +34,17 @@ pub const MEMBERS: &[&str] = &[
 /// Where a fact is conditional on a configure switch, the switch is named so
 /// the assumption can be re-checked instead of silently drifting.
 pub const VALUES: &[Member] = &[
-    // `#if defined(DEBUG) && DEBUG`. Release builds define neither.
-    ("isDebugBuild", Value::Bool(false)),
+    // `#if defined(DEBUG) && DEBUG` (`src/node_config.cc:49`). A Rust build has no
+    // `DEBUG` macro; the equivalent question is whether this binary carries debug
+    // assertions, which is what `debug_assertions` answers.
+    //
+    // It must be the *same* expression `process.features.debug` uses
+    // (`crates/rn-realm/src/lib.rs`), because Node derives one from the other:
+    // `lib/internal/bootstrap/node.js:271` sets `features.debug = isDebugBuild`.
+    // Two independent sources is how a debug build came to report
+    // `features.debug === true` beside `isDebugBuild === false`, which no Node
+    // build can produce and which made every DEBUG-gated test ambiguous here.
+    ("isDebugBuild", Value::Bool(cfg!(debug_assertions))),
     // `#ifdef OPENSSL_IS_BORINGSSL`. Node's release binaries link OpenSSL, and
     // the vendored `deps/openssl` is upstream OpenSSL 4.1.0, not BoringSSL.
     ("openSSLIsBoringSSL", Value::Bool(false)),
