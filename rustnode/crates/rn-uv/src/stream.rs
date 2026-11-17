@@ -392,6 +392,32 @@ pub unsafe fn read_start(stream: *mut uv::uv_stream_t, state: *mut StreamState) 
     }
 }
 
+/// Boxes `bytes` and returns a `uv_buf_t` over the box's own allocation.
+///
+/// Writing `buffer_from` instead of `bytes.as_ptr()` followed by
+/// `bytes.into_boxed_slice()` is not stylistic. `into_boxed_slice` shrinks the
+/// allocation to exactly `len`, and `RawVec` implements that shrink with
+/// `realloc` whenever `capacity != len`. A pointer taken from the `Vec` before
+/// the call therefore names a block that may already be freed when libuv reads
+/// it — the write-a-use-after-free this helper exists to make unrepresentable.
+///
+/// It is a real defect and not a theoretical one: the two shapes that bit this
+/// runtime were a `Vec` grown by `extend_from_slice` (`send_pending_data`,
+/// `TLSWrap`'s `pending_output`) and a `Vec::with_capacity(worst_case)` filled
+/// with fewer bytes (`codec::write`). Both leave spare capacity, so both
+/// reallocated on every write. glibc's `realloc` shrinks large blocks in place,
+/// which is why this survived native runs and only valgrind reported it; the
+/// allocator is free to move, and on a moving one every write of those frames
+/// reads freed memory.
+pub fn buffer_from(bytes: Vec<u8>) -> (uv::uv_buf_t, Box<[u8]>) {
+    let owned = bytes.into_boxed_slice();
+    let buffer = uv::uv_buf_t {
+        base: owned.as_ptr() as *mut std::os::raw::c_char,
+        len: owned.len(),
+    };
+    (buffer, owned)
+}
+
 /// Issues a write with no caller-supplied request object.
 ///
 /// `StreamPipe` is the only caller: it pumps a source stream's reads into a sink

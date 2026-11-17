@@ -647,20 +647,13 @@ fn write_to_stream(
     bytes: Vec<u8>,
 ) -> i32 {
     if !stream.is_null() {
-        let length = bytes.len();
-        let buffer = rn_uv::sys::uv_buf_t {
-            base: bytes.as_ptr() as *mut std::os::raw::c_char,
-            len: length,
-        };
-        // SAFETY: `stream` is live while the session holds it, and `bytes` is
-        // moved into `owned` so the buffer outlives the completion.
+        // The box is created before its address is taken; see [`buffer_from`].
+        let (buffer, owned) = rn_uv::stream::buffer_from(bytes);
+        let length = buffer.len;
+        // SAFETY: `stream` is live while the session holds it, and `owned` is
+        // the allocation `buffer.base` points into, moved into the completion.
         return unsafe {
-            rn_uv::stream::queue_write_unowned(
-                stream,
-                vec![buffer],
-                length,
-                vec![bytes.into_boxed_slice()],
-            )
+            rn_uv::stream::queue_write_unowned(stream, vec![buffer], length, vec![owned])
         };
     }
     let handle = state

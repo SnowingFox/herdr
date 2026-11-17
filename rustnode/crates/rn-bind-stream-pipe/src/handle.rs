@@ -557,21 +557,17 @@ fn write_to_sink(pipe: &PipeState, bytes: Vec<u8>) {
     if pipe.sink.is_null() {
         return;
     }
-    let length = bytes.len();
-    let buffer = rn_uv::sys::uv_buf_t {
-        base: bytes.as_ptr() as *mut std::os::raw::c_char,
-        len: length,
-    };
+    // The box is created before its address is taken; see
+    // `rn_uv::stream::buffer_from`. A `to_vec()` happens to be exact capacity
+    // today, but this function must not depend on its caller's `Vec` history.
+    let (buffer, owned) = rn_uv::stream::buffer_from(bytes);
+    let length = buffer.len;
     pipe.pending_writes.set(pipe.pending_writes.get() + 1);
     // SAFETY: the sink is live until `sink_destroyed` is set, which the callers
-    // of this function have checked by not having seen it.
+    // of this function have checked by not having seen it, and `owned` is the
+    // allocation `buffer.base` points into.
     let outcome = unsafe {
-        rn_uv::stream_ops::ops_of(pipe.sink).write(
-            pipe.sink,
-            vec![buffer],
-            length,
-            vec![bytes.into_boxed_slice()],
-        )
+        rn_uv::stream_ops::ops_of(pipe.sink).write(pipe.sink, vec![buffer], length, vec![owned])
     };
     match outcome {
         rn_uv::stream_ops::WriteOutcome::Queued => {
