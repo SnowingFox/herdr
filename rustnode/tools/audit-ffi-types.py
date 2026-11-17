@@ -126,7 +126,18 @@ class Type:
 
 def split_top(text, sep=","):
     out, depth, cur = [], 0, ""
-    for ch in text:
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        # `->` is one token: its `>` is a return arrow, not a closing bracket.
+        # Without this a parameter whose type is itself a function
+        # (`Option<unsafe extern "C" fn(A, B) -> C>`) drove the depth negative,
+        # so the comma after it never split and the declaration reached
+        # `rust_type_to_c` as one unparseable string.
+        if ch == "-" and text[index + 1 : index + 2] == ">":
+            cur += "->"
+            index += 2
+            continue
         if ch in "(<[":
             depth += 1
         elif ch in ")>]":
@@ -136,6 +147,7 @@ def split_top(text, sep=","):
             cur = ""
         else:
             cur += ch
+        index += 1
     if cur.strip():
         out.append(cur.strip())
     return out
@@ -333,7 +345,18 @@ def load_typedefs(include_dir):
 
 def split_top(text, sep=","):
     out, depth, cur = [], 0, ""
-    for ch in text:
+    index = 0
+    while index < len(text):
+        ch = text[index]
+        # `->` is one token: its `>` is a return arrow, not a closing bracket.
+        # Without this a parameter whose type is itself a function
+        # (`Option<unsafe extern "C" fn(A, B) -> C>`) drove the depth negative,
+        # so the comma after it never split and the declaration reached
+        # `rust_type_to_c` as one unparseable string.
+        if ch == "-" and text[index + 1 : index + 2] == ">":
+            cur += "->"
+            index += 2
+            continue
         if ch in "(<[":
             depth += 1
         elif ch in ")>]":
@@ -343,6 +366,7 @@ def split_top(text, sep=","):
             cur = ""
         else:
             cur += ch
+        index += 1
     if cur.strip():
         out.append(cur.strip())
     return out
@@ -364,9 +388,16 @@ def rust_type_to_c(t, typedefs):
     t = re.sub(r'^mut\s+', '', t)
     t = re.sub(r'\s+', ' ', t).strip()
 
-    m = re.match(r'^Option<\s*(?:unsafe\s+)?extern "C" fn\s*\((.*)\)\s*(?:->\s*(.+?))?\s*>$', t, re.S)
+    # Balanced parentheses again: `fn(*mut SSL, void *) -> int` used to be
+    # matched by a greedy `\(.*\)`, which swallowed the `-> int` into the
+    # argument list and produced `int`'s pointer for a parameter that is a
+    # callback. The same nesting exists in `fnptr` returns.
+    _inner = r'\(((?:[^()]|\([^()]*\))*)\)'
+    m = re.match(r'^Option<\s*(?:unsafe\s+)?extern "C" fn\s*' + _inner
+                 + r'\s*(?:->\s*(.+?))?\s*>$', t, re.S)
     if not m:
-        m = re.match(r'^(?:unsafe\s+)?extern "C" fn\s*\((.*)\)\s*(?:->\s*(.+?))?$', t, re.S)
+        m = re.match(r'^(?:unsafe\s+)?extern "C" fn\s*' + _inner
+                     + r'\s*(?:->\s*(.+?))?$', t, re.S)
     if m:
         params = [rust_type_to_c(p, typedefs) for p in split_top(m.group(1))]
         if any(p is None for p in params):
@@ -414,7 +445,13 @@ def rust_extern_decls():
         r'\n( *)'
         r'(?:pub(?:\s*\([^)]*\))?\s+)?'
         r'(?:unsafe\s+)?'
-        r'fn\s+([A-Za-z_0-9]+)\s*\((.*?)\)\s*(?:->\s*([^;{]+?))?\s*;',
+        # Balanced parentheses, so a parameter that is itself a function type
+        # (`Option<extern "C" fn(A, B) -> C>`) does not end the argument list at
+        # its own closing paren. The greedy-but-then-backtracking `(.*?)\)\s*;`
+        # form matched the *first* `)` that a `;` follows, which split such a
+        # declaration in the middle of its last parameter and put
+        # `SSL_set_cert_cb` in the untranslatable bucket instead of auditing it.
+        r'fn\s+([A-Za-z_0-9]+)\s*\(((?:[^()]|\([^()]*\))*)\)\s*(?:->\s*([^;{]+?))?\s*;',
         re.S)
     for root in RUST_ROOTS:
         for path in sorted(glob.glob(os.path.join(root, "**", "*.rs"), recursive=True)):

@@ -241,6 +241,14 @@ pub struct WrapState {
     /// Once set, `ClearIn` does nothing and `ReadStart` does not re-arm, which is
     /// `crypto_tls.cc:1094`'s `!flags_.eof` guard.
     pub error: Option<crate::error::SslError>,
+    /// `TLSWrap::ocsp_response_`: the stapled OCSP response bytes.
+    ///
+    /// `setOCSPResponse` stores them and [`crate::callback::ocsp_status`] attaches
+    /// them when OpenSSL asks while building CertificateStatus. Node keeps a
+    /// `v8::Global<ArrayBufferView>`; the bytes are what the callback needs, and
+    /// copying them here means the callback never has to reach into V8 — it runs
+    /// on the library's stack, where `cycle` holds this state's borrow.
+    pub ocsp_response: Vec<u8>,
 }
 
 impl WrapState {
@@ -277,6 +285,7 @@ impl WrapState {
             callback: None,
             verify_mode: 0,
             error: None,
+            ocsp_response: Vec::new(),
         }
     }
 
@@ -377,6 +386,10 @@ impl WrapState {
         // the slot is dropped through the handles it carries rather than by looking
         // itself up.
         if let Some(handles) = self.callback.take() {
+            // The mirrored `SSL*` is cleared with the slot, because the `SSL` is
+            // about to be freed: a `setKeyCert` reached through the slot after
+            // this point must see null rather than a dangling pointer.
+            handles.ssl.set(std::ptr::null_mut());
             handles.unregister();
         }
         self.pending_output.clear();
@@ -388,6 +401,7 @@ impl WrapState {
         self.session.clear();
         self.alpn_protos.clear();
         self.error = None;
+        self.ocsp_response.clear();
         self.flags.eof = false;
         self.secure_context = None;
         self.flags.established = false;

@@ -212,6 +212,23 @@ struct CallbackSlot {
     /// its output until `newSessionDone` runs, so a ticket can never be sent
     /// before the application has decided whether to store the session.
     awaiting_new_session: Rc<Cell<bool>>,
+    /// `TLSWrap::cert_cb_ != nullptr`, i.e. `enableCertCb` ran. Read by
+    /// [`cert_cb`] to answer `is_waiting_cert_cb()` without the state borrow.
+    cert_cb_enabled: Rc<Cell<bool>>,
+    /// `flags_.cert_cb_running`. Set by [`cert_cb`] while it parks, cleared by
+    /// `certCbDone` before the resume; the second entry parks again.
+    cert_cb_running: Rc<Cell<bool>>,
+    /// The `oncertcb` payload a queued native immediate has not delivered yet.
+    pending_cert_cb: Rc<RefCell<Option<CertCbPending>>>,
+    /// The wrap's `SSL*`, mirrored so a callback that runs while `cycle` holds
+    /// the state borrow can still reach it. Null once the SSL is freed.
+    ssl: Rc<Cell<*mut ffi::SSL>>,
+    /// `TLSWrap::ocsp_response_`, mirrored for [`ocsp_status`].
+    ///
+    /// The status callback runs on `SSL_do_handshake`'s stack, where `cycle`
+    /// holds the state's `RefCell`, so the bytes have to be reachable without it
+    /// — the same reason every other field here is.
+    ocsp_response: Rc<RefCell<Vec<u8>>>,
 }
 
 /// Records the mirrors a wrap's callbacks read.
@@ -232,6 +249,11 @@ pub fn register(
     let alpn_callback_enabled = Rc::new(Cell::new(false));
     let alpn_protos = Rc::new(RefCell::new(Vec::new()));
     let awaiting_new_session = Rc::new(Cell::new(false));
+    let cert_cb_enabled = Rc::new(Cell::new(false));
+    let cert_cb_running = Rc::new(Cell::new(false));
+    let pending_cert_cb = Rc::new(RefCell::new(None));
+    let ssl_slot = Rc::new(Cell::new(std::ptr::null_mut()));
+    let ocsp_response = Rc::new(RefCell::new(Vec::new()));
     SLOTS.with(|slots| {
         let mut slots = slots.borrow_mut();
         // A wrap registered twice — which a handle swap can do — replaces its
@@ -250,6 +272,11 @@ pub fn register(
             session,
             alpn_protos: Rc::clone(&alpn_protos),
             awaiting_new_session: Rc::clone(&awaiting_new_session),
+            cert_cb_enabled: Rc::clone(&cert_cb_enabled),
+            cert_cb_running: Rc::clone(&cert_cb_running),
+            pending_cert_cb: Rc::clone(&pending_cert_cb),
+            ssl: Rc::clone(&ssl_slot),
+            ocsp_response: Rc::clone(&ocsp_response),
         });
     });
     CallbackHandles {
@@ -261,6 +288,11 @@ pub fn register(
         alpn_callback_enabled,
         alpn_protos,
         awaiting_new_session,
+        cert_cb_enabled,
+        cert_cb_running,
+        pending_cert_cb,
+        ssl: ssl_slot,
+        ocsp_response,
         cell: Some(cell),
     }
 }
@@ -287,6 +319,16 @@ pub struct CallbackHandles {
     pub alpn_protos: Rc<RefCell<Vec<u8>>>,
     /// `flags_.awaiting_new_session`, shared with the slot.
     pub awaiting_new_session: Rc<Cell<bool>>,
+    /// `TLSWrap::cert_cb_ != nullptr`, shared with the slot.
+    pub cert_cb_enabled: Rc<Cell<bool>>,
+    /// `flags_.cert_cb_running`, shared with the slot.
+    pub cert_cb_running: Rc<Cell<bool>>,
+    /// The queued `oncertcb` payload, shared with the slot.
+    pub pending_cert_cb: Rc<RefCell<Option<CertCbPending>>>,
+    /// The wrap's `SSL*`, shared with the slot.
+    pub ssl: Rc<Cell<*mut ffi::SSL>>,
+    /// The stapled OCSP response, shared with the slot.
+    pub ocsp_response: Rc<RefCell<Vec<u8>>>,
     /// The state cell this set of handles was registered for.
     ///
     /// Held so [`CallbackHandles::unregister`] can drop the slot without a caller
@@ -313,6 +355,11 @@ impl CallbackHandles {
             alpn_callback_enabled: Rc::clone(&self.alpn_callback_enabled),
             alpn_protos: Rc::clone(&self.alpn_protos),
             awaiting_new_session: Rc::clone(&self.awaiting_new_session),
+            cert_cb_enabled: Rc::clone(&self.cert_cb_enabled),
+            cert_cb_running: Rc::clone(&self.cert_cb_running),
+            pending_cert_cb: Rc::clone(&self.pending_cert_cb),
+            ssl: Rc::clone(&self.ssl),
+            ocsp_response: Rc::clone(&self.ocsp_response),
             // Delivery-only: the owning set is the one that unregisters, so this
             // copy must not drop the slot a second time.
             cell: None,
@@ -783,7 +830,11 @@ fn call_handler<'s>(
 /// `ssl` must be live, and `cell` must be the address of the `RefCell<WrapState>`
 /// that outlives it. `wrap()` establishes both: the state is allocated for the
 /// object's lifetime and the `SSL` is freed by that same state's teardown.
-pub unsafe fn install(ssl: *mut ffi::SSL, cell: *mut std::cell::RefCell<WrapState>) {
+pub unsafe fn install(
+    ssl: *mut ffi::SSL,
+    cell: *mut std::cell::RefCell<WrapState>,
+    kind: crate::ssl::Kind,
+) {
     if ssl.is_null() || cell.is_null() {
         return;
     }
@@ -793,6 +844,23 @@ pub unsafe fn install(ssl: *mut ffi::SSL, cell: *mut std::cell::RefCell<WrapStat
         // is the slot `ffi::SSL_get_ex_data(ssl, 0)` reads back.
         ffi::SSL_set_ex_data(ssl, 0, cell.cast::<c_void>());
         crate::ffi_extra::SSL_set_info_callback(ssl, Some(info));
+        // `SSL_set_cert_cb(ssl, SSLCertCallback, this)` from `InitSSL`
+        // (`crypto_tls.cc:586`). Installed on every wrap, client included, as
+        // Node does — [`cert_cb`] itself decides whether to act, and a
+        // client must answer `1` so its handshake is never parked.
+        crate::ffi_extra::ssl_set_cert_cb(ssl, Some(cert_cb), cell.cast::<c_void>());
+        // `if (is_server()) sc_->SetSelectSNIContextCallback(...)`, which
+        // records `socket.servername` from the ClientHello. Installed only
+        // for a server: a client has no name to select for, and Node's
+        // `InitSSL` guards it the same way.
+        if kind == crate::ssl::Kind::Server {
+            install_sni_select(ssl);
+        }
+        // `ConfigureSecureContext(sc)`: the OCSP stapling response callback,
+        // which is what answers a client's status_request. Installed for
+        // both kinds because Node's `ConfigureSecureContext` is unconditional;
+        // [`ocsp_status`] itself branches on `is_client`.
+        install_ocsp_status(ssl);
         // The session callbacks live on the `SSL_CTX`, which the `SSL` shares with
         // every other wrap built from the same `SecureContext` — so this is
         // Node's `sc_->SetGetSessionCallback(...)` / `SetNewSessionCallback(...)`
@@ -816,6 +884,628 @@ pub type CertCallback = Option<unsafe extern "C" fn(*mut ffi::SSL, *mut c_void) 
 /// The unused-parameter guard for the callback's `ret`.
 #[allow(dead_code)]
 fn ret_is_unused(_: c_int, _: *const c_char) {}
+
+// ---------------------------------------------------------------------------
+// The certificate callback: SSL_set_cert_cb, its parking, and its resume
+// ---------------------------------------------------------------------------
+
+/// What `SSLCertCallback` decided to do, as OpenSSL's return value.
+///
+/// The three answers are Node's, and the middle one is the whole mechanism:
+/// `-1` does not fail the handshake, it *parks* it. OpenSSL then returns
+/// `SSL_ERROR_WANT_X509_LOOKUP` from whatever `SSL_do_handshake`/`SSL_read`
+/// called it, and the handshake is resumed by calling `SSL_do_handshake` again
+/// after JavaScript has answered — not by returning a value.
+pub const CERT_CB_CONTINUE: c_int = 1;
+/// `SSL_set_cert_cb`'s "suspend and ask me again" answer.
+pub const CERT_CB_PARK: c_int = -1;
+
+/// `TLSWrap::SSLCertCallback` (`crypto_tls.cc:200`).
+///
+/// OpenSSL calls this while selecting a certificate, from inside
+/// `SSL_do_handshake` or `SSL_read` — on its own stack, with the wrap's state
+/// borrowed by `cycle`. Three early exits:
+///
+/// * not a server: a client has nothing to select;
+/// * `enableCertCb` was never called (`cert_cb_ == nullptr`), which is every
+///   plain server;
+/// * the callback is already running, which means this is the resume re-entry
+///   and must park again rather than queue a second JavaScript emission.
+///
+/// Otherwise it records what JavaScript needs — the servername and whether the
+/// ClientHello carried a `status_request` — and parks. The JavaScript runs from
+/// a native immediate (`ScheduleCertCb`), because a handler that synchronously
+/// calls `certCbDone` would otherwise re-enter the SSL library on this very
+/// stack.
+///
+/// # Safety
+///
+/// OpenSSL invokes this with the `SSL*` its app-data names, both live for the
+/// duration of the call.
+pub unsafe extern "C" fn cert_cb(ssl: *mut ffi::SSL, _arg: *mut c_void) -> c_int {
+    let Some(slot) = slot_of(ssl) else {
+        return CERT_CB_CONTINUE;
+    };
+    if slot.kind != crate::ssl::Kind::Server || !slot.cert_cb_enabled.get() {
+        return CERT_CB_CONTINUE;
+    }
+    if slot.cert_cb_running.replace(true) {
+        // Node returns `-1` here too: "Not an error. Suspend handshake with
+        // SSL_ERROR_WANT_X509_LOOKUP, and handshake will continue after certcb
+        // is done."
+        return CERT_CB_PARK;
+    }
+
+    // `SSLPointer::GetServerName(s)`, copied because the view points into
+    // SSL-owned memory that is only valid until this call returns.
+    let servername = {
+        // SAFETY: `ssl` is live, per this function's contract.
+        let pointer = unsafe {
+            crate::ffi_extra::SSL_get_servername(ssl, crate::methods::TLSEXT_NAMETYPE_HOST_NAME)
+        };
+        if pointer.is_null() {
+            String::new()
+        } else {
+            // SAFETY: OpenSSL returns a NUL-terminated string owned by the SSL.
+            unsafe { std::ffi::CStr::from_ptr(pointer) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    // `SSL_get_tlsext_status_type(s) == TLSEXT_STATUSTYPE_ocsp`.
+    // SAFETY: `ssl` is live.
+    let ocsp = unsafe { crate::ffi_extra::ssl_get_tlsext_status_type(ssl) }
+        == crate::ffi_extra::TLSEXT_STATUSTYPE_OCSP;
+
+    schedule_cert_cb(&slot, servername, ocsp);
+    CERT_CB_PARK
+}
+
+/// `TLSWrap::ScheduleCertCb` (`crypto_tls.cc:515`): defer `oncertcb` to a native
+/// immediate.
+///
+/// Node uses `env()->SetImmediate` with a strong reference so the wrap survives
+/// until the callback runs. The queued function is a plain `fn` pointer here,
+/// which cannot carry the servername or the ocsp flag, so they are parked in the
+/// slot that the immediate drains — the same split [`CallbackSlot`] exists for.
+fn schedule_cert_cb(slot: &CallbackSlot, servername: String, ocsp: bool) {
+    if let Ok(mut pending) = slot.pending_cert_cb.try_borrow_mut() {
+        *pending = Some(CertCbPending { servername, ocsp });
+    }
+    rn_core::native_immediates::set_immediate(emit_cert_cb);
+}
+
+/// The `oncertcb` emission the immediate queues.
+///
+/// `TLSWrap::EmitCertCb` (`crypto_tls.cc:525`): builds `{servername,
+/// OCSPRequest}` and calls `oncertcb(info)`, which is `loadSNI` at
+/// `wrap.js:296`. That function decides between the SNI context switch and the
+/// OCSP request, and always ends in `requestOCSPDone` → `certCbDone`, which is
+/// what resumes the parked handshake.
+fn emit_cert_cb(scope: &mut v8::PinScope<'_, '_>) {
+    for slot in SLOTS.with(|slots| slots.borrow().clone()) {
+        let Some(pending) = slot.pending_cert_cb.borrow_mut().take() else {
+            continue;
+        };
+        let Some(object) = slot.object.clone() else {
+            continue;
+        };
+        let object = v8::Local::new(scope, object);
+        let info = v8::Object::new(scope);
+        if let Some(text) = v8::String::new(scope, &pending.servername) {
+            if let Some(key) = v8::String::new(scope, "servername") {
+                let _ = info.set(scope, key.into(), text.into());
+            }
+        }
+        if let Some(key) = v8::String::new(scope, "OCSPRequest") {
+            let _ = info.set(
+                scope,
+                key.into(),
+                v8::Boolean::new(scope, pending.ocsp).into(),
+            );
+        }
+        call_handler(scope, object, "oncertcb", &[info.into()]);
+    }
+}
+
+/// What a parked `oncertcb` is waiting to tell JavaScript.
+pub struct CertCbPending {
+    servername: String,
+    /// `info.OCSPRequest`: the ClientHello carried a `status_request`
+    /// extension. `wrap.js`'s `requestOCSP` returns early without emitting
+    /// `'OCSPRequest'` when this is false, which is why an ordinary connection
+    /// to an OCSP-configured server succeeds without firing the listener.
+    ocsp: bool,
+}
+
+/// Why an SNI context could not be installed.
+///
+/// The two shapes are distinct because Node reports them differently: a crypto
+/// failure goes through `ThrowCryptoError`, which derives an
+/// `ERR_SSL_<REASON>` code from the OpenSSL queue, while a failure with nothing
+/// queued has no reason to name and gets this crate's own code.
+pub enum SniContextError {
+    /// An OpenSSL failure, with its queue already captured.
+    Crypto(crate::error::SslError),
+    /// A failure OpenSSL did not queue anything for.
+    Generic(String),
+}
+
+/// Applies the SNI context JavaScript selected, which is `TLSWrap::CertCbDone`'s
+/// context half.
+///
+/// `crypto_tls.cc:1765`: read `sni_context` off the wrap object, and when it is a
+/// `SecureContext`, install it on this `SSL` with `setSniContext` + `SetCACerts`.
+///
+/// Three outcomes, matching Node's three branches:
+///
+/// * `Ok(true)` — nothing to switch, or the switch succeeded. The handshake
+///   resumes.
+/// * `Ok(false)` — JavaScript supplied something that is not a `SecureContext`.
+///   Node reports it through `onerror` and does not resume, so no certificate is
+///   ever installed twice.
+/// * `Err(reason)` — the context could not be installed, which Node throws for
+///   (`ThrowCryptoError`), and `wrap.js`'s `requestOCSP` catches that to destroy
+///   the socket. A silent `Ok(false)` here is what made an empty
+///   `createSecureContext()` park the handshake forever.
+///
+/// # Safety
+///
+/// `ssl` must be the live `SSL` of the wrap whose object is `object`.
+pub unsafe fn apply_sni_context<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    ssl: *mut ffi::SSL,
+) -> Result<bool, SniContextError> {
+    let Some(key) = v8::String::new(scope, "sni_context") else {
+        return Ok(true);
+    };
+    let Some(ctx) = object.get(scope, key.into()) else {
+        return Ok(true);
+    };
+    if ctx.is_undefined() || ctx.is_null() {
+        // No SNI context was selected, which is `loadSNI`'s
+        // `callback(null, undefined)` path. Nothing to switch.
+        return Ok(true);
+    }
+    let Ok(ctx) = v8::Local::<v8::Object>::try_from(ctx) else {
+        // A primitive is `ctx->IsObject()` being false in Node, which falls
+        // through to the resume without complaint.
+        return Ok(true);
+    };
+    if !rn_bind_secure_context::is_secure_context(ctx) {
+        // `crypto_tls.cc:1798`: report it through `onerror` and do not resume.
+        if let Some(text) = v8::String::new(scope, "Invalid SNI context") {
+            let error = v8::Exception::type_error(scope, text);
+            call_handler(scope, object, "onerror", &[error]);
+        }
+        return Ok(false);
+    }
+    let Some(sni_ctx) = rn_bind_secure_context::ssl_ctx_of(ctx) else {
+        return Err(SniContextError::Generic(
+            "the SNI SecureContext has been closed".to_string(),
+        ));
+    };
+    // `crypto_tls.cc:1775` is
+    // `if (w->ssl_.setSniContext(...) && !w->SetCACerts(sc))` — the `&&`
+    // short-circuits when `setSniContext` fails, so a context with **no
+    // certificate** does not throw. Node resumes and lets the handshake fail on
+    // its own, which is why an empty `createSecureContext()` produces
+    // `no suitable signature algorithm` from the TLS layer rather than an error
+    // from this function. Matching that keeps the failure shape the same as the
+    // oracle's instead of inventing a code here.
+    // SAFETY: `ssl` is live per this function's contract, and `sni_ctx` is owned
+    // by the rooted `SecureContext` object `ctx` holds a reference to.
+    let has_certificate = unsafe { !openssl_sys::SSL_CTX_get0_certificate(sni_ctx).is_null() };
+    if !has_certificate {
+        return Ok(true);
+    }
+    if !unsafe { set_sni_context(ssl, sni_ctx) } {
+        // `ThrowCryptoError` reports the queue's own entry, whose reason becomes
+        // the `ERR_SSL_<REASON>` code — for an empty context that is
+        // `ERR_SSL_NO_SUITABLE_SIGNATURE_ALGORITHM`, exactly what the oracle
+        // reports. A failure that queued nothing falls back to a generic code.
+        let error = crate::error::SslError::capture();
+        // An empty message means the queue had nothing to report, which is the
+        // generic shape rather than a crypto one.
+        if error.message.is_empty() {
+            return Err(SniContextError::Generic(
+                "could not install the SNI context's certificate".to_string(),
+            ));
+        }
+        return Err(SniContextError::Crypto(error));
+    }
+    Ok(true)
+}
+
+/// `ncrypto::SSLPointer::setSniContext` (`deps/ncrypto/ncrypto.cc:5156`),
+/// followed by `TLSWrap::SetCACerts`.
+///
+/// # Why the explicit certificate installation
+///
+/// `SSL_set_SSL_CTX` alone is not enough. It swaps the context, but the
+/// certificate the handshake will use was already selected from the *old*
+/// context by the time this runs, so the connection completes presenting the
+/// default certificate — a valid TLS session for the wrong hostname. That is the
+/// bug this function exists to prevent, and why every step is checked.
+///
+/// # Safety
+///
+/// `ssl` must be live and `ctx` a live `SSL_CTX`.
+pub unsafe fn set_sni_context(ssl: *mut ffi::SSL, ctx: *mut ffi::SSL_CTX) -> bool {
+    // SAFETY: both pointers are live per this function's contract.
+    unsafe {
+        let certificate = openssl_sys::SSL_CTX_get0_certificate(ctx);
+        if certificate.is_null() {
+            // A context with no certificate cannot serve one. Node's
+            // `X509View::From` returns an empty view and `setSniContext` fails.
+            return false;
+        }
+        let key = openssl_sys::SSL_CTX_get0_privatekey(ctx);
+        // `SSL_use_certificate` replaces only the certificate matching the key
+        // type, so the old context's certificates are cleared first — otherwise
+        // credentials from the default context can be selected for a key type
+        // the new one does not provide.
+        crate::ffi_extra::SSL_certs_clear(ssl);
+        if openssl_sys::SSL_use_certificate(ssl, certificate) != 1 {
+            return false;
+        }
+        if !key.is_null() && openssl_sys::SSL_use_PrivateKey(ssl, key) != 1 {
+            return false;
+        }
+        let mut chain: *mut openssl_sys::stack_st_X509 = std::ptr::null_mut();
+        if crate::ffi_extra::ssl_ctx_get0_chain_certs(ctx, &mut chain) == 1 && !chain.is_null() {
+            if crate::ffi_extra::ssl_set1_chain(ssl, chain) != 1 {
+                return false;
+            }
+        }
+    }
+    // `SSL_set_SSL_CTX` before the certificates, because installing them on the
+    // old context's `cert` slot is what leaves the handshake presenting the
+    // default certificate.
+    // SAFETY: both pointers are live.
+    unsafe {
+        if openssl_sys::SSL_set_SSL_CTX(ssl, ctx) != ctx {
+            return false;
+        }
+    }
+    // SAFETY: `ssl` is live.
+    unsafe { set_ca_certs(ssl, ctx) }
+}
+
+/// `TLSWrap::SetCACerts` (`crypto_tls.cc:1589`), expanded.
+///
+/// `SSL_set1_verify_cert_store` plus a duplicated client-CA list, so a switched
+/// context's own trust anchors are what a request for a client certificate
+/// advertises. The duplicate is required because `SSL_set_client_CA_list` takes
+/// ownership of the list it is given while the source belongs to the context.
+///
+/// # Safety
+///
+/// `ssl` must be live and `ctx` a live `SSL_CTX`.
+unsafe fn set_ca_certs(ssl: *mut ffi::SSL, ctx: *mut ffi::SSL_CTX) -> bool {
+    // SAFETY: both pointers are live per this function's contract.
+    unsafe {
+        let store = openssl_sys::SSL_CTX_get_cert_store(ctx);
+        if store.is_null() || crate::ffi_extra::ssl_set1_verify_cert_store(ssl, store) != 1 {
+            return false;
+        }
+        let names = crate::ffi_extra::SSL_CTX_get_client_CA_list(ctx);
+        if !names.is_null() {
+            let copy = crate::ffi_extra::SSL_dup_CA_list(names);
+            if !copy.is_null() {
+                // `SSL_set_client_CA_list` takes ownership of `copy`.
+                openssl_sys::SSL_set_client_CA_list(ssl, copy);
+            }
+        }
+    }
+    true
+}
+
+/// Resumes a handshake parked by [`cert_cb`], `TLSWrap::CertCbDone`'s last line.
+///
+/// `crypto_tls.cc:1806` reads `cert_cb_`/`cert_cb_arg_`, clears
+/// `flags_.cert_cb_running`, then calls the parked continuation — which is
+/// `ResumeAfterCertCb` → `Cycle()`. Node does **not** call `SSL_do_handshake`
+/// here: `Cycle`'s first phase is `ClearOut` → `SSL_read`, and `SSL_read` is what
+/// drives a handshake forward ("seems odd to read when we want to send",
+/// `crypto_tls.cc:660`). Calling `SSL_do_handshake` instead would advance the
+/// handshake but leave the record it produced unflushed, because the phases are
+/// what hand ciphertext to the socket.
+///
+/// # Safety
+///
+/// `cell` must be the live state cell of the wrap whose `certCbDone` ran.
+pub unsafe fn resume_after_cert_cb(cell: *mut RefCell<WrapState>) {
+    if cell.is_null() {
+        return;
+    }
+    // SAFETY: the caller guarantees the cell is live.
+    unsafe { crate::cycle::run(cell) };
+}
+
+/// Whether a parked cert callback is running, for `certCbDone`'s guard.
+///
+/// `TLSWrap::CertCbDone` opens with
+/// `CHECK(w->is_waiting_cert_cb() && w->flags_.cert_cb_running)`, which is a
+/// caller bug in Node and an error here.
+pub fn cert_cb_running(cell: *const RefCell<WrapState>) -> bool {
+    if cell.is_null() {
+        return false;
+    }
+    SLOTS.with(|slots| {
+        slots
+            .borrow()
+            .iter()
+            .filter(|slot| slot.cell == cell)
+            .any(|slot| slot.cert_cb_running.get())
+    })
+}
+
+/// `TLSWrap::SelectSNIContextCallback` (`crypto_tls.cc:1554`), the *other* SNI
+/// hook.
+///
+/// This is not the cert callback. OpenSSL runs it while parsing the ClientHello,
+/// **before** any certificate work, and its job here is narrower than Node's
+/// because the cert callback already performs the context switch:
+///
+/// * record the name on the wrap object, which is what
+///   `socket.servername` reads, and which must be set even on a handshake that
+///   later fails — `test-tls-sni-servername.js` asserts exactly that;
+/// * then decline with `SSL_TLSEXT_ERR_NOACK`.
+///
+/// Declining is deliberate and is where this differs from Node, which installs a
+/// `SecureContext` here as well (a synchronous switch that cannot call into
+/// JavaScript). Answering `NOACK` leaves the context alone, so the switch happens
+/// once, in `certCbDone`, from JavaScript's answer — one path rather than two that
+/// can disagree about which certificate is live. If this returned `OK` after
+/// Node's own context installation were added, the two would race.
+///
+/// `ad` is left untouched: it is only meaningful for an alert, and `NOACK` sends
+/// none.
+///
+/// # Safety
+///
+/// OpenSSL invokes this with a live `SSL*` and a writable `int*`.
+pub unsafe extern "C" fn select_sni_context(
+    ssl: *mut ffi::SSL,
+    _ad: *mut c_int,
+    _arg: *mut c_void,
+) -> c_int {
+    let Some(slot) = slot_of(ssl) else {
+        return ffi::SSL_TLSEXT_ERR_NOACK;
+    };
+    // SAFETY: `ssl` is live, per this function's contract.
+    let pointer = unsafe {
+        crate::ffi_extra::SSL_get_servername(ssl, crate::methods::TLSEXT_NAMETYPE_HOST_NAME)
+    };
+    if pointer.is_null() {
+        return ffi::SSL_TLSEXT_ERR_NOACK;
+    }
+    // SAFETY: OpenSSL returns a NUL-terminated string owned by the SSL.
+    let servername = unsafe { std::ffi::CStr::from_ptr(pointer) }
+        .to_string_lossy()
+        .into_owned();
+    let Some(object) = slot.object.clone() else {
+        return ffi::SSL_TLSEXT_ERR_NOACK;
+    };
+    let _ = rn_uv::callback::with_context(|scope| {
+        let object = v8::Local::new(scope, object);
+        // Node sets this on `p->GetOwner()`, which is the **`TLSSocket`**
+        // (`handle[owner_symbol] = this` at `wrap.js:824`), not on the native
+        // handle. That distinction is what makes the name visible to a
+        // `'tlsClientError'` handler: the event is emitted with the socket, and
+        // `_finishInit` — the other place `servername` is assigned — is never
+        // reached when the handshake fails.
+        //
+        // `owner_symbol` is a per-isolate `Symbol`, not a string key, so it is
+        // looked up through the same table `internalBinding('symbols')` uses;
+        // a string key would silently define an unrelated property.
+        let owner_symbol = rn_core::symbol::symbol_by_description(scope, "owner_symbol");
+        let receiver: v8::Local<'_, v8::Object> = object
+            .get(scope, owner_symbol.into())
+            .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+            .unwrap_or(object);
+        let Some(key) = v8::String::new(scope, "servername") else {
+            return;
+        };
+        let Some(value) = v8::String::new(scope, &servername) else {
+            return;
+        };
+        let _ = receiver.set(scope, key.into(), value.into());
+    });
+    ffi::SSL_TLSEXT_ERR_NOACK
+}
+
+/// Installs [`select_sni_context`] on a **server** wrap's `SSL_CTX`.
+///
+/// `InitSSL`'s `if (is_server()) sc_->SetSelectSNIContextCallback(...)`
+/// (`crypto_tls.cc:581`). The callback lives on the `SSL_CTX`, which every `SSL`
+/// from one `SecureContext` shares, so it is installed once per wrap and is
+/// idempotent — the same shape [`crate::methods`]' ALPN installer has.
+///
+/// # Safety
+///
+/// `ssl` must be the live `SSL` of a server wrap.
+pub unsafe fn install_sni_select(ssl: *mut ffi::SSL) {
+    if ssl.is_null() {
+        return;
+    }
+    // SAFETY: `ssl` is live, per this function's contract.
+    let ctx = unsafe { crate::ffi_extra::SSL_get_SSL_CTX(ssl) };
+    if ctx.is_null() {
+        return;
+    }
+    // SAFETY: `ctx` is live for the SSL's lifetime, and the callback is a plain
+    // `extern "C"` item that reads only the SSL's own app-data.
+    unsafe {
+        openssl_sys::SSL_CTX_set_tlsext_servername_callback__fixed_rust(
+            ctx,
+            Some(select_sni_context),
+        );
+    }
+}
+
+/// `TLSExtStatusCallback`'s **server** half (`crypto_tls.cc:311`), attached by
+/// `ConfigureSecureContext` (`:357`) through `SSL_CTX_set_tlsext_status_cb`.
+///
+/// OpenSSL calls this while building the CertificateStatus message, so that the
+/// answer decides whether the handshake carries a stapled response. Three
+/// outcomes:
+///
+/// * no response was set → `SSL_TLSEXT_ERR_NOACK`, which sends no
+///   CertificateStatus without failing the handshake;
+/// * a response was set → hand it to `SSL_set_tlsext_status_ocsp_resp`, which
+///   **takes ownership of the pointer**, then clear the stored copy so a second
+///   handshake cannot free it twice;
+/// * the setter refuses → free what was allocated and report
+///   `SSL_TLSEXT_ERR_NOACK`, which is Node's `OPENSSL_free` on that path.
+///
+/// # Why the bytes are copied into an OpenSSL allocation
+///
+/// `SSL_set_tlsext_status_ocsp_resp` takes ownership and will `OPENSSL_free` the
+/// pointer when the `SSL` is freed, so handing it a `Vec`'s buffer would be a
+/// mismatch of allocators. Node does the same `MallocOpenSSL` + `memcpy` for the
+/// same reason.
+///
+/// # Safety
+///
+/// OpenSSL invokes this with the `SSL*` its app-data names, live for the call.
+pub unsafe extern "C" fn ocsp_status(ssl: *mut ffi::SSL, _arg: *mut c_void) -> c_int {
+    let Some(slot) = slot_of(ssl) else {
+        return ffi::SSL_TLSEXT_ERR_NOACK;
+    };
+    if slot.kind == crate::ssl::Kind::Client {
+        // `TLSExtStatusCallback`'s client half (`crypto_tls.cc:289`): hand the
+        // received response to `onocspresponse`, which is `wrap.js`'s
+        // `onocspresponse` and emits the `'OCSPResponse'` event. Node always
+        // emits — with `null` when the server sent no response — and always
+        // returns 1, because a listener has no way to reject asynchronously and
+        // can only `destroy()` the socket itself.
+        //
+        // The bytes are read through the callback slot rather than the state for
+        // the usual reason: this runs inside `SSL_do_handshake`, where `cycle`
+        // holds the state's borrow.
+        let mut response: *mut std::os::raw::c_uchar = std::ptr::null_mut();
+        // SAFETY: `ssl` is live, and `response` is a live out-parameter.
+        let length = unsafe { openssl_sys::SSL_get_tlsext_status_ocsp_resp(ssl, &mut response) };
+        let bytes = if response.is_null() || length <= 0 {
+            None
+        } else {
+            // SAFETY: OpenSSL points at `length` bytes it owns.
+            Some(unsafe { std::slice::from_raw_parts(response, length as usize) }.to_vec())
+        };
+        let Some(object) = slot.object.clone() else {
+            return 1;
+        };
+        let _ = rn_uv::callback::with_context(|scope| {
+            let object = v8::Local::new(scope, object);
+            let value: v8::Local<'_, v8::Value> = match bytes.as_deref() {
+                Some(bytes) => match buffer_to_view(scope, bytes) {
+                    Some(view) => view.into(),
+                    None => v8::null(scope).into(),
+                },
+                None => v8::null(scope).into(),
+            };
+            call_handler(scope, object, "onocspresponse", &[value]);
+        });
+        return 1;
+    }
+    let Ok(mut stored) = slot.ocsp_response.try_borrow_mut() else {
+        return ffi::SSL_TLSEXT_ERR_NOACK;
+    };
+    if stored.is_empty() {
+        return ffi::SSL_TLSEXT_ERR_NOACK;
+    }
+    let bytes = std::mem::take(&mut *stored);
+    drop(stored);
+    let length = bytes.len();
+    // SAFETY: `OPENSSL_malloc` with a non-zero length, then a copy of exactly
+    // that many bytes into it.
+    let data = unsafe { openssl_sys::OPENSSL_malloc(length).cast::<u8>() };
+    if data.is_null() {
+        return ffi::SSL_TLSEXT_ERR_NOACK;
+    }
+    // SAFETY: `data` has `length` writable bytes and `bytes` has exactly that.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, length) };
+    // SAFETY: `ssl` is live, and on success OpenSSL owns `data` from here.
+    let accepted = unsafe { openssl_sys::SSL_set_tlsext_status_ocsp_resp(ssl, data, length as _) };
+    if accepted == 0 {
+        // SAFETY: OpenSSL refused it, so the allocation is still ours.
+        unsafe { openssl_sys::OPENSSL_free(data.cast()) };
+        return ffi::SSL_TLSEXT_ERR_NOACK;
+    }
+    ffi::SSL_TLSEXT_ERR_OK
+}
+
+/// `ConfigureSecureContext`'s `sc->ctx().setStatusCallback(TLSExtStatusCallback)`
+/// (`crypto_tls.cc:357`).
+///
+/// Installed once per wrap on the `SSL_CTX`, which every `SSL` from one
+/// `SecureContext` shares, so this is idempotent exactly as the ALPN installer is.
+/// Without it the server never answers a `status_request` at all, and
+/// `wrap.js`'s `setOCSPResponse` would store bytes nothing ever reads.
+///
+/// # Safety
+///
+/// `ssl` must be the live `SSL` of a wrap.
+pub unsafe fn install_ocsp_status(ssl: *mut ffi::SSL) {
+    if ssl.is_null() {
+        return;
+    }
+    // SAFETY: `ssl` is live, per this function's contract.
+    let ctx = unsafe { crate::ffi_extra::SSL_get_SSL_CTX(ssl) };
+    if ctx.is_null() {
+        return;
+    }
+    // SAFETY: `ctx` is live for the SSL's lifetime, and the callback is a plain
+    // `extern "C"` item that reads only the SSL's own app-data.
+    unsafe {
+        openssl_sys::SSL_CTX_set_tlsext_status_cb(ctx, Some(ocsp_status));
+    }
+}
+
+/// The live `SSL` of `object`, read without borrowing the wrap state.
+///
+/// `setKeyCert` reaches it from inside `ALPNCallback`, which runs on
+/// `SSL_do_handshake`'s stack while `cycle` holds the state's `RefCell` — so
+/// `with_state` fails there and the pointer has to come from the callback slot.
+/// Null when the object is not a `TLSWrap`, which every caller reports as a
+/// caller bug.
+pub fn ssl_of(object: v8::Local<v8::Object>) -> *mut ffi::SSL {
+    let Some(cell) = crate::state::state_cell(object) else {
+        return std::ptr::null_mut();
+    };
+    SLOTS.with(|slots| {
+        slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.cell == cell)
+            .map(|slot| slot.ssl.get())
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+/// Clears `flags_.cert_cb_running`, which `CertCbDone` does before resuming.
+///
+/// Reached through the slot for the reason [`clear_awaiting_new_session`] is:
+/// `certCbDone` runs while `cycle` may hold the state borrow.
+pub fn clear_cert_cb_running(cell: *const RefCell<WrapState>) {
+    if cell.is_null() {
+        return;
+    }
+    SLOTS.with(|slots| {
+        for slot in slots.borrow().iter().filter(|slot| slot.cell == cell) {
+            slot.cert_cb_running.set(false);
+            // `TLSWrap::CertCbDone`'s `w->cert_cb_ = nullptr`: the parked
+            // callback is consumed by the resume, so `is_waiting_cert_cb()`
+            // becomes false and the next `cert_cb` answers `1`. Without this the
+            // resume re-parks on every cycle and the handshake never completes —
+            // observed as an endless `oncertcb` loop with the connection hanging.
+            slot.cert_cb_enabled.set(false);
+        }
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -852,6 +1542,12 @@ mod tests {
     #[test]
     fn installing_on_a_null_ssl_does_nothing() {
         // SAFETY: null is explicitly handled.
-        unsafe { install(std::ptr::null_mut(), std::ptr::null_mut()) };
+        unsafe {
+            install(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                crate::ssl::Kind::Server,
+            )
+        };
     }
 }

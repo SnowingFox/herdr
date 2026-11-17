@@ -265,7 +265,8 @@ fn wrap_builds_a_working_tls_wrap() {
         console.log([ \
           res.isStreamBase === true, \
           res.hasPeerCertificate() === false, \
-          res.getServername() === null, \
+          /* TLSWrap::GetServername sets false, not null, when no name was set. */ \
+          res.getServername() === false, \
           res.isSessionReused() === false, \
           res.writeQueueSize === 0, \
           typeof res.getProtocol() === 'string', \
@@ -1922,5 +1923,189 @@ fn an_ec_peer_certificate_can_be_read() {
         output.status.code(),
         Some(0),
         "the script must exit cleanly; stderr: {stderr}"
+    );
+}
+
+/// A server using `addContext()` must present the **context's** certificate.
+///
+/// This is the SNI half of the cert-callback work, and it is a security
+/// property rather than a feature check. `wrap.js:1047` calls
+/// `ssl.enableCertCb()` for any server whose `SNICallback` is not the default,
+/// which covers every `addContext()` server. Without the parking mechanism
+/// `enableCertCb` threw; with a parking mechanism that forgot to *apply*
+/// JavaScript's answer, the handshake completes under the default certificate —
+/// a valid TLS session for the wrong hostname, which is worse than a refusal
+/// because nothing the client inspects reports an error.
+///
+/// The assertion is on the served CN, not on the exit status, for exactly that
+/// reason: a mis-serving server exits 0.
+#[test]
+fn an_add_context_server_serves_the_context_certificate() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl could not generate a certificate");
+        return;
+    };
+    let (key, cert) = (key.display(), cert.display());
+    // The second identity, generated in the same temp dir.
+    let alt_dir = std::env::temp_dir().join(format!("rn-bind-tls-alt-{}", std::process::id()));
+    std::fs::create_dir_all(&alt_dir).expect("the temp dir is writable");
+    let (alt_key, alt_cert) = (alt_dir.join("key.pem"), alt_dir.join("cert.pem"));
+    if !alt_key.exists() || !alt_cert.exists() {
+        let generated = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-keyout"])
+            .arg(&alt_key)
+            .arg("-out")
+            .arg(&alt_cert)
+            .args(["-days", "1", "-nodes", "-subj", "/CN=second.test"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !generated {
+            eprintln!("skipping: openssl could not generate the second certificate");
+            return;
+        }
+    }
+    let (alt_key, alt_cert) = (alt_key.display(), alt_cert.display());
+
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        const server = tls.createServer({{
+          key: fs.readFileSync('{key}'),
+          cert: fs.readFileSync('{cert}'),
+        }}, (socket) => socket.end('ok'));
+        server.addContext('second.test', {{
+          key: fs.readFileSync('{alt_key}'),
+          cert: fs.readFileSync('{alt_cert}'),
+        }});
+        server.listen(0, '127.0.0.1', () => {{
+          const client = tls.connect({{
+            port: server.address().port,
+            host: '127.0.0.1',
+            rejectUnauthorized: false,
+            servername: 'second.test',
+          }}, () => {{
+            const peer = client.getPeerCertificate();
+            console.log('served CN:', peer && peer.subject && peer.subject.CN);
+            client.end();
+          }});
+          client.on('data', () => {{}});
+          client.on('close', () => server.close());
+        }});
+        "#
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    assert_eq!(code, 0, "the handshake must complete; stderr: {stderr}");
+    assert!(
+        stdout.contains("served CN: second.test"),
+        "the SNI context's certificate must be the one served, not the default; \
+         stdout: {stdout}"
+    );
+}
+
+/// A server with an `'OCSPRequest'` listener must connect, and must **not** fire
+/// the listener for a client that sent no `status_request`.
+///
+/// Both halves matter and they fail differently. Without the parking mechanism
+/// the setup threw; with a mechanism that ignored `info.OCSPRequest` the
+/// listener would fire on every connection, which is not what Node does.
+#[test]
+fn an_ocsp_server_connects_without_firing_the_listener() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl could not generate a certificate");
+        return;
+    };
+    let (key, cert) = (key.display(), cert.display());
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        let fired = 0;
+        const server = tls.createServer({{
+          key: fs.readFileSync('{key}'),
+          cert: fs.readFileSync('{cert}'),
+        }}, (socket) => socket.end('ok'));
+        server.on('OCSPRequest', (c, i, cb) => {{ fired += 1; cb(null, null); }});
+        server.listen(0, '127.0.0.1', () => {{
+          const client = tls.connect({{
+            port: server.address().port,
+            host: '127.0.0.1',
+            rejectUnauthorized: false,
+          }}, () => console.log('secureConnect'));
+          client.on('data', () => {{}});
+          client.on('close', () => {{
+            console.log('fired=' + fired);
+            server.close();
+          }});
+        }});
+        "#
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    assert_eq!(code, 0, "the handshake must complete; stderr: {stderr}");
+    assert!(
+        stdout.contains("secureConnect"),
+        "the connection must succeed, not park and stall; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("fired=0"),
+        "no status_request was sent, so the listener must not fire; stdout: {stdout}"
+    );
+}
+
+/// A client asking for OCSP status must make the server's listener fire.
+///
+/// This is the other side of the same conditional: `requestOCSP: true` puts a
+/// `status_request` extension in the ClientHello, `SSL_get_tlsext_status_type`
+/// reports it, and only then does `wrap.js` emit `'OCSPRequest'`. It also pins
+/// that `requestOCSP` exists on the client side — while it was a deferred stub,
+/// `TLSSocket.prototype._start` threw and the connection never began.
+#[test]
+fn request_ocsp_fires_the_servers_listener() {
+    let Some((key, cert)) = certificate() else {
+        eprintln!("skipping: openssl could not generate a certificate");
+        return;
+    };
+    let (key, cert) = (key.display(), cert.display());
+    let script = format!(
+        r#"
+        const tls = require('tls');
+        const fs = require('fs');
+        let fired = 0;
+        const server = tls.createServer({{
+          key: fs.readFileSync('{key}'),
+          cert: fs.readFileSync('{cert}'),
+        }}, (socket) => socket.end('ok'));
+        server.on('OCSPRequest', (c, i, cb) => {{
+          fired += 1;
+          console.log('OCSPRequest has cert=' + !!c);
+          cb(null, null);
+        }});
+        server.listen(0, '127.0.0.1', () => {{
+          const client = tls.connect({{
+            port: server.address().port,
+            host: '127.0.0.1',
+            rejectUnauthorized: false,
+            requestOCSP: true,
+          }}, () => console.log('secureConnect'));
+          client.on('data', () => {{}});
+          client.on('close', () => {{
+            console.log('fired=' + fired);
+            server.close();
+          }});
+        }});
+        "#
+    );
+    let (stdout, stderr, code) = run_tls(&script);
+    assert_eq!(code, 0, "the handshake must complete; stderr: {stderr}");
+    assert!(
+        stdout.contains("OCSPRequest has cert=true"),
+        "the listener must run with the server's certificate; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("fired=1"),
+        "the listener must fire exactly once; stdout: {stdout}"
     );
 }

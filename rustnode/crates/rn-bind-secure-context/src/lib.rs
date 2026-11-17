@@ -306,6 +306,22 @@ pub fn is_closed(object: v8::Local<v8::Object>) -> Option<bool> {
     with_state(object, |context| context.as_ptr().is_none())
 }
 
+/// Whether `object` is a `SecureContext` instance.
+///
+/// `crypto_tls.cc:1769` guards the SNI context switch with
+/// `env->secure_context_constructor_template()->HasInstance(ctx)`, and the
+/// distinction it draws is load-bearing rather than cosmetic: an object that is
+/// *not* a `SecureContext` is a `TypeError` reported to `onerror`, while an
+/// `undefined`/primitive means "no context was selected" and resumes the
+/// handshake unchanged.
+///
+/// The check is the internal field rather than `instanceof`, because
+/// `instanceof` is observable and monkey-patchable while this is the same test
+/// V8's `HasInstance` performs against the constructor template.
+pub fn is_secure_context(object: v8::Local<v8::Object>) -> bool {
+    object.internal_field_count() >= INTERNAL_FIELD_COUNT && ssl_ctx_of(object).is_some()
+}
+
 /// `init(secureProtocol, minV, maxV)`.
 ///
 /// `secureProtocol` is `undefined` or a string; the versions are int32. Node

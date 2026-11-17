@@ -24,7 +24,7 @@
 //! a second *version* would mean a second `openssl-src` build. Adding the symbols
 //! locally costs four lines each and cannot perturb that.
 
-use std::os::raw::{c_char, c_int, c_long, c_uchar};
+use std::os::raw::{c_char, c_int, c_long, c_uchar, c_void};
 
 use openssl_sys as ffi;
 
@@ -39,7 +39,98 @@ pub const SSL_CTRL_MODE: c_int = 33;
 /// `#define SSL_CTRL_SET_VERIFY_CERT_STORE 106` in `ssl.h:1317`.
 pub const SSL_CTRL_SET_VERIFY_CERT_STORE: c_int = 106;
 
+/// `#define SSL_CTRL_GET_CHAIN_CERTS 115` in `ssl.h:1323`.
+///
+/// `SSL_CTX_get0_chain_certs` and `SSL_get0_chain_certs` are macros over this
+/// control; `openssl-sys` declares neither, so both are expanded below.
+pub const SSL_CTRL_GET_CHAIN_CERTS: c_int = 115;
+
+/// `#define SSL_CTRL_CHAIN 88` in `ssl.h:1302`.
+///
+/// `SSL_set1_chain`/`SSL_add1_chain_cert` are macros over it, with the `larg`
+/// argument being the up-ref flag.
+pub const SSL_CTRL_CHAIN: c_int = 88;
+
+/// `#define SSL_ERROR_WANT_X509_LOOKUP 4` in `ssl.h:1373`.
+///
+/// Returned when `SSL_set_cert_cb`'s callback answers `-1`: the handshake is
+/// suspended, not failed, and resumes through a second `SSL_do_handshake`.
+pub const SSL_ERROR_WANT_X509_LOOKUP: c_int = 4;
+
+/// `#define SSL_CTRL_GET_TLSEXT_STATUS_REQ_TYPE 127` in `ssl.h:1334`.
+///
+/// `SSL_get_tlsext_status_type(ssl)` is a macro over it (`tls1.h:303`), and it is
+/// how `SSLCertCallback` learns whether the ClientHello carried a
+/// `status_request` extension. That boolean is the `info.OCSPRequest` field
+/// `lib/internal/tls/wrap.js` branches on.
+pub const SSL_CTRL_GET_TLSEXT_STATUS_REQ_TYPE: c_int = 127;
+
+/// `TLSEXT_STATUSTYPE_ocsp` (`tls1.h:236`).
+pub const TLSEXT_STATUSTYPE_OCSP: c_int = 1;
+
+/// `void SSL_set_cert_cb(SSL *s, int (*cb)(SSL *ssl, void *arg), void *arg);`
+/// — `ssl.h:1641`.
+///
+/// The certificate callback that *parks* a handshake. Returning `-1` from it
+/// makes `SSL_do_handshake` return `SSL_ERROR_WANT_X509_LOOKUP`, which OpenSSL
+/// treats as "ask again later" rather than as a failure — and the resume is a
+/// second handshake entry, not a return value. That shape is why this is the one
+/// deferred method that needed a resume path (see `crate::methods::cert_cb_done`).
+///
+/// # Safety
+///
+/// `ssl` must be live, and `callback` must be null or a valid
+/// `int (*)(SSL*, void*)` that stays callable for as long as the `SSL` lives.
+/// `crate::callback::install` is the only caller and names a plain `extern "C"`
+/// function item, which outlives every `SSL`.
+pub unsafe fn ssl_set_cert_cb(
+    ssl: *mut ffi::SSL,
+    callback: Option<unsafe extern "C" fn(*mut ffi::SSL, *mut c_void) -> c_int>,
+    arg: *mut c_void,
+) {
+    if ssl.is_null() {
+        return;
+    }
+    // SAFETY: the caller guarantees `ssl` is live and `callback` callable.
+    unsafe { SSL_set_cert_cb(ssl, callback, arg) };
+}
+
 extern "C" {
+
+    /// `void SSL_set_cert_cb(SSL *s, int (*cb)(SSL *ssl, void *arg), void *arg);`
+    /// — `ssl.h:1641`. Reached through [`ssl_set_cert_cb`], the only caller.
+    pub fn SSL_set_cert_cb(
+        ssl: *mut ffi::SSL,
+        callback: Option<unsafe extern "C" fn(*mut ffi::SSL, *mut c_void) -> c_int>,
+        arg: *mut c_void,
+    );
+
+    /// `void SSL_certs_clear(SSL *s);` — `ssl.h:1939`.
+    ///
+    /// Clears every certificate on the `SSL`. `SSLPointer::setSniContext`
+    /// (`deps/ncrypto/ncrypto.cc:5156`) does this before installing an SNI
+    /// context's certificate, because `SSL_use_certificate` replaces only the
+    /// certificate matching the new key's type — so credentials from the default
+    /// context could otherwise be selected for a different key type.
+    pub fn SSL_certs_clear(ssl: *mut ffi::SSL);
+
+    /// `STACK_OF(X509_NAME) *SSL_dup_CA_list(const STACK_OF(X509_NAME) *sk);`
+    /// — `ssl.h:2118`.
+    ///
+    /// Returns a new reference-counted copy that the caller owns, or null on
+    /// failure. `TLSWrap::SetCACerts` needs a copy because
+    /// `SSL_set_client_CA_list` takes ownership of what it is given, and the
+    /// source list belongs to the `SSL_CTX`.
+    pub fn SSL_dup_CA_list(names: *const ffi::stack_st_X509_NAME) -> *mut ffi::stack_st_X509_NAME;
+
+    /// `STACK_OF(X509_NAME) *SSL_CTX_get_client_CA_list(const SSL_CTX *s);`
+    /// — `ssl.h:2104`.
+    ///
+    /// Borrowed: the list is owned by the context. `openssl-sys` declares neither
+    /// this nor `SSL_dup_CA_list`, which is why `SetCACerts` could not be written
+    /// before this pair existed.
+    pub fn SSL_CTX_get_client_CA_list(ctx: *const ffi::SSL_CTX) -> *mut ffi::stack_st_X509_NAME;
+
     /// `const char *SSL_get_servername(const SSL *s, const int tlsext_typename);`
     /// — `tls1.h:281`.
     ///
@@ -183,6 +274,86 @@ pub unsafe fn ssl_set1_verify_cert_store(ssl: *mut ffi::SSL, store: *mut ffi::X5
     }
     // SAFETY: the caller guarantees both pointers are live.
     unsafe { ffi::SSL_ctrl(ssl, SSL_CTRL_SET_VERIFY_CERT_STORE, 1, store.cast()) as c_int }
+}
+
+/// `SSL_get_tlsext_status_type(ssl)`, a **macro** over `SSL_ctrl` (`tls1.h:303`):
+///
+/// ```c
+/// #define SSL_get_tlsext_status_type(ssl) \
+///     SSL_ctrl(ssl, SSL_CTRL_GET_TLSEXT_STATUS_REQ_TYPE, 0, NULL)
+/// ```
+///
+/// Its answer is what `SSLCertCallback` turns into the `ocsp` boolean of the
+/// `oncertcb` info object: `TLSEXT_STATUSTYPE_ocsp` means the ClientHello carried
+/// a `status_request` extension. That is why a server with an `'OCSPRequest'`
+/// listener parks every handshake but only consults JavaScript when the client
+/// actually asked — the listener must not run for a client that did not.
+///
+/// # Safety
+///
+/// `ssl` must be live, or null.
+pub unsafe fn ssl_get_tlsext_status_type(ssl: *mut ffi::SSL) -> c_int {
+    if ssl.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller guarantees `ssl` is live.
+    unsafe {
+        ffi::SSL_ctrl(
+            ssl,
+            SSL_CTRL_GET_TLSEXT_STATUS_REQ_TYPE,
+            0,
+            std::ptr::null_mut(),
+        ) as c_int
+    }
+}
+
+/// `SSL_CTX_get0_chain_certs(ctx, &chain)`, a macro over `SSL_CTX_ctrl`
+/// (`ssl.h.in:1398`):
+///
+/// ```c
+/// #define SSL_CTX_get0_chain_certs(ctx, px509) \
+///     SSL_CTX_ctrl(ctx, SSL_CTRL_GET_CHAIN_CERTS, 0, px509)
+/// ```
+///
+/// Returns 1 with `*chain` set to the context's extra certificates (borrowed, not
+/// a new reference), or 0. `SSLPointer::setSniContext` replays them onto the
+/// `SSL` after installing the leaf, so a switched context presents its full chain
+/// rather than only the leaf.
+///
+/// # Safety
+///
+/// `ctx` must be live and `chain` a writable out-parameter.
+pub unsafe fn ssl_ctx_get0_chain_certs(
+    ctx: *mut ffi::SSL_CTX,
+    chain: *mut *mut ffi::stack_st_X509,
+) -> c_int {
+    if ctx.is_null() || chain.is_null() {
+        return 0;
+    }
+    *chain = std::ptr::null_mut();
+    // SAFETY: the caller guarantees `ctx` is live and `chain` writable.
+    unsafe { ffi::SSL_CTX_ctrl(ctx, SSL_CTRL_GET_CHAIN_CERTS, 0, chain.cast()) as c_int }
+}
+
+/// `SSL_set1_chain(ssl, chain)`, a macro over `SSL_ctrl` (`ssl.h.in:1422`):
+///
+/// ```c
+/// #define SSL_set1_chain(s, sk) SSL_ctrl(s, SSL_CTRL_CHAIN, 1, (char *)(sk))
+/// ```
+///
+/// The `1` is the up-ref flag, matching `SSL_set1_verify_cert_store`'s shape: the
+/// `SSL` takes its own reference on every certificate in the list, so the
+/// `SSL_CTX` that owns the list may be freed first.
+///
+/// # Safety
+///
+/// `ssl` must be live and `chain` null or a live stack.
+pub unsafe fn ssl_set1_chain(ssl: *mut ffi::SSL, chain: *mut ffi::stack_st_X509) -> c_int {
+    if ssl.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller guarantees `ssl` is live.
+    unsafe { ffi::SSL_ctrl(ssl, SSL_CTRL_CHAIN, 1, chain.cast()) as c_int }
 }
 
 #[cfg(test)]
