@@ -186,6 +186,49 @@ def write_json(path: pathlib.Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def npm_pack_entry(report: object, package_name: str, package_dir: pathlib.Path) -> dict:
+    """Pick this package's entry out of `npm pack --json`'s report.
+
+    npm changed the shape between major versions: up to npm 11 the report is an
+    **array** with one element per packed package, and from npm 12 it is an
+    **object keyed by package name**. Both are in the wild (npm 12.2.2 returns
+    the object), so both are accepted here.
+
+    The object form is resolved by this package's own name, never by "the first
+    value": a lookup that took whatever came first would silently pack the wrong
+    thing the day npm reports more than one entry, which is the same class of
+    failure as the `KeyError` this function replaced. A name that is not present
+    fails with the keys that are, so the next shape change names itself.
+    """
+    if isinstance(report, list):
+        if not report:
+            raise PackError(f"npm pack in {package_dir} reported no tarball")
+        first = report[0]
+        if not isinstance(first, dict) or "filename" not in first:
+            raise PackError(
+                f"npm pack in {package_dir} returned an array whose first element "
+                f"is not a pack record: {first!r}"
+            )
+        return first
+    if isinstance(report, dict):
+        entry = report.get(package_name)
+        if entry is None:
+            raise PackError(
+                f"npm pack in {package_dir} reported {sorted(report)} but not "
+                f"{package_name!r}; npm's --json shape may have changed again"
+            )
+        if not isinstance(entry, dict) or "filename" not in entry:
+            raise PackError(
+                f"npm pack in {package_dir} reported {package_name!r} without a "
+                f"filename: {entry!r}"
+            )
+        return entry
+    raise PackError(
+        f"npm pack in {package_dir} returned {type(report).__name__}, which is not "
+        f"the array (npm <=11) or the name-keyed object (npm 12+) this expects"
+    )
+
+
 def npm_pack(package_dir: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
     """Run `npm pack` and return the tarball it wrote.
 
@@ -205,9 +248,9 @@ def npm_pack(package_dir: pathlib.Path, out_dir: pathlib.Path) -> pathlib.Path:
         report = json.loads(result.stdout)
     except json.JSONDecodeError as error:
         raise PackError(f"npm pack in {package_dir} printed unparseable JSON: {error}") from error
-    if not report:
-        raise PackError(f"npm pack in {package_dir} reported no tarball")
-    filename = report[0]["filename"]
+    manifest = json.loads((package_dir / "package.json").read_text(encoding="utf-8"))
+    entry = npm_pack_entry(report, manifest["name"], package_dir)
+    filename = entry["filename"]
     tarball = out_dir / filename
     if not tarball.is_file():
         raise PackError(f"npm pack reported {filename} but {tarball} does not exist")

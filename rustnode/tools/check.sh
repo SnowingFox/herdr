@@ -683,4 +683,17 @@ step "the npm package manifest matches the binary and the workspace version"
 # the drift.
 python3 tools/npm-manifest-check.py
 
+step "the npm packer reads both npm <=11 and npm 12 --json shapes"
+# `npm 12` changed `npm pack --json` from an array to an object keyed by package
+# name, and the packer indexed it as an array, so `pack` died with `KeyError: 0`
+# after writing only the main tarball. The step above did not catch it because
+# the manifest check never invokes `npm pack` — the packing path was unexercised
+# in this gate and in CI.
+#
+# This runs the real `npm_pack()` against a stub `npm` that prints each shape as
+# data, so it needs no npm, no network and no release binary. It is the case
+# file's own negative control that makes it worth having: reverting the caller
+# to `report[0]["filename"]` fails seven of its eight cases.
+./tools/npm-pack-json-shape.test.sh
+
 printf '\nall checks passed\n'

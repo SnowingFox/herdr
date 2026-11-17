@@ -337,6 +337,20 @@ def main(argv: list[str]) -> int:
         # shell shim, so its resolution logic is free. This is the stable
         # assertion; the absolute delta below varies with machine load.
         overhead = shim_median - floor_median
+        # A negative median delta is not evidence that the shim is faster than
+        # the binary it execs; it is evidence that the box was too busy for this
+        # measurement to resolve anything. Reporting `ok` on one would be the
+        # same mistake as quoting a single flattering point: the number is
+        # printed either way, so it is labelled here instead of being trusted.
+        resolvable = shim_median - direct_median >= 0
+        if not resolvable:
+            print(
+                f"    WARNING  shim - direct is {shim_median - direct_median:+.2f} ms, i.e. the "
+                f"shim measured FASTER than the binary it execs.\n"
+                f"             That is physically impossible, so this timing run resolved nothing:\n"
+                f"             the machine was too loaded for these samples to mean anything.\n"
+                f"             Re-run on a quiet box before quoting any figure above."
+            )
         check(overhead < 2.0, f"resolution logic adds nothing over a minimal shim ({overhead:+.2f} ms)")
         # And the absolute cost stays in shell-startup territory next to a ~26 ms
         # boot. The bound is loose on purpose: the real number is `sh`'s cost on
