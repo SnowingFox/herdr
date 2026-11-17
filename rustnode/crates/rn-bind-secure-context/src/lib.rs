@@ -32,8 +32,8 @@
 //! throws names itself.
 //!
 //! [`stubs`] is the list of what throws and why. The short version: the
-//! certificate-compression path, the PKCS#12 loader, the ticket-key HMAC
-//! callback, and the bundled/extra root store are not implemented. Everything in
+//! certificate-compression path, the ticket-key HMAC callback, and the
+//! bundled/extra root store are not implemented. Everything in
 //! `configSecureContext`'s default path — ciphers, protocols, CA certs, cert,
 //! key, CRL, session settings, ticket keys, ECDH curve and DH parameters — is
 //! real OpenSSL work against a real `SSL_CTX`.
@@ -50,6 +50,7 @@
 //! not provide a namespace.
 
 use std::cell::RefCell;
+use std::ffi::CStr;
 
 use rn_v8_sys::v8;
 
@@ -102,11 +103,6 @@ pub const STUBS: &[(&str, &str)] = &[
         "RFC 8879 certificate compression needs SSL_CTX_set1_cert_comp_preference \
          plus the pre-compressed-cert cache that SNI context switching replays. \
          Node gates it on NODE_OPENSSL_HAS_CERT_COMP; it is not wired here.",
-    ),
-    (
-        "loadPKCS12",
-        "The .pfx/.p12 path needs PKCS12_parse plus the cert/key/CA installation \
-         sequence. The keys slice owns the PKCS#12 parser, so this lands with it.",
     ),
     (
         "enableTicketKeyCallback",
@@ -761,6 +757,81 @@ fn close(
     let _ = with_state(args.this(), |context| context.close());
 }
 
+/// `loadPKCS12(pfx[, passphrase])`.
+fn load_pkcs12(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue,
+) {
+    if args.length() < 1 {
+        throw_coded(
+            scope,
+            "PFX certificate argument is mandatory",
+            "ERR_MISSING_ARGS",
+        );
+        return;
+    }
+
+    let Some(bundle) = bytes_of(args.get(0)) else {
+        throw_coded(
+            scope,
+            "Unable to load PFX certificate",
+            "ERR_CRYPTO_OPERATION_FAILED",
+        );
+        return;
+    };
+
+    let passphrase = if args.length() >= 2 {
+        let value = args.get(1);
+        if value.is_undefined() || value.is_null() {
+            None
+        } else {
+            match bytes_of(value) {
+                Some(bytes) => Some(bytes),
+                None => {
+                    throw_type_error(scope, "Pass phrase must be a buffer");
+                    return;
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    let result = with_state(args.this(), |context| {
+        context.load_pkcs12(&bundle, passphrase.as_deref())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(context::LoadPkcs12Error::Parse(
+            rn_bind_crypto_x509::pkcs12::Pkcs12Error::UnsupportedAlgorithm,
+        ))) => throw_coded(
+            scope,
+            "Unsupported PKCS12 PFX data",
+            "ERR_CRYPTO_UNSUPPORTED_OPERATION",
+        ),
+        Some(Err(context::LoadPkcs12Error::Parse(
+            rn_bind_crypto_x509::pkcs12::Pkcs12Error::NotRecognised,
+        ))) => throw_pfx_error(scope, 0),
+        Some(Err(context::LoadPkcs12Error::Parse(
+            rn_bind_crypto_x509::pkcs12::Pkcs12Error::Failed(packed),
+        ))) => throw_pfx_error(scope, packed),
+        Some(Err(context::LoadPkcs12Error::MissingPrivateKey)) => throw_coded(
+            scope,
+            "Unable to load private key from PFX data",
+            "ERR_CRYPTO_OPERATION_FAILED",
+        ),
+        Some(Err(context::LoadPkcs12Error::MissingCertificate)) => throw_coded(
+            scope,
+            "Unable to load certificate from PFX data",
+            "ERR_CRYPTO_OPERATION_FAILED",
+        ),
+        Some(Err(context::LoadPkcs12Error::Failed(packed))) => throw_pfx_error(scope, packed),
+        Some(Err(context::LoadPkcs12Error::Context(error))) => throw_context_error(scope, &error),
+        None => throw_type_error(scope, "Invalid SecureContext receiver"),
+    }
+}
+
 /// `_external` reads the `SSL_CTX` address.
 ///
 /// Node returns a `v8::External` wrapping the raw pointer, and a real `node`
@@ -813,11 +884,6 @@ stub_method!(
     set_certificate_compression,
     "setCertificateCompression",
     "certificate compression is not wired to the OpenSSL bindings here."
-);
-stub_method!(
-    load_pkcs12,
-    "loadPKCS12",
-    "the PKCS#12 loader lands with the keys slice."
 );
 stub_method!(
     enable_ticket_key_callback,
@@ -1147,6 +1213,42 @@ fn throw_coded(scope: &mut v8::PinScope<'_, '_>, message: &str, code: &str) {
         }
     }
     scope.throw_exception(exception);
+}
+
+/// The historical TLS `pfx` error shape Node emits.
+fn throw_pfx_error(scope: &mut v8::PinScope<'_, '_>, packed: u64) {
+    if packed != 0 {
+        // OpenSSL's `ERR_GET_REASON`: the low 23 bits.
+        if (packed & 0x7F_FFFF) as i32 == 252 {
+            throw_coded(
+                scope,
+                "Unsupported PKCS12 PFX data",
+                "ERR_CRYPTO_UNSUPPORTED_OPERATION",
+            );
+            return;
+        }
+
+        // SAFETY: OpenSSL returns a static NUL-terminated reason string or null.
+        let pointer =
+            unsafe { openssl_sys::ERR_reason_error_string(packed as std::os::raw::c_ulong) };
+        if !pointer.is_null() {
+            // SAFETY: `pointer` is a static C string from OpenSSL.
+            let reason = unsafe { CStr::from_ptr(pointer) }.to_string_lossy();
+            if reason == "unsupported" {
+                throw_coded(
+                    scope,
+                    "Unsupported PKCS12 PFX data",
+                    "ERR_CRYPTO_UNSUPPORTED_OPERATION",
+                );
+                return;
+            }
+            if !reason.is_empty() {
+                throw(scope, &reason);
+                return;
+            }
+        }
+    }
+    throw(scope, "Unknown error");
 }
 
 /// Throws a plain `TypeError`, which is what a bad argument type is in Node.
