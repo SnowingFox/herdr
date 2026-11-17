@@ -195,6 +195,16 @@ fn main() {
     // allow-list version of this function could not detect.
     apply_v8_flags(&options.v8_args);
 
+    // `--version` answers here, exactly where `src/node.cc:1282` does it: after
+    // `InitializeNodeWithArgsInternal` has applied the V8 argument vector and
+    // before `V8::Initialize`, the inspector, or any realm exists. The position
+    // is observable in both directions — `node --version --not-a-real-flag` is a
+    // `bad option` and exits 9 because V8 rejects the flag first, while
+    // `node --version --inspect` prints the version and never opens the socket.
+    if options.print_version {
+        println!("{}", rn_realm::versions::process_version_string());
+        terminate(0);
+    }
 
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
@@ -452,8 +462,8 @@ fn main() {
                     rn_core::profile::mark("install_stdio + console");
                     // Node's entry points are main scripts, and each of them
                     // calls `prepareMainThreadExecution()` itself: that is the
-                    // first line of `run_main_module.js` and `eval_stdin.js`
-                    // alike. The CLI calls it here only for the
+                    // first line of `run_main_module.js`, `print_help.js` and
+                    // `eval_stdin.js` alike. The CLI calls it here only for the
                     // paths it drives itself — `-e`, a file entry point, and the
                     // empty program — so a main script must not find it already
                     // run. Node enforces the same ordering with the assertion in
@@ -572,27 +582,45 @@ fn main() {
             print_result = *print;
             value = evaluate_script(scope, code).map(|value| v8::Global::new(scope, value));
         }
-        // `internal/main/eval_stdin` is Node's own entry point for a script read
-        // from standard input, run as a main script. It is not reimplemented
-        // here for the same reason a file is not: it reads stdin through
-        // `process.stdin`, honours `--input-type`, `--print` and
+        // `internal/main/eval_stdin` and `internal/main/print_help` are Node's
+        // own entry points, run as main scripts. They are not reimplemented
+        // here for the same reason a file is not: `eval_stdin` reads stdin
+        // through `process.stdin`, honours `--input-type`, `--print` and
         // `--strip-types`, and hands the code to `evalScript`, which is what
         // gives the module `module`/`exports`/`require`/`__filename` and makes
         // `require.main` undefined — reproducing that by hand would be a second
         // copy of `evalScript`'s semantics.
-        args::Source::Stdin { .. } => {
+        //
+        // `print_help` is the same argument one surface over: the usage text is
+        // generated from the option table at run time, so a Rust-side copy
+        // would silently drift from the table `getOptionValue` reports.
+        args::Source::Stdin { .. } | args::Source::Help => {
             let id = options
                 .source
                 .main_script_id()
-                .expect("stdin names a main script");
+                .expect("both sources name a main script");
             // The main scripts call `prepareMainThreadExecution()` themselves,
             // which is why the CLI skipped its own call above. A failure is
             // reported through the same uncaught path a file entry point uses:
-            // `eval_stdin` reports the user script's throw from inside its own
-            // `end` handler.
+            // `print_help` throwing is a startup error, and `eval_stdin` reports
+            // the user script's throw from inside its own `end` handler.
             let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
             let scope = &mut try_catch.init();
-            let failure = bootstrap::run_main_script(scope, id);
+            let failure = match options.source.program_name_substitutions() {
+                // `--help` writes its usage header as the literal `node`, and
+                // the vendored tree has to stay byte-identical to Node's, so the
+                // name is substituted in the source rather than in the file.
+                substitutions if !substitutions.is_empty() => {
+                    rn_js2c::builtin_by_id(id).and_then(|builtin| {
+                        let mut source = builtin.source().to_string();
+                        for (needle, replacement) in substitutions {
+                            source = source.replace(needle, replacement);
+                        }
+                        bootstrap::run_main_script_with_source(scope, id, &source)
+                    })
+                }
+                _ => bootstrap::run_main_script(scope, id),
+            };
             if let Some(message) = failure {
                 eprintln!("{message}");
             }

@@ -590,8 +590,11 @@ mod tests {
 
     #[test]
     fn node_version_matches_process_version() {
-        // `napi_get_node_version` must agree with `process.version`, which the
-        // CLI reports from this same constant through the pinned tree.
+        // `napi_get_node_version` fills three integers, so it carries the
+        // `MAJOR.MINOR.PATCH` part of the release identity rather than a
+        // nightly's date-and-SHA suffix — Node's own `napi_get_node_version` has
+        // the same shape. `rn-realm` owns the full string and asserts this prefix
+        // against `tools/node-pin.toml`.
         assert_eq!(
             format!("v{NODE_MAJOR_VERSION}.{NODE_MINOR_VERSION}.{NODE_PATCH_VERSION}"),
             "v28.0.0"

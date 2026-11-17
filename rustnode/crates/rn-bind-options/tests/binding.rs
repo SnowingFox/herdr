@@ -245,6 +245,8 @@ fn cli_option_info_is_two_maps_with_the_expected_entries() {
               helpEnvSetting: help.envVarSettings,
               alias: aliases.get('-h'),
               groupAlias: aliases.get('--inspect='),
+              profAlias: aliases.get('--prof-process'),
+              profLen: aliases.get('--prof-process').length,
             });
             "#,
         );
@@ -254,7 +256,7 @@ fn cli_option_info_is_two_maps_with_the_expected_entries() {
                 r#"{"optionsIsMap":true,"aliasesIsMap":true,"#,
                 r#""title":{"helpText":"the process title to use on startup","envVarSettings":0,"type":5,"defaultIsTrue":false},"#,
                 r#""titleKeys":["helpText","envVarSettings","type","defaultIsTrue"],"titleProto":null,"#,
-                r#""helpEnvSetting":1,"alias":["--help"],"groupAlias":["--inspect-port","--inspect"]}"#
+                r#""helpEnvSetting":1,"alias":["--help"],"groupAlias":["--inspect-port","--inspect"],"profAlias":["--prof-process","--"],"profLen":2}"#
             )
         );
     });

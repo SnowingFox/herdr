@@ -1,4 +1,4 @@
-//! A script piped on stdin runs, the way Node's own CLI runs it.
+//! The two command-line surfaces Node's own CLI has and rustnode did not.
 //!
 //! # A script piped on stdin did not run, and exited 0
 //!
@@ -18,11 +18,26 @@
 //! `__filename` and a `[stdin]` module id, while leaving `require.main`
 //! undefined.
 //!
+//! # `--version`, `-v`, `--help` and `-h` were all rejected
+//!
+//! ```text
+//! $ rustnode --version -> rustnode: unsupported option '--version'
+//! ```
+//!
+//! They are ordinary options in Node's table (`src/node_options.cc:1694-1696`,
+//! with the `-h`/`-v` aliases), and their output is part of the interface: a
+//! version check reads it, and CI compares it. `--version` is answered in
+//! `InitializeOncePerProcess` after the V8 argument vector is applied, which is
+//! why `node --version --not-a-real-flag` is a `bad option` and exits 9 instead
+//! of printing. `--help` is a main script (`internal/main/print_help`), so it
+//! runs with the realm up and its text is generated from the option table.
+//!
 //! # Why the expectations are literal here
 //!
-//! The expected output is what the reference binary produces, written down
-//! rather than compared against whatever `node` is on `PATH`: a different Node
-//! is a different engine.
+//! The version string is compared against `tools/node-pin.toml` rather than
+//! against whatever `node` is on `PATH`: a different Node is a different engine,
+//! and the point of these assertions is that the pinned identity is what this
+//! binary reports.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -61,6 +76,18 @@ fn run(arguments: &[&str], stdin: &str) -> Run {
     }
 }
 
+/// The version `tools/node-pin.toml` records for the reference binary.
+fn pinned_version() -> String {
+    let pin = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/node-pin.toml"),
+    )
+    .expect("the pin is readable");
+    pin.lines()
+        .find_map(|line| line.trim().strip_prefix("oracle_version = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("the pin records oracle_version")
+        .to_string()
+}
 
 /// A bare pipe runs the script and exits 0. The bug this file exists for.
 #[test]
@@ -173,4 +200,113 @@ fn an_empty_pipe_exits_zero() {
     let run = run(&[], "");
     assert_eq!(run.stdout, "");
     assert_eq!(run.status, Some(0));
+}
+
+/// `--version` and `-v` print the pinned version identity and exit 0.
+///
+/// The exact bytes matter: the string is what a CI version check compares, so a
+/// trailing newline and the leading `v` are part of the contract.
+#[test]
+fn version_prints_the_pinned_identity() {
+    let expected = format!("{}\n", pinned_version());
+    for argument in ["--version", "-v"] {
+        let run = run(&[argument], "");
+        assert_eq!(run.stdout, expected, "{argument}");
+        assert_eq!(run.stderr, "", "{argument}");
+        assert_eq!(run.status, Some(0), "{argument}");
+    }
+}
+
+/// The version wins over a script argument, which is what `node --version
+/// app.js` does: it prints the version and never loads `app.js`.
+#[test]
+fn version_wins_over_a_script_argument() {
+    let run = run(&["--version", "definitely-not-a-script.js"], "");
+    assert_eq!(run.stdout, format!("{}\n", pinned_version()));
+    assert_eq!(run.status, Some(0));
+}
+
+/// A flag after the eval source belongs to the script, so `node -e ... a
+/// --version` does not print the version.
+///
+/// This is the direction that is easy to get wrong, and the one that matters: a
+/// program that accepts `--version` of its own would otherwise never see it.
+#[test]
+fn a_flag_after_the_script_belongs_to_the_script() {
+    let run = run(
+        &[
+            "-e",
+            "console.log(JSON.stringify(process.argv.slice(1)))",
+            "a",
+            "--version",
+        ],
+        "",
+    );
+    assert_eq!(run.stdout.trim(), r#"["a","--version"]"#, "{}", run.stderr);
+}
+
+/// `--help` prints Node's usage text, with this binary's name in the two places
+/// the text names the program.
+#[test]
+fn help_prints_the_usage_text() {
+    let run = run(&["--help"], "");
+    assert_eq!(run.status, Some(0));
+    assert_eq!(run.stderr, "");
+    let first_line = run.stdout.lines().next().unwrap_or_default();
+    assert_eq!(
+        first_line, "Usage: rustnode [options] [ script.js ] [arguments]",
+        "the usage line has to name this binary"
+    );
+    assert!(
+        run.stdout.contains("       rustnode inspect [options]"),
+        "the inspect usage line has to name it too"
+    );
+    // The text is generated from the option table, so it has to be the whole
+    // table rather than a header: these are entries from different parts of it,
+    // including one whose help text wraps.
+    for needle in [
+        "  -                           script read from stdin (default if no",
+        "  -e, --eval=...              evaluate script",
+        "  -v, --version               print Node.js version",
+        "Documentation can be found at https://nodejs.org/",
+    ] {
+        assert!(run.stdout.contains(needle), "missing {needle:?}");
+    }
+}
+
+/// `-h` is the same text as `--help`.
+#[test]
+fn short_help_is_the_same_text() {
+    let long = run(&["--help"], "");
+    let short = run(&["-h"], "");
+    assert_eq!(short.stdout, long.stdout);
+    assert_eq!(short.status, Some(0));
+}
+
+/// `--help` wins over `-e`, which is the order `src/node.cc:371` puts them in:
+/// the help check comes before the `has_eval_string` branch.
+#[test]
+fn help_wins_over_an_eval_string() {
+    let run = run(&["-e", "console.log('EVALSCRIPT-EXECUTED')", "--help"], "");
+    assert!(
+        !run.stdout.contains("EVALSCRIPT-EXECUTED"),
+        "the eval script must not run: {}",
+        run.stdout
+    );
+    assert!(run.stdout.starts_with("Usage: rustnode "), "{}", run.stdout);
+    assert_eq!(run.status, Some(0));
+}
+
+/// A rejected flag still fails when `--version` was asked for, because V8 sees
+/// the argument vector before Node answers the version request.
+#[test]
+fn a_rejected_flag_beats_version() {
+    let run = run(&["--version", "--not-a-real-flag"], "");
+    assert_eq!(run.status, Some(9));
+    assert!(
+        run.stderr.contains("bad option: --not-a-real-flag"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stdout.is_empty(), "{}", run.stdout);
 }
