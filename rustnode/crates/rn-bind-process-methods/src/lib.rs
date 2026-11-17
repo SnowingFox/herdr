@@ -30,7 +30,7 @@ use dlopen::{dlopen as dlopen_binding, dlopen_binary};
 use rn_core::{AliasedUint8Array, BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
-pub use dlopen::{last_env, loaded_addon_count};
+pub use dlopen::{last_env, loaded_addon_count, run_addon_teardowns};
 
 /// Members exposed on the namespace object, matching
 /// `contracts/process_methods.json`.

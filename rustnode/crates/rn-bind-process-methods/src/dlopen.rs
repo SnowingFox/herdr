@@ -40,6 +40,61 @@ thread_local! {
     static ADDONS: RefCell<Vec<LoadedAddon>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Runs every loaded addon's teardown, in Node's order.
+///
+/// `Environment::RunCleanup` runs each environment's hooks when the environment
+/// stops. This runtime has one process-lifetime environment per loaded addon, so
+/// the equivalent moment is process exit, and this is what the CLI calls there —
+/// **before** `rn_uv::threadpool::drain()`, because a cleanup hook must not run
+/// after the pool that may still hold an addon's work has been torn down.
+///
+/// Not a `Drop` impl on [`LoadedAddon`]: `std::process::exit` does not run
+/// destructors, and that is how every exit in this runtime ends. A destructor
+/// here would be dead code on the only path that matters.
+///
+/// Visits newest-first, matching the reverse-registration principle Node applies
+/// within one environment: the last addon loaded may depend on an earlier one, so
+/// it is torn down first.
+///
+/// Idempotent per environment — each `Env` takes its hooks and instance-data slot
+/// on the first call — so a second call is a cheap no-op rather than a double
+/// free. That matters because this can be reached from both the normal exit path
+/// and a `process.reallyExit`, and there is no ordering guarantee between them.
+///
+/// Returns how many environments reported that they ran something, so a test can
+/// distinguish "no addons loaded" from "an addon with no hooks".
+pub fn run_addon_teardowns() -> usize {
+    // Taken out of the thread-local for the duration: a hook that loads another
+    // addon re-enters `dlopen`, which pushes onto `ADDONS`, and holding the
+    // borrow across the hooks would make that push a silent no-op.
+    let addons: Vec<LoadedAddon> = ADDONS
+        .with(|slot| {
+            slot.try_borrow_mut()
+                .map(|mut all| std::mem::take(&mut *all))
+        })
+        .unwrap_or_default();
+
+    let mut ran = 0;
+    for addon in addons.iter().rev() {
+        // SAFETY: the environment was created by `rn_napi::load` and has not been
+        // freed; `LoadedAddon` owns it for as long as this list does.
+        if unsafe { rn_napi::env::run_env_teardown(addon.env()) } {
+            ran += 1;
+        }
+    }
+
+    // Returned to the list so the library handles are not dropped here — dropping
+    // one would `dlclose` an addon whose hooks just ran and whose function
+    // pointers JavaScript may still hold until the process actually exits.
+    ADDONS.with(|slot| {
+        if let Ok(mut all) = slot.try_borrow_mut() {
+            all.extend(addons);
+        }
+    });
+
+    ran
+}
+
 /// Whether this process may load native addons at all.
 ///
 /// `Environment::no_native_addons()` is `!options_->allow_native_addons`, and

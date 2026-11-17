@@ -84,15 +84,23 @@ impl ErrorSlot {
 }
 
 /// One `napi_add_async_cleanup_hook` registration.
+///
+/// Carries its environment so removal can unlink it: the shim takes no
+/// `napi_env`, and once a teardown drains the list a freed handle left in it
+/// would be dereferenced at exit.
 pub(crate) struct AsyncCleanupHook {
-    hook: crate::abi::NapiAsyncCleanupHook,
-    arg: *mut std::ffi::c_void,
+    pub(crate) hook: crate::abi::NapiAsyncCleanupHook,
+    pub(crate) arg: *mut std::ffi::c_void,
+    /// The environment that owns this handle, so removal can reach its list.
+    pub(crate) env: *const Env,
 }
 
-/// Removes and frees an async cleanup hook handle.
+/// Removes an async cleanup hook by unlinking it from its environment's list.
 ///
-/// Freeing is the removal: the handle owns the registration, as Node's does.
-/// Returns `false` for a handle this runtime did not produce.
+/// # Safety
+///
+/// `handle` must be one `Env::add_async_cleanup_hook` produced and must not have
+/// been removed already.
 pub(crate) unsafe fn remove_async_cleanup_hook(
     handle: *mut crate::abi::NapiAsyncCleanupHookHandle,
 ) -> bool {
@@ -100,11 +108,23 @@ pub(crate) unsafe fn remove_async_cleanup_hook(
         return false;
     }
     // SAFETY: the caller passes a handle from `Env::add_async_cleanup_hook`, which
-    // allocated it with `Box::into_raw` and frees it exactly once here.
-    drop(unsafe { Box::from_raw(handle.cast::<AsyncCleanupHook>()) });
+    // allocated it with `Box::into_raw`.
+    let boxed = unsafe { Box::from_raw(handle.cast::<AsyncCleanupHook>()) };
+    // Unlink before freeing. `napi_remove_async_cleanup_hook` takes no `napi_env`,
+    // which is why the handle remembers its own owner: without this the freed
+    // pointer stays in the environment's list and a teardown dereferences it,
+    // which is a use-after-free at exit rather than an error an addon can see.
+    if !boxed.env.is_null() {
+        // SAFETY: `env` was stored by `add_async_cleanup_hook` from a live `&self`
+        // and the environment outlives every handle registered on it.
+        let environment = unsafe { &*boxed.env };
+        if let Ok(mut hooks) = environment.async_cleanup_hooks.try_borrow_mut() {
+            hooks.retain(|other| *other != handle);
+        }
+    }
+    drop(boxed);
     true
 }
-
 /// Reports `error` through Node's uncaught-exception path.
 ///
 /// # Safety
@@ -327,7 +347,7 @@ impl Env {
     /// `test_cleanup_hook` fail on the missing teardown rather than on the missing
     /// symbol. Reported rather than stubbed into a lie.
     #[allow(dead_code)]
-    pub(crate) fn run_cleanup_hooks(&self) {
+    pub fn run_cleanup_hooks(&self) {
         let hooks = match self.cleanup_hooks.try_borrow_mut() {
             Ok(mut hooks) => std::mem::take(&mut *hooks),
             Err(_) => return,
@@ -349,7 +369,7 @@ impl Env {
     /// [`Self::run_cleanup_hooks`]), so nothing calls this; it exists so the
     /// registration's payload is read rather than stored and forgotten.
     #[allow(dead_code)]
-    pub(crate) fn run_async_cleanup_hooks(&self) {
+    pub fn run_async_cleanup_hooks(&self) {
         let handles = match self.async_cleanup_hooks.try_borrow_mut() {
             Ok(mut hooks) => std::mem::take(&mut *hooks),
             Err(_) => return,
@@ -425,6 +445,49 @@ impl Env {
         self.instance_data.get().map(|(data, _)| data)
     }
 
+    /// Runs this environment's full teardown, in Node's order.
+    ///
+    /// Node's `Environment::RunCleanup` does these in this sequence, and each step
+    /// is observable from an addon, so the order is part of the contract rather
+    /// than an implementation detail:
+    ///
+    /// 1. **Async cleanup hooks first** — `CleanupHandles`, which runs the
+    ///    `napi_add_async_cleanup_hook` payloads.
+    /// 2. **Then the plain cleanup hooks, in reverse registration order** — a
+    ///    hook registered last can still use what an earlier one set up.
+    /// 3. **Then the instance-data finalizer** — `napi_set_instance_data`'s
+    ///    callback, which is what `test_instance_data` asserts as `addon_free`.
+    ///
+    /// Taking the hooks before running them is deliberate and matches Node's
+    /// `std::mem::take`-equivalent at the head of each drain, with one difference
+    /// that matters: Node re-checks membership before each call so a hook removed
+    /// by an already-running hook does not fire. `take()` cannot express that, so
+    /// a removal during teardown is only honoured for hooks not yet taken. That
+    /// gap is recorded here rather than hidden; `test_cleanup_hook` removes its
+    /// hook *before* teardown begins, so it does not exercise it.
+    ///
+    /// Returns whether anything ran, so a caller can tell "no addons" from "an
+    /// addon with no hooks".
+    pub fn run_teardown(&self) -> bool {
+        let had_async = !self.async_cleanup_hooks.borrow().is_empty();
+        let had_plain = !self.cleanup_hooks.borrow().is_empty();
+        let had_instance = self.instance_data.get().is_some();
+
+        self.run_async_cleanup_hooks();
+        self.run_cleanup_hooks();
+
+        // The instance-data finalizer runs last, and only once: `take` clears the
+        // slot so a second teardown cannot double-free an addon's payload.
+        if let Some((data, Some(finalize))) = self.instance_data.take() {
+            let env = self as *const Self as *mut NapiEnv;
+            // SAFETY: the addon registered this callback with this pointer and has
+            // not been told the environment is gone yet.
+            unsafe { finalize(env, data, std::ptr::null_mut()) };
+        }
+
+        had_async || had_plain || had_instance
+    }
+
     /// Adds a reference and returns its opaque handle.
     ///
     /// Node's `napi_ref` is a pointer to a heap `Reference`; here it is a
@@ -498,7 +561,14 @@ impl Env {
         hook: crate::abi::NapiAsyncCleanupHook,
         arg: *mut std::ffi::c_void,
     ) -> *mut crate::abi::NapiAsyncCleanupHookHandle {
-        let entry = Box::new(AsyncCleanupHook { hook, arg });
+        // The environment pointer is recorded here because
+        // `napi_remove_async_cleanup_hook` takes no `napi_env`, and removal has to
+        // unlink the handle from this list before freeing it.
+        let entry = Box::new(AsyncCleanupHook {
+            hook,
+            arg,
+            env: self as *const Self,
+        });
         let handle = Box::into_raw(entry).cast::<crate::abi::NapiAsyncCleanupHookHandle>();
         if let Ok(mut hooks) = self.async_cleanup_hooks.try_borrow_mut() {
             hooks.push(handle);
@@ -617,6 +687,29 @@ pub(crate) unsafe fn env_from<'a>(env: *mut NapiEnv) -> Option<&'a Env> {
     // it is still alive. Only `&Env` is produced, never `&mut`, so nested calls
     // may hold it at the same time.
     Some(unsafe { &*(env as *const Env) })
+}
+
+/// Runs one addon environment's teardown.
+///
+/// The raw-pointer entry point for a caller that owns the environment without
+/// being this crate — `rn-bind-process-methods` keeps the loaded-addon list, but
+/// it must not dereference an `Env` itself: the layout and the lifetime rule
+/// belong here, where the box is created.
+///
+/// Returns `false` for a null or unknown pointer, so a caller with a stale entry
+/// gets a miss rather than a wild deref.
+///
+/// # Safety
+///
+/// `env` must be null or a pointer this crate produced for a boxed [`Env`] that
+/// has not been freed.
+pub unsafe fn run_env_teardown(env: *mut NapiEnv) -> bool {
+    // SAFETY: the caller guarantees the pointer is one this crate created and is
+    // still alive.
+    match unsafe { env_from(env) } {
+        Some(environment) => environment.run_teardown(),
+        None => false,
+    }
 }
 
 /// Reads a NUL-terminated C string the addon passed, as UTF-8.
