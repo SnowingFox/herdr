@@ -432,12 +432,13 @@ unsafe extern "C" fn on_connection(server: *mut uv::uv_stream_t, status: i32) {
     let Some(state) = (unsafe { handle::owner(server) }) else {
         return;
     };
-    // SAFETY: the owner pointer is live while the handle is.
-    let state = unsafe { &*state };
 
     if status != 0 {
         rn_uv::callback::with_context(|scope| {
-            call_onconnection(scope, state, status, None);
+            // SAFETY: `state` came from the live listening stream's owner
+            // pointer, and `deliver_connection` ends its own borrow before the
+            // JavaScript runs.
+            unsafe { handle::deliver_connection(scope, state, status, None) };
         });
         return;
     }
@@ -468,40 +469,10 @@ unsafe extern "C" fn on_connection(server: *mut uv::uv_stream_t, status: i32) {
             }
             return;
         };
-        call_onconnection(scope, state, 0, Some(object));
+        // SAFETY: `state` is the live listening stream's owner, and
+        // `deliver_connection` ends its own borrow before the JavaScript runs.
+        unsafe { handle::deliver_connection(scope, state, 0, Some(object)) };
     });
-}
-
-/// Calls `server.onconnection(status, handle)`, `this` being the server.
-fn call_onconnection(
-    scope: &mut v8::PinScope<'_, '_>,
-    state: &rn_uv::handle::StreamState,
-    status: i32,
-    client: Option<v8::Local<v8::Object>>,
-) {
-    let Some(object) = state
-        .owner_object
-        .as_ref()
-        .map(|object| v8::Local::new(scope, object))
-    else {
-        return;
-    };
-    let Some(key) = v8::String::new(scope, "onconnection") else {
-        return;
-    };
-    let Some(value) = object.get(scope, key.into()) else {
-        return;
-    };
-    let Ok(callback) = v8::Local::<v8::Function>::try_from(value) else {
-        return;
-    };
-    let status_value: v8::Local<v8::Value> = v8::Integer::new(scope, status).into();
-    let handle_value: v8::Local<v8::Value> = match client {
-        Some(client) => client.into(),
-        None => v8::undefined(scope).into(),
-    };
-    let receiver: v8::Local<v8::Value> = object.into();
-    let _ = callback.call(&*scope, receiver, &[status_value, handle_value]);
 }
 
 /// `PipeWrap::Connect`: `connect(req, path)`.

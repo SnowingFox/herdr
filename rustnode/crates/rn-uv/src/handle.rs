@@ -491,6 +491,90 @@ fn onread_of<'s>(
     v8::Local::<v8::Function>::try_from(value).ok()
 }
 
+/// Calls `handle.onconnection(status, client)` for a listening stream.
+///
+/// This is `TCPWrap::OnConnection`'s and `PipeWrap::OnConnection`'s final step:
+/// `MakeCallback(env()->onconnection_string(), ...)`
+/// (`src/tcp_wrap.cc`, `src/pipe_wrap.cc`). `lib/net.js` assigns that property
+/// on the server handle, so it is read here rather than stored.
+///
+/// # Why this is not a bare `callback.call`
+///
+/// Both callers used to do `let _ = callback.call(..)` directly under
+/// `with_context`, and that is the reason a throwing `'connection'` handler
+/// printed `node:internal/tls/wrap:28443: Uncaught Error: …` on **stdout** and
+/// left the process exiting **0**. `with_context` installs no `TryCatch`, so
+/// the exception stayed pending until V8's default reporter saw it at
+/// teardown — which prints to stdout and sets no exit code. Node runs an
+/// accepted socket's `'connection'` handler inside the same
+/// `InternalCallbackScope` a read uses, so a throw there reaches
+/// `process._fatalException` exactly like a read's does.
+///
+/// [`rn_core::callback_scope::with_scope`] is that scope: it installs the
+/// `TryCatch` and routes a caught exception through the registered
+/// `report_uncaught` hook, which is `rn_errors`' single implementation of the
+/// `_fatalException` order.
+///
+/// The caller supplies the scope because it is already inside one: both
+/// `on_connection` bodies need one to build the client wrapper.
+///
+/// # Safety
+///
+/// `state` must be live, and the caller must hold no reference to it across this
+/// call: the callback can `destroy()` the server, which mutates the same state.
+pub unsafe fn deliver_connection(
+    scope: &mut v8::PinScope<'_, '_>,
+    state: *const StreamState,
+    status: i32,
+    client: Option<v8::Local<'_, v8::Object>>,
+) {
+    if state.is_null() {
+        return;
+    }
+    // Everything the callback needs is taken under a borrow that ends before the
+    // call, for the reason the doc comment above gives.
+    let Some((owner, context, frame)) = ({
+        // SAFETY: the caller guarantees `state` is live.
+        let state = unsafe { &*state };
+        state.owner_object.clone().map(|owner| {
+            (
+                owner,
+                rn_core::callback_scope::AsyncContext {
+                    async_id: state.async_wrap.async_id,
+                    trigger_async_id: state.async_wrap.trigger_async_id,
+                },
+                state.context_frame.clone(),
+            )
+        })
+    }) else {
+        return;
+    };
+    let args = rn_core::callback_scope::ScopeArgs {
+        context,
+        resource: Some(owner.clone()),
+        frame,
+    };
+    let object: v8::Local<'_, v8::Object> = v8::Local::new(scope, &owner);
+    let Some(key) = v8::String::new(scope, "onconnection") else {
+        return;
+    };
+    let Some(value) = object.get(scope, key.into()) else {
+        return;
+    };
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(value) else {
+        return;
+    };
+    let status_value: v8::Local<'_, v8::Value> = v8::Integer::new(scope, status).into();
+    let handle_value: v8::Local<'_, v8::Value> = match client {
+        Some(client) => client.into(),
+        None => v8::undefined(&*scope).into(),
+    };
+    let _ = rn_core::callback_scope::with_scope(scope, args, |scope| {
+        let receiver: v8::Local<'_, v8::Value> = object.into();
+        let _ = callback.call(&*scope, receiver, &[status_value, handle_value]);
+    });
+}
+
 /// Casts a typed handle pointer to the `uv_handle_t` libuv's generic calls want.
 pub fn as_handle<T>(handle: *mut T) -> *mut uv::uv_handle_t {
     handle.cast()
