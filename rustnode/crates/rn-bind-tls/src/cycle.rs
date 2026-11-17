@@ -72,6 +72,15 @@ pub enum IoOutcome {
     /// `SSL_ERROR_WANT_WRITE`: `enc_out_` needs draining before the call can
     /// proceed.
     WantWrite,
+    /// `SSL_ERROR_WANT_X509_LOOKUP`: the handshake is parked until JavaScript
+    /// answers the certificate callback.
+    ///
+    /// This is not an error and not a retry-with-more-data: `SSL_set_cert_cb`'s
+    /// callback returned `-1` to suspend, so the only thing that can make
+    /// progress is `certCbDone` calling `SSL_do_handshake` again. Treating it as
+    /// `SSL_error 4` — which the catch-all arm did — turned the parked handshake
+    /// into `tlsClientError: SSL error 4` while the resume was still pending.
+    CertCbParked,
     /// `SSL_ERROR_ZERO_RETURN`: the peer sent a clean close-notify.
     ZeroReturn,
     /// `SSL_ERROR_SYSCALL` with `ret == 0`: the peer closed without a
@@ -102,6 +111,7 @@ impl IoOutcome {
             ffi::SSL_ERROR_NONE => Self::Wrote(moved),
             ffi::SSL_ERROR_WANT_READ => Self::WantRead,
             ffi::SSL_ERROR_WANT_WRITE => Self::WantWrite,
+            crate::ffi_extra::SSL_ERROR_WANT_X509_LOOKUP => Self::CertCbParked,
             ffi::SSL_ERROR_ZERO_RETURN => Self::ZeroReturn,
             ffi::SSL_ERROR_SYSCALL if ret == 0 => Self::SyscallEof,
             other => {
@@ -115,8 +125,11 @@ impl IoOutcome {
     }
 
     /// Whether this outcome means the operation should be retried later.
+    ///
+    /// `CertCbParked` counts: the handshake is waiting, not failing, and the
+    /// resume path re-enters `SSL_do_handshake` once JavaScript answers.
     pub fn should_retry(&self) -> bool {
-        matches!(self, Self::WantRead | Self::WantWrite)
+        matches!(self, Self::WantRead | Self::WantWrite | Self::CertCbParked)
     }
 }
 
@@ -334,7 +347,10 @@ pub unsafe fn clear_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
                     // EOF read rather than an error, so `'end'` fires.
                     state.flags.eof = true;
                 }
-                IoOutcome::WantRead | IoOutcome::WantWrite => {}
+                // `CertCbParked` is a handshake waiting for JavaScript, not a
+                // failure: the resume re-enters `SSL_read` and this call simply
+                // had nothing to report.
+                IoOutcome::WantRead | IoOutcome::WantWrite | IoOutcome::CertCbParked => {}
                 IoOutcome::Wrote(_) => {}
                 IoOutcome::Failed(reason) => {
                     // `crypto_tls.cc:938`: the alert is in `enc_out_` and has to
@@ -427,7 +443,7 @@ pub unsafe fn clear_in(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
         IoOutcome::Wrote(count) => count,
         // `WANT_WRITE` or `WANT_READ`: push the bytes back so the next cycle
         // retries them. `crypto_tls.cc:1056`.
-        IoOutcome::WantWrite | IoOutcome::WantRead => {
+        IoOutcome::WantWrite | IoOutcome::WantRead | IoOutcome::CertCbParked => {
             state.pending_cleartext = data;
             0
         }

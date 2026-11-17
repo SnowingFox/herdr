@@ -376,9 +376,16 @@ fn wrap(
         state.session.clone(),
     );
     state.callback = Some(handles);
+    // The `SSL*` is mirrored into the callback slot so a callback that runs
+    // while `cycle` holds this state's borrow — `setKeyCert` from inside
+    // `ALPNCallback`, for instance — can still reach it. `WrapState::destroy`
+    // clears the mirror with the SSL, so it cannot outlive the pointer.
+    if let Some(handles) = state.callback.as_ref() {
+        handles.ssl.set(ssl_ptr);
+    }
     // SAFETY: `cell` is the state allocated for this object, and it outlives the
     // `SSL` because teardown frees the `SSL` from that same state.
-    unsafe { crate::callback::install(ssl_ptr, cell) };
+    unsafe { crate::callback::install(ssl_ptr, cell, kind) };
     drop(state);
 
     // The stream the listener attaches to, if the handle published one. A handle

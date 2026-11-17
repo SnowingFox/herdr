@@ -26,10 +26,11 @@
 //! The seven are the ones a real connection reaches: `https.Agent` attaches a
 //! `'session'` listener to every socket it opens, `http2.connect` sets
 //! `ALPNProtocols`, and a resumption round trip needs `loadSession`/`setSession`
-//! with `newSessionDone` to unpark the server's ticket. What remains is listed in
-//! the `pending_method!` table with a reason each: mostly OCSP, PSK and
-//! SNI-certificate switching, which no ordinary HTTPS or HTTP/2 connection
-//! reaches.
+//! with `newSessionDone` to unpark the server's ticket. Increment 5 landed the
+//! cert-callback family — `enableCertCb`, `certCbDone`, `requestOCSP`,
+//! `setOCSPResponse`, `setKeyCert` — which is SNI certificate switching and OCSP
+//! stapling. What remains is listed in the `pending_method!` table with a reason
+//! each: PSK, Finished-message queries, and renegotiation.
 //!
 //! The code is `ERR_TLS_NOT_IMPLEMENTED` rather than Node's
 //! `ERR_METHOD_NOT_IMPLEMENTED` so a test that matches on it knows it is looking
@@ -112,49 +113,25 @@ pending_method!(
 //
 // | method | why it is still deferred |
 // | --- | --- |
-// | `certCbDone`, `enableCertCb` | OCSP and SNI certificate switching for a server: `SSL_set_cert_cb` parks the handshake until JavaScript answers. An ordinary TLS server and every client path never enters it. |
 // | `clientHelloDone` | Resumes a server handshake parked by the *early ClientHello* callback, which only a `'resumeSession'` server listener reaches. Client-side resumption uses `setSession`, which is implemented. |
-// | `requestOCSP`, `setOCSPResponse` | The stapled-OCSP pair. `requestOCSP` needs `SSL_set_tlsext_status_type` plus the response callback; `setOCSPResponse` needs a peer response to attach. Neither is on by default. |
-// | `setKeyCert` | Per-`SSL` certificate for an SNI-selected context. A server's certificate comes from its `SecureContext`, so only `setSecureContext`-per-session server code needs this. |
 // | `exportKeyingMaterial`, `getFinished`, `getPeerFinished` | Channel-binding and Finished-message queries: `tlsSocket.exportKeyingMaterial()` and the `test-tls-*` files that read them. Nothing in `https`, `http2` or `fetch` calls them. |
 // | `enablePskCallback`, `setPskIdentityHint` | Pre-shared keys, an alternative to certificates. `tls.connect({ pskCallback })` is the only caller, and no mainstream client uses it. |
 // | `getX509Certificate` | The `X509Certificate` object for the *local* certificate. `getCertificate` (legacy shape) is implemented; this is the newer class-returning form. |
 // | `renegotiate` | TLS 1.2 renegotiation. TLS 1.3 has no renegotiation and this build's clients negotiate 1.3; `tlsSocket.renegotiate()` is the only caller. |
-pending_method!(
-    pending_cert_cb_done,
-    "certCbDone",
-    4,
-    "it resumes the handshake from the oncertcb handler, which needs the OCSP and SNI certificate-switch path"
-);
+//
+// The cert-callback family *was* on this list — `certCbDone`, `enableCertCb`,
+// `requestOCSP`, `setOCSPResponse` and `setKeyCert` — and is now implemented. It
+// was the one deferral whose absence was a **security** defect rather than a
+// missing feature. `wrap.js:1047` calls `enableCertCb()` for any server whose
+// `SNICallback` is not the default, which covers every `addContext()` server, so
+// a multi-certificate server completed every handshake under its *default*
+// certificate: a valid TLS session for the wrong hostname. See
+// `crate::callback`'s cert-callback section for the parking mechanism.
 pending_method!(
     pending_client_hello_done,
     "clientHelloDone",
     4,
     "it resumes a server handshake parked by the early ClientHello callback, which only a 'resumeSession' server listener reaches"
-);
-pending_method!(
-    pending_enable_cert_cb,
-    "enableCertCb",
-    4,
-    "it parks the handshake until oncertcb answers, which is the OCSP and SNI certificate-switch path"
-);
-pending_method!(
-    pending_request_ocsp,
-    "requestOCSP",
-    4,
-    "it enables the status-request extension and needs the OCSP response path"
-);
-pending_method!(
-    pending_set_key_cert,
-    "setKeyCert",
-    4,
-    "it installs a per-SSL certificate and key, which switch on the SNI context path"
-);
-pending_method!(
-    pending_set_ocsp_response,
-    "setOCSPResponse",
-    4,
-    "it attaches a stapled OCSP response"
 );
 pending_method!(
     pending_export_keying_material,
@@ -235,18 +212,18 @@ pub fn install_into<'s>(
 
         // Increment 4: the SSL callbacks, session resumption, and the queries that
         // need a completed handshake.
-        "certCbDone" => method!(pending_cert_cb_done),
+        "certCbDone" => method!(cert_cb_done),
         "clientHelloDone" => method!(pending_client_hello_done),
-        "enableCertCb" => method!(pending_enable_cert_cb),
+        "enableCertCb" => method!(enable_cert_cb),
         "enableALPNCb" => method!(enable_alpn_cb),
         "enableKeylogCallback" => method!(enable_keylog_callback),
         "enableSessionCallbacks" => method!(enable_session_callbacks),
         "loadSession" => method!(load_session),
         "newSessionDone" => method!(new_session_done),
-        "requestOCSP" => method!(pending_request_ocsp),
+        "requestOCSP" => method!(request_ocsp),
         "setALPNProtocols" => method!(set_alpn_protocols),
-        "setKeyCert" => method!(pending_set_key_cert),
-        "setOCSPResponse" => method!(pending_set_ocsp_response),
+        "setKeyCert" => method!(set_key_cert),
+        "setOCSPResponse" => method!(set_ocsp_response),
         "setServername" => method!(set_servername),
         "setSession" => method!(set_session),
         "exportKeyingMaterial" => method!(pending_export_keying_material),
@@ -907,8 +884,10 @@ fn destroy_ssl<'s>(
 const UV_ECANCELED: i32 = -4082;
 
 /// `TLSEXT_NAMETYPE_host_name` (`tls1.h`), the name type `GetServername` asks for.
-const TLSEXT_NAMETYPE_HOST_NAME: c_int = 0;
-
+///
+/// `pub(crate)` because `crate::callback`'s cert callback asks the same question
+/// of the same SSL when it builds the `oncertcb` info object.
+pub(crate) const TLSEXT_NAMETYPE_HOST_NAME: c_int = 0;
 /// `TLSWrap::GetServername`.
 ///
 /// `SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name)`, or `null` when none was
@@ -937,11 +916,16 @@ fn get_servername<'s>(
     match name.flatten() {
         Some(text) => match v8::String::new(scope, &text) {
             Some(value) => rv.set(value.into()),
-            None => rv.set(v8::null(scope).into()),
+            None => rv.set(v8::Boolean::new(scope, false).into()),
         },
-        // A receiver with no state, a freed SSL, or no name: `null`, which is what
-        // `wrap.js` treats as "nothing to carry over".
-        None => rv.set(v8::null(scope).into()),
+        // `TLSWrap::GetServername` (`crypto_tls.cc:1539`) sets **`false`** when
+        // there is no name, not `null`, and `lib/internal/tls/wrap.js` depends on
+        // that exact value in two places: `_handle.getServername()` is compared
+        // with `=== null` to decide whether to adopt it (`:1210`), and a server
+        // handler that branches on `socket.servername !== false` takes the
+        // "no SNI" path. Returning `null` made the second compare true and the
+        // name `null` reached an HTTP header as the string `'null'`.
+        None => rv.set(v8::Boolean::new(scope, false).into()),
     }
 }
 
@@ -1302,6 +1286,319 @@ fn new_session_done<'s>(
     }
 }
 
+/// `TLSWrap::EnableCertCb` (`crypto_tls.cc:1496`): arm the certificate callback.
+///
+/// Node's body is `wrap->WaitForCertCb(ResumeAfterCertCb, wrap)`, which sets
+/// `cert_cb_` and `cert_cb_arg_`. Two things follow, and both are why this is not
+/// a flag:
+///
+/// * `is_waiting_cert_cb()` becomes true, so [`crate::callback::cert_cb`] starts
+///   parking the handshake instead of answering `1`;
+/// * the parked handshake resumes by calling `ResumeAfterCertCb` → `Cycle()` →
+///   `SSL_do_handshake`, which is a **second entry**, not a return value.
+///
+/// `wrap.js` calls this in the two situations where JavaScript has a say in
+/// certificate selection: a server with an `'OCSPRequest'` listener (`:998`) and a
+/// server whose `SNICallback` is not the default, which covers any server using
+/// `addContext()` (`:1047`).
+///
+/// The `CHECK_NOT_NULL(ssl_)` is an error rather than an abort, per this crate's
+/// convention for a caller bug a real `node` would crash on.
+fn enable_cert_cb<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let result = with_state(args.this(), |state| {
+        if state.ssl.is_none() {
+            return Err("enableCertCb after destroySSL");
+        }
+        state.cert_cb_pending = true;
+        if let Some(handles) = state.callback.as_ref() {
+            handles.cert_cb_enabled.set(true);
+        }
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_coded(scope, message, "ERR_TLS_INVALID_STATE"),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
+    }
+}
+
+/// `TLSWrap::CertCbDone` (`crypto_tls.cc:1755`): resume the parked handshake.
+///
+/// `wrap.js`'s `requestOCSPDone` calls this at the end of every `oncertcb`, on
+/// every path — after the SNI context switch, after the `'OCSPRequest'` listener,
+/// and when there is nothing to ask. It is therefore the one place a parked
+/// handshake is released, and it does three things in Node's order:
+///
+/// 1. `CHECK(w->is_waiting_cert_cb() && w->flags_.cert_cb_running)`;
+/// 2. install `sni_context` on the `SSL` when JavaScript selected one, which is
+///    what makes an SNI context switch take effect — skipping it completes the
+///    handshake under the **default** certificate, silently serving the wrong
+///    certificate to a client that asked for another hostname;
+/// 3. clear `cert_cb_running` and call the parked continuation.
+///
+/// Node's first step also allows for `sni_context` being something that is not a
+/// `SecureContext` at all, which it reports through `onerror` and does **not**
+/// resume from.
+fn cert_cb_done<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let object = args.this();
+    let Some(cell) = crate::state::state_cell(object) else {
+        throw_type_error(scope, "Invalid TLSWrap receiver");
+        return;
+    };
+    // Node's `CHECK`: `certCbDone` without a parked callback is a caller bug.
+    if !crate::callback::cert_cb_running(cell) {
+        throw_coded(
+            scope,
+            "certCbDone is only valid while a cert callback is pending",
+            "ERR_TLS_INVALID_STATE",
+        );
+        return;
+    }
+    let ssl = with_state(object, |state| state.ssl_ptr()).unwrap_or(std::ptr::null_mut());
+    if ssl.is_null() {
+        throw_coded(
+            scope,
+            "certCbDone after destroySSL",
+            "ERR_TLS_INVALID_STATE",
+        );
+        return;
+    }
+    // SAFETY: `ssl` is the live SSL of this receiver, checked above.
+    let resume = match unsafe { crate::callback::apply_sni_context(scope, object, ssl) } {
+        Ok(installed) => installed,
+        // `crypto_tls.cc:1776` is `ThrowCryptoError(env, err, "CertCbDone")`:
+        // a context whose certificate cannot be installed throws, and
+        // `wrap.js`'s `requestOCSP` catches it and destroys the socket. Returning
+        // silently instead left the handshake parked with no error and no
+        // close, which is an unresponsive connection rather than a failure —
+        // `test-tls-empty-sni-context.js` hangs on exactly that.
+        Err(reason) => {
+            crate::callback::clear_cert_cb_running(cell);
+            match reason {
+                crate::callback::SniContextError::Crypto(error) => {
+                    // `ThrowCryptoError('CertCbDone')`: the message is the
+                    // queue's text and the code its derived `ERR_SSL_*`.
+                    let code = error
+                        .code
+                        .clone()
+                        .unwrap_or_else(|| "ERR_SSL_OPERATION_FAILED".to_string());
+                    throw_coded(scope, &error.message, &code);
+                }
+                crate::callback::SniContextError::Generic(message) => {
+                    throw_coded(scope, &message, "ERR_SSL_OPERATION_FAILED");
+                }
+            }
+            return;
+        }
+    };
+    // The flag is cleared before the resume, because the resume re-enters
+    // `cert_cb`: leaving it set would make that second entry park again forever.
+    //
+    // `certCbDone` also consumes the parked callback, exactly as Node's
+    // `cert_cb_ = nullptr` does — `is_waiting_cert_cb()` goes false, so a later
+    // `cert_cb` answers `1` and the handshake proceeds. `wrap.js` re-arms it per
+    // socket from `_init`, so one wrap gets one park, and without this the resume
+    // re-parks on every cycle and the connection never completes.
+    crate::callback::clear_cert_cb_running(cell);
+    if !resume {
+        // An invalid SNI context was reported through `onerror`; Node does not
+        // call the continuation in that case, so the handshake never completes
+        // under the wrong certificate.
+        return;
+    }
+    let _ = with_state(object, |state| {
+        state.cert_cb_pending = false;
+    });
+    // SAFETY: `cell` is this object's live state and the object is the receiver.
+    unsafe { crate::callback::resume_after_cert_cb(cell) };
+    // The resumed handshake produced ciphertext — ServerHello, Certificate,
+    // CertificateVerify — which has to reach the socket.
+    let stream = with_state(object, |state| state.underlying).flatten();
+    if let Some(stream) = stream {
+        // SAFETY: `stream` is the wrap's own `underlying`, live while it holds it.
+        unsafe { crate::stream::flush(scope, object, stream, None) };
+    }
+}
+
+/// `TLSWrap::RequestOCSP` (`crypto_tls.cc:2257`): ask the server for OCSP status.
+///
+/// `SSL_set_tlsext_status_type(ssl, TLSEXT_STATUSTYPE_ocsp)`, which makes the
+/// **client**'s ClientHello carry a `status_request` extension. `wrap.js`'s
+/// `TLSSocket.prototype._start` calls it when `requestOCSP: true` was passed to
+/// `tls.connect`, before `start()`.
+///
+/// This is the only way a server's `'OCSPRequest'` listener is reached: the
+/// server parks every handshake once `enableCertCb` has run, but
+/// `wrap.js`'s `requestOCSP` returns early when `info.OCSPRequest` is false, so
+/// an ordinary connection never emits the event. Without this method the client
+/// side of that pairing does not exist and the listener can only ever be reached
+/// by a client that is not rustnode.
+///
+/// Node's body has no return value and no error branch.
+fn request_ocsp<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    let result = with_state(args.this(), |state| {
+        let ssl = state.ssl_ptr();
+        if ssl.is_null() {
+            return Err("requestOCSP after destroySSL");
+        }
+        // SAFETY: `ssl` is live, checked above. The control only records the
+        // extension type; the ClientHello is what actually carries it.
+        unsafe {
+            openssl_sys::SSL_set_tlsext_status_type(ssl, crate::ffi_extra::TLSEXT_STATUSTYPE_OCSP);
+        }
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_coded(scope, message, "ERR_TLS_INVALID_STATE"),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
+    }
+}
+
+/// `TLSWrap::SetKeyCert` (`crypto_tls.cc:1849`): switch this connection's
+/// certificate to a `SecureContext` the application supplies.
+///
+/// `TLSSocket.prototype.setKeyCert(context)` (`wrap.js:1302`) is the caller, and
+/// the one path that reaches it before a handshake is an `ALPNCallback` — the
+/// ACME `acme-tls/1` challenge, which has to present a certificate the default
+/// context does not have. Node's body:
+///
+/// * a client returns silently (there is no certificate to select);
+/// * a non-object, or an object that is not a `SecureContext`, is a
+///   `TypeError` ("Must give a SecureContext as first argument");
+/// * otherwise `setSniContext` plus `SetCACerts`, which is the **same**
+///   installation `certCbDone` performs for an SNI switch — [`set_sni_context`]
+///   is shared for exactly that reason.
+///
+/// The `is_client()` early return is first in Node and matters: `wrap.js` calls
+/// this on the socket the callback's `this` names, and a client-side call must
+/// not be an error.
+fn set_key_cert<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    if with_state(args.this(), |state| state.kind == crate::ssl::Kind::Client).unwrap_or(false) {
+        return;
+    }
+    let Some(context) = v8::Local::<v8::Object>::try_from(args.get(0)).ok() else {
+        throw_type_error(scope, "Must give a SecureContext as first argument");
+        return;
+    };
+    if !rn_bind_secure_context::is_secure_context(context) {
+        throw_type_error(scope, "Must give a SecureContext as first argument");
+        return;
+    }
+    let Some(ctx) = rn_bind_secure_context::ssl_ctx_of(context) else {
+        throw_coded(
+            scope,
+            "the SecureContext has been closed",
+            "ERR_TLS_INVALID_CONTEXT",
+        );
+        return;
+    };
+    let mut ssl = with_state(args.this(), |state| state.ssl_ptr()).unwrap_or(std::ptr::null_mut());
+    if ssl.is_null() {
+        // Two ways here: a genuinely destroyed wrap, or — the real one — an
+        // `ALPNCallback` that called this, which runs inside
+        // `SSL_do_handshake` while `cycle` holds the state's `RefCell`. The
+        // receiver cannot be borrowed from there, so the pointer comes from the
+        // callback slot, which exists for exactly this reason (see
+        // `crate::callback`'s R2 note).
+        ssl = crate::callback::ssl_of(args.this());
+    }
+    if ssl.is_null() {
+        throw_coded(
+            scope,
+            "setKeyCert after destroySSL",
+            "ERR_TLS_INVALID_STATE",
+        );
+        return;
+    }
+    // SAFETY: `ssl` is this receiver's live SSL and `ctx` is owned by the rooted
+    // `SecureContext` the caller passed, which the object above holds.
+    unsafe {
+        if !crate::callback::set_sni_context(ssl, ctx) {
+            throw_coded(
+                scope,
+                "could not install the SecureContext's certificate",
+                "ERR_SSL_OPERATION_FAILED",
+            );
+        }
+    }
+}
+
+/// `TLSWrap::SetOCSPResponse` (`crypto_tls.cc:2244`): store the stapled response.
+///
+/// `wrap.js`'s `requestOCSP`'s `onOCSP` calls this with the third argument of the
+/// application's `'OCSPRequest'` callback, before `certCbDone`. The bytes are only
+/// *stored*: the status callback installed by [`install_ocsp_status`] attaches
+/// them when OpenSSL asks for the response while building the CertificateStatus
+/// message.
+///
+/// Node `THROW_AND_RETURN_IF_NOT_BUFFER`s, and the check is load-bearing rather
+/// than defensive — the buffer's length becomes the `len` OpenSSL is told, so a
+/// non-buffer would have to be coerced into something whose length is unrelated
+/// to the bytes actually handed over.
+fn set_ocsp_response<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    _rv: v8::ReturnValue<'s>,
+) {
+    if args.length() < 1 || args.get(0).is_undefined() {
+        throw_type_error(scope, "OCSP response argument is mandatory");
+        return;
+    }
+    let view = args.get(0);
+    // `Buffer::HasInstance`: a `Uint8Array` over a backing store. `Buffer` is one,
+    // so this accepts exactly what Node's check accepts and rejects a string or
+    // an `ArrayBuffer` the same way.
+    let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(view) else {
+        throw_type_error(scope, "OCSP response must be a Buffer");
+        return;
+    };
+    let length = view.byte_length();
+    let base = view.data().cast::<u8>();
+    // SAFETY: `base` points at `length` bytes of the caller's view, valid for the
+    // duration of this call, and the bytes are copied rather than borrowed.
+    let bytes = if base.is_null() || length == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(base, length) }.to_vec()
+    };
+    let result = with_state(args.this(), |state| {
+        if state.ssl.is_none() {
+            return Err("setOCSPResponse after destroySSL");
+        }
+        state.ocsp_response = bytes.clone();
+        // Mirrored for the status callback, which runs on the library's stack
+        // where this state's `RefCell` is already borrowed.
+        if let Some(handles) = state.callback.as_ref() {
+            if let Ok(mut stored) = handles.ocsp_response.try_borrow_mut() {
+                *stored = bytes;
+            }
+        }
+        Ok(())
+    });
+    match result {
+        Some(Ok(())) => {}
+        Some(Err(message)) => throw_coded(scope, message, "ERR_TLS_INVALID_STATE"),
+        None => throw_type_error(scope, "Invalid TLSWrap receiver"),
+    }
+}
+
 /// `TLSWrap::SetALPNProtocols` (`crypto_tls.cc:1819`): the ALPN list.
 ///
 /// Two branches, and which one runs is the whole negotiation:
@@ -1564,6 +1861,12 @@ mod tests {
             "setSession",
             "newSessionDone",
             "setALPNProtocols",
+            // Increment 5: the cert-callback family.
+            "certCbDone",
+            "enableCertCb",
+            "requestOCSP",
+            "setOCSPResponse",
+            "setKeyCert",
         ];
         for name in implemented {
             assert!(
@@ -1574,7 +1877,7 @@ mod tests {
         // The rest still throw, and each names its increment. The count is pinned
         // so a method that quietly becomes implemented — or stops being — shows up
         // here rather than only in a live smoke test.
-        assert_eq!(crate::wrap::PROTO_METHODS.len() - implemented.len(), 17);
+        assert_eq!(crate::wrap::PROTO_METHODS.len() - implemented.len(), 12);
     }
 
     /// The deferrals a real HTTPS or HTTP/2 connection does not reach, so the
@@ -1584,20 +1887,15 @@ mod tests {
     /// names the increment, and a test that listed them nowhere would let one
     /// silently drift into "implemented" or vanish from the prototype.
     #[test]
-    fn the_deferred_set_is_the_ocsp_psk_and_sni_surface() {
+    fn the_deferred_set_is_the_psk_and_query_surface() {
         let deferred = [
-            "certCbDone",
             "clientHelloDone",
-            "enableCertCb",
             "enablePskCallback",
             "exportKeyingMaterial",
             "getFinished",
             "getPeerFinished",
             "getX509Certificate",
             "renegotiate",
-            "requestOCSP",
-            "setKeyCert",
-            "setOCSPResponse",
             "setPskIdentityHint",
         ];
         for name in deferred {
@@ -1606,7 +1904,7 @@ mod tests {
                 "{name} is deferred but not installed"
             );
         }
-        assert_eq!(deferred.len(), 13);
+        assert_eq!(deferred.len(), 8);
     }
 
     /// Every prototype method reports `length` 0, whatever its arity.

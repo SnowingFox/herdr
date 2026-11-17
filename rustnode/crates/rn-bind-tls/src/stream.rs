@@ -791,6 +791,12 @@ fn dispatch_chunks<'s>(
             crate::cycle::IoOutcome::WantRead | crate::cycle::IoOutcome::WantWrite => {
                 state.pending_cleartext.extend_from_slice(&cleartext);
             }
+            // A handshake parked by the cert callback: nothing was written, and
+            // `certCbDone`'s resume cycles again. Retrying the same bytes is
+            // correct for the same reason `WANT_WRITE` is.
+            crate::cycle::IoOutcome::CertCbParked => {
+                state.pending_cleartext.extend_from_slice(&cleartext);
+            }
             crate::cycle::IoOutcome::ZeroReturn | crate::cycle::IoOutcome::SyscallEof => {
                 state.flags.eof = true;
             }
