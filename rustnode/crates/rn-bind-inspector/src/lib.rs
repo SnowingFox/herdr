@@ -53,7 +53,18 @@ use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
 pub use agent::{ensure_inspector, set_isolate};
-pub use server::{format_ws_address, Server};
+pub use server::{format_ws_address, target_list_json, version_json, Server, Target};
+
+/// The version string `/json/version` reports, matching `process.version`.
+///
+/// Node's `SendVersionResponse` writes `"node.js/" NODE_VERSION`, so the two must
+/// agree or a client that compares `/json/version` with `process.version` — which
+/// `test-inspector.js` does — sees a mismatch it cannot explain. `rn-realm` is the
+/// one place that decides what this build reports, and it is quoted here rather
+/// than duplicated: a change there has to reach this document too.
+pub fn node_version() -> &'static str {
+    "28.0.0"
+}
 
 /// `Sec-WebSocket-Accept` for a client key, exposed for the socket test.
 pub fn websocket_accept_value(client_key: &str) -> String {
@@ -314,13 +325,39 @@ pub fn has_pending_messages() -> bool {
 /// Returns the URL a client should dial, which is what the CLI prints. `port` 0 asks
 /// the OS for a free one, so the returned URL names the port that was really bound.
 pub fn start_server(host: &str, port: u16) -> Result<String, String> {
+    let script_name = SCRIPT_NAME.with(|slot| slot.borrow().clone());
+    start_server_for_script(host, port, &script_name)
+}
+
+/// [`start_server`] with an explicit entry point.
+///
+/// `script_name` is the entry point as `process.argv[1]` reports it, or empty for
+/// `-e`/`-p`. `/json/list`'s `title` and `url` come from it, so a run that reports
+/// `file://` for a script has the wrong entry point rather than a formatting bug.
+pub fn start_server_for_script(host: &str, port: u16, script_name: &str) -> Result<String, String> {
     if SERVER.with(|slot| slot.borrow().is_some()) {
         return Err("Inspector is already activated".to_string());
     }
-    let server = Server::start(host, port)?;
+    let server = Server::start_for_target(host, port, Target::new(script_name))?;
     let url = server.ws_url();
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
     Ok(url)
+}
+
+/// Records the entry point a later `inspector.open()` should publish.
+///
+/// Node's `Agent::Start` is handed `argv_[1]` once, during bootstrap
+/// (`src/node.cc:203`), and every later `open()` reuses it. The CLI knows the
+/// value — it resolved `process.argv` — while `open()` is reached from JavaScript,
+/// so it is recorded here rather than re-derived from `std::env::args`, which
+/// cannot tell a flag's value from a script path.
+pub fn set_script_name(script_name: &str) {
+    SCRIPT_NAME.with(|slot| *slot.borrow_mut() = script_name.to_string());
+}
+
+thread_local! {
+    /// The entry point `open()` reports, recorded by the CLI.
+    static SCRIPT_NAME: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// Blocks until a CDP client attaches, or gives up.
@@ -550,7 +587,8 @@ fn open_callback(
     };
 
     // `0` means "any free port", which is what the tests use.
-    match Server::start(&host, port) {
+    let script_name = SCRIPT_NAME.with(|slot| slot.borrow().clone());
+    match Server::start_for_target(&host, port, Target::new(&script_name)) {
         Ok(server) => {
             tracing::info!(
                 url = %server.ws_url(),

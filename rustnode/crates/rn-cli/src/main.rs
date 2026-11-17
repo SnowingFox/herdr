@@ -319,6 +319,17 @@ fn main() {
             std::process::exit(1);
         }
         let request = &options.debug_port;
+        // The entry point `/json/list` reports is the *unresolved* `argv[1]`, as
+        // `Agent::Start` receives it (`src/node.cc:203`): the oracle titles a
+        // relative `app.js` as `"app.js"` while resolving `url` itself. The CLI
+        // knows which argument that was, so it is recorded here rather than
+        // re-read from `std::env::args`, which cannot tell a flag's value from a
+        // script path.
+        match &options.source {
+            args::Source::File(path) => rn_bind_inspector::set_script_name(path),
+            args::Source::Inspect => rn_bind_inspector::set_script_name(args::INSPECT_SUBCOMMAND),
+            _ => {}
+        }
         match rn_bind_inspector::start_server(request.host.as_str(), request.port) {
             Ok(url) => {
                 eprintln!("Debugger listening on {url}");

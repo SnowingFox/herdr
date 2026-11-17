@@ -130,13 +130,44 @@ fn the_server_reports_the_port_it_bound() {
     // `--inspect=0` asks the OS for a port, and the URL Node prints has to name the port
     // that was actually bound — a server that echoed the requested `0` would print
     // `ws://127.0.0.1:0/` and no client could connect.
+    //
+    // The path carries the target id, which is `GetWsUrl`'s
+    // `FormatWsAddress(host, port, id_, true)`: a client upgrades at the path
+    // `/json/list` published rather than at `/`.
     let server = Server::start("127.0.0.1", 0).expect("the server must bind");
     assert_ne!(server.port(), 0, "a bound port must be a real one");
     let url = server.ws_url();
+    let prefix = format!("ws://127.0.0.1:{}/", server.port());
+    assert!(
+        url.starts_with(&prefix),
+        "the URL Node prints must name the bound port and carry the target id, got {url}"
+    );
+    let id = &url[prefix.len()..];
     assert_eq!(
-        url,
-        format!("ws://127.0.0.1:{}/", server.port()),
-        "the URL Node prints must name the bound port"
+        id.len(),
+        36,
+        "the target id is a formatted UUID, got {id:?}"
+    );
+    assert_eq!(
+        id.split('-').map(str::len).collect::<Vec<_>>(),
+        [8, 4, 4, 4, 12],
+        "the id is %04x%04x-%04x-%04x-%04x-%04x%04x%04x, got {id:?}"
+    );
+    assert!(
+        id.starts_with(|c: char| c.is_ascii_hexdigit()),
+        "the id must be hexadecimal, got {id:?}"
+    );
+    // Version 4 and the RFC 4122 variant, which is what `GenerateID` sets.
+    assert_eq!(&id[14..15], "4", "the version nibble must be 4, got {id:?}");
+    assert!(
+        matches!(&id[19..20], "8" | "9" | "a" | "b"),
+        "the variant nibble must be 8, 9, a or b, got {id:?}"
+    );
+    // The listener address without an id is a different fact, and it is what a
+    // bare `GET /` answers with.
+    assert_eq!(
+        server.listen_url(),
+        format!("ws://127.0.0.1:{}/", server.port())
     );
 }
 
