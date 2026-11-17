@@ -2005,6 +2005,16 @@ fn digest_encoding(
 }
 
 /// Sets the return value to a digest in the requested encoding.
+///
+/// The no-encoding case must be a real `Buffer`, not a bare `Uint8Array`: Node's
+/// `HashDigest` ends in `StringBytes::Encode(..., BUFFER)`, which is
+/// `Buffer::Copy` (`src/string_bytes.cc:583`). The difference is load-bearing
+/// rather than cosmetic — `node inspect`'s client validates the WebSocket
+/// handshake with `shasum.digest().toString('base64')`
+/// (`lib/internal/debugger/inspect_client.js:60`), and a `Uint8Array` has no
+/// `toString(encoding)` at all, so it printed the byte list instead of the
+/// accept value and every `node inspect` session died with
+/// `WebSocket secret mismatch`.
 fn emit_digest(
     scope: &mut v8::PinScope<'_, '_>,
     rv: &mut v8::ReturnValue,
@@ -2012,8 +2022,9 @@ fn emit_digest(
     encoding_name: Option<&str>,
 ) {
     match encoding_name {
-        None => match encoding::uint8_array(scope, bytes) {
-            Some(array) => rv.set(array.into()),
+        None => match encoding::uint8_array(scope, bytes).and_then(|array| as_buffer(scope, array))
+        {
+            Some(value) => rv.set(value),
             None => throw(scope, "cannot allocate the digest result"),
         },
         Some(name) => match encoding::encode_bytes(bytes, name) {
@@ -2024,6 +2035,31 @@ fn emit_digest(
             None => throw_type_error(scope, &format!("Unknown encoding: {name}")),
         },
     }
+}
+
+/// Gives a byte view `Buffer.prototype`, producing a real `Buffer`.
+///
+/// This is `Buffer::New` (`node_buffer.cc`): a `Uint8Array` over the same
+/// backing store with `globalThis.Buffer.prototype` set on it. The prototype
+/// comes from the global rather than a stored handle because
+/// `internal/bootstrap/node.js` installs `Buffer` as a global getter and user
+/// code may replace it, and a `Buffer` built from a stale prototype would not be
+/// recognised by `Buffer.isBuffer`.
+///
+/// `None` before `Buffer` exists, which is a bootstrap ordering error rather than
+/// a runtime condition: nothing calls a digest before the realm has `Buffer`.
+fn as_buffer<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    view: v8::Local<'s, v8::Uint8Array>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "Buffer")?;
+    let constructor = global.get(scope, key.into())?;
+    let constructor = v8::Local::<v8::Object>::try_from(constructor).ok()?;
+    let prototype_key = v8::String::new(scope, "prototype")?;
+    let prototype = constructor.get(scope, prototype_key.into())?;
+    view.set_prototype(scope, prototype)?;
+    Some(view.into())
 }
 
 /// Builds a JavaScript array of strings.
