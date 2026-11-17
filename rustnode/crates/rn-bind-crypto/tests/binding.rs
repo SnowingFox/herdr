@@ -60,15 +60,25 @@ fn crypto_binding_end_to_end() {
     let prelude = v8::String::new(
         scope,
         r#"
-        globalThis.Buffer = {
-          from(value) {
-            if (typeof value === 'string') {
-              return new TextEncoder().encode(value);
-            }
-            return new Uint8Array(value);
-          },
-          alloc(length) { return new Uint8Array(length); },
+        // A `Buffer` stand-in with a real `prototype`, because `Hash.digest()`
+        // returns `Buffer::Copy`, which gives the result
+        // `Buffer.prototype` — the same object `Buffer.isBuffer` keys on. The
+        // stub used to be a bare object, which was enough while the digest was a
+        // `Uint8Array` and is not enough now.
+        function BufferStub() {}
+        BufferStub.prototype = { __proto__: Uint8Array.prototype };
+        BufferStub.from = function from(value) {
+          if (typeof value === 'string') {
+            return new TextEncoder().encode(value);
+          }
+          return new Uint8Array(value);
         };
+        BufferStub.alloc = function alloc(length) { return new Uint8Array(length); };
+        BufferStub.isBuffer = function isBuffer(value) {
+          return value instanceof Uint8Array &&
+                 Object.getPrototypeOf(value) === BufferStub.prototype;
+        };
+        globalThis.Buffer = BufferStub;
         globalThis.TextEncoder = class TextEncoder {
           encode(text) {
             const bytes = [];
@@ -211,16 +221,30 @@ fn cases() -> Vec<Case> {
             expected: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         },
         Case {
-            name: "digest() without an encoding is a byte array",
-            // `Hash.prototype._flush` pushes this straight into the stream.
+            name: "digest() without an encoding is a Buffer",
+            // `Hash.prototype._flush` pushes this straight into the stream, and
+            // `StringBytes::Encode(..., BUFFER)` is `Buffer::Copy`. The
+            // observable consequence is that the result carries
+            // `Buffer.prototype` — that is what gives it `toString(encoding)`,
+            // which `node inspect`'s handshake uses to render the
+            // `Sec-WebSocket-Accept` value. A bare `Uint8Array` satisfies a
+            // length-only check and breaks exactly that.
+            //
+            // The stub's prototype is what stands in for `lib/buffer.js`, so the
+            // assertion is identity with it rather than a method call: the real
+            // prototype supplies the methods, and this test pins that the digest
+            // is given it.
             source: r#"
                 const handle = new binding.Hash('sha1', undefined, -1, {});
                 handle.update('abc');
                 const digest = handle.digest();
-                return digest.constructor.name + ':' + digest.length + ':' + digest[0];
+                return Buffer.isBuffer(digest) + ':' +
+                       (Object.getPrototypeOf(digest) === Buffer.prototype) + ':' +
+                       (digest instanceof Uint8Array) + ':' +
+                       digest.length + ':' + digest[0];
             "#,
             // SHA-1("abc") is 20 bytes starting with 0xa9.
-            expected: "Uint8Array:20:169",
+            expected: "true:true:true:20:169",
         },
         Case {
             name: "update() decodes a string using the given encoding",
