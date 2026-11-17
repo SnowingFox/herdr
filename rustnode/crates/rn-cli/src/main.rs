@@ -637,7 +637,8 @@ fn main() {
             value = evaluate_script(scope, code).map(|value| v8::Global::new(scope, value));
         }
         // `internal/main/eval_stdin`, `internal/main/print_help` and
-        // `internal/main/inspect` are Node's own entry points, run as main
+        // `internal/main/inspect` and `internal/main/test_runner` are Node's own
+        // entry points, run as main
         // scripts. They are not reimplemented here for the same reason a file is
         // not: `eval_stdin` reads stdin through `process.stdin`, honours
         // `--input-type`, `--print` and `--strip-types`, and hands the code to
@@ -654,8 +655,12 @@ fn main() {
         // and the probe mode all live there, and the script requires `events`,
         // `util`, `timers/promises`, `child_process`, `net`, `http` and
         // `internal/url`, so it has to run after the loaders are installed —
-        // which is where this arm is.
-        args::Source::Stdin { .. } | args::Source::Help | args::Source::Inspect => {
+        // which is where this arm is. `test_runner` has the same property:
+        // `internal/main/test_runner` owns setup and launches user tests from JS.
+        args::Source::Stdin { .. }
+        | args::Source::Help
+        | args::Source::Inspect
+        | args::Source::Test => {
             let id = options
                 .source
                 .main_script_id()

@@ -373,6 +373,12 @@ pub enum Source {
     /// parser stops at the first non-flag, so they were never options — which is
     /// why they travel in [`Options::script_args`] and are not interpreted here.
     Inspect,
+    /// `--test`: Node's own test-runner entry point,
+    /// `internal/main/test_runner`.
+    ///
+    /// Remaining positional arguments are test globs or file paths, so they
+    /// stay untouched in `process.argv`.
+    Test,
 }
 
 impl Source {
@@ -385,7 +391,10 @@ impl Source {
     /// `prepareMainThreadExecution()`, and running it twice trips
     /// `initializeModuleLoaders`' assertion that no user module has executed.
     pub fn uses_main_script(&self) -> bool {
-        matches!(self, Self::Stdin { .. } | Self::Help | Self::Inspect)
+        matches!(
+            self,
+            Self::Stdin { .. } | Self::Help | Self::Inspect | Self::Test
+        )
     }
 
     /// The main script id this source runs, when it is one.
@@ -394,6 +403,7 @@ impl Source {
             Self::Stdin { .. } => Some("internal/main/eval_stdin"),
             Self::Help => Some("internal/main/print_help"),
             Self::Inspect => Some("internal/main/inspect"),
+            Self::Test => Some("internal/main/test_runner"),
             _ => None,
         }
     }
@@ -459,13 +469,17 @@ pub const INSPECT_SUBCOMMAND: &str = "inspect";
 /// option table (`rn_bind_options::is_v8_flag`) and forwarded; see
 /// [`record_v8_flag`] and the fallback in [`parse_with_env`].
 const IGNORED_WITHOUT_VALUE: &[&str] = &[
+    "--cpu-prof",
     "--disable-proto",
     "--enable-source-maps",
+    "--heap-prof",
     "--expose-internals",
     "--expose_internals",
     "--experimental-strip-types",
     "--experimental-worker",
     "--frozen-intrinsics",
+    "--network-family-autoselection",
+    "--no-network-family-autoselection",
     "--no-deprecation",
     "--no-warnings",
     "--pending-deprecation",
@@ -474,16 +488,67 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
     "--throw-deprecation",
     "--trace-deprecation",
     "--trace-warnings",
+    "--watch",
+    "--watch-preserve-output",
+];
+
+/// Test-runner flags that take no value.
+///
+/// Their semantics live in Node's own `lib/internal/test_runner/**` modules, so
+/// the CLI only needs to accept and forward them.
+const TEST_FLAGS_WITHOUT_VALUE: &[&str] = &[
+    "--test",
+    "--test-force-exit",
+    "--test-update-snapshots",
+    "--experimental-test-coverage",
+    "--experimental-test-module-mocks",
+    "--test-only",
+    "--test-forbid-only",
+    "--test-coverage-include-all",
+    "--test-randomize",
+    "--test-udp-no-try-send",
 ];
 
 /// Flags whose value is a separate argument (`--flag value`).
 const VALUE_SEPARATE: &[&str] = &[
     "--conditions",
+    "--cpu-prof-interval",
+    "--cpu-prof-dir",
+    "--cpu-prof-name",
+    "--heap-prof-dir",
+    "--heap-prof-name",
+    "--heap-prof-interval",
     "--import",
+    "--inspect-publish-uid",
     "--loader",
+    "--network-family-autoselection-attempt-timeout",
+    "--heapsnapshot-near-heap-limit",
+    "--watch-kill-signal",
+    "--watch-path",
     "--require",
     "--tls-keylog",
     "-r",
+];
+
+/// Test-runner flags whose value may be the next argument.
+const TEST_VALUE_SEPARATE: &[&str] = &[
+    "--test-concurrency",
+    "--test-timeout",
+    "--test-coverage-branches",
+    "--test-coverage-functions",
+    "--test-coverage-lines",
+    "--test-isolation",
+    "--test-name-pattern",
+    "--test-reporter",
+    "--test-reporter-destination",
+    "--test-shard",
+    "--test-skip-pattern",
+    "--experimental-test-tag-filter",
+    "--test-coverage-include",
+    "--test-coverage-exclude",
+    "--test-global-setup",
+    "--test-random-seed",
+    "--test-rerun-failures",
 ];
 
 /// Flags that select the default trust store.
@@ -551,14 +616,42 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
     "--allow-wasi=",
     "--allow-worker=",
     "--conditions=",
+    "--cpu-prof-dir=",
+    "--cpu-prof-interval=",
+    "--cpu-prof-name=",
     "--disable-warning=",
+    "--heap-prof-dir=",
+    "--heap-prof-interval=",
+    "--heap-prof-name=",
     "--experimental-loader=",
     "--import=",
     "--input-type=",
     "--inspect=",
     "--inspect-brk=",
+    "--inspect-publish-uid=",
     "--loader=",
+    "--network-family-autoselection-attempt-timeout=",
+    "--heapsnapshot-near-heap-limit=",
     "--permission=",
+    "--watch-kill-signal=",
+    "--watch-path=",
+    "--test-concurrency=",
+    "--test-timeout=",
+    "--test-coverage-branches=",
+    "--test-coverage-functions=",
+    "--test-coverage-lines=",
+    "--test-isolation=",
+    "--test-name-pattern=",
+    "--test-reporter=",
+    "--test-reporter-destination=",
+    "--test-shard=",
+    "--test-skip-pattern=",
+    "--experimental-test-tag-filter=",
+    "--test-coverage-include=",
+    "--test-coverage-exclude=",
+    "--test-global-setup=",
+    "--test-random-seed=",
+    "--test-rerun-failures=",
     "--title=",
     "--tls-keylog=",
     "--unhandled-rejections=",
@@ -950,6 +1043,12 @@ pub fn parse_with_env(
             continue;
         }
 
+        if TEST_FLAGS_WITHOUT_VALUE.contains(&argument.as_str()) {
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
         // `--abort-on-uncaught-exception` is a real option, not an ignored one:
         // it changes how the process dies. It is parsed here rather than left in
         // the ignore list because a flag that is accepted and then not acted on
@@ -1096,6 +1195,15 @@ pub fn parse_with_env(
             continue;
         }
 
+        if TEST_VALUE_SEPARATE.contains(&argument.as_str()) {
+            let Some(value) = args.get(index + 1) else {
+                return Err(ParseError::Cli(format!("{argument} requires an argument")));
+            };
+            options.exec_argv.push(format!("{argument}={value}"));
+            index += 2;
+            continue;
+        }
+
         // `--experimental-` is a namespace, not a promise: the table decides
         // which experimental flags exist. One it declares is accepted and
         // recorded so a script that merely mentions it still boots; one it does
@@ -1171,6 +1279,8 @@ pub fn parse_with_env(
     // before `-e` is (`:371` against `:380`), which is why `node -e 1 --help`
     // prints the usage text instead of running the code.
     let positional = &args[index..];
+    let run_test = options.exec_argv.iter().any(|flag| flag == "--test")
+        || options.env_argv.iter().any(|flag| flag == "--test");
     options.source = if positional.first().map(String::as_str) == Some(INSPECT_SUBCOMMAND) {
         // `StartExecution` checks `first_argv == "inspect"` (`src/node.cc:367`)
         // before it looks at `print_help` (`:371`) or `has_eval_string` (`:384`),
@@ -1189,6 +1299,9 @@ pub fn parse_with_env(
         // answer, so the realm has to be up before it runs.
         options.script_args = positional.to_vec();
         Source::Help
+    } else if run_test {
+        options.script_args = positional.to_vec();
+        Source::Test
     } else if let Some(code) = eval_code {
         // `-e`/`-p` ran: their arguments are `argv.slice(1)`, with an explicit
         // `--` consumed by the flag walk above rather than forwarded.
