@@ -17,3 +17,8 @@ rn-bind-symbols = { path = "../rn-bind-symbols" }
 # callback is `task_queue`'s, so the call goes through it rather than through a
 # second copy of the JavaScript protocol.
 rn-bind-task-queue = { path = "../rn-bind-task-queue" }
+# The ES module compile path honours `NODE_COMPILE_CACHE` exactly where
+# `ModuleWrap::CompileSourceTextModule` does, and the on-disk store plus its key
+# derivation live in the `modules` namespace. Reusing that crate keeps one cache
+# rather than two that disagree about the file format.
+rn-bind-modules = { path = "../rn-bind-modules" }

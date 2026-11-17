@@ -340,6 +340,20 @@ fn main() {
     }
     rn_core::profile::mark("install_globals (bootstrap.js)");
 
+    // `Environment::InitializeCompileCache`, which `LoadEnvironment` calls after
+    // `InitializeDiagnostics` and before `StartExecution` — so before any module
+    // is compiled and, crucially, *after* the permission model is installed.
+    // Enabling it earlier made `--permission` grant the cache directory by
+    // accident: the model was not yet in the thread-local the check reads, so
+    // every check passed and a denied run wrote its cache anyway.
+    //
+    // The exit flush is registered by the enable itself — here for the
+    // environment variable, and inside the binding for
+    // `module.enableCompileCache()` — because Node's `AtExit` callback is
+    // registered by `Environment::EnableCompileCache` on both paths.
+    rn_bind_modules::compile_cache::initialize_from_env();
+    rn_core::profile::mark("compile cache init");
+
     // `process.argv` is `[execPath, scriptPath?, ...scriptArgs]`. Node puts the
     // resolved script path in `argv[1]` and omits that slot for `-e`/`-p`, where
     // the arguments follow the executable directly. Resolving it here, rather

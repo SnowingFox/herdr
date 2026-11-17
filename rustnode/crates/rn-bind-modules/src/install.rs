@@ -420,7 +420,19 @@ fn enable_compile_cache(
     };
     let portable = args.get(1).is_true();
     let read_only = args.get(2).is_true();
-    let result = compile_cache::with_cache(|cache| cache.enable(&directory, portable, read_only));
+    // The fourth slot is Node's internal `keyRoot`, which
+    // `module.enableCompileCache()` does not pass but an embedder can: it is the
+    // directory a portable cache's keys are computed relative to.
+    let key_root = arg_string(scope, &args, 3).unwrap_or_default();
+    let result =
+        compile_cache::with_cache(|cache| cache.enable(&directory, portable, read_only, &key_root));
+    // `Environment::EnableCompileCache` registers its `AtExit` flush the moment
+    // the enable succeeds, which is why `module.enableCompileCache()` writes a
+    // cache on a plain exit. Doing it here rather than at startup is what makes
+    // that path write anything at all.
+    if result.status == compile_cache::STATUS_ENABLED {
+        compile_cache::register_exit_flush();
+    }
     let values: [v8::Local<v8::Value>; 3] = [
         v8::Integer::new(scope, i32::from(result.status)).into(),
         v8::String::new(scope, &result.message)
@@ -440,11 +452,15 @@ fn get_compile_cache_dir(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let directory = compile_cache::with_cache(|cache| cache.tagged_directory().to_string());
+    let directory = compile_cache::tagged_directory().unwrap_or_default();
     set_string(scope, &mut rv, &directory);
 }
 
 /// `flushCompileCache(keepDeserializedCache)`.
+///
+/// `module.flushCompileCache()` reaches this, and `test-compile-cache-api-flush`
+/// asserts the writes happen *before* the "finished" line: a flush that only
+/// scheduled the work would pass a "did it happen" check and fail that one.
 fn flush_compile_cache(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -455,7 +471,13 @@ fn flush_compile_cache(
         throw_invalid_arg_type(scope, "keepDeserializedCache should be a boolean");
         return;
     }
-    compile_cache::with_cache(|cache| cache.flush());
+    compile_cache::trace(format_args!(
+        "[compile cache] module.flushCompileCache() requested.\n"
+    ));
+    compile_cache::with_cache(|cache| cache.persist());
+    compile_cache::trace(format_args!(
+        "[compile cache] module.flushCompileCache() finished.\n"
+    ));
     rv.set_undefined();
 }
 
@@ -475,22 +497,39 @@ fn get_compile_cache_entry(
         return;
     };
     let code_type = args.get(2).uint32_value(scope).unwrap_or(0) as i32;
-    let Some((key, transpiled)) = compile_cache::with_cache(|cache| {
-        cache.get_or_insert(source.as_bytes(), &filename, code_type)
-    }) else {
+    let Some(lookup) =
+        compile_cache::with_cache(|cache| cache.lookup(source.as_bytes(), &filename, code_type))
+    else {
         // The cache is off: `undefined`, which `lib/**` checks for.
         return;
     };
 
-    let external = v8::External::new(scope, pointer_from_key(key));
+    let external = v8::External::new(scope, pointer_from_key(lookup.key));
     let mut names = vec![v8::String::new(scope, "external").expect("key").into()];
     let mut values: Vec<v8::Local<v8::Value>> = vec![external.into()];
-    if let Some(transpiled) = transpiled {
+    if let Some(transpiled) = lookup.cached.as_deref() {
+        let text = std::str::from_utf8(transpiled).ok();
+        compile_cache::trace(format_args!(
+            "[compile cache] retrieving transpile cache for {} {}...",
+            compile_cache::type_name_of(code_type),
+            lookup.source_filename
+        ));
+        let Some(text) = text else {
+            compile_cache::trace(format_args!("failed\n"));
+            return;
+        };
+        compile_cache::trace(format_args!("success\n"));
         names.push(v8::String::new(scope, "transpiled").expect("key").into());
         values.push(
-            v8::String::new(scope, &transpiled)
+            v8::String::new(scope, text)
                 .map_or_else(|| v8::undefined(scope).into(), |value| value.into()),
         );
+    } else {
+        compile_cache::trace(format_args!(
+            "[compile cache] no transpile cache for {} {}\n",
+            compile_cache::type_name_of(code_type),
+            lookup.source_filename
+        ));
     }
     let null = v8::null(scope);
     rv.set(v8::Object::with_prototype_and_properties(scope, null.into(), &names, &values).into());
@@ -527,8 +566,8 @@ fn save_compile_cache_entry(
 /// `getWasmCompileCacheEntry(source, filename, options)`.
 ///
 /// The WebAssembly sibling of [`get_compile_cache_entry`], and the one
-/// `lib/internal/modules/esm/translators.js` calls unconditionally in
-/// `translateWasm` — so every `.wasm` import reaches it.
+/// `lib/internal/esm/translators.js` calls unconditionally in `translateWasm` —
+/// so every `.wasm` import reaches it.
 ///
 /// Node's version returns `undefined` when the cache is disabled, and otherwise
 /// a null-prototype object that always carries an `external` handle and *may*
@@ -541,13 +580,23 @@ fn save_compile_cache_entry(
 /// * a missing entry (`undefined`) means the cache is off and the caller must
 ///   not call the save member at all.
 ///
-/// The bytes this crate can round-trip are V8's serialized compiled module, and
-/// producing them needs `v8::CompiledWasmModule::Serialize()`, which the linked
-/// `v8` crate does not bind. So the `module` slot is always absent here: this
-/// returns the same shape Node returns on a miss, and the wasm cache behaves as
-/// a write-through store that never produces a hit. That is observable and
-/// identical to what the oracle prints for a miss; see the crate README for the
-/// condition that would turn the hit path on.
+/// # Why there is never a hit here
+///
+/// Producing the payload needs `v8::CompiledWasmModule::Serialize()`, and
+/// consuming it needs `ModuleCachingInterface::SetCachedCompiledModuleBytes`.
+/// The second is bound by the `v8` crate; the first is not — a search of
+/// `v8-152.2.0/src` finds `CompiledWasmModule::get_wire_bytes_ref` and
+/// `source_url` and nothing that serializes. So this returns the shape Node
+/// returns on a miss, and the wasm cache behaves as a store that never produces
+/// a hit.
+///
+/// That is exactly what the oracle does in the default configuration too: V8
+/// only serializes optimized code, so `test-compile-cache-wasm`'s third block
+/// asserts `nothing to serialize for Wasm` and
+/// `skip persisting Wasm ... because the cache was not initialized`, which is
+/// what this produces. Only the `--no-liftoff --no-wasm-lazy-compilation` block
+/// differs, because that is the configuration in which V8 does have code to
+/// serialize.
 fn get_wasm_compile_cache_entry(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -559,17 +608,34 @@ fn get_wasm_compile_cache_entry(
     let Some(filename) = arg_string(scope, &args, 1) else {
         return;
     };
-    let Some((key, _cached)) = compile_cache::with_cache(|cache| {
-        cache.get_or_insert_bytes(&source, &filename, compile_cache::K_WASM)
-    }) else {
+    let Some(lookup) =
+        compile_cache::with_cache(|cache| cache.lookup(&source, &filename, compile_cache::K_WASM))
+    else {
         // The cache is off: `undefined`, which `translators.js` tests with
         // `cacheEntry !== undefined` before it ever saves.
         return;
     };
 
-    let external = v8::External::new(scope, pointer_from_key(key));
-    let names = [v8::String::new(scope, "external").expect("key").into()];
-    let values = [external.into()];
+    let external = v8::External::new(scope, pointer_from_key(lookup.key));
+    let names = vec![v8::String::new(scope, "external").expect("key").into()];
+    let values: Vec<v8::Local<v8::Value>> = vec![external.into()];
+    match lookup.cached {
+        Some(bytes) if !bytes.is_empty() => {
+            // Nothing in this build writes a wasm payload, so this arm exists
+            // only so a cache directory written by a real Node cannot be read as
+            // a hit through a deserializer this runtime does not have. Report
+            // the miss Node reports and leave `module` absent.
+            compile_cache::trace(format_args!(
+                "[compile cache] deserializing Wasm {}...rejected\n",
+                lookup.source_filename
+            ));
+            let _ = bytes;
+        }
+        _ => compile_cache::trace(format_args!(
+            "[compile cache] no cache for Wasm {}\n",
+            lookup.source_filename
+        )),
+    }
     let null = v8::null(scope);
     rv.set(v8::Object::with_prototype_and_properties(scope, null.into(), &names, &values).into());
 }
@@ -579,15 +645,17 @@ fn get_wasm_compile_cache_entry(
 /// Node serializes the compiled module and files it under the entry's key, so a
 /// later `getWasmCompileCacheEntry` for the same wire bytes can hand back a
 /// `module` without recompiling. `CompiledWasmModule::Serialize()` is the one
-/// V8 call that produces those bytes and the linked `v8` crate does not bind
-/// it, so there is nothing to store: the member records the save and writes no
-/// payload.
+/// V8 call that produces those bytes and the linked `v8` crate does not bind it,
+/// so there is nothing to store.
 ///
 /// It must still exist and must still accept the call. `translateWasm` reaches
 /// it on every `.wasm` import whose entry came back defined, so a missing or
 /// throwing member is a `TypeError` on the import path rather than a lost cache
-/// hit. The entry is left uninitialized so the flush step skips it, which is
-/// exactly what the oracle does when V8 has nothing to serialize.
+/// hit. The save is routed through [`compile_cache::CompileCache::store_code_cache`]
+/// with no payload, which is what emits Node's own
+/// `nothing to serialize for Wasm <url>` line and leaves the entry
+/// uninitialized so the flush step skips it — the oracle prints the same pair
+/// whenever V8 had no optimized code to serialize.
 fn save_wasm_compile_cache_entry(
     _scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -604,6 +672,11 @@ fn save_wasm_compile_cache_entry(
     if !module.is_wasm_module_object() {
         return;
     }
+    let Ok(handle) = v8::Local::<v8::External>::try_from(handle) else {
+        return;
+    };
+    let key = key_from_pointer(handle.value());
+    compile_cache::with_cache(|cache| cache.store_code_cache(key, None, false));
     rv.set_undefined();
 }
 

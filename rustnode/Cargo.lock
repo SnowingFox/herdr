@@ -1217,7 +1217,9 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rn-core",
+ "rn-env",
  "rn-node-oracle",
+ "rn-permission",
  "rn-v8-sys",
  "serde_json",
 ]
@@ -1836,11 +1838,13 @@ dependencies = [
 name = "rn-cli"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rn-bind-async-wrap",
  "rn-bind-crypto",
  "rn-bind-heap-utils",
  "rn-bind-inspector",
  "rn-bind-messaging",
+ "rn-bind-modules",
  "rn-bind-options",
  "rn-bind-sqlite",
  "rn-bind-task-queue",
@@ -1964,6 +1968,7 @@ dependencies = [
 name = "rn-module-wrap"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-modules",
  "rn-bind-symbols",
  "rn-bind-task-queue",
  "rn-core",
