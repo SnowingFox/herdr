@@ -242,6 +242,11 @@ pub fn run_if_waiting_for_debugger() {
     if !paused.waiting_for_frontend {
         return;
     }
+    // `Runtime.runIfWaitingForDebugger` ends the startup wait immediately.
+    // Without also marking this wait as resumed, `should_run` falls through to
+    // the regular pause branch (`attached && !resumed`) and keeps blocking
+    // until the client disconnects.
+    paused.resumed = true;
     paused.waiting_for_frontend = false;
     paused.generation = paused.generation.wrapping_add(1);
     drop(paused);

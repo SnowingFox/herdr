@@ -616,13 +616,13 @@ fn a_script_argument_that_looks_like_a_flag_is_not_reparsed_as_runtime_option() 
 fn a_declared_flag_rustnode_has_not_implemented_is_not_forwarded() {
     // The rule `forward_v8_flags` used to state as a comment: a flag the table
     // declares is Node's, so handing it to V8 would change V8's behaviour behind
-    // rustnode's back. `--max-http-header-size` is declared by the table and not
+    // rustnode's back. `--report-compact` is declared by the table and not
     // implemented by the CLI, so it stays a rejection rather than becoming a V8
     // flag that V8 would also refuse (as a `bad option`) or, worse, accept.
-    let (code, _, stderr) = run_args(&["--max-http-header-size=32768", "-e", "1"]);
+    let (code, _, stderr) = run_args(&["--report-compact", "-e", "1"]);
     assert_eq!(code, 9, "stderr: {stderr}");
     assert!(
-        stderr.contains("unsupported option '--max-http-header-size=32768'"),
+        stderr.contains("unsupported option '--report-compact'"),
         "stderr: {stderr}"
     );
 }

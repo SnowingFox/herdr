@@ -369,6 +369,12 @@ pub fn wait_for_client() -> bool {
     })
 }
 
+/// Writes and closes NODE_V8_COVERAGE output for this isolate, if enabled.
+pub fn flush_coverage(scope: &mut v8::PinScope<'_, '_>) {
+    let _ = profiler::take_coverage(scope);
+    profiler::end_coverage(scope);
+}
+
 /// Blocks until a client sends `Runtime.runIfWaitingForDebugger`, dispatching its
 /// commands in the meantime.
 ///
@@ -915,6 +921,7 @@ fn set_coverage_directory(
         return;
     }
     profiler::set_coverage_directory(&args.get(0).to_rust_string_lossy(scope));
+    profiler::start_coverage(scope);
 }
 
 fn set_source_map_cache_getter(
