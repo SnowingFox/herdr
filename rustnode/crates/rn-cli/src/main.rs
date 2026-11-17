@@ -5,6 +5,7 @@ use rn_bindings::install_all;
 use rn_core::Env;
 use rn_realm as bootstrap;
 use rn_v8_sys::v8;
+use std::path::Path;
 
 fn main() {
     rn_core::profile::start();
@@ -84,6 +85,10 @@ fn main() {
     // that needed it looks like it exercised something it did not.
     for flag in &options.unimplemented {
         eprintln!("rustnode: warning: {flag} is accepted but not implemented");
+    }
+    if let Some(missing) = missing_test_runner_path(&options) {
+        eprintln!("Could not find '{missing}'");
+        terminate(1);
     }
     rn_permission::runtime::install_shared(options.permission.clone());
     rn_core::profile::mark("args parse + permission install");
@@ -357,7 +362,13 @@ fn main() {
                     // created the agent that `schedulePauseOnNextStatement` needs.
                     // Scheduling it before the wait is accepted by V8 and then has
                     // no effect, because there is no debugger agent to arm yet.
-                    rn_bind_inspector::schedule_start_break();
+                    // `--test` enters through `internal/main/test_runner`, whose
+                    // startup side effects (including the inspector concurrency
+                    // warning) must run before any debugger pause in
+                    // `test-runner-inspect.mjs`'s attach flow.
+                    if !matches!(options.source, args::Source::Test) {
+                        rn_bind_inspector::schedule_start_break();
+                    }
                 }
             }
             Err(message) => {
@@ -772,6 +783,11 @@ fn main() {
         // run, and Node drains once more before exiting.
         hooks.drain(scope);
     }
+    // `NODE_V8_COVERAGE` writes profiles at process exit in Node. The JS side
+    // provides the directory and source-map getter through `setCoverageDirectory`
+    // and `setSourceMapCacheGetter`; flushing here makes that data visible
+    // before we terminate the process.
+    rn_bind_inspector::flush_coverage(scope);
 
     // The loop has settled, so the process is at the point Node calls
     // `EmitProcessExitInternal` from. `beforeExit` has already been offered the
@@ -825,6 +841,27 @@ fn terminate(code: i32) -> ! {
     rn_bindings::run_addon_teardowns();
     rn_uv::threadpool::drain();
     std::process::exit(code);
+}
+
+fn missing_test_runner_path(options: &args::Options) -> Option<&str> {
+    if !matches!(options.source, args::Source::Test) {
+        return None;
+    }
+    options.script_args.iter().find_map(|candidate| {
+        if looks_like_glob(candidate) {
+            return None;
+        }
+        (!Path::new(candidate).exists()).then_some(candidate.as_str())
+    })
+}
+
+fn looks_like_glob(candidate: &str) -> bool {
+    candidate.contains('*')
+        || candidate.contains('?')
+        || candidate.contains('[')
+        || candidate.contains(']')
+        || candidate.contains('{')
+        || candidate.contains('}')
 }
 
 /// Compiles and runs `source` as a bare script and reports the result.

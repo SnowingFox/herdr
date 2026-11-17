@@ -480,6 +480,8 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
     "--frozen-intrinsics",
     "--network-family-autoselection",
     "--no-network-family-autoselection",
+    "--node-snapshot",
+    "--no-node-snapshot",
     "--no-deprecation",
     "--no-warnings",
     "--pending-deprecation",
@@ -488,6 +490,8 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
     "--throw-deprecation",
     "--trace-deprecation",
     "--trace-warnings",
+    "--strip-types",
+    "--no-strip-types",
     "--watch",
     "--watch-preserve-output",
 ];
@@ -521,10 +525,17 @@ const VALUE_SEPARATE: &[&str] = &[
     "--import",
     "--inspect-publish-uid",
     "--loader",
+    "--max-http-header-size",
     "--network-family-autoselection-attempt-timeout",
     "--heapsnapshot-near-heap-limit",
+    "--report-signal",
     "--watch-kill-signal",
     "--watch-path",
+    "--v8-pool-size",
+    "--tls-cipher-list",
+    "--secure-heap",
+    "--secure-heap-min",
+    "--use-largepages",
     "--require",
     "--tls-keylog",
     "-r",
@@ -630,11 +641,14 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
     "--inspect-brk=",
     "--inspect-publish-uid=",
     "--loader=",
+    "--max-http-header-size=",
     "--network-family-autoselection-attempt-timeout=",
     "--heapsnapshot-near-heap-limit=",
+    "--report-signal=",
     "--permission=",
     "--watch-kill-signal=",
     "--watch-path=",
+    "--v8-pool-size=",
     "--test-concurrency=",
     "--test-timeout=",
     "--test-coverage-branches=",
@@ -653,7 +667,12 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
     "--test-random-seed=",
     "--test-rerun-failures=",
     "--title=",
+    "--tls-cipher-list=",
     "--tls-keylog=",
+    "--secure-heap=",
+    "--secure-heap-min=",
+    "--use-largepages=",
+    "--trace-event-file-pattern=",
     "--unhandled-rejections=",
 ];
 
@@ -1845,11 +1864,11 @@ mod tests {
     fn a_declared_flag_rustnode_does_not_implement_is_rejected_not_forwarded() {
         // The rule the old `forward_v8_flags` comment stated: a flag Node's
         // table declares is Node's, so handing it to V8 would change V8's
-        // behaviour behind rustnode's back. `--max-http-header-size` is in the
+        // behaviour behind rustnode's back. `--report-compact` is in the
         // table and the CLI does not act on it, so it stays an error and never
         // reaches `v8_args`.
-        let error = parse_of(&["--max-http-header-size=32768", "-e", "1"]).expect_err("rejects");
-        assert!(error.contains("--max-http-header-size=32768"), "{error}");
+        let error = parse_of(&["--report-compact", "-e", "1"]).expect_err("rejects");
+        assert!(error.contains("--report-compact"), "{error}");
     }
 
     #[test]
