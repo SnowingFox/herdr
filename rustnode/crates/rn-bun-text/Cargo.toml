@@ -18,3 +18,6 @@ serde_json.workspace = true
 # The differential test compares against the pinned Node oracle rather than
 # whatever `node` `PATH` resolves to; see `tools/node-pin.toml`.
 rn-node-oracle = { path = "../../tools/node-oracle" }
+
+[build-dependencies]
+rn-v8-sys.workspace = true

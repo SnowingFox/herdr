@@ -40,6 +40,7 @@ const VALUES_JS: &str = include_str!("values.js");
 /// The `readableStreamTo*` family.
 const STREAMS_JS: &str = include_str!("streams.js");
 const TIMERS_JS: &str = include_str!("timers.js");
+include!(concat!(env!("OUT_DIR"), "/script_code_cache.rs"));
 
 /// `Bun.ArrayBufferSink`, whose instances have methods but whose constructor has
 /// no `prototype` property.
@@ -545,9 +546,31 @@ fn evaluate<'s>(
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     let source =
         v8::String::new(scope, source).ok_or_else(|| format!("cannot allocate {label}"))?;
-    let script = v8::Script::compile(scope, source, None)
-        .ok_or_else(|| format!("cannot compile {label}"))?;
-    match script.run(scope) {
+    let cached = SCRIPT_CODE_CACHE
+        .iter()
+        .find_map(|(name, bytes)| (*name == label).then_some(*bytes))
+        .filter(|bytes| !bytes.is_empty());
+    let mut source = match cached {
+        Some(bytes) => v8::script_compiler::Source::new_with_cached_data(
+            source,
+            None,
+            v8::script_compiler::CachedData::new(bytes),
+        ),
+        None => v8::script_compiler::Source::new(source, None),
+    };
+    let options = if source.get_cached_data().is_some() {
+        v8::script_compiler::CompileOptions::ConsumeCodeCache
+    } else {
+        v8::script_compiler::CompileOptions::NoCompileOptions
+    };
+    let script = v8::script_compiler::compile_unbound_script(
+        scope,
+        &mut source,
+        options,
+        v8::script_compiler::NoCacheReason::NoReason,
+    )
+    .ok_or_else(|| format!("cannot compile {label}"))?;
+    match script.bind_to_current_context(scope).run(scope) {
         Some(value) => Ok(value),
         None => Err(format!("{label} threw while being evaluated")),
     }
