@@ -81,7 +81,18 @@ pub fn import_raw_seed(algorithm: KeyAlgorithm, bytes: &[u8]) -> Result<PKey, Ke
     if bytes.len() != algorithm.seed_size() {
         return Err(KeyFormatError::InvalidData);
     }
-    new_raw(algorithm, bytes, RawKind::Private)
+    let key_type = match algorithm.name() {
+        "ML-DSA-44" => openssl::pkey::KeyType::ML_DSA_44,
+        "ML-DSA-65" => openssl::pkey::KeyType::ML_DSA_65,
+        "ML-DSA-87" => openssl::pkey::KeyType::ML_DSA_87,
+        "ML-KEM-512" => openssl::pkey::KeyType::ML_KEM_512,
+        "ML-KEM-768" => openssl::pkey::KeyType::ML_KEM_768,
+        "ML-KEM-1024" => openssl::pkey::KeyType::ML_KEM_1024,
+        _ => return Err(KeyFormatError::UnsupportedFormat),
+    };
+    let key = OpenSslPKey::private_key_from_seed(None, key_type, None, bytes)
+        .map_err(|_| KeyFormatError::InvalidData)?;
+    Ok(PKey::from_private(key))
 }
 
 /// Dispatches a raw import by its `kKeyFormat*` value.

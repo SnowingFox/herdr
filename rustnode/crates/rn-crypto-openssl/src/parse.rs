@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn an_encrypted_pem_without_a_passphrase_needs_one() {
+    fn an_encrypted_pem_without_a_passphrase_is_a_parse_failure() {
         let key = OpenSslPKey::private_key_from_pem(RSA_PRIVATE_PEM.as_bytes()).expect("fixture");
         let encrypted = key
             .private_key_to_pem_pkcs8_passphrase(
@@ -526,7 +526,9 @@ mod tests {
 
         let error = parse_private_key(&encrypted, &PrivateKeyEncoding::default())
             .expect_err("needs a passphrase");
-        assert_eq!(error.kind, crate::error::ParseError::NeedPassphrase);
+        // Node classifies this from the oldest queue entry only, which is an
+        // OpenSSL parse failure here rather than `PEM_R_BAD_PASSWORD_READ`.
+        assert_eq!(error.kind, crate::error::ParseError::Failed);
 
         let config = PrivateKeyEncoding {
             passphrase: Some(b"correct-horse".to_vec()),

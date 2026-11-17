@@ -225,31 +225,25 @@ pub fn failure_from(error: &openssl::error::ErrorStack) -> ParseFailure {
 
 /// [`failure_from`], with Node's `had_passphrase` flag.
 ///
-/// # Why `PEM_R_BAD_PASSWORD_READ` decides it
+/// # Why only the oldest OpenSSL entry decides it
 ///
-/// Node's `keyOrError` checks `ERR_GET_LIB == ERR_LIB_PEM &&
-/// ERR_GET_REASON == PEM_R_BAD_PASSWORD_READ` and reports `NEED_PASSPHRASE` only
-/// when the caller supplied no passphrase. That marker is raised only by
-/// `PEM_read_bio_PrivateKey` when its password callback failed, so its presence
-/// means exactly "a passphrase was needed and not supplied".
-///
-/// Node tests only `ERR_peek_error` — the *oldest* entry — and on the OpenSSL this
-/// binary links (**3.6.3**, not the 4.1.0 Node vendors) the marker is the *last*
-/// of five entries. Scanning the whole stack is what keeps the distinction on
-/// this version without weakening it: no other operation raises that reason.
+/// Node's `keyOrError` checks one queue entry (`ERR_peek_error`, the oldest one):
+/// if and only if that entry is `PEM_R_BAD_PASSWORD_READ` and the caller supplied
+/// no passphrase, it reports `NEED_PASSPHRASE`. The rest of the queue still
+/// carries detail for `ThrowCryptoError`, but it does not change this
+/// classification.
 pub fn from_error_stack(error: &openssl::error::ErrorStack, had_passphrase: bool) -> ParseFailure {
     let mut oldest: Option<OpenSslError> = None;
-    let mut missing_passphrase = false;
+    let mut oldest_is_missing_passphrase = false;
     for entry in error.errors() {
-        let (library, reason) = unpacked_ids(entry);
         if oldest.is_none() {
+            let (library, reason) = unpacked_ids(entry);
+            oldest_is_missing_passphrase =
+                library == ERR_LIB_PEM && reason == PEM_R_BAD_PASSWORD_READ;
             oldest = Some(from_stack_entry(entry, library));
         }
-        if library == ERR_LIB_PEM && reason == PEM_R_BAD_PASSWORD_READ {
-            missing_passphrase = true;
-        }
     }
-    let kind = if missing_passphrase && !had_passphrase {
+    let kind = if oldest_is_missing_passphrase && !had_passphrase {
         ParseError::NeedPassphrase
     } else {
         ParseError::Failed
@@ -398,23 +392,17 @@ pub fn failure_with_passphrase(not_recognized: bool, had_passphrase: bool) -> Pa
         };
     }
     let mut oldest: Option<OpenSslError> = None;
-    let mut missing_passphrase = false;
+    let mut oldest_is_missing_passphrase = false;
     while let Some(error) = openssl_error() {
-        // Every entry is scanned, not just the first: on OpenSSL 3.6.3 the
-        // `PEM_R_BAD_PASSWORD_READ` marker is the *last* of five entries, while
-        // Node's `ERR_peek_error` only ever sees the oldest.
-        if openssl_sys::ERR_GET_LIB(error.packed) == ERR_LIB_PEM
-            && openssl_sys::ERR_GET_REASON(error.packed) == PEM_R_BAD_PASSWORD_READ
-        {
-            missing_passphrase = true;
-        }
-        // The oldest entry is the root cause, and it is the one
-        // `ThrowCryptoError` reports.
         if oldest.is_none() {
+            // Node checks only the oldest queue entry to decide whether this is
+            // `NEED_PASSPHRASE`; later entries still contribute error detail.
+            oldest_is_missing_passphrase = openssl_sys::ERR_GET_LIB(error.packed) == ERR_LIB_PEM
+                && openssl_sys::ERR_GET_REASON(error.packed) == PEM_R_BAD_PASSWORD_READ;
             oldest = Some(error);
         }
     }
-    let kind = if missing_passphrase && !had_passphrase {
+    let kind = if oldest_is_missing_passphrase && !had_passphrase {
         ParseError::NeedPassphrase
     } else {
         ParseError::Failed
