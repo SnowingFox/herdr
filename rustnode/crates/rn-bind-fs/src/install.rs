@@ -1994,7 +1994,9 @@ fn read_file_utf8_binding<'a, 's, 'i>(
     mut rv: v8::ReturnValue<'s>,
 ) {
     let flags = crate::args::int32(scope, args.get(1)).unwrap_or(0);
-    if let Some(fd) = crate::args::int32(scope, args.get(0)) {
+    let first = args.get(0);
+    if first.is_int32() {
+        let fd = first.int32_value(scope).unwrap_or(-1);
         match fsops::read_file_utf8_fd(fd) {
             Ok(text) => {
                 if let Some(value) = v8::String::new(scope, &text) {
@@ -2037,7 +2039,9 @@ fn write_file_utf8_binding<'a, 's, 'i>(
         return;
     };
     let text = text.to_rust_string_lossy(scope);
-    if let Some(fd) = crate::args::int32(scope, args.get(0)) {
+    let first = args.get(0);
+    if first.is_int32() {
+        let fd = first.int32_value(scope).unwrap_or(-1);
         match fsops::write_file_utf8_fd(fd, &text) {
             Ok(()) => rv.set_undefined(),
             Err(error) => throw_error(scope, &error),

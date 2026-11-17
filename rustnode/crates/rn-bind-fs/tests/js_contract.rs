@@ -1088,6 +1088,14 @@ fn run_in_binary(label: &str, source: &str) -> String {
 }
 
 #[test]
+fn script_entrypoint_file_is_executed() {
+    // `run_in_binary` launches `rustnode <script-file>`. If file entrypoint
+    // loading regresses to reading stdin (fd 0), this returns an empty string.
+    let out = run_in_binary("script-entrypoint", "console.log('from file');");
+    assert_eq!(out, "from file");
+}
+
+#[test]
 fn read_file_job_is_named_by_lib_fs_and_constructs() {
     // `lib/fs.js` destructures both names from the namespace at load time and
     // constructs them directly, so a missing entry is a `TypeError` before any
