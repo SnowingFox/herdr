@@ -810,6 +810,14 @@ fn main() {
 fn terminate(code: i32) -> ! {
     rn_core::profile::mark("loop finished");
     rn_core::profile::report();
+    // Addon teardown before the threadpool drain: a `napi_add_env_cleanup_hook`
+    // hook must not run after the pool that may still hold its work has been
+    // torn down. Node reaches the same point at `Environment::RunCleanup`, from
+    // `node::Stop` — before the pool join in `node::TearDownOncePerProcess`.
+    //
+    // A `Drop` on the loaded-addon list would not do: `std::process::exit` below
+    // does not run destructors, and this is the only exit path.
+    rn_bindings::run_addon_teardowns();
     rn_uv::threadpool::drain();
     std::process::exit(code);
 }

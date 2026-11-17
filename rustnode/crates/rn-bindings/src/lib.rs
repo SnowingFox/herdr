@@ -9,3 +9,11 @@
 mod install_all;
 
 pub use install_all::install_all;
+
+/// Runs every loaded addon's teardown. See
+/// [`rn_bind_process_methods::run_addon_teardowns`].
+///
+/// Re-exported because the CLI depends on this crate and not on the loader crate
+/// directly, and a teardown caller should not have to know which crate owns the
+/// loaded-addon list.
+pub use rn_bind_process_methods::run_addon_teardowns;
