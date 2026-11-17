@@ -12,18 +12,22 @@
 #   this shim                      27.76 ms   (+2.0 ms)
 #   node + spawnSync shim          ~51 ms      (+22 ms)
 #
-# The split is the whole point, and both numbers have to be quoted together:
+# The split is the whole point, and both figures have to be quoted together:
 #
 #   +1.7 ms   the shell. Starting any `sh` costs this; the two-line stub with no
 #             logic at all measures it.
 #   +0.31 ms  this script. Its resolution is within noise of that floor.
 #
-# So the defensible claim is "never worse than a two-line `sh` script", NOT
-# "adds no measurable cost": the wrapper really does cost ~2 ms over a direct
-# invocation, and this is the startup path of a runtime whose pitch is startup
-# time, so an understated number here would be quoted back at us. Earlier
-# versions of this comment carried +0.13 ms, which compared the shim against a
-# floor measured in a different, quieter window and understated the shell cost.
+# The absolute delta is load-sensitive and the row above is its high end: the same
+# measurement in a quieter window gave +0.4 ms over the binary. So the cost of
+# this shim is +0.4 to +2.0 ms depending on machine load. The floor comparison is
+# not load-sensitive in the same way, because both sides pay the shell start and
+# move together, which is why "never worse than a two-line `sh` script" is the
+# defensible claim and "adds no measurable cost" is not. This is the startup path
+# of a runtime whose pitch is startup time, so an understated number here is the
+# kind that gets quoted back at us: an earlier version of this comment carried
+# +0.13 ms, which compared the shim against a floor measured in a different,
+# quieter window and understated the shell cost.
 #
 # A Node shim cannot avoid booting a whole second runtime before the real one
 # starts, which is why esbuild/biome/deno pay that cost to resolve a path that
