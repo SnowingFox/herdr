@@ -1918,6 +1918,25 @@ fn process_object<'s>(
     feature(scope, "debug", cfg!(debug_assertions));
     // Modules are requireable, and TypeScript stripping is not implemented.
     feature(scope, "require_module", true);
+    // `dtls` and `quic` are getters in `lib/internal/bootstrap/node.js:290-300`,
+    // each a conjunction whose first term is `process.config.variables.node_use_*`.
+    // Both are `0` in the pinned build, so both are `false`; this build has no
+    // DTLS or QUIC either. Verified against the oracle **with the experimental
+    // flags on**, because a value that only happens to be false by default would
+    // be wrong the moment a flag flips it:
+    //
+    //   node --experimental-quic --experimental-dtls \
+    //     -e 'console.log(process.features.quic, process.features.dtls)'
+    //   false false
+    //
+    // Omitting them entirely — which is what this used to do — leaves them
+    // `undefined`, and `undefined` passes a truthiness check by accident while
+    // failing `=== false` and the `in` operator. `test/common/index.js:78` reads
+    // `!!process.features.quic`, which is why the 272 QUIC tests still skipped
+    // correctly and this was invisible: the bug costs no test files, but the
+    // property is still wrong.
+    feature(scope, "dtls", false);
+    feature(scope, "quic", false);
     if let Some(key) = v8::String::new(scope, "typescript") {
         if let Some(value) = v8::String::new(scope, "strip") {
             let _ = features.set(scope, key.into(), value.into());

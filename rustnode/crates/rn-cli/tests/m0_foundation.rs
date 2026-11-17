@@ -318,6 +318,42 @@ fn process_features_reports_what_the_binary_actually_has() {
 }
 
 #[test]
+fn quic_and_dtls_are_false_rather_than_absent() {
+    // `lib/internal/bootstrap/node.js:290-300` makes both getters over
+    // `process.config.variables.node_use_*`, which are 0 in the pinned build, so
+    // both must read `false`.
+    //
+    // Absent is not equivalent. `test/common/index.js:78` computes
+    // `hasQuic = hasCrypto && !!process.features.quic`, and `!!undefined` is
+    // `false` too — so leaving the keys out made all 272 QUIC tests skip
+    // correctly and the defect cost no test files. It is still wrong: `undefined`
+    // fails `=== false` and `in`, which is the same trap `process.config.variables`
+    // had.
+    let out = rustnode(&[
+        "-e",
+        "const f = process.features;\n\
+         console.log(f.quic === false, f.dtls === false, 'quic' in f, 'dtls' in f);",
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "true true true true",
+        "quic/dtls must be present and false, not undefined"
+    );
+
+    // The experimental flags must not flip them: the oracle reports false even
+    // with both on, because its `node_use_*` are 0 and this build has neither
+    // feature. A hard-coded `false` that happened to be right only by default
+    // would be wrong here.
+    let out = rustnode(&[
+        "--experimental-quic",
+        "--experimental-dtls",
+        "-e",
+        "console.log(process.features.quic, process.features.dtls);",
+    ]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "false false");
+}
+
+#[test]
 fn a_script_reports_failure_through_the_exit_code() {
     // Node's own tests fail by setting `process.exitCode`, not by throwing, so
     // a runtime that ignores it would report every test as passing.
