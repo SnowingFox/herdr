@@ -276,8 +276,12 @@ pub struct SessionState {
     /// `setGracefulCloseInitiated()`: `setGracefulClose` ran, so the
     /// `ongracefulclosecomplete` notification is armed.
     pub graceful_close: Cell<bool>,
+    /// A GOAWAY was submitted through `Http2Session::Goaway`.
+    pub goaway_initiated: Cell<bool>,
     /// Whether that notification has fired, so it fires once.
     pub graceful_close_notified: Cell<bool>,
+    /// `OnFrameSent` saw a GOAWAY nghttp2 initiated internally.
+    pub internal_goaway_sent: Cell<bool>,
     /// `is_receiving()`: inside `nghttp2_session_mem_recv`.
     ///
     /// `SendPendingData` must not run while this is set, because sending can close
@@ -387,7 +391,9 @@ impl SessionState {
             destroyed_streams: RefCell::new(std::collections::BTreeSet::new()),
             inbound: RefCell::new(Vec::new()),
             graceful_close: Cell::new(false),
+            goaway_initiated: Cell::new(false),
             graceful_close_notified: Cell::new(false),
+            internal_goaway_sent: Cell::new(false),
             receiving: Cell::new(false),
             sending: Cell::new(false),
             write_scheduled: Cell::new(false),
@@ -673,6 +679,9 @@ pub fn send_pending_data(scope: &mut v8::PinScope<'_, '_>, state: &SessionState)
         crate::stream::settle_writes(state, stream_id);
     }
     maybe_notify_graceful_close(state);
+    if state.internal_goaway_sent.replace(false) && !state.closing.get() && !state.destroyed.get() {
+        emit_internal_protocol_error(state);
+    }
 }
 
 /// Hands `bytes` to the stream this session consumed, and returns the status.
@@ -1064,12 +1073,25 @@ fn receive_scope(scope: &mut v8::PinScope<'_, '_>, state: &SessionState, bytes: 
     };
     state.recv_error_code.borrow_mut().take();
     state.receiving.set(true);
-    // SAFETY: `raw` is live and `bytes` is readable for its length.
-    let consumed = unsafe { ffi::nghttp2_session_mem_recv(raw, bytes.as_ptr(), bytes.len()) };
+    let mut consumed = 0isize;
+    let mut consumed_total = 0usize;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let remaining = &bytes[offset..];
+        // SAFETY: `raw` is live and `remaining` is readable for its length.
+        consumed =
+            unsafe { ffi::nghttp2_session_mem_recv(raw, remaining.as_ptr(), remaining.len()) };
+        if consumed <= 0 {
+            break;
+        }
+        let step = consumed as usize;
+        consumed_total += step;
+        offset += step;
+    }
     state.receiving.set(false);
     state
         .session_memory
-        .set(state.session_memory.get() + bytes.len() as u64);
+        .set(state.session_memory.get() + consumed_total as u64);
 
     // Everything submitted from inside the receive is replayed here: `receiving`
     // is already false, so nghttp2 is no longer walking its own outbound queue.
@@ -1312,6 +1334,22 @@ pub fn has_pending_data(state: &SessionState) -> bool {
     want_write != 0 || want_read != 0
 }
 
+/// Emits `onSessionInternalError(NGHTTP2_ERR_PROTO)`, as Node does.
+fn emit_internal_protocol_error(state: &SessionState) {
+    let _ = rn_uv::callback::with_context(|scope| {
+        let Some(object) = crate::session_object(scope, state) else {
+            return;
+        };
+        let Some(callback) = crate::callbacks::pick_global(|callbacks| callbacks.error.clone())
+        else {
+            return;
+        };
+        let callback = v8::Local::new(scope, callback);
+        let args = [v8::Integer::new(scope, ffi::NGHTTP2_ERR_PROTO).into()];
+        let _ = callback.call(scope, object.into(), &args);
+    });
+}
+
 /// `MaybeNotifyGracefulCloseComplete`: tell `core.js` the connection is drained.
 ///
 /// `http2session.setGracefulClose()` sets a flag, and `core.js` installs
@@ -1358,14 +1396,15 @@ pub fn goaway(session: &SessionState, code: u32, last_stream_id: i32, data: &[u8
     if raw(session).is_none() {
         return;
     }
+    session.goaway_initiated.set(true);
     // `nghttp2_submit_*` must not run while `nghttp2_session_mem_recv` is walking
     // the outbound queue. `core.js` calls this from a stream callback, which is
     // *inside* `mem_recv`, so submitting here corrupts nghttp2's frame queue and
     // the next `mem_send` reads a null field inside `session_pack_extension` — the
     // segfault that `session.goaway()` on a live stream reproduced every time.
     //
-    // `closing` is set either way: it drives stream refusal, which must take effect
-    // from the moment JavaScript asked, not from the moment nghttp2 heard.
+    // The session has entered shutdown from JavaScript's perspective: no new
+    // streams should be accepted once GOAWAY is requested.
     session.closing.set(true);
     let submit = DeferredSubmit::Goaway {
         code,

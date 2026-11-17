@@ -595,7 +595,7 @@ unsafe extern "C" fn on_frame_not_sent(
 /// `OnFrameSent`: counts a completed frame.
 unsafe extern "C" fn on_frame_sent(
     _session: *mut ffi::nghttp2_session,
-    _frame: *const ffi::nghttp2_frame,
+    frame: *const ffi::nghttp2_frame,
     user_data: *mut c_void,
 ) -> std::os::raw::c_int {
     // SAFETY: as `on_begin_headers`.
@@ -603,6 +603,21 @@ unsafe extern "C" fn on_frame_sent(
         return CALLBACK_FAILURE;
     };
     state.chunks_sent.set(state.chunks_sent.get() + 1);
+    if !frame.is_null() {
+        // nghttp2 can terminate a session internally and queue GOAWAY without
+        // going through any API-level callback. Mirror Node's marker so
+        // `SendPendingData` can emit `onSessionInternalError` after the frame is
+        // on the wire.
+        let hd = unsafe { (*frame).hd };
+        if hd.type_ == ffi::NGHTTP2_GOAWAY
+            && !state.closing.get()
+            && !state.destroyed.get()
+            && !state.graceful_close.get()
+            && !state.goaway_initiated.get()
+        {
+            state.internal_goaway_sent.set(true);
+        }
+    }
     0
 }
 
