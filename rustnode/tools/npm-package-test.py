@@ -279,6 +279,38 @@ def main(argv: list[str]) -> int:
         result = run([command, "-e", "process.exit(7)"], cwd=clean, env=local_env)
         check(result.returncode == 7, f"local install forwards the exit code too ({result.returncode})")
 
+        section("npx runs it without a prior install")
+        # `npx` is a third path, not a variant of the two above: it resolves the
+        # package, installs it into a cache, and runs the bin — and it does so
+        # with no `node_modules` in the caller's directory. The objective names
+        # `npx` explicitly, and until this existed nothing exercised it: both
+        # other checks run a command that is already installed.
+        #
+        # A clean HOME and cache are what make it a real cold path; without them
+        # a previous run's cache could satisfy it and prove nothing.
+        npx_home = workdir / "npx-home"
+        npx_home.mkdir()
+        npx_cache = workdir / "npx-cache"
+        npx_cache.mkdir()
+        npx_env = {
+            **os.environ,
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(npx_home),
+            "npm_config_cache": str(npx_cache),
+            "npm_config_registry": registry_url,
+        }
+        result = run(
+            ["npx", "--yes", f"{main_name}@{main['manifest']['version']}",
+             "-e", "console.log('npx-ran', process.version)"],
+            cwd=clean,
+            env=npx_env,
+        )
+        check(result.returncode == 0,
+              f"npx exited 0 ({result.stderr.strip()[-200:]})")
+        check("npx-ran v" in result.stdout,
+              f"npx ran the command ({result.stdout.strip()!r})")
+        print(f"    npx {main_name} -> {result.stdout.strip().splitlines()[-1]!r}")
+
         section("the common path forks nothing")
         # The resolver's fast path must not fork, and the way to prove that
         # rather than infer it from a timing is to make the external tool it
