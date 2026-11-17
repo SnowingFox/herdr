@@ -241,6 +241,51 @@ pub fn with_scope<R>(
     returned.then_some(result)
 }
 
+/// A scope the caller opens and closes itself.
+///
+/// [`with_scope`] is the shape every libuv call site wants: one closure, one
+/// scope. Node-API is the exception — `napi_open_callback_scope` and
+/// `napi_close_callback_scope` are two separate calls with the addon's own code
+/// in between, so the scope's state has to live somewhere the caller holds.
+/// This is that state: the args [`CallbackScopeHooks::close`] needs, and the
+/// prior frame [`CallbackScopeHooks::open`] produced.
+///
+/// The hooks are captured rather than looked up again at close time, so a
+/// scope always closes against the implementation that opened it — the same
+/// reason [`with_scope`] clones the `Rc` instead of borrowing the slot across
+/// the body.
+pub struct OpenScope {
+    hooks: Option<Rc<dyn CallbackScopeHooks>>,
+    args: ScopeArgs,
+    prior_frame: Option<v8::Global<v8::Value>>,
+}
+
+/// Opens a scope and returns the state needed to close it.
+///
+/// Returns a value even with no implementation registered, so a close is never
+/// unbalanced: the bootstrap case runs the addon's code unscoped, which is what
+/// [`with_scope`] does and what every call site did before hooks existed.
+pub fn open_scope(scope: &mut v8::PinScope<'_, '_>, args: ScopeArgs) -> OpenScope {
+    let hooks = HOOKS.with(|slot| slot.borrow().clone());
+    let prior_frame = hooks.as_ref().and_then(|hooks| hooks.open(scope, &args));
+    OpenScope {
+        hooks,
+        args,
+        prior_frame,
+    }
+}
+
+/// Closes a scope [`open_scope`] opened.
+///
+/// `threw` is the caller's answer to "did the body fail", which Node derives
+/// from the `TryCatch` `CallbackScope` holds. A caller that has no `TryCatch`
+/// passes whatever evidence it has; the only effect is whether `after` fires.
+pub fn close_scope(scope: &mut v8::PinScope<'_, '_>, open: OpenScope, threw: bool) {
+    if let Some(hooks) = open.hooks {
+        hooks.close(scope, &open.args, open.prior_frame, threw);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

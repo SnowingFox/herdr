@@ -203,6 +203,18 @@ pub struct NapiAsyncContext {
     _private: [u8; 0],
 }
 
+/// `typedef struct napi_callback_scope__* napi_callback_scope;`
+///
+/// Opaque to the addon. Ours points at a boxed
+/// [`crate::env::CallbackScopeState`], which holds the open scope
+/// [`rn_core::callback_scope::open_scope`] produced. The addon only ever passes
+/// this back to `napi_close_callback_scope`, and the pair may span addon code
+/// that calls into JavaScript, so it cannot live on a Rust stack frame.
+#[repr(C)]
+pub struct NapiCallbackScope {
+    _private: [u8; 0],
+}
+
 /// `napi_status`, in declaration order.
 ///
 /// The integer values are the ABI: an addon compares against `napi_ok` and

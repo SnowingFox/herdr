@@ -124,6 +124,59 @@ pub(crate) unsafe extern "C" fn invoke_addon_callback(info: *const v8::FunctionC
             rv.set(value);
         }
     }
+
+    // `Env::CallIntoModule`'s tail (`src/js_native_api_v8.h:96-99`): a
+    // `napi_*` call that failed inside the addon recorded its exception on the
+    // environment rather than leaving it pending in V8, so nothing is thrown when
+    // the addon returns. Node re-throws it here, once the addon's frame is gone.
+    //
+    // Without this a `napi_call_function` that throws is invisible to the JS
+    // caller: `test_callback_scope`'s `runInCallbackScope(..., () => { throw ... })`
+    // returns normally and `process.once('uncaughtException')` never fires.
+    //
+    // SAFETY: `data.env` is the environment this callback was created against,
+    // which `load` leaks so it outlives every call.
+    if let Some(environment) = unsafe { data.env.as_ref() } {
+        rethrow_recorded_exception(scope, environment);
+    }
+}
+
+/// Throws the exception an addon's failed `napi_*` call recorded, then clears it.
+///
+/// This is `HandleThrow` (`src/js_native_api_v8.h:73`) plus the `Reset()` that
+/// follows it in `CallIntoModule`. A termination counts as already handled:
+/// `terminatedOrTerminating()` returns early, because throwing into a terminating
+/// isolate is meaningless.
+pub(crate) fn rethrow_recorded_exception(scope: &mut v8::PinScope<'_, '_>, environment: &Env) {
+    if scope.is_execution_terminating() {
+        return;
+    }
+    // The Global is taken out before the value is rethrown: a `Local` built from a
+    // `Global` that is still in the table would leave the environment reporting an
+    // exception that V8 now owns, and the next `napi_*` call would report
+    // `napi_pending_exception` for it a second time.
+    let taken = environment
+        .exceptions()
+        .try_borrow_mut()
+        .ok()
+        .and_then(|mut state| state.take());
+    let Some(exception) = taken else {
+        return;
+    };
+    // A recorded-but-value-less pending exception cannot be rethrown as a value;
+    // `mark_exception_pending` is used by paths that then hand the throw to their
+    // own route (a thread-safe function's uncaught path), so there is nothing to
+    // do here beyond having cleared the flag above.
+    if environment
+        .exceptions()
+        .try_borrow()
+        .map(|state| state.is_pending())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let value = v8::Local::new(scope, exception);
+    scope.throw_exception(value);
 }
 
 /// Recovers the [`CallbackData`] a template's data slot points at.
