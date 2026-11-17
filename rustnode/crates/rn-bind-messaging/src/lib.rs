@@ -591,7 +591,11 @@ fn message_port_constructor(
     // Node's `MessagePort::New` throws `ERR_CONSTRUCT_CALL_INVALID` and does not
     // use `ConstructorBehavior::kThrow`, precisely so the prototype stays on the
     // function. Both `new MessagePort()` and `MessagePort()` reach this.
-    throw_type_error(scope, "Constructor cannot be called");
+    throw_type_error_with_code(
+        scope,
+        "ERR_CONSTRUCT_CALL_INVALID",
+        "Constructor cannot be called",
+    );
 }
 
 fn message_channel_constructor(
@@ -600,7 +604,11 @@ fn message_channel_constructor(
     mut rv: v8::ReturnValue<'_>,
 ) {
     if !args.is_construct_call() {
-        throw_type_error(scope, "Cannot call constructor without `new`");
+        throw_type_error_with_code(
+            scope,
+            "ERR_CONSTRUCT_CALL_REQUIRED",
+            "Cannot call constructor without `new`",
+        );
         return;
     }
 
@@ -792,9 +800,27 @@ fn post_message<'s>(
             throw_data_clone_exception_str(scope, &text);
             return;
         }
-        Err(serialize::SerializeError::NotIterable) => {
+        Err(serialize::SerializeError::NotIterableTransferList) => {
             // `GetTransferList`'s `THROW_ERR_INVALID_ARG_TYPE`, which *is* a
             // `TypeError` and carries `code` `ERR_INVALID_ARG_TYPE`.
+            throw_type_error_with_code(
+                scope,
+                "ERR_INVALID_ARG_TYPE",
+                "Optional transferList argument must be an iterable",
+            );
+            return;
+        }
+        Err(serialize::SerializeError::NotIterableOptionsTransfer) => {
+            throw_type_error_with_code(
+                scope,
+                "ERR_INVALID_ARG_TYPE",
+                "Optional options.transfer argument must be an iterable",
+            );
+            return;
+        }
+        Err(serialize::SerializeError::NotIterableSequence) => {
+            // This path is for `structuredClone` only, but keep the fallback here
+            // so the postMessage contract does not panic if the call shape changes.
             throw_type_error_with_code(
                 scope,
                 "ERR_INVALID_ARG_TYPE",
@@ -1003,16 +1029,18 @@ fn port_argument(
     args: &v8::FunctionCallbackArguments<'_>,
 ) -> Option<Rc<PortInner>> {
     let Ok(object) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
-        throw_type_error(
+        throw_type_error_with_code(
             scope,
+            "ERR_INVALID_ARG_TYPE",
             "The \"port\" argument must be a MessagePort instance",
         );
         return None;
     };
     let state = port_state_of(scope, object);
     if state.is_none() {
-        throw_type_error(
+        throw_type_error_with_code(
             scope,
+            "ERR_INVALID_ARG_TYPE",
             "The \"port\" argument must be a MessagePort instance",
         );
     }
@@ -1384,7 +1412,9 @@ fn structured_clone<'s>(
             throw_data_clone_exception_str(scope, &reason);
             return;
         }
-        Err(serialize::SerializeError::NotIterable) => {
+        Err(serialize::SerializeError::NotIterableTransferList)
+        | Err(serialize::SerializeError::NotIterableOptionsTransfer)
+        | Err(serialize::SerializeError::NotIterableSequence) => {
             // Node reaches this through the `webidl` converter in
             // `js_transferable.js`, which rejects a non-sequence `transfer`
             // before the native layer sees it.

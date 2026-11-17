@@ -92,9 +92,13 @@ struct Transfers<'s> {
 pub(crate) enum SerializeError {
     /// A transfer-list entry was rejected. Carries Node's message text.
     DataClone(String),
-    /// `transferList` is not iterable at all, `GetTransferList`'s
+    /// `transferList` itself is not iterable, `GetTransferList`'s
     /// `ERR_INVALID_ARG_TYPE`.
-    NotIterable,
+    NotIterableTransferList,
+    /// `options.transfer` exists but is not iterable.
+    NotIterableOptionsTransfer,
+    /// `structuredClone(..., { transfer })` got a non-sequence transfer value.
+    NotIterableSequence,
     /// V8 scheduled the exception; rethrowing would replace it.
     Thrown,
 }
@@ -553,21 +557,25 @@ fn collect_transfers<'s>(
     // back to `options.transfer`, and only a non-iterable *there* is the same
     // `TypeError`; an object with neither is an empty transfer list.
     let Ok(holder) = v8::Local::<v8::Object>::try_from(transfer_list) else {
-        return Err(SerializeError::NotIterable);
+        return Err(match shape {
+            TransferList::Argument => SerializeError::NotIterableTransferList,
+            TransferList::Sequence => SerializeError::NotIterableSequence,
+        });
     };
     let mut entries: Vec<v8::Local<'s, v8::Value>> = Vec::new();
     match read_iterable(scope, holder)? {
         Some(found) => entries = found,
-        None if shape == TransferList::Sequence => return Err(SerializeError::NotIterable),
+        None if shape == TransferList::Sequence => return Err(SerializeError::NotIterableSequence),
         None => {
             // `ReadIterable` was not an iterable, so `options.transfer` decides.
             let transfer = get_key(scope, holder, "transfer");
             let transfer = transfer.unwrap_or_else(|| v8::undefined(scope).into());
             if !transfer.is_undefined() {
                 let Ok(options) = v8::Local::<v8::Object>::try_from(transfer) else {
-                    return Err(SerializeError::NotIterable);
+                    return Err(SerializeError::NotIterableOptionsTransfer);
                 };
-                entries = read_iterable(scope, options)?.ok_or(SerializeError::NotIterable)?;
+                entries = read_iterable(scope, options)?
+                    .ok_or(SerializeError::NotIterableOptionsTransfer)?;
             }
         }
     }
@@ -580,8 +588,19 @@ fn collect_transfers<'s>(
                 "Found invalid value in transferList.".to_string(),
             ));
         };
+        // `markAsUntransferable()` stamps `node:transfer_mode` and Node consults
+        // that stamp before any type-specific transfer path.
+        let marked_untransferable = is_untransferable_mark(scope, object)
+            || crate::js_transfer_mode(scope, object)
+                .map(|mode| !mode.is_transferable())
+                .unwrap_or(false);
 
         if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(entry) {
+            if marked_untransferable {
+                return Err(SerializeError::DataClone(
+                    "Cannot transfer object of unsupported type.".to_string(),
+                ));
+            }
             // Node folds "cannot be detached" and "already detached" into one
             // test and one message: `if (!ab->IsDetachable() || ab->WasDetached())`
             // with `transfer_unsupported_type_str()`. The two are one mechanism,
@@ -618,6 +637,11 @@ fn collect_transfers<'s>(
                 "Found invalid value in transferList.".to_string(),
             ));
         };
+        if marked_untransferable {
+            return Err(SerializeError::DataClone(
+                "Cannot transfer object of unsupported type.".to_string(),
+            ));
+        }
         // Node tests this *before* the duplicate check, and the source port
         // before both: `Transfer list contains source port` is what a script sees
         // when it names the port it is posting on, whether or not that port is
@@ -734,6 +758,19 @@ fn well_known_symbol<'s>(
     let key = v8::String::new(scope, name)?;
     let symbol = holder.get(scope, key.into())?;
     symbol.is_symbol().then_some(symbol)
+}
+
+/// Whether `markAsUntransferable(obj)` stamped `obj`.
+///
+/// `internal/buffer` marks this under `untransferable_object_private_symbol`
+/// (`node:untransferableObject` here). Node treats that as "cannot be moved",
+/// so attempting to transfer such a value must fail before any detach attempt.
+fn is_untransferable_mark(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+) -> bool {
+    let key = rn_core::symbol(scope, "node:untransferableObject");
+    object.has(scope, key.into()).unwrap_or(false)
 }
 
 #[cfg(test)]
