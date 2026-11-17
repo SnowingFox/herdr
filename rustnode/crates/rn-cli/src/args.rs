@@ -477,7 +477,14 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
 ];
 
 /// Flags whose value is a separate argument (`--flag value`).
-const VALUE_SEPARATE: &[&str] = &["--conditions", "--import", "--loader", "--require", "-r"];
+const VALUE_SEPARATE: &[&str] = &[
+    "--conditions",
+    "--import",
+    "--loader",
+    "--require",
+    "--tls-keylog",
+    "-r",
+];
 
 /// Flags that select the default trust store.
 ///
@@ -487,7 +494,26 @@ const VALUE_SEPARATE: &[&str] = &["--conditions", "--import", "--loader", "--req
 /// `--use-openssl-ca` also has a `NODE_OPTIONS`-visible environment spelling in
 /// Node, but the option table is the one place argv is interpreted, so the flag
 /// is all that is recorded here.
-const ROOT_STORE_FLAGS: &[&str] = &["--use-system-ca", "--use-openssl-ca"];
+const ROOT_STORE_FLAGS: &[&str] = &[
+    "--use-system-ca",
+    "--no-use-system-ca",
+    "--use-openssl-ca",
+    "--no-use-openssl-ca",
+    "--use-bundled-ca",
+];
+
+/// Flags that select the process-wide TLS protocol defaults.
+///
+/// `lib/tls.js` reads these through `getOptionValue()` to choose
+/// `DEFAULT_MIN_VERSION`/`DEFAULT_MAX_VERSION`.
+const TLS_VERSION_FLAGS: &[&str] = &[
+    "--tls-min-v1.0",
+    "--tls-min-v1.1",
+    "--tls-min-v1.2",
+    "--tls-min-v1.3",
+    "--tls-max-v1.2",
+    "--tls-max-v1.3",
+];
 
 /// `--abort-on-uncaught-exception` in the spellings Node accepts.
 ///
@@ -534,6 +560,7 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
     "--loader=",
     "--permission=",
     "--title=",
+    "--tls-keylog=",
     "--unhandled-rejections=",
 ];
 
@@ -963,6 +990,15 @@ pub fn parse_with_env(
         // as ignored, because a flag that is accepted and then not acted on is
         // the failure mode `Options::unimplemented` exists to avoid.
         if ROOT_STORE_FLAGS.contains(&argument.as_str()) {
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
+        // `lib/tls.js` reads these protocol toggles from `internal/options`.
+        // Accepting them here keeps the CLI aligned with the option table and
+        // lets JS set `DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`.
+        if TLS_VERSION_FLAGS.contains(&argument.as_str()) {
             options.exec_argv.push(argument.clone());
             index += 1;
             continue;
@@ -2160,5 +2196,70 @@ mod tests {
         // 0 asks the OS for a free port and is allowed; 1024 is the floor.
         assert!(parse_of(&["--inspect-port=0"]).is_ok());
         assert!(parse_of(&["--inspect-port=1024"]).is_ok());
+    }
+
+    #[test]
+    fn tls_cli_flags_from_the_node_option_table_are_accepted() {
+        let options = parse_of(&[
+            "--tls-min-v1.0",
+            "--tls-max-v1.2",
+            "--tls-keylog=/tmp/keylog.log",
+            "--no-use-system-ca",
+            "--no-use-openssl-ca",
+            "--use-bundled-ca",
+        ])
+        .expect("parses");
+
+        assert!(options
+            .exec_argv
+            .iter()
+            .any(|flag| flag == "--tls-min-v1.0"));
+        assert!(options
+            .exec_argv
+            .iter()
+            .any(|flag| flag == "--tls-max-v1.2"));
+        assert!(options
+            .exec_argv
+            .iter()
+            .any(|flag| flag == "--tls-keylog=/tmp/keylog.log"));
+        assert!(options
+            .exec_argv
+            .iter()
+            .any(|flag| flag == "--no-use-system-ca"));
+        assert!(options
+            .exec_argv
+            .iter()
+            .any(|flag| flag == "--no-use-openssl-ca"));
+        assert!(options
+            .exec_argv
+            .iter()
+            .any(|flag| flag == "--use-bundled-ca"));
+
+        assert_eq!(
+            options.parsed.value_of("--tls-min-v1.0"),
+            Some(rn_bind_options::ParsedValue::Bool(true))
+        );
+        assert_eq!(
+            options.parsed.value_of("--tls-max-v1.2"),
+            Some(rn_bind_options::ParsedValue::Bool(true))
+        );
+        assert_eq!(
+            options.parsed.value_of("--tls-keylog"),
+            Some(rn_bind_options::ParsedValue::Text(
+                "/tmp/keylog.log".to_string()
+            ))
+        );
+        assert_eq!(
+            options.parsed.value_of("--use-system-ca"),
+            Some(rn_bind_options::ParsedValue::Bool(false))
+        );
+        assert_eq!(
+            options.parsed.value_of("--use-openssl-ca"),
+            Some(rn_bind_options::ParsedValue::Bool(false))
+        );
+        assert_eq!(
+            options.parsed.value_of("--use-bundled-ca"),
+            Some(rn_bind_options::ParsedValue::Bool(true))
+        );
     }
 }
