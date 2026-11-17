@@ -142,6 +142,18 @@ fn with_isolate<R>(body: impl FnOnce(&mut v8::Isolate) -> R) -> Option<R> {
 }
 
 /// `Bun.gc(force?)`.
+///
+/// Returns the heap's used size in bytes **after** the collection, which is
+/// measured and is the same number `process.memoryUsage().heapUsed` reports at
+/// that moment:
+///
+/// ```text
+/// const r = Bun.gc(true);  r === process.memoryUsage().heapUsed  // true, every run
+/// ```
+///
+/// So the value is not comparable between two runtimes — two heaps differ — but
+/// it is comparable *within* one process against `heapUsed`, which is the
+/// invariant the differential test pins.
 fn gc(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -175,17 +187,34 @@ fn gc(
 }
 
 /// `Bun.generateHeapSnapshot(format?, destination?)`.
+///
+/// Measured, and the rules are narrower than the docs suggest:
+///
+/// ```text
+/// generateHeapSnapshot()            => jsc object   (the default)
+/// generateHeapSnapshot('jsc')       => jsc object
+/// generateHeapSnapshot('v8')        => JSON string
+/// generateHeapSnapshot(42)          => jsc object   (only *strings* are validated)
+/// generateHeapSnapshot('V8')        => TypeError    (the match is case-sensitive)
+/// generateHeapSnapshot('v8','arraybuffer') => ArrayBuffer
+/// generateHeapSnapshot('v8','x')    => TypeError    (second arg checked only here)
+/// generateHeapSnapshot('jsc','x')   => jsc object   (second arg never checked)
+/// ```
+///
+/// So the first argument is a *string* whitelist rather than a type check, and
+/// the destination is validated only on the `v8` path — which is why a bogus
+/// second argument is silently ignored for `jsc`.
 fn generate_heap_snapshot(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    // The format is validated before any work, which is what makes the error
-    // mention both accepted spellings.
+    // Only a string chooses a format; anything else (including a number, a
+    // boolean and an object) takes the `jsc` default rather than throwing.
     let format = args.get(0);
-    let v8_format = if format.is_undefined() || format.is_null() {
+    let v8_format = if !format.is_string() {
         false
-    } else if format.is_string() {
+    } else {
         match format.to_rust_string_lossy(scope).as_str() {
             "jsc" => false,
             "v8" => true,
@@ -194,29 +223,26 @@ fn generate_heap_snapshot(
                 return;
             }
         }
-    } else {
-        // A non-string, non-undefined argument is the same error: there is no
-        // value it could mean.
-        throw_type_error(scope, "Expected 'v8' or 'jsc' or undefined");
-        return;
     };
 
-    // The second argument selects an `ArrayBuffer` only for the `v8` form.
-    let destination = args.get(1);
-    let want_array_buffer = if destination.is_undefined() || destination.is_null() {
-        false
-    } else if destination
-        .to_rust_string_lossy(scope)
-        .eq_ignore_ascii_case("arraybuffer")
-    {
-        true
-    } else {
-        throw_type_error(
-            scope,
-            "Expected 'arraybuffer' or undefined as second argument",
-        );
-        return;
-    };
+    // The second argument is read only on the `v8` path. There, a non-string
+    // value is treated as absent (measured for `{}`, `true` and `null`), and the
+    // only accepted string is exactly `arraybuffer`.
+    let mut want_array_buffer = false;
+    if v8_format {
+        let destination = args.get(1);
+        if destination.is_string() {
+            if destination.to_rust_string_lossy(scope) == "arraybuffer" {
+                want_array_buffer = true;
+            } else {
+                throw_type_error(
+                    scope,
+                    "Expected 'arraybuffer' or undefined as second argument",
+                );
+                return;
+            }
+        }
+    }
 
     let Some(json) = take_snapshot_json() else {
         // No isolate recorded, or V8 produced nothing: a caller would otherwise

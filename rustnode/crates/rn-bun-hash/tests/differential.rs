@@ -120,6 +120,28 @@ for (const variant of ['wyhash','adler32','crc32','cityHash32','cityHash64','xxH
   out.push('variant ' + variant + ' abc ' + Bun.hash[variant]('abc').toString());
   out.push('variant ' + variant + ' empty ' + Bun.hash[variant]('').toString());
   out.push('variant ' + variant + ' multi ' + Bun.hash[variant](pattern(200)).toString());
+  // Seeds other than 0: the xxHash3 4..8-byte branch folds the seed's bytes in
+  // swapped order, which only shows up away from seed 0, and the seed type rules
+  // (only a number or a BigInt counts) are what separate a number from a
+  // coercible string.
+  for (const seed of [1, 5, 42, -1, 4294967301]) {
+    out.push('seeded ' + variant + ' abcdef ' + seed + ' ' + Bun.hash[variant]('abcdef', seed).toString());
+  }
+  // The 4..8 byte lengths that branch on the seed.
+  for (const n of [4, 5, 6, 7, 8]) {
+    out.push('seeded ' + variant + ' len ' + n + ' ' + Bun.hash[variant](pattern(n), 7).toString());
+  }
+  // Only a number or a BigInt is a seed; everything else is 0.
+  out.push('seed types ' + variant + ' ' + [
+    Bun.hash[variant]('abcdef', 0),
+    Bun.hash[variant]('abcdef', 7n),
+    Bun.hash[variant]('abcdef', '7'),
+    Bun.hash[variant]('abcdef', true),
+    Bun.hash[variant]('abcdef', null),
+    Bun.hash[variant]('abcdef', [7]),
+    Bun.hash[variant]('abcdef', new Number(7)),
+    Bun.hash[variant]('abcdef', { valueOf: () => 7 }),
+  ].map(String).join(','));
 }
 
 // Failure modes: class, code and message, which is what a caller catches.

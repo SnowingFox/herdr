@@ -430,15 +430,17 @@ fn router_match<'s>(
     };
 
     match match_target(&state.routes, &target) {
-        Some(found) => match build_result(scope, &found) {
+        Ok(Some(found)) => match build_result(scope, &found) {
             Some(value) => rv.set(value),
             None => rv.set(v8::null(scope).into()),
         },
-        None => rv.set(v8::null(scope).into()),
+        Ok(None) => rv.set(v8::null(scope).into()),
+        Err(message) => error::throw_plain_error(scope, &message),
     }
 }
 
 /// A successful match, in plain Rust data.
+#[derive(Debug)]
 struct Found {
     file: String,
     pathname: String,
@@ -450,18 +452,27 @@ struct Found {
 
 /// Matches `target` against `routes`, most specific first.
 ///
-/// Bun's three quirks are reproduced deliberately: `pathname` keeps the query,
-/// a trailing slash matches, and an empty input is `"/"`.
-fn match_target(routes: &[Route], target: &str) -> Option<Found> {
+/// Bun's quirks are reproduced deliberately: `pathname` keeps the query, a
+/// trailing slash matches, and an empty input is `"/"`.
+///
+/// `pathname`, `params` and `query` are all **percent-decoded**, and a malformed
+/// escape throws `Error: DecodingError parsing path: <the whole original input>`
+/// rather than matching. Measured: that error covers the query half too
+/// (`/?b=%zz` throws), so the decode runs over the whole input before the split.
+/// `%2F` decodes to a `/` that then fails to match, which is why
+/// `match('/a%2Fb')` is `null` rather than a throw.
+fn match_target(routes: &[Route], target: &str) -> Result<Option<Found>, String> {
     let pathname = if target.is_empty() {
         "/".to_string()
     } else {
         target.to_string()
     };
+    let decoded =
+        decode_path(&pathname).map_err(|()| format!("DecodingError parsing path: {pathname}"))?;
 
-    let (path_part, query_part) = match pathname.split_once('?') {
+    let (path_part, query_part) = match decoded.split_once('?') {
         Some((path, query)) => (path, Some(query)),
-        None => (pathname.as_str(), None),
+        None => (decoded.as_str(), None),
     };
 
     // A trailing slash does not defeat a match; the segments are what count.
@@ -481,17 +492,18 @@ fn match_target(routes: &[Route], target: &str) -> Option<Found> {
             // them before the string's own pairs.
             let mut combined = params.clone();
             combined.extend(query);
-            return Some(Found {
+            return Ok(Some(Found {
                 file: route.file.clone(),
-                pathname: pathname.clone(),
+                // The whole decoded input: the query is kept.
+                pathname: decoded.clone(),
                 name: route.name.clone(),
                 kind: route.kind,
                 params,
                 query: combined,
-            });
+            }));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Whether `route` matches `segments`, and the parameters it captured.
@@ -548,6 +560,14 @@ fn match_route(route: &Route, segments: &[&str]) -> Option<Vec<(String, String)>
 }
 
 /// Splits a query string into decoded pairs.
+///
+/// `+` is **not** a space here: measured, `/?a+b=c+d` gives the key `"a+b"` and
+/// the value `"c+d"`, while `%2B` decodes to `+`. That is the opposite of form
+/// encoding, and the reason the path decoder cannot be a URL query parser.
+///
+/// An empty key produces no entry at all (`/?=v` is `{}`), while `/?a` is
+/// `{a: ""}`. A repeated key is an array on the JS side; that collapse happens
+/// when the object is built, not here.
 fn parse_query(query: Option<&str>) -> Vec<(String, String)> {
     let Some(query) = query else {
         return Vec::new();
@@ -555,42 +575,64 @@ fn parse_query(query: Option<&str>) -> Vec<(String, String)> {
     query
         .split('&')
         .filter(|pair| !pair.is_empty())
-        .map(|pair| match pair.split_once('=') {
-            Some((key, value)) => (decode(key), decode(value)),
-            None => (decode(pair), String::new()),
+        .filter_map(|pair| match pair.split_once('=') {
+            Some((key, value)) => {
+                let key = decode_component(key);
+                (!key.is_empty()).then(|| (key, decode_component(value)))
+            }
+            None => {
+                let key = decode_component(pair);
+                (!key.is_empty()).then(|| (key, String::new()))
+            }
         })
         .collect()
 }
 
-/// Percent-decodes a query component, leaving malformed escapes alone.
-fn decode(text: &str) -> String {
+/// Percent-decodes a whole path, or reports a malformed escape.
+///
+/// Unlike [`decode_component`] this fails when `%` is not followed by two hex
+/// digits, because `match` throws for those rather than matching them literally.
+fn decode_path(text: &str) -> Result<String, ()> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
-                match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
-                    Some(byte) => {
-                        out.push(byte);
-                        index += 3;
-                    }
-                    None => {
-                        out.push(bytes[index]);
-                        index += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            byte => {
+        if bytes[index] == b'%' {
+            let Some(hex) = text.get(index + 1..index + 3) else {
+                return Err(());
+            };
+            let Ok(byte) = u8::from_str_radix(hex, 16) else {
+                return Err(());
+            };
+            out.push(byte);
+            index += 3;
+            continue;
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    // Invalid UTF-8 becomes U+FFFD: measured, `/%FF` yields `"\u{fffd}"`.
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Percent-decodes one component, leaving a malformed escape as literal text.
+fn decode_component(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let decoded = text
+                .get(index + 1..index + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+            if let Some(byte) = decoded {
                 out.push(byte);
-                index += 1;
+                index += 3;
+                continue;
             }
         }
+        out.push(bytes[index]);
+        index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -599,7 +641,13 @@ fn decode(text: &str) -> String {
 ///
 /// `Object.getOwnPropertyNames(result)` is `[]` because every field is on the
 /// prototype. That is measured, and it is why the object cannot simply be a plain
-/// object with data properties.
+/// object with data properties. Three further details are measured:
+///
+/// * the prototype carries `Symbol.toStringTag: "MatchedRoute"`, so
+///   `Object.prototype.toString.call(result)` is `"[object MatchedRoute]"`;
+/// * each accessor is `configurable: false`;
+/// * the key order is `filePath, kind, name, params, pathname, query, scriptSrc,
+///   src` — alphabetical, which is what `Object.getOwnPropertyNames` reports.
 fn build_result<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     found: &Found,
@@ -616,15 +664,18 @@ fn build_result<'s>(
         r#"
         (function (file, pathname, name, kind, params, query) {
           const proto = {};
+          Object.defineProperty(proto, Symbol.toStringTag, {
+            value: 'MatchedRoute', enumerable: false, configurable: true, writable: false,
+          });
           for (const [key, value] of [
-            ['filePath', file], ['pathname', pathname], ['params', params],
-            ['query', query], ['name', name], ['kind', kind],
-            ['src', file], ['scriptSrc', file],
+            ['filePath', file], ['kind', kind], ['name', name],
+            ['params', params], ['pathname', pathname], ['query', query],
+            ['scriptSrc', file], ['src', file],
           ]) {
             Object.defineProperty(proto, key, {
               get() { return value; },
               enumerable: true,
-              configurable: true,
+              configurable: false,
             });
           }
           return Object.create(proto);
@@ -664,6 +715,7 @@ fn pairs_object<'s>(
 }
 
 /// Why the directory could not be read.
+#[derive(Debug)]
 struct DirectoryFailure {
     message: String,
 }
@@ -698,16 +750,25 @@ fn collect_routes(directory: &str) -> Result<Vec<Route>, DirectoryFailure> {
     })?;
 
     let mut routes = Vec::new();
-    collect_recursive(&root, &absolute, &[], &mut routes);
+    collect_recursive(&root, &absolute, Path::new(""), &[], &mut routes);
     Ok(routes)
 }
 
 /// The file extensions a route file may have.
 const EXTENSIONS: &[&str] = &["js", "jsx", "ts", "tsx", "mjs", "cjs", "mts", "cts", "mdx"];
 
+/// Walks one directory level.
+///
+/// `relative` is the path from the router's root down to `root`, carried
+/// explicitly rather than recovered by `strip_prefix`: `root` is the *current*
+/// directory, so stripping it yields only the file name and every nested route
+/// would report `<dir>/<file>` instead of `<dir>/<sub>/<file>`. Measured: Bun
+/// reports the full absolute path, so the first implementation was wrong for
+/// every route not directly under the root.
 fn collect_recursive(
     root: &Path,
     absolute_root: &Path,
+    relative: &Path,
     prefix: &[String],
     routes: &mut Vec<Route>,
 ) {
@@ -725,7 +786,7 @@ fn collect_recursive(
         if path.is_dir() {
             let mut next = prefix.to_vec();
             next.push(name.to_string());
-            collect_recursive(&path, absolute_root, &next, routes);
+            collect_recursive(&path, absolute_root, &relative.join(name), &next, routes);
             continue;
         }
 
@@ -743,7 +804,8 @@ fn collect_recursive(
 
         let pattern = format!("/{}", segments.join("/"));
         let file = absolute_root
-            .join(path.strip_prefix(root).unwrap_or(&path))
+            .join(relative)
+            .join(name)
             .to_string_lossy()
             .into_owned();
         let kind = kind_of(&segments);
@@ -786,6 +848,12 @@ mod tests {
         }
     }
 
+    /// A successful match, unwrapped: the tests below assert about a hit, and
+    /// `expect` names the failure when there is none.
+    fn matched(routes: &[Route], target: &str) -> Option<Found> {
+        match_target(routes, target).expect("no decode failure")
+    }
+
     #[test]
     fn an_exact_route_beats_a_dynamic_one_that_also_matches() {
         // `specificity` is what decides the order, and an implementation that
@@ -794,7 +862,7 @@ mod tests {
             route("/api/[name]", "dynamic", &["api", "[name]"]),
             route("/api/hello", "exact", &["api", "hello"]),
         ];
-        let found = match_target(&routes, "/api/hello").expect("matches");
+        let found = matched(&routes, "/api/hello").expect("matches");
         assert_eq!(found.name, "/api/hello");
         assert_eq!(found.kind, "exact");
     }
@@ -804,7 +872,7 @@ mod tests {
         // Measured Bun behaviour: both carry the data. Reproducing it is the
         // point; "fixing" it would be a divergence.
         let routes = vec![route("/about", "exact", &["about"])];
-        let found = match_target(&routes, "/about?x=1&y=2").expect("matches");
+        let found = matched(&routes, "/about?x=1&y=2").expect("matches");
         assert_eq!(found.pathname, "/about?x=1&y=2");
         assert_eq!(
             found.query,
@@ -818,7 +886,7 @@ mod tests {
     #[test]
     fn a_dynamic_segment_puts_its_param_in_query_too() {
         let routes = vec![route("/blog/[slug]", "dynamic", &["blog", "[slug]"])];
-        let found = match_target(&routes, "/blog/hello?x=1").expect("matches");
+        let found = matched(&routes, "/blog/hello?x=1").expect("matches");
         assert_eq!(
             found.params,
             vec![("slug".to_string(), "hello".to_string())]
@@ -839,7 +907,7 @@ mod tests {
             "catch-all",
             &["docs", "[...rest]"],
         )];
-        let found = match_target(&routes, "/docs/a/b/c").expect("matches");
+        let found = matched(&routes, "/docs/a/b/c").expect("matches");
         assert_eq!(
             found.params,
             vec![("rest".to_string(), "a/b/c".to_string())]
@@ -853,9 +921,9 @@ mod tests {
             "optional-catch-all",
             &["x", "[[...opt]]"],
         )];
-        assert_eq!(match_target(&routes, "/x").expect("matches").params, vec![]);
+        assert_eq!(matched(&routes, "/x").expect("matches").params, vec![]);
         assert_eq!(
-            match_target(&routes, "/x/a").expect("matches").params,
+            matched(&routes, "/x/a").expect("matches").params,
             vec![("opt".to_string(), "a".to_string())]
         );
     }
@@ -863,7 +931,7 @@ mod tests {
     #[test]
     fn a_trailing_slash_still_matches_but_stays_in_the_pathname() {
         let routes = vec![route("/about", "exact", &["about"])];
-        let found = match_target(&routes, "/about/").expect("matches");
+        let found = matched(&routes, "/about/").expect("matches");
         assert_eq!(found.name, "/about");
         assert_eq!(found.pathname, "/about/");
     }
@@ -871,14 +939,14 @@ mod tests {
     #[test]
     fn an_empty_target_is_the_root_route() {
         let routes = vec![route("/", "exact", &[])];
-        assert_eq!(match_target(&routes, "").expect("matches").name, "/");
+        assert_eq!(matched(&routes, "").expect("matches").name, "/");
     }
 
     #[test]
     fn a_miss_returns_none() {
         let routes = vec![route("/about", "exact", &["about"])];
-        assert!(match_target(&routes, "/nope").is_none());
-        assert!(match_target(&routes, "/about/deeper").is_none());
+        assert!(matched(&routes, "/nope").is_none());
+        assert!(matched(&routes, "/about/deeper").is_none());
     }
 
     #[test]
@@ -887,5 +955,84 @@ mod tests {
         assert_eq!(kind_of(&["[slug]".to_string()]), "dynamic");
         assert_eq!(kind_of(&["[...rest]".to_string()]), "catch-all");
         assert_eq!(kind_of(&["[[...opt]]".to_string()]), "optional-catch-all");
+    }
+
+    #[test]
+    fn a_nested_route_collects_its_full_path_from_a_real_directory() {
+        let directory = std::env::temp_dir().join(format!(
+            "rn-bun-router-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0)
+        ));
+        let nested = directory.join("blog").join("deep");
+        std::fs::create_dir_all(&nested).expect("create the fixture tree");
+        std::fs::write(nested.join("[slug].tsx"), "").expect("write the route file");
+
+        let routes = collect_routes(&directory.to_string_lossy()).expect("the directory reads");
+        let resolved = std::fs::canonicalize(&directory).expect("the fixture resolves");
+        let route = routes
+            .iter()
+            .find(|route| route.pattern == "/blog/deep/[slug]")
+            .expect("the nested route is found");
+        assert_eq!(
+            route.file,
+            resolved
+                .join("blog")
+                .join("deep")
+                .join("[slug].tsx")
+                .to_string_lossy(),
+            "a nested route must report its whole path, not just the file name"
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn the_pathname_and_params_are_percent_decoded() {
+        // Measured: `pathname` is the decoded input, so `/a%20b` reports `/a b`
+        // and the param is `a b`.
+        let routes = vec![route("/[x]", "dynamic", &["[x]"])];
+        let found = matched(&routes, "/a%20b").expect("matches");
+        assert_eq!(found.pathname, "/a b");
+        assert_eq!(found.params, vec![("x".to_string(), "a b".to_string())]);
+    }
+
+    #[test]
+    fn a_plus_in_a_query_is_not_a_space() {
+        // Measured: `/?a+b=c+d` gives the key `a+b` and the value `c+d`, while
+        // `%2B` decodes to `+`. Form encoding would turn both into spaces.
+        let routes = vec![route("/", "exact", &[])];
+        let found = matched(&routes, "/?a+b=c+d&e%2Bf=g").expect("matches");
+        assert_eq!(
+            found.query,
+            vec![
+                ("a+b".to_string(), "c+d".to_string()),
+                ("e+f".to_string(), "g".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_escape_is_a_decode_error_over_the_whole_input() {
+        // Measured: the error names the whole original target, including the
+        // query, and it throws rather than returning a miss.
+        let routes = vec![route("/a", "exact", &["a"])];
+        let error = match_target(&routes, "/a?q=%zz").expect_err("a decode failure");
+        assert_eq!(error, "DecodingError parsing path: /a?q=%zz");
+        let error = match_target(&routes, "/%4").expect_err("a decode failure");
+        assert_eq!(error, "DecodingError parsing path: /%4");
+    }
+
+    #[test]
+    fn an_empty_query_key_produces_no_entry() {
+        // Measured: `/?=v` is `{}` while `/?a` is `{a: ""}`.
+        let routes = vec![route("/", "exact", &[])];
+        assert!(matched(&routes, "/?=v").expect("matches").query.is_empty());
+        assert_eq!(
+            matched(&routes, "/?a").expect("matches").query,
+            vec![("a".to_string(), String::new())]
+        );
     }
 }

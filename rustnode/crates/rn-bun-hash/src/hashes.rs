@@ -466,14 +466,12 @@ fn len_0_to_16(input: &[u8], secret: &[u8], seed: u64) -> u64 {
         return avalanche(acc);
     }
     if len >= 4 {
-        let seed = seed
-            ^ ((u32::from_le_bytes([
-                (seed & 0xff) as u8,
-                ((seed >> 8) & 0xff) as u8,
-                ((seed >> 16) & 0xff) as u8,
-                ((seed >> 24) & 0xff) as u8,
-            ]) as u64)
-                << 32);
+        // `XXH3_avalanche`'s 4..8 branch folds the seed with its own
+        // **byte-swapped** low half. Reading the low 32 bits back in the same
+        // order is a no-op and produces a different hash from `seed != 0` while
+        // agreeing at `seed == 0`, which is why the mistake survived: the
+        // measured seed-0 vectors all pass either way.
+        let seed = seed ^ ((u32::from_be_bytes((seed as u32).to_le_bytes()) as u64) << 32);
         let input1 = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
         let tail = &input[len - 4..];
         let input2 = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);

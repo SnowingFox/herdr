@@ -890,8 +890,11 @@ fn with_state<R>(
 
 /// Seed conversion: `HashObject.rs`'s `seed_of` plus JSC's `toUInt64NoTruncate`.
 ///
-/// A seed that is neither a number nor a BigInt becomes 0, so `hash("abc","zzz")`
-/// and `hash("abc",null)` both equal `hash("abc",0)`. A BigInt wraps modulo 2^64.
+/// A seed of any other type becomes 0, so `hash("abc","zzz")`, `hash("abc",true)`
+/// and `hash("abc",null)` all equal `hash("abc",0)`. That includes the coercible
+/// ones — measured, `hash("abc", "7")`, `hash("abc", true)` and
+/// `hash("abc", [7])` are all the seed-0 answer, not the seed-7 one — because
+/// `seed_of` tests the type and never converts it. A `BigInt` wraps modulo 2^64.
 /// A number follows JSC, and none of it is guessable:
 ///
 /// * `NaN` is 0, `-Infinity` is 0, `Infinity` is `u64::MAX`;
@@ -900,7 +903,9 @@ fn with_state<R>(
 ///   and `1.9` is `1`.
 ///
 /// All of that is measured across the full double range. A plain `as u64` cast
-/// would get every large negative seed wrong, because Rust saturates.
+/// would get every large negative seed wrong, because Rust saturates. Calling
+/// `number_value` to read a number is the other trap: it converts, so it would
+/// accept a `String`/`Boolean`/`Number` object that Bun reads as 0.
 fn seed_of(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> u64 {
     if value.is_big_int() {
         if let Ok(big) = v8::Local::<v8::BigInt>::try_from(value) {
@@ -909,6 +914,9 @@ fn seed_of(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) ->
             let (value, _) = big.u64_value();
             return value;
         }
+        return 0;
+    }
+    if !value.is_number() {
         return 0;
     }
     let Some(number) = value.number_value(scope) else {

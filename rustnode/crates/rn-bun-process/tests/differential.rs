@@ -232,6 +232,29 @@ out.gc = {
   acceptsFalse: typeof Bun.gc(false) === 'number',
   acceptsString: typeof Bun.gc('x') === 'number',
   throwsOnNew: (() => { try { new Bun.gc(); return false; } catch { return true; } })(),
+  // Measured on Bun: the number is the heap's used size *after* the collection,
+  // and equals `process.memoryUsage().heapUsed` exactly. rustnode reports the
+  // same statistic but the comparison itself allocates between the two reads, so
+  // only the *shape* (a positive safe integer in the same order of magnitude) is
+  // comparable. Recorded here as a ratio so a value in seconds or a constant zero
+  // still fails.
+  heapUsedRatio: (() => {
+    const used = Bun.gc(true);
+    const after = process.memoryUsage().heapUsed;
+    return after > 0 ? Math.round((used / after) * 100) / 100 : 0;
+  })(),
+  shrinksAfterGarbage: (() => {
+    Bun.gc(true);
+    const junk = [];
+    // 20,000 objects, not 50,000: the size only has to make the collection
+    // observable, and a bigger array here provokes a V8 concurrent-scavenger race
+    // when the heap-snapshot members run in the same process.
+    for (let i = 0; i < 20000; i++) junk.push({ i, s: 'x'.repeat(20) });
+    const grown = Bun.gc(true);
+    junk.length = 0;
+    const shrunk = Bun.gc(true);
+    return shrunk < grown;
+  })(),
 };
 
 // --- generateHeapSnapshot: it RETURNS the snapshot; it writes no file. Measured.
@@ -294,6 +317,7 @@ out.spawnSync = {
 const prototypeOf = (value) => Object.getOwnPropertyNames(Object.getPrototypeOf(value)).join(',');
 (async () => {
   const p = Bun.spawn(['echo', 'hi']);
+  await p.exited;
   out.spawn = {
     ownKeys: Object.getOwnPropertyNames(p).join(','),
     prototype: prototypeOf(p),
@@ -304,6 +328,12 @@ const prototypeOf = (value) => Object.getOwnPropertyNames(Object.getPrototypeOf(
     readableIsStdout: p.readable === p.stdout,
     stdioIsThreeNulls: JSON.stringify(p.stdio),
     resourceUsageIsFunction: typeof p.resourceUsage === 'function',
+    // `resourceUsageBeforeExit` is NOT compared: rustnode's spawn runs the child
+    // to completion before returning, so there is no live child to sample. That
+    // is the same divergence the `kill` half of this test documents, and recording
+    // it here is what keeps the omission visible.
+    resourceUsageAfterExit: JSON.stringify(p.resourceUsage()),
+    resourceUsageKeys: Object.keys(p.resourceUsage()).length,
     exitedValue: await p.exited,
     exitCode: p.exitCode,
     signalCode: String(p.signalCode),
@@ -611,15 +641,47 @@ fn the_gc_and_snapshot_members_match_bun_1_4_4() {
     let ours: serde_json::Value = serde_json::from_str(&ours).expect("rustnode emits JSON");
     let theirs: serde_json::Value = serde_json::from_str(&theirs).expect("Bun emits JSON");
     assert_eq!(
-        ours["gc"], theirs["gc"],
-        "Bun.gc differs from Bun 1.4.4.\n  rustnode: {}\n  bun:      {}",
-        ours["gc"], theirs["gc"]
-    );
-    assert_eq!(
         ours["snapshot"], theirs["snapshot"],
         "Bun.generateHeapSnapshot differs from Bun 1.4.4.\n  rustnode: {}\n  bun:      {}",
         ours["snapshot"], theirs["snapshot"]
     );
+    // `gc` is compared field by field rather than as one object, because
+    // `heapUsedRatio` cannot be equal: Bun's reads are the same statistic with
+    // nothing allocated between them, while rustnode's two reads allocate the
+    // comparison itself. Everything else about `gc` must match exactly.
+    for field in [
+        "returnsNumber",
+        "acceptsNoArgument",
+        "acceptsFalse",
+        "acceptsString",
+        "throwsOnNew",
+        "shrinksAfterGarbage",
+    ] {
+        assert_eq!(
+            ours["gc"][field], theirs["gc"][field],
+            "Bun.gc.{field} differs from Bun 1.4.4.\n  rustnode: {}\n  bun:      {}",
+            ours["gc"], theirs["gc"]
+        );
+    }
+    // The ratio is a shape check, not a value comparison: it must be close to 1
+    // on both runtimes, which fails a `gc` returning 0, a constant, or a value in
+    // the wrong units.
+    for (label, ratio) in [
+        ("rustnode", ours["gc"]["heapUsedRatio"].as_f64()),
+        ("bun", theirs["gc"]["heapUsedRatio"].as_f64()),
+    ] {
+        let ratio = ratio.expect("the probe emits a ratio");
+        assert!(
+            (0.9..=1.01).contains(&ratio),
+            "{label}'s Bun.gc return is {ratio} of process.memoryUsage().heapUsed, \
+             so it is not the post-collection used-heap size: {}",
+            if label == "rustnode" {
+                &ours["gc"]
+            } else {
+                &theirs["gc"]
+            }
+        );
+    }
     // The invariant that matters most, asserted on its own so a partial match on
     // the rest cannot hide it: the `v8` result parses as JSON with the three
     // arrays a `.heapsnapshot` reader needs.
@@ -627,6 +689,56 @@ fn the_gc_and_snapshot_members_match_bun_1_4_4() {
     assert_eq!(
         ours["snapshot"]["jscKeys"],
         "version,type,nodes,nodeClassNames,edges,edgeTypes,edgeNames"
+    );
+}
+
+/// `Bun.generateHeapSnapshot`'s argument rules, in their own process.
+///
+/// Split out because every call takes a full heap walk, and adding them to the
+/// shared probe pushed it into a V8 concurrent-scavenger race — the same script
+/// crashes intermittently in `v8::internal::Scavenger::ScavengePage` on a worker
+/// thread. Here the process takes four snapshots and exits, which does not.
+#[test]
+fn the_snapshot_argument_rules_match_bun_1_4_4() {
+    let Some(oracle) = bun_oracle() else {
+        return;
+    };
+    let script = r#"
+const attempt = (fn) => { try { return { ok: true, value: fn() }; } catch (error) { return { ok: false, message: error.message }; } };
+const v8ArrayBuffer = Bun.generateHeapSnapshot('v8', 'arraybuffer');
+process.stdout.write(JSON.stringify({
+  // Only a *string* chooses a format; anything else takes the `jsc` default.
+  nonStringIsJsc: typeof Bun.generateHeapSnapshot(42) === 'object',
+  // The second argument is validated only on the `v8` path.
+  jscIgnoresSecondArg: typeof Bun.generateHeapSnapshot('jsc', 'bogus') === 'object',
+  v8RejectsSecondArg: attempt(() => Bun.generateHeapSnapshot('v8', 'bogus')),
+  v8ArrayBuffer: v8ArrayBuffer instanceof ArrayBuffer && v8ArrayBuffer.byteLength > 0,
+  caseSensitive: attempt(() => Bun.generateHeapSnapshot('V8')).ok === false,
+}));
+"#;
+    let ours = run(&rustnode(), script);
+    let theirs = run(std::path::Path::new(&oracle), script);
+    assert_eq!(
+        ours, theirs,
+        "Bun.generateHeapSnapshot's argument rules differ from Bun 1.4.4.\n  \
+         rustnode: {ours}\n  bun:      {theirs}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&ours).expect("the probe emits JSON");
+    // A probe that silently measured nothing would compare equal against itself.
+    for field in [
+        "nonStringIsJsc",
+        "jscIgnoresSecondArg",
+        "v8ArrayBuffer",
+        "caseSensitive",
+    ] {
+        assert_eq!(
+            parsed[field], true,
+            "the probe measured nothing for {field}: {ours}"
+        );
+    }
+    assert_eq!(
+        parsed["v8RejectsSecondArg"]["ok"], false,
+        "a bogus second argument must throw on the v8 path: {ours}"
     );
 }
 
@@ -752,4 +864,167 @@ process.stdout.write(JSON.stringify(out));
             "{field} is not true from a script file: {parsed}"
         );
     }
+}
+
+/// `sendMany`, the multicast/TTL setters and `reload`, compared against Bun 1.4.4.
+///
+/// Split from `the_udp_socket_matches_bun_1_4_4` because these members need a
+/// *live receiver* to observe what actually arrives, and because every one of them
+/// was previously implemented from inference rather than measurement. The probe
+/// records delivery, so "returned the right number" cannot pass while nothing
+/// left the socket.
+#[test]
+fn the_udp_batch_and_socket_option_members_match_bun_1_4_4() {
+    let Some(oracle) = bun_oracle() else {
+        return;
+    };
+    let script = r#"
+const attempt = (fn) => {
+  try { return { ok: true, value: fn() }; }
+  catch (error) { return { ok: false, name: error.constructor.name, code: error.code ?? null, message: error.message }; }
+};
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+(async () => {
+  const got = [];
+  const receiver = await Bun.udpSocket({
+    port: 0, hostname: '127.0.0.1',
+    socket: { data(_socket, data) { got.push(new TextDecoder().decode(data)); } },
+  });
+  const port = receiver.port;
+
+  const sender = await Bun.udpSocket({ port: 0, hostname: '127.0.0.1' });
+  const connected = await Bun.udpSocket({ connect: { port, hostname: '127.0.0.1' } });
+  const out = {};
+
+  // --- sendMany is a FLAT array, not an array of tuples.
+  out.arities = { sendMany: sender.sendMany.length, reload: sender.reload.length };
+  out.connectedCount = connected.sendMany(['a', 'b', 'c']);
+  await wait(120);
+  out.connectedDelivered = got.splice(0);
+  out.flatCount = sender.sendMany(['p', port, '127.0.0.1', 'q', port, '127.0.0.1']);
+  await wait(120);
+  out.flatDelivered = got.splice(0);
+  // A tuple shape is rejected rather than understood, and nothing is delivered.
+  out.tupleRejected = attempt(() => sender.sendMany([['t', port, '127.0.0.1']]));
+  out.connectedTupleRejected = attempt(() => connected.sendMany([['t']]));
+  out.notArray = attempt(() => sender.sendMany('x'));
+  out.noArgument = attempt(() => sender.sendMany());
+  out.empty = sender.sendMany([]);
+  out.badLength = attempt(() => sender.sendMany(['a', port, '127.0.0.1', 'b']));
+  // Validation is complete before the first datagram leaves.
+  out.atomicRejects = attempt(() => sender.sendMany(['a', port, '127.0.0.1', 'b', 0, '127.0.0.1']));
+  await wait(120);
+  out.atomicDelivered = got.splice(0);
+  out.payloadMessage = attempt(() => sender.sendMany([42, port, '127.0.0.1']));
+  out.sendPayloadMessage = attempt(() => sender.send('x', port, 42));
+
+  // --- the setters report the argument, or a status.
+  const options = await Bun.udpSocket({ port: 0, hostname: '127.0.0.1' });
+  out.setTTL = {
+    four: attempt(() => options.setTTL(4)),
+    float: attempt(() => options.setTTL(4.7)),
+    string: attempt(() => options.setTTL('3')),
+    bool: attempt(() => options.setTTL(true)),
+    zero: attempt(() => options.setTTL(0)),
+    high: attempt(() => options.setTTL(256)),
+    nullValue: attempt(() => options.setTTL(null)),
+    noArgument: attempt(() => options.setTTL()),
+  };
+  out.setMulticastTTL = {
+    one: attempt(() => options.setMulticastTTL(1)),
+    zero: attempt(() => options.setMulticastTTL(0)),
+    high: attempt(() => options.setMulticastTTL(256)),
+  };
+  out.setBroadcast = {
+    trueValue: attempt(() => options.setBroadcast(true)),
+    falseValue: attempt(() => options.setBroadcast(false)),
+    numberValue: attempt(() => options.setBroadcast(0)),
+    stringValue: attempt(() => options.setBroadcast('yes')),
+    noArgument: attempt(() => options.setBroadcast()),
+  };
+  out.setMulticastLoopback = {
+    trueValue: attempt(() => options.setMulticastLoopback(true)),
+    numberValue: attempt(() => options.setMulticastLoopback(0)),
+    nullValue: attempt(() => options.setMulticastLoopback(null)),
+  };
+  out.multicastInterface = {
+    loopback: attempt(() => options.setMulticastInterface('127.0.0.1')),
+    wildcard: attempt(() => options.setMulticastInterface('0.0.0.0')),
+    unparsable: attempt(() => options.setMulticastInterface('bogus')),
+    shorthand: attempt(() => options.setMulticastInterface('127.1')),
+    hex: attempt(() => options.setMulticastInterface('0x7f000001')),
+  };
+  out.membership = {
+    join: attempt(() => options.addMembership('239.255.0.1')),
+    joinWithInterface: attempt(() => options.addMembership('239.255.0.2', '127.0.0.1')),
+    drop: attempt(() => options.dropMembership('239.255.0.1')),
+    dropUnjoined: attempt(() => options.dropMembership('239.9.9.9')),
+    badGroup: attempt(() => options.addMembership('bogus')),
+    noArgument: attempt(() => options.addMembership()),
+  };
+  out.keepalive = { ref: attempt(() => options.ref()), unref: attempt(() => options.unref()) };
+
+  // --- reload replaces the data callback and keeps the binding.
+  const reloaded = await Bun.udpSocket({
+    port: 0, hostname: '127.0.0.1',
+    socket: { data(_socket, data) { got.push('first:' + new TextDecoder().decode(data)); } },
+  });
+  const reloadedPort = reloaded.port;
+  sender.send('1', reloadedPort, '127.0.0.1');
+  await wait(120);
+  out.reloadBefore = got.splice(0);
+  out.reloadReturns = attempt(() => reloaded.reload({
+    socket: { data(_socket, data) { got.push('second:' + new TextDecoder().decode(data)); } },
+  }));
+  out.reloadKeepsPort = reloaded.port === reloadedPort;
+  sender.send('2', reloadedPort, '127.0.0.1');
+  await wait(120);
+  out.reloadAfter = got.splice(0);
+  out.reloadAcceptsSameOptions = attempt(() => reloaded.reload({ port: 0, hostname: '127.0.0.1' }));
+  out.reloadKeepsPortAfterOptions = reloaded.port === reloadedPort;
+  out.reloadRejectsNonObject = attempt(() => reloaded.reload(true));
+  out.reloadNoArgument = attempt(() => reloaded.reload());
+  out.reloadBadPort = attempt(() => reloaded.reload({ port: -1 }));
+
+  // --- a closed socket still answers, and says so.
+  const closed = await Bun.udpSocket({ port: 0, hostname: '127.0.0.1' });
+  closed.close();
+  out.closed = {
+    send: attempt(() => closed.send('x', port, '127.0.0.1')),
+    sendMany: attempt(() => closed.sendMany([])),
+    setTTL: attempt(() => closed.setTTL(3)),
+    addMembership: attempt(() => closed.addMembership('239.255.0.1')),
+    setBroadcast: attempt(() => closed.setBroadcast(true)),
+    binaryType: closed.binaryType,
+    closedFlag: closed.closed,
+    closeAgain: attempt(() => closed.close()),
+  };
+
+  sender.close();
+  connected.close();
+  options.close();
+  reloaded.close();
+  receiver.close();
+  process.stdout.write(JSON.stringify(out));
+})();
+"#;
+    let ours = run(&rustnode(), script);
+    let theirs = run(std::path::Path::new(&oracle), script);
+    let ours: serde_json::Value = serde_json::from_str(&ours).expect("rustnode emits JSON");
+    let theirs: serde_json::Value = serde_json::from_str(&theirs).expect("Bun emits JSON");
+    assert_eq!(
+        ours, theirs,
+        "the udp batch and option members differ from Bun 1.4.4.\n  rustnode: {ours}\n  bun:      {theirs}"
+    );
+    // The probe is only meaningful if it actually delivered datagrams and got
+    // counts back; a `sendMany` that threw everything would match itself.
+    assert_eq!(ours["connectedCount"], serde_json::json!(3));
+    assert_eq!(ours["flatCount"], serde_json::json!(2));
+    assert_eq!(
+        ours["atomicDelivered"],
+        serde_json::json!([]),
+        "a rejected batch must deliver nothing: {ours}"
+    );
+    assert_eq!(ours["reloadKeepsPort"], serde_json::json!(true));
+    assert_eq!(ours["closed"]["closedFlag"], serde_json::json!(true));
 }

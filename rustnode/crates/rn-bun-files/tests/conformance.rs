@@ -993,3 +993,96 @@ fn node_has_no_bun_global_and_rustnode_does() {
         "the Node oracle has a Bun global, so this comparison is about the wrong runtime"
     );
 }
+
+/// `Bun.FileSystemRouter` details the coarser router test cannot see.
+///
+/// Four measured behaviours, each of which the first implementation had wrong and
+/// none of which the routes-and-match test above distinguishes:
+///
+/// * `match().filePath` is the **whole** absolute path, so a route one directory
+///   down reports `<dir>/blog/[slug].tsx` rather than `<dir>/[slug].tsx`;
+/// * `match().pathname` and `params` are percent-decoded, while `+` in a query is
+///   left alone;
+/// * the result's prototype carries `Symbol.toStringTag: "MatchedRoute"` and
+///   non-configurable getters;
+/// * a malformed escape throws `DecodingError parsing path: <the whole input>`.
+#[test]
+fn bun_file_system_router_nested_paths_and_decoding_match_bun() {
+    let dir = TempDir::new("router-nested");
+    dir.write("pages/index.tsx", "");
+    dir.write("pages/blog/index.tsx", "");
+    dir.write("pages/blog/[slug].tsx", "");
+    dir.write("pages/docs/[[...opt]].tsx", "");
+
+    let script = format!(
+        r#"{PROBE}
+const router = () => new Bun.FileSystemRouter({{ style: "nextjs", dir: "pages" }});
+// The whole path, relative to the router's own directory, so the comparison does
+// not depend on the temp directory's name. Sorted, because `Object.keys` order of
+// `routes` is not stable in Bun either — it is measured to vary between runs.
+show("filePaths", () => Object.fromEntries(
+  Object.entries(router().routes)
+    .map(([route, file]) => [route, file.slice(file.indexOf("pages"))])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([route, file]) => [route, file])
+));
+show("matchFilePaths", () => ["/", "/blog", "/blog/x", "/docs", "/docs/a"].map((path) => {{
+  const m = router().match(path);
+  return [m.name, m.kind, m.filePath.slice(m.filePath.indexOf("pages"))];
+}}));
+show("tag", () => Object.prototype.toString.call(router().match("/blog/x")));
+show("getters", () => {{
+  const proto = Object.getPrototypeOf(router().match("/blog/x"));
+  return Object.getOwnPropertyNames(proto).map((key) => {{
+    const d = Object.getOwnPropertyDescriptor(proto, key);
+    return [key, typeof d.get, typeof d.set, d.enumerable, d.configurable];
+  }});
+}});
+show("decoded", () => {{
+  const m = router().match("/blog/a%20b");
+  return [m.pathname, m.params];
+}});
+show("utf8", () => {{ const m = router().match("/blog/%E2%9C%93"); return [m.pathname, m.params]; }});
+show("plusInQuery", () => router().match("/blog/x?a+b=c+d").query);
+show("plusEscaped", () => router().match("/blog/x?a%2Bb=c").query);
+show("emptyQueryKey", () => router().match("/blog/x?=v").query);
+show("repeatedKey", () => router().match("/blog/x?a=1&b=2").query);
+show("badEscape", () => router().match("/blog/%zz"));
+show("shortEscape", () => router().match("/blog/%4"));
+show("encodedSlashMisses", () => router().match("/blog/a%2Fb"));
+"#
+    );
+    let out = ours(Some(dir.path()), &script);
+
+    for expected in [
+        // Nested routes keep their directories. Sorted: Bun's own `routes` key
+        // order varies between runs, so an order comparison would be flaky.
+        r#"filePaths ["value",{"/":"pages/index.tsx","/blog":"pages/blog/index.tsx","/blog/[slug]":"pages/blog/[slug].tsx","/docs/[[...opt]]":"pages/docs/[[...opt]].tsx"}]"#,
+        r#"matchFilePaths ["value",[["/","exact","pages/index.tsx"],["/blog","exact","pages/blog/index.tsx"],["/blog/[slug]","dynamic","pages/blog/[slug].tsx"],["/docs/[[...opt]]","optional-catch-all","pages/docs/[[...opt]].tsx"],["/docs/[[...opt]]","optional-catch-all","pages/docs/[[...opt]].tsx"]]]"#,
+        r#"tag ["value","[object MatchedRoute]"]"#,
+        r#"getters ["value",[["filePath","function","undefined",true,false],["kind","function","undefined",true,false],["name","function","undefined",true,false],["params","function","undefined",true,false],["pathname","function","undefined",true,false],["query","function","undefined",true,false],["scriptSrc","function","undefined",true,false],["src","function","undefined",true,false]]]"#,
+        // Decoded, and `+` is not a space.
+        r#"decoded ["value",["/blog/a b",{"slug":"a b"}]]"#,
+        r#"utf8 ["value",["/blog/✓",{"slug":"✓"}]]"#,
+        r#"plusInQuery ["value",{"slug":"x","a+b":"c+d"}]"#,
+        r#"plusEscaped ["value",{"slug":"x","a+b":"c"}]"#,
+        r#"emptyQueryKey ["value",{"slug":"x"}]"#,
+        r#"repeatedKey ["value",{"slug":"x","a":"1","b":"2"}]"#,
+        r#"badEscape ["throw","Error",null,"DecodingError parsing path: /blog/%zz"]"#,
+        r#"shortEscape ["throw","Error",null,"DecodingError parsing path: /blog/%4"]"#,
+        r#"encodedSlashMisses ["value",null]"#,
+    ] {
+        assert!(
+            out.lines().any(|line| line == expected),
+            "missing {expected} in:\n{out}"
+        );
+    }
+
+    if bun_oracle().is_some() {
+        assert_eq!(
+            out,
+            bun(&script, Some(dir.path())),
+            "Bun.FileSystemRouter's nested paths and decoding differ from Bun 1.4.4"
+        );
+    }
+}
