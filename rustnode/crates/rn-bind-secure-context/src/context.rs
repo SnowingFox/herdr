@@ -32,6 +32,7 @@
 use std::os::raw::{c_int, c_long};
 
 use foreign_types::{ForeignType, ForeignTypeRef};
+use openssl::error::ErrorStack;
 use openssl::ssl::{SslContextBuilder, SslMethod, SslSessionCacheMode};
 use openssl::x509::{X509Crl, X509};
 use openssl_sys as ffi;
@@ -91,6 +92,21 @@ pub enum ContextError {
     DhParamTooSmall,
 }
 
+/// Why `loadPKCS12` failed.
+#[derive(Debug)]
+pub enum LoadPkcs12Error {
+    /// The PKCS#12 parser rejected the input.
+    Parse(rn_bind_crypto_x509::pkcs12::Pkcs12Error),
+    /// The parsed bundle had no private key.
+    MissingPrivateKey,
+    /// The parsed bundle had no leaf certificate.
+    MissingCertificate,
+    /// OpenSSL rejected an operation; the packed queue head, if one exists.
+    Failed(u64),
+    /// The `SSL_CTX` was not available.
+    Context(ContextError),
+}
+
 impl std::fmt::Display for ContextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -109,6 +125,12 @@ impl std::fmt::Display for ContextError {
             Self::Install(reason) => write!(f, "{reason}"),
             Self::DhParamTooSmall => write!(f, "DH parameter is less than 1024 bits"),
         }
+    }
+}
+
+impl From<rn_bind_crypto_x509::pkcs12::Pkcs12Error> for LoadPkcs12Error {
+    fn from(value: rn_bind_crypto_x509::pkcs12::Pkcs12Error) -> Self {
+        Self::Parse(value)
     }
 }
 
@@ -599,6 +621,97 @@ impl Context {
             .map_err(|error| ContextError::Install(error.to_string()))
     }
 
+    /// `loadPKCS12`: installs key, leaf certificate and extra certificates.
+    ///
+    /// This mirrors `SecureContext::LoadPKCS12`: clear previously exposed leaf /
+    /// issuer snapshots, parse one bundle, require both key and leaf cert, load
+    /// chain and key into the context, and add each extra certificate as both a
+    /// trust-store anchor and a client-advertised CA name.
+    pub fn load_pkcs12(
+        &mut self,
+        bundle: &[u8],
+        passphrase: Option<&[u8]>,
+    ) -> Result<(), LoadPkcs12Error> {
+        // A new PFX load replaces the previous cert snapshots even when it fails.
+        self.cert = None;
+        self.issuer = None;
+
+        let mut parsed = rn_bind_crypto_x509::pkcs12::parse(bundle, passphrase)?;
+        let key = match parsed.key.take() {
+            Some(key) => {
+                // SAFETY: `PKCS12_parse` returned one owned reference. Taking
+                // the pointer out of `parsed` transfers that ownership here.
+                unsafe {
+                    <openssl::pkey::PKey<openssl::pkey::Private> as ForeignType>::from_ptr(key)
+                }
+            }
+            None => return Err(LoadPkcs12Error::MissingPrivateKey),
+        };
+        let certificate_der = parsed
+            .certificate
+            .take()
+            .ok_or(LoadPkcs12Error::MissingCertificate)?;
+        let leaf = X509::from_der(&certificate_der).map_err(|_| LoadPkcs12Error::Failed(0))?;
+
+        let mut extra_certs = Vec::with_capacity(parsed.chain.len());
+        for der in &parsed.chain {
+            let certificate = X509::from_der(der).map_err(|_| LoadPkcs12Error::Failed(0))?;
+            extra_certs.push(certificate);
+        }
+
+        let mut issuer = None;
+        for certificate in &extra_certs {
+            // SAFETY: both handles are live objects owned by Rust wrappers here.
+            let issued = unsafe { ffi::X509_check_issued(certificate.as_ptr(), leaf.as_ptr()) };
+            if issued == ffi::X509_V_OK {
+                issuer = Some(certificate.to_owned());
+                break;
+            }
+        }
+
+        {
+            let context = self.context().map_err(LoadPkcs12Error::Context)?;
+            context
+                .set_certificate(&leaf)
+                .map_err(|error| LoadPkcs12Error::Failed(packed_error(&error)))?;
+
+            for certificate in &extra_certs {
+                {
+                    let store = context.cert_store_mut();
+                    // Duplicate CA certificates are benign, as in Node.
+                    let _ = store.add_cert(certificate.to_owned());
+                }
+                // SAFETY: `context` owns a live `SSL_CTX` and `certificate` is
+                // a live `X509`.
+                let added =
+                    unsafe { ffi::SSL_CTX_add_client_CA(context.as_ptr(), certificate.as_ptr()) };
+                if added != 1 {
+                    return Err(LoadPkcs12Error::Failed(
+                        unsafe { ffi::ERR_get_error() } as u64
+                    ));
+                }
+            }
+
+            for certificate in extra_certs {
+                context
+                    .add_extra_chain_cert(certificate)
+                    .map_err(|error| LoadPkcs12Error::Failed(packed_error(&error)))?;
+            }
+
+            context
+                .set_private_key(&key)
+                .map_err(|error| LoadPkcs12Error::Failed(packed_error(&error)))?;
+        }
+
+        let issuer = match issuer {
+            Some(issuer) => Some(issuer),
+            None => self.issuer_from_store(&leaf),
+        };
+        self.cert = Some(leaf);
+        self.issuer = issuer;
+        Ok(())
+    }
+
     /// `addCACert`: one CA certificate into this context's own trust store.
     pub fn add_ca_cert(&mut self, pem: &[u8]) -> Result<(), ContextError> {
         let certificates =
@@ -782,6 +895,11 @@ fn parse_dh_params(pem: &[u8]) -> Option<(i32, *mut ffi::EVP_PKEY)> {
         let bits = ffi::EVP_PKEY_get_bits(params);
         Some((bits, params))
     }
+}
+
+/// The packed queue-head code from an OpenSSL error stack.
+fn packed_error(error: &ErrorStack) -> u64 {
+    error.errors().first().map_or(0, |entry| entry.code())
 }
 
 #[cfg(test)]
