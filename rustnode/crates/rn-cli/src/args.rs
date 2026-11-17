@@ -307,6 +307,10 @@ fn parse_inspect_port(port: &str, message: &str) -> Result<u16, String> {
 #[derive(Debug, Default)]
 pub enum Source {
     /// Nothing to run: behaves like `-e ''`.
+    ///
+    /// Only reachable when standard input is a terminal. Node starts the REPL
+    /// there, which rustnode does not have, so the closest honest behaviour is
+    /// the empty program — an interactive terminal is not a script.
     #[default]
     Empty,
     /// `-e` or `-p`.
@@ -317,6 +321,55 @@ pub enum Source {
     },
     /// A script path.
     File(String),
+    /// Standard input, run as a CommonJS module by `internal/main/eval_stdin`.
+    ///
+    /// This is Node's `eval_stdin` entry point, reached when no script
+    /// argument was given and stdin is not a terminal, or when the script
+    /// argument was `-`. The two spellings differ in one observable way:
+    /// `node -` publishes `"-"` as `process.argv[1]`, while a bare `node` with
+    /// a pipe publishes no `argv[1]` at all.
+    Stdin {
+        /// The `-` marker was given, so it belongs in `process.argv`.
+        marker: bool,
+    },
+}
+
+impl Source {
+    /// Whether the entry point is one of Node's `internal/main/**` scripts,
+    /// which run pre-execution themselves.
+    ///
+    /// `-e`, a file and the empty program are driven by the CLI, so the CLI
+    /// calls `prepareMainThreadExecution` for them. Stdin is not: the first
+    /// line of `eval_stdin.js` is `prepareMainThreadExecution()`, and running it
+    /// twice trips `initializeModuleLoaders`' assertion that no user module has
+    /// executed.
+    pub fn uses_main_script(&self) -> bool {
+        matches!(self, Self::Stdin { .. })
+    }
+
+    /// The main script id this source runs, when it is one.
+    pub fn main_script_id(&self) -> Option<&'static str> {
+        match self {
+            Self::Stdin { .. } => Some("internal/main/eval_stdin"),
+            _ => None,
+        }
+    }
+
+}
+
+/// Whether standard input is a terminal, which decides what a run with no
+/// script argument does.
+///
+/// Node's dispatch is `first_argv.empty() && uv_guess_handle(STDIN_FILENO) !=
+/// UV_TTY` → `internal/main/eval_stdin`. Keeping the answer as a parameter
+/// rather than calling `isatty` here keeps this module free of runtime probes
+/// and makes both branches testable; the CLI passes what libuv reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdinKind {
+    /// `uv_guess_handle(STDIN_FILENO) == UV_TTY`.
+    Terminal,
+    /// Piped, redirected from a file, or `/dev/null` — anything but a tty.
+    Redirected,
 }
 
 /// Flags that take no separate value and that rustnode deliberately ignores.
@@ -599,9 +652,16 @@ pub fn program_name() -> String {
 /// the command line is examined at all, which is what Node does: its
 /// environment parse returns `kInvalidCommandLineArgument` before reaching the
 /// command-line parse below it.
+///
+/// `stdin` is what libuv reports for the standard input descriptor. It decides
+/// only the case Node's dispatch (`src/node.cc:395-405`) reserves for it: no
+/// script argument at all, where a terminal means the REPL and anything else
+/// means `internal/main/eval_stdin`. Passing it in rather than probing here
+/// keeps this function pure, so both branches are testable.
 pub fn parse_with_env(
     args: &[String],
     env: Option<(rn_bind_options::EnvOptions, rn_bind_options::Store)>,
+    stdin: StdinKind,
 ) -> Result<Options, ParseError> {
     let mut options = Options::new();
 
@@ -659,51 +719,102 @@ pub fn parse_with_env(
     }
 
     let mut unimplemented = BTreeSet::new();
+    // The code `-e`/`--eval` named, and whether `-p`/`--print` asked for the
+    // result. Node's parser records these as two independent option fields
+    // (`eval_string` and `print_eval`), which is why `-p 1+1 -e 'x'` prints the
+    // result of `x`: the last `--eval` wins while the print request stands.
+    let mut eval_code: Option<String> = None;
+    let mut print_eval = false;
     let mut index = 0;
 
     while index < args.len() {
         let argument = &args[index];
 
-        if argument == "-e" || argument == "--eval" || argument == "-p" || argument == "--print" {
-            let Some(code) = args.get(index + 1) else {
-                return Err(ParseError::Cli(format!("{argument} requires an argument")));
-            };
-            options.source = Source::Eval {
-                code: code.clone(),
-                print: argument == "-p" || argument == "--print",
-            };
-            // Node keeps `-e`/`-p` out of the *flags* it inherits, but it does
-            // put the flag and its source in `process.execArgv`, because a child
-            // process re-running the parent has to reproduce the same entry
-            // point. Only the leading `node` and the script path are absent.
-            options.exec_argv.push(argument.clone());
-            options.exec_argv.push(code.clone());
-            // Arguments after the source belong to the evaluated code, with an
-            // explicit `--` acting only as a separator (`node -e 'x' -- a`
-            // gives `['a']`, the same as `node -e 'x' a`).
-            index += 2;
-            if args.get(index).map(String::as_str) == Some("--") {
-                index += 1;
-            }
-            options.script_args = args[index..].to_vec();
-            return finish(options, unimplemented);
+        // An argument of length one — a bare `-` — is not a flag. `ArgsInfo`
+        // breaks its loop for `args.first().size() <= 1`, which is exactly what
+        // makes `node -` name the stdin script instead of being a bad option.
+        if !argument.starts_with('-') || argument.len() == 1 {
+            break;
         }
 
-        // `--` ends flag parsing; everything after is the script and its args.
+        // `--` ends flag parsing; everything after it is positional. It is not
+        // a positional itself, which is why `node -- -` still means stdin.
         if argument == "--" {
             index += 1;
-            if let Some(script) = args.get(index) {
-                options.source = Source::File(script.clone());
-                options.script_args = args[index + 1..].to_vec();
-            }
-            return finish(options, unimplemented);
+            break;
         }
 
-        // A script path is the first non-flag argument; the rest belong to it.
-        if !argument.starts_with('-') {
-            options.source = Source::File(argument.clone());
-            options.script_args = args[index + 1..].to_vec();
-            return finish(options, unimplemented);
+        // `-e`/`--eval` and its `=value` form. The value must not look like a
+        // flag: `node -e -1` is `-e requires an argument` in Node, because
+        // `Parse` refuses a separate value that starts with `-`.
+        if argument == "-e" || argument == "--eval" {
+            let Some(code) = args.get(index + 1).filter(|next| !next.starts_with('-')) else {
+                return Err(ParseError::Cli(format!("{argument} requires an argument")));
+            };
+            // Node records the flag and its source in `process.execArgv`,
+            // because a child process re-running the parent has to reproduce
+            // the same entry point. Only the leading `node` and the script path
+            // are absent.
+            options.exec_argv.push(argument.clone());
+            options.exec_argv.push(code.clone());
+            eval_code = Some(code.clone());
+            index += 2;
+            continue;
+        }
+
+        // `-pe` is `--print --eval`, expanded from the alias table, so it takes
+        // the value as the same kind of separate argument `--eval` does.
+        if argument == "-pe" {
+            let Some(code) = args.get(index + 1).filter(|next| !next.starts_with('-')) else {
+                return Err(ParseError::Cli("-pe requires an argument".to_string()));
+            };
+            options.exec_argv.push(argument.clone());
+            options.exec_argv.push(code.clone());
+            eval_code = Some(code.clone());
+            print_eval = true;
+            index += 2;
+            continue;
+        }
+
+        // `--eval=code`. The `=` form is one argument, so the value cannot look
+        // like a flag; an empty value is still an error, and the message keeps
+        // the `=` Node prints (`--eval= requires an argument`).
+        if let Some(code) = argument.strip_prefix("--eval=") {
+            if code.is_empty() {
+                return Err(ParseError::Cli("--eval= requires an argument".to_string()));
+            }
+            options.exec_argv.push(argument.clone());
+            eval_code = Some(code.to_string());
+            index += 1;
+            continue;
+        }
+
+        // `-p`/`--print` is a boolean option, and the alias table is what makes
+        // it take a following non-flag argument as the source: `--print <arg>`
+        // expands to `-pe`, which expands to `--print --eval`. So
+        // `node -p 1+1` evaluates `1+1`, while `node -p --no-warnings` leaves
+        // the source empty and prints the result of an empty program.
+        if argument == "-p" || argument == "--print" {
+            options.exec_argv.push(argument.clone());
+            print_eval = true;
+            match args.get(index + 1).filter(|next| !next.starts_with('-')) {
+                Some(code) => {
+                    options.exec_argv.push(code.clone());
+                    eval_code = Some(code.clone());
+                    index += 2;
+                }
+                None => index += 1,
+            }
+            continue;
+        }
+
+        // `--print=value` sets the boolean and discards the value, because the
+        // option's type is `kBoolean` and `Parse` never reads one for it.
+        if argument.starts_with("--print=") {
+            options.exec_argv.push(argument.clone());
+            print_eval = true;
+            index += 1;
+            continue;
         }
 
         if UNIMPLEMENTED.contains(&argument.as_str()) {
@@ -914,8 +1025,44 @@ pub fn parse_with_env(
         index += 1;
     }
 
+    // The walk is over: what is left is positional. Node's dispatch order
+    // (`src/node.cc:365-405`) is what decides which of them is the entry point,
+    // and every branch below is one of its cases.
+    let positional = &args[index..];
+    options.source = if let Some(code) = eval_code {
+        // `-e`/`-p` ran: their arguments are `argv.slice(1)`, with an explicit
+        // `--` consumed by the flag walk above rather than forwarded.
+        options.script_args = positional.to_vec();
+        Source::Eval {
+            code,
+            print: print_eval,
+        }
+    } else if let Some((script, rest)) = positional.split_first() {
+        // A positional is the script path, and `-` is the marker for stdin
+        // rather than a file named `-`: `run_main_module` is skipped for it
+        // (`src/node.cc:400`) and `eval_stdin` runs instead, with the marker
+        // left in `process.argv`.
+        if script == "-" {
+            options.script_args = rest.to_vec();
+            Source::Stdin { marker: true }
+        } else {
+            options.script_args = rest.to_vec();
+            Source::File(script.clone())
+        }
+    } else if stdin == StdinKind::Redirected {
+        // No script, standard input is not a terminal: Node reads it as a
+        // CommonJS module. This is the case that used to evaluate `"0"` and
+        // exit 0 without printing anything.
+        Source::Stdin { marker: false }
+    } else {
+        // A terminal. Node starts the REPL here; rustnode has none, so the
+        // empty program is the honest stand-in.
+        Source::Empty
+    };
+
     finish(options, unimplemented)
 }
+
 
 /// Records one V8 flag for `process.execArgv` and for forwarding.
 ///
@@ -1191,7 +1338,7 @@ mod tests {
     /// in this module's own environment tests below.
     fn parse_of(args: &[&str]) -> Result<Options, String> {
         let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
-        parse_with_env(&owned, None).map_err(|error| match error {
+        parse_with_env(&owned, None, StdinKind::Terminal).map_err(|error| match error {
             ParseError::Cli(message)
             | ParseError::NodeOptions(message)
             | ParseError::OptionValue(message) => message,
@@ -1425,6 +1572,7 @@ mod tests {
                 "1".to_string(),
             ],
             Some(env),
+            StdinKind::Terminal,
         )
         .expect("parses");
         assert_eq!(
@@ -1488,6 +1636,95 @@ mod tests {
         assert!(options.script_args.is_empty());
     }
 
+    /// A bare pipe runs stdin; a terminal does not.
+    ///
+    /// This is the whole of Node's dispatch at `src/node.cc:400-405`:
+    /// `first_argv.empty() && uv_guess_handle(STDIN_FILENO) != UV_TTY` means
+    /// `internal/main/eval_stdin`. Before this, both cases fell through to the
+    /// empty program, which evaluated `"0"` and exited 0 while printing
+    /// nothing — a silent success for a script that never ran.
+    #[test]
+    fn no_argument_reads_stdin_only_when_it_is_not_a_terminal() {
+        let options = parse_with_env(&[], None, StdinKind::Redirected).expect("parses");
+        assert!(matches!(options.source, Source::Stdin { marker: false }));
+        assert!(options.script_args.is_empty());
+
+        let options = parse_with_env(&[], None, StdinKind::Terminal).expect("parses");
+        assert!(matches!(options.source, Source::Empty));
+    }
+
+    /// `-` is the stdin marker, and it stays in `process.argv`.
+    ///
+    /// `src/node.cc:400` skips `run_main_module` when the script is `-`, and the
+    /// marker is left in `argv` rather than stripped: `node - x y` reports
+    /// `[execPath, '-', 'x', 'y']`.
+    #[test]
+    fn a_dash_means_stdin_and_keeps_itself_in_argv() {
+        let options = parse_of(&["-", "x", "y"]).expect("parses");
+        assert!(matches!(options.source, Source::Stdin { marker: true }));
+        assert_eq!(options.script_args, ["x", "y"]);
+
+        // `--` does not make `-` a file name: it only ends flag parsing.
+        let options = parse_of(&["--", "-"]).expect("parses");
+        assert!(matches!(options.source, Source::Stdin { marker: true }));
+    }
+
+    /// `--` before a non-dash argument still names a file.
+    ///
+    /// The reason the distinction matters: `node -- a b` makes `a` the script,
+    /// so `--` forwards nothing to a stdin script — the stdin path is only
+    /// reached when nothing positional follows.
+    #[test]
+    fn double_dash_still_names_a_script_file() {
+        let options = parse_of(&["--", "a", "b"]).expect("parses");
+        assert!(matches!(options.source, Source::File(path) if path == "a"));
+        assert_eq!(options.script_args, ["b"]);
+    }
+
+
+
+
+
+
+    /// The last `--eval` wins while `--print` stands, because Node records them
+    /// as two independent option fields (`eval_string`, `print_eval`).
+    #[test]
+    fn print_and_eval_compose_as_two_option_fields() {
+        let options = parse_of(&["-e", "1", "-p", "2"]).expect("parses");
+        assert!(matches!(
+            &options.source,
+            Source::Eval { code, print: true } if code == "2"
+        ));
+
+        // `-p` alone has no source, so it falls through to the stdin entry
+        // point, which reads `--print` from the option store. That is how
+        // `echo 1+1 | node -p` prints `2`.
+        let options =
+            parse_with_env(&["-p".to_string()], None, StdinKind::Redirected).expect("parses");
+        assert!(matches!(options.source, Source::Stdin { marker: false }));
+        assert!(
+            options.exec_argv.iter().any(|flag| flag == "-p"),
+            "{:?}",
+            options.exec_argv
+        );
+        assert_eq!(
+            options.parsed.value_of("--print"),
+            Some(rn_bind_options::ParsedValue::Bool(true)),
+            "the store is what eval_stdin reads --print from"
+        );
+    }
+
+    /// A value that looks like a flag is not consumed, which is how
+    /// `node -e -1` becomes `-e requires an argument`.
+    #[test]
+    fn an_eval_value_that_looks_like_a_flag_is_missing() {
+        let error = parse_of(&["-e", "-1"]).expect_err("rejects");
+        assert!(error.contains("-e requires an argument"), "{error}");
+
+        let error = parse_of(&["--eval="]).expect_err("rejects");
+        assert!(error.contains("--eval= requires an argument"), "{error}");
+    }
+
     #[test]
     fn a_script_path_is_not_in_exec_argv() {
         let options = parse_of(&["--no-warnings", "app.js", "arg"]).expect("parses");
@@ -1534,7 +1771,8 @@ mod tests {
     #[test]
     fn a_bare_inspect_keeps_the_configured_port() {
         let env = rn_bind_options::parse_env("--inspect-port=9339").expect("parses");
-        let options = parse_with_env(&["--inspect".to_string()], Some(env)).expect("parses");
+        let options = parse_with_env(&["--inspect".to_string()], Some(env), StdinKind::Terminal)
+            .expect("parses");
         assert!(options.inspect_enabled);
         assert_eq!(options.debug_port.port, 9339);
     }
@@ -1542,8 +1780,12 @@ mod tests {
     #[test]
     fn a_later_inspect_port_still_moves_the_address() {
         let env = rn_bind_options::parse_env("--inspect").expect("parses");
-        let options =
-            parse_with_env(&["--inspect-port=9338".to_string()], Some(env)).expect("parses");
+        let options = parse_with_env(
+            &["--inspect-port=9338".to_string()],
+            Some(env),
+            StdinKind::Terminal,
+        )
+        .expect("parses");
         assert!(options.inspect_enabled);
         assert_eq!(options.debug_port.port, 9338);
     }

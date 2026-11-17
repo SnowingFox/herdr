@@ -52,7 +52,15 @@ fn main() {
     // around whatever model is already there, and the `fs`, `child_process` and
     // `worker` checks read the same one. Parsing later would leave the binding
     // holding a disabled model while the CLI held an enforcing one.
-    let options = match args::parse_with_env(&args, env_options) {
+    let options = match args::parse_with_env(
+        &args,
+        env_options,
+        if rn_uv::is_terminal(0) {
+            args::StdinKind::Terminal
+        } else {
+            args::StdinKind::Redirected
+        },
+    ) {
         Ok(options) => options,
         Err(error) => match error {
             args::ParseError::Cli(message) => {
@@ -186,6 +194,7 @@ fn main() {
     // is accepted and then does nothing, which is the failure mode the old
     // allow-list version of this function could not detect.
     apply_v8_flags(&options.v8_args);
+
 
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
@@ -328,12 +337,20 @@ fn main() {
     // while `argv` matches what Node reports for the same command line.
     let mut argv_rest: Vec<String> = Vec::new();
     let mut script_path = None;
-    if let args::Source::File(path) = &options.source {
-        let resolved = std::path::absolute(path)
-            .map(|resolved| resolved.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.clone());
-        argv_rest.push(resolved.clone());
-        script_path = Some(resolved);
+    match &options.source {
+        args::Source::File(path) => {
+            let resolved = std::path::absolute(path)
+                .map(|resolved| resolved.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.clone());
+            argv_rest.push(resolved.clone());
+            script_path = Some(resolved);
+        }
+        // `node -` publishes the marker itself as `argv[1]`, which is what
+        // `patchProcessObject` then leaves alone: its `expandArgv1` branch skips
+        // an argument starting with `-`. A bare `node` with a pipe publishes no
+        // `argv[1]` at all.
+        args::Source::Stdin { marker: true } => argv_rest.push("-".to_string()),
+        _ => {}
     }
     argv_rest.extend(options.script_args.iter().cloned());
 
@@ -433,11 +450,27 @@ fn main() {
                     // a second descriptor. See `install_console`.
                     bootstrap::install_console(scope, require);
                     rn_core::profile::mark("install_stdio + console");
-                    bootstrap::prepare_execution(scope, require);
-                    rn_core::profile::mark("prepare_execution");
+                    // Node's entry points are main scripts, and each of them
+                    // calls `prepareMainThreadExecution()` itself: that is the
+                    // first line of `run_main_module.js` and `eval_stdin.js`
+                    // alike. The CLI calls it here only for the
+                    // paths it drives itself — `-e`, a file entry point, and the
+                    // empty program — so a main script must not find it already
+                    // run. Node enforces the same ordering with the assertion in
+                    // `initializeModuleLoaders` ("no user module has been
+                    // executed yet"), which is what made a `.mjs` entry point
+                    // fail with `ERR_INTERNAL_ASSERTION` before the CLI ran
+                    // pre-execution at all.
+                    if options.source.uses_main_script() {
+                        rn_core::profile::mark("prepare_execution (deferred to main script)");
+                    } else {
+                        bootstrap::prepare_execution(scope, require);
+                        rn_core::profile::mark("prepare_execution");
+                    }
                     // `node -e` exposes builtins as lazy globals; a script file
                     // does not, which is why this is gated on the source. Node's
-                    // own `eval_string.js` makes the same distinction.
+                    // own `eval_string.js` makes the same distinction, and
+                    // `eval_stdin.js` deliberately does not take it.
                     if matches!(options.source, args::Source::Eval { .. }) {
                         if let Err(message) = rn_realm::install_eval_builtins(scope, require) {
                             eprintln!("rustnode: builtin globals unavailable: {message}");
@@ -538,6 +571,40 @@ fn main() {
         args::Source::Eval { code, print } => {
             print_result = *print;
             value = evaluate_script(scope, code).map(|value| v8::Global::new(scope, value));
+        }
+        // `internal/main/eval_stdin` is Node's own entry point for a script read
+        // from standard input, run as a main script. It is not reimplemented
+        // here for the same reason a file is not: it reads stdin through
+        // `process.stdin`, honours `--input-type`, `--print` and
+        // `--strip-types`, and hands the code to `evalScript`, which is what
+        // gives the module `module`/`exports`/`require`/`__filename` and makes
+        // `require.main` undefined — reproducing that by hand would be a second
+        // copy of `evalScript`'s semantics.
+        args::Source::Stdin { .. } => {
+            let id = options
+                .source
+                .main_script_id()
+                .expect("stdin names a main script");
+            // The main scripts call `prepareMainThreadExecution()` themselves,
+            // which is why the CLI skipped its own call above. A failure is
+            // reported through the same uncaught path a file entry point uses:
+            // `eval_stdin` reports the user script's throw from inside its own
+            // `end` handler.
+            let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+            let scope = &mut try_catch.init();
+            let failure = bootstrap::run_main_script(scope, id);
+            if let Some(message) = failure {
+                eprintln!("{message}");
+            }
+            let handled = if scope.has_caught() && !scope.has_terminated() {
+                match scope.exception() {
+                    Some(exception) => rn_errors::report_uncaught_exception(scope, exception),
+                    None => true,
+                }
+            } else {
+                true
+            };
+            entry_fatal = !handled;
         }
         args::Source::Empty => {
             value = evaluate_script(scope, "0").map(|value| v8::Global::new(scope, value));
