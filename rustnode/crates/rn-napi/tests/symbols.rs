@@ -30,8 +30,9 @@ fn rustnode() -> PathBuf {
     path
 }
 
-/// The `napi_*` and `node_api_*` names in the binary's dynamic symbol table.
-fn exported_node_api_symbols() -> Vec<String> {
+/// The defined names in the binary's dynamic symbol table that start with any of
+/// `prefixes`.
+fn exported_symbols_with_prefixes(prefixes: &[&str]) -> Vec<String> {
     let binary = rustnode();
     assert!(
         binary.is_file(),
@@ -47,11 +48,21 @@ fn exported_node_api_symbols() -> Vec<String> {
     let mut names: Vec<String> = text
         .lines()
         .filter_map(|line| line.split_whitespace().last())
-        .filter(|name| name.starts_with("napi_") || name.starts_with("node_api_"))
+        .filter(|name| prefixes.iter().any(|prefix| name.starts_with(prefix)))
         .map(str::to_string)
         .collect();
     names.sort();
     names
+}
+
+/// The `napi_*` and `node_api_*` names in the binary's dynamic symbol table.
+fn exported_node_api_symbols() -> Vec<String> {
+    exported_symbols_with_prefixes(&["napi_", "node_api_"])
+}
+
+/// The `uv_*` names in the binary's dynamic symbol table.
+fn exported_libuv_symbols() -> Vec<String> {
+    exported_symbols_with_prefixes(&["uv_"])
 }
 
 #[test]
@@ -128,6 +139,78 @@ fn the_surface_is_not_empty_and_covers_the_core() {
             "{required} is not exported"
         );
     }
+}
+
+#[test]
+fn the_libuv_surface_is_published() {
+    // An addon that `#include <uv.h>` resolves those calls against the host binary,
+    // because `napi_get_uv_event_loop` hands it a `uv_loop_t*` and libuv is the API
+    // it drives that loop with. Before `uv_*` joined the export patterns in
+    // `crates/rn-cli/build.rs`, six files of Node's `test/node-api/` aborted at
+    // `dlopen` with `symbol lookup error: undefined symbol: uv_sleep` — so this is
+    // the regression guard for that flag, not a formality.
+    //
+    // A representative set rather than the exact count or the exact list. The count
+    // is a fact about how much of libuv a given link happened to extract from
+    // `libuv.a` (a member nothing references is never pulled in), so pinning it
+    // would fail on an unrelated dependency change and say nothing about addons.
+    // The names below are the ones the failing addons actually imported: the
+    // thread, mutex, check/idle and async init families, `uv_queue_work` for the
+    // threadpool, and `uv_sleep`. Each is a distinct capability, so a regression
+    // names the part of the surface that vanished.
+    let exported = exported_libuv_symbols();
+    for required in [
+        "uv_sleep",
+        "uv_thread_create",
+        "uv_thread_join",
+        "uv_mutex_init",
+        "uv_mutex_lock",
+        "uv_queue_work",
+        "uv_check_init",
+        "uv_idle_init",
+        "uv_async_init",
+        "uv_timer_init",
+        "uv_close",
+        "uv_run",
+    ] {
+        assert!(
+            exported.iter().any(|symbol| symbol == required),
+            "{required} is not exported; an addon importing it would abort at load \
+             with `undefined symbol` (exported libuv surface: {} names)",
+            exported.len()
+        );
+    }
+    // A floor, not the oracle's count. Node's own binary exports 318 `uv_*` names
+    // because it extracts more of libuv; requiring that here would only pass by
+    // forcing archive members in with `--undefined` for functions no addon calls.
+    assert!(
+        exported.len() > 100,
+        "the published libuv surface collapsed to {} names",
+        exported.len()
+    );
+}
+
+#[test]
+fn libuv_internals_stay_hidden() {
+    // The `uv_*` export is a pattern, so the thing worth pinning in the other
+    // direction is that it does not reach libuv's internal `uv__*` symbols.
+    //
+    // What actually enforces this is `-fvisibility=hidden` on the vendored libuv
+    // build, not the pattern's shape: widening the glob to `uv*` still publishes
+    // zero `uv__*` names, measured. So this test guards the vendored build
+    // configuration and the libuv version. If libuv were ever built without
+    // `-fvisibility=hidden`, those internals would become exported ABI and this
+    // is the assertion that would say so — which matters because an addon
+    // binding one would break when libuv reorganises its internals.
+    let exported = exported_libuv_symbols();
+    let internals: Vec<&String> = exported
+        .iter()
+        .filter(|symbol| symbol.starts_with("uv__"))
+        .collect();
+    assert!(
+        internals.is_empty(),
+        "libuv internals must not be exported: {internals:?}"
+    );
 }
 
 #[test]
