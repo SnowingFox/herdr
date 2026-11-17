@@ -57,6 +57,22 @@ fn run_args(arguments: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Same as [`run_args`], but for dynamically built arguments.
+fn run_args_owned(arguments: &[String]) -> (i32, String, String) {
+    let directory = std::env::temp_dir();
+    let output = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .env_remove("NODE_OPTIONS")
+        .current_dir(&directory)
+        .args(arguments)
+        .output()
+        .expect("rustnode runs");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 /// Asserts `--flag` is accepted and that the script still runs.
 ///
 /// Running the script is the part that matters: exit 0 alone would also be
@@ -510,6 +526,90 @@ fn every_bad_flag_is_reported_not_only_the_first() {
     assert_eq!(code, 9, "stderr: {stderr}");
     assert!(stderr.contains("bad option: --bogus-a"), "stderr: {stderr}");
     assert!(stderr.contains("bad option: --bogus-b"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_trailing_unknown_flag_after_eval_is_still_a_bad_option() {
+    // `-e` does not end option parsing in Node. A trailing unknown flag is still
+    // handed to V8 and rejected as `bad option`.
+    let (code, stdout, stderr) = run_args(&["-e", "0", "--bogus-xyz"]);
+    assert_eq!(code, 9, "stderr: {stderr}");
+    assert!(stdout.trim().is_empty(), "stdout: {stdout:?}");
+    let prefix = format!("{}: ", env!("CARGO_BIN_EXE_rustnode"));
+    assert_eq!(
+        stderr.trim_end(),
+        format!("{prefix}bad option: --bogus-xyz"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn a_trailing_valid_flag_after_eval_still_applies() {
+    // `--no-warnings` after `-e` must still be treated as a runtime option.
+    let script = "process.emitWarning('boom')";
+    let (without_code, _, without_stderr) = run_args(&["-e", script]);
+    let (with_code, _, with_stderr) = run_args(&["-e", script, "--no-warnings"]);
+    assert_eq!(without_code, 0, "stderr: {without_stderr}");
+    assert_eq!(with_code, 0, "stderr: {with_stderr}");
+    assert!(
+        without_stderr.contains("Warning: boom"),
+        "without the flag the warning should be present, stderr: {without_stderr}"
+    );
+    assert!(
+        !with_stderr.contains("Warning: boom"),
+        "trailing --no-warnings should suppress the warning, stderr: {with_stderr}"
+    );
+}
+
+#[test]
+fn a_trailing_value_flag_after_eval_is_parsed() {
+    let (code, stdout, stderr) = run_args(&[
+        "-e",
+        "console.log(process.execArgv.includes('--max-old-space-size=256'))",
+        "--max-old-space-size=256",
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "true", "stderr: {stderr}");
+}
+
+#[test]
+fn a_trailing_double_dash_after_eval_only_separates_script_args() {
+    let script = "console.log(JSON.stringify(process.argv.slice(1)))";
+    let (only_dash_code, only_dash_stdout, only_dash_stderr) = run_args(&["-e", script, "--"]);
+    assert_eq!(only_dash_code, 0, "stderr: {only_dash_stderr}");
+    assert_eq!(only_dash_stdout.trim(), "[]", "stderr: {only_dash_stderr}");
+
+    let (extra_code, extra_stdout, extra_stderr) = run_args(&["-e", script, "--", "extra"]);
+    assert_eq!(extra_code, 0, "stderr: {extra_stderr}");
+    assert_eq!(
+        extra_stdout.trim(),
+        r#"["extra"]"#,
+        "stderr: {extra_stderr}"
+    );
+}
+
+#[test]
+fn a_script_argument_that_looks_like_a_flag_is_not_reparsed_as_runtime_option() {
+    let directory = temp_dir("trailing-script-args");
+    let script = directory.join("show.js");
+    std::fs::write(
+        &script,
+        "console.log(JSON.stringify(process.argv.slice(2)));\n",
+    )
+    .expect("write script");
+    let args = vec![
+        script.to_string_lossy().into_owned(),
+        "--bogus-xyz".to_string(),
+        "value".to_string(),
+    ];
+    let (code, stdout, stderr) = run_args_owned(&args);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        r#"["--bogus-xyz","value"]"#,
+        "stderr: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&directory);
 }
 
 #[test]
