@@ -121,7 +121,15 @@ impl WorkerThread {
             rn_uv::memory::constrained_memory(),
             rn_uv::memory::total_memory(),
         );
-        let [young, old, code_range, _stack] = self.request.resource_limits;
+        let limits = self.request.resource_limits;
+        let [young, old, code_range, _stack] = limits;
+        let stack_limit = crate::stack::stack_limit(limits);
+        // `Worker::UpdateResourceConstraints` sets `constraints->set_stack_limit`
+        // from the worker thread's own stack base before creating the isolate.
+        // This pointer is into the current thread's stack and remains valid for
+        // the isolate's lifetime because the isolate is owned and dropped on this
+        // same thread.
+        params = unsafe { params.set_stack_limit(stack_limit) };
         if young > 0.0 {
             params = params.set_max_young_generation_size_in_bytes(mb(young));
         }
@@ -139,6 +147,9 @@ impl WorkerThread {
         // isolate without one would leave `process.memoryUsage().arrayBuffers`
         // reading zero inside every worker.
         let mut isolate = v8::Isolate::new(rn_core::with_counted_array_buffer_allocator(params));
+        // The first isolate enter recomputes stack limits from V8 flags.
+        // `Worker::Run` resets the worker-specific limit immediately after.
+        unsafe { rn_v8_sys::set_isolate_stack_limit(&isolate, stack_limit as usize) };
         // Microtasks are explicit, exactly as on the main thread: Node's tick
         // queue must beat a `.then`, and the default `Auto` policy would invert
         // that.
