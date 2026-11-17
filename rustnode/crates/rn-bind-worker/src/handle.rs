@@ -559,8 +559,10 @@ impl WorkerHandle {
         }
         self.finished.store(false, Ordering::SeqCst);
         let name = self.request.name.clone();
+        let stack_size = crate::stack::stack_size_bytes(self.request.resource_limits);
         let handle = std::thread::Builder::new()
             .name(name)
+            .stack_size(stack_size)
             .spawn(run)
             .map_err(|error| format!("cannot start the worker thread: {error}"))?;
         *self.thread.borrow_mut() = Some(handle);

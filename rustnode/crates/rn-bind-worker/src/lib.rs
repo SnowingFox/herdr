@@ -93,6 +93,7 @@ pub mod heap_statistics;
 pub mod parent;
 pub mod registry;
 pub mod run;
+mod stack;
 mod worker;
 
 use std::cell::RefCell;
