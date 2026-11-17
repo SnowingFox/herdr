@@ -54,8 +54,9 @@ use std::os::raw::c_char;
 use rn_v8_sys::v8;
 
 use crate::abi::{
-    NapiBasicFinalize, NapiCallbackInfo, NapiEnv, NapiFinalize, NapiRef, NapiStatus, NapiValue,
-    NapiValueType, NAPI_DEFAULT_MODULE_API_VERSION, NAPI_SUPPORTED_VERSION_MAX,
+    NapiAsyncContext, NapiBasicFinalize, NapiCallbackInfo, NapiEnv, NapiFinalize, NapiRef,
+    NapiStatus, NapiValue, NapiValueType, NAPI_DEFAULT_MODULE_API_VERSION,
+    NAPI_SUPPORTED_VERSION_MAX,
 };
 use crate::env::{env_from, Env};
 use crate::values::{arg, in_scope, to_napi, type_of};
@@ -5716,8 +5717,8 @@ pub const EXPORTED: &[&str] = &[
 /// reason here is expected to name what was checked and what the check showed.
 pub const DEFERRED: &[(&str, &str)] = &[
     (
-        "napi_async_init / napi_async_destroy / napi_make_callback / napi_open_callback_scope / napi_close_callback_scope",
-        "an async context is an AsyncWrap with a fresh async id, an EmitAsyncInit and an EmitDestroy; the pieces exist (`rn_bind_async_wrap::emit_async_init`, `emit_destroy`, `push_top_level_context`) but the emit entry points are keyed off the namespace's installed hook functions, not a `napi_env`, and `push_context`/`emit_hook` are private to that crate. Exposing them is a cross-crate API change, not a shim",
+        "napi_open_callback_scope / napi_close_callback_scope",
+        "a callback scope is opened in one call and closed in another, so it must hold the pushed async context and the prior frame across the gap. `rn_core::callback_scope::with_scope` does that for the duration of one closure, and its hook implementation is private to that function, so an open/close pair needs a small public open/close API there rather than a shim here. `napi_async_init`, `napi_async_destroy` and `napi_make_callback` are installed",
     ),
     (
         "napi_module_register",
@@ -5747,6 +5748,189 @@ pub const SUPPORTED_NAPI_VERSION: i32 = NAPI_SUPPORTED_VERSION_MAX;
 
 /// The version an addon that omits `node_api_module_get_api_version_v1` gets.
 pub const DEFAULT_MODULE_API_VERSION: i32 = NAPI_DEFAULT_MODULE_API_VERSION;
+
+/// `napi_async_init`: create an async context from a resource.
+///
+/// Node's `v8impl::AsyncContext` allocates a fresh async id, roots the resource,
+/// and calls `EmitAsyncInit`. A null `async_resource` becomes a fresh object
+/// rather than an error, which is what the `async_resource != nullptr` branch in
+/// `node_api.cc` does — an addon that only wants an id does not have to make one.
+#[export_name = "napi_async_init"]
+pub unsafe extern "C" fn napi_async_init(
+    env: *mut NapiEnv,
+    async_resource: *mut NapiValue,
+    async_resource_name: *mut NapiValue,
+    result: *mut *mut NapiAsyncContext,
+) -> NapiStatus {
+    if result.is_null() || async_resource_name.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    if (unsafe { env_from(env) }).is_none() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+
+    // The name is validated but not retained: `emit_async_init` takes the
+    // provider id, not a name, and the resource object is what `async_hooks`
+    // reports. Node's own `v8_resource_name` is used only to check it is a
+    // string, which `to_string` here does.
+    let initialised = in_scope(|scope| {
+        // SAFETY: the caller passed a readable `napi_value` or null.
+        let resource = if async_resource.is_null() {
+            Some(v8::Object::new(scope))
+        } else {
+            // SAFETY: as above; a non-null `napi_value` is a live handle.
+            unsafe { arg(async_resource) }
+                .and_then(|value| v8::Local::<v8::Object>::try_from(value).ok())
+        };
+        // SAFETY: as above. The string becomes the `init` hook's type, so it is
+        // read rather than merely validated.
+        let Some(name) = (unsafe { arg(async_resource_name) })
+            .and_then(|value| value.to_string(scope))
+            .map(|value| value.to_rust_string_lossy(scope))
+        else {
+            return std::ptr::null_mut();
+        };
+        crate::env::create_async_context(scope, resource, &name)
+    });
+
+    match initialised {
+        Some(context) if !context.is_null() => {
+            // SAFETY: the caller passed a writable slot for one pointer; the
+            // addon sees only the opaque `napi_async_context`.
+            unsafe { result.write(context.cast::<NapiAsyncContext>()) };
+            status(env, NapiStatus::Ok)
+        }
+        _ => status(env, NapiStatus::InvalidArg),
+    }
+}
+
+/// `napi_async_destroy`: free an async context and queue its `destroy` hook.
+#[export_name = "napi_async_destroy"]
+pub unsafe extern "C" fn napi_async_destroy(
+    env: *mut NapiEnv,
+    async_context: *mut NapiAsyncContext,
+) -> NapiStatus {
+    if async_context.is_null() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: the caller passes a pointer `napi_async_init` boxed and not yet
+    // destroyed.
+    unsafe {
+        crate::env::destroy_async_context(async_context.cast::<crate::env::AsyncContextState>())
+    };
+    status(env, NapiStatus::Ok)
+}
+
+/// `napi_make_callback`: call a JS function inside an async context's scope.
+///
+/// This is the function `test_callback_scope` and `test_make_callback` need, and
+/// the reason `rn_core::callback_scope::with_scope` exists: it opens the async
+/// context, emits `before`, calls, emits `after`, and restores. A null
+/// `async_context` means "no context", which Node handles as a plain
+/// `MakeCallback` with a zeroed context.
+///
+/// A throw is reported and returned as `napi_pending_exception`, matching Node's
+/// `try_catch.HasCaught()` branch.
+#[export_name = "napi_make_callback"]
+pub unsafe extern "C" fn napi_make_callback(
+    env: *mut NapiEnv,
+    async_context: *mut NapiAsyncContext,
+    recv: *mut NapiValue,
+    func: *mut NapiValue,
+    argc: usize,
+    argv: *const *mut NapiValue,
+    result: *mut *mut NapiValue,
+) -> NapiStatus {
+    if recv.is_null() || func.is_null() || (argc > 0 && argv.is_null()) {
+        return status(env, NapiStatus::InvalidArg);
+    }
+    // SAFETY: `env` is null or one of this crate's environments.
+    if (unsafe { env_from(env) }).is_none() {
+        return status(env, NapiStatus::InvalidArg);
+    }
+
+    // Read the id pair before entering the scope: `async_context` is the addon's
+    // pointer and nothing inside the callback may be trusted to keep it alive.
+    let context = if async_context.is_null() {
+        None
+    } else {
+        // SAFETY: the caller passes a pointer `napi_async_init` produced.
+        let boxed = unsafe { &*async_context.cast::<crate::env::AsyncContextState>() };
+        Some(rn_core::callback_scope::AsyncContext {
+            async_id: boxed.async_id,
+            trigger_async_id: boxed.trigger_async_id,
+        })
+    };
+
+    let called = in_scope(|scope| {
+        // SAFETY: every handle below came from the caller and is live for the
+        // duration of this call, per the Node-API contract.
+        let (recv, func) = unsafe { (arg(recv), arg(func)) };
+        let (Some(recv), Some(func)) = (recv, func) else {
+            return Err(NapiStatus::InvalidArg);
+        };
+        let Ok(recv) = v8::Local::<v8::Object>::try_from(recv) else {
+            return Err(NapiStatus::InvalidArg);
+        };
+        let Ok(func) = v8::Local::<v8::Function>::try_from(func) else {
+            return Err(NapiStatus::InvalidArg);
+        };
+
+        let mut arguments = Vec::with_capacity(argc);
+        for index in 0..argc {
+            // SAFETY: the caller passed `argc` readable handles, and `arg`
+            // rebuilds the `Local` behind each one.
+            let Some(value) = (unsafe { arg(argv.add(index).read()) }) else {
+                return Err(NapiStatus::InvalidArg);
+            };
+            arguments.push(value);
+        }
+
+        // The context's own resource is what the callback sees through
+        // `executionAsyncResource()`. Re-rooted per call because `with_scope`
+        // takes an owned `Global` and the context keeps its own.
+        let resource = if async_context.is_null() {
+            None
+        } else {
+            let boxed = unsafe { &*async_context.cast::<crate::env::AsyncContextState>() };
+            boxed
+                .resource
+                .as_ref()
+                .map(|object| v8::Global::new(scope, v8::Local::new(scope, object)))
+        };
+
+        let args = rn_core::callback_scope::ScopeArgs {
+            context: context.unwrap_or(rn_core::callback_scope::AsyncContext {
+                async_id: 0.0,
+                trigger_async_id: 0.0,
+            }),
+            resource,
+            frame: None,
+        };
+
+        rn_core::callback_scope::with_scope(scope, args, |scope| {
+            // Converted inside the closure: `with_scope` hands a freshly-scoped
+            // `PinScope`, so a `Local` cannot escape it. `napi_value` is a raw
+            // pointer and outlives the scope, which is what the caller expects.
+            func.call(scope, recv.into(), &arguments).map(to_napi)
+        })
+        .ok_or(NapiStatus::PendingException)
+    });
+
+    match called {
+        Some(Ok(Some(value))) => {
+            if !result.is_null() {
+                // SAFETY: the caller passed a writable slot for one pointer.
+                unsafe { result.write(value) };
+            }
+            status(env, NapiStatus::Ok)
+        }
+        Some(Ok(None)) => status(env, NapiStatus::GenericFailure),
+        Some(Err(code)) => status(env, code),
+        None => status(env, NapiStatus::PendingException),
+    }
+}
 
 #[cfg(test)]
 mod tests {

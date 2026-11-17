@@ -728,6 +728,77 @@ pub(crate) fn c_string(value: *const c_char) -> String {
         .into_owned()
 }
 
+/// One `napi_async_init` registration.
+///
+/// Node's `v8impl::AsyncContext` is an async id pair plus the resource it rooted
+/// so `EmitAsyncInit` can name it. Only the pair is kept here: `emit_async_init`
+/// is called once, at creation, and the resource's job after that is only to be
+/// the `executionAsyncResource()` of callbacks made through this context — which
+/// `ScopeArgs::resource` supplies per call rather than rooting a second time.
+pub struct AsyncContextState {
+    pub(crate) async_id: f64,
+    pub(crate) trigger_async_id: f64,
+    /// The resource the addon handed to `napi_async_init`, rooted.
+    ///
+    /// Node's `AsyncContext` roots this and returns it as `resource()` so
+    /// `MakeCallback` can hand it to `InternalMakeCallback`, which is what makes
+    /// `executionAsyncResource()` inside the callback the addon's own object.
+    /// Without it the scope has no resource and callbacks see `undefined`.
+    pub(crate) resource: Option<v8::Global<v8::Object>>,
+}
+
+/// Creates an async context, as `napi_async_init` does.
+///
+/// Node's constructor is `new_async_id()`, the default trigger id, and an
+/// `EmitAsyncInit` — and its destructor is `EmitDestroy`, which is why
+/// [`destroy_async_context`] queues one rather than merely freeing.
+pub fn create_async_context(
+    scope: &mut v8::PinScope<'_, '_>,
+    resource: Option<v8::Local<v8::Object>>,
+    resource_name: &str,
+) -> *mut AsyncContextState {
+    let async_id = rn_bind_async_wrap::next_async_id();
+    let trigger_async_id = rn_bind_async_wrap::default_trigger_async_id();
+    if let Some(resource) = resource {
+        // The type the `init` hook sees is the `async_resource_name` the addon
+        // passed to `napi_async_init`, not a provider id — Node's `AsyncContext`
+        // hands that string straight to `EmitAsyncInit`. An addon reporting
+        // `'test_async'` is therefore matched by a hook filtering on that string,
+        // and passing `PROVIDER_NONE` here made every such hook miss.
+        rn_bind_async_wrap::emit_async_init_named(
+            scope,
+            resource,
+            resource_name,
+            async_id,
+            trigger_async_id,
+        );
+    }
+    Box::into_raw(Box::new(AsyncContextState {
+        async_id,
+        trigger_async_id,
+        // Rooted for the context's lifetime: `napi_make_callback` re-reads it on
+        // every call, which is how Node's `resource()` works.
+        resource: resource.map(|object| v8::Global::new(scope, object)),
+    }))
+}
+
+/// Destroys an async context, queuing its `destroy` hook.
+///
+/// # Safety
+///
+/// `context` must be one [`create_async_context`] produced and must not have been
+/// destroyed already.
+pub unsafe fn destroy_async_context(context: *mut AsyncContextState) {
+    if context.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes a pointer `create_async_context` boxed.
+    let boxed = unsafe { Box::from_raw(context) };
+    // Node's `~AsyncContext` is `EmitDestroy`. Not a no-op when no `destroy`
+    // hook is registered — `emit_destroy` short-circuits itself in that case.
+    rn_bind_async_wrap::emit_destroy(boxed.async_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

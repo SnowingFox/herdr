@@ -192,6 +192,17 @@ pub struct NapiAsyncCleanupHookHandle {
     _private: [u8; 0],
 }
 
+/// `typedef struct napi_async_context__* napi_async_context;`
+///
+/// Opaque to the addon. Ours points at an [`crate::env::NapiAsyncContext`],
+/// which holds the async id pair `napi_make_callback` opens its scope with —
+/// Node's `v8impl::AsyncContext` holds the same two, plus the resource it rooted
+/// for `EmitAsyncInit`.
+#[repr(C)]
+pub struct NapiAsyncContext {
+    _private: [u8; 0],
+}
+
 /// `napi_status`, in declaration order.
 ///
 /// The integer values are the ABI: an addon compares against `napi_ok` and
