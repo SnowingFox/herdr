@@ -20,6 +20,7 @@ pub mod function;
 pub mod handle;
 pub mod hook_slot;
 pub mod host_object;
+pub mod isolate_params;
 pub mod native_immediates;
 pub mod per_context;
 pub mod profile;
@@ -40,6 +41,9 @@ pub use function::{
     class, class_with_length, extras_method, method, method_function, method_function_raw,
     named_method, named_method_with_length, named_template, set_class, set_fast_method, set_method,
     set_named_method_with_length,
+};
+pub use isolate_params::{
+    installable_memory, max_old_space_size_percentage_mb, set_isolate_create_params_for_node,
 };
 pub use per_context::{
     per_context_exports, per_isolate_symbols_object, private_symbols_object,

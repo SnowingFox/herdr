@@ -89,6 +89,7 @@
 //! test.
 
 pub mod handle;
+pub mod heap_statistics;
 pub mod parent;
 pub mod registry;
 pub mod run;
@@ -143,7 +144,8 @@ pub fn install_check_phase() {
     // `env->add_refs(1)` on `startThread`.
     rn_bind_timers::add_external_work_predicate(any_keeps_loop_alive);
     // And the phase has to stay armed while an exit is owed, or the report runs
-    // after the loop has already decided it has nothing to do.
+    // after the loop has already decided it has nothing to do. A
+    // `getHeapStatistics()` answer is the same kind of owed work.
     rn_bind_timers::add_check_phase_pending_predicate(has_finished);
 }
 pub use crate::run::WorkerThread;
@@ -585,6 +587,73 @@ pub fn is_stopping() -> bool {
 /// Drops the published flag, so a reused thread starts clean.
 pub fn clear_stopping() {
     STOP_FLAG.with(|slot| *slot.borrow_mut() = None);
+}
+
+thread_local! {
+    /// What the near-heap-limit callback needs, recorded when the isolate is
+    /// created.
+    ///
+    /// The callback is an `extern "C"` function V8 calls on the worker's own
+    /// thread with only a data pointer, and a `Box`ed context would have to
+    /// outlive the isolate to be safe there. The thread-local avoids that: the
+    /// thread *is* the isolate's lifetime, so the entry exists exactly as long as
+    /// the callback can be invoked.
+    static OOM_STATE: std::cell::RefCell<Option<OutOfMemoryState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The two things `Worker::Exit` needs from the near-heap-limit callback.
+struct OutOfMemoryState {
+    /// Used for `env->Stop()`, which is `terminate_execution` here: it makes the
+    /// allocation that tripped the limit fail at the next safepoint instead of
+    /// running on into the allowance the callback just granted.
+    isolate: v8::IsolateHandle,
+    /// `custom_error_`, which the parent turns into the `error` event.
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Records what the near-heap-limit callback needs, for this worker's thread.
+///
+/// Called by the worker thread before its realm starts, because V8 may invoke
+/// the callback during any allocation after the isolate exists.
+pub fn publish_stop_handle(
+    isolate: v8::IsolateHandle,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    OOM_STATE.with(|slot| *slot.borrow_mut() = Some(OutOfMemoryState { isolate, flag }));
+}
+
+/// `Worker::Exit(kGenericUserError, "ERR_WORKER_OUT_OF_MEMORY", ...)`.
+///
+/// Both halves of Node's `Exit` that matter here: the recorded error, which the
+/// parent raises, and `Stop(env)`, which is `terminate_execution`. Setting the
+/// flag without stopping would leave the allocation running until V8 aborted the
+/// process; stopping without the flag would make the parent report a bare exit
+/// code for a worker the test expects to fail with an `error` event.
+pub fn record_out_of_memory() {
+    OOM_STATE.with(|slot| {
+        let slot = slot.borrow();
+        let Some(state) = slot.as_ref() else {
+            return;
+        };
+        state.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Marks this realm as stopping too, so the fatal handler reports
+        // "handled" rather than serializing the termination as an error.
+        crate::mark_stopping();
+        state.isolate.terminate_execution();
+    });
+}
+
+/// Marks this worker's realm as stopping without needing the parent's flag.
+///
+/// `is_stopping` reads [`STOP_FLAG`], which the parent publishes; this is the
+/// worker's own verdict, from the only place it can produce one.
+fn mark_stopping() {
+    STOP_FLAG.with(|slot| {
+        if let Some(flag) = slot.borrow().as_ref() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
 }
 
 /// Records the exit code a worker's `process.exit()` asked for.

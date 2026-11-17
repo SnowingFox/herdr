@@ -139,7 +139,108 @@ pub struct WorkerHandle {
     /// place it exists. Weak so a worker that the script dropped can still be
     /// collected once its thread is done.
     object: RefCell<Option<v8::Weak<v8::Object>>>,
+    /// Whether the worker ran out of heap, which is `Worker::Exit`'s
+    /// `custom_error_`.
+    ///
+    /// An atomic rather than the two strings Node stores, because the only
+    /// custom error rustnode can produce is `ERR_WORKER_OUT_OF_MEMORY` with its
+    /// one fixed reason — that is the only place `Worker::Exit` is called with a
+    /// non-null `error_code`, and every other exit passes `nullptr`. The flag is
+    /// set on the worker's thread by the near-heap-limit callback and read on the
+    /// parent's once the thread has finished, which is what the release/acquire
+    /// pair on `finished` orders.
+    out_of_memory: Arc<AtomicBool>,
+    /// The taker objects waiting for this worker's heap statistics.
+    ///
+    /// `Worker::GetHeapStatistics` creates a `WorkerHeapStatisticsTaker` on the
+    /// parent's isolate, asks the worker's thread for a snapshot through
+    /// `RequestInterrupt`, and calls `taker.ondone(stats)` from the parent's loop
+    /// once it arrives. The taker belongs to the *parent* isolate, so it cannot
+    /// be touched by the worker's thread — only the numbers cross.
+    pending_heap_statistics: RefCell<Vec<PendingHeapStatistics>>,
+    /// The interrupt payloads whose raw pointers the worker's thread can still
+    /// read.
+    ///
+    /// Boxed on purpose: [`crate::heap_statistics::request`] hands V8 a pointer
+    /// into the allocation, and an interrupt V8 has already queued holds that
+    /// address. A `Vec<InterruptData>` would move its elements when the vector
+    /// grows, so the second `getHeapStatistics()` call would leave the first
+    /// call's pointer dangling.
+    #[allow(
+        clippy::vec_box,
+        reason = "the box is the stable address the V8 interrupt callback holds, \
+                  not an indirection the vector already provides"
+    )]
+    interrupt_data: RefCell<Vec<Box<crate::heap_statistics::InterruptData>>>,
+    /// The parent's wake token, so the statistics interrupt can wake this loop.
+    parent_wake: Cell<Option<rn_uv::wake::ThreadToken>>,
 }
+
+/// One `worker.getHeapStatistics()` call waiting for its numbers.
+pub struct PendingHeapStatistics {
+    /// The object `lib/internal/worker.js` reads `ondone` off.
+    taker: v8::Global<v8::Object>,
+    /// Where the worker's thread writes the snapshot.
+    ///
+    /// `Mutex` because the write happens on the worker's thread and the read on
+    /// the parent's; `None` means the interrupt has not run yet.
+    result: Arc<Mutex<Option<[f64; HEAP_STATISTIC_FIELDS]>>>,
+}
+
+impl PendingHeapStatistics {
+    /// Queues one call.
+    pub(crate) fn new(
+        taker: v8::Global<v8::Object>,
+        result: Arc<Mutex<Option<[f64; HEAP_STATISTIC_FIELDS]>>>,
+    ) -> Self {
+        Self { taker, result }
+    }
+
+    /// The taker object, as a handle in this isolate.
+    pub(crate) fn taker<'s>(
+        &self,
+        scope: &v8::PinScope<'s, '_>,
+    ) -> Option<v8::Local<'s, v8::Object>> {
+        Some(v8::Local::new(scope, &self.taker))
+    }
+
+    /// The numbers, once the worker's thread has reported them.
+    pub(crate) fn values(&self) -> Option<[f64; HEAP_STATISTIC_FIELDS]> {
+        *self.result.lock().ok()?
+    }
+
+    /// Whether the worker's thread has answered yet.
+    pub(crate) fn ready(&self) -> bool {
+        self.result.lock().is_ok_and(|slot| slot.is_some())
+    }
+}
+
+/// How many numbers `Worker::GetHeapStatistics` reports.
+///
+/// The fifteen `Number::New` values `src/node_worker.cc:1251-1265` puts in the
+/// dictionary, in that order.
+pub const HEAP_STATISTIC_FIELDS: usize = 15;
+
+/// The field names the same function builds its dictionary from, in order.
+///
+/// `heap_stats_names` at `src/node_worker.cc:1229-1245`.
+pub const HEAP_STATISTIC_NAMES: [&str; HEAP_STATISTIC_FIELDS] = [
+    "total_heap_size",
+    "total_heap_size_executable",
+    "total_physical_size",
+    "total_available_size",
+    "used_heap_size",
+    "heap_size_limit",
+    "malloced_memory",
+    "peak_malloced_memory",
+    "does_zap_garbage",
+    "number_of_native_contexts",
+    "number_of_detached_contexts",
+    "total_global_handles_size",
+    "used_global_handles_size",
+    "external_memory",
+    "total_allocated_bytes",
+];
 
 impl WorkerHandle {
     /// Builds the parent side of a worker that has not started yet.
@@ -161,6 +262,10 @@ impl WorkerHandle {
             has_ref: Cell::new(true),
             reported: Cell::new(false),
             object: RefCell::new(None),
+            out_of_memory: Arc::new(AtomicBool::new(false)),
+            pending_heap_statistics: RefCell::new(Vec::new()),
+            interrupt_data: RefCell::new(Vec::new()),
+            parent_wake: Cell::new(None),
         }
     }
 
@@ -268,6 +373,35 @@ impl WorkerHandle {
         self.exit_code.load(Ordering::SeqCst)
     }
 
+    /// The custom error Node's `Worker::Exit` recorded, as `onexit`'s second and
+    /// third arguments.
+    ///
+    /// `src/node_worker.cc:496-505` passes `custom_error_` and
+    /// `custom_error_str_` as `Null` when they were never set, and `kOnExit` in
+    /// `lib/internal/worker.js` tests the first for truthiness before raising
+    /// `new errorCodes[customErr](customErrReason)`. `ERR_WORKER_OUT_OF_MEMORY`
+    /// is the only one this runtime can produce, so the pair is fixed.
+    #[must_use]
+    pub fn custom_error<'s>(
+        &self,
+        scope: &v8::PinScope<'s, '_>,
+    ) -> (
+        Option<v8::Local<'s, v8::Value>>,
+        Option<v8::Local<'s, v8::Value>>,
+    ) {
+        if !self.out_of_memory.load(Ordering::SeqCst) {
+            return (None, None);
+        }
+        let code = v8::String::new(scope, "ERR_WORKER_OUT_OF_MEMORY");
+        let reason = v8::String::new(scope, "JS heap out of memory");
+        (code.map(Into::into), reason.map(Into::into))
+    }
+
+    /// Records that this worker ran out of heap, the way `Worker::Exit` does.
+    pub fn set_out_of_memory(&self) {
+        self.out_of_memory.store(true, Ordering::SeqCst);
+    }
+
     /// Asks the worker's isolate to stop executing.
     ///
     /// This is `Worker::Exit` reaching `env->Stop()`: `terminate_execution` is
@@ -346,6 +480,76 @@ impl WorkerHandle {
     /// The finished flag, for the worker thread to set on its way out.
     pub(crate) fn finished_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.finished)
+    }
+
+    /// The out-of-memory flag, for the worker thread's near-heap-limit callback.
+    pub(crate) fn out_of_memory_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.out_of_memory)
+    }
+
+    /// Queues one `getHeapStatistics()` delivery.
+    pub(crate) fn queue_heap_statistics(&self, pending: PendingHeapStatistics) {
+        self.pending_heap_statistics.borrow_mut().push(pending);
+    }
+
+    /// Whether a `getHeapStatistics()` call is waiting for numbers that have
+    /// arrived, so the check phase has work to do.
+    ///
+    /// A call whose numbers have *not* arrived keeps the loop alive but is not
+    /// work: the worker's thread will wake the parent when it answers.
+    #[must_use]
+    pub fn has_deliverable_heap_statistics(&self) -> bool {
+        self.pending_heap_statistics
+            .borrow()
+            .iter()
+            .any(PendingHeapStatistics::ready)
+    }
+
+    /// Whether any `getHeapStatistics()` call is outstanding, answered or not.
+    ///
+    /// This is the ref Node's `WorkerHeapStatisticsTaker` takes: the promise
+    /// `lib/internal/worker.js` returned cannot settle while the parent's loop
+    /// exits, so the loop has to stay alive for it.
+    #[must_use]
+    pub fn has_pending_heap_statistics(&self) -> bool {
+        !self.pending_heap_statistics.borrow().is_empty()
+    }
+
+    /// Takes the calls whose numbers have arrived, leaving the rest queued.
+    pub(crate) fn take_ready_heap_statistics(&self) -> Vec<PendingHeapStatistics> {
+        let mut pending = self.pending_heap_statistics.borrow_mut();
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(PendingHeapStatistics::ready);
+        *pending = waiting;
+        ready
+    }
+
+    /// Keeps one interrupt's data alive for the life of the worker.
+    ///
+    /// The worker's thread reads it through a raw pointer, so freeing it when the
+    /// call is delivered would race an interrupt V8 had already queued. Holding
+    /// it until the handle is dropped — which happens after the isolate is
+    /// disposed — makes the pointer valid for every interrupt that can run.
+    pub(crate) fn retain_interrupt_data(&self, data: Box<crate::heap_statistics::InterruptData>) {
+        self.interrupt_data.borrow_mut().push(data);
+    }
+
+    /// The isolate handle, once the worker's thread has created one.
+    #[must_use]
+    pub(crate) fn isolate_handle(&self) -> Option<v8::IsolateHandle> {
+        self.isolate.lock().ok()?.clone()
+    }
+
+    /// The parent's wake token, so the worker's thread can wake this loop.
+    #[must_use]
+    pub(crate) fn parent_wake(&self) -> Option<rn_uv::wake::ThreadToken> {
+        self.parent_wake.get()
+    }
+
+    /// Records the parent's wake token for the statistics interrupt.
+    pub(crate) fn set_parent_wake(&self, token: Option<rn_uv::wake::ThreadToken>) {
+        self.parent_wake.set(token);
     }
 
     /// Starts the worker thread with `run` as its body.

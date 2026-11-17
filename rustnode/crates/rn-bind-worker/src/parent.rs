@@ -80,9 +80,10 @@ pub fn unregister(handle: &Rc<RefCell<WorkerHandle>>) {
 pub fn any_keeps_loop_alive() -> bool {
     WORKERS.with(|workers| {
         let workers = workers.borrow();
-        workers
-            .iter()
-            .any(|worker| worker.borrow().keeps_loop_alive())
+        workers.iter().any(|worker| {
+            let handle = worker.borrow();
+            handle.keeps_loop_alive() || handle.has_pending_heap_statistics()
+        })
     })
 }
 
@@ -107,8 +108,27 @@ pub fn has_finished() -> bool {
         let workers = workers.borrow();
         workers.iter().any(|worker| {
             let handle = worker.borrow();
-            handle.exited() && !handle.reported()
+            // A `getHeapStatistics()` answer that has arrived also needs this
+            // pass to run, and a call still in flight needs the loop to stay
+            // alive (`keeps_loop_alive` below) but is not work.
+            (handle.exited() && !handle.reported()) || handle.has_deliverable_heap_statistics()
         })
+    })
+}
+
+/// Whether any worker still owes the parent an answer it can deliver, or a
+/// statement that it cannot.
+///
+/// A `getHeapStatistics()` call that has not been answered keeps the parent's
+/// loop alive: `lib/internal/worker.js` returned a promise for it, and letting
+/// the loop exit would leave that promise unsettled.
+#[must_use]
+pub fn has_pending_heap_statistics() -> bool {
+    WORKERS.with(|workers| {
+        workers
+            .borrow()
+            .iter()
+            .any(|worker| worker.borrow().has_pending_heap_statistics())
     })
 }
 
@@ -116,6 +136,10 @@ pub fn has_finished() -> bool {
 ///
 /// Returns whether any `onexit` callback ran, which the loop uses to decide
 /// whether it did work this turn.
+///
+/// `getHeapStatistics()` answers are delivered by the same pass, because they
+/// arrive through the same wake and have the same timing requirement — the answer
+/// is read by JavaScript that is already waiting on a promise.
 ///
 /// The handle is joined here — after the thread has already set its finished
 /// flag, so the join returns at once — because this is the point where the
@@ -130,12 +154,27 @@ pub fn report_finished(scope: &mut v8::PinScope<'_, '_>) -> bool {
 
     let mut reported = false;
     for worker in workers {
-        let (callback, code) = {
+        // `getHeapStatistics()` answers first: the promise they settle was
+        // created before the worker could exit, and Node delivers them through a
+        // separate immediate with no ordering guarantee against `onexit`.
+        for pending in worker.borrow().take_ready_heap_statistics() {
+            if crate::heap_statistics::deliver(scope, &pending) {
+                reported = true;
+            }
+        }
+        let (callback, code, custom_error) = {
             let handle = worker.borrow();
             if !handle.exited() || handle.reported() {
                 continue;
             }
-            (handle.onexit(scope), handle.exit_code())
+            let custom_error = {
+                let (code, reason) = handle.custom_error(scope);
+                match (code, reason) {
+                    (Some(code), Some(reason)) => Some((code, reason)),
+                    _ => None,
+                }
+            };
+            (handle.onexit(scope), handle.exit_code(), custom_error)
         };
         {
             // `claim_report` is what makes this happen exactly once, even though
@@ -150,10 +189,24 @@ pub fn report_finished(scope: &mut v8::PinScope<'_, '_>) -> bool {
         // `exit` and clears the handle. `lib/internal/worker.js` assigns it
         // between `new WorkerImpl` and `startThread`, so it exists by the time a
         // thread can finish.
+        //
+        // The second and third arguments are the custom error Node's
+        // `Worker::Exit` records — `custom_error_` and `custom_error_str_`,
+        // which `src/node_worker.cc:496-505` passes as `null` when unset. They
+        // are what turns a worker that ran out of heap into an `error` event
+        // carrying `ERR_WORKER_OUT_OF_MEMORY` instead of a bare exit code.
+        let (custom_error, custom_error_reason) = match custom_error {
+            Some((code, reason)) => (Some(code), Some(reason)),
+            None => (None, None),
+        };
         if let Some(callback) = callback {
             let code = v8::Integer::new(scope, code);
             let null = v8::null(scope);
-            let arguments = [code.into(), null.into(), null.into()];
+            let arguments = [
+                code.into(),
+                custom_error.unwrap_or_else(|| null.into()),
+                custom_error_reason.unwrap_or_else(|| null.into()),
+            ];
             // A throw inside a worker's `'exit'` listener is uncaught: the event
             // is reported from the check phase, where nothing above it can handle
             // one. `onexit` runs through `MakeCallback` in Node, so a throw goes

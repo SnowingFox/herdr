@@ -39,6 +39,7 @@ pub mod callback;
 pub mod handle;
 pub mod ledger;
 pub mod listener;
+pub mod memory;
 pub mod poller;
 pub mod process_title;
 pub mod stream;

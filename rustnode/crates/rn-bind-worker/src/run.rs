@@ -74,6 +74,9 @@ pub struct WorkerThread {
     /// the parent's `uv_async_t`, or the parent only notices at whatever
     /// unrelated timer happens to fire next.
     pub parent_wake: Option<rn_uv::wake::ThreadToken>,
+    /// Set by the near-heap-limit callback, so the parent raises
+    /// `ERR_WORKER_OUT_OF_MEMORY` for this worker.
+    pub out_of_memory: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WorkerThread {
@@ -102,7 +105,22 @@ impl WorkerThread {
 
     fn run_inner(&self) -> i32 {
         // ---- 1. the isolate -------------------------------------------------
-        let mut params = v8::CreateParams::default();
+        // `WorkerThreadData` calls `SetIsolateCreateParamsForNode` and then
+        // `UpdateResourceConstraints` (`src/node_worker.cc:180-182`), in that
+        // order and for a reason: the machine's memory configures only the
+        // limits `resourceLimits` did not name, so a worker asking for
+        // `maxOldGenerationSizeMb: 16` keeps 16 MB of old generation while its
+        // young generation still comes from the machine.
+        //
+        // Leaving the first call out is what made
+        // `test-worker-resource-limits` abort: the 16 MB old generation was
+        // honoured against V8's browser semi-space, and the heap floor that
+        // leaves is above what the test allocates.
+        let mut params = rn_core::set_isolate_create_params_for_node(
+            v8::CreateParams::default(),
+            rn_uv::memory::constrained_memory(),
+            rn_uv::memory::total_memory(),
+        );
         let [young, old, code_range, _stack] = self.request.resource_limits;
         if young > 0.0 {
             params = params.set_max_young_generation_size_in_bytes(mb(young));
@@ -144,9 +162,31 @@ impl WorkerThread {
         // "The inspector is not available: no isolate was recorded".
         rn_bind_inspector::set_isolate(&mut isolate);
 
+        // `Worker::NearHeapLimit` (`src/node_worker.cc:272`). Without it a heap
+        // overflow inside a worker ends in V8's own `Fatal JavaScript out of
+        // memory` abort, which takes the *process* down: `test-worker-resource-
+        // limits` allocates past a 16 MB old generation on purpose and expects
+        // the worker to fail with `ERR_WORKER_OUT_OF_MEMORY` while the parent
+        // survives and joins it.
+        //
+        // The callback raises the limit by 16 MB so the collection already in
+        // progress can finish, records the error the parent will raise, and
+        // stops the worker the way `Worker::Exit` does — which is what makes the
+        // terminate land at the next safepoint instead of letting the allocation
+        // continue into the allowance it just granted.
+        isolate.add_near_heap_limit_callback(near_heap_limit, std::ptr::null_mut());
+
         if let Ok(mut slot) = self.isolate.lock() {
             *slot = Some(isolate.thread_safe_handle());
         }
+        // The same handle, for the near-heap-limit callback: it runs on this
+        // thread with only a data pointer, and the terminate `Worker::Exit`
+        // performs has to be reachable from there. Published *before* the
+        // callback can fire, which is why this comes before the realm starts.
+        crate::publish_stop_handle(
+            isolate.thread_safe_handle(),
+            Arc::clone(&self.out_of_memory),
+        );
 
         let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
         let scope = &mut scope.init();
@@ -389,6 +429,32 @@ fn exec_path() -> String {
 fn mb(value: f64) -> usize {
     const MB: f64 = 1024.0 * 1024.0;
     (value * MB) as usize
+}
+
+/// `Worker::NearHeapLimit` (`src/node_worker.cc:272`).
+///
+/// V8 calls this when the old generation has reached its limit. Node's answer
+/// is to grant 16 MB so the collection in progress can finish, remember the
+/// error the parent should raise, and stop the worker; the allocation that
+/// tripped the limit then fails against a heap that is closing rather than
+/// aborting the process through `FatalProcessOutOfMemory`.
+///
+/// # Safety
+///
+/// Called by V8 on the worker's own thread with the `data` this was registered
+/// with, which is null: the state it needs is the thread-local realm record, and
+/// a pointer would have to outlive the isolate.
+unsafe extern "C" fn near_heap_limit(
+    _data: *mut std::ffi::c_void,
+    current_heap_limit: usize,
+    _initial_heap_limit: usize,
+) -> usize {
+    const EXTRA_HEAP_ALLOWANCE: usize = 16 * 1024 * 1024;
+    // `Worker::Exit(kGenericUserError, "ERR_WORKER_OUT_OF_MEMORY",
+    // "JS heap out of memory")`. The exit code and the two strings are what
+    // `kOnExit` in `lib/internal/worker.js` turns into the `error` event.
+    crate::record_out_of_memory();
+    current_heap_limit + EXTRA_HEAP_ALLOWANCE
 }
 
 /// Releases everything this thread created, in the order libuv requires.

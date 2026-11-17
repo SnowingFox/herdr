@@ -63,6 +63,13 @@ fn main() {
                 eprintln!("{}: {message}", args::program_name());
                 terminate(9);
             }
+            // `CheckOptions` errors are printed by the same loop as the
+            // environment's, because Node's error vector does not record which
+            // source produced one.
+            args::ParseError::OptionValue(message) => {
+                eprintln!("{}: {message}", args::program_name());
+                terminate(9);
+            }
         },
     };
     // A flag whose feature has not landed must not pass silently, or a test
@@ -190,9 +197,19 @@ fn main() {
     // created without one cannot report live backing-store bytes at all. See
     // `rn_core::array_buffer_allocator` for why this is per isolate rather than
     // process-wide.
-    let mut isolate = v8::Isolate::new(rn_core::with_counted_array_buffer_allocator(
-        Default::default(),
-    ));
+    //
+    // The constraints are `SetIsolateCreateParamsForNode`
+    // (`src/api/environment.cc:210`), which is what makes this isolate's heap
+    // sized from the machine rather than from V8's browser default of 1.4 GB.
+    // Without it `v8.getHeapStatistics().heap_size_limit` reports 1496 MB on a
+    // 47 GB box where Node reports 4192 MB, and the 32 MB semi-space
+    // `ConfigureDefaults` picks is what stops startup from scavenging.
+    let params = rn_core::set_isolate_create_params_for_node(
+        v8::CreateParams::default(),
+        rn_uv::memory::constrained_memory(),
+        rn_uv::memory::total_memory(),
+    );
+    let mut isolate = v8::Isolate::new(rn_core::with_counted_array_buffer_allocator(params));
     rn_core::profile::mark("Isolate::new");
     // `import.meta` and `import()` are dispatched by V8 through isolate-level
     // handlers rather than `internalBinding()`, so they are installed here,

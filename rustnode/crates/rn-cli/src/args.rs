@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 
 /// Why the process may not start.
 ///
-/// The two sources print differently, and the difference is Node's, not
+/// The three sources print differently, and the difference is Node's, not
 /// cosmetic:
 ///
 /// * a bad command-line flag is `rustnode: <message>` (Node prints
@@ -29,15 +29,24 @@ use std::collections::BTreeSet;
 ///   `StartInternal` prints every collected error as
 ///   `"%s: %s\n", result->args().at(0), error` and the message is Node's own
 ///   text. The program name is `argv[0]` verbatim, which is what makes the
-///   output byte-identical rather than merely similar.
+///   output byte-identical rather than merely similar;
+/// * a rejected option *value* — the errors `CheckOptions` records after the
+///   walk, such as a percentage out of range — is printed by that same loop, so
+///   it uses `<program>: <message>` too.
 ///
-/// Both exit 9 (`ExitCode::kInvalidCommandLineArgument`).
+/// All three exit 9 (`ExitCode::kInvalidCommandLineArgument`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     /// A rejected command-line flag.
     Cli(String),
     /// A rejected `NODE_OPTIONS` value, already in Node's wording.
     NodeOptions(String),
+    /// A rejected option value, already in Node's wording.
+    ///
+    /// Separate from [`ParseError::NodeOptions`] only so the call sites say
+    /// which source produced it; both print the same way, because Node's error
+    /// vector does not record a source.
+    OptionValue(String),
 }
 
 /// What the command line asked for.
@@ -123,6 +132,16 @@ pub struct Options {
     /// endpoint is enabled, which is what makes `--inspect-port` observable
     /// without a socket.
     pub debug_port: InspectRequest,
+    /// `--max-old-space-size-percentage`, as the user typed it.
+    ///
+    /// Kept as the raw string rather than the computed size because it is
+    /// converted at the very end of parsing, the way
+    /// `PerIsolateOptions::HandleMaxOldSpaceSizePercentage` runs from
+    /// `CheckOptions`: the *last* source to set it wins, and only that value is
+    /// converted. The conversion needs the machine's memory, so it also cannot
+    /// happen during the walk in a way that would be comparable across
+    /// processes.
+    pub max_old_space_size_percentage: Option<String>,
 }
 
 impl Options {
@@ -147,6 +166,7 @@ impl Options {
             inspect_enabled: false,
             inspect_wait: false,
             debug_port: InspectRequest::default_endpoint(),
+            max_old_space_size_percentage: None,
         }
     }
 
@@ -606,6 +626,26 @@ pub fn parse_with_env(
             }
             apply_abort(argument, &mut options);
         }
+        // `--max-old-space-size-percentage` is a per-isolate option, and
+        // `PerIsolateOptions::CheckOptions` runs at the end of *each* source's
+        // parse (`src/node_options-inl.h:556`). An environment value out of
+        // range is therefore rejected even when the command line replaces it:
+        // the oracle refuses `NODE_OPTIONS=--max-old-space-size-percentage=0`
+        // together with a command-line `=50`. Only the last value in the
+        // variable is converted, because `HandleMaxOldSpaceSizePercentage`
+        // reads the field the walk left behind.
+        //
+        // The value is already in `env_store` with the walk's `requires an
+        // argument` check applied, so this reads it rather than re-walking. Only
+        // the verdict is taken here: the command line's value replaces this one,
+        // and the `--max_old_space_size` argument Node appends comes from
+        // `finish`.
+        let env_percentage = env_store.value_of("--max-old-space-size-percentage");
+        if let Some(rn_bind_options::ParsedValue::Text(value)) = env_percentage {
+            if !value.is_empty() {
+                validate_percentage(&value).map_err(ParseError::NodeOptions)?;
+            }
+        }
         // The variable's V8 flags come first, which is Node's order: the
         // environment is parsed into the same `v8_args` vector before the
         // command line, so a command-line `--max-old-space-size` overrides the
@@ -646,7 +686,7 @@ pub fn parse_with_env(
                 index += 1;
             }
             options.script_args = args[index..].to_vec();
-            return Ok(finish(options, unimplemented));
+            return finish(options, unimplemented);
         }
 
         // `--` ends flag parsing; everything after is the script and its args.
@@ -656,14 +696,14 @@ pub fn parse_with_env(
                 options.source = Source::File(script.clone());
                 options.script_args = args[index + 1..].to_vec();
             }
-            return Ok(finish(options, unimplemented));
+            return finish(options, unimplemented);
         }
 
         // A script path is the first non-flag argument; the rest belong to it.
         if !argument.starts_with('-') {
             options.source = Source::File(argument.clone());
             options.script_args = args[index + 1..].to_vec();
-            return Ok(finish(options, unimplemented));
+            return finish(options, unimplemented);
         }
 
         if UNIMPLEMENTED.contains(&argument.as_str()) {
@@ -720,6 +760,54 @@ pub fn parse_with_env(
         // the failure mode `Options::unimplemented` exists to avoid.
         if ROOT_STORE_FLAGS.contains(&argument.as_str()) {
             options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
+        // `--max-old-space-size-percentage` is a Node option rather than a V8
+        // one: `src/node_options.cc:237` validates it, converts it against the
+        // machine's memory, and hands V8 `--max_old_space_size=<mb>`. It is
+        // parsed here, and not left to the V8 fall-through below, because the
+        // table declares it `kString` so V8 would never see it.
+        //
+        // The value is recorded as typed. The conversion needs the machine's
+        // memory and must happen once, on the value the *last* source set —
+        // `CheckOptions` runs at the end of a source's parse and
+        // `HandleMaxOldSpaceSizePercentage` overwrites `max_old_space_size`,
+        // which is why `--max-old-space-size-percentage=0` followed by `=50` is
+        // accepted. `finish` does that conversion.
+        if let Some(value) = percentage_value(argument) {
+            let Some(value) = value else {
+                // The bare form takes the next argument, and refuses one that
+                // looks like a flag: `--max-old-space-size-percentage -1` is
+                // "requires an argument" in Node, not "-1 is out of range".
+                let Some(next) = args.get(index + 1) else {
+                    return Err(ParseError::OptionValue(
+                        "--max-old-space-size-percentage requires an argument".to_string(),
+                    ));
+                };
+                if next.is_empty() || next.starts_with('-') {
+                    return Err(ParseError::OptionValue(
+                        "--max-old-space-size-percentage requires an argument".to_string(),
+                    ));
+                }
+                options
+                    .exec_argv
+                    .push(format!("--max-old-space-size-percentage={next}"));
+                options.max_old_space_size_percentage = Some(next.clone());
+                index += 2;
+                continue;
+            };
+            // An empty inline value is `Parse`'s `RequiresArgumentErr`, which
+            // names the flag with the `=` the caller typed — and it fires before
+            // `CheckOptions` would have said "greater than 0".
+            if value.is_empty() {
+                return Err(ParseError::OptionValue(
+                    "--max-old-space-size-percentage= requires an argument".to_string(),
+                ));
+            }
+            options.exec_argv.push(argument.clone());
+            options.max_old_space_size_percentage = Some(value);
             index += 1;
             continue;
         }
@@ -826,7 +914,7 @@ pub fn parse_with_env(
         index += 1;
     }
 
-    Ok(finish(options, unimplemented))
+    finish(options, unimplemented)
 }
 
 /// Records one V8 flag for `process.execArgv` and for forwarding.
@@ -841,6 +929,48 @@ pub fn parse_with_env(
 fn record_v8_flag(options: &mut Options, argument: &str) {
     options.exec_argv.push(argument.to_string());
     options.v8_args.push(argument.to_string());
+}
+
+/// Whether `argument` is `--max-old-space-size-percentage`, in either spelling
+/// of the name and either the `=value` or the bare form.
+///
+/// Returns `Some(Some(value))` for the inline form, `Some(None)` for the bare
+/// form (whose value is the next argument), and `None` for anything else.
+/// Underscores after the leading dashes are dashes, exactly as `Parse`
+/// normalizes them, which is what makes `--max_old_space_size_percentage` work.
+fn percentage_value(argument: &str) -> Option<Option<String>> {
+    let (name, value) = match argument.split_once('=') {
+        Some((name, value)) => (name, Some(value.to_string())),
+        None => (argument, None),
+    };
+    if !argument.starts_with("--") {
+        return None;
+    }
+    let normalized = format!("--{}", name[2..].replace('_', "-"));
+    if normalized != "--max-old-space-size-percentage" {
+        return None;
+    }
+    Some(value)
+}
+
+/// Converts one `--max-old-space-size-percentage` value the way Node does.
+///
+/// Returns the `--max_old_space_size=<mb>` argument Node appends to its V8
+/// argument vector (`src/node.cc:784-789`), or Node's rejection message.
+///
+/// That append is what gives the percentage *precedence* over
+/// `--max-old-space-size`, and precedence over the flag's position: Node
+/// appends after the whole walk, so
+/// `--max-old-space-size-percentage=50 --max-old-space-size=1000` still answers
+/// 23677 MB on the oracle. V8 lets the last `max_old_space_size` win
+/// (`heap.cc:5004`), which is why the appended argument is the decisive one.
+fn validate_percentage(value: &str) -> Result<String, String> {
+    let mb = rn_core::max_old_space_size_percentage_mb(
+        value,
+        rn_uv::memory::constrained_memory(),
+        rn_uv::memory::total_memory(),
+    )?;
+    Ok(format!("--max_old_space_size={mb}"))
 }
 
 /// Whether `argument` is `--inspect`, `--inspect-port`, `--inspect-brk`,
@@ -928,8 +1058,22 @@ fn apply_abort(argument: &str, options: &mut Options) {
     }
 }
 
-fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
+/// The final pass Node runs after the command-line walk: `CheckOptions`.
+///
+/// Returns a [`ParseError::OptionValue`] for a value the walk accepted but
+/// `CheckOptions` rejects. Every value checked here is one whose check must run
+/// on the *final* value of its source, which is why it cannot happen earlier in
+/// the walk.
+fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Result<Options, ParseError> {
     options.unimplemented = unimplemented.into_iter().collect();
+    // `PerIsolateOptions::CheckOptions` converts the percentage before V8 ever
+    // sees a flag, and appends its answer as `--max_old_space_size=<mb>`. That
+    // append is what gives the percentage precedence over an explicit
+    // `--max-old-space-size` regardless of where the two appeared.
+    if let Some(value) = options.max_old_space_size_percentage.take() {
+        let argument = validate_percentage(&value).map_err(ParseError::OptionValue)?;
+        options.v8_args.push(argument);
+    }
     // The options binding's own parser, fed the flags this CLI accepted. It is
     // a second pass over the same argv by design: this parser decides *what
     // rustnode does*, and `rn-bind-options` decides *what Node's option layer
@@ -993,7 +1137,7 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Options {
         current_dir(),
         config,
     ));
-    options
+    Ok(options)
 }
 
 /// Whether `--permission` was given without `--allow-addons` and without audit
@@ -1048,7 +1192,9 @@ mod tests {
     fn parse_of(args: &[&str]) -> Result<Options, String> {
         let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         parse_with_env(&owned, None).map_err(|error| match error {
-            ParseError::Cli(message) | ParseError::NodeOptions(message) => message,
+            ParseError::Cli(message)
+            | ParseError::NodeOptions(message)
+            | ParseError::OptionValue(message) => message,
         })
     }
 
