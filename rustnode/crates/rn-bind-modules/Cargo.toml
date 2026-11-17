@@ -10,6 +10,18 @@ description = "internalBinding('modules') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+# `NODE_COMPILE_CACHE`, `NODE_COMPILE_CACHE_PORTABLE`,
+# `NODE_COMPILE_CACHE_READONLY` and `NODE_DISABLE_COMPILE_CACHE` are read from
+# the process environment block, and `--allow-env` removes what it does not
+# grant from that same block. Node reads them through `credentials::SafeGetenv`,
+# which consults the permission model separately; going through `rn-env` gets
+# the same answer for the scrub form and one answer for both.
+rn-env = { path = "../rn-env" }
+# `CompileCacheHandler::Enable` asks the permission model before it creates or
+# reads the cache directory, and reports the denial as a failed enable rather
+# than throwing. Two tests assert the exact wording, so the check has to be the
+# same one `fs` uses.
+rn-permission = { path = "../rn-permission" }
 libc.workspace = true
 
 [dev-dependencies]

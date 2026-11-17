@@ -371,13 +371,35 @@ pub fn compile_function_for_cjs_loader<'s>(
     // would make every `require` fail.
     let params = cjs_parameters(scope);
 
+    // The compile cache is consulted before the compile and updated after it,
+    // which is the order `CompileFunctionForCJSLoader` uses. The lookup has to
+    // happen outside the `TryCatch` because a miss reads the disk, and a read
+    // that fails is a miss rather than an exception to report.
+    //
+    // `code_bytes` is the UTF-8 encoding of the source, which is what Node hashes
+    // (`Utf8Value code_utf8(isolate_, code)`) and also what decides a hit: the
+    // loader read the same file into the same string on the previous run.
+    let code_bytes = code.to_rust_string_lossy(scope).into_bytes();
+    let filename_text = filename.to_rust_string_lossy(scope);
+    let lookup = rn_bind_modules::compile_cache::with_cache(|cache| {
+        cache.lookup(
+            &code_bytes,
+            &filename_text,
+            rn_bind_modules::compile_cache::K_COMMONJS,
+        )
+    });
+    let mut cached_bytes = lookup
+        .as_ref()
+        .and_then(|lookup| lookup.cached.as_ref())
+        .map(|bytes| CachedBytes::new(bytes.clone()));
+
     // Everything happens inside one catch. Throwing from *inside* it would be
     // captured by the handler and never reach the caller, so this function returns
     // the decision out of the catch and throws afterwards.
     let outcome = {
         let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
         let catch = &mut try_catch.init();
-        let mut source = build_source(catch, code, filename, 0, 0, None, None);
+        let mut source = build_source(catch, code, filename, 0, 0, None, cached_bytes.as_mut());
         compile_cjs_loader(catch, &mut source, &params, code, should_detect_module)
     };
 
@@ -396,6 +418,22 @@ pub fn compile_function_for_cjs_loader<'s>(
             rv.set(object.into());
         }
         CompileOutcome::Compiled(function, rejected) => {
+            // A failed compile never reaches this point, which is what makes the
+            // entry stay uninitialized and `Persist` report
+            // "skip persisting ... because the cache was not initialized" for a
+            // file V8 refused to parse. Node returns before `MaybeSave` for the
+            // same reason.
+            if let Some(lookup) = lookup {
+                // V8 only serializes what it compiled, so a `None` here means
+                // V8 had nothing to cache and the entry is left as it was.
+                let produced = function.create_code_cache().map(|cached| {
+                    let bytes: &[u8] = &cached;
+                    bytes.to_vec()
+                });
+                rn_bind_modules::compile_cache::with_cache(|cache| {
+                    cache.store_code_cache(lookup.key, produced, rejected)
+                });
+            }
             let object = build_cjs_result(scope, Some(function), false, rejected);
             rv.set(object.into());
         }

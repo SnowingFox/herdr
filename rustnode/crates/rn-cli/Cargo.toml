@@ -53,6 +53,11 @@ rn-bind-task-queue = { path = "../rn-bind-task-queue" }
 # state. Opening it here is what makes top-level `triggerAsyncId()` answer 1.
 rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
+# `NODE_COMPILE_CACHE` is enabled by the CLI before any module compiles and
+# flushed after `exit` has been emitted, which is where Node's
+# `InitializeCompileCache` and its `AtExit` callback sit. The cache itself lives
+# with the `modules` namespace, so the CLI only asks it to start and stop.
+rn-bind-modules = { path = "../rn-bind-modules" }
 # A worker's exit is reported from the parent's check phase, so the CLI wires
 # that hook when it installs the loop.
 rn-bind-worker = { path = "../rn-bind-worker" }
@@ -62,6 +67,9 @@ rn-napi = { path = "../rn-napi" }
 # version string in two places.
 rn-bind-zlib = { path = "../rn-bind-zlib" }
 rn-v8-sys = { path = "../rn-v8-sys" }
+# `NODE_COMPILE_CACHE` is flushed from an `atexit` handler, which is the one hook
+# `process.reallyExit`'s direct `std::process::exit` also reaches.
+libc.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

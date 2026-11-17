@@ -1022,7 +1022,18 @@ pub fn parse_with_env(
             let Some(value) = args.get(index + 1) else {
                 return Err(ParseError::Cli(format!("{argument} requires an argument")));
             };
-            options.exec_argv.push(format!("{argument}={value}"));
+            // A long flag is recorded joined, so `execArgv` has one shape for
+            // `--require=x` and `--require x` alike. A short one must stay two
+            // entries: `-r=x` is a single-dash argument, and both Node's `Parse`
+            // and the alias table here read an `=` only on a two-dash spelling —
+            // so joining it would record an option nothing recognizes and the
+            // preload would be silently dropped.
+            if argument.starts_with("--") {
+                options.exec_argv.push(format!("{argument}={value}"));
+            } else {
+                options.exec_argv.push(argument.clone());
+                options.exec_argv.push(value.clone());
+            }
             index += 2;
             continue;
         }
@@ -1619,6 +1630,18 @@ mod tests {
         // The value is joined into one entry, and the entry point follows it, so
         // `execArgv` reproduces the whole invocation minus the script path.
         assert_eq!(options.exec_argv, ["--require=preload.js", "-e", "1"]);
+        assert!(matches!(options.source, Source::Eval { .. }));
+    }
+
+    #[test]
+    fn a_short_flag_keeps_its_value_as_a_separate_entry() {
+        // `-r=x` is not a spelling Node accepts: an `=` is read only on a
+        // two-dash argument, so joining the pair would record `-r=x`, which the
+        // alias table has no entry for and the preload would never run.
+        // `process.execArgv` under the oracle is `["-r", "/tmp/pre.js", ...]`,
+        // which is the shape this pins.
+        let options = parse_of(&["-r", "/tmp/pre.js", "-e", "1"]).expect("parses");
+        assert_eq!(options.exec_argv, ["-r", "/tmp/pre.js", "-e", "1"]);
         assert!(matches!(options.source, Source::Eval { .. }));
     }
 

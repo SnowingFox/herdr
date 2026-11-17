@@ -343,7 +343,20 @@ fn module_wrap_new<'s>(
     let module = if synthetic {
         create_synthetic(scope, url, args.get(2))
     } else {
-        create_source_text(scope, url, args.get(2), id_symbol)
+        // `ModuleWrap::New` uses `args[5]` as *user* cached data only when it is
+        // an `ArrayBufferView`, which is `vm.SourceTextModule`'s own code cache.
+        // Anything else — including the default loader's symbol — leaves the
+        // on-disk compile cache in charge.
+        let user_cached_data = v8::Local::<v8::ArrayBufferView>::try_from(args.get(5))
+            .ok()
+            .map(|view| view_bytes(&view));
+        create_source_text(
+            scope,
+            url,
+            args.get(2),
+            id_symbol,
+            user_cached_data.as_deref(),
+        )
     };
     let Some(module) = module else {
         if !scope.is_execution_terminating() {
@@ -434,6 +447,7 @@ fn create_source_text<'s>(
     url: v8::Local<'s, v8::Value>,
     source: v8::Local<'s, v8::Value>,
     id_symbol: Option<v8::Local<'s, v8::Symbol>>,
+    user_cached_data: Option<&[u8]>,
 ) -> Option<v8::Local<'s, v8::Module>> {
     let url = v8::Local::<v8::String>::try_from(url).ok()?;
     let source = v8::Local::<v8::String>::try_from(source).ok()?;
@@ -462,13 +476,70 @@ fn create_source_text<'s>(
         true,
         host_defined.map(|options| options.into()),
     );
-    let mut source_text = v8::script_compiler::Source::new(source, Some(&origin));
-    v8::script_compiler::compile_module2(
+    // The compile cache is consulted exactly where `ModuleWrap::CompileSourceText`
+    // does it: only when the caller did not supply its own cached data, which is
+    // the `vm.Module` case. A user-supplied cache wins, and the on-disk store is
+    // not touched — that is what the `has_value()` test in `module_wrap.cc`
+    // means.
+    let filename = url.to_rust_string_lossy(scope);
+    let source_bytes = source.to_rust_string_lossy(scope).into_bytes();
+    let lookup = match user_cached_data {
+        Some(_) => None,
+        None => rn_bind_modules::compile_cache::with_cache(|cache| {
+            cache.lookup(
+                &source_bytes,
+                &filename,
+                rn_bind_modules::compile_cache::K_ESM,
+            )
+        }),
+    };
+    let cached: Option<Vec<u8>> = match user_cached_data {
+        Some(bytes) => Some(bytes.to_vec()),
+        None => lookup
+            .as_ref()
+            .and_then(|lookup| lookup.cached.as_ref())
+            .cloned(),
+    };
+
+    let mut source_text = match &cached {
+        Some(bytes) if !bytes.is_empty() => v8::script_compiler::Source::new_with_cached_data(
+            source,
+            Some(&origin),
+            v8::script_compiler::CachedData::new(bytes),
+        ),
+        _ => v8::script_compiler::Source::new(source, Some(&origin)),
+    };
+    let options = if source_text.get_cached_data().is_some() {
+        v8::script_compiler::CompileOptions::ConsumeCodeCache
+    } else {
+        v8::script_compiler::CompileOptions::NoCompileOptions
+    };
+    let module = v8::script_compiler::compile_module2(
         scope,
         &mut source_text,
-        v8::script_compiler::CompileOptions::NoCompileOptions,
+        options,
         v8::script_compiler::NoCacheReason::BecauseModule,
-    )
+    )?;
+    let rejected = source_text
+        .get_cached_data()
+        .map(|data| data.rejected())
+        .unwrap_or(false);
+    if let Some(lookup) = lookup {
+        // `CreateCodeCache` on the unbound module script is what Node's
+        // `SerializeCodeCache(Local<Module>)` does, and it returns nothing when
+        // V8 has no optimized code to serialize.
+        let produced = module
+            .get_unbound_module_script(scope)
+            .create_code_cache()
+            .map(|cache| {
+                let bytes: &[u8] = &cache;
+                bytes.to_vec()
+            });
+        rn_bind_modules::compile_cache::with_cache(|cache| {
+            cache.store_code_cache(lookup.key, produced, rejected)
+        });
+    }
+    Some(module)
 }
 
 /// `HostDefinedOptions::kLength`, from `src/module_wrap.h`.
@@ -1658,6 +1729,27 @@ fn throw_type_error(scope: &mut v8::PinScope, message: &str) {
         let exception = v8::Exception::type_error(scope, message);
         scope.throw_exception(exception);
     }
+}
+
+/// The bytes of an `ArrayBufferView`, as `vm.SourceTextModule`'s code cache.
+///
+/// Copied rather than borrowed because `CachedData::new` only needs the bytes to
+/// outlive the `Source`, and the `view` here does — but an empty view carries a
+/// dangling data pointer, and an empty cache has to read as "none" rather than
+/// as a cache V8 will reject.
+fn view_bytes(view: &v8::Local<v8::ArrayBufferView>) -> Vec<u8> {
+    let length = view.byte_length();
+    if length == 0 {
+        return Vec::new();
+    }
+    let data = view.data().cast::<u8>();
+    if data.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `view` is a live `ArrayBufferView`, so its backing store holds at
+    // least `byte_length()` readable bytes starting at `data()`, which already
+    // accounts for `byteOffset`.
+    unsafe { std::slice::from_raw_parts(data, length) }.to_vec()
 }
 
 /// Registers the `module_wrap` namespace with the runtime.
