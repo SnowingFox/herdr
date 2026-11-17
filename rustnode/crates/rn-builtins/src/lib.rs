@@ -220,18 +220,20 @@ fn natives_getter(
 
 /// Build configuration a real Node publishes as its `config.gypi` string.
 ///
-/// rustnode does not generate a `config.gypi`, so this reproduces the keys the
-/// JavaScript layer reads rather than shipping a whole gyp file. Note that the
-/// separate native `config` namespace is what `buffer.js` consults for ICU and
-/// inspector support; this string is read by the bootstrap switches.
+/// The fixture is the pinned oracle's `process.config.variables` object. Keeping
+/// it as checked-in JSON means `process.config` and `internalBinding('builtins')`
+/// stay in sync.
 const BUILD_CONFIG: &str = concat!(
-    "{\"variables\":{\"v8_enable_i18n_support\":1,",
-    "\"node_use_openssl\":1,\"node_shared_openssl\":0,",
-    "\"node_use_bundled_ca\":1,\"node_use_dtrace\":0,",
-    "\"node_use_etw\":0,\"node_use_perfetto\":0,",
-    "\"node_shareable_openssl\":0,\"node_enable_v8_vtune_profiling\":0,",
-    "\"node_target_type\":\"executable\"}}"
+    "{\"variables\":",
+    include_str!("build_config_variables.json"),
+    "}"
 );
+
+/// The serialized `config.gypi` payload `internalBinding('builtins').config`
+/// exposes.
+pub fn build_config_json() -> &'static str {
+    BUILD_CONFIG
+}
 
 fn id_array<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
     let ids: Vec<&'static str> = builtin_sources()
