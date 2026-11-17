@@ -26,57 +26,67 @@ than a list of patched-over gaps.
 The npm package version (`0.1.0`) is rustnode's own version. It is deliberately
 **not** the Node version, and the two numbers below are different on purpose.
 
-## `process.version` says `v28.0.0`, and that is a compatibility claim
+## `process.version` names the Node API level, and that is a compatibility claim
 
 ```console
 $ rsnode -e 'console.log(process.version)'
-v28.0.0
+v28.0.0-nightly20261111e8c1160d20
 
 $ rsnode -p 'process.versions.node'
-28.0.0
+28.0.0-nightly20261111e8c1160d20
 ```
 
-`v28.0.0` is **the Node API level this build targets**, not a Node release and
-not the version of this package. It is reported because the vendored `lib/**`
-JavaScript is copied byte-identical from Node 28.0.0 and the native layer
-implements the bindings that JavaScript expects; a version string is how Node
-code branches on the API surface it can use, so reporting anything else would
-make libraries take the wrong branch. `process.versions` lists the other
+`v28.0.0-nightly20261111e8c1160d20` is **the Node API level this build targets**,
+not a Node release and not the version of this package. It is reported because the
+vendored `lib/**` JavaScript is copied byte-identical from Node 28.0.0 and the
+native layer implements the bindings that JavaScript expects; a version string is
+how Node code branches on the API surface it can use, so reporting anything else
+would make libraries take the wrong branch. `process.versions` lists the other
 components the binary actually links, at the versions it actually links them.
+
+The date-and-SHA suffix is part of the identity rather than decoration. Node 28
+has not been released, so the tree this build copies reports itself as a nightly
+of revision `e8c1160d20`, and `src/node_version.h` derives every version string
+in the process from that one release identity. Reporting a shortened `v28.0.0`
+would make `process.version` disagree with `rsnode --version` inside a single
+process, and `--version` has to match the reference binary byte for byte. The
+three-component `28.0.0` still appears where an integer ABI is what is wanted:
+`napi_get_node_version` fills major/minor/patch and carries no suffix.
 
 The `v8` entry is `15.2.124.1-rusty`, which is where the substitution is visible
 without reading anything else.
 
-## `--version`
+## `--version` and `--help`
+
+Both flags work, and both match the runtime they describe rather than being
+intercepted by the npm wrapper:
 
 ```console
 $ rsnode --version
-rustnode: unsupported option '--version'
-$ echo $?
-9
+v28.0.0-nightly20261111e8c1160d20
+
+$ rsnode --help
+Usage: rustnode [options] [ script.js ] [arguments]
+       rustnode inspect [options] [ script.js | host:port ] [arguments]
+...
 ```
 
-**None of the informational flags are implemented yet.** The CLI rejects unknown
-flags rather than ignoring them, so all of these exit 9:
+`--version` prints the same string as `process.version`, which is the identity
+described above: it is the Node API level and the pinned revision, not this
+package's version.
 
-```console
-$ rsnode --version   # rustnode: unsupported option '--version'
-$ rsnode -v          # rustnode: unsupported option '-v'
-$ rsnode --help      # rustnode: unsupported option '--help'
-```
+`--help` is generated from the runtime's own option table, so the text reflects
+the options this build actually has. Its two usage lines name `rustnode` because
+that is what the program is; everything after them is the table.
 
-This package does not intercept `--version` to fake an answer. A second entry
-point reporting a version the runtime itself does not report would be the
-misleading thing this section exists to avoid, and faking `--version` while
-`--help` still failed would make this documentation wrong.
+The wrapper forwards both flags unchanged. It does not answer them itself: a
+second entry point reporting a version the runtime does not would be the
+misleading thing this section exists to avoid. Because both are now real flags,
+`rsnode --version` and `rsnode --help` exit 0 rather than being rejected.
 
-Adding them is a CLI surface change, not a packaging one: it belongs in its own
-change, compared byte-for-byte against the Node behaviour it is imitating.
-
-Three ways to get a version that work today:
+The package version is a separate query:
 
 ```bash
-rsnode -p 'process.version'      # the Node API level, v28.0.0
 npm ls -g @example/rsnode        # this package's version
 rsnode -p 'process.versions'     # every linked component, at its real version
 ```
@@ -113,8 +123,13 @@ exact bytes you run.
 rsnode script.js                 # run a file
 rsnode -e 'console.log(1+1)'     # evaluate
 rsnode -p 'process.platform'     # evaluate and print
+echo 'console.log(1)' | rsnode   # run a script from standard input
 rsnode --expose-internals        # accepted, see below
 ```
+
+A script on standard input is a CommonJS module with `module`, `require` and
+`__filename`, exactly as `node` runs one; `-` names it explicitly and forwards
+the arguments after it (`rsnode - x y`), which `--` does not.
 
 Flags rustnode accepts but does not yet act on are recorded and reported rather
 than silently ignored, and flags it has never heard of are an error — a typo
