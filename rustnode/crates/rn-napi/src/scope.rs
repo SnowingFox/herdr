@@ -30,6 +30,12 @@ thread_local! {
     /// lifetimes that cannot be written down here; [`enter`] is the only writer
     /// and it always stores the address of a live `PinScope`.
     static CURRENT: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
+    /// Address of a long-lived scope opened from a bare libuv callback.
+    ///
+    /// This is separate from `CURRENT`: `CURRENT` is strictly the lexical
+    /// Node-API entry point scope restored by `ScopeGuard`, while this slot
+    /// supports callback code that opened a handle scope explicitly.
+    static DETACHED: Cell<*mut c_void> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 /// Restores [`CURRENT`] when it goes out of scope, including on unwind.
@@ -55,6 +61,37 @@ impl ScopeGuard {
             let pointer = slot.get();
             (!pointer.is_null()).then_some(pointer)
         })
+    }
+}
+
+/// Restores [`DETACHED`] when it is dropped.
+///
+/// `napi_open_handle_scope` from a bare libuv callback installs one of these and
+/// keeps it in the handle-scope stack's detached root; dropping that root clears
+/// the pointer before the backing V8 storage is destroyed.
+pub(crate) struct DetachedScopeGuard {
+    previous: *mut c_void,
+}
+
+impl DetachedScopeGuard {
+    /// Publishes `scope` as the detached scope Node-API shims may use.
+    pub(crate) fn enter<'s>(scope: &mut v8::PinScope<'s, '_>) -> Self {
+        let previous = DETACHED
+            .with(|slot| slot.replace((scope as *mut v8::PinScope<'s, '_>).cast::<c_void>()));
+        Self { previous }
+    }
+
+    fn current() -> Option<*mut c_void> {
+        DETACHED.with(|slot| {
+            let pointer = slot.get();
+            (!pointer.is_null()).then_some(pointer)
+        })
+    }
+}
+
+impl Drop for DetachedScopeGuard {
+    fn drop(&mut self) {
+        DETACHED.with(|slot| slot.set(self.previous));
     }
 }
 
@@ -88,7 +125,7 @@ impl Drop for ScopeGuard {
 pub(crate) unsafe fn with_scope<'s, R>(
     f: impl FnOnce(&mut v8::PinScope<'s, '_>) -> R,
 ) -> Option<R> {
-    let pointer = ScopeGuard::current()?;
+    let pointer = ScopeGuard::current().or_else(DetachedScopeGuard::current)?;
     // SAFETY: the pointer came from `ScopeGuard::enter`, which is alive for as
     // long as this call: a shim runs synchronously inside the entry point that
     // owns the guard. `'s` is the caller's assertion about that frame.

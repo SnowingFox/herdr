@@ -68,6 +68,18 @@ pub fn has_context() -> bool {
     CONTEXT.with(|slot| slot.borrow().is_some())
 }
 
+/// The recorded isolate pointer and rooted context, if any.
+///
+/// `rn-napi` uses this to keep an entered scope alive across several Node-API
+/// calls made from one bare libuv callback (open handle scope, create values,
+/// close handle scope). Cloning the `Global` keeps the context rooted for that
+/// detached lifetime.
+pub fn isolate_and_context() -> Option<(v8::UnsafeRawIsolatePtr, v8::Global<v8::Context>)> {
+    let isolate = ISOLATE.with(|slot| *slot.borrow())?;
+    let context = CONTEXT.with(|slot| slot.borrow().clone())?;
+    Some((isolate, context))
+}
+
 /// Runs `body` inside a scope libuv callbacks can use to touch JavaScript.
 ///
 /// Returns `None` when no binding has installed yet, or when the recorded

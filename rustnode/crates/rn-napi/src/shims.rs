@@ -2338,6 +2338,7 @@ pub unsafe extern "C" fn napi_open_handle_scope(
     // callback's.
     let opened = in_scope(|scope| environment.scopes().open(scope))
         .flatten()
+        .or_else(|| environment.scopes().open_detached())
         .ok_or(NapiStatus::HandleScopeMismatch);
     match opened {
         Ok(handle) => {
@@ -2378,6 +2379,7 @@ pub unsafe extern "C" fn napi_open_escapable_handle_scope(
     };
     let opened = in_scope(|scope| environment.scopes().open_escapable(scope))
         .flatten()
+        .or_else(|| environment.scopes().open_escapable_detached())
         .ok_or(NapiStatus::HandleScopeMismatch);
     match opened {
         Ok(handle) => {
@@ -5796,10 +5798,6 @@ pub const PARTIAL_GAPS: &[(&str, &str)] = &[
     (
         "napi_type_tag_object on a napi_external",
         "Node stores the tag in its own `ExternalWrapper`; this crate's `napi_create_external` is a plain `v8::External`, which has no slot for it. The object form is implemented and matches the oracle; the external form reports `napi_invalid_arg`",
-    ),
-    (
-        "a Node-API call made from a bare libuv callback rather than a napi_callback",
-        "Node's shims read `env->isolate` and open whatever scope they need, so an addon may call `napi_open_handle_scope` from its own `uv_check_start`/`uv_queue_work` completion. Every shim here resolves against the scope the current Node-API entry point published, and a bare libuv callback has none, so those calls report `napi_handle_scope_mismatch` and the addon's `assert(cb() != nullptr)` aborts. Entering `rn_uv::callback::with_context` for the duration of one shim is not enough: the addon keeps the handles it creates across later calls, so the scope has to stay open between them, which means the scope stack has to own an entered context rather than borrow the caller's. Blocks `test_uv_loop` and `test_callback_scope/test-resolve-async`",
     ),
 ];
 
