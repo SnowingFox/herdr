@@ -429,6 +429,7 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
         .get(&stream_id)
         .map(|record| record.reading)
         .unwrap_or(false);
+    let mut consume_now = false;
     {
         let mut streams = session.streams.borrow_mut();
         let Some(record) = streams.get_mut(&stream_id) else {
@@ -453,8 +454,17 @@ pub fn deliver_data(session: &SessionState, stream_id: i32, bytes: &[u8]) {
         // `OnDataChunkReceived`: consume immediately when the owner is reading,
         // otherwise remember the credit for `ReadStart` to hand back. A paused
         // stream that never accounts for the bytes never reopens its window.
-        if !reading {
+        if reading {
+            consume_now = true;
+        } else {
             record.paused_unconsumed += bytes.len();
+        }
+    }
+    if consume_now {
+        if let Some(raw) = crate::session_ptr(session) {
+            // SAFETY: `raw` is the live nghttp2 session and `stream_id` belongs
+            // to this session.
+            let _ = unsafe { crate::ffi::nghttp2_session_consume(raw, stream_id, bytes.len()) };
         }
     }
     // Staged rather than delivered: this runs inside `nghttp2_session_mem_recv`,
