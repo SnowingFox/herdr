@@ -71,12 +71,21 @@ fn rustnode() -> std::path::PathBuf {
     path
 }
 
-/// The probe: everything about these sixteen members two processes can agree on.
+/// The probe: everything about these seventeen members two processes can agree on.
 ///
 /// Every field is either an exact comparable value or an invariant that must hold
 /// on both runtimes. Nothing here is a value that would be equal for the wrong
 /// reason — a constant that happens to match would be caught by the second half of
 /// the test, which requires each invariant to be `true` on rustnode as well.
+///
+/// # Why the semver boundary is measured on a literal, not on `Bun.version`
+///
+/// The two runtimes report different version strings on purpose, so comparing
+/// `Bun.semver.order(Bun.version, ...)` would compare two different questions.
+/// The ordering claim is about the *marker*, so the probe hardcodes it and asks
+/// both runtimes the same question. If the marker changes, the probe's literal
+/// changes with it, and the runtime assertion on `Bun.version` is what notices a
+/// constant that was edited in only one place.
 const PROBE: &str = r#"
 const out = {};
 function attempt(fn) {
@@ -130,10 +139,36 @@ out.origin = Bun.origin;
 out.isMainThread = Bun.isMainThread;
 out.isStandaloneExecutable = Bun.isStandaloneExecutable;
 out.enableANSIColorsIsBoolean = typeof Bun.enableANSIColors === 'boolean';
-// `hasVersion` is NOT compared: `Bun.version` is deferred pending a product
-// decision, so Bun has it and this build does not. The deferral is asserted on
-// rustnode below, which is what keeps the claim honest.
+// `hasVersion` is compared: both runtimes have the member. The *value* is not
+// comparable (Bun reports its release, this reports the compat marker), so it is
+// excluded from the diff by `strip` below and asserted on rustnode instead.
 out.hasVersion = Object.getOwnPropertyNames(Bun).includes('version');
+out.version = Bun.version;
+out.versionIsString = typeof Bun.version === 'string';
+out.versionShape = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(Bun.version);
+out.versionStartsWithOne = Bun.version.startsWith('1.');
+out.versionWithShaMatchesVersion = Bun.version_with_sha.startsWith('v' + Bun.version + ' (');
+
+// --- the semver boundary, which is the reason the marker is a prerelease.
+//
+// The comparison is made on the *literal* marker rather than on `Bun.version`, so
+// the two runtimes are asked the same question and the answers are directly
+// comparable: this is a test of the semver ordering, not of which version string
+// each runtime reports.
+//
+// `>=` on two strings in JavaScript is a *lexicographic* comparison, and it puts
+// "1.4.4-rsnode" ABOVE "1.4.4" (`'-' > '.'`), which is the wrong answer. So the
+// boundary is measured with `Bun.semver.order`, the real semantic comparison this
+// runtime exposes, and `markerStringCompareClaims144` records the operator's
+// answer only to show it is the one that lies.
+const MARKER = '1.4.4-rsnode';
+const atLeast = (other) => Bun.semver.order(MARKER, other) >= 0;
+out.markerAtLeast144 = atLeast('1.4.4');
+out.markerAtLeast10 = atLeast('1.0');
+out.markerAtLeast100 = atLeast('1.0.0');
+out.markerEqualsItself = Bun.semver.order(MARKER, MARKER) === 0;
+out.markerStringCompareClaims144 = MARKER >= '1.4.4';
+
 out.revisionShape = /^[0-9a-f]{40}$/.test(Bun.revision);
 // `version_with_sha` embeds the build's own commit, so only its shape can be
 // compared: two runtimes with different revisions are meant to differ here.
@@ -354,21 +389,26 @@ fn the_process_members_match_bun_1_4_4() {
     };
     let ours = run(&rustnode(), PROBE);
     let theirs = run(std::path::Path::new(&oracle), PROBE);
-    // Three fields are excluded before the comparison, each for a reason the test
-    // states rather than a reason it hides:
+    // Fields excluded before the comparison, each for a reason the test states
+    // rather than a reason it hides:
     //
-    // * `hasVersion` — `Bun.version` is deferred pending a product decision;
-    // * `versionWithShaShape` — the version half of the marker differs by design;
+    // * `version` — the value names a different runtime by design (the
+    //   compatibility marker versus Bun's release), and its exact value is
+    //   asserted on rustnode below;
+    // * `versionWithShaShape` — the version half of the marker differs the same
+    //   way;
     // * `descriptorsFlattenedByRegistry` — the registry publishes every member as
     //   a plain data property, so Bun's per-member attributes cannot survive.
     //
     // All three are asserted on rustnode separately below, so a regression in any
-    // of them still fails this test.
+    // of them still fails this test. Every *other* `version` field is compared,
+    // because those are shapes and booleans whose values agree even though the
+    // version strings do not.
     let strip = |text: &str| -> serde_json::Value {
         let mut parsed: serde_json::Value =
             serde_json::from_str(text).expect("the probe emits JSON");
         if let Some(object) = parsed.as_object_mut() {
-            object.remove("hasVersion");
+            object.remove("version");
             object.remove("versionWithShaShape");
             // `version_with_sha` embeds each runtime's own commit, so the two
             // are *meant* to differ. Its self-consistency is asserted on
@@ -418,6 +458,18 @@ fn the_process_members_match_bun_1_4_4() {
         ("isMainThread", serde_json::json!(true)),
         ("isStandaloneExecutable", serde_json::json!(false)),
         ("enableANSIColorsIsBoolean", serde_json::json!(true)),
+        ("hasVersion", serde_json::json!(true)),
+        ("versionIsString", serde_json::json!(true)),
+        ("versionShape", serde_json::json!(true)),
+        ("versionStartsWithOne", serde_json::json!(true)),
+        ("versionWithShaMatchesVersion", serde_json::json!(true)),
+        ("markerAtLeast144", serde_json::json!(false)),
+        ("markerAtLeast10", serde_json::json!(true)),
+        ("markerAtLeast100", serde_json::json!(true)),
+        ("markerEqualsItself", serde_json::json!(true)),
+        // The lexicographic operator reports the opposite, which is why the
+        // boundary is not tested with it.
+        ("markerStringCompareClaims144", serde_json::json!(true)),
         ("revisionShape", serde_json::json!(true)),
         ("versionWithShaShape", serde_json::json!(true)),
         (
@@ -431,13 +483,15 @@ fn the_process_members_match_bun_1_4_4() {
              comparison measured nothing about it: {ours}"
         );
     }
-    // `Bun.version` is deferred, so it must be absent rather than `undefined`
-    // under a name that exists — the deferral is reported by the registry, and
-    // this is the runtime half of that claim.
+    // `Bun.version` reports the compatibility marker, and its version half in
+    // `Bun.version_with_sha` is the same string. Comparing the value against Bun's
+    // is not possible — they name different runtimes on purpose — so the exact
+    // value is pinned here, which is the runtime half of the same claim the unit
+    // test makes about the constant.
     assert_eq!(
-        parsed["hasVersion"],
-        serde_json::Value::Bool(false),
-        "Bun.version is deferred, so it must not exist on the object: {ours}"
+        parsed["version"],
+        serde_json::json!(rn_bun_process::version::COMPAT_MARKER),
+        "Bun.version must report the compatibility marker: {ours}"
     );
     // The registry flattens every descriptor to one writable/configurable data
     // property, so Bun's per-member attributes cannot survive publication. This

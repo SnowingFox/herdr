@@ -118,6 +118,15 @@ fail it. That is the correct state for "started, stopped, and here is why" — b
 not for "did not get to it". Absent is the honest word for the latter, and absent
 needs no declaration at all.
 
+A deferral is a placeholder, not an answer: it makes a gap visible where an
+`undefined` would not, and it should be visible for as short a time as possible.
+Tier 1 has none today, so the last one to leave — `Bun.version`, in
+`rn-bun-process` — is the worked example of the other direction. Its value could
+not be measured, because this runtime is not Bun, so the crate installed a
+documented compatibility marker instead and the deferral became a declaration.
+That is what "started, stopped, and here is why" is for: it bought the time to
+decide, and then the decision replaced it.
+
 ## Testing a member
 
 Two layers, and both are worth having:

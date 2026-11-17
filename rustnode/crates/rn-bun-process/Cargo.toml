@@ -45,3 +45,8 @@ libc.workspace = true
 # oracle, neither of which is a runtime dependency.
 rn-node-oracle = { path = "../../tools/node-oracle" }
 serde_json = "1"
+# `Bun.version` reports a semver prerelease, and the design claim about it is a
+# semver *ordering* claim. `rn_bun_text::semver::order` is Bun's own ordering
+# (recorded against 1.4.4 in that crate's `data/semver-oracle.json`), so the test
+# uses it rather than a second implementation or JavaScript string comparison.
+rn-bun-text = { path = "../rn-bun-text" }
