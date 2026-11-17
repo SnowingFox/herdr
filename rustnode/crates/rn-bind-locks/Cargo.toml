@@ -1,0 +1,21 @@
+[package]
+name = "rn-bind-locks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "internalBinding('locks') for rustnode"
+
+[dependencies]
+rn-core.workspace = true
+# The check-phase hook that runs a woken environment's queue pass. The phase is
+# owned there, and a lock wake is the same "run this before the loop advances"
+# shape a `MessagePort` delivery has.
+rn-bind-timers = { path = "../rn-bind-timers" }
+# The manager is process-wide and has to wake another thread's loop, which is a
+# `uv_async_send` on that thread's wake handle. The handle is owned by `rn-uv`.
+rn-uv.workspace = true
+rn-v8-sys.workspace = true
+v8.workspace = true
+tracing.workspace = true

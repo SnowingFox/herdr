@@ -37,6 +37,7 @@ rn-bind-http2 = { path = "../rn-bind-http2" }
 rn-bind-icu = { path = "../rn-bind-icu" }
 rn-bind-inspector = { path = "../rn-bind-inspector" }
 rn-bind-js-stream = { path = "../rn-bind-js-stream" }
+rn-bind-locks = { path = "../rn-bind-locks" }
 rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-bind-mksnapshot = { path = "../rn-bind-mksnapshot" }
 rn-bind-modules = { path = "../rn-bind-modules" }

@@ -1190,6 +1190,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rn-bind-locks"
+version = "0.1.0"
+dependencies = [
+ "rn-bind-timers",
+ "rn-core",
+ "rn-uv",
+ "rn-v8-sys",
+ "tracing",
+ "v8",
+]
+
+[[package]]
 name = "rn-bind-messaging"
 version = "0.1.0"
 dependencies = [
@@ -1628,6 +1640,7 @@ dependencies = [
  "rn-bind-icu",
  "rn-bind-inspector",
  "rn-bind-js-stream",
+ "rn-bind-locks",
  "rn-bind-messaging",
  "rn-bind-mksnapshot",
  "rn-bind-modules",
