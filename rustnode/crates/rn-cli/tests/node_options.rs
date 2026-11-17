@@ -558,6 +558,136 @@ fn max_old_space_size_still_moves_the_heap_limit() {
 }
 
 #[test]
+fn max_old_space_size_percentage_sizes_the_heap_and_beats_max_old_space_size() {
+    // `--max-old-space-size-percentage` is a Node option, not a V8 one:
+    // `src/node_options.cc:237` converts it against the machine's memory and
+    // appends `--max_old_space_size=<mb>` to the V8 argument vector, which is
+    // what makes it win over any `--max-old-space-size`. Before this landed the
+    // flag was `unsupported option`, and
+    // `test-max-old-space-size-percentage.js` failed on its first case.
+    let script = "console.log(require('v8').getHeapStatistics().heap_size_limit)";
+    let (code, stdout, stderr) = run_args(&["--max-old-space-size-percentage=50", "-e", script]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let limit: u64 = stdout.trim().parse().expect("a number");
+    // 50% of this machine's usable memory, so anything below 1 GB proves the
+    // flag did nothing at all. The exact figure is machine-dependent, which is
+    // why this is a floor plus a comparison rather than a constant.
+    assert!(
+        limit > 1024 * 1024 * 1024,
+        "50% of the machine's memory must exceed a gigabyte, got {limit}"
+    );
+
+    // The percentage beats an explicit size, in either order. Both orders are
+    // checked because the answer comes from where Node *appends* its argument,
+    // not from where the flag appeared.
+    for arguments in [
+        [
+            "--max-old-space-size=1000",
+            "--max-old-space-size-percentage=50",
+        ],
+        [
+            "--max-old-space-size-percentage=50",
+            "--max-old-space-size=1000",
+        ],
+    ] {
+        let (code, stdout, stderr) = run_args(&[arguments[0], arguments[1], "-e", script]);
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let with_percentage: u64 = stdout.trim().parse().expect("a number");
+        assert_eq!(
+            with_percentage,
+            limit,
+            "{} must not change the percentage's answer",
+            arguments.join(" ")
+        );
+    }
+
+    // And the last percentage in one source wins, because `CheckOptions` reads
+    // the field the walk left behind.
+    let (code, stdout, stderr) = run_args(&[
+        "--max-old-space-size-percentage=25",
+        "--max-old-space-size-percentage=50",
+        "-e",
+        script,
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim().parse::<u64>().ok(), Some(limit));
+}
+
+#[test]
+fn max_old_space_size_percentage_rejects_what_node_rejects() {
+    // Node's own message, verbatim, because `test-max-old-space-size-percentage`
+    // matches it with a regular expression and the process exits 9.
+    for (value, expected) in [
+        (
+            "0",
+            "--max-old-space-size-percentage must be greater than 0 and up to 100. Got: 0",
+        ),
+        (
+            "101",
+            "--max-old-space-size-percentage must be greater than 0 and up to 100. Got: 101",
+        ),
+        (
+            "-1",
+            "--max-old-space-size-percentage must be greater than 0 and up to 100. Got: -1",
+        ),
+        (
+            "abc",
+            "--max-old-space-size-percentage must be greater than 0 and up to 100. Got: abc",
+        ),
+        (
+            "1%",
+            "--max-old-space-size-percentage must be greater than 0 and up to 100. Got: 1%",
+        ),
+        ("", "--max-old-space-size-percentage= requires an argument"),
+    ] {
+        let flag = format!("--max-old-space-size-percentage={value}");
+        let (code, _, stderr) = run_args(&[&flag, "-e", "1"]);
+        assert_eq!(code, 9, "{flag} must be rejected, stderr: {stderr}");
+        assert!(
+            stderr.contains(expected),
+            "{flag} stderr was {stderr:?}, expected {expected:?}"
+        );
+    }
+
+    // The bare form refuses a value that looks like a flag rather than reading
+    // it as a negative percentage.
+    let (code, _, stderr) = run_args(&["--max-old-space-size-percentage", "-1", "-e", "1"]);
+    assert_eq!(code, 9, "stderr: {stderr}");
+    assert!(
+        stderr.contains("--max-old-space-size-percentage requires an argument"),
+        "stderr: {stderr}"
+    );
+
+    // Two spellings with valid values still succeed, so the rejection above is
+    // about the value rather than the flag being unusable in that shape.
+    let (code, _, stderr) = run_args(&["--max-old-space-size-percentage", "50", "-e", "1"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+}
+
+#[test]
+fn max_old_space_size_percentage_from_node_options_is_validated_and_used() {
+    // The variable is a separate parse in Node, and its value is checked even
+    // when the command line replaces it: `NODE_OPTIONS=...=0` plus a
+    // command-line `=50` fails on the environment's 0 on the oracle.
+    let script = "console.log(require('v8').getHeapStatistics().heap_size_limit)";
+    let (code, stdout, stderr) = run_env("--max-old-space-size-percentage=100", script);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let from_env: u64 = stdout.trim().parse().expect("a number");
+    assert!(from_env > 1024 * 1024 * 1024, "got {from_env}");
+
+    let (code, _, stderr) = run_env_args(
+        "--max-old-space-size-percentage=0",
+        "",
+        &["--max-old-space-size-percentage=50", "-e", script],
+    );
+    assert_eq!(code, 9, "stderr: {stderr}");
+    assert!(
+        stderr.contains("must be greater than 0 and up to 100. Got: 0"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn allow_natives_syntax_still_parses_natives_intrinsics() {
     // The intrinsic is a parse error unless V8 has the flag, so this fails at
     // compile time rather than by a wrong answer.

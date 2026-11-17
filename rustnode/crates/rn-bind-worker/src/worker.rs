@@ -86,6 +86,9 @@ pub fn install_worker_constructor<'s>(
     install_method(scope, prototype, "hasRef", has_ref)?;
     // `lib/internal/worker.js` reads this for `worker.resourceLimits`.
     install_method(scope, prototype, "getResourceLimits", get_resource_limits)?;
+    // `worker.getHeapStatistics()`, which `lib/internal/worker.js:554` wraps in a
+    // promise around the returned taker's `ondone`.
+    install_method(scope, prototype, "getHeapStatistics", get_heap_statistics)?;
     // `worker.performance.eventLoopUtilization()` reads both; -1 is Node's
     // "not available yet" and makes the ELU figures zeroes rather than throwing.
     install_method(scope, prototype, "loopIdleTime", loop_idle_time)?;
@@ -290,7 +293,12 @@ fn start_thread(
         exec_argv,
         thread_id,
         parent_wake: rn_uv::wake::current_thread_token(),
+        out_of_memory: handle.out_of_memory_flag(),
     };
+    // The statistics interrupt runs on the worker's thread and can reach only
+    // this handle's shared state, so the token it uses to wake *this* loop is
+    // recorded here rather than passed through the thread.
+    handle.set_parent_wake(thread.parent_wake);
     if let Err(message) = handle.start(move || thread.run()) {
         throw_type_error(scope, &message);
     }
@@ -358,7 +366,59 @@ fn get_resource_limits(
     rv.set(crate::float64_array(scope, &limits));
 }
 
-/// `loopIdleTime()`: -1, which is Node's "not measured yet".
+/// `getHeapStatistics()`: asks the worker's isolate for a snapshot.
+///
+/// `src/node_worker.cc:1187` builds a taker object in the parent's isolate,
+/// returns it, and schedules the read on the worker's thread through
+/// `RequestInterrupt`. `lib/internal/worker.js:554` then:
+///
+/// ```text
+/// const taker = this[kHandle]?.getHeapStatistics();
+/// return new Promise((resolve, reject) => {
+///   if (!taker) return reject(new ERR_WORKER_NOT_RUNNING());
+///   taker.ondone = (handle) => { resolve(handle); };
+/// });
+/// ```
+///
+/// so an answered call is the taker with `ondone` assigned, and an unstarted or
+/// finished worker is a falsy return that becomes `ERR_WORKER_NOT_RUNNING`.
+fn get_heap_statistics(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Some(slot) = slot_of(scope, args.this()) else {
+        throw_type_error(scope, "getHeapStatistics called on a non-Worker");
+        return;
+    };
+    // SAFETY: as in `start_thread`.
+    let handle = unsafe { &*slot }.handle.borrow();
+    // `RequestInterrupt` reports false when there is no environment, which is
+    // Node's `if (!scheduled) args.GetReturnValue().Set(Local<Object>())`: the
+    // return value stays unset, `this[kHandle]?.getHeapStatistics()` yields
+    // `undefined`, and `lib/internal/worker.js` rejects with
+    // `ERR_WORKER_NOT_RUNNING`.
+    let Some(isolate) = handle.isolate_handle() else {
+        return;
+    };
+    let taker = v8::Object::new(scope);
+    let Some((pending, interrupt_data)) = crate::heap_statistics::request(
+        &isolate,
+        v8::Global::new(scope, taker),
+        handle.parent_wake(),
+    ) else {
+        return;
+    };
+    handle.queue_heap_statistics(pending);
+    // The interrupt callback reads this through a raw pointer, so it has to
+    // outlive the isolate and nothing on the worker's thread can free it. The
+    // handle owns it until the worker is disposed, which is the lifetime Node
+    // gives the taker.
+    handle.retain_interrupt_data(interrupt_data);
+    // Returning the taker *object* is what lets `lib/internal/worker.js` assign
+    // `ondone` on the object the delivery will read it from.
+    rv.set(taker.into());
+}
 fn loop_idle_time(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
