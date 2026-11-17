@@ -158,6 +158,15 @@ impl Shared {
         &self.target
     }
 
+    /// The port the listener bound.
+    ///
+    /// `Shared` carries it because a caller that has only the shared half — a
+    /// reader thread that outlives the `Server` value, or a test helper that
+    /// cannot hold a `Server` across threads — still needs to dial the listener.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// Takes everything a frontend has sent since the last drain.
     pub fn take_incoming(&self) -> Vec<Incoming> {
         let mut incoming = self
@@ -397,13 +406,24 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
                     continue;
                 }
 
+                // Set before the reader thread starts: a command that arrives in
+                // the first read is dispatched on the isolate thread, and a pause it
+                // requests must see a frontend. Setting it afterwards leaves a
+                // window in which the pause refuses and JavaScript continues.
                 shared.attached.store(true, Ordering::SeqCst);
+                // The paused state has its own notion of attachment, and it is the
+                // one `pause::should_run` consults. Without this the pause loop
+                // returns immediately because it believes no frontend is there,
+                // which is exactly the defect that made `Debugger.pause` a no-op:
+                // `pause::set_attached` had no production caller at all.
+                crate::pause::set_attached(true);
                 let reader_shared = Arc::clone(&shared);
                 let reader = std::thread::Builder::new()
                     .name("inspector-reader".to_string())
                     .spawn(move || read_loop(connection, stream, reader_shared));
                 if reader.is_err() {
                     shared.attached.store(false, Ordering::SeqCst);
+                    crate::pause::set_attached(false);
                 }
             }
             Err(error) => {
@@ -828,9 +848,12 @@ fn read_loop(connection: usize, mut stream: TcpStream, shared: Arc<Shared>) {
                         connection,
                         message: text,
                     });
-                // The isolate is asleep in `uv_run`; this asks it for one check
-                // phase, which is where the queue is drained.
+                // The isolate is asleep in `uv_run` — or inside the pause loop —
+                // and this asks it to look at the queue. Requesting the loop's
+                // check phase only helps the first case; the pause loop reads the
+                // queue itself, and `pause::wake` is what tells it to.
                 request_drain();
+                crate::pause::wake();
             }
             // CDP over WebSocket is text. A binary frame is dropped rather than
             // guessed at, so a client using the CBOR form fails visibly.
@@ -839,26 +862,41 @@ fn read_loop(connection: usize, mut stream: TcpStream, shared: Arc<Shared>) {
             }
             Ok(Some(Frame::Close)) => {
                 send_close(&mut stream);
-                shared.attached.store(false, Ordering::SeqCst);
+                detach(&shared);
                 return;
             }
             Ok(Some(Frame::Ping(payload))) => {
                 if write_server_frame(&mut stream, 0xA, &payload).is_err() {
-                    shared.attached.store(false, Ordering::SeqCst);
+                    detach(&shared);
                     return;
                 }
             }
             Ok(Some(Frame::Pong)) => {}
             Ok(None) => {
-                shared.attached.store(false, Ordering::SeqCst);
+                detach(&shared);
                 return;
             }
-            Err(_) => {
-                shared.attached.store(false, Ordering::SeqCst);
+            Err(error) => {
+                // A read error is an ordinary disconnect: the client closed the
+                // socket, or the network dropped it. Logged rather than silent so
+                // a connection that keeps failing is visible.
+                tracing::debug!(%error, "the inspector reader stopped");
+                detach(&shared);
                 return;
             }
         }
     }
+}
+
+/// Records that a connection ended, in both attachment trackers.
+///
+/// The two are separate facts with different readers: `Shared::attached` is what
+/// keeps the process alive (`Agent::IsActive`), and the pause module's flag is what
+/// `shouldRunMessageLoop` consults. A disconnect has to clear both, or a pause waits
+/// for a client that is gone.
+fn detach(shared: &Arc<Shared>) {
+    shared.attached.store(false, Ordering::SeqCst);
+    crate::pause::set_attached(false);
 }
 
 /// Writes replies for one connection.

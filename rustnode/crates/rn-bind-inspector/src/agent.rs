@@ -145,14 +145,28 @@ impl v8::inspector::V8InspectorClientImpl for Client {
         // frontend messages — including the `Debugger.resume` that ends it — and the
         // isolate sits still until then.
         crate::pause::set_resumed(false);
-        // `NodeRuntime.waitingForDebugger` is what `test-inspector-debug-brk-flag.js`
-        // and `test-inspector.js` wait for after sending `NodeRuntime.enable`. It is
-        // emitted here, at the moment the pause really starts, because that is the
-        // event's meaning: the runtime is stopped and the frontend may now drive it.
-        if let Some(message) = crate::domains::waiting_for_debugger_notification() {
-            crate::deliver_to_frontends(&message);
-        }
-        crate::pause::run_pause_loop();
+        // V8 calls this from inside protocol dispatch, with no handle scope of its
+        // own, and the pause loop needs one to dispatch the `Debugger.resume` that
+        // ends it. Re-entering the recorded isolate for the duration is the same
+        // arrangement `ensure_default_context_in_group` uses below, and it is safe
+        // for the same reason: the isolate is alive because V8 is inside a call on
+        // it, and the pointer only ever names the isolate this thread recorded.
+        with_isolate(|isolate| {
+            let storage = std::pin::pin!(v8::HandleScope::new(isolate));
+            let mut scope = storage.init();
+            let context = STATE
+                .with(|state| state.borrow().default_context.clone())
+                .map(|context| v8::Local::new(&scope, &context));
+            let Some(context) = context else {
+                // No inspected context means there is nothing a frontend could
+                // resume into; waiting would only stall the process.
+                tracing::warn!("pausing with no inspected context");
+                return;
+            };
+            let context_storage = std::pin::pin!(v8::ContextScope::new(&mut scope, context));
+            let mut context_scope = context_storage;
+            crate::pause::run_pause_loop(&mut context_scope, crate::drain_pending_messages);
+        });
     }
 
     /// Maps a script's resource name to the URL the debugger reports for it.
@@ -185,6 +199,17 @@ impl v8::inspector::V8InspectorClientImpl for Client {
         // `Debugger.resume`, on the paused thread, so it only has to flip the flag the
         // wait condition reads.
         crate::pause::resume();
+    }
+
+    /// `Runtime.runIfWaitingForDebugger`, which ends `--inspect-brk`'s wait.
+    ///
+    /// Node's `runIfWaitingForDebugger` (`inspector_agent.cc:588`) clears
+    /// `waiting_for_frontend_` and unsets the per-channel flag. V8 calls this hook
+    /// from inside the protocol dispatch, which for `--inspect-brk` happens on the
+    /// paused thread inside `wait_for_frontend_loop`, so the loop's condition sees
+    /// the cleared flag on its next turn.
+    fn run_if_waiting_for_debugger(&self, _context_group_id: i32) {
+        crate::pause::run_if_waiting_for_debugger();
     }
     fn ensure_default_context_in_group(
         &self,

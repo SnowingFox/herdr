@@ -46,14 +46,14 @@ pub mod agent;
 pub mod domains;
 mod pause;
 mod profiler;
-mod server;
+pub mod server;
 mod session;
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
 pub use agent::{ensure_inspector, set_isolate};
-pub use server::{format_ws_address, target_list_json, version_json, Server, Target};
+pub use server::{format_ws_address, target_list_json, version_json, Server, Shared, Target};
 
 /// The version string `/json/version` reports, matching `process.version`.
 ///
@@ -369,6 +369,62 @@ pub fn wait_for_client() -> bool {
     })
 }
 
+/// Blocks until a client sends `Runtime.runIfWaitingForDebugger`, dispatching its
+/// commands in the meantime.
+///
+/// This is `--inspect-brk`'s wait, and it is a message loop rather than an
+/// attachment check for a reason the previous shape got wrong: a client that has
+/// attached has not yet said "run", and the commands it sends first —
+/// `Debugger.enable`, `Debugger.setBreakpointByUrl`, `Debugger.setPauseOnExceptions`
+/// — have to be dispatched *before* it can send the one that ends the wait. Polling
+/// for attachment and then waiting for a separate signal deadlocks, because nothing
+/// dispatches in between.
+///
+/// Returns whether it waited at all. With no client attached it returns immediately,
+/// which is Node's behaviour when nothing is listening.
+pub fn wait_for_frontend(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    pause::wait_for_frontend_loop(scope, drain_pending_messages, pause::ATTACH_TIMEOUT)
+}
+
+/// Asks every attached session to pause before its next statement.
+///
+/// `--inspect-brk`'s break on start, and `callAndPauseOnStart`'s. This is
+/// `Agent::PauseOnNextJavascriptStatement` (`inspector_agent.cc:1098`), which is
+/// `client_->schedulePauseOnNextStatement(reason)`, forwarded to every live session.
+///
+/// The request is also recorded, because `--inspect-brk` has to make it before the
+/// entry point's first statement and the client's session may not exist yet. The
+/// server asks [`take_pending_start_break`] after it creates a session, which is the
+/// moment V8 can be told.
+pub fn schedule_start_break() {
+    START_BREAK_PENDING.with(|flag| flag.set(true));
+    request_pause("Break on start");
+}
+
+/// Whether `--inspect-brk` still owes its first-line break.
+pub fn start_break_pending() -> bool {
+    START_BREAK_PENDING.with(std::cell::Cell::get)
+}
+
+/// Arms the break-on-start interrupt on every live session.
+///
+/// Separate from [`schedule_start_break`] because the two happen at different
+/// moments: that one records the request, and this one applies it once V8 has a
+/// debugger agent for the session. Called from `Runtime.runIfWaitingForDebugger`.
+pub fn schedule_start_break_now() {
+    request_pause("Break on start");
+}
+
+/// Consumes the pending break-on-start request.
+pub fn take_pending_start_break() -> bool {
+    START_BREAK_PENDING.with(|flag| flag.replace(false))
+}
+
+thread_local! {
+    /// Set by `--inspect-brk` until `Runtime.runIfWaitingForDebugger` has been seen.
+    static START_BREAK_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Marks a frontend as attached, which is what makes a pause wait.
 pub fn set_frontend_attached(attached: bool) {
     pause::set_attached(attached);
@@ -397,12 +453,45 @@ pub fn arm_pause_for_test() {
     pause::arm();
 }
 
-/// Runs the pause loop, for a test that needs to observe it blocking.
+/// Whether a pause loop is on the stack, which a nested pause must observe.
+pub fn pause_on_stack() -> bool {
+    pause::pause_on_stack()
+}
+
+/// Runs the pause loop from a test, with a scope to dispatch through.
 ///
 /// Returns whether it waited. Production code reaches this through V8's
 /// `runMessageLoopOnPause`, which is the only caller that should exist outside tests.
-pub fn run_pause_loop_for_test() -> bool {
-    pause::run_pause_loop()
+///
+/// The scope is not optional: the loop dispatches frontend messages while it waits,
+/// which is how `Debugger.resume` arrives, and a test that wanted to observe the
+/// blocking without one would be testing a loop that cannot be resumed.
+pub fn run_pause_loop_for_test(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    pause::run_pause_loop(scope, drain_pending_messages)
+}
+
+/// [`run_pause_loop_for_test`] dispatching through a caller's own server.
+///
+/// A test that owns a `Server` would otherwise have its messages queued where the
+/// pause loop cannot see them: the loop drains the CLI's server, and a test's is a
+/// different one. That is the shape the production path has — one server, reached
+/// through a thread-local — so a test that could not substitute its own could only
+/// be written against the CLI.
+pub fn run_pause_loop_draining(
+    scope: &mut v8::PinScope<'_, '_>,
+    shared: &std::sync::Arc<server::Shared>,
+) -> bool {
+    pause::run_pause_loop(scope, |scope| server::drain(scope, shared))
+}
+
+/// Dispatches every queued frontend message with an open V8 scope.
+///
+/// This is what the pause loop calls while waiting. It is separate from
+/// [`server::drain`] because it has to reach the server the CLI installed rather
+/// than one a caller holds, and it returns the count so the loop can tell "nothing
+/// arrived" from "a message was handled and may have queued more".
+pub fn drain_pending_messages(scope: &mut v8::PinScope<'_, '_>) -> usize {
+    drain_attached(scope)
 }
 
 /// Sends one notification to every attached frontend.

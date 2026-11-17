@@ -334,8 +334,30 @@ fn main() {
             Ok(url) => {
                 eprintln!("Debugger listening on {url}");
                 eprintln!("For help, see: https://nodejs.org/learn/getting-started/debugging");
-                if options.inspect_wait && !rn_bind_inspector::wait_for_client() {
-                    eprintln!("rustnode: --inspect-brk found no client; running without waiting");
+                // `--inspect-brk` blocks here until a client sends
+                // `Runtime.runIfWaitingForDebugger`, which is
+                // `Agent::WaitForConnectByOptions` plus `waitForFrontend`.
+                //
+                // It cannot be a sleep-and-poll: the client's first commands —
+                // `Debugger.enable`, `Debugger.setBreakpointByUrl`, then
+                // `runIfWaitingForDebugger` — all arrive *while* the process is
+                // stopped, so the wait has to dispatch them. That is why this goes
+                // through the same message loop an ordinary pause uses rather than
+                // blocking on an attachment flag; the flag-only version deadlocked
+                // as soon as a client tried to say "run".
+                if options.inspect_wait {
+                    if !rn_bind_inspector::wait_for_frontend(scope) {
+                        eprintln!(
+                            "rustnode: --inspect-brk found no client; running without waiting"
+                        );
+                    }
+                    // `PauseOnNextJavascriptStatement("Break at bootstrap")` runs
+                    // *after* the wait, which is `src/node.cc:231-232`: the client has
+                    // said "run", the session exists, and `Debugger.enable` has
+                    // created the agent that `schedulePauseOnNextStatement` needs.
+                    // Scheduling it before the wait is accepted by V8 and then has
+                    // no effect, because there is no debugger agent to arm yet.
+                    rn_bind_inspector::schedule_start_break();
                 }
             }
             Err(message) => {
