@@ -615,31 +615,30 @@ pub fn spawn(
             return uv::uv_errno_t_UV_ENOMEM;
         };
         let native = options.to_libuv(libuv_flags, uid, gid);
+        let raw = handle.process.as_mut_ptr();
+        // `uv_close` reaches the owning `ProcessHandle` through `handle->data`.
+        // Set it before `uv_spawn`: libuv can still return an error after
+        // initialising the handle, and that path still needs a close callback.
+        unsafe { (*raw).data = std::ptr::from_mut(handle).cast() };
         // SAFETY: `handle.process` is a live, zeroed `uv_process_t` that has
         // never been initialised, and `native` borrows from `options`, which
         // outlives the call.
-        let status = unsafe { uv::uv_spawn(loop_pointer, handle.process.as_mut_ptr(), &native) };
-        if status == 0 {
-            // `uv_spawn` calls `uv__handle_init`, which registers the handle with
-            // the loop; `data` is overwritten here because the constructor stored
-            // it before the handle was valid.
-            let raw = handle.process.as_mut_ptr();
-            // SAFETY: `uv_spawn` returned success, so the handle is initialised.
-            unsafe { (*raw).data = std::ptr::from_mut(handle).cast() };
-        }
+        let status = unsafe { uv::uv_spawn(loop_pointer, raw, &native) };
+        // Match Node's HandleWrap state: once `uv_spawn` ran, the handle may need
+        // `uv_close` even if spawn failed.
+        handle.spawned = true;
         status
     })
     .unwrap_or(uv::uv_errno_t_UV_EBADF);
 
     if status != 0 {
-        // A failed `uv_spawn` leaves the handle uninitialised, which is exactly
-        // the state `close()` expects for a process that never ran.
+        // A failed `uv_spawn` can still leave an initialised libuv handle, so
+        // `close()` must take the normal `uv_close` path.
         rv.set(v8::Integer::new(scope, status).into());
         return;
     }
 
     let pid = process::with_handle(object, |handle| {
-        handle.spawned = true;
         // The wrapper is rooted from here on: the exit callback has to reach it,
         // and the JavaScript object may otherwise be collected while the child
         // still runs.
