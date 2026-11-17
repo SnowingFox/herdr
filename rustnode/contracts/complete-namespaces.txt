@@ -25,6 +25,7 @@ inspector
 internal_only_v8
 ipc_serdes
 js_stream
+locks
 messaging
 mksnapshot
 module_wrap

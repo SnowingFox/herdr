@@ -486,6 +486,19 @@ unsafe extern "C" fn near_heap_limit(
 /// per incarnation turns into nondeterministic full-suite failures that take days
 /// to attribute.
 fn teardown() {
+    // 0. Everything this realm registered as "must run when I go away", which is
+    //    Node's `RunCleanup`. A `navigator.locks` request queued in the
+    //    process-wide lock manager is the case that needs it: its environment is
+    //    about to stop existing, and leaving the request (or a held lock) behind
+    //    would block every other environment that asked for the same resource
+    //    forever. Runs first because later steps close the handles a hook may
+    //    need, and because releasing a lock can wake another thread's loop.
+    //
+    //    The hooks themselves are not cleared: a worker thread is one-shot, and
+    //    each hook clears its own realm state, so a cleared list buys nothing and
+    //    would also drop the hooks other producers registered here.
+    rn_core::hook_slot::run_teardown_hooks();
+
     // 1. Nothing may schedule from here on. The flag was set by `terminate()`;
     //    setting it again is harmless and covers the path where the loop ended
     //    on its own while a native immediate was still queued.

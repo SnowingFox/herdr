@@ -507,6 +507,37 @@ mod tests {
         assert!(!flag(Hook::ExitRequested));
     }
 
+    thread_local! {
+        static ORDER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn first() {
+        ORDER.with(|order| order.borrow_mut().push(1));
+    }
+
+    fn second() {
+        ORDER.with(|order| order.borrow_mut().push(2));
+    }
+
+    #[test]
+    fn teardown_hooks_run_newest_first_exactly_once() {
+        ORDER.with(|order| order.borrow_mut().clear());
+        add_teardown_hook(first);
+        // Registering twice must not queue the same function twice: a binding that
+        // registers on every call would otherwise grow the list without bound.
+        add_teardown_hook(first);
+        add_teardown_hook(second);
+
+        run_teardown_hooks();
+        assert_eq!(ORDER.with(|order| order.borrow().clone()), vec![2, 1]);
+
+        // The list is cleared, so a second teardown on the same thread is a no-op
+        // rather than running a disposed realm's hooks again.
+        run_teardown_hooks();
+        assert_eq!(ORDER.with(|order| order.borrow().clone()), vec![2, 1]);
+        assert!(!has_teardown_hooks());
+    }
+
     #[test]
     fn the_abort_option_defaults_to_off() {
         STATE.with(|state| state.borrow_mut().abort_on_uncaught_exception = false);
@@ -561,4 +592,52 @@ pub fn env_message_port<'s>(scope: &v8::PinScope<'s, '_>) -> Option<v8::Local<'s
 /// handle from the isolate that ran before it.
 pub fn clear_env_message_port() {
     ENV_MESSAGE_PORT.with(|slot| *slot.borrow_mut() = None);
+}
+
+thread_local! {
+    /// What a realm teardown must run, in registration order.
+    ///
+    /// Node has `Environment::AddCleanupHook` for exactly this, and the lock
+    /// manager is its main user: `LockManager::OnEnvironmentCleanup` drops the
+    /// environment's held locks and pending requests, so a worker that terminates
+    /// mid-request cannot leave a resource held by a thread that no longer exists.
+    /// rustnode had no equivalent, so a `navigator.locks` request queued by a
+    /// worker that was then terminated stayed in the queue forever and every later
+    /// request for that name blocked behind it.
+    ///
+    /// Additive and per thread: a worker registers its own hook, and clearing them
+    /// when the realm ends is what stops a reused thread from running a hook that
+    /// belongs to an environment that is gone.
+    static TEARDOWN_HOOKS: RefCell<Vec<fn()>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Registers work that must run when this thread's realm is torn down.
+///
+/// Idempotent per function pointer, so a binding that registers on every call
+/// does not accumulate hooks.
+pub fn add_teardown_hook(hook: fn()) {
+    TEARDOWN_HOOKS.with(|hooks| {
+        let mut hooks = hooks.borrow_mut();
+        if !hooks.contains(&hook) {
+            hooks.push(hook);
+        }
+    });
+}
+
+/// Runs every teardown hook, newest first, and clears the list.
+///
+/// Newest first is Node's `RunCleanup` order: a hook registered later may depend
+/// on state a hook registered earlier created, so it has to run while that state
+/// is still there.
+pub fn run_teardown_hooks() {
+    let hooks = TEARDOWN_HOOKS.with(|hooks| std::mem::take(&mut *hooks.borrow_mut()));
+    for hook in hooks.into_iter().rev() {
+        hook();
+    }
+}
+
+/// Whether any teardown hook is registered. Tests read it.
+#[must_use]
+pub fn has_teardown_hooks() -> bool {
+    TEARDOWN_HOOKS.with(|hooks| !hooks.borrow().is_empty())
 }
