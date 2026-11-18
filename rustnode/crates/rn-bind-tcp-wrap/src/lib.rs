@@ -92,6 +92,17 @@ impl BindingModule for TcpWrap {
 
         let tcp = handle::constructor(scope)?;
         set(scope, object, "TCP", tcp)?;
+        // A `TCP` can be sent over an IPC channel and can be the object a
+        // transferred descriptor is delivered into, so the shared transfer layer
+        // has to be able to build one and to recognise one.
+        let Ok(constructor) = v8::Local::<v8::Function>::try_from(tcp) else {
+            return Err("TCP is not a function".to_string());
+        };
+        rn_uv::handle_transfer::register_resolver(scope, constructor, handle::transfer_lookup);
+        rn_uv::handle_transfer::register_acceptor(
+            uv::uv_handle_type_UV_TCP,
+            handle::accept_transferred,
+        );
 
         let connect_wrap = wrap::constructor(scope)?;
         set(scope, object, "TCPConnectWrap", connect_wrap)?;

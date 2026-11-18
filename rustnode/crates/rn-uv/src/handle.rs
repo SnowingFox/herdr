@@ -431,6 +431,15 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
             // reaches nobody.
             let _ = rn_core::callback_scope::with_scope(scope, context_args(), |scope| {
                 let object: v8::Local<v8::Object> = v8::Local::new(scope, &owner);
+                // A descriptor that arrived with these bytes is attached before
+                // `onread` runs, because `lib/internal/child_process.js` reads
+                // `channel.pendingHandle` from inside its own read handler and
+                // clears it as it goes. Doing this after the callback would
+                // deliver every transferred handle one message late.
+                //
+                // SAFETY: `state` is the live owner of this read and the stream
+                // pointer inside it is valid for its lifetime.
+                unsafe { publish_pending_handle(scope, state, object) };
                 let Some(handler) = onread_of(scope, object) else {
                     return;
                 };
@@ -464,6 +473,60 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
             let _ = handler.call(&*scope, receiver, &[]);
         });
     });
+}
+
+/// Attaches a descriptor that arrived on an IPC pipe as `handle.pendingHandle`.
+///
+/// This is the head of `LibuvStreamWrap::OnUvRead` (`src/stream_wrap.cc:276`):
+///
+/// ```c
+/// if (is_named_pipe_ipc() &&
+///     uv_pipe_pending_count(reinterpret_cast<uv_pipe_t*>(stream())) > 0) {
+///   type = uv_pipe_pending_type(...);
+/// }
+/// ...
+/// object()->Set(env()->context(), env()->pending_handle_string(), local_pending_obj);
+/// ```
+///
+/// It must run before `onread`, because `lib/internal/child_process.js` reads
+/// `channel.pendingHandle` inside its own read handler. The property is set only
+/// when something is pending, which is also what Node does: a read without a
+/// descriptor leaves whatever was there, and the reader clears it.
+///
+/// # Safety
+///
+/// `state` must be live and its `stream` must be a live `uv_stream_t`.
+unsafe fn publish_pending_handle<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    state: *mut StreamState,
+    object: v8::Local<'s, v8::Object>,
+) {
+    // SAFETY: the caller guarantees `state` is live. The borrow ends before the
+    // `uv_accept` below, which allocates and may run JavaScript.
+    let (stream, is_ipc) = unsafe {
+        let state = &*state;
+        (
+            state.stream,
+            crate::handle_transfer::is_ipc_pipe(as_handle(state.stream)),
+        )
+    };
+    if !is_ipc || stream.is_null() {
+        return;
+    }
+    // SAFETY: `is_ipc` proved this is a live IPC pipe, which is what the pending
+    // count requires.
+    let kind = unsafe { crate::handle_transfer::pending_type(stream) };
+    if kind == uv::uv_handle_type_UV_UNKNOWN_HANDLE {
+        return;
+    }
+    // SAFETY: as above; the descriptor is pending on this pipe.
+    let Some(received) = (unsafe { crate::handle_transfer::accept(scope, stream, kind) }) else {
+        return;
+    };
+    let Some(key) = v8::String::new(scope, "pendingHandle") else {
+        return;
+    };
+    object.set(scope, key.into(), received.into());
 }
 
 /// Publishes `(nread, offset)` into the shared `streamBaseState`.

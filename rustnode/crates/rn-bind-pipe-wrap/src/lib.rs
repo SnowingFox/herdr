@@ -84,6 +84,17 @@ impl BindingModule for PipeWrap {
 
         let pipe = handle::constructor(scope)?;
         set(scope, object, "Pipe", pipe)?;
+        // A `Pipe` can be sent over an IPC channel and can be the object a
+        // transferred descriptor is delivered into, so the shared transfer layer
+        // has to be able to build one and to recognise one.
+        let Ok(constructor) = v8::Local::<v8::Function>::try_from(pipe) else {
+            return Err("Pipe is not a function".to_string());
+        };
+        rn_uv::handle_transfer::register_resolver(scope, constructor, handle::transfer_lookup);
+        rn_uv::handle_transfer::register_acceptor(
+            uv::uv_handle_type_UV_NAMED_PIPE,
+            handle::accept_transferred,
+        );
 
         let connect_wrap = wrap::constructor(scope)?;
         set(scope, object, "PipeConnectWrap", connect_wrap)?;

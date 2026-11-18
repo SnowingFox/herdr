@@ -85,6 +85,69 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// A `Pipe` handed to `child.send` or `cluster`, as `uv_write2` sees it.
+///
+/// `HandleWrap::GetHandle`/`IsAlive`, which is all the send path reads.
+struct Transfer<'a>(&'a PipeHandle);
+
+impl rn_uv::handle_transfer::Transferable for Transfer<'_> {
+    fn transfer_handle(&self) -> *mut uv::uv_handle_t {
+        rn_uv::handle::as_handle(self.0.stream())
+    }
+
+    fn transfer_is_alive(&self) -> bool {
+        self.0.state.is_alive()
+    }
+}
+
+/// Reads a `Pipe` out of a value the resolver has already matched to this class.
+///
+/// `raw_handle` cannot distinguish a `Pipe` from a `TCP` — both store their
+/// pointer in internal field 0 — so this is only ever called after
+/// `[[HasInstance]]` has established the class.
+pub(crate) fn transfer_lookup<'s>(
+    _scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<Box<dyn rn_uv::handle_transfer::Transferable>> {
+    let pointer = raw_handle(object)?;
+    // SAFETY: `raw_handle` proved the pointer came from `install`, so it points at
+    // a live `PipeHandle`. The returned value borrows it only for the duration of
+    // the send call, which is the object's own JavaScript frame.
+    let handle = unsafe { &*pointer };
+    Some(Box::new(Transfer(handle)))
+}
+
+/// Accepts a descriptor `uv_write2` delivered, as `AcceptHandle<PipeWrap>`.
+///
+/// # Safety
+///
+/// `parent` must be a live IPC pipe with a descriptor pending on it.
+pub(crate) unsafe fn accept_transferred<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    parent: *mut uv::uv_stream_t,
+    _kind: uv::uv_handle_type,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let client = PipeHandle::new(crate::SOCKET)?;
+    // SAFETY: the client's stream is live and `parent` holds the pending
+    // descriptor; `uv_accept` moves it into `client`.
+    let status = unsafe { uv::uv_accept(parent, client.stream()) };
+    if status != 0 {
+        tracing::error!(status, "uv_accept failed for a transferred pipe");
+        return None;
+    }
+    park_accept(client);
+    let object = instantiate(scope);
+    if object.is_none() {
+        // Nothing will adopt the handle, so close it rather than leaking a
+        // descriptor. `take_pending_accept` returns the one just parked.
+        if let Some(orphan) = take_pending_accept() {
+            // SAFETY: the orphan is a handle no wrapper adopted.
+            rn_uv::handle_transfer::close_orphan(rn_uv::handle::as_handle(orphan.stream()));
+        }
+    }
+    object
+}
+
 /// Takes the parked accept handle, if there is one.
 pub fn take_pending_accept() -> Option<Box<PipeHandle>> {
     PENDING_ACCEPT.with(|slot| slot.borrow_mut().take())
@@ -311,6 +374,12 @@ fn new(
     handle.state.async_wrap = rn_core::AsyncWrapState::uninitialised(PipeHandle::provider(kind));
 
     let object = args.this();
+    // An IPC pipe is the only kind that can carry descriptors, and libuv has no
+    // getter for the bit, so it is recorded before the handle is published: the
+    // send path and the read path both ask about it.
+    if kind == crate::IPC {
+        rn_uv::handle_transfer::set_ipc_pipe(rn_uv::handle::as_handle(handle.stream()));
+    }
     install(scope, object, handle);
     // After `install`, so a hook that reads `getAsyncId()` reaches installed
     // state, which is the same ordering the TCP constructor uses.
