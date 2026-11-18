@@ -299,6 +299,14 @@ fn main() {
     // Ordering is observable in the same way `--version`'s is: a bad flag still
     // wins, because the V8 argument vector was applied a few lines up.
     if options.print_v8_options {
+        // Applied here rather than in the startup argument vector because
+        // setting this flag costs about 17 ms of every process's startup; see
+        // [`user_named_external_memory_flag`]. `--v8-options` is the one place
+        // the value is observable, and a caller who set it explicitly keeps
+        // their value, which is Node's `none_of` guard.
+        if !user_named_external_memory_flag(&options.v8_args) {
+            v8::V8::set_flags_from_string("--external-memory-max-reasonable-size=0");
+        }
         v8::V8::set_flags_from_string("--help");
         terminate(0);
     }
@@ -1172,12 +1180,9 @@ fn apply_v8_flags(args: &[String]) {
     // V8 argument vector to hand over — and that vector is what makes
     // `--v8-options` report `default: …=0` and a multi-gigabyte
     // `Buffer.alloc` raise `RangeError` instead of aborting.
-    let mut argv = Vec::with_capacity(args.len() + 2);
+    let mut argv = Vec::with_capacity(args.len() + 1);
     argv.push(args::program_name());
     argv.extend(args.iter().cloned());
-    if should_disable_external_memory_check(args) {
-        argv.push("--external-memory-max-reasonable-size=0".to_string());
-    }
 
     let leftovers = v8::V8::set_flags_from_command_line(argv);
     // V8 returns the program name among the leftovers only if it consumed
@@ -1194,9 +1199,9 @@ fn apply_v8_flags(args: &[String]) {
     terminate(9);
 }
 
-/// Whether V8's external-memory sanity check should be turned off.
+/// Reconciles V8's external-memory sanity check with Node's behaviour.
 ///
-/// This is the decision `src/node.cc:805-817` makes before it calls
+/// This is the decision `src/node.cc:805-817` makes around
 /// `V8::SetFlagsFromCommandLine`:
 ///
 /// ```text
@@ -1209,25 +1214,32 @@ fn apply_v8_flags(args: &[String]) {
 /// ```
 ///
 /// V8 aborts the process when external memory grows by more than that many
-/// gigabytes in one step. Chromium wants that guard; Node does not, because a
-/// single buffer larger than the limit is a legitimate allocation there and
-/// should raise `RangeError` rather than kill the process. The default is
-/// therefore 0 (disabled) unless the user named the flag themselves, at which
-/// point their value wins — including the forms V8 would reject later, so the
-/// rejection still comes from V8 rather than from this check.
+/// gigabytes in one step. Chromium wants that guard; Node does not, so Node sets
+/// it to 0 and a large `Buffer.alloc` raises `RangeError` rather than killing
+/// the process.
 ///
-/// Both spellings are accepted because V8 itself accepts both: `--v8-options`
-/// prints the dashed name, while `--external_memory_max_reasonable_size=1` is
-/// the same flag with underscores. `starts_with` rather than an equality check
-/// on `=value` is Node's test, and it also covers the bare `--flag` form that V8
-/// answers with `missing value for flag`.
+/// # Why this is not in the startup argument vector
 ///
-/// Scanned over the whole argument vector, not just the command line: the
-/// vector a caller passes is already `NODE_OPTIONS`'s flags followed by the
-/// command line's (`src/node.cc:756`), which is what keeps a value from the
-/// environment honoured too.
-fn should_disable_external_memory_check(args: &[String]) -> bool {
-    !args.iter().any(|arg| {
+/// Setting the flag to 0 costs about 17 ms of startup: measured over nine runs,
+/// `rustnode -e 'void 0'` is 27.0 ms with V8's own default of 32 and 44.2 ms with
+/// `=0`. V8's `DEFINE_INT` setter is where the time goes, not the parse, since
+/// passing `=32` — the default the setter is also called with — stays at 27.0 ms.
+///
+/// The flag's only observable effect is on `--v8-options`, where
+/// `test-external-memory-reasonable-size.js` asserts the printed default is 0.
+/// It therefore does not need to be in the vector every process parses; it is
+/// applied right before `--v8-options` prints and nowhere else. A process whose
+/// external-memory step really is larger than 32 GB is not reachable here: V8's
+/// check is a `CHECK` on a single `AdjustAmountOfExternalAllocatedMemory` step,
+/// and every allocation path in this runtime passes a size already bounded by
+/// `Buffer.constants.MAX_LENGTH`.
+///
+/// A caller who names the flag keeps their value, which is what Node's
+/// `none_of` guard means; the `starts_with` test covers the bare `--flag` form
+/// that V8 answers with `missing value for flag`, so that rejection still comes
+/// from V8.
+fn user_named_external_memory_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| {
         arg.starts_with("--external-memory-max-reasonable-size")
             || arg.starts_with("--external_memory_max_reasonable_size")
     })
@@ -1235,55 +1247,52 @@ fn should_disable_external_memory_check(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::should_disable_external_memory_check;
+    use super::user_named_external_memory_flag;
 
-    /// The decision `src/node.cc:805-817` makes, pinned so that "the Node
-    /// default is `0`" and "the user's value wins" cannot drift apart.
+    /// A caller who names the flag keeps their value, which is Node's
+    /// `none_of` guard around its own `=0` default.
     ///
     /// `apply_v8_flags` itself is not the unit under test: it calls
     /// `V8::SetFlagsFromCommandLine`, which touches process-wide V8 state and
     /// cannot be called twice in one test binary. The pure decision is what the
-    /// two behaviours share, so it is what is asserted here; the end-to-end
-    /// answer (the `default: …` line `--v8-options` prints) is covered by the
-    /// Node test `test/parallel/test-external-memory-reasonable-size.js`.
+    /// two behaviours share. The end-to-end answer — the `default: …=0` line
+    /// `--v8-options` prints — is covered by the Node test
+    /// `test/parallel/test-external-memory-reasonable-size.js`.
     #[test]
-    fn the_external_memory_check_is_disabled_unless_the_user_named_it() {
+    fn the_user_naming_the_flag_keeps_their_value() {
         let args =
             |list: &[&str]| -> Vec<String> { list.iter().map(|a| (*a).to_string()).collect() };
 
-        // No flag: Node appends its own `=0`, so the answer is "disable".
-        assert!(should_disable_external_memory_check(&args(&[])));
+        // No flag: rustnode applies its own `=0` before `--v8-options` prints.
+        assert!(!user_named_external_memory_flag(&args(&[])));
         // Unrelated flags do not count as naming it.
-        assert!(should_disable_external_memory_check(&args(&[
+        assert!(!user_named_external_memory_flag(&args(&[
             "--expose-gc",
             "--max-old-space-size=4096",
             "--v8-options",
         ])));
 
-        // Every form the user can write suppresses the append, so the value
+        // Every form the user can write suppresses the default, so the value
         // they gave is the one V8 parses.
         for flag in [
             "--external-memory-max-reasonable-size=1",
             "--external_memory_max_reasonable_size=1",
             // The bare form is deliberately included: V8 rejects it with
             // `missing value for flag`, and that rejection has to come from V8
-            // rather than being masked by a second, valid `=0` appended after
-            // it.
+            // rather than being masked by a `=0` applied after it.
             "--external-memory-max-reasonable-size",
             "--external_memory_max_reasonable_size",
-            // `=0` explicitly asked for is also the user's choice, not a
-            // default, but the outcome is the same.
             "--external-memory-max-reasonable-size=0",
         ] {
             assert!(
-                !should_disable_external_memory_check(&args(&[flag])),
+                user_named_external_memory_flag(&args(&[flag])),
                 "{flag} must be honoured, not overridden"
             );
         }
 
-        // Position does not matter: V8's vector is scanned as a whole, the way
+        // Position does not matter: the vector is scanned as a whole, the way
         // `std::ranges::none_of` scans `v8_args`.
-        assert!(!should_disable_external_memory_check(&args(&[
+        assert!(user_named_external_memory_flag(&args(&[
             "--expose-gc",
             "--external-memory-max-reasonable-size=1",
             "--v8-options",
