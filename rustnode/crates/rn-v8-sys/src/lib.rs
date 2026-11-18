@@ -6,6 +6,8 @@
 
 pub use v8;
 
+pub mod platform;
+
 use std::cell::RefCell;
 
 unsafe extern "C" {
@@ -221,10 +223,35 @@ pub unsafe fn query_objects<'s>(
     Some(unsafe { std::mem::transmute::<*mut v8::Array, v8::Local<'s, v8::Array>>(array) })
 }
 
-/// Runs the tasks V8 has queued for this isolate on the process' platform.
+thread_local! {
+    /// Whether the platform installed into V8 is ours.
+    ///
+    /// A `CustomPlatform` diverts every foreground post to [`platform`]'s queue, so
+    /// `pump_message_loop` would then find an empty default queue and report that
+    /// nothing ran. The flag picks the right drain without a global lookup, and it
+    /// is per thread because "did *this* thread install the platform" is the
+    /// question — installation happens once, before any isolate exists.
+    static CUSTOM_PLATFORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Records that [`platform::new_platform`] produced the installed platform.
+///
+/// Called by whoever installs it, on the thread that calls
+/// `V8::initialize_platform`. Without this the drain would keep asking V8's default
+/// runner for work and never see a task posted through `PlatformImpl`.
+pub fn use_custom_platform() {
+    CUSTOM_PLATFORM.with(|slot| slot.set(true));
+}
+
+/// Runs the tasks V8 has queued for this isolate.
 /// Returns whether any task ran. `wait_for_work` is false throughout: the queue
 /// is drained from the event loop's per-iteration checkpoint, so blocking there
 /// would stall the loop whenever nothing was posted.
+///
+/// With the default platform the tasks live in V8's own foreground runner, which
+/// `pump_message_loop` pops from. With [`platform::new_platform`] installed they
+/// live in [`platform`]'s queue instead, because `CustomPlatform` hands every post
+/// to `PlatformImpl` and never queues it internally — so the drain has to be ours.
 ///
 /// The platform is cached after the first call. `v8::V8::get_current_platform`
 /// takes V8's global-state mutex and clones a `SharedRef`, and this runs on every
@@ -238,6 +265,10 @@ pub unsafe fn query_objects<'s>(
 pub fn pump_platform_tasks(scope: &v8::PinScope<'_, '_>) -> bool {
     /// Tasks one call will run before returning to the loop.
     const DRAIN_TASK_BUDGET: usize = 64;
+
+    if CUSTOM_PLATFORM.with(|slot| slot.get()) {
+        return platform::drain(scope);
+    }
 
     thread_local! {
         static PLATFORM: RefCell<Option<v8::SharedRef<v8::Platform>>> =
