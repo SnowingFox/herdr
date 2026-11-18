@@ -568,3 +568,37 @@ fn measure_memory_is_exposed_and_returns_a_promise() {
         "#);
     assert_eq!(result, r#"{"typeof":"function","then":"function"}"#);
 }
+
+#[test]
+fn a_compiled_function_carries_its_host_defined_option_id() {
+    // `lib/internal/vm.js`'s `registerImportModuleDynamically` is called with the
+    // *compiled function*, and `internal/modules/esm/utils.js`'s `registerModule`
+    // reads `referrer[host_defined_option_symbol]` off it as a `WeakMap` key. Node
+    // sets that with `SetPrivate` in `src/node_contextify.cc:1552`; without it the
+    // read is `undefined`, which matches none of the four sentinel symbols
+    // `registerModule` early-returns on, so `moduleRegistries.set(undefined, ...)`
+    // throws "Invalid value used as weak map key".
+    //
+    // The recorded value is the oracle's: a function compiled with no callback
+    // carries `Symbol(vm_dynamic_import_no_callback)`, which is the very value
+    // `lib/internal/vm.js` hands in for that case, so the mark makes the two agree.
+    let result = run(r#"
+        const fn = contextify.compileFunction(
+          'return 1', 'file.js', 0, 0, undefined, false, undefined, [], [],
+          Symbol('vm_dynamic_import_no_callback'),
+        ).function;
+        // The mark is a registered `v8::Symbol`, so `lib/**` reads it with a
+        // bracket accessor. Look it up by its Node description the way
+        // `util.privateSymbols` would resolve it.
+        const mark = Symbol.for('node:host_defined_option_symbol');
+        const value = fn[mark];
+        __out = JSON.stringify({
+          typeof: typeof value,
+          description: value === undefined ? null : value.description,
+        });
+        "#);
+    assert_eq!(
+        result,
+        r#"{"typeof":"symbol","description":"vm_dynamic_import_no_callback"}"#
+    );
+}
