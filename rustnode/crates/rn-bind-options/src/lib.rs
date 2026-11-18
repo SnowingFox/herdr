@@ -35,8 +35,11 @@ use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
 pub use env::{parse as parse_env, EnvError, EnvOptions};
-pub use option::{DefaultValue, OptionInfo, OptionNamespace};
-pub use parsed::{declares, is_v8_flag, takes_separate_value, ParsedValue, Store};
+pub use option::{kind, DefaultValue, OptionInfo, OptionNamespace};
+pub use parsed::{
+    declares, is_no_op, is_v8_flag, no_op_names, option_info, shared_field, takes_separate_value,
+    ParsedValue, Store, SHARED_FIELDS,
+};
 pub use values::{
     cli_info, cli_values, env_options_input_types, namespace_options_input_types, options_as_flags,
     parse_node_options, CliValue, EmbedderOptions, InputType, NodeOptionsError, OptionMetadata,

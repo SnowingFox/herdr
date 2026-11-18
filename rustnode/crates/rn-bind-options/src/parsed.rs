@@ -441,15 +441,29 @@ impl Store {
     /// Public so the runtime can correct a recorded default that describes the
     /// reference binary rather than this one. The one caller is `--strip-types`:
     /// it is recorded as `default: true` because Node 28 ships amaro, and this
+    /// Writes `value` for `name`, replacing an earlier one.
+    ///
+    /// A name in [`SHARED_FIELDS`] writes every spelling of its field, because
+    /// Node has one `require_module` for both `--require-module` and
+    /// `--experimental-require-module`: whichever the walk reaches last decides,
+    /// and both names then report it. Writing only the name that appeared would
+    /// leave the other spelling stale and send `lib/**` down the wrong branch.
+    ///
+    /// Public so the runtime can correct a recorded default that describes the
+    /// reference binary rather than this one. The one caller is `--strip-types`:
+    /// it is recorded as `default: true` because Node 28 ships amaro, and this
     /// build vendors none, so the TypeScript path would throw
     /// `ERR_NO_TYPESCRIPT` on the first `eval` script. Fixing the *value* keeps
     /// the recorded table honest and makes the runtime tell the truth about
     /// itself, which is the same rule `config.hasInspector` follows.
     pub fn set(&mut self, name: &str, value: ParsedValue) {
-        if let Some(entry) = self.values.iter_mut().find(|(option, _)| option == name) {
-            entry.1 = value;
-        } else {
-            self.values.push((name.to_string(), value));
+        let names: &[&str] = shared_field(name).unwrap_or(std::slice::from_ref(&name));
+        for target in names {
+            if let Some(entry) = self.values.iter_mut().find(|(option, _)| option == target) {
+                entry.1 = value.clone();
+            } else {
+                self.values.push(((*target).to_string(), value.clone()));
+            }
         }
     }
 
@@ -504,6 +518,54 @@ pub fn is_v8_flag(argument: &str) -> bool {
 #[must_use]
 pub fn declares(argument: &str) -> bool {
     lookup_argument(argument).is_some()
+}
+
+/// Whether Node's table registers `argument` as `NoOp{}`.
+///
+/// A `NoOp` option is one Node accepts and then does nothing with: `Parse`'s
+/// `kNoOp` case is a bare `break` (`src/node_options-inl.h:521`). It has no
+/// field, so nothing can read it and no behaviour can hang off it. Every such
+/// flag in Node 28 is a historical spelling kept so old command lines still
+/// start — `--experimental-fetch`, `--experimental-modules` and the rest of the
+/// ES-module-flag family are `NoOp` because their features are unconditionally
+/// on.
+///
+/// This is the distinction a warning needs. "rustnode has no behaviour for this
+/// flag" is only true when *Node* has behaviour behind it; for a `NoOp` the
+/// correct report is silence, because complaining that rustnode did not
+/// implement something Node also did not implement is a false alarm on every run.
+///
+/// An undeclared argument answers `false`: this is a question about the table,
+/// and a V8 flag is not in it. Use [`declares`] for that separation.
+#[must_use]
+pub fn is_no_op(argument: &str) -> bool {
+    matches!(lookup_argument(argument), Some(option) if option.kind == kind::NO_OP)
+}
+
+/// Every `NoOp{}` option name in Node's table, in source order.
+///
+/// The set a warning rule can be checked against: each of these is a flag Node
+/// accepts and then does nothing with, so none of them can name behaviour
+/// rustnode is missing. [`is_no_op`] answers the same question one name at a
+/// time; this exists so a test can assert over the whole set and catch a rule
+/// that silently started warning again for a name nobody listed.
+#[must_use]
+pub fn no_op_names() -> Vec<&'static str> {
+    OPTIONS
+        .iter()
+        .filter(|option| option.kind == kind::NO_OP)
+        .map(|option| option.name)
+        .collect()
+}
+
+/// The `OptionInfo` Node's table has for `argument`, if any.
+///
+/// Answers the same lookup [`declares`] and [`is_no_op`] use — underscore
+/// normalisation, alias expansion, and the `--no-` prefix stripped — so a caller
+/// that needs several facts about one argument does not repeat the walk.
+#[must_use]
+pub fn option_info(argument: &str) -> Option<&'static OptionInfo> {
+    lookup_argument(argument)
 }
 
 /// Whether Node's parser would read a *separate* argument for `argument`.
@@ -673,6 +735,44 @@ fn strip_brackets(host: &str) -> &str {
 /// `ParseAndValidatePort`: `std::from_chars` into a `uint16_t`.
 fn parse_port(port: &str) -> u16 {
     port.parse().unwrap_or(0)
+}
+
+/// Option names Node binds to the *same* field in `src/node_options.h`.
+///
+/// The table records one `OptionInfo` per `AddOption`, which loses the fact that
+/// two `AddOption` calls can pass the same `BOOL_FIELD(f)`. Node has exactly one
+/// such pair: `--require-module` and `--experimental-require-module` are both
+/// `BOOL_FIELD(require_module)` (`src/node_options.cc:719` and `:724`), with the
+/// second kept as the legacy spelling. The generator cannot see the sharing
+/// because it renders each call independently, and the struct field name is not
+/// in the table.
+///
+/// The sharing is observable and not cosmetic. `getOptionValue` reads
+/// `require_module` no matter which name asked, and `Parse` assigns to the field
+/// as it walks, so **the last occurrence wins across both spellings** and both
+/// names report the winner. Measured on the pinned oracle:
+///
+/// ```text
+/// --no-require-module --experimental-require-module  -> both true
+/// --experimental-require-module --no-require-module  -> both false
+/// ```
+///
+/// A store that kept the two names apart would answer `false` for the second
+/// command line, which is the wrong branch in
+/// `lib/internal/modules/cjs/loader.js`'s `getOptionValue('--require-module')`.
+///
+/// Each group lists the aliases of one field. `OptionInfo::name` is still the
+/// declared spelling, so `--help` and `getCLIOptionsInfo` keep reporting both
+/// entries; this only decides which names write to one another's values.
+pub const SHARED_FIELDS: &[&[&str]] = &[&["--require-module", "--experimental-require-module"]];
+
+/// The group of names Node binds to one field, or `None` for an unshared option.
+#[must_use]
+pub fn shared_field(name: &str) -> Option<&'static [&'static str]> {
+    SHARED_FIELDS
+        .iter()
+        .copied()
+        .find(|group| group.contains(&name))
 }
 
 /// `Implies(from, to)` and `ImpliesNot(from, to)` from `src/node_options.cc`.

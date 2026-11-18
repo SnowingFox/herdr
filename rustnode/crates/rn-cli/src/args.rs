@@ -702,6 +702,40 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
     // `rn-napi` asks.
     "--force-node-api-uncaught-exceptions-policy",
     "--no-force-node-api-uncaught-exceptions-policy",
+    // `--require-module` and its `--experimental-` legacy alias, whose value
+    // `lib/internal/modules/cjs/loader.js` reads twice (`:1897` decides whether
+    // a `require()`d file is reparsed for ESM syntax, `:2104` throws
+    // `ERR_REQUIRE_ESM` when the format came back `module` and the flag is off).
+    // Both spellings reach the store, and `rn-bind-options` keeps the two names
+    // on one value because Node binds one `require_module` field to both.
+    //
+    // The `--no-` forms are listed because the negation is the whole point of
+    // the flag and the walk matches names literally rather than deriving them
+    // from the option's kind.
+    "--require-module",
+    "--no-require-module",
+    "--experimental-require-module",
+    "--no-experimental-require-module",
+    // `--experimental-detect-module` and `--experimental-print-required-tla` are
+    // the other two thirds of that same reader: `loader.js:1892` gates the
+    // entry point's format detection on the first, and
+    // `experimental-print-required-tla` travels with `--require-module` in the
+    // `--experimental-require-module` implication. Both are `kBoolean`s whose
+    // value `lib/**` reads, so the store is the whole mechanism.
+    "--experimental-detect-module",
+    "--no-experimental-detect-module",
+    "--experimental-print-required-tla",
+    "--no-experimental-print-required-tla",
+    // Three `NoOp{}` entries that rustnode used to reject outright. Node accepts
+    // each and does nothing with it, so refusing the command line is a divergence
+    // of the same kind the warning was: `--http-parser` is a removed HTTP/1
+    // implementation, `--napi-modules` a build-time flag that is now the default,
+    // and `--node-memory-debug` a debug build's instrumentation switch. All three
+    // are silent on the oracle, and a `node` invocation carrying one must start
+    // here too.
+    "--http-parser",
+    "--napi-modules",
+    "--node-memory-debug",
 ];
 
 /// Test-runner flags that take no value.
@@ -923,48 +957,28 @@ const PERMISSION_BOOLEAN_GRANTS: &[&str] = &[
     "--allow-worker",
 ];
 
-/// Flags that enable an experimental surface rustnode has not built yet.
+/// Experimental flags this build is known **not** to honour, named individually.
 ///
-/// Accepting them silently would make a test look like it exercised the feature
-/// when it did not, so they are recorded in [`Options::unimplemented`].
+/// [`warns_about`] warns by default, so this list is not what makes a flag warn;
+/// it is the evidence for the ones a reader is most likely to ask about, and the
+/// place a newly discovered gap gets written down. An entry here that also
+/// appeared in [`IMPLEMENTED_EXPERIMENTAL`] would be a contradiction, and the
+/// unit tests reject that.
 ///
-/// A flag belongs here only while the *behaviour* behind it is absent. Three
-/// were removed once `rn-bind-options` started publishing their values, because
-/// warning about them had become a lie that some tests read:
+/// Everything in this list was measured missing against the pinned oracle:
+/// `--experimental-shadow-realm` leaves `globalThis.ShadowRealm` `undefined` where
+/// Node reports `function`, `--experimental-web-worker` does the same for
+/// `Worker`, `--experimental-network-inspection` reaches a
+/// `setupNetworkTracking` this build's inspector does not publish, and
+/// `--experimental-eventsource` leaves `globalThis.EventSource` `undefined`.
 ///
-/// * `--experimental-bench` — `node:bench` is now requireable.
-/// * `--experimental-stream-iter` — `stream/iter` resolves to the vendored
-///   implementation, and the `test-quic-stream-iteration*` files pass.
-/// * `--allow-natives-syntax` — forwarded to V8, so `%DebugPrint` and the other
-///   natives intrinsics parse instead of throwing `SyntaxError`.
-///
-/// `--permission` was the fourth, and it has now left the list too. Every scope
-/// that is enforced is listed in `crates/rn-permission`'s module documentation;
-/// the ones that are not, and the reason each cannot be, are:
-///
-/// * `wasi` — rustnode has no `internalBinding('wasi')`, so `new WASI()` already
-///   throws "the namespace has no Rust implementation yet". A permission check
-///   in front of that would report the wrong cause.
-/// * `ffi` — no `node:ffi` surface either; `require('node:ffi')` fails on the
-///   missing binding for the same reason.
-/// * `openssl.store` — the crypto layer has no STORE-loader path to gate.
-///
-/// The three above are all "no surface exists", so the warning would name a
-/// permission gap where the real gap is a missing feature.
-///
-/// `worker`, `inspector`, `net`, `addon`, `fs` and `child` *are* enforced, so
-/// none of them belongs here. `worker` became enforceable with the
-/// worker_threads landing; `inspector.open()` checks `inspector`.
-///
-/// `--permission` itself is deliberately absent: the warning is what told a user
-/// the model was not enforced, and for the scopes above the honest signal is the
-/// missing-feature error, not a permission one.
+/// The list is documentation, not the rule — that is [`warns_about`], which is
+/// driven by the option table so a `NoOp{}` name can never be mis-declared.
 const UNIMPLEMENTED: &[&str] = &[
     "--experimental-network-inspection",
     "--experimental-shadow-realm",
-    "--experimental-vm-modules",
     "--experimental-web-worker",
-    "--js-source-phase-imports",
+    "--experimental-eventsource",
 ];
 
 /// Experimental flags whose behaviour *is* implemented.
@@ -984,7 +998,44 @@ const IMPLEMENTED_EXPERIMENTAL: &[&str] = &[
     "--experimental-bench",
     "--experimental-stream-iter",
     "--experimental-sqlite",
+    // `--experimental-vm-modules` is a `BOOL_FIELD` whose value rustnode both
+    // stores and honours. `lib/internal/process/pre_execution.js:197` reads it
+    // and patches `vm` with `Module`, `SourceTextModule` and `SyntheticModule`,
+    // and `lib/internal/vm.js:84` keys the dynamic-import sentinel on it. The
+    // observable parity is exact: `typeof require('vm').SourceTextModule` is
+    // `"undefined"` without the flag and `"function"` with it, on both runtimes.
+    // The store carries the value for the same reason — `getOptionValue` returns
+    // `true` here exactly as it does on Node — so the warning this used to print
+    // was false.
+    "--experimental-vm-modules",
 ];
+
+/// Whether accepting `argument` should print the not-implemented warning.
+///
+/// The warning means one thing: **rustnode has no behaviour for this flag, and
+/// Node does.** Both halves are required, and they are answered differently.
+///
+/// The second is a fact about the option table, so it is read from the table.
+/// Node has no behaviour for a `NoOp{}` entry — `Parse`'s `kNoOp` arm is a bare
+/// `break` — so there is nothing for rustnode to be missing. Warning about
+/// `--experimental-fetch` was a lie printed on every run: the feature it names is
+/// unconditionally on, and Node keeps the spelling only so old command lines
+/// still start. `kV8Option` entries are the same shape but never reach here: they
+/// are forwarded to V8, so their behaviour is V8's and rustnode gets it free.
+///
+/// The first half is a fact about *this build*, which the table cannot know, so
+/// it stays an explicit list. [`IMPLEMENTED_EXPERIMENTAL`] names the flags whose
+/// value or code path rustnode honours.
+///
+/// The default is therefore to **warn**: a declared experimental flag nobody has
+/// proved this build honours keeps saying so. That direction is deliberate. The
+/// opposite default — warn only about names on a list — is what made
+/// `--experimental-vm-modules` a false alarm while `--experimental-eventsource`,
+/// which really is missing (`typeof globalThis.EventSource` is `"undefined"` here
+/// and `"function"` on Node), stayed honest. Silence has to be earned per flag.
+fn warns_about(argument: &str) -> bool {
+    !rn_bind_options::is_no_op(argument) && !IMPLEMENTED_EXPERIMENTAL.contains(&argument)
+}
 
 /// Parses the `NODE_OPTIONS` environment variable, with Node's rules.
 ///
@@ -1732,11 +1783,11 @@ pub fn parse_with_env(
         if (argument.starts_with("--experimental-") || argument.starts_with("--no-experimental-"))
             && rn_bind_options::declares(argument)
         {
-            // Most of the surface gates modules that have not landed, so those
-            // flags stay in `unimplemented` and say so. `--experimental-bench`
-            // is the exception: it is implemented, so reporting it missing
-            // would be a lie that some tests read.
-            if !IMPLEMENTED_EXPERIMENTAL.contains(&argument.as_str()) {
+            // Whether this is reported depends on what Node's table says the
+            // flag *is*, not on the `--experimental-` prefix: a `NoOp{}` entry
+            // has no behaviour in Node either, so there is nothing missing here
+            // and the warning would be false. See [`warns_about`].
+            if warns_about(argument) {
                 unimplemented.insert(argument.clone());
             }
             options.exec_argv.push(argument.clone());
@@ -2577,8 +2628,105 @@ mod tests {
 
     #[test]
     fn an_unimplemented_experimental_flag_is_reported_not_hidden() {
+        // A flag Node binds to a real field, whose behaviour rustnode lacks.
+        // `experimental_network_inspection` reaches `setupNetworkTracking` in
+        // `src/inspector_agent.cc`, and this build publishes no such method.
+        let options = parse_of(&["--experimental-network-inspection", "-e", "1"]).expect("parses");
+        assert_eq!(options.unimplemented, ["--experimental-network-inspection"]);
+    }
+
+    /// The rule the warning has to follow, as a table over Node's own kinds.
+    ///
+    /// Driven from `rn_bind_options` rather than from a literal list, because the
+    /// defect was a literal list drifting from the table: every `NoOp{}` entry was
+    /// warned about even though Node does nothing behind it either. A name added
+    /// to `src/node_options.cc` as `NoOp` therefore cannot be mis-declared here
+    /// without this test failing.
+    #[test]
+    fn a_no_op_flag_is_never_reported_unimplemented() {
+        let no_ops = rn_bind_options::no_op_names();
+        // The table has 19 such entries; a generator change that emptied this
+        // list would make the loop below assert nothing.
+        assert!(no_ops.len() >= 13, "{no_ops:?}");
+
+        for flag in no_ops {
+            let options = parse_of(&[flag, "-e", "1"])
+                .unwrap_or_else(|error| panic!("{flag} should parse: {error}"));
+            assert!(
+                options.unimplemented.is_empty(),
+                "{flag} is NoOp in Node's table but was reported unimplemented"
+            );
+        }
+    }
+
+    /// The other direction: silencing `NoOp` must not silence a flag whose
+    /// behaviour really is missing. Without this, a `warns_about` that returned
+    /// `false` unconditionally would pass the test above.
+    ///
+    /// Every one of these was measured missing against the pinned oracle:
+    /// `--experimental-eventsource` leaves `globalThis.EventSource` `undefined`
+    /// where Node reports `function`, and the other three are the C++ surfaces
+    /// named in [`UNIMPLEMENTED`].
+    #[test]
+    fn a_flag_with_real_behaviour_is_still_reported() {
+        for flag in UNIMPLEMENTED {
+            assert!(
+                !rn_bind_options::is_no_op(flag),
+                "{flag} is a NoOp, so it does not belong in UNIMPLEMENTED"
+            );
+            let options = parse_of(&[flag, "-e", "1"])
+                .unwrap_or_else(|error| panic!("{flag} should parse: {error}"));
+            assert_eq!(options.unimplemented, [*flag]);
+        }
+    }
+
+    /// Silence has to be earned, so the two lists cannot overlap: a flag in both
+    /// would be one this build both does and does not honour.
+    #[test]
+    fn no_flag_is_both_implemented_and_unimplemented() {
+        for flag in IMPLEMENTED_EXPERIMENTAL {
+            assert!(
+                !UNIMPLEMENTED.contains(flag),
+                "{flag} is claimed by both lists"
+            );
+        }
+    }
+
+    /// A flag that is neither implemented nor known-missing still warns.
+    ///
+    /// This is the direction the defect was in: `--experimental-vm-modules` was a
+    /// false alarm because nothing proved it worked, and the fix is to prove the
+    /// ones that do rather than to assume it. A flag nobody has verified keeps
+    /// saying so.
+    #[test]
+    fn an_unverified_experimental_flag_still_warns() {
+        for flag in [
+            "--experimental-storage-inspection",
+            "--experimental-worker-inspection",
+            "--experimental-inspector-network-resource",
+            "--experimental-webstorage",
+            "--experimental-quic",
+        ] {
+            assert!(!rn_bind_options::is_no_op(flag), "{flag}");
+            assert!(!IMPLEMENTED_EXPERIMENTAL.contains(&flag), "{flag}");
+            let options = parse_of(&[flag, "-e", "1"]).expect("parses");
+            assert_eq!(options.unimplemented, [flag]);
+        }
+    }
+
+    /// `--experimental-vm-modules` is a `BOOL_FIELD` whose value rustnode stores
+    /// *and* whose reader is in vendored `lib/**`, so the feature is live and the
+    /// warning this used to print was false. `typeof
+    /// require('vm').SourceTextModule` is `"function"` with the flag on both
+    /// runtimes, which is the observable the oracle check pins.
+    #[test]
+    fn an_experimental_flag_whose_value_is_honoured_is_not_reported() {
         let options = parse_of(&["--experimental-vm-modules", "-e", "1"]).expect("parses");
-        assert_eq!(options.unimplemented, ["--experimental-vm-modules"]);
+        assert!(options.unimplemented.is_empty());
+        assert_eq!(
+            options.parsed.value_of("--experimental-vm-modules"),
+            Some(rn_bind_options::ParsedValue::Bool(true))
+        );
     }
 
     /// The bug this whole change exists for: `--permission` used to be accepted
@@ -2914,9 +3062,73 @@ mod tests {
             options.unimplemented
         );
 
-        let options = parse_of(&["--experimental-vm-modules", "-e", "1"]).expect("parses");
-        assert_eq!(options.unimplemented, ["--experimental-vm-modules"]);
+        let options = parse_of(&["--experimental-shadow-realm", "-e", "1"]).expect("parses");
+        assert_eq!(options.unimplemented, ["--experimental-shadow-realm"]);
         assert!(options.v8_args.is_empty(), "{:?}", options.v8_args);
+    }
+
+    /// `--require-module` defaults to true, and the `--no-` spellings both clear
+    /// it in the same store entry.
+    ///
+    /// The default is the part that matters most: `loader.js:1897` reads this to
+    /// decide whether a `require()`d file is reparsed for ESM syntax, and
+    /// `:2104` throws `ERR_REQUIRE_ESM` when it is off. `DEFINE_BOOL_FIELD(
+    /// require_module) = true` in `src/node_options.h:216` is where the default
+    /// comes from, so a store that started `false` would break `require()` of
+    /// ESM everywhere, not only under the flag.
+    #[test]
+    fn require_module_defaults_to_true_and_each_negation_clears_it() {
+        let options = parse_of(&["-e", "1"]).expect("parses");
+        assert_eq!(
+            options.parsed.value_of("--require-module"),
+            Some(rn_bind_options::ParsedValue::Bool(true))
+        );
+
+        for flag in ["--no-require-module", "--no-experimental-require-module"] {
+            let options = parse_of(&[flag, "-e", "1"])
+                .unwrap_or_else(|error| panic!("{flag} should parse: {error}"));
+            assert_eq!(
+                options.parsed.value_of("--require-module"),
+                Some(rn_bind_options::ParsedValue::Bool(false)),
+                "{flag} left --require-module set"
+            );
+        }
+    }
+
+    /// The two spellings are one field in Node, so the *last* one wins across
+    /// both and each name reports the winner.
+    ///
+    /// Node binds `--require-module` and `--experimental-require-module` to the
+    /// same `BOOL_FIELD(require_module)` (`src/node_options.cc:719` and `:724`),
+    /// and `Parse` assigns as it walks. A store that kept the two names apart
+    /// would answer `false` for the second command line below, which sends
+    /// `loader.js` down the `ERR_REQUIRE_ESM` branch after the user asked for
+    /// the opposite.
+    #[test]
+    fn the_require_module_aliases_share_one_value() {
+        let cases = [
+            (
+                ["--no-require-module", "--experimental-require-module"],
+                true,
+            ),
+            (
+                ["--experimental-require-module", "--no-require-module"],
+                false,
+            ),
+            (["--no-require-module", "--require-module"], true),
+            (["--require-module", "--no-require-module"], false),
+        ];
+        for (flags, expected) in cases {
+            let options = parse_of(&[flags[0], flags[1], "-e", "1"])
+                .unwrap_or_else(|error| panic!("{flags:?} should parse: {error}"));
+            for name in ["--require-module", "--experimental-require-module"] {
+                assert_eq!(
+                    options.parsed.value_of(name),
+                    Some(rn_bind_options::ParsedValue::Bool(expected)),
+                    "{flags:?} gave the wrong {name}"
+                );
+            }
+        }
     }
 
     /// `-c` and `--check` are the same option, and both reach `check_syntax`.
