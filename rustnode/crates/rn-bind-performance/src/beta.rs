@@ -349,7 +349,7 @@ pub(crate) fn student_t_upper_quantile(mut p: f64, df: f64) -> f64 {
     // or below makes the `while` below run until the bound overflows, so the clamp
     // is what keeps a `confidence` of exactly `1` from looping forever. The JS
     // layer rejects those values, so this only guards a direct native call.
-    if !(p > 0.0) {
+    if p.is_nan() || p <= 0.0 {
         p = f64::MIN_POSITIVE;
     }
     let mut lo = 0.0_f64;

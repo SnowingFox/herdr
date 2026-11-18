@@ -187,8 +187,6 @@ fn exact_support(
         return None;
     }
     let first = lo;
-
-    lo = first;
     hi = len;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
@@ -362,8 +360,9 @@ pub fn calculate(
     result.quantiles[0] = lowest;
     result.quantiles[probabilities.len() - 1] = highest;
 
-    for i in 1..probabilities.len() - 1 {
-        let mut value = quantile(snapshot, probabilities[i], dequantization);
+    for (i, probability) in probabilities.iter().enumerate().take(probabilities.len() - 1).skip(1)
+    {
+        let mut value = quantile(snapshot, *probability, dequantization);
         value = clamp(value, lowest, highest);
         if value < result.quantiles[i - 1] {
             value = result.quantiles[i - 1];
