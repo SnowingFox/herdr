@@ -179,6 +179,13 @@ pub struct Options {
     /// `kAllowedInEnvvar` — so it is read from the environment's store rather
     /// than only from the command-line walk.
     pub force_repl: bool,
+    /// `--check`/`-c`: parse the entry point instead of running it.
+    ///
+    /// Read after the walk rather than during it, because it decides the
+    /// [`Source`] in the same place Node's `StartExecution` reads
+    /// `options()->syntax_check_only`, and because the flag can appear on either
+    /// side of the script argument's position.
+    pub syntax_check_only: bool,
 }
 
 impl Options {
@@ -208,6 +215,7 @@ impl Options {
             print_version: false,
             print_help: false,
             force_repl: false,
+            syntax_check_only: false,
         }
     }
 
@@ -415,6 +423,17 @@ pub enum Source {
     /// Remaining positional arguments are test globs or file paths, so they
     /// stay untouched in `process.argv`.
     Test,
+    /// `--check`/`-c`: parse the entry point and exit without running it, which
+    /// is `internal/main/check_syntax`.
+    ///
+    /// A [`Source`] rather than a flag for the same reason as [`Self::Help`]:
+    /// the checking itself is Node's, and `check_syntax.js` decides the module
+    /// format, reads the file or stdin, and reports the `SyntaxError` through
+    /// `wrapSafe`/`ModuleWrap`. Reimplementing any of that here would be a
+    /// second copy of the loader's format rules. The positional argument, when
+    /// there is one, stays in `process.argv`, because that is where
+    /// `check_syntax.js` reads it from (it resolves `process.argv[1]` itself).
+    CheckSyntax,
 }
 
 impl Source {
@@ -429,7 +448,12 @@ impl Source {
     pub fn uses_main_script(&self) -> bool {
         matches!(
             self,
-            Self::Stdin { .. } | Self::Help | Self::Inspect | Self::Test | Self::Repl
+            Self::Stdin { .. }
+            | Self::Help
+            | Self::Inspect
+            | Self::Test
+            | Self::Repl
+            | Self::CheckSyntax
         )
     }
 
@@ -441,6 +465,7 @@ impl Source {
             Self::Inspect => Some("internal/main/inspect"),
             Self::Test => Some("internal/main/test_runner"),
             Self::Repl => Some("internal/main/repl"),
+            Self::CheckSyntax => Some("internal/main/check_syntax"),
             _ => None,
         }
     }
@@ -1106,6 +1131,19 @@ pub fn parse_with_env(
             continue;
         }
 
+        // `--check`/`-c` selects `internal/main/check_syntax` instead of running
+        // the entry point. Both spellings are in Node's option table as
+        // `--check` plus the `-c` alias, and `--no-check` clears it the way any
+        // boolean negation does, so all three go through [`flag_name`].
+        if let Some((name, negated)) = flag_name(argument) {
+            if name == "--check" {
+                options.syntax_check_only = !negated;
+                options.exec_argv.push(argument.clone());
+                index += 1;
+                continue;
+            }
+        }
+
         if UNIMPLEMENTED.contains(&argument.as_str()) {
             unimplemented.insert(argument.clone());
             options.exec_argv.push(argument.clone());
@@ -1397,6 +1435,19 @@ pub fn parse_with_env(
                 print: print_eval,
             }
         }
+    } else if options.syntax_check_only {
+        // `StartExecution` reaches `syntax_check_only` only after
+        // `has_eval_string` (`src/node.cc:380` against `:384`), and the pair is
+        // already rejected by [`finish`] with Node's own sentence, so reaching
+        // here means there is no `-e` to run instead.
+        //
+        // The positional argument is `process.argv[1]`, which is what
+        // `check_syntax.js` resolves and reads; with none, it reads stdin. Both
+        // cases keep the original spelling here because the script does the
+        // path resolution itself, and doing it here would make its
+        // `process.argv[1]` already-absolute in a way Node's is not yet.
+        options.script_args = positional.to_vec();
+        Source::CheckSyntax
     } else if let Some((script, rest)) = positional.split_first() {
         // A positional is the script path, and `-` is the marker for stdin
         // rather than a file named `-`: `run_main_module` is skipped for it
@@ -1449,11 +1500,14 @@ pub fn parse_with_env(
 /// `--no-version` clears what an earlier `--version` set instead of being an
 /// unknown option.
 ///
-/// Only the four spellings the caller handles are canonicalized, and they are
+/// Only the six spellings the caller handles are canonicalized, and they are
 /// returned as `'static` strings so the `--no-` prefix can be dropped without an
 /// allocation. Returns `None` for anything else, including a short flag with a
 /// value glued on (`-v=`): `Parse` only splits on `=` when the argument starts
 /// with two dashes, so `-v=` is V8's `bad option`, not `-v`.
+///
+/// `-c` is the alias table's spelling of `--check`, and `--check` is a boolean,
+/// so it takes the `=value` form and the `--no-` negation like the two above.
 fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
     // Only a `--long` argument is split at `=`: `Parse` skips the split entirely
     // for a short flag, so `-v=1` is not `-v`.
@@ -1465,8 +1519,10 @@ fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
     match name {
         "--version" | "-v" => Some(("--version", false)),
         "--help" | "-h" => Some(("--help", false)),
+        "--check" | "-c" => Some(("--check", false)),
         "--no-version" => Some(("--version", true)),
         "--no-help" => Some(("--help", true)),
+        "--no-check" => Some(("--check", true)),
         _ => None,
     }
 }
@@ -1638,6 +1694,15 @@ fn apply_abort(argument: &str, options: &mut Options) {
 /// the walk.
 fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Result<Options, ParseError> {
     options.unimplemented = unimplemented.into_iter().collect();
+    // `EnvironmentOptions::CheckOptions` (`src/node_options.cc:318`) rejects this
+    // pair by name. Node's dispatch would otherwise reach `--eval` first
+    // (`src/node.cc:380` before `:384`), so without the check the command would
+    // quietly evaluate the string and never say the two cannot be combined.
+    if options.syntax_check_only && matches!(options.source, Source::Eval { .. }) {
+        return Err(ParseError::OptionValue(
+            "either --check or --eval can be used, not both".to_string(),
+        ));
+    }
     // `PerIsolateOptions::CheckOptions` converts the percentage before V8 ever
     // sees a flag, and appends its answer as `--max_old_space_size=<mb>`. That
     // append is what gives the percentage precedence over an explicit
@@ -2036,6 +2101,77 @@ mod tests {
         let options = parse_of(&["--experimental-vm-modules", "-e", "1"]).expect("parses");
         assert_eq!(options.unimplemented, ["--experimental-vm-modules"]);
         assert!(options.v8_args.is_empty(), "{:?}", options.v8_args);
+    }
+
+    /// `-c` and `--check` are the same option, and both reach `check_syntax`.
+    ///
+    /// The two spellings matter because Node's own suite uses both: `-c` is the
+    /// alias table's form (`src/node_options.cc`'s `AddAlias`), so a parser that
+    /// took only `--check` would still reject half the syntax tests. The source
+    /// is what the dispatch reads, so asserting on it is asserting on the
+    /// routing rather than on a flag bit nothing consumes.
+    #[test]
+    fn check_selects_the_syntax_check_source_in_both_spellings() {
+        for flag in ["-c", "--check"] {
+            let options = parse_of(&[flag, "app.js"]).expect("parses");
+            assert!(
+                matches!(options.source, Source::CheckSyntax),
+                "{flag} must select check_syntax, got {:?}",
+                options.source
+            );
+            // The positional stays in `process.argv` because `check_syntax.js`
+            // resolves `process.argv[1]` itself; resolving it here would make
+            // the script see an already-absolute path Node's does not.
+            assert_eq!(options.script_args, ["app.js"]);
+            assert!(options.exec_argv.iter().any(|entry| entry == flag));
+        }
+    }
+
+    /// `--no-check` clears a `--check` given before it, as for any boolean.
+    #[test]
+    fn no_check_clears_an_earlier_check() {
+        let options = parse_of(&["--check", "--no-check", "app.js"]).expect("parses");
+        assert!(!options.syntax_check_only);
+        assert!(
+            !matches!(options.source, Source::CheckSyntax),
+            "a cleared flag must not select check_syntax, got {:?}",
+            options.source
+        );
+    }
+
+    /// `--check` with no positional reads stdin, so the source is still
+    /// `CheckSyntax` and there is no script argument to hand the script.
+    #[test]
+    fn check_without_a_script_still_selects_check_syntax() {
+        let options = parse_of(&["-c"]).expect("parses");
+        assert!(matches!(options.source, Source::CheckSyntax));
+        assert!(options.script_args.is_empty(), "{:?}", options.script_args);
+    }
+
+    /// `CheckOptions` rejects `--check` with `--eval` by name.
+    ///
+    /// Without this the dispatch reaches `--eval` first — Node's `StartExecution`
+    /// checks `has_eval_string` (`src/node.cc:380`) before `syntax_check_only`
+    /// (`:384`) — so the command would quietly evaluate the string instead of
+    /// reporting that the two cannot be combined.
+    #[test]
+    fn check_with_eval_is_rejected_with_nodes_sentence() {
+        let error = parse_of(&["-c", "-e", "1"]).expect_err("rejects");
+        assert_eq!(error, "either --check or --eval can be used, not both");
+    }
+
+    /// The check flag must not swallow the `--check`-shaped V8 flags.
+    ///
+    /// `flag_name` matches exact spellings, so a longer name that merely starts
+    /// with `--check` stays unknown and is left for V8 to accept or refuse. This
+    /// pins the boundary rather than the specific flag.
+    #[test]
+    fn a_flag_merely_prefixed_with_check_is_not_check() {
+        assert!(flag_name("--check-not-a-flag").is_none());
+        assert_eq!(flag_name("-c"), Some(("--check", false)));
+        assert_eq!(flag_name("--no-check"), Some(("--check", true)));
+        // A short flag never splits at `=`, so `-c=1` is not `-c`.
+        assert!(flag_name("-c=1").is_none());
     }
 
     #[test]
