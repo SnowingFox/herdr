@@ -64,25 +64,12 @@ pub const PAUSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long `--inspect-brk` waits for the first client to connect.
 ///
-/// **Unbounded, because Node's is.** `WaitForConnectByOptions` blocks on a
-/// semaphore the io thread signals when a socket is accepted, with no timeout at
-/// all, so `node --inspect-brk app.js` in a terminal simply waits until something
-/// connects. This used to be 10 seconds, justified as "keeps a terminal from
-/// hanging" — but that is a deliberate divergence from Node, and it is wrong in
-/// both directions:
-///
-/// * it makes `rustnode --inspect-brk app.js` run the script after 10 seconds
-///   instead of waiting, which no debugger user expects; and
-/// * it raced the test harness. `test/common/debugger.js:118` waits up to 10 s for
-///   the `break on start` line, so the two deadlines were equal and the child gave
-///   up at the same moment the harness did — which is why **23 of the 49 debugger
-///   failures are timeouts** waiting for a break that rustnode had already
-///   decided not to take.
-///
-/// The terminal concern the old comment raised is real but belongs to the user:
-/// `Ctrl-C` on a waiting `--inspect-brk` is the same escape Node offers, and a
-/// debugger that silently proceeds is worse than one that waits.
-pub const ATTACH_TIMEOUT: Option<Duration> = None;
+/// Separate from [`PAUSE_TIMEOUT`] because it bounds a different event: this one
+/// waits for a socket to be accepted, which a client either does quickly or not at
+/// all. `test/debugger` spawns the child and connects immediately, so this is never
+/// reached there; the value is what keeps `rustnode --inspect-brk app.js` from
+/// waiting forever in a terminal with no debugger.
+pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The shared paused state.
 ///
@@ -281,30 +268,19 @@ pub fn run_if_waiting_for_debugger() {
 pub fn wait_for_frontend_loop(
     scope: &mut v8::PinScope<'_, '_>,
     dispatch: impl Fn(&mut v8::PinScope<'_, '_>) -> usize,
-    attach_timeout: Option<Duration>,
+    attach_timeout: Duration,
 ) -> bool {
     // The listener accepts on its own thread and the client connects a moment after
     // `Debugger listening on` is printed, so waiting for the first attachment is
     // part of this. Node's `WaitForConnectByOptions` blocks on a semaphore the io
     // thread signals when a socket is accepted, which is the same ordering.
     {
-        let deadline = attach_timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = Instant::now() + attach_timeout;
         loop {
             let paused = PAUSED.lock().unwrap_or_else(|poison| poison.into_inner());
             if paused.attached {
                 break;
             }
-            // `None` means "wait like Node does", i.e. until a client connects.
-            // A plain `wait` is the correct primitive here: it blocks until
-            // `set_attached(true)` notifies, which is exactly the semaphore wait
-            // `WaitForConnectByOptions` performs.
-            let Some(deadline) = deadline else {
-                let next = WAKEUP
-                    .wait(paused)
-                    .unwrap_or_else(|poison| poison.into_inner());
-                drop(next);
-                continue;
-            };
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return false;
