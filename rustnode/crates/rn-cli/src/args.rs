@@ -216,6 +216,21 @@ pub struct Options {
     /// `Thrown at:` block from that capture instead of the
     /// `(Use \`node --trace-uncaught ...\`)` hint.
     pub trace_uncaught: bool,
+    /// `--v8-options`: print V8's own option list and run nothing.
+    ///
+    /// `PerProcessOptions::print_v8_help`, answered at `src/node.cc:1297` —
+    /// which is to say immediately after `--version` (`:1282`) and before
+    /// `V8::Initialize`, by calling `V8::SetFlagsFromString("--help")`. V8
+    /// writes the list itself, so the text is V8's and not a transcription.
+    pub print_v8_options: bool,
+    /// `--zero-fill-buffers`: zero-fill every newly allocated `Buffer`.
+    ///
+    /// `PerProcessOptions::zero_fill_all_buffers` (`src/node_options.h:430`).
+    /// The decision is made at allocation time in `rn-bind-buffer`, so this is
+    /// recorded into the shared hook slot rather than read from here; the field
+    /// exists so the walk has somewhere to put the answer and the `--no-`
+    /// negation can clear it.
+    pub zero_fill_buffers: bool,
     /// `--bench`: run Node's benchmark runner instead of a script.
     ///
     /// `EnvironmentOptions::bench_runner` (`src/node_options.h`), read by
@@ -276,6 +291,8 @@ impl Options {
             syntax_check_only: false,
             trace_exit: false,
             trace_uncaught: false,
+            print_v8_options: false,
+            zero_fill_buffers: false,
             bench_runner: false,
             env_files: Vec::new(),
             env_file_store: std::collections::BTreeMap::new(),
@@ -659,6 +676,32 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
     "--no-strip-types",
     "--watch",
     "--watch-preserve-output",
+    // The three below are read by code that already exists, so accepting them
+    // is not the "silently ignored" failure this list is warned about: the
+    // value reaches the store, and the reader acts on it.
+    //
+    // * `--insecure-http-parser` — `lib/internal/http/common.js:33` reads it
+    //   through `getOptionValue` and folds it into `calculateLenientFlags`,
+    //   which the parser's `initialize` already honours.
+    // * `--no-extra-info-on-fatal-exception` — `ReportException`
+    //   (`src/node_errors.cc:590`) prints the trailing `Node.js <version>` line
+    //   only when `extra_info_on_fatal_exception` is set. `rn-errors` reads the
+    //   same value out of the store.
+    // * `--disable-sigusr1` — the inspector agent's SIGUSR1 listener is what it
+    //   turns off; rustnode's agent never installs one, so the flag's effect is
+    //   already the state of this build and accepting it states the truth.
+    "--insecure-http-parser",
+    "--no-insecure-http-parser",
+    "--extra-info-on-fatal-exception",
+    "--no-extra-info-on-fatal-exception",
+    "--disable-sigusr1",
+    "--no-disable-sigusr1",
+    // Read by `rn-napi`'s `CallbackIntoModule` equivalent rather than by the
+    // CLI: it decides whether an old addon's throw is fatal or a DEP0168
+    // warning. Accepting it here is what puts the value in the store that
+    // `rn-napi` asks.
+    "--force-node-api-uncaught-exceptions-policy",
+    "--no-force-node-api-uncaught-exceptions-policy",
 ];
 
 /// Test-runner flags that take no value.
@@ -1236,6 +1279,11 @@ pub fn parse_with_env(
         {
             options.trace_uncaught = value;
         }
+        if let Some(rn_bind_options::ParsedValue::Bool(value)) =
+            env_store.value_of("--zero-fill-buffers")
+        {
+            options.zero_fill_buffers = value;
+        }
         // The environment's values become the base the command line is applied
         // to, which is Node's two-pass order rather than a merge of two lists.
         options.parsed = env_store;
@@ -1485,6 +1533,55 @@ pub fn parse_with_env(
                     options.exec_argv.push(argument.clone());
                     index += 1;
                     continue;
+                }
+                // `--v8-options` prints V8's list and exits 0. It is recorded
+                // here rather than answered in this walk because V8 is not
+                // initialised yet: `main` answers it where `src/node.cc:1297`
+                // does, after the V8 flag vector is applied and before
+                // `V8::Initialize`.
+                //
+                // The flag is `kDisallowedInEnvvar`, so `NODE_OPTIONS` is
+                // refused by `rn_bind_options::parse_env` before this point;
+                // `test-cli-node-options-disallowed.js` asserts exactly that.
+                "--v8-options" => {
+                    options.print_v8_options = sets;
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
+                // `--zero-fill-buffers` is `kAllowedInEnvvar`, so its value can
+                // also come from the store; `finish` installs whichever source
+                // won.
+                "--zero-fill-buffers" => {
+                    options.zero_fill_buffers = sets;
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
+                // `--debug` and `--debug-brk` are rejected, not accepted. They
+                // are `BOOL_FIELD(deprecated_debug)` in Node's table and
+                // `CheckOptions` turns that into DEP0062
+                // (`src/node_options.cc:59`) — an error, exit 9, on every run
+                // that names either one. Accepting them quietly would claim a
+                // debugger endpoint this build does not open.
+                //
+                // `--debug-brk=` is an alias for `--debug-brk` in Node's table,
+                // so the `=value` form is the same rejection; `--no-debug`
+                // clears a flag that was never set, which is not an error.
+                "--debug" | "--debug-brk" if negated => {
+                    // `--no-debug` clears a flag that was never set. Only the
+                    // non-negated spellings are the DEP0062 error, so this arm
+                    // exists to let the negation through.
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
+                "--debug" | "--debug-brk" => {
+                    return Err(ParseError::OptionValue(
+                        "[DEP0062]: `node --debug` and `node --debug-brk` are invalid. \
+                         Please use `node --inspect` and `node --inspect-brk` instead."
+                            .to_string(),
+                    ));
                 }
                 _ => {}
             }
@@ -1901,12 +1998,18 @@ fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
         "--trace-exit" => Some(("--trace-exit", false)),
         "--trace-uncaught" => Some(("--trace-uncaught", false)),
         "--bench" => Some(("--bench", false)),
+        "--v8-options" => Some(("--v8-options", false)),
+        "--zero-fill-buffers" => Some(("--zero-fill-buffers", false)),
+        "--debug" | "--debug-brk" => Some(("--debug-brk", false)),
+        "--no-debug" | "--no-debug-brk" => Some(("--debug-brk", true)),
         "--no-version" => Some(("--version", true)),
         "--no-help" => Some(("--help", true)),
         "--no-check" => Some(("--check", true)),
         "--no-trace-exit" => Some(("--trace-exit", true)),
         "--no-trace-uncaught" => Some(("--trace-uncaught", true)),
         "--no-bench" => Some(("--bench", true)),
+        "--no-v8-options" => Some(("--v8-options", true)),
+        "--no-zero-fill-buffers" => Some(("--zero-fill-buffers", true)),
         _ => None,
     }
 }
@@ -1998,7 +2101,15 @@ fn is_inspect_flag(argument: &str) -> bool {
     let name = argument.split_once('=').map_or(argument, |(name, _)| name);
     matches!(
         name,
-        "--inspect" | "--inspect-port" | "--inspect-brk" | "--inspect-brk-node" | "--inspect-wait"
+        "--inspect"
+            | "--inspect-port"
+            | "--inspect-brk"
+            | "--inspect-brk-node"
+            | "--inspect-wait"
+            | "--no-inspect"
+            | "--no-inspect-brk"
+            | "--no-inspect-wait"
+            | "--no-inspect-brk-node"
     )
 }
 
@@ -2055,6 +2166,21 @@ fn apply_inspect(argument: &str, options: &mut Options) -> Result<(), String> {
         "--inspect" => {
             options.debug_port = parsed;
             options.inspect_enabled = true;
+        }
+        // `--no-inspect` is the negation of a boolean in Node's table, so it
+        // clears what an earlier source set instead of leaving it open. Node
+        // options are last-write-wins, and `test-debugger-no-inspect-brk.js`
+        // asserts both directions: `--no-inspect --no-inspect-brk --inspect-brk`
+        // still breaks, and a lone `--no-inspect` before `probe.js` refuses.
+        "--no-inspect" => {
+            options.inspect_enabled = false;
+            options.inspect_wait = false;
+            options.inspect_break_node = false;
+        }
+        "--no-inspect-brk" => options.inspect_wait = false,
+        "--no-inspect-wait" => options.inspect_wait = false,
+        "--no-inspect-brk-node" => {
+            options.inspect_break_node = false;
         }
         // `--inspect-wait` opens the endpoint and blocks for a client like
         // `--inspect-brk`, but arms no break-on-start: Node's `wait_for_connect()`

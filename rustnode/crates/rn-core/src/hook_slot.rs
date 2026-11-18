@@ -265,6 +265,10 @@ struct HookState {
     trace_exit: bool,
     trace_uncaught: bool,
     stack_trace_limit: i64,
+    zero_fill_buffers: bool,
+    extra_info_on_fatal_exception: bool,
+    node_version: String,
+    force_node_api_uncaught_exceptions_policy: bool,
 }
 
 /// Node's `PerIsolateOptions::stack_trace_limit` default (`src/node_options.h:359`).
@@ -289,6 +293,12 @@ impl Default for HookState {
             trace_exit: false,
             trace_uncaught: false,
             stack_trace_limit: DEFAULT_STACK_TRACE_LIMIT,
+            zero_fill_buffers: false,
+            // `extra_info_on_fatal_exception` defaults to *true*
+            // (`src/node_options.cc:1419`), unlike every other boolean here.
+            extra_info_on_fatal_exception: true,
+            node_version: String::new(),
+            force_node_api_uncaught_exceptions_policy: false,
         }
     }
 }
@@ -435,6 +445,78 @@ pub fn set_stack_trace_limit(value: i64) {
 #[must_use]
 pub fn stack_trace_limit() -> i64 {
     STATE.with(|state| state.borrow().stack_trace_limit)
+}
+
+/// Records whether `--zero-fill-buffers` was on the command line.
+///
+/// `PerProcessOptions::zero_fill_all_buffers` (`src/node_options.h:430`), which
+/// `AllocateUnsafeArrayBuffer` reads (`src/node_buffer.cc:1831`). The allocation
+/// itself happens in `rn-bind-buffer`, on whichever thread asks, so the value
+/// has to live in the shared slot rather than in the CLI's `Options`.
+pub fn set_zero_fill_buffers(value: bool) {
+    STATE.with(|state| {
+        state.borrow_mut().zero_fill_buffers = value;
+    });
+}
+
+/// Whether `--zero-fill-buffers` was given.
+#[must_use]
+pub fn zero_fill_buffers() -> bool {
+    STATE.with(|state| state.borrow().zero_fill_buffers)
+}
+
+/// Records whether `--no-extra-info-on-fatal-exception` was given.
+///
+/// `EnvironmentOptions::extra_info_on_fatal_exception`, which `ReportException`
+/// reads to decide whether to print the trailing `Node.js <version>` line
+/// (`src/node_errors.cc:590`). It is one of the few booleans that defaults to
+/// true.
+pub fn set_extra_info_on_fatal_exception(value: bool) {
+    STATE.with(|state| {
+        state.borrow_mut().extra_info_on_fatal_exception = value;
+    });
+}
+
+/// Whether the fatal-exception trailer should be printed.
+#[must_use]
+pub fn extra_info_on_fatal_exception() -> bool {
+    STATE.with(|state| state.borrow().extra_info_on_fatal_exception)
+}
+
+/// Records the version string the fatal-exception trailer quotes.
+///
+/// `NODE_VERSION` is `rn-realm`'s, and `rn-realm` depends on `rn-errors`, so the
+/// text cannot be built where it is printed. The CLI records it once at startup
+/// and `rn-errors` reads it from here.
+pub fn set_node_version(version: String) {
+    STATE.with(|state| {
+        state.borrow_mut().node_version = version;
+    });
+}
+
+/// The version string the fatal-exception trailer quotes.
+#[must_use]
+pub fn node_version() -> String {
+    STATE.with(|state| state.borrow().node_version.clone())
+}
+
+/// Records whether `--force-node-api-uncaught-exceptions-policy` was given.
+///
+/// `EnvironmentOptions::force_node_api_uncaught_exceptions_policy`
+/// (`src/node_options.h:251`). `CallbackIntoModule` reads it to decide whether a
+/// module-API-version-9-or-older addon's throw becomes a fatal uncaught
+/// exception or a DEP0168 deprecation warning (`src/node_api.cc:148`), and
+/// `rn-napi` asks the same question here.
+pub fn set_force_node_api_uncaught_exceptions_policy(value: bool) {
+    STATE.with(|state| {
+        state.borrow_mut().force_node_api_uncaught_exceptions_policy = value;
+    });
+}
+
+/// Whether `--force-node-api-uncaught-exceptions-policy` was given.
+#[must_use]
+pub fn force_node_api_uncaught_exceptions_policy() -> bool {
+    STATE.with(|state| state.borrow().force_node_api_uncaught_exceptions_policy)
 }
 
 /// Installs a closure that writes to the process's standard error.

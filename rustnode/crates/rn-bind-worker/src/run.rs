@@ -95,6 +95,8 @@ pub struct WorkerDiagnostics {
     pub trace_uncaught: bool,
     /// `--stack-trace-limit`, which both of the above use for their frame count.
     pub stack_trace_limit: i32,
+    /// `--zero-fill-buffers`, for every buffer this worker allocates.
+    pub zero_fill_buffers: bool,
 }
 
 impl WorkerDiagnostics {
@@ -124,6 +126,7 @@ impl WorkerDiagnostics {
             trace_exit: flag("--trace-exit"),
             trace_uncaught: flag("--trace-uncaught"),
             stack_trace_limit,
+            zero_fill_buffers: flag("--zero-fill-buffers"),
         }
     }
 }
@@ -421,6 +424,7 @@ impl WorkerThread {
         rn_core::hook_slot::set_trace_exit(diagnostics.trace_exit);
         rn_core::hook_slot::set_trace_uncaught(diagnostics.trace_uncaught);
         rn_core::hook_slot::set_stack_trace_limit(i64::from(diagnostics.stack_trace_limit));
+        rn_core::hook_slot::set_zero_fill_buffers(diagnostics.zero_fill_buffers);
 
         let mut argv = vec![exec_path()];
         argv.extend(self.request.argv.iter().cloned());

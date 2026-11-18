@@ -123,6 +123,28 @@ fn main() {
     // script does later can turn them on.
     rn_core::hook_slot::set_trace_exit(options.trace_exit);
     rn_core::hook_slot::set_trace_uncaught(options.trace_uncaught);
+    // `--zero-fill-buffers` decides how `createUnsafeArrayBuffer` allocates, and
+    // that call happens in `rn-bind-buffer` on whichever thread asks, so the
+    // decision travels in the shared slot rather than in this struct.
+    rn_core::hook_slot::set_zero_fill_buffers(options.zero_fill_buffers);
+    // `ReportException` ends every uncaught report with `Node.js <version>`
+    // unless `--no-extra-info-on-fatal-exception` cleared it. The text lives in
+    // `rn-realm`, which depends on `rn-errors`, so the version is recorded here
+    // and read back from the slot rather than making that edge a cycle.
+    rn_core::hook_slot::set_node_version(rn_realm::versions::process_version_string().to_string());
+    if let Some(rn_bind_options::ParsedValue::Bool(value)) =
+        options.parsed.value_of("--extra-info-on-fatal-exception")
+    {
+        rn_core::hook_slot::set_extra_info_on_fatal_exception(value);
+    }
+    // `CallbackIntoModule`'s policy switch, read by `rn-napi` on every addon
+    // throw. Recorded here because the binding crate cannot see `Options`.
+    if let Some(rn_bind_options::ParsedValue::Bool(value)) = options
+        .parsed
+        .value_of("--force-node-api-uncaught-exceptions-policy")
+    {
+        rn_core::hook_slot::set_force_node_api_uncaught_exceptions_policy(value);
+    }
     // `env->exec_argv()`, which a worker without its own `options.execArgv`
     // inherits (`src/node_worker.cc:664`). Recording it here is what makes the
     // parent's `--trace-exit` reach a worker: the worker re-parses this list
@@ -265,6 +287,19 @@ fn main() {
     // `node --version --inspect` prints the version and never opens the socket.
     if options.print_version {
         println!("{}", rn_realm::versions::process_version_string());
+        terminate(0);
+    }
+
+    // `--v8-options`, answered at `src/node.cc:1297`: immediately after the
+    // version and before `V8::Initialize`, by handing V8 its own `--help`. V8
+    // writes the list, so the text is generated from the flags this build
+    // actually has rather than transcribed — which is the only way the answer
+    // can stay true across a V8 bump.
+    //
+    // Ordering is observable in the same way `--version`'s is: a bad flag still
+    // wins, because the V8 argument vector was applied a few lines up.
+    if options.print_v8_options {
+        v8::V8::set_flags_from_string("--help");
         terminate(0);
     }
 

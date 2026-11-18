@@ -603,6 +603,13 @@ fn report(
             rn_core::hook_slot::write_stderr(&format!("Thrown at:\n{frames}\n"));
         }
     }
+    // `src/node_errors.cc:590`, the last thing `ReportException` writes. It is
+    // printed here rather than by the caller because this is the one place that
+    // produces the uncaught text, and the ordering (after `Thrown at:`) is part
+    // of what the oracle's output has.
+    if let Some(trailer) = extra_info_on_fatal_exception_text() {
+        rn_core::hook_slot::write_stderr(&trailer);
+    }
 }
 
 /// Formats a V8 [`v8::StackTrace`] the way Node's `FormatStackTrace` does.
@@ -655,6 +662,26 @@ pub fn format_stack_trace(scope: &mut v8::PinScope, trace: &v8::StackTrace) -> S
         }
     }
     result
+}
+
+/// The `Node.js <version>` trailer `ReportException` ends with, if it is wanted.
+///
+/// `src/node_errors.cc:588-591`: after the exception and any `Thrown at:` block,
+/// Node writes a blank line and then `Node.js ` plus the version, unless
+/// `--no-extra-info-on-fatal-exception` cleared `extra_info_on_fatal_exception`
+/// (which defaults to true — `src/node_options.cc:1419`). It is the marker a
+/// reader uses to tell "the process died of an uncaught exception" from "it
+/// printed something and exited", so an oracle comparison of any uncaught throw
+/// depends on it.
+///
+/// Returns the text rather than writing it because the version string lives in
+/// `rn-realm`, which already depends on this crate — writing it here would need
+/// the reverse edge and make a cycle. The caller that has both writes the
+/// result.
+#[must_use]
+pub fn extra_info_on_fatal_exception_text() -> Option<String> {
+    rn_core::hook_slot::extra_info_on_fatal_exception()
+        .then(|| format!("\nNode.js {}\n", rn_core::hook_slot::node_version()))
 }
 
 /// Prints the `--trace-exit` warning for an environment that is ending.
