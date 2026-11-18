@@ -574,6 +574,16 @@ fn main() {
     ) {
         Ok(mut loaders) => {
             rn_core::profile::mark("realm bootstrap returned");
+            // The bootstrap stored the *requested* `--inspect-port`, which is 0
+            // when the caller asked the OS for one. A server started above
+            // already knows the port it bound, so that value wins — this is
+            // `DebugPortGetter` reading `env->inspector_host_port()`, which
+            // `inspector_io.cc` updates after `uv_tcp_bind` resolves a 0.
+            // `cluster` derives each worker's `--inspect-port` from this getter,
+            // so a 0 here made it pass `--inspect-port=1` and fail to start.
+            if let Some(bound) = rn_bind_inspector::bound_port() {
+                rn_uv::process_title::set_debug_port(bound);
+            }
             if options.expose_internals() {
                 bootstrap::expose_internals(scope, &loaders);
                 rn_core::profile::mark("expose_internals");

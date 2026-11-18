@@ -340,8 +340,26 @@ pub fn start_server_for_script(host: &str, port: u16, script_name: &str) -> Resu
     }
     let server = Server::start_for_target(host, port, Target::new(script_name))?;
     let url = server.ws_url();
+    // `process.debugPort` reports the port the listener actually bound, not the
+    // one that was requested. Node's `DebugPortGetter` reads
+    // `env->inspector_host_port()`, and `inspector_io.cc` writes the bound port
+    // back into it once `uv_tcp_bind` has resolved a `0`.
+    //
+    // Doing it here rather than at the CLI's call site covers `inspector.open()`
+    // too, which starts a server without going through the command line.
+    rn_uv::process_title::set_debug_port(server.port());
     SERVER.with(|slot| *slot.borrow_mut() = Some(server));
     Ok(url)
+}
+
+/// The port the live inspector listener bound, when one is running.
+///
+/// `None` before any server starts or after it is closed. Exists because the
+/// realm bootstrap writes the *requested* `--inspect-port` into
+/// `process.debugPort` unconditionally, and with `--inspect-port=0` that would
+/// overwrite the real port a server started moments earlier had recorded.
+pub fn bound_port() -> Option<u16> {
+    SERVER.with(|slot| slot.borrow().as_ref().map(Server::port))
 }
 
 /// Records the entry point a later `inspector.open()` should publish.
