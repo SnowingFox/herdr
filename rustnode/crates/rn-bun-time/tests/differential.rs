@@ -191,8 +191,13 @@ process.stdout.write(JSON.stringify({
     );
     assert_eq!(
         parsed["enumerableCount"],
-        serde_json::json!(9),
-        "the enumerable global count is a ratchet pinned at 9: {out}"
+        serde_json::json!(13),
+        "the enumerable global count is a ratchet: 9 always-present globals plus \
+         the four `eval_string` defines (`module`, `exports`, `__filename`, \
+         `__dirname`). It was pinned at 9 while `-e` compiled a bare \
+         `v8::Script` and left those four undefined, which is the bug that made \
+         9 correct; the oracle reports 21 for `-e`. The count only guards \
+         against a global we invent, so it moves with a fix like this one: {out}"
     );
 }
 
