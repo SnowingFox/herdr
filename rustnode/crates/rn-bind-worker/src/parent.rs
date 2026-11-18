@@ -82,7 +82,9 @@ pub fn any_keeps_loop_alive() -> bool {
         let workers = workers.borrow();
         workers.iter().any(|worker| {
             let handle = worker.borrow();
-            handle.keeps_loop_alive() || handle.has_pending_heap_statistics()
+            handle.keeps_loop_alive()
+                || handle.has_pending_heap_statistics()
+                || handle.has_pending_heap_snapshots()
         })
     })
 }
@@ -111,7 +113,9 @@ pub fn has_finished() -> bool {
             // A `getHeapStatistics()` answer that has arrived also needs this
             // pass to run, and a call still in flight needs the loop to stay
             // alive (`keeps_loop_alive` below) but is not work.
-            (handle.exited() && !handle.reported()) || handle.has_deliverable_heap_statistics()
+            (handle.exited() && !handle.reported())
+                || handle.has_deliverable_heap_statistics()
+                || handle.has_deliverable_heap_snapshots()
         })
     })
 }
@@ -159,6 +163,11 @@ pub fn report_finished(scope: &mut v8::PinScope<'_, '_>) -> bool {
         // separate immediate with no ordering guarantee against `onexit`.
         for pending in worker.borrow().take_ready_heap_statistics() {
             if crate::heap_statistics::deliver(scope, &pending) {
+                reported = true;
+            }
+        }
+        for pending in worker.borrow().take_ready_heap_snapshots() {
+            if crate::heap_snapshot::deliver(scope, &pending) {
                 reported = true;
             }
         }

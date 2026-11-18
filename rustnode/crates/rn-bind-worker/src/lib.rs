@@ -89,6 +89,7 @@
 //! test.
 
 pub mod handle;
+pub mod heap_snapshot;
 pub mod heap_statistics;
 pub mod parent;
 pub mod registry;

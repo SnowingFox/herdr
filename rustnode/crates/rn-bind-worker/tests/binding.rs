@@ -204,7 +204,7 @@ fn the_worker_member_is_a_constructor_with_the_methods_the_js_layer_calls() {
         read(
             "[typeof __worker.Worker, \
                ['startThread','stopThread','ref','unref','hasRef','getResourceLimits', \
-                'loopIdleTime','loopStartTime'] \
+                'takeHeapSnapshot','getHeapStatistics','loopIdleTime','loopStartTime'] \
                  .every((n) => typeof __worker.Worker.prototype[n] === 'function')]"
         ),
         "[\"function\",true]"
