@@ -30,15 +30,20 @@ fn rustnode() -> Option<PathBuf> {
 
 /// Runs `source` through `rustnode` and returns its last stdout line.
 ///
-/// The script reaches the namespace the way `lib/**` does — through
-/// `internal/bootstrap/realm`'s `internalBinding` — because there is no
-/// `internalBinding` global.
+/// The script reaches the namespace through `internal/test/binding`'s
+/// `internalBinding`, which is the module Node exposes the bindings through and
+/// which needs `--expose-internals` — the oracle has the same requirement. It used
+/// to go through `internal/bootstrap/realm`, which only worked because the CLI
+/// installed the realm loader as an unrestricted global `require`; `realm.js`
+/// filters that id out of the user-requireable list and Node's own
+/// `test-loaders-hidden-from-users.js` asserts the require throws.
 fn run(source: &str) -> String {
     let Some(binary) = rustnode() else {
         eprintln!("skipping: target/debug/rustnode is not built");
         return String::new();
     };
     let output = Command::new(&binary)
+        .arg("--expose-internals")
         .arg("-e")
         .arg(source)
         .output()
@@ -59,7 +64,7 @@ fn run(source: &str) -> String {
 #[test]
 fn the_binding_is_reachable_through_the_cli() {
     let result = run(r#"
-const binding = require('internal/bootstrap/realm').internalBinding('http_parser');
+const binding = require('internal/test/binding').internalBinding('http_parser');
 console.log(JSON.stringify({
   keys: Object.keys(binding).sort(),
   methods: binding.methods.length,
@@ -89,7 +94,7 @@ console.log(JSON.stringify({
 #[test]
 fn a_byte_wise_request_parses_the_same_through_the_cli() {
     let result = run(r#"
-const binding = require('internal/bootstrap/realm').internalBinding('http_parser');
+const binding = require('internal/test/binding').internalBinding('http_parser');
 const H = binding.HTTPParser;
 const parser = new H();
 const log = [];
@@ -148,7 +153,7 @@ console.log(JSON.stringify({ results, log }));
 #[test]
 fn a_parse_error_carries_code_reason_and_bytes_parsed() {
     let result = run(r#"
-const binding = require('internal/bootstrap/realm').internalBinding('http_parser');
+const binding = require('internal/test/binding').internalBinding('http_parser');
 const H = binding.HTTPParser;
 const parser = new H();
 parser[H.kOnHeadersComplete] = () => 0;
@@ -179,7 +184,7 @@ console.log(JSON.stringify({
 #[test]
 fn the_connections_list_works_through_the_cli() {
     let result = run(r#"
-const binding = require('internal/bootstrap/realm').internalBinding('http_parser');
+const binding = require('internal/test/binding').internalBinding('http_parser');
 const H = binding.HTTPParser;
 const list = new binding.ConnectionsList();
 const parser = new H();

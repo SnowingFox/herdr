@@ -41,8 +41,8 @@ fn run(script: &str) -> String {
 }
 
 /// The binding, reached the way a builtin reaches it.
-const PRELUDE: &str = "const realm = require('internal/bootstrap/realm');\
-const v8b = realm.internalBinding('v8');";
+const PRELUDE: &str = "\
+const v8b = require('internal/test/binding').internalBinding('v8');";
 
 #[test]
 fn every_contract_member_is_present() {

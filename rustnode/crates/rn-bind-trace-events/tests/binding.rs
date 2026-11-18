@@ -52,9 +52,9 @@ fn the_module_loads_and_exposes_the_public_surface() {
 fn has_agent_agrees_with_has_tracing() {
     // The two bindings have to agree: Node's guard requires both, and the only
     // failing combination is `hasTracing: true` with `hasAgent(): false`.
-    let output = run("const realm = require('internal/bootstrap/realm');
-        const { hasTracing } = realm.internalBinding('config');
-        const { hasAgent } = realm.internalBinding('trace_events');
+    let output = run("
+        const { hasTracing } = require('internal/test/binding').internalBinding('config');
+        const { hasAgent } = require('internal/test/binding').internalBinding('trace_events');
         console.log(hasTracing === hasAgent());");
     assert_eq!(output, "true");
 }
@@ -105,8 +105,8 @@ fn the_category_flag_buffer_is_a_live_view_with_stable_identity() {
     // `internal/trace_events.js`'s `categoryEnabledChecker` caches the buffer and
     // reads `buffer[0]`, so a second call has to return the same array and that
     // array has to see the enable.
-    let output = run("const realm = require('internal/bootstrap/realm');
-        const te = realm.internalBinding('trace_events');
+    let output = run("
+        const te = require('internal/test/binding').internalBinding('trace_events');
         const first = te.getCategoryEnabledBuffer('node.perf');
         const before = first[0];
         const set = new te.CategorySet(['node.perf']);
@@ -144,8 +144,8 @@ fn enabling_the_async_hooks_category_notifies_the_state_handler() {
     // handler with `isTraceCategoryEnabled('node.async_hooks')`, which is how
     // `toggleTraceCategoryState` starts the async-hook tracer. Node installs
     // that handler in `internal/bootstrap/node.js`.
-    let output = run("const realm = require('internal/bootstrap/realm');
-        const te = realm.internalBinding('trace_events');
+    let output = run("
+        const te = require('internal/test/binding').internalBinding('trace_events');
         const seen = [];
         te.setTraceCategoryStateUpdateHandler((enabled) => seen.push(enabled));
         const tr = require('trace_events').createTracing({ categories: ['node.async_hooks'] });

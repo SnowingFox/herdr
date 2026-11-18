@@ -39,6 +39,14 @@ fn run(script: &str) -> (String, String, bool) {
         binary.display()
     );
     let output = Command::new(&binary)
+        // `internal/test/binding` is what Node exposes the bindings through, and
+        // it needs `--expose-internals` — the oracle has the same requirement. The
+        // scripts here used to reach the namespaces through
+        // `require('internal/bootstrap/realm')`, which only worked because the CLI
+        // installed the realm loader as an unrestricted global `require`;
+        // `realm.js` filters that id out of the user-requireable list and Node's
+        // own `test-loaders-hidden-from-users.js` asserts the require throws.
+        .arg("--expose-internals")
         .arg("-e")
         .arg(script)
         .output()
@@ -923,7 +931,7 @@ fn a_real_addon_loads_from_bytes_through_dlopen_binary() {
     let build = support::build_addon_or_abort();
     let stdout = run_ok(&format!(
         "const fs = require('fs');\n\
-         const {{ internalBinding }} = require('internal/bootstrap/realm');\n\
+         const {{ internalBinding }} = require('internal/test/binding');\n\
          const pm = internalBinding('process_methods');\n\
          const bytes = fs.readFileSync({paths});\n\
          const mod = {{ exports: {{}} }};\n\
@@ -942,7 +950,7 @@ fn dlopen_binary_rejects_an_argument_that_is_not_a_view() {
     let build = support::build_addon_or_abort();
     let stdout = run_ok(&format!(
         "const fs = require('fs');\n\
-         const {{ internalBinding }} = require('internal/bootstrap/realm');\n\
+         const {{ internalBinding }} = require('internal/test/binding');\n\
          const pm = internalBinding('process_methods');\n\
          const bytes = fs.readFileSync({paths});\n\
          try {{ pm.dlopenBinary({{ exports: {{}} }}, '/virtual/x.node', 0, 'not a view'); }}\n\

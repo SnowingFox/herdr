@@ -86,8 +86,8 @@ fn run_with_timeout(script: &str, limit: Duration) -> String {
     }
 }
 
-const PRELUDE: &str = "const realm = require('internal/bootstrap/realm');\
-const locks = realm.internalBinding('locks');";
+const PRELUDE: &str = "\
+const locks = require('internal/test/binding').internalBinding('locks');";
 
 #[test]
 fn the_namespace_has_the_members_and_attributes_the_oracle_reports() {

@@ -36,8 +36,8 @@ fn run(script: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-const PRELUDE: &str = "const realm = require('internal/bootstrap/realm');\
-const timers = realm.internalBinding('timers');";
+const PRELUDE: &str = "\
+const timers = require('internal/test/binding').internalBinding('timers');";
 
 #[test]
 fn the_counters_have_the_shapes_lib_timers_expects() {

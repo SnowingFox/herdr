@@ -30,6 +30,14 @@ fn run(script: &str) -> String {
         return String::new();
     };
     let output = Command::new(&binary)
+        // `internal/test/binding` is what Node exposes the bindings through, and
+        // it needs `--expose-internals` — the same requirement the oracle has.
+        // The old prelude reached the namespace through
+        // `require('internal/bootstrap/realm')`, which worked only because the
+        // CLI used to install the realm loader as an unrestricted global
+        // `require`; `realm.js` filters that id out of the user-requireable list
+        // even with the flag, and Node's own test asserts the require throws.
+        .arg("--expose-internals")
         .arg("-e")
         .arg(script)
         .output()
@@ -81,7 +89,7 @@ impl Drop for TempTree {
 }
 
 /// Reaches the namespace the same way `lib/internal/fs/glob.js` does.
-const PRELUDE: &str = "const { internalBinding } = require('internal/bootstrap/realm'); \
+const PRELUDE: &str = "const { internalBinding } = require('internal/test/binding'); \
                        const g = internalBinding('glob');";
 
 #[test]
