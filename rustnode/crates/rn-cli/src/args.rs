@@ -3114,9 +3114,22 @@ mod tests {
             options.unimplemented
         );
 
-        let options = parse_of(&["--experimental-shadow-realm", "-e", "1"]).expect("parses");
-        assert_eq!(options.unimplemented, ["--experimental-shadow-realm"]);
-        assert!(options.v8_args.is_empty(), "{:?}", options.v8_args);
+        // `--experimental-shadow-realm` implies `--harmony-shadow-realm`
+        // (`src/node_options.cc:1624`), so the V8 half is forwarded under the
+        // name V8 knows. That makes this a paired flag rather than an
+        // unimplemented one: `ShadowRealm` exists in the runtime, gated on the
+        // table entry exactly as Node gates it.
+        //
+        // The first assertion is the one that matters: an undeclared name would
+        // fall through to the V8 split and be accepted by accident, which is
+        // the regression this test names.
+        let shadow = parse_of(&["--experimental-shadow-realm", "-e", "1"]).expect("parses");
+        assert!(
+            shadow.unimplemented.is_empty(),
+            "{:?}",
+            shadow.unimplemented
+        );
+        assert_eq!(shadow.v8_args, ["--harmony-shadow-realm"]);
     }
 
     /// `--require-module` defaults to true, and the `--no-` spellings both clear
