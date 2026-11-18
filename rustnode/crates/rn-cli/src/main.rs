@@ -807,6 +807,14 @@ fn main() {
         None => bootstrap::read_exit_code(scope).unwrap_or(0),
     };
 
+    // `NodeMainInstance` reaches `Agent::WaitForDisconnect` from an `AtExit` hook,
+    // so Node prints the sentinel and blocks *after* the `exit` handlers have run
+    // and after the status is settled. With a client attached, this is where the
+    // process holds still for it; with nobody attached it is a no-op that prints
+    // nothing. Skipping it made a debugged process spin at 100% CPU until the
+    // client disconnected and never print the line every harness keys on.
+    rn_bind_inspector::wait_for_disconnect(scope);
+
     // An uncaught exception asks for 1 unless the exit handlers replaced that
     // with a code of their own, which is the order Node applies.
     if exit_requested || rn_core::hook_slot::flag(rn_core::hook_slot::EXIT_REQUESTED) {

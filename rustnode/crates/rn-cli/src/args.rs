@@ -1510,9 +1510,19 @@ fn apply_inspect(argument: &str, options: &mut Options) -> Result<(), String> {
             // Only the address changes; whether to listen is a separate flag.
             options.debug_port = parsed;
         }
-        "--inspect" | "--inspect-wait" => {
+        "--inspect" => {
             options.debug_port = parsed;
             options.inspect_enabled = true;
+        }
+        // `--inspect-wait` opens the endpoint and blocks for a client like
+        // `--inspect-brk`, but arms no break-on-start: Node's `wait_for_connect()`
+        // is true while `break_node_first_line` stays false, so
+        // `WaitForConnectByOptions` waits and then runs straight into user code.
+        // Treating it as plain `--inspect` made the process never wait at all.
+        "--inspect-wait" => {
+            options.debug_port = parsed;
+            options.inspect_enabled = true;
+            options.inspect_wait = true;
         }
         "--inspect-brk" => {
             options.debug_port = parsed;
@@ -2290,6 +2300,23 @@ mod tests {
         assert!(options.inspect_enabled);
         assert!(options.inspect_wait);
         assert!(options.inspect_break_node);
+        assert_eq!(options.debug_port.port, 9339);
+    }
+
+    /// `--inspect-wait` waits for a client but arms no break-on-start.
+    ///
+    /// Node's `DebugOptions` sets `wait_for_connect()` for `--inspect-wait` and
+    /// leaves `break_node_first_line` false, so `WaitForConnectByOptions` blocks
+    /// and then runs user code without pausing. The oracle shows the difference:
+    /// `node --inspect-wait=0 -e "..."` prints only the listening banner and never
+    /// the script's output until a client connects. Treating the flag as plain
+    /// `--inspect` made rustnode run the script immediately.
+    #[test]
+    fn inspect_wait_waits_without_breaking() {
+        let options = parse_of(&["--inspect-wait=9339"]).expect("parses");
+        assert!(options.inspect_enabled);
+        assert!(options.inspect_wait);
+        assert!(!options.inspect_break_node);
         assert_eq!(options.debug_port.port, 9339);
     }
 

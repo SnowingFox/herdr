@@ -400,10 +400,17 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
         {
             return true;
         }
-        // A debugger being attached keeps `node --inspect` alive after the script
-        // finishes, which is what lets a client evaluate in a process that has already
-        // run its entry point. Node's `Agent::IsActive` does the same.
-        if rn_bind_inspector::is_attached() || rn_bind_inspector::has_pending_messages() {
+        // A debugger being attached must not pin the libuv loop. Node's loop
+        // returns normally when the script's work is done, and `Agent::IsActive`
+        // holds the *process* at exit instead, through `WaitForDisconnect`. Pinning
+        // the loop here is what made a debugged process spin at 100% CPU: libuv had
+        // nothing to do, `has_external_work` kept answering true, and the exit path
+        // that prints `Waiting for the debugger to disconnect...` was never reached.
+        //
+        // A message that is already queued still keeps the loop alive for one turn,
+        // which is what lets a `Runtime.evaluate` arriving in the last idle moment be
+        // dispatched rather than dropped.
+        if rn_bind_inspector::has_pending_messages() {
             return true;
         }
         // A Node-API finalizer deferred from a V8 GC thread keeps the process alive
