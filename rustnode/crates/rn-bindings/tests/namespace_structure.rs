@@ -105,9 +105,11 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 ///   `util.{getSharedArrayBufferGrowable,arrayBufferViewHasBuffer}` are installed.
 /// * `crypto.isKeyAlgorithmAvailable` was installed already; only its stale
 ///   `DEFERRED` entry was wrong, so it is claimed rather than deferred.
-/// * `blob.createBlobFromFilePath`, `icu.{decode,getConverter,hasConverter}`,
-///   `heap_utils.buildEmbedderGraph` and `internal_only_v8.queryObjects` are
-///   declared in `DEFERRED` with measured reasons, and are absent from `MEMBERS`.
+/// * `blob.createBlobFromFilePath`, `icu.{decode,getConverter,hasConverter}` and
+///   `heap_utils.buildEmbedderGraph` are declared in `DEFERRED` with measured
+///   reasons, and are absent from `MEMBERS`. `internal_only_v8.queryObjects` was
+///   the fourth and has left that list: it is installed now, through the
+///   `HeapProfiler::QueryObjects` shim in `rn-v8-sys`.
 /// * `sqlite.backup` left before this: PR #99 removed it from `MEMBERS` and left it
 ///   deferred with an accurate reason. It is still unimplemented, as a declared
 ///   deferral rather than a member falsely claimed installed.

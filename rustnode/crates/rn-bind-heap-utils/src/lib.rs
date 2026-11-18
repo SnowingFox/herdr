@@ -5,6 +5,11 @@
 //! members exist on the namespace: two are implemented here, and the third is
 //! deferred with a reason.
 //!
+//! This crate also registers `internalBinding('internal_only_v8')`, the one-member
+//! namespace `v8.queryObjects()` is built on. Both live here because
+//! `lib/internal/heap_utils.js` is the single module that destructures members of
+//! either, so a caller loading one loads the other.
+//!
 //! # `triggerHeapSnapshot(filename, options)` — implemented
 //!
 //! `src/heap_utils.cc`'s `TriggerHeapSnapshot` takes a V8 heap snapshot and
@@ -400,29 +405,15 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
 pub struct InternalOnlyV8;
 
 /// Members `contracts/internal_only_v8.json` records.
-pub const INTERNAL_ONLY_V8_MEMBERS: &[&str] = &[];
+pub const INTERNAL_ONLY_V8_MEMBERS: &[&str] = &["queryObjects"];
 
 /// Why `queryObjects` is not implemented.
 ///
-/// `src/internal_only_v8.cc:QueryObjects` walks the heap with
-/// `Isolate::GetHeapProfiler()->QueryObjects(context, &predicate, &out)`, where
-/// the predicate is a C++ `v8::QueryObjectPredicate` subclass that filters on the
-/// creation context and the prototype chain. The filter is the whole behaviour:
-/// it is what makes `v8.queryObjects(Ctor)` answer only objects of that realm
-/// whose prototype chain contains `Ctor.prototype`.
-///
-/// The `v8` header declares it (`v8-152.2.0/v8/include/v8-profiler.h:1008`), but
-/// the crate's `binding.cc` binds no `HeapProfiler` method other than
-/// `TakeHeapSnapshot`, so neither `QueryObjects` nor the C++ subclass it takes is
-/// reachable from Rust. An empty array would claim every object had been
-/// collected, which is worse than an absent member.
-pub const INTERNAL_ONLY_V8_DEFERRED: &[(&str, &str)] = &[(
-    "queryObjects",
-    "needs v8::HeapProfiler::QueryObjects and a C++ v8::QueryObjectPredicate \
-     subclass; the v8 crate binds only HeapProfiler::TakeHeapSnapshot, so neither \
-     the walk nor the predicate it takes is reachable, and an empty array would \
-     claim every object had been collected",
-)];
+/// Empty: `queryObjects` is implemented, through the `HeapProfiler::QueryObjects`
+/// shim in `rn-v8-sys`. This constant stays because the registry subtracts it from
+/// the contract, and the gate reports a name that is neither installed nor
+/// deferred — which is exactly the shape a future gap here should take.
+pub const INTERNAL_ONLY_V8_DEFERRED: &[(&str, &str)] = &[];
 
 impl BindingModule for InternalOnlyV8 {
     fn namespace(&self) -> &'static str {
@@ -442,11 +433,49 @@ impl BindingModule for InternalOnlyV8 {
         scope: &mut v8::PinScope<'s, '_>,
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
-        // Deliberately empty: the namespace object has to exist so `require`
-        // succeeds, and `queryObjects` reads as `undefined` because it is not
-        // installed. `deferred()` is what records that, and `deferred-reach.py`
-        // proves it is not called at module scope.
-        Ok(v8::Object::new(scope))
+        let object = v8::Object::new(scope);
+        // `lib/internal/heap_utils.js` destructures `_queryObjects` at module
+        // scope, so the member has to exist before `lib/v8.js` can load.
+        install_function(scope, object, "queryObjects", query_objects)?;
+        Ok(object)
+    }
+}
+
+/// `queryObjects(prototype)`.
+///
+/// `lib/internal/heap_utils.js`'s `queryObjects(ctor, options)` does the argument
+/// validation — `ctor` must be a function, `options.format` one of `count` or
+/// `summary` — and calls `_queryObjects(ctor.prototype)`. So this receives one
+/// argument, a prototype object, and returns the matching objects as an `Array`.
+///
+/// Node's `QueryObjects` answers a non-object argument with an empty `Array`
+/// (`src/internal_only_v8.cc`: `if (!args[0]->IsObject())`). That branch is
+/// reachable here only through a direct `internalBinding` call, because the JS
+/// wrapper has already rejected a non-function constructor, but it is reproduced
+/// because it is the C's behaviour rather than an accident of the wrapper.
+fn query_objects<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let prototype = args.get(0);
+    if !prototype.is_object() {
+        rv.set(v8::Array::new(scope, 0).into());
+        return;
+    }
+    let Ok(search) = v8::Local::<v8::Object>::try_from(prototype) else {
+        rv.set(v8::Array::new(scope, 0).into());
+        return;
+    };
+    // SAFETY: `scope` is the entered scope the walk runs in, and `search` is an
+    // object handle from that same scope, so both outlive the call.
+    let found = unsafe { rn_v8_sys::query_objects(scope, search) };
+    match found {
+        Some(array) => rv.set(array.into()),
+        // The shim only refuses a null argument, so reaching here means V8
+        // produced a null handle; an empty array is Node's answer for "nothing
+        // matched" and is the only honest report available.
+        None => rv.set(v8::Array::new(scope, 0).into()),
     }
 }
 
@@ -468,6 +497,22 @@ mod tests {
             );
             assert!(!reason.is_empty(), "{name} has no reason");
         }
+    }
+
+    /// `internal_only_v8` claims its one contract member and defers nothing.
+    ///
+    /// This is the assertion that would have caught the deferral outliving the
+    /// fix: while `queryObjects` was unimplemented it was absent from `MEMBERS`
+    /// and present in `DEFERRED`, and now the reverse has to hold.
+    #[test]
+    fn the_internal_only_v8_namespace_claims_query_objects() {
+        assert_eq!(INTERNAL_ONLY_V8_MEMBERS, ["queryObjects"]);
+        assert!(
+            INTERNAL_ONLY_V8_DEFERRED.is_empty(),
+            "{:?} is still deferred",
+            INTERNAL_ONLY_V8_DEFERRED
+        );
+        assert!(!INTERNAL_ONLY_V8_MEMBERS.contains(&"getHeapProfiler"));
     }
 
     #[test]
