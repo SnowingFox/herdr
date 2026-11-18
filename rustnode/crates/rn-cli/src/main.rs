@@ -311,8 +311,19 @@ fn main() {
         terminate(0);
     }
 
-    let platform = v8::new_default_platform(0, false).make_shared();
+    // A `CustomPlatform` rather than the default one, so a foreground task V8
+    // posts from *another* thread can wake this thread's event loop. With the
+    // default platform such a task is queued and nothing signals the waiter, so
+    // `Atomics.waitAsync` only settled when some unrelated event happened to turn
+    // the loop: `postMessageToThread` into a throwing `workerMessage` handler
+    // reported `ERR_WORKER_MESSAGING_ERRORED` after 5011 ms instead of 13 ms, and
+    // with only unref'd timers it never settled at all. See
+    // `rn_v8_sys::platform`.
+    let platform = rn_v8_sys::platform::new_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
+    // Tells the loop's platform-task checkpoint to drain our queue rather than
+    // V8's default one, which a custom platform leaves empty by design.
+    rn_v8_sys::use_custom_platform();
     v8::V8::initialize();
     rn_core::profile::mark("V8::initialize");
 

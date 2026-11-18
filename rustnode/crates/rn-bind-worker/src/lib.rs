@@ -150,6 +150,31 @@ pub fn install_check_phase() -> bool {
     if let Some(token) = token {
         rn_bind_messaging::refresh_owner_tokens(token);
     }
+    // V8 posts a foreground task to whichever isolate's queue owns the work, and
+    // the task's completion is what settles some promises — `Atomics.waitAsync`
+    // is the one that made this necessary. `ThreadToken::notify` is exactly the
+    // cross-thread wake those posts need, so the platform's queue gets the same
+    // one. Registering it here rather than in `rn-v8-sys` keeps the platform free
+    // of any dependency on the loop.
+    if let Some(token) = token {
+        if let Some(isolate) = rn_uv::callback::remembered_isolate_key() {
+            rn_v8_sys::platform::register_waker(
+                isolate,
+                std::sync::Arc::new(move || {
+                    // `false` means this thread's loop is already gone, so the task
+                    // will never run. There is nothing to recover here — the same
+                    // race a port's wake has — but it is worth a trace rather than
+                    // being discarded, because a settlement that never happens is
+                    // otherwise indistinguishable from a lost wake.
+                    if !token.notify() {
+                        tracing::debug!(
+                            "dropped a V8 foreground-task wake: this thread has no loop"
+                        );
+                    }
+                }),
+            );
+        }
+    }
     rn_bind_timers::add_check_phase_hook(report_worker_exits);
     // A running worker pins the loop even though it owns nothing on this loop's
     // libuv handle set: its thread has a loop of its own. Node calls this

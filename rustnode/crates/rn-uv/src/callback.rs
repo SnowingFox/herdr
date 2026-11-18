@@ -68,6 +68,23 @@ pub fn has_context() -> bool {
     CONTEXT.with(|slot| slot.borrow().is_some())
 }
 
+/// The address of the isolate this thread installed bindings into.
+///
+/// The same value [`rn_v8_sys::platform::isolate_key`] derives from a scope, so
+/// code that has no scope in hand — a loop callback, a wake handler — can still
+/// name the isolate V8 keys its platform queues by. `None` before any binding has
+/// installed on this thread.
+pub fn remembered_isolate_key() -> Option<usize> {
+    ISOLATE.with(|slot| {
+        (*slot.borrow()).map(|pointer| {
+            // SAFETY: the pointer was produced by `as_raw_isolate_ptr` and is only
+            // read as an address here, never dereferenced. V8 passes the same
+            // address as `isolate_ptr` to every `PlatformImpl` method.
+            unsafe { std::mem::transmute::<v8::UnsafeRawIsolatePtr, usize>(pointer) }
+        })
+    })
+}
+
 /// The recorded isolate pointer and rooted context, if any.
 ///
 /// `rn-napi` uses this to keep an entered scope alive across several Node-API
