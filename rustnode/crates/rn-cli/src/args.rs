@@ -449,11 +449,11 @@ impl Source {
         matches!(
             self,
             Self::Stdin { .. }
-            | Self::Help
-            | Self::Inspect
-            | Self::Test
-            | Self::Repl
-            | Self::CheckSyntax
+                | Self::Help
+                | Self::Inspect
+                | Self::Test
+                | Self::Repl
+                | Self::CheckSyntax
         )
     }
 
