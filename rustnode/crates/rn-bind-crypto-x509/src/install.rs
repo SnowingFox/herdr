@@ -651,7 +651,7 @@ fn reset_root_cert_store<'s>(
         let Some(entry) = array.get_index(scope, index) else {
             return;
         };
-        match view_bytes_of(scope, entry) {
+        match certificate_bytes_of(scope, entry) {
             Some(bytes) => entries.push(bytes),
             None => {
                 throw_type_error(scope, "The certificates must be Buffers");
@@ -659,8 +659,14 @@ fn reset_root_cert_store<'s>(
             }
         }
     }
-    if crate::root_store::reset(&entries).is_none() {
-        throw_crypto_error_with(scope, 0, "Failed to parse certificate");
+    match crate::root_store::reset(&entries) {
+        Ok(_) => {}
+        Err(crate::root_store::ResetError::NoValidCertificates) => {
+            throw_operation_failed(scope, "No valid certificates found in the provided array");
+        }
+        Err(crate::root_store::ResetError::OpenSsl(packed)) => {
+            throw_crypto_error_with(scope, packed, "Failed to parse certificate");
+        }
     }
 }
 
@@ -695,6 +701,27 @@ fn view_bytes_of(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) 
         }
     }
     Some(bytes)
+}
+
+/// PEM bytes for one entry of a `resetRootCertStore` array.
+///
+/// Node's `ArrayOfStringsToX509s` funnels each entry through `LoadBIO`
+/// (`src/crypto/crypto_context.cc:1167`), and `LoadBIO` accepts a string as
+/// well as a buffer. So both shapes are certificates there, and
+/// `lib/tls.js:setDefaultCACertificates` documents the pair explicitly:
+/// it validates `typeof certs[i] !== 'string' && !isArrayBufferView(certs[i])`.
+///
+/// Accepting only buffers made `tls.setDefaultCACertificates(tls.getCACertificates('bundled'))`
+/// throw, because the getters return strings — a round trip through the same
+/// API was the one thing the two halves did not agree on.
+fn certificate_bytes_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> Option<Vec<u8>> {
+    if let Ok(text) = v8::Local::<v8::String>::try_from(value) {
+        return Some(text.to_rust_string_lossy(scope).into_bytes());
+    }
+    view_bytes_of(scope, value)
 }
 
 fn throw(scope: &mut v8::PinScope<'_, '_>, message: &str) {

@@ -769,9 +769,10 @@ impl Context {
     /// Node's `SetRootCerts` calls `UseDefaultRootCertStore`, which is
     /// `NewRootCertStore`: the bundled roots by default, the system store as
     /// well only under `--use-system-ca` (or alone under `--use-openssl-ca`,
-    /// which is `X509_STORE_set_default_paths`). `NODE_EXTRA_CA_CERTS` and a
-    /// reset user store are applied by `lib/tls.js` and the other getters, not
-    /// here.
+    /// which is `X509_STORE_set_default_paths`). A user store installed by
+    /// `tls.setDefaultCACertificates` replaces all of that, which is why the
+    /// reset is checked first. `NODE_EXTRA_CA_CERTS` is applied by `lib/tls.js`
+    /// and the other getters, not here.
     ///
     /// Installing the bundled roots is what makes a default `https.get` verify
     /// at all. Until this landed, `addRootCerts` called `set_default_paths`,
@@ -797,6 +798,20 @@ impl Context {
         // A duplicate CA is not an error: Node ignores the return value of
         // `X509_STORE_add_cert` for exactly that reason, and the bundled set
         // holds no duplicates to begin with.
+        //
+        // A user reset replaces the whole set rather than adding to it:
+        // `NewRootCertStore` copies `certs_from_users` and returns immediately
+        // (`crypto_context.cc:1054-1061`), which is what makes
+        // `tls.setDefaultCACertificates([oneCert])` reject every chain that
+        // does not lead to that one certificate.
+        if rn_bind_crypto_x509::root_store::user_store_is_replaced() {
+            for pem in rn_bind_crypto_x509::root_store::user() {
+                if let Ok(certificate) = X509::from_pem(pem.as_bytes()) {
+                    let _ = store.add_cert(certificate);
+                }
+            }
+            return Ok(());
+        }
         for pem in rn_bind_crypto_x509::root_store::bundled() {
             match X509::from_pem(pem.as_bytes()) {
                 Ok(certificate) => {
