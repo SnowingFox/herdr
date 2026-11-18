@@ -5,6 +5,11 @@
 //! members exist on the namespace: two are implemented here, and the third is
 //! deferred with a reason.
 //!
+//! This crate also registers `internalBinding('internal_only_v8')`, the one-member
+//! namespace `v8.queryObjects()` is built on. Both live here because
+//! `lib/internal/heap_utils.js` is the single module that destructures members of
+//! either, so a caller loading one loads the other.
+//!
 //! # `triggerHeapSnapshot(filename, options)` — implemented
 //!
 //! `src/heap_utils.cc`'s `TriggerHeapSnapshot` takes a V8 heap snapshot and
@@ -492,6 +497,22 @@ mod tests {
             );
             assert!(!reason.is_empty(), "{name} has no reason");
         }
+    }
+
+    /// `internal_only_v8` claims its one contract member and defers nothing.
+    ///
+    /// This is the assertion that would have caught the deferral outliving the
+    /// fix: while `queryObjects` was unimplemented it was absent from `MEMBERS`
+    /// and present in `DEFERRED`, and now the reverse has to hold.
+    #[test]
+    fn the_internal_only_v8_namespace_claims_query_objects() {
+        assert_eq!(INTERNAL_ONLY_V8_MEMBERS, ["queryObjects"]);
+        assert!(
+            INTERNAL_ONLY_V8_DEFERRED.is_empty(),
+            "{:?} is still deferred",
+            INTERNAL_ONLY_V8_DEFERRED
+        );
+        assert!(!INTERNAL_ONLY_V8_MEMBERS.contains(&"getHeapProfiler"));
     }
 
     #[test]
