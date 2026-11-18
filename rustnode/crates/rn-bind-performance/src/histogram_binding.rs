@@ -46,10 +46,13 @@
 
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use rn_v8_sys::v8;
 
+use crate::beta::{regularized_incomplete_beta, student_t_cdf, student_t_upper_quantile};
 use crate::hdr::{HdrHistogram, Layout};
+use crate::qrde::Dequantization;
 
 /// The internal field holding the state cell.
 pub(crate) const STATE_FIELD: i32 = 0;
@@ -97,6 +100,17 @@ pub struct HistogramState {
     pub threshold: i64,
     /// EWMA of "this sample exceeded `threshold`".
     pub ewma_error_rate: f64,
+    /// `mutation_generation_`: bumped by every change that invalidates the
+    /// recorded-bucket snapshot.
+    ///
+    /// `GetRecordedSnapshotSource` stamps the generation alongside the snapshot it
+    /// builds and `CacheRecordedSnapshot` only stores the snapshot when the
+    /// generation still matches, so a `qrde` that started before a `record` cannot
+    /// install a stale cache behind a newer one.
+    pub mutation_generation: u64,
+    /// `recorded_snapshot_cache_`: the bucketed view a previous cached `qrde`
+    /// computed, reused when the histogram has not changed since.
+    pub recorded_snapshot: Option<Arc<crate::qrde::Snapshot>>,
 }
 
 impl HistogramState {
@@ -122,7 +136,16 @@ impl HistogramState {
             ewma_initialized: false,
             threshold,
             ewma_error_rate: 0.0,
+            mutation_generation: 0,
+            recorded_snapshot: None,
         }
+    }
+
+    /// `Histogram::InvalidateRecordedSnapshot`: note that the cached bucketed view
+    /// no longer describes this histogram.
+    pub fn invalidate_recorded_snapshot(&mut self) {
+        self.mutation_generation += 1;
+        self.recorded_snapshot = None;
     }
 
     /// `Histogram::UpdateEwma`, called after a successful record.
@@ -161,6 +184,7 @@ impl HistogramState {
     /// `Histogram::Record`: record, or count the value as exceeding.
     pub fn record(&mut self, value: i64) {
         if self.histogram.record(value) {
+            self.invalidate_recorded_snapshot();
             self.update_ewma(value as f64);
         } else {
             self.exceeds += 1;
@@ -170,6 +194,7 @@ impl HistogramState {
     /// `Histogram::RecordCorrected`.
     pub fn record_corrected(&mut self, value: i64, expected_interval: i64) {
         if self.histogram.record_corrected(value, expected_interval) {
+            self.invalidate_recorded_snapshot();
             self.update_ewma(value as f64);
         } else {
             self.exceeds += 1;
@@ -189,6 +214,7 @@ impl HistogramState {
             // delta negative and the record would be silently rejected.
             delta = time.saturating_sub(self.prev) as i64;
             if self.histogram.record(delta) {
+                self.invalidate_recorded_snapshot();
                 self.update_ewma(delta as f64);
             } else {
                 self.exceeds += 1;
@@ -201,6 +227,7 @@ impl HistogramState {
     /// `Histogram::Reset`.
     pub fn reset(&mut self) {
         self.histogram.reset();
+        self.invalidate_recorded_snapshot();
         self.reset_count += 1;
         self.exceeds = 0;
         self.prev = 0;
@@ -213,6 +240,9 @@ impl HistogramState {
     /// `Histogram::Subtract`: remove `other`'s counts and report what was dropped.
     pub fn subtract(&mut self, other: &HistogramState) -> i64 {
         let dropped = self.histogram.subtract(&other.histogram);
+        // `Histogram::Subtract` invalidates even when nothing was dropped: the
+        // counts array was still rewritten and the internal counters recomputed.
+        self.invalidate_recorded_snapshot();
         self.reset_count += 1;
         self.exceeds = self.exceeds.saturating_sub(other.exceeds);
         dropped
@@ -333,6 +363,211 @@ impl HistogramState {
         (value as f64, lower as f64, upper as f64)
     }
 
+    /// `Histogram::KsTest`: the Kolmogorov-Smirnov D statistic against `other`.
+    ///
+    /// Walks both counts arrays by *index*, which is what makes the comparison
+    /// bucket-aligned: two histograms with the same layout put the same value range
+    /// at each index, and one with a longer array keeps its extra indices
+    /// contributing through its own cumulative count alone.
+    pub fn ks_test(&self, other: &HistogramState) -> f64 {
+        let n1 = self.histogram.count();
+        let n2 = other.histogram.count();
+        if n1 == 0 || n2 == 0 {
+            return 0.0;
+        }
+
+        let len = self
+            .histogram
+            .layout_counts_len()
+            .max(other.histogram.layout_counts_len());
+        let counts1 = self.histogram.counts_slice();
+        let counts2 = other.histogram.counts_slice();
+        let mut cum1 = 0_i64;
+        let mut cum2 = 0_i64;
+        let mut max_d = 0.0_f64;
+        for index in 0..len {
+            if index < counts1.len() as i32 {
+                cum1 += counts1[index as usize];
+            }
+            if index < counts2.len() as i32 {
+                cum2 += counts2[index as usize];
+            }
+            let cdf1 = cum1 as f64 / n1 as f64;
+            let cdf2 = cum2 as f64 / n2 as f64;
+            let difference = if cdf1 > cdf2 {
+                cdf1 - cdf2
+            } else {
+                cdf2 - cdf1
+            };
+            if difference > max_d {
+                max_d = difference;
+            }
+        }
+        max_d
+    }
+
+    /// `Histogram::WelchTest`: Welch's t-test against `other`.
+    ///
+    /// Returns `(t, degrees_of_freedom, p, ci_lower, ci_upper)`. The
+    /// `{0, 0, 1, 0, 0}` early exits are Node's: they are what a caller reads as
+    /// "no evidence", and `lib/**`'s benchmark comparison branches on `pValue`
+    /// being exactly 1.
+    pub fn welch_test(&self, other: &HistogramState, confidence: f64) -> (f64, f64, f64, f64, f64) {
+        let n1 = self.histogram.count();
+        let n2 = other.histogram.count();
+        if n1 < 2 || n2 < 2 {
+            return (0.0, 0.0, 1.0, 0.0, 0.0);
+        }
+
+        let mean1 = self.histogram.mean();
+        let mean2 = other.histogram.mean();
+        let sd1 = self.histogram.stddev();
+        let sd2 = other.histogram.stddev();
+
+        // `hdr_stddev` is population stddev (divides by N); Welch's t-test needs
+        // sample variance (divides by N-1).
+        let var1 = sd1 * sd1 * n1 as f64 / (n1 - 1) as f64;
+        let var2 = sd2 * sd2 * n2 as f64 / (n2 - 1) as f64;
+
+        let se1 = var1 / n1 as f64;
+        let se2 = var2 / n2 as f64;
+        let se_sum = se1 + se2;
+        if se_sum == 0.0 {
+            return (0.0, 0.0, 1.0, 0.0, 0.0);
+        }
+
+        let t = (mean1 - mean2) / se_sum.sqrt();
+        // Welch-Satterthwaite degrees of freedom.
+        let df = (se_sum * se_sum) / (se1 * se1 / (n1 - 1) as f64 + se2 * se2 / (n2 - 1) as f64);
+
+        // Two-tailed p-value.
+        let p = 2.0 * student_t_cdf(-t.abs(), df);
+
+        let alpha = 1.0 - confidence;
+        let t_crit = student_t_upper_quantile(alpha / 2.0, df);
+        let margin = t_crit * se_sum.sqrt();
+        let difference = mean1 - mean2;
+        (t, df, p, difference - margin, difference + margin)
+    }
+
+    /// `Histogram::MannWhitneyTest`: the U statistic, z score and two-tailed
+    /// p-value by normal approximation.
+    pub fn mann_whitney_test(&self, other: &HistogramState) -> (f64, f64, f64) {
+        let n1 = self.histogram.count();
+        let n2 = other.histogram.count();
+        if n1 == 0 || n2 == 0 {
+            return (0.0, 0.0, 1.0);
+        }
+
+        let len = self
+            .histogram
+            .layout_counts_len()
+            .max(other.histogram.layout_counts_len());
+        let counts1 = self.histogram.counts_slice();
+        let counts2 = other.histogram.counts_slice();
+
+        // At each bucket index, the values from histogram 1 at that index beat all
+        // values from histogram 2 at lower indices (concordant pairs).
+        let mut cum2 = 0_i64;
+        let mut concordant = 0.0_f64;
+        let mut tied = 0.0_f64;
+        for index in 0..len {
+            let c1 = count_at(counts1, index);
+            let c2 = count_at(counts2, index);
+            concordant += c1 as f64 * cum2 as f64;
+            tied += c1 as f64 * c2 as f64;
+            cum2 += c2;
+        }
+
+        // The U statistic for sample 1 is the concordant pairs plus half the ties.
+        let u = concordant + 0.5 * tied;
+        let dn1 = n1 as f64;
+        let dn2 = n2 as f64;
+        let mu = dn1 * dn2 / 2.0;
+
+        // Tie correction for the variance:
+        // `sigma^2 = n1*n2/12 * (N+1 - sum(t_k^3 - t_k) / (N*(N-1)))`, where `t_k`
+        // is the number of observations tied at rank `k`.
+        let n_total = dn1 + dn2;
+        let mut tie_correction = 0.0_f64;
+        for index in 0..len {
+            let tk = (count_at(counts1, index) + count_at(counts2, index)) as f64;
+            if tk > 1.0 {
+                tie_correction += tk * tk * tk - tk;
+            }
+        }
+
+        let sigma_sq =
+            (dn1 * dn2 / 12.0) * (n_total + 1.0 - tie_correction / (n_total * (n_total - 1.0)));
+        if sigma_sq <= 0.0 {
+            return (u, 0.0, 1.0);
+        }
+
+        let z = (u - mu) / sigma_sq.sqrt();
+        let p = 2.0 * crate::beta::normal_cdf(-z.abs());
+        (u, z, p)
+    }
+
+    /// `Histogram::CohensD`: pooled-standard-deviation effect size against `other`.
+    pub fn cohens_d(&self, other: &HistogramState) -> f64 {
+        let n1 = self.histogram.count();
+        let n2 = other.histogram.count();
+        if n1 < 2 || n2 < 2 {
+            return 0.0;
+        }
+
+        let mean1 = self.histogram.mean();
+        let mean2 = other.histogram.mean();
+        let sd1 = self.histogram.stddev();
+        let sd2 = other.histogram.stddev();
+
+        // Bessel's correction: population variance to sample variance.
+        let var1 = sd1 * sd1 * n1 as f64 / (n1 - 1) as f64;
+        let var2 = sd2 * sd2 * n2 as f64 / (n2 - 1) as f64;
+
+        let pooled_sd =
+            (((n1 - 1) as f64 * var1 + (n2 - 1) as f64 * var2) / (n1 + n2 - 2) as f64).sqrt();
+        if pooled_sd == 0.0 {
+            return 0.0;
+        }
+        (mean1 - mean2) / pooled_sd
+    }
+
+    /// `Histogram::CliffsD`: Cliff's delta against `other`, in `[-1, 1]`.
+    ///
+    /// Positive means this histogram's values tend to be larger. The discordant
+    /// count is derived from the total pair count rather than accumulated, which
+    /// matches the C and keeps the two passes over a long counts array to one.
+    pub fn cliffs_d(&self, other: &HistogramState) -> f64 {
+        let n1 = self.histogram.count();
+        let n2 = other.histogram.count();
+        if n1 == 0 || n2 == 0 {
+            return 0.0;
+        }
+
+        let len = self
+            .histogram
+            .layout_counts_len()
+            .max(other.histogram.layout_counts_len());
+        let counts1 = self.histogram.counts_slice();
+        let counts2 = other.histogram.counts_slice();
+
+        let mut cum2 = 0_i64;
+        let mut concordant = 0.0_f64;
+        let mut tied = 0.0_f64;
+        for index in 0..len {
+            let c1 = count_at(counts1, index);
+            let c2 = count_at(counts2, index);
+            concordant += c1 as f64 * cum2 as f64;
+            tied += c1 as f64 * c2 as f64;
+            cum2 += c2;
+        }
+
+        let pairs = n1 as f64 * n2 as f64;
+        let discordant = pairs - concordant - tied;
+        (concordant - discordant) / pairs
+    }
+
     /// An independent copy, as `Histogram::Clone` builds for `snapshot()`.
     ///
     /// The recorded data and every counter that survives a copy travel; the
@@ -349,6 +584,8 @@ impl HistogramState {
             ewma_initialized: self.ewma_initialized,
             threshold: self.threshold,
             ewma_error_rate: self.ewma_error_rate,
+            mutation_generation: self.mutation_generation,
+            recorded_snapshot: None,
         }
     }
 }
@@ -375,162 +612,21 @@ pub fn cdf(histogram: &HdrHistogram, value: i64) -> f64 {
     1.0
 }
 
+/// Reads one counts entry, treating an index past the array as empty.
+///
+/// The C guards each read with `i < counts_len` because the two histograms may
+/// have different layouts; the shorter array simply has no samples there.
+fn count_at(counts: &[i64], index: i32) -> i64 {
+    counts.get(index as usize).copied().unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // The statistical helpers `meanCI` and friends are built on.
 // ---------------------------------------------------------------------------
-
-/// Continued fraction for the regularized incomplete beta function.
-///
-/// Port of Node's `BetaContinuedFraction` in `src/histogram.cc`.
-fn beta_continued_fraction(a: f64, b: f64, x: f64) -> f64 {
-    const FPMIN: f64 = 1e-30;
-    const MAXIT: usize = 200;
-    const EPS: f64 = 3e-12;
-
-    let qab = a + b;
-    let qap = a + 1.0;
-    let qam = a - 1.0;
-    let mut c = 1.0;
-    let mut d = 1.0 - qab * x / qap;
-    if d.abs() < FPMIN {
-        d = FPMIN;
-    }
-    d = 1.0 / d;
-    let mut h = d;
-
-    for m in 1..=MAXIT {
-        let m2 = 2.0 * m as f64;
-        let mut aa = m as f64 * (b - m as f64) * x / ((qam + m2) * (a + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < FPMIN {
-            d = FPMIN;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < FPMIN {
-            c = FPMIN;
-        }
-        d = 1.0 / d;
-        h *= d * c;
-
-        aa = -(a + m as f64) * (qab + m as f64) * x / ((a + m2) * (qap + m2));
-        d = 1.0 + aa * d;
-        if d.abs() < FPMIN {
-            d = FPMIN;
-        }
-        c = 1.0 + aa / c;
-        if c.abs() < FPMIN {
-            c = FPMIN;
-        }
-        d = 1.0 / d;
-        let delta = d * c;
-        h *= delta;
-        if (delta - 1.0).abs() <= EPS {
-            break;
-        }
-    }
-    h
-}
-
-/// Regularized incomplete beta function `I_x(a, b)`.
-///
-/// Port of Node's scalar `RegularizedIncompleteBeta(a, b, x)` path, which
-/// powers `StudentTCdf` and therefore `meanCI`.
-fn regularized_incomplete_beta(a: f64, b: f64, x: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    if x >= 1.0 {
-        return 1.0;
-    }
-
-    let sum = a + b;
-    let log_normalization = log_gamma(sum) - log_gamma(a) - log_gamma(b);
-    let log_front = log_normalization + a * x.ln() + b * (1.0 - x).ln();
-    let front = log_front.exp();
-    let symmetry_point = (a + 1.0) / (sum + 2.0);
-
-    if x < symmetry_point {
-        front * beta_continued_fraction(a, b, x) / a
-    } else {
-        1.0 - front * beta_continued_fraction(b, a, 1.0 - x) / b
-    }
-}
-
-/// Natural logarithm of the gamma function.
-///
-/// The incomplete-beta front term needs `lgamma` for `a`, `b` and `a+b`; this
-/// Lanczos form keeps the implementation self-contained in Rust and numerically
-/// stable for the positive inputs histogram statistics use.
-fn log_gamma(x: f64) -> f64 {
-    const COEFFICIENTS: [f64; 9] = [
-        0.999_999_999_999_809_9,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-
-    if x < 0.5 {
-        return std::f64::consts::PI.ln()
-            - (std::f64::consts::PI * x).sin().ln()
-            - log_gamma(1.0 - x);
-    }
-
-    let shifted = x - 1.0;
-    let mut sum = COEFFICIENTS[0];
-    for (index, coefficient) in COEFFICIENTS.iter().enumerate().skip(1) {
-        sum += coefficient / (shifted + index as f64);
-    }
-    let g = 7.0;
-    let t = shifted + g + 0.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (shifted + 0.5) * t.ln() - t + sum.ln()
-}
-
-/// Student's t CDF, `P(T <= t)` for `df` degrees of freedom.
-fn student_t_cdf(t: f64, df: f64) -> f64 {
-    let squared = t * t;
-    let denominator = df + squared;
-    if squared < df {
-        let x = squared / denominator;
-        let ibeta = regularized_incomplete_beta(0.5, df / 2.0, x);
-        if t >= 0.0 {
-            0.5 + 0.5 * ibeta
-        } else {
-            0.5 - 0.5 * ibeta
-        }
-    } else {
-        let x = df / denominator;
-        let ibeta = regularized_incomplete_beta(df / 2.0, 0.5, x);
-        if t >= 0.0 {
-            1.0 - 0.5 * ibeta
-        } else {
-            0.5 * ibeta
-        }
-    }
-}
-
-/// Positive Student's t quantile for an upper-tail probability.
-fn student_t_upper_quantile(p: f64, df: f64) -> f64 {
-    let mut lo = 0.0_f64;
-    let mut hi = 1.0_f64;
-    while student_t_cdf(-hi, df) > p {
-        hi *= 2.0;
-    }
-
-    for _ in 0..100 {
-        let mid = (lo + hi) / 2.0;
-        if student_t_cdf(-mid, df) > p {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    (lo + hi) / 2.0
-}
+//
+// The beta machinery itself lives in [`crate::beta`], because `qrde` needs both
+// the scalar CDF these helpers use and the front-term form with the large-shape
+// expansion. It is one implementation, not a copy per consumer.
 
 /// Binomial CDF `P(X <= k)` for `X ~ Binomial(n, p)`.
 fn binomial_cdf(k: i64, n: i64, p: f64) -> f64 {
@@ -753,7 +849,7 @@ pub(crate) fn add_histogram_methods<'s>(
     template: v8::Local<'s, v8::FunctionTemplate>,
 ) -> Result<(), String> {
     let prototype = template.prototype_template(scope);
-    let methods: [(&str, v8::Local<'s, v8::FunctionTemplate>); 36] = [
+    let methods: [(&str, v8::Local<'s, v8::FunctionTemplate>); 42] = [
         ("count", method(scope, histogram_count)),
         ("countBigInt", method(scope, histogram_count_bigint)),
         ("min", method(scope, histogram_min)),
@@ -794,6 +890,15 @@ pub(crate) fn add_histogram_methods<'s>(
         ("reset", method(scope, histogram_reset)),
         ("resetCount", method(scope, histogram_reset_count)),
         ("snapshot", method(scope, histogram_snapshot)),
+        ("ksTest", method(scope, histogram_ks_test)),
+        ("welchTest", method(scope, histogram_welch_test)),
+        (
+            "mannWhitneyTest",
+            method(scope, histogram_mann_whitney_test),
+        ),
+        ("cohensD", method(scope, histogram_cohens_d)),
+        ("cliffsD", method(scope, histogram_cliffs_d)),
+        ("qrde", method(scope, histogram_qrde)),
         ("diff", method(scope, histogram_diff)),
         ("export", method(scope, histogram_export)),
     ];
@@ -1024,6 +1129,222 @@ fn histogram_percentile_ci(
         result.set_index(scope, index as u32, v8::Number::new(scope, *value).into());
     }
     rv.set(result.into());
+}
+
+/// Builds a JS `Array` of `values` as a return value.
+///
+/// An `Array` rather than a `Float64Array` because that is what `Array::New` in
+/// `GetWelchTest` and `GetMannWhitneyTest` produces; `lib/internal/histogram.js`
+/// reads the entries by index and never looks at the prototype.
+fn number_array<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    rv: &mut v8::ReturnValue<'_>,
+    values: &[f64],
+) {
+    let result = v8::Array::new(scope, values.len() as i32);
+    for (index, value) in values.iter().enumerate() {
+        result.set_index(scope, index as u32, v8::Number::new(scope, *value).into());
+    }
+    rv.set(result.into());
+}
+
+/// Runs `body` with the states of `this` and `args[0]`, which must both be
+/// histograms of this module's.
+///
+/// Reports the failure itself and returns `None` so a caller can `return` on it.
+/// `self_` names the result for the `this === other` case, because Node has a
+/// separate locked path for it and its answer is a constant there rather than a
+/// second pass over the counts.
+fn with_pair<R>(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    self_: R,
+    body: impl FnOnce(&HistogramState, &HistogramState) -> R,
+) -> Option<R> {
+    let Some(this_cell) = cell_of(args.this()) else {
+        throw_illegal_invocation(scope);
+        return None;
+    };
+    let other = match v8::Local::<v8::Object>::try_from(args.get(0)) {
+        Ok(object) => cell_of(object),
+        Err(_) => None,
+    };
+    let Some(other_cell) = other else {
+        throw_type_error(scope, "expected a Histogram");
+        return None;
+    };
+    // Both cells are borrowed but neither is borrowed mutably, so the two
+    // `RefCell` borrows are independent even when they are the same cell.
+    if std::ptr::eq(this_cell, other_cell) {
+        return Some(self_);
+    }
+    let this = this_cell.state.borrow();
+    Some(body(&this, &other_cell.state.borrow()))
+}
+
+/// `ksTest(other)`: the Kolmogorov-Smirnov D statistic.
+///
+/// A histogram compared with itself is `0` in Node without taking a second lock,
+/// and `0` is also what the counts walk computes, so the constant is the same
+/// answer by a shorter route.
+fn histogram_ks_test(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Some(value) = with_pair(scope, &args, 0.0, |this, other| this.ks_test(other)) else {
+        return;
+    };
+    rv.set(v8::Number::new(scope, value).into());
+}
+
+/// `welchTest(other, confidence)`: Welch's t-test against `other`.
+fn histogram_welch_test(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Some(confidence) = args.get(1).number_value(scope) else {
+        throw_type_error(scope, "welchTest confidence must be a number");
+        return;
+    };
+    let Some(values) = with_pair(scope, &args, (0.0, 0.0, 1.0, 0.0, 0.0), |this, other| {
+        this.welch_test(other, confidence)
+    }) else {
+        return;
+    };
+    let values = [values.0, values.1, values.2, values.3, values.4];
+    number_array(scope, &mut rv, &values);
+}
+
+/// `mannWhitneyTest(other)`: the U statistic, z score and two-tailed p-value.
+fn histogram_mann_whitney_test(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Some(values) = with_pair(scope, &args, (0.0, 0.0, 1.0), |this, other| {
+        this.mann_whitney_test(other)
+    }) else {
+        return;
+    };
+    let values = [values.0, values.1, values.2];
+    number_array(scope, &mut rv, &values);
+}
+
+/// `cohensD(other)`: the pooled-standard-deviation effect size.
+fn histogram_cohens_d(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Some(value) = with_pair(scope, &args, 0.0, |this, other| this.cohens_d(other)) else {
+        return;
+    };
+    rv.set(v8::Number::new(scope, value).into());
+}
+
+/// `cliffsD(other)`: Cliff's delta against `other`.
+fn histogram_cliffs_d(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Some(value) = with_pair(scope, &args, 0.0, |this, other| this.cliffs_d(other)) else {
+        return;
+    };
+    rv.set(v8::Number::new(scope, value).into());
+}
+
+/// `qrde(boundaries, mode, cache)`: the promise `CalculateQrde` resolves.
+///
+/// `lib/internal/histogram.js` validates everything before it gets here — the
+/// boundaries are a `Float64Array` of at least two strictly increasing values
+/// starting at `0` and ending at `1`, and the mode is one of `0`, `1`, `2` — so
+/// the checks below are the `CHECK`s the C carries, reporting rather than
+/// aborting.
+fn histogram_qrde(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Ok(input) = v8::Local::<v8::Float64Array>::try_from(args.get(0)) else {
+        throw_type_error(scope, "qrde expects a Float64Array of probabilities");
+        return;
+    };
+    let length = input.length();
+    if !(2..=1001).contains(&length) {
+        throw_out_of_range(scope, "probabilities must be >= 2 && <= 1001");
+        return;
+    }
+    let Some(mode) = args.get(1).uint32_value(scope) else {
+        throw_type_error(scope, "qrde dequantization must be an unsigned integer");
+        return;
+    };
+    let Some(dequantization) = Dequantization::from_u32(mode) else {
+        throw_out_of_range(scope, "dequantization is out of range");
+        return;
+    };
+    let cache_snapshot = args.get(2).boolean_value(scope);
+
+    let mut probabilities = Vec::with_capacity(length);
+    for index in 0..length {
+        let Some(value) = input.get_index(scope, index as u32) else {
+            return;
+        };
+        probabilities.push(value.number_value(scope).unwrap_or(0.0));
+    }
+
+    let Some(cell) = cell_of(args.this()) else {
+        throw_illegal_invocation(scope);
+        return;
+    };
+
+    // `GetRecordedSnapshotSource`: a cached snapshot wins when the caller asked
+    // for one and the histogram has not changed since it was taken. Otherwise the
+    // buckets are copied *now*, so a `record` between this call and the completion
+    // cannot change the answer — which the qrde tests exercise directly.
+    let (snapshot, generation, cache_hit) = {
+        let state = cell.state.borrow();
+        match (cache_snapshot, state.recorded_snapshot.as_ref()) {
+            (true, Some(cached)) => (Arc::clone(cached), state.mutation_generation, true),
+            _ => (
+                Arc::new(crate::qrde::Snapshot::build(&state.histogram)),
+                state.mutation_generation,
+                false,
+            ),
+        }
+    };
+
+    let cache = if cache_snapshot && !cache_hit {
+        Some((v8::Global::new(scope.as_ref(), args.this()), generation))
+    } else {
+        None
+    };
+
+    let work = crate::qrde::Work::new(snapshot, probabilities, dequantization);
+    if let Some(promise) = crate::qrde::schedule(scope, work, cache) {
+        rv.set(promise);
+    }
+}
+
+/// `CacheRecordedSnapshot`: installs a completed `qrde`'s snapshot in the cache.
+///
+/// The generation check is what makes a late completion harmless: if the histogram
+/// changed while the job ran, the snapshot it produced no longer describes the
+/// histogram and caching it would make the *next* call return stale data.
+pub fn cache_recorded_snapshot(
+    object: v8::Local<'_, v8::Object>,
+    generation: u64,
+    snapshot: &Arc<crate::qrde::Snapshot>,
+) {
+    let Some(cell) = cell_of(object) else {
+        return;
+    };
+    let mut state = cell.state.borrow_mut();
+    if generation == state.mutation_generation {
+        state.recorded_snapshot = Some(Arc::clone(snapshot));
+    }
 }
 
 fn histogram_percentiles(
@@ -1335,7 +1656,9 @@ fn histogram_add(
         let copy = other_cell.state.borrow().snapshot();
         let mut this = this_cell.state.borrow_mut();
         this.exceeds += copy.exceeds;
-        this.histogram.add(&copy.histogram)
+        let dropped = this.histogram.add(&copy.histogram);
+        this.invalidate_recorded_snapshot();
+        dropped
     } else {
         let other = other_cell.state.borrow();
         let mut this = this_cell.state.borrow_mut();
@@ -1343,7 +1666,9 @@ fn histogram_add(
         if other.prev > this.prev {
             this.prev = other.prev;
         }
-        this.histogram.add(&other.histogram)
+        let dropped = this.histogram.add(&other.histogram);
+        this.invalidate_recorded_snapshot();
+        dropped
     };
     rv.set(v8::Number::new(scope, dropped as f64).into());
 }

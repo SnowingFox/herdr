@@ -204,8 +204,10 @@ impl Layout {
         value_from_index(bucket_index, sub_bucket_index, self.unit_magnitude)
     }
 
-    /// `hdr_size_of_equivalent_value_range`.
-    fn size_of_equivalent_value_range(&self, value: i64) -> i64 {
+    /// `hdr_size_of_equivalent_value_range`, public because `qrde` reports each
+    /// recorded bucket's width: the half-width is what a dequantized bucket
+    /// spreads its samples over.
+    pub fn size_of_equivalent_value_range(&self, value: i64) -> i64 {
         let bucket_index = self.bucket_index(value);
         let sub_bucket_index = self.sub_bucket_index(value, bucket_index);
         let adjusted_bucket = if sub_bucket_index >= self.sub_bucket_count {
@@ -303,6 +305,20 @@ pub struct Bucket {
     /// Samples recorded into this bucket.
     pub count: i64,
     /// Running total through this bucket.
+    pub cumulative_count: i64,
+}
+
+/// `Histogram::RecordedBucket`, one occupied bucket as `BuildRecordedSnapshot`
+/// records it for `qrde`.
+///
+/// `value` is the **median** equivalent value — the point `qrde` centers its
+/// within-bucket moments on — and `resolution` is the equivalent-value width,
+/// which decides whether a bucket with more than one sample is dequantized.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordedBucket {
+    pub value: f64,
+    pub resolution: f64,
+    pub count: i64,
     pub cumulative_count: i64,
 }
 
@@ -536,6 +552,26 @@ impl HdrHistogram {
     /// `hdr_iter_recorded_init`: only non-empty buckets.
     pub fn iter_recorded(&self) -> impl Iterator<Item = Bucket> + '_ {
         self.iter_all().filter(|bucket| bucket.count != 0)
+    }
+
+    /// The recorded buckets in the shape `qrde` consumes, which is
+    /// `BuildRecordedSnapshot`'s `RecordedBucket` list.
+    ///
+    /// `value` is the *median* equivalent value, not the bucket's lowest one that
+    /// [`iter_recorded`](Self::iter_recorded) reports: `BuildRecordedSnapshot`
+    /// stores `iter.median_equivalent_value`, and `qrde` places its within-bucket
+    /// moments around that point. `resolution` is the bucket's equivalent-value
+    /// width, which decides whether a bucket with more than one sample is
+    /// dequantized at all.
+    pub fn recorded_buckets(&self) -> Vec<RecordedBucket> {
+        self.iter_recorded()
+            .map(|bucket| RecordedBucket {
+                value: bucket.median as f64,
+                resolution: self.layout.size_of_equivalent_value_range(bucket.value) as f64,
+                count: bucket.count,
+                cumulative_count: bucket.cumulative_count,
+            })
+            .collect()
     }
 
     /// `hdr_iter_percentile_init` with `ticks_per_half_distance = 1`, which is

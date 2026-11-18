@@ -32,10 +32,12 @@
 //! `loopIdleTime`, `uvMetricsInfo` and `updateGarbageCollectionTracking` report
 //! loop and collector statistics.
 
+mod beta;
 mod cbor;
 mod eld;
 mod hdr;
 mod histogram_binding;
+mod qrde;
 
 use std::cell::RefCell;
 use std::sync::OnceLock;

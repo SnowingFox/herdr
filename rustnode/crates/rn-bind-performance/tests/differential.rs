@@ -544,3 +544,194 @@ fn an_imported_payload_matches_the_oracle() {
     );
     assert!(actual.starts_with("5 10 50 30 30"), "{actual}");
 }
+#[test]
+fn the_distribution_comparisons_match_the_oracle() {
+    // `ksTest`, `welchTest`, `mannWhitneyTest`, `cohensD` and `cliffsD` are five
+    // different reductions of the same two counts arrays. Each is printed with
+    // 17 significant digits so a last-bit disagreement is visible: these are the
+    // methods a benchmark comparison reports as a verdict, and `#207`'s lesson is
+    // that a textbook formula matching to 1e-3 is not the same function.
+    let Some(oracle) = rn_node_oracle::require_oracle("the histogram distribution tests") else {
+        return;
+    };
+    let output = same_as_oracle(
+        &oracle,
+        &format!(
+            "{PROLOGUE}
+            function show(name, value) {{
+              if (Array.isArray(value)) {{
+                console.log(`${{name}}=${{value.map((v) => v.toPrecision(17)).join(',')}}`);
+              }} else if (typeof value === 'object') {{
+                console.log(`${{name}}=${{Object.entries(value).map(([k, v]) =>
+                  `${{k}}:${{typeof v === 'object'
+                    ? Object.entries(v).map(([kk, vv]) => `${{kk}}:${{vv.toPrecision(17)}}`).join('|')
+                    : v.toPrecision(17)}}`).join(';')}}`);
+              }} else {{
+                console.log(`${{name}}=${{value.toPrecision(17)}}`);
+              }}
+            }}
+            const a = createHistogram({{ lowest: 1, highest: 100000, figures: 3 }});
+            const b = createHistogram({{ lowest: 1, highest: 100000, figures: 3 }});
+            for (let i = 1; i <= 200; i++) a.record(i * 3);
+            for (let i = 1; i <= 150; i++) b.record(i * 3 + 40);
+            show('ks', a.ksTest(b));
+            show('ks-sym', b.ksTest(a));
+            show('welch', a.welchTest(b));
+            show('welch90', a.welchTest(b, {{ confidence: 0.9 }}));
+            show('mw', a.mannWhitneyTest(b));
+            show('cohen', a.cohensD(b));
+            show('cliff', a.cliffsD(b));
+
+            // Same histogram against itself: every method has a constant answer.
+            show('self-ks', a.ksTest(a));
+            show('self-welch', a.welchTest(a));
+            show('self-mw', a.mannWhitneyTest(a));
+            show('self-cohen', a.cohensD(a));
+            show('self-cliff', a.cliffsD(a));
+
+            // Ties matter: identical distributions are all-tied pairs, which is
+            // where the tie correction in `mannWhitneyTest` and the discordant
+            // count in `cliffsD` decide the answer.
+            const tied = createHistogram({{ lowest: 1, highest: 100000, figures: 3 }});
+            for (let i = 1; i <= 150; i++) tied.record(i * 3 + 40);
+            show('tied-ks', a.ksTest(tied));
+            show('tied-mw', a.mannWhitneyTest(tied));
+            show('tied-cliff', a.cliffsD(tied));
+
+            // Empty on either side, and too few samples for a variance.
+            const empty = createHistogram({{ lowest: 1, highest: 100000, figures: 3 }});
+            show('empty-ks', a.ksTest(empty));
+            show('empty-mw', a.mannWhitneyTest(empty));
+            show('empty-welch', a.welchTest(empty));
+            show('empty-cohen', a.cohensD(empty));
+            show('empty-cliff', a.cliffsD(empty));
+
+            const one = createHistogram({{ lowest: 1, highest: 100000, figures: 3 }});
+            one.record(7);
+            const two = createHistogram({{ lowest: 1, highest: 100000, figures: 3 }});
+            two.record(9);
+            show('one-welch', one.welchTest(two));
+            show('one-cohen', one.cohensD(two));
+
+            // A constant histogram has no spread, so Welch's standard error is
+            // zero and the C returns its no-evidence constant.
+            const flat1 = createHistogram({{ lowest: 1, highest: 100000, figures: 3 }});
+            const flat2 = createHistogram({{ lowest: 1, highest: 100000, figures: 3 }});
+            for (let i = 0; i < 10; i++) {{ flat1.record(100); flat2.record(200); }}
+            show('flat-welch', flat1.welchTest(flat2));
+            show('flat-cohen', flat1.cohensD(flat2));
+            show('flat-cliff', flat1.cliffsD(flat2));"
+        ),
+    );
+    // Spot checks so a comparison that agreed on a parse error cannot pass.
+    assert!(output.starts_with("ks="), "{output}");
+    assert!(
+        output.contains("self-welch=tStatistic:0.0000000000000000"),
+        "{output}"
+    );
+    assert!(output.contains("empty-ks=0.0000000000000000"), "{output}");
+    assert!(output.contains("flat-cohen=0.0000000000000000"), "{output}");
+}
+
+#[test]
+fn the_quantile_density_estimate_matches_the_oracle() {
+    // `qrde` is a bucket-by-bucket integral over the recorded buckets, so this
+    // covers the three dequantization modes, the exact-support search that only
+    // engages at 512 or more buckets, and the correction counter.
+    let Some(oracle) = rn_node_oracle::require_oracle("the histogram QRDE") else {
+        return;
+    };
+    let output = same_as_oracle(
+        &oracle,
+        &format!(
+            "{PROLOGUE}
+            function show(name, result) {{
+              console.log(`${{name}} count=${{result.count}} buckets=${{result.bucketCount}}` +
+                          ` corrections=${{result.corrections}} mode=${{result.dequantize}}`);
+              console.log(`${{name}} q=${{Array.from(result.quantiles)
+                .map((v) => v.toPrecision(17)).join(',')}}`);
+              console.log(`${{name}} d=${{Array.from(result.densities)
+                .map((v) => v.toPrecision(17)).join(',')}}`);
+            }}
+            async function main() {{
+              const empty = createHistogram();
+              show('empty', await empty.qrde());
+
+              const small = createHistogram();
+              for (const value of [3, 4, 7]) small.record(value);
+              for (const mode of ['none', 'hdr', 'all']) {{
+                show(`small-${{mode}}`, await small.qrde({{ bins: 10, dequantize: mode }}));
+              }}
+
+              // A point mass: `none` is a step, `all` spreads it across the
+              // bucket's half-width on either side.
+              const point = createHistogram();
+              for (let i = 0; i < 100; i++) point.record(100);
+              for (const mode of ['none', 'hdr', 'all']) {{
+                show(`point-${{mode}}`, await point.qrde({{ bins: 10, dequantize: mode }}));
+              }}
+
+              // A wide bucket, where `hdr` and `none` disagree but `hdr` and
+              // `all` agree.
+              const wide = createHistogram();
+              for (let i = 0; i < 100; i++) wide.record(100000);
+              for (const mode of ['none', 'hdr', 'all']) {{
+                show(`wide-${{mode}}`, await wide.qrde({{ bins: 10, dequantize: mode }}));
+              }}
+
+              // More than 512 buckets engages `QrdeExactSupport`.
+              const many = createHistogram();
+              for (let i = 1; i <= 1024; i++) many.record(i);
+              show('many-none', await many.qrde({{ bins: 100, dequantize: 'none' }}));
+
+              // Asymmetric bucket shapes choose different beta branches.
+              const skewed = createHistogram();
+              for (let i = 1; i <= 10; i++) skewed.record(i);
+              for (let i = 0; i < 90; i++) skewed.record(1000 + i);
+              show('skewed', await skewed.qrde({{ bins: 20 }}));
+
+              // The largest count a double can hold exactly, which drives the
+              // asymptotic beta CDF branch.
+              const large = createHistogram();
+              large.record(1);
+              large.record(3);
+              for (let i = 0; i < 20; i++) {{
+                const copy = createHistogram();
+                copy.add(large);
+                large.add(copy);
+              }}
+              show('large', await large.qrde({{ bins: 4, dequantize: 'none' }}));
+            }}
+            main();"
+        ),
+    );
+    // Spot checks, so a comparison that agreed on a parse error cannot pass. The
+    // values are the oracle's: `toPrecision(17)` on 100 is `"100.00000000000000"`,
+    // which is 17 significant digits, not 17 decimals.
+    assert!(
+        output.contains("empty count=0 buckets=0 corrections=0 mode=hdr"),
+        "{output}"
+    );
+    assert!(
+        output.contains("point-none q=100.00000000000000,"),
+        "{output}"
+    );
+    assert!(
+        output.contains("point-all q=99.500000000000000,"),
+        "{output}"
+    );
+    assert!(
+        output.contains("point-none d=Infinity,Infinity"),
+        "{output}"
+    );
+    assert!(
+        output.contains("many-none count=1024 buckets=1024"),
+        "{output}"
+    );
+    // 512 or more buckets engages `QrdeExactSupport`; the two tails must still
+    // land on the data's own endpoints.
+    assert!(
+        output.contains("many-none q=1.0000000000000000,10.740000001653831"),
+        "{output}"
+    );
+}
