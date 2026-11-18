@@ -133,6 +133,69 @@ fn worker_get_heap_statistics_rejects_after_the_worker_is_gone() {
 }
 
 #[test]
+fn worker_get_heap_snapshot_streams_parseable_v8_snapshot_json() {
+    // The reported worker-cluster defect: `this[kHandle]?.takeHeapSnapshot is not
+    // a function`, which makes `worker.getHeapSnapshot()` throw before its
+    // promise can settle and leaves the test waiting forever.
+    let source = r#"
+      const { Worker } = require('worker_threads');
+      const w = new Worker('require("worker_threads").parentPort.postMessage(1)', { eval: true });
+      w.once('message', async () => {
+        const stream = await w.getHeapSnapshot();
+        const chunks = [];
+        stream.on('data', (chunk) => chunks.push(chunk));
+        stream.on('end', () => {
+          const text = Buffer.concat(chunks).toString();
+          let parsed;
+          try {
+            parsed = JSON.parse(text);
+          } catch {
+            console.log('false');
+            w.terminate();
+            return;
+          }
+          console.log(Boolean(
+            parsed.snapshot &&
+            parsed.snapshot.meta &&
+            Array.isArray(parsed.nodes) &&
+            Array.isArray(parsed.strings)
+          ));
+          w.terminate();
+        });
+      });
+    "#;
+    let (code, stdout, stderr) = run(env!("CARGO_BIN_EXE_rustnode"), source);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout.trim(), "true", "stdout: {stdout:?}");
+}
+
+#[test]
+fn worker_get_heap_snapshot_rejects_after_the_worker_is_gone() {
+    // Same running-state contract as `getHeapStatistics()`: once the worker has
+    // exited, the native call returns no taker and JS rejects with
+    // `ERR_WORKER_NOT_RUNNING`.
+    let source = r#"
+      const { Worker } = require('worker_threads');
+      const w = new Worker('', { eval: true });
+      w.once('exit', async () => {
+        try {
+          await w.getHeapSnapshot();
+          console.log('resolved');
+        } catch (error) {
+          console.log('rejected', error.code);
+        }
+      });
+    "#;
+    let (code, stdout, stderr) = run(env!("CARGO_BIN_EXE_rustnode"), source);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "rejected ERR_WORKER_NOT_RUNNING",
+        "stdout: {stdout:?}"
+    );
+}
+
+#[test]
 fn a_worker_past_its_old_generation_limit_reports_out_of_memory_and_the_parent_survives() {
     // The acceptance case for the heap work. Before the isolate was sized from
     // the machine *and* the near-heap-limit callback existed, this aborted the

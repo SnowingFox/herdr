@@ -174,6 +174,20 @@ pub struct WorkerHandle {
     interrupt_data: RefCell<Vec<Box<crate::heap_statistics::InterruptData>>>,
     /// The parent's wake token, so the statistics interrupt can wake this loop.
     parent_wake: Cell<Option<rn_uv::wake::ThreadToken>>,
+    /// The taker objects waiting for this worker's heap snapshot stream handle.
+    pending_heap_snapshots: RefCell<Vec<PendingHeapSnapshot>>,
+    /// The interrupt payloads whose raw pointers heap-snapshot interrupts still
+    /// read.
+    ///
+    /// Kept for the isolate's lifetime for the same reason as `interrupt_data`:
+    /// a queued V8 interrupt may still hold a pointer after this turn's call has
+    /// already resolved.
+    #[allow(
+        clippy::vec_box,
+        reason = "the box is the stable address the V8 interrupt callback holds, \
+                  not an indirection the vector already provides"
+    )]
+    snapshot_interrupt_data: RefCell<Vec<Box<crate::heap_snapshot::InterruptData>>>,
 }
 
 /// One `worker.getHeapStatistics()` call waiting for its numbers.
@@ -185,6 +199,17 @@ pub struct PendingHeapStatistics {
     /// `Mutex` because the write happens on the worker's thread and the read on
     /// the parent's; `None` means the interrupt has not run yet.
     result: Arc<Mutex<Option<[f64; HEAP_STATISTIC_FIELDS]>>>,
+}
+
+/// One `worker.takeHeapSnapshot()` call waiting for its stream handle.
+pub struct PendingHeapSnapshot {
+    /// The object `lib/internal/worker.js` reads `ondone` off.
+    taker: v8::Global<v8::Object>,
+    /// The serialized snapshot bytes once the worker's thread has produced them.
+    ///
+    /// `Mutex` because the write happens on the worker's thread and the read on
+    /// the parent's; `None` means the interrupt has not run yet.
+    result: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 impl PendingHeapStatistics {
@@ -207,6 +232,31 @@ impl PendingHeapStatistics {
     /// The numbers, once the worker's thread has reported them.
     pub(crate) fn values(&self) -> Option<[f64; HEAP_STATISTIC_FIELDS]> {
         *self.result.lock().ok()?
+    }
+
+    /// Whether the worker's thread has answered yet.
+    pub(crate) fn ready(&self) -> bool {
+        self.result.lock().is_ok_and(|slot| slot.is_some())
+    }
+}
+
+impl PendingHeapSnapshot {
+    /// Queues one call.
+    pub(crate) fn new(taker: v8::Global<v8::Object>, result: Arc<Mutex<Option<Vec<u8>>>>) -> Self {
+        Self { taker, result }
+    }
+
+    /// The taker object, as a handle in this isolate.
+    pub(crate) fn taker<'s>(
+        &self,
+        scope: &v8::PinScope<'s, '_>,
+    ) -> Option<v8::Local<'s, v8::Object>> {
+        Some(v8::Local::new(scope, &self.taker))
+    }
+
+    /// The serialized bytes, once the worker's thread has reported them.
+    pub(crate) fn bytes(&self) -> Option<Vec<u8>> {
+        self.result.lock().ok()?.clone()
     }
 
     /// Whether the worker's thread has answered yet.
@@ -266,6 +316,8 @@ impl WorkerHandle {
             pending_heap_statistics: RefCell::new(Vec::new()),
             interrupt_data: RefCell::new(Vec::new()),
             parent_wake: Cell::new(None),
+            pending_heap_snapshots: RefCell::new(Vec::new()),
+            snapshot_interrupt_data: RefCell::new(Vec::new()),
         }
     }
 
@@ -550,6 +602,50 @@ impl WorkerHandle {
     /// Records the parent's wake token for the statistics interrupt.
     pub(crate) fn set_parent_wake(&self, token: Option<rn_uv::wake::ThreadToken>) {
         self.parent_wake.set(token);
+    }
+
+    /// Queues one `takeHeapSnapshot()` delivery.
+    pub(crate) fn queue_heap_snapshot(&self, pending: PendingHeapSnapshot) {
+        self.pending_heap_snapshots.borrow_mut().push(pending);
+    }
+
+    /// Whether a `takeHeapSnapshot()` call is waiting for bytes that have
+    /// arrived, so the check phase has work to do.
+    #[must_use]
+    pub fn has_deliverable_heap_snapshots(&self) -> bool {
+        self.pending_heap_snapshots
+            .borrow()
+            .iter()
+            .any(PendingHeapSnapshot::ready)
+    }
+
+    /// Whether any `takeHeapSnapshot()` call is outstanding, answered or not.
+    ///
+    /// The loop has to stay alive while the promise
+    /// `lib/internal/worker.js` returned is still unsettled.
+    #[must_use]
+    pub fn has_pending_heap_snapshots(&self) -> bool {
+        !self.pending_heap_snapshots.borrow().is_empty()
+    }
+
+    /// Takes the calls whose snapshot bytes have arrived, leaving the rest
+    /// queued.
+    pub(crate) fn take_ready_heap_snapshots(&self) -> Vec<PendingHeapSnapshot> {
+        let mut pending = self.pending_heap_snapshots.borrow_mut();
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(PendingHeapSnapshot::ready);
+        *pending = waiting;
+        ready
+    }
+
+    /// Keeps one heap-snapshot interrupt's data alive for the life of the
+    /// worker.
+    pub(crate) fn retain_snapshot_interrupt_data(
+        &self,
+        data: Box<crate::heap_snapshot::InterruptData>,
+    ) {
+        self.snapshot_interrupt_data.borrow_mut().push(data);
     }
 
     /// Starts the worker thread with `run` as its body.

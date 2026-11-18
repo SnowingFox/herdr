@@ -86,6 +86,9 @@ pub fn install_worker_constructor<'s>(
     install_method(scope, prototype, "hasRef", has_ref)?;
     // `lib/internal/worker.js` reads this for `worker.resourceLimits`.
     install_method(scope, prototype, "getResourceLimits", get_resource_limits)?;
+    // `worker.getHeapSnapshot()`, which `lib/internal/worker.js:546` wraps in a
+    // promise around the returned taker's `ondone`.
+    install_method(scope, prototype, "takeHeapSnapshot", take_heap_snapshot)?;
     // `worker.getHeapStatistics()`, which `lib/internal/worker.js:554` wraps in a
     // promise around the returned taker's `ondone`.
     install_method(scope, prototype, "getHeapStatistics", get_heap_statistics)?;
@@ -364,6 +367,43 @@ fn get_resource_limits(
         unsafe { &*slot }.handle.borrow().request().resource_limits
     });
     rv.set(crate::float64_array(scope, &limits));
+}
+
+/// `takeHeapSnapshot()`: asks the worker's isolate for a stream handle.
+///
+/// `src/node_worker.cc:1128` follows the same taker pattern as
+/// `getHeapStatistics()`: return an object now, call its `ondone` once the worker
+/// thread has produced the result.
+fn take_heap_snapshot(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    let Some(slot) = slot_of(scope, args.this()) else {
+        throw_type_error(scope, "takeHeapSnapshot called on a non-Worker");
+        return;
+    };
+    // SAFETY: as in `start_thread`.
+    let handle = unsafe { &*slot }.handle.borrow();
+    // Same `RequestInterrupt` answer as `getHeapStatistics()`: no environment
+    // means an unset return value, and `lib/internal/worker.js` rejects with
+    // `ERR_WORKER_NOT_RUNNING`.
+    let Some(isolate) = handle.isolate_handle() else {
+        return;
+    };
+    let taker = v8::Object::new(scope);
+    let Some((pending, interrupt_data)) = crate::heap_snapshot::request(
+        &isolate,
+        v8::Global::new(scope, taker),
+        handle.parent_wake(),
+    ) else {
+        return;
+    };
+    handle.queue_heap_snapshot(pending);
+    // The interrupt callback reads this through a raw pointer, so it has to
+    // outlive the isolate and nothing on the worker's thread can free it.
+    handle.retain_snapshot_interrupt_data(interrupt_data);
+    rv.set(taker.into());
 }
 
 /// `getHeapStatistics()`: asks the worker's isolate for a snapshot.
