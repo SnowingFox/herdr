@@ -86,6 +86,27 @@ pub trait Scheduler {
         false
     }
 
+    /// Runs the embedder's queued platform tasks, reporting whether any ran.
+    ///
+    /// V8 posts work to the isolate's foreground task runner and completes it
+    /// from a task rather than inline — a `MeasureMemory` request waits for the
+    /// GC task V8 schedules, and a streaming `WebAssembly.compile` resolves when
+    /// a worker task reports back. None of that is visible to libuv, so a loop
+    /// that only asked "is libuv alive" would exit with the promises still
+    /// pending.
+    ///
+    /// Node handles this by calling `platform->DrainTasks(isolate)` once per
+    /// iteration *before* reading `uv_loop_alive`, so a task that resolves a
+    /// promise is seen by the same decision that would otherwise stop the loop.
+    /// This is that call, and [`Loop::tick`] runs it in the same position.
+    ///
+    /// Returns whether at least one task ran. The default is `false`, so a
+    /// scheduler with no platform queue costs one virtual call per idle
+    /// iteration and changes nothing.
+    fn drain_platform_tasks(&mut self) -> bool {
+        false
+    }
+
     /// Called once the loop has run dry, and again after each idle it reaches.
     ///
     /// This is `beforeExit`. Node emits it from inside `SpinEventLoopInternal`
@@ -184,8 +205,25 @@ impl Loop {
         // so it counts here too. The check phase is what drains it, and that
         // phase runs whether or not libuv has a ref'd handle of its own.
         if !rn_uv::uv_loop::is_active() {
+            // The platform queue is drained even here, and this is the case that
+            // matters most: a promise resolved entirely by a V8 task owns no
+            // libuv handle, so without this the loop would call itself dead
+            // while that task is still waiting to run. Node drains before every
+            // liveness read, including the one that ends the loop
+            // (`src/api/embed_helpers.cc:45`).
+            //
+            // A task that ran may have queued more work — its own continuation,
+            // or a tick — so the liveness answer is re-taken afterwards and the
+            // queues are drained. Reporting "still has work" for the turn a task
+            // ran is what gives a chain of tasks its next turn: without it the
+            // loop would stop after the first one.
+            let ran_tasks = scheduler.drain_platform_tasks();
             if !scheduler.has_external_work() {
-                return false;
+                if !ran_tasks {
+                    return false;
+                }
+                scheduler.drain();
+                return true;
             }
             // A loop libuv calls dead never blocks in poll, so this iteration
             // runs the check phase and returns rather than waiting.
@@ -194,6 +232,7 @@ impl Loop {
             return rn_uv::uv_loop::is_active() || scheduler.has_external_work();
         }
         let _ = rn_uv::uv_loop::run_once_blocking();
+        scheduler.drain_platform_tasks();
         scheduler.drain();
         rn_uv::uv_loop::is_active() || scheduler.has_external_work()
     }

@@ -316,6 +316,17 @@ fn define_global(
     Ok(())
 }
 
+/// How many V8 foreground tasks one drain may run.
+///
+/// `Platform::pump_message_loop` runs at most one task and does not block, so
+/// draining means calling it until it reports an empty queue. The bound exists
+/// because a task is allowed to post another task: without one, a promise chain
+/// that keeps scheduling would hold this iteration forever and the libuv timer
+/// phase would never run again. 64 is comfortably more than the handful a normal
+/// turn needs (a measure-memory request is one GC task plus one reporting task)
+/// while staying small enough to be a pause rather than a hang.
+const FOREGROUND_TASKS_PER_DRAIN: u32 = 64;
+
 /// The scheduler the loop drives: V8's microtask checkpoint and the exit flag.
 ///
 /// The timers themselves are not here. They are libuv handles
@@ -350,6 +361,34 @@ impl<'a, 's, 'i> V8Scheduler<'a, 's, 'i> {
 }
 
 impl Scheduler for V8Scheduler<'_, '_, '_> {
+    fn drain_platform_tasks(&mut self) -> bool {
+        // V8's own queued work, which is `SpinEventLoopInternal`'s
+        // `platform->DrainTasks(isolate)` (`src/api/embed_helpers.cc:45`).
+        //
+        // This is not an optimisation. V8 posts a number of things to the
+        // isolate's foreground task runner and resolves them from a task, not
+        // inline: a `MeasureMemory` request waits for the GC task that
+        // `MemoryMeasurement::ScheduleGCTask` posts
+        // (`src/heap/memory-measurement.cc:306`), and a streaming
+        // `WebAssembly.compile` resolves from a worker task's completion. Nothing
+        // in this runtime pumped that runner, so both stayed pending while the
+        // loop found no libuv work and exited.
+        //
+        // `pump_message_loop` runs at most one task and does not block, so the
+        // count is what stops a task that reposts itself from starving the timer
+        // phase. `DrainTasks` bounds itself the same way, by blocking on worker
+        // tasks rather than by spinning (`FlushForegroundTasksInternal`).
+        let platform = v8::V8::get_current_platform();
+        let isolate: &v8::Isolate = &*self.scope;
+        let mut ran = false;
+        let mut budget = FOREGROUND_TASKS_PER_DRAIN;
+        while budget > 0 && v8::Platform::pump_message_loop(&platform, isolate, false) {
+            ran = true;
+            budget -= 1;
+        }
+        ran
+    }
+
     fn drain(&mut self) {
         // The inspector's reader threads queue CDP messages and ask for a check phase
         // through `native_immediates`, but the immediate only runs if the loop reaches

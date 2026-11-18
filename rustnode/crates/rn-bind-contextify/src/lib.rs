@@ -41,6 +41,7 @@
 pub mod compile;
 pub mod constants;
 pub mod detect;
+pub mod measure_memory;
 pub mod script;
 
 use rn_core::{BindingModule, InstallCtx};
@@ -48,10 +49,10 @@ use rn_v8_sys::v8;
 
 /// Members exposed on the namespace object, matching `contracts/contextify.json`.
 ///
-/// This lists what the object actually installs. `measureMemory` is deliberately
-/// absent and declared in [`DEFERRED`] instead, because `rn-compat` only checks a
-/// deferral that `members` omits: listing a member in both places would make the
-/// contract check pass without ever noticing the gap.
+/// This lists what the object actually installs. A member this crate cannot
+/// provide belongs in [`DEFERRED`] and *not* here, because `rn-compat` only
+/// checks a deferral that `members` omits: listing a member in both places would
+/// make the contract check pass without ever noticing the gap.
 pub const MEMBERS: &[&str] = &[
     "ContextifyScript",
     "compileFunction",
@@ -59,23 +60,14 @@ pub const MEMBERS: &[&str] = &[
     "constants",
     "containsModuleSyntax",
     "makeContext",
+    "measureMemory",
     "runInterruptible",
 ];
 
 /// Members the namespace needs but this crate does not install yet.
 ///
-/// `measureMemory` is the only recorded member this crate cannot provide. It
-/// needs `v8::Isolate::MeasureMemory` plus `v8::MeasureMemoryDelegate::Default`,
-/// and the `v8` crate linked here exposes neither: a search of
-/// `v8-152.2.0/src` for `MeasureMemory` finds no binding at all, so there is no
-/// way to ask V8 for a heap measurement. `lib/vm.js` reads the function at module
-/// scope (`measureMemory: _measureMemory`), which is a destructuring bind and
-/// therefore harmless, and only calls it from inside `vm.measureMemory()`, which
-/// is behind an experimental flag.
-pub const DEFERRED: &[(&str, &str)] = &[(
-    "measureMemory",
-    "needs v8::Isolate::MeasureMemory and v8::MeasureMemoryDelegate::Default, neither of which the v8 crate binds; only callable through the flagged vm.measureMemory()",
-)];
+/// Empty: every member `contracts/contextify.json` records is installed.
+pub const DEFERRED: &[(&str, &str)] = &[];
 
 /// `internalBinding('contextify')`.
 pub struct Contextify;
@@ -106,7 +98,7 @@ impl BindingModule for Contextify {
         // through the static `ContextFromContextifiedSandbox`.
         rn_core::hook_slot::set_sandbox_context_lookup(script::context_of);
 
-        let values: [(&str, v8::Local<v8::Value>); 7] = [
+        let values: [(&str, v8::Local<v8::Value>); 8] = [
             ("ContextifyScript", script::constructor(scope)?),
             (
                 "compileFunction",
@@ -132,6 +124,10 @@ impl BindingModule for Contextify {
             (
                 "makeContext",
                 function(scope, "makeContext", script::make_context)?,
+            ),
+            (
+                "measureMemory",
+                function(scope, "measureMemory", measure_memory::measure_memory)?,
             ),
             (
                 "runInterruptible",
@@ -165,10 +161,10 @@ mod tests {
 
     #[test]
     fn the_member_list_covers_the_recorded_contract() {
-        // `contracts/contextify.json` lists eight members. This crate installs
-        // seven and declares `measureMemory` deferred, so `rn-compat` requires
-        // this crate to claim exactly the other seven.
-        assert_eq!(MEMBERS.len(), 7);
+        // `contracts/contextify.json` lists eight members, and every one of them
+        // is installed now that `measureMemory` is a shim over
+        // `Isolate::MeasureMemory`.
+        assert_eq!(MEMBERS.len(), 8);
         let mut sorted = MEMBERS.to_vec();
         sorted.sort_unstable();
         assert_eq!(
@@ -180,18 +176,17 @@ mod tests {
                 "constants",
                 "containsModuleSyntax",
                 "makeContext",
+                "measureMemory",
                 "runInterruptible",
             ]
         );
     }
 
     #[test]
-    fn measure_memory_is_declared_and_not_claimed() {
-        // Listing a deferral in `members` too would let the contract check pass
-        // without ever noticing the gap.
-        assert!(!MEMBERS.contains(&"measureMemory"));
-        assert_eq!(DEFERRED.len(), 1);
-        assert_eq!(DEFERRED[0].0, "measureMemory");
-        assert!(!DEFERRED[0].1.is_empty());
+    fn nothing_is_declared_deferred() {
+        // A deferral is a claim about a member this crate cannot install. There
+        // are none, so `DEFERRED` must stay empty rather than keep an entry that
+        // would let a future gap hide behind it.
+        assert!(DEFERRED.is_empty());
     }
 }

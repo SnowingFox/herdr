@@ -106,7 +106,7 @@ fn the_namespace_exposes_every_claimed_member() {
         "ContextifyScript:function,compileFunction:function,\
          compileFunctionForCJSLoader:function,constants:object,\
          containsModuleSyntax:function,makeContext:function,\
-         measureMemory:undefined,runInterruptible:function"
+         measureMemory:function,runInterruptible:function"
             .replace(' ', "")
     );
 }
@@ -552,15 +552,47 @@ fn run_interruptible_propagates_a_real_exception() {
 }
 
 #[test]
-fn measure_memory_is_absent_rather_than_faked() {
-    // The one member this crate defers: the `v8` crate binds neither
-    // `Isolate::MeasureMemory` nor `MeasureMemoryDelegate`. An absent member is
-    // honest; a stub returning a resolved promise would look like it worked.
+fn measure_memory_is_installed_and_returns_a_promise() {
+    // The binding is `MeasureMemoryDelegate::Default` plus
+    // `Isolate::MeasureMemory` through the shim in `rn-v8-sys`. Its contract is
+    // Node's (`src/node_contextify.cc:2005`): two integer arguments in, the
+    // promise from a resolver created in the current context out.
     let result = run(r#"
+        const { constants } = contextify;
+        const promise = contextify.measureMemory(
+          constants.measureMemory.mode.SUMMARY,
+          constants.measureMemory.execution.EAGER,
+        );
         __out = JSON.stringify({
           typeof: typeof contextify.measureMemory,
-          constantsPresent: typeof contextify.constants.measureMemory === 'object',
+          isPromise: promise instanceof Promise,
+          name: contextify.measureMemory.name,
+          length: contextify.measureMemory.length,
         });
         "#);
-    assert_eq!(result, r#"{"typeof":"undefined","constantsPresent":true}"#);
+    assert_eq!(
+        result,
+        r#"{"typeof":"function","isPromise":true,"name":"measureMemory","length":0}"#
+    );
+}
+
+#[test]
+fn measure_memory_rejects_a_non_integer_argument() {
+    // Node opens with `CHECK(args[0]->IsInt32())`. A `CHECK` aborts, so the same
+    // condition is a thrown `TypeError` here — and it must not *coerce*, which is
+    // the failure mode `int32_value` would introduce: a string would arrive as 0
+    // and silently select the summary mode.
+    let result = run(r#"
+        const errors = [];
+        for (const args of [['0', 0], [0, null], [1.5, 0]]) {
+          try {
+            contextify.measureMemory(...args);
+            errors.push('no throw');
+          } catch (error) {
+            errors.push(error.name);
+          }
+        }
+        __out = errors.join(',');
+        "#);
+    assert_eq!(result, "TypeError,TypeError,TypeError");
 }

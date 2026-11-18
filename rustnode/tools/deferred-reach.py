@@ -143,14 +143,14 @@ KNOWN_UNGUARDED = {
     #   perf_hooks.createHistogram TypeError: _Histogram is not a constructor
     #   new BroadcastChannel     TypeError: broadcastChannel is not a function
     #   fs.openAsBlobSync        TypeError: _createBlobFromFilePath is not a function
-    #   vm.measureMemory         TypeError: _measureMemory is not a function
     #   v8.queryObjects          TypeError: _queryObjects is not a function
     #
     # The two wasm cache members used to be here. They were removed with the
     # import path fix that installed them, which is what this list shrinking
     # looks like; they are now in `MEMBERS` and called by the `.wasm` tests.
+    # `contextify.measureMemory` left the same way, when the `MeasureMemory`
+    # shim installed it and the three `test-vm-measure-memory*` files passed.
     "blob.createBlobFromFilePath",
-    "contextify.measureMemory",
     "internal_only_v8.queryObjects",
     "crypto.CheckPrimeJob",
     "crypto.DsaKeyPairGenJob",
