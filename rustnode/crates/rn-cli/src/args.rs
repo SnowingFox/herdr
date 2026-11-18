@@ -1784,25 +1784,11 @@ pub fn parse_with_env(
         // the one option whose value is optional, so a following flag is not an
         // error for it; Node lists the package's scripts instead.
         if rn_bind_options::takes_separate_value(argument) {
-            // `--stack-trace-limit` is the one option that is both an
-            // `kInteger` and V8's (`src/node_options-inl.h:501-504`). It has to
-            // keep its value *and* reach the V8 argument vector, and this branch
-            // used to do only the first: the flag was recorded for
-            // `process.execArgv`, `record_v8_flag` never ran, and
-            // `Error.stackTraceLimit` stayed at V8's default of 10 no matter
-            // what the command line said.
-            let also_v8 = rn_bind_options::is_v8_flag(argument);
-            let record = |options: &mut Options, text: &str| {
-                options.exec_argv.push(text.to_string());
-                if also_v8 {
-                    options.v8_args.push(text.to_string());
-                }
-            };
             if !argument.starts_with("--") || !argument.contains('=') {
                 match args.get(index + 1) {
                     Some(value) if !value.starts_with('-') => {
-                        record(&mut options, argument);
-                        record(&mut options, value);
+                        options.exec_argv.push(argument.clone());
+                        options.exec_argv.push(value.clone());
                         if UNIMPLEMENTED.contains(&argument.as_str()) {
                             unimplemented.insert(argument.clone());
                         }
@@ -1827,7 +1813,7 @@ pub fn parse_with_env(
             {
                 unimplemented.insert(argument.clone());
             }
-            record(&mut options, argument);
+            options.exec_argv.push(argument.clone());
             index += 1;
             continue;
         }
