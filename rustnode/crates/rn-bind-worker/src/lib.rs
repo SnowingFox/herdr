@@ -533,6 +533,43 @@ mod tests {
     }
 
     #[test]
+    fn a_workers_option_store_is_parsed_from_its_own_exec_argv() {
+        // `Worker::New` gives a worker its own `PerIsolateOptions` built from its
+        // `execArgv`, and `pre_execution.js` reads every `--experimental-*` gate
+        // from it. The worker's thread parses that list and must *install* it;
+        // parsing it only for the diagnostics read left
+        // `internalBinding('options')` answering with the parent's store, so
+        // `new Worker(..., { execArgv: ['--experimental-web-worker'] })` saw the
+        // flag as false and `pre_execution` deleted the `Worker` global.
+        //
+        // `Store::parse` and `install` are the two halves, and this pins the pair
+        // rather than the call site: the value has to survive the round trip
+        // through the store the binding reads.
+        let parsed = rn_bind_options::Store::parse(&[
+            "--experimental-web-worker".to_string(),
+            "--trace-uncaught".to_string(),
+        ]);
+        assert_eq!(
+            parsed.value_of("--experimental-web-worker"),
+            Some(rn_bind_options::ParsedValue::Bool(true)),
+            "the flag must parse out of execArgv"
+        );
+        assert_eq!(
+            parsed.value_of("--trace-uncaught"),
+            Some(rn_bind_options::ParsedValue::Bool(true)),
+            "the diagnostics read uses the same store"
+        );
+
+        // A worker without the flag inherits a store where it is false, which is
+        // what makes the gate off rather than merely absent.
+        let inherited = rn_bind_options::Store::parse(&["--no-warnings".to_string()]);
+        assert_eq!(
+            inherited.value_of("--experimental-web-worker"),
+            Some(rn_bind_options::ParsedValue::Bool(false)),
+        );
+    }
+
+    #[test]
     fn the_main_thread_facts_are_the_defaults() {
         let facts = RealmFacts::default();
         assert!(facts.is_main_thread);

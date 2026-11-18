@@ -966,17 +966,14 @@ const PERMISSION_BOOLEAN_GRANTS: &[&str] = &[
 /// unit tests reject that.
 ///
 /// Everything in this list was measured missing against the pinned oracle:
-/// `--experimental-shadow-realm` leaves `globalThis.ShadowRealm` `undefined` where
-/// Node reports `function`, `--experimental-web-worker` does the same for
-/// `Worker`, `--experimental-network-inspection` reaches a
-/// `setupNetworkTracking` this build's inspector does not publish, and
-/// `--experimental-eventsource` leaves `globalThis.EventSource` `undefined`.
+/// `--experimental-network-inspection` reaches a `setupNetworkTracking` this
+/// build's inspector does not publish, and `--experimental-eventsource` leaves
+/// `globalThis.EventSource` `undefined`.
 ///
 /// The list is documentation, not the rule — that is [`warns_about`], which is
 /// driven by the option table so a `NoOp{}` name can never be mis-declared.
 const UNIMPLEMENTED: &[&str] = &[
     "--experimental-network-inspection",
-    "--experimental-web-worker",
     "--experimental-eventsource",
 ];
 
@@ -1008,6 +1005,19 @@ const IMPLEMENTED_EXPERIMENTAL: &[&str] = &[
     // `true` here exactly as it does on Node — so the warning this used to print
     // was false.
     "--experimental-vm-modules",
+    // `--experimental-web-worker` is now real. Node exposes the web `Worker`
+    // class unconditionally from `internal/bootstrap/web/exposed-window-or-worker.js`
+    // and gates it afterwards: `pre_execution.js`'s
+    // `removeWebWorkersIfDisabled` deletes the global when the option is false.
+    // rustnode installs the same global lazily from `internal/webworker` in
+    // `rn-realm`, so its own `prepareMainThreadExecution` — the same function —
+    // performs the same deletion. Both probes agree with the oracle:
+    // `typeof globalThis.Worker` is `"function"` with the flag and `"undefined"`
+    // without, and a `Worker` built over a `file:`, `data:` or `blob:` URL
+    // round-trips a message, transfers a detached `ArrayBuffer`, and reports
+    // `self`, `location`, `importScripts` and `close` through
+    // `DedicatedWorkerGlobalScope`.
+    "--experimental-web-worker",
 ];
 
 /// Whether accepting `argument` should print the not-implemented warning.

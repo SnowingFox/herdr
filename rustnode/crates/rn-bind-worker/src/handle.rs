@@ -73,6 +73,19 @@ pub struct SpawnRequest {
     pub name: String,
     /// `execArgv`, forwarded as the worker's own flags.
     pub exec_argv: Vec<String>,
+    /// Whether [`Self::exec_argv`] was inherited rather than given.
+    ///
+    /// `src/node_worker.cc:701` splits on this: an absent `options.execArgv`
+    /// inherits both the list and a *clone of the parent's parsed options*, while
+    /// an explicit one is parsed from its own list. Only the clone carries the
+    /// corrections `main` applied after parsing.
+    pub exec_argv_inherited: bool,
+    /// The creating environment's parsed options, when the list was inherited.
+    ///
+    /// Captured on the creating thread at the same moment as `exec_argv`,
+    /// because that thread's store is the one Node's `env` names. A `None` means
+    /// no store was installed there, and the child parses its own list instead.
+    pub inherited_store: Option<std::sync::Arc<rn_bind_options::Store>>,
     /// The resource limits, in the order `node_worker.h` declares them.
     ///
     /// `-1` for a limit the caller did not set, which is what

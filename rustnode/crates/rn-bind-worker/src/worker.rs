@@ -179,7 +179,43 @@ fn worker_constructor(
     };
 
     let resource_limits = read_resource_limits(scope, args.get(3));
-    let exec_argv = read_exec_argv(scope, args.get(2));
+    // `src/node_worker.cc:701`: when `options.execArgv` was not an array, the
+    // worker inherits `env->exec_argv()` — the *creating* environment's list —
+    // and `per_isolate_opts` is that environment's clone. Resolving the
+    // inheritance here rather than on the new thread is what makes it the
+    // creator's list: the worker thread starts with empty thread-locals, and a
+    // nested worker created by a worker must inherit *that worker's* `execArgv`,
+    // not the process's. It also lets the child's option store be built from the
+    // same list the creator resolved.
+    let inherited = read_exec_argv(scope, args.get(2));
+    // `src/node_worker.cc:701`: an absent `options.execArgv` means the worker
+    // inherits `env->exec_argv()` — the *creating* environment's list — and
+    // `per_isolate_opts` is that environment's clone. Resolving the inheritance
+    // here is what makes it the creator's list: the worker thread starts with
+    // empty thread-locals, and a nested worker created by a worker must inherit
+    // *that worker's* `execArgv`, not the process's.
+    //
+    // The flag is kept because the two branches are not the same operation: an
+    // inherited list is paired with a *clone of the parent's parsed options*,
+    // while an explicit one is parsed fresh. Node distinguishes them at the same
+    // point, and the difference is observable — see `WorkerThread::run_inner`.
+    let exec_argv_inherited = inherited.is_empty();
+    let exec_argv = if exec_argv_inherited {
+        rn_core::hook_slot::exec_argv()
+    } else {
+        inherited
+    };
+    // `src/node_worker.cc:702-704` clones `env->isolate_data()->options()` when
+    // `options.execArgv` was absent. Read here, on the creating thread, because
+    // that is the thread whose store belongs to `env`: the child thread starts
+    // with an empty slot, so reading it there could only ever find the
+    // process-wide handle and would hand a nested worker the main thread's
+    // flags.
+    let inherited_store = if exec_argv_inherited {
+        rn_bind_options::parsed::parent_store()
+    } else {
+        None
+    };
     let env = read_worker_env(scope, args.get(1));
 
     // The channel: one end becomes `this.messagePort`, and the other travels to
@@ -198,6 +234,8 @@ fn worker_constructor(
         eval,
         name: name.clone(),
         exec_argv,
+        exec_argv_inherited,
+        inherited_store,
         resource_limits,
         // `lib/internal/worker.js` pushes `options.argv` onto `process.argv` in
         // the worker's own bootstrap, from the `LOAD_SCRIPT` message, so the

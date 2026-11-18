@@ -247,6 +247,14 @@ fn an_init_failure_becomes_the_custom_error_onexit_reports() {
                 eval: true,
                 name: "WorkerThread".to_string(),
                 exec_argv: Vec::new(),
+                // An empty list is `options.execArgv` absent, which is the
+                // inherited case: the worker clones the creating environment's
+                // options rather than parsing anything of its own. `None` here
+                // stands in for "no store installed on this thread", and the
+                // worker then falls back to its own parse. Neither value is
+                // observable to `custom_error`, which is what this test covers.
+                exec_argv_inherited: true,
+                inherited_store: None,
                 resource_limits: [-1.0; 4],
                 argv: Vec::new(),
                 env: WorkerEnv::Copy(Vec::new()),

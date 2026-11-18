@@ -199,6 +199,35 @@ pub fn value_of(name: &str) -> Option<ParsedValue> {
     store().and_then(|store| store.value_of(name))
 }
 
+/// The store the creating environment holds, for a worker to clone.
+///
+/// `src/node_worker.cc:702-704` copies the parent's `exec_argv` and clones
+/// `env->isolate_data()->options()`, so a worker inherits the values the process
+/// actually holds — including the ones the CLI corrected after parsing, such as
+/// `--strip-types` forced to false in a build with no amaro. Re-parsing the raw
+/// list would recompute those from the table instead.
+///
+/// This thread's own store wins, because `env` is the *creating* environment:
+/// when a worker creates a worker, the clone has to come from the worker's
+/// options, not the process's. `install` puts a worker's store in this thread's
+/// slot only — the process-wide handle is written once by the CLI, and
+/// `get_or_init` deliberately leaves it alone — so reading the process handle
+/// here would hand a nested worker the main thread's flags.
+///
+/// `None` before any store is installed, which only happens in a test that never
+/// parsed a command line; the caller falls back to its own parse in that case.
+#[must_use]
+pub fn parent_store() -> Option<std::sync::Arc<Store>> {
+    if let Some(installed) = PARSED.with(|parsed| parsed.borrow().clone()) {
+        return Some(installed);
+    }
+    PROCESS_STORE
+        .get()?
+        .lock()
+        .ok()
+        .map(|store| std::sync::Arc::clone(&store))
+}
+
 /// Every parsed value, in table order, for a caller that wants them all.
 #[must_use]
 pub fn all_values() -> Option<Vec<(String, ParsedValue)>> {

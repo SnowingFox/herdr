@@ -213,17 +213,59 @@ impl WorkerThread {
         // stack behind an uncaught exception, which can only be set on
         // `&mut Isolate`. Node makes the same decision at the same point, in
         // `WorkerThreadData`'s constructor before `NewIsolate`.
-        let inherited_argv = self.exec_argv.is_empty();
-        let exec_argv = if inherited_argv {
-            rn_core::hook_slot::exec_argv()
-        } else {
-            self.exec_argv.clone()
-        };
+        // The list was resolved on the creating thread, which is the one that
+        // owns `env->exec_argv()` for this worker: `WorkerImpl` inherits the
+        // creator's list when `options.execArgv` was absent, so `self.exec_argv`
+        // is already the answer and an empty list here means the creator really
+        // had no flags. Re-reading the hook slot from *this* thread would look up
+        // the wrong environment's list — the worker thread starts with empty
+        // thread-locals, so the lookup could only ever find the process's.
+        let exec_argv = self.exec_argv.clone();
         // The inherited list is re-parsed with the real option parser rather
         // than scanned, so `--no-trace-exit` after `--trace-exit` keeps its
         // meaning and a worker cannot end up with a value the parent's own
         // parser disagreed with.
         let worker_options = rn_bind_options::Store::parse(&exec_argv);
+        // The parse above is what `internalBinding('options')` has to answer
+        // from, not a local used only for the diagnostics read below it. Node
+        // gives every worker its own `PerIsolateOptions` built from this list
+        // (`src/node_worker.cc`), and `pre_execution.js` consults that store for
+        // every `--experimental-*` gate. Leaving it uninstalled meant a worker
+        // built its options from the *parent's* `internalBinding('options')`, so
+        // `new Worker(..., { execArgv: ['--experimental-web-worker'] })` reported
+        // `getOptionValue('--experimental-web-worker') === false` and
+        // `pre_execution` deleted the `Worker` global that
+        // `exposed-window-or-worker` had just defined. That is what
+        // `test-common-wpt-backends.js` trips over: its runner passes the flag
+        // through `execArgv` only, so the WPT worker thread had no `Worker`.
+        //
+        // This runs on the worker's own thread, before the isolate exists, and
+        // `install` publishes a thread-local as well as the process-wide handle,
+        // so the worker sees its own list while the parent keeps its own.
+        //
+        // The *inherited* case is not re-parsed: `src/node_worker.cc:702-704`
+        // copies the parent's `exec_argv` and **clones the parent's
+        // `per_isolate_opts`**, so a worker sees the values this process already
+        // holds — including the ones `main` corrected after parsing. A worker
+        // that re-parsed the raw list would put `--strip-types` back to `true`
+        // for a build with no amaro, which is exactly what
+        // `rn-cli`'s `a_worker_reads_the_option_values_this_process_was_started_with`
+        // pins.
+        if self.request.exec_argv_inherited {
+            match self.request.inherited_store.as_ref() {
+                Some(parent) => rn_bind_options::parsed::install((**parent).clone()),
+                None => rn_bind_options::parsed::install(worker_options.clone()),
+            }
+        } else {
+            rn_bind_options::parsed::install(worker_options.clone());
+        }
+        // A worker's `env->exec_argv()` is its *own* list, and the workers it
+        // creates inherit that one rather than the process's. Recording it on
+        // this thread is what makes the inheritance per-environment, the way
+        // Node's field is; without it a nested worker read the CLI's list from
+        // the process-wide slot and lost whatever `execArgv` its parent was
+        // given.
+        rn_core::hook_slot::set_thread_exec_argv(exec_argv.clone());
         let diagnostics = WorkerDiagnostics::from_store(&worker_options);
         let worker_trace_uncaught = diagnostics.trace_uncaught;
         let worker_stack_trace_limit = diagnostics.stack_trace_limit;
@@ -528,6 +570,28 @@ impl WorkerThread {
         if let Err(message) = rn_realm::install_cjs_loader(scope, require, &anchor) {
             tracing::error!(%message, "the worker's commonjs loader is unavailable");
         }
+        // `install_cjs_loader` publishes a global `require` because the realm
+        // bootstrap has to hand its loader to user code before the entry kind is
+        // known. On the main thread the CLI deletes it again for a file entry
+        // point; a worker has to do the same, and Node's answer differs by kind:
+        //
+        //   worker_threads eval worker      globalThis.require is a function
+        //   worker_threads file worker      undefined
+        //   web Worker, classic, file: URL  a function, from
+        //                                   `installDedicatedWorkerGlobalScope`
+        //   web Worker, module or data: URL undefined
+        //
+        // Each of those then arrives from the place Node gets it. `evalScript`
+        // assigns `globalThis.require` for an eval worker, and
+        // `internal/webworker`'s `installDedicatedWorkerGlobalScope` calls
+        // `Module.createRequire(locationURL)` for a classic file worker. Leaving
+        // this copy in place made all four cases report a function, which
+        // `test-worker-spec-differences.js` pins as a spec difference.
+        //
+        // Deleting is safe for `worker_threads` because `webWorkerData` is only
+        // set on the web Worker path: a plain thread never re-adds it, which is
+        // exactly Node's behaviour.
+        rn_realm::delete_require_global(scope);
 
         // The worker's `getEnvMessagePort()` has to answer before
         // `worker_thread.js` runs, because `createWorkerStdio()` is the first

@@ -605,7 +605,30 @@ pub fn trace_uncaught() -> bool {
 /// Node's worker constructor reads the parent `Environment`'s field across the
 /// same boundary, from the thread that is still the parent. Writing happens once,
 /// from the CLI before any worker exists, so the lock is uncontended in practice.
+///
+/// # A worker's own list, for its children
+///
+/// `env->exec_argv()` in Node is a field on the *Environment*, so a worker that
+/// creates another worker passes **its own** list, not the process's. The
+/// process-wide slot above cannot express that: it holds the CLI's list, and a
+/// nested worker reading it would inherit the main thread's flags instead of its
+/// parent worker's. [`set_thread_exec_argv`] therefore records the list on the
+/// worker's thread, and [`exec_argv`] prefers it. That is what makes
+/// `new Worker(..., { execArgv: ['--experimental-web-worker'] })` visible to a
+/// `Worker` that the thread in turn constructs —
+/// `test-common-wpt-backends.js` builds its web Worker exactly that way, so
+/// without this the WPT worker thread had no `Worker` global at all.
 static EXEC_ARGV_SHARED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+thread_local! {
+    /// This thread's own `env->exec_argv()`, when it is a worker that has one.
+    ///
+    /// `None` on the main thread and on a worker that never recorded a list, so
+    /// [`exec_argv`] falls back to the process-wide slot and the CLI's list keeps
+    /// its meaning.
+    static EXEC_ARGV_THREAD: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// Records the flags this environment was started with.
 pub fn set_exec_argv(argv: Vec<String>) {
@@ -614,9 +637,24 @@ pub fn set_exec_argv(argv: Vec<String>) {
     }
 }
 
+/// Records this worker thread's own flags, for the workers it creates.
+///
+/// Unlike [`set_exec_argv`] this does not touch the process-wide slot: a worker
+/// inheriting its parent's list must not rewrite what the main thread reports as
+/// its own.
+pub fn set_thread_exec_argv(argv: Vec<String>) {
+    EXEC_ARGV_THREAD.with(|slot| *slot.borrow_mut() = Some(argv));
+}
+
 /// The flags this environment was started with.
+///
+/// This thread's own list wins when it has one, which is Node's per-`Environment`
+/// answer: a worker passes its `execArgv` to its children, not the process's.
 #[must_use]
 pub fn exec_argv() -> Vec<String> {
+    if let Some(argv) = EXEC_ARGV_THREAD.with(|slot| slot.borrow().clone()) {
+        return argv;
+    }
     EXEC_ARGV_SHARED
         .lock()
         .map(|slot| slot.clone())
