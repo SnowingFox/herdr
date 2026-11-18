@@ -261,12 +261,16 @@ fn a_v8_flag_from_the_variable_reaches_v8() {
 fn a_quoted_value_keeps_its_spaces() {
     // The tokenizer consumes the quotes rather than including them, and a space
     // inside them is not a separator.
-    expect_env(
-        r#"--title="a b c""#,
-        "const v = require('internal/test/binding').internalBinding('options') \
-         .getCLIOptionsValues(); console.log(v['--title'])",
-        "a b c",
-    );
+    // `--expose-internals` is a command-line flag rather than a `NODE_OPTIONS`
+    // one here because that is what it takes for `internal/test/binding` to be
+    // requireable — the same requirement the oracle has. The value under test is
+    // still the variable's `--title`.
+    let script = "const v = require('internal/test/binding').internalBinding('options') \
+                  .getCLIOptionsValues(); console.log(v['--title'])";
+    let (code, stdout, stderr) =
+        run_env_args(r#"--title="a b c""#, script, &["--expose-internals"]);
+    assert_eq!(stdout.trim(), "a b c", "stderr: {stderr}");
+    assert_eq!(code, 0, "stderr: {stderr}");
 }
 
 #[test]
@@ -308,7 +312,11 @@ fn a_scalar_takes_the_command_lines_value() {
     // The variable is parsed first, so the command line overwrites it.
     let script = "const v = require('internal/test/binding').internalBinding('options') \
                   .getCLIOptionsValues(); console.log(v['--title'])";
-    let (code, stdout, stderr) = run_env_args("--title=from-env", script, &["--title=from-cli"]);
+    let (code, stdout, stderr) = run_env_args(
+        "--title=from-env",
+        script,
+        &["--title=from-cli", "--expose-internals"],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout.trim(), "from-cli", "stderr: {stderr}");
 }

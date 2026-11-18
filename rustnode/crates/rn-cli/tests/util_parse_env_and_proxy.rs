@@ -38,6 +38,30 @@ fn expect(source: &str, expected: &str) {
     assert_eq!(code, 0, "stderr: {stderr}");
 }
 
+/// [`expect`] for a script that reaches `internal/*`, which needs
+/// `--expose-internals` exactly as it does in Node.
+///
+/// The flag is a command-line flag rather than something the eval path grants:
+/// `BuiltinModule.normalizeRequirableId` refuses every `internal/` id without it,
+/// and the oracle refuses them the same way, so a test that reached them through
+/// `-e` alone was relying on a permissive global `require` that rustnode no
+/// longer has.
+fn expect_exposed(source: &str, expected: &str) {
+    let out = Command::new(env!("CARGO_BIN_EXE_rustnode"))
+        .args(["--expose-internals", "-e", source])
+        .output()
+        .expect("rustnode runs");
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        stdout.trim(),
+        expected,
+        "script exited {code}, stderr: {stderr}"
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+}
+
 // ------------------------------------------------------------- util.parseEnv --
 
 #[test]
@@ -100,7 +124,7 @@ fn parse_env_is_installed_on_the_binding() {
     // looking at the object, so the member being *callable* is the fact worth
     // pinning. `parseEnv` used to be deferred with a reason naming
     // `NODE_OPTIONS`, which is parsed in C++ and never calls this binding.
-    expect(
+    expect_exposed(
         "const { internalBinding } = require('internal/test/binding');\
          const binding = internalBinding('util');\
          console.log(typeof binding.parseEnv, typeof binding.getProxyDetails);",
@@ -197,7 +221,7 @@ fn get_proxy_details_answers_each_arity_the_way_the_js_layer_reads_it() {
     // The three shapes `internal/util/inspect.js` depends on: one argument is a
     // pair, `true` is a pair, anything else is the target alone. A revoked
     // proxy's target is `null` in both forms.
-    expect(
+    expect_exposed(
         "const { internalBinding } = require('internal/test/binding');\
          const get = internalBinding('util').getProxyDetails;\
          const live = new Proxy({ a: 1 }, {});\

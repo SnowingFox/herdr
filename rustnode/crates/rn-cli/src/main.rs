@@ -64,8 +64,14 @@ fn main() {
     ) {
         Ok(options) => options,
         Err(error) => match error {
+            // `StartInternal` prints every rejected argument the same way:
+            // `"%s: %s\n"` against `argv[0]` verbatim, which is what makes the
+            // output byte-identical to the oracle's. The fixed `rustnode:`
+            // prefix this used to print was a shape no test expects and no Node
+            // build produces; `test-cli-eval.js` compares the whole line against
+            // `${process.execPath}: -e requires an argument`.
             args::ParseError::Cli(message) => {
-                eprintln!("rustnode: {message}");
+                eprintln!("{}: {message}", args::program_name());
                 terminate(9);
             }
             args::ParseError::NodeOptions(message) => {
@@ -543,15 +549,12 @@ fn main() {
                         bootstrap::prepare_execution(scope, require);
                         rn_core::profile::mark("prepare_execution");
                     }
-                    // `node -e` exposes builtins as lazy globals; a script file
-                    // does not, which is why this is gated on the source. Node's
-                    // own `eval_string.js` makes the same distinction, and
-                    // `eval_stdin.js` deliberately does not take it.
-                    if matches!(options.source, args::Source::Eval { .. }) {
-                        if let Err(message) = rn_realm::install_eval_builtins(scope, require) {
-                            eprintln!("rustnode: builtin globals unavailable: {message}");
-                        }
-                    }
+                    // `node -e` exposes builtins as lazy globals, and
+                    // `internal/main/eval_string` does that itself
+                    // (`addBuiltinLibsToObject(globalThis, '<eval>')` is its
+                    // first statement after pre-execution). Installing them
+                    // here as well would run that twice, and the second call
+                    // would re-define every getter the first one installed.
                 }
                 None => {
                     eprintln!("rustnode: timers unavailable: the realm bootstrap left no require")
@@ -582,9 +585,7 @@ fn main() {
     //
     // The file's text is deliberately not read here: the loader reads it, and a
     // second read would bypass the loader's source handling (and its cache).
-    let mut print_result = false;
     let mut entry_promise: Option<v8::Global<v8::Promise>> = None;
-    let mut value = None;
     let mut entry_fatal = false;
     match &options.source {
         args::Source::File(_) => {
@@ -644,13 +645,9 @@ fn main() {
                 }
             }
         }
-        args::Source::Eval { code, print } => {
-            print_result = *print;
-            value = evaluate_script(scope, code).map(|value| v8::Global::new(scope, value));
-        }
-        // `internal/main/eval_stdin`, `internal/main/print_help` and
-        // `internal/main/inspect` and `internal/main/test_runner` are Node's own
-        // entry points, run as main
+        // `internal/main/eval_string`, `internal/main/eval_stdin`,
+        // `internal/main/print_help`, `internal/main/inspect` and
+        // `internal/main/test_runner` are Node's own entry points, run as main
         // scripts. They are not reimplemented here for the same reason a file is
         // not: `eval_stdin` reads stdin through `process.stdin`, honours
         // `--input-type`, `--print` and `--strip-types`, and hands the code to
@@ -658,6 +655,14 @@ fn main() {
         // `module`/`exports`/`require`/`__filename` and makes `require.main`
         // undefined — reproducing that by hand would be a second copy of
         // `evalScript`'s semantics.
+        //
+        // `eval_string` is the `-e`/`-p` half of the same argument, and it is
+        // the whole reason `--input-type` works for `-e`: that script is what
+        // reads `getOptionValue('--input-type')` and chooses between
+        // `evalModuleEntryPoint` and `evalScript`. Driving the eval from here
+        // left `module`, `exports`, `__filename` and `__dirname` undefined
+        // (`typeof module` was `"function"` from the loader's global) and made
+        // `--input-type=module -e 'import ...'` a `SyntaxError`.
         //
         // `print_help` is the same argument one surface over: the usage text is
         // generated from the option table at run time, so a Rust-side copy
@@ -722,8 +727,58 @@ fn main() {
             };
             entry_fatal = !handled || failed;
         }
+        // `internal/main/eval_string` runs *user* code, so its throw has to stay
+        // live for the caller's `TryCatch`: `report_uncaught_exception` is what
+        // reaches `process._fatalException` and, through
+        // `shouldAbortOnUncaughtToggle`, the `--abort-on-uncaught-exception`
+        // decision. Returning the message as a value instead — the shape every
+        // other main script uses, because their throws are rustnode defects and
+        // a printed message is more useful than a silent gap — printed the error
+        // and exited 1 where Node dies on SIGTRAP.
+        //
+        // The scope is *not* re-created here on purpose: `run_eval_main_script`
+        // leaves the exception pending, so the arm below sees it.
+        //
+        // A module-format `-e` is evaluated as an ES module, and Node's ESM path
+        // has no `require` binding at all: `evalModuleEntryPoint` compiles the
+        // code as a module, whose scope never has one. `test-cli-eval.js`
+        // asserts `typeof require === 'undefined'` for `--input-type module
+        // --eval`, and the global `require` installed for `-e` is the only thing
+        // that would make it `"function"`.
+        //
+        // `--input-type` is read from the store because that is where
+        // `eval_string.js` reads it; the parser only rejects a value that is not
+        // one of the four spellings.
+        args::Source::Eval => {
+            let module_input = matches!(
+                options.parsed.value_of("--input-type"),
+                Some(rn_bind_options::ParsedValue::Text(ref input_type))
+                    if input_type == "module" || input_type == "module-typescript"
+            );
+            if module_input {
+                rn_realm::delete_require_global(scope);
+            }
+            let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+            let scope = &mut try_catch.init();
+            if let Err(message) = bootstrap::run_eval_main_script(scope) {
+                eprintln!("rustnode: {message}");
+                entry_fatal = true;
+            }
+            let handled = if scope.has_caught() && !scope.has_terminated() {
+                match scope.exception() {
+                    Some(exception) => rn_errors::report_uncaught_exception(scope, exception),
+                    None => true,
+                }
+            } else {
+                true
+            };
+            entry_fatal = entry_fatal || !handled;
+        }
         args::Source::Empty => {
-            value = evaluate_script(scope, "0").map(|value| v8::Global::new(scope, value));
+            // A bare `node` on a terminal-less descriptor with no script still
+            // behaves like `-e ''`, which is what Node reaches when nothing else
+            // matched. The completion value is discarded: nothing prints it.
+            let _ = evaluate_script(scope, "0");
         }
     }
     rn_core::profile::mark("user script");
@@ -740,13 +795,6 @@ fn main() {
     if entry_fatal {
         let code = rn_realm::runtime::emit_exit_after_failure(scope);
         terminate(if code == 0 { 1 } else { code });
-    }
-
-    if print_result {
-        if let Some(value) = value {
-            let value = v8::Local::new(scope, value);
-            println!("{}", value.to_rust_string_lossy(scope));
-        }
     }
 
     // The script body has run. Everything it queued — timers, immediates, ticks,

@@ -1179,6 +1179,48 @@ pub fn run_main_script(scope: &mut v8::PinScope<'_, '_>, id: &str) -> Option<Str
     run_bootstrap_script(scope, id)
 }
 
+/// Runs `internal/main/eval_string` with the caller's `TryCatch` left open.
+///
+/// Every other main script returns its error as a value, because the CLI's
+/// report path is `eprintln!` over that message. `eval_string` is different: it
+/// runs *user* code, so a throw from it is the entry point's throw, and Node
+/// hands that to `process._fatalException` rather than printing it. Skipping
+/// that path made `--abort-on-uncaught-exception -e 'throw 1'` print and exit 1
+/// instead of dying on SIGTRAP, because the abort decision is consulted inside
+/// `triggerUncaughtException` and `report_uncaught_exception` — both of which
+/// only run when the exception is still live for the caller.
+///
+/// So this does not open a `TryCatch` of its own: the exception stays pending in
+/// the caller's scope, which is what [`run_main`]'s file branch already expects
+/// for a `require` that throws. `None` means "the script returned", and the
+/// caller's `scope.has_caught()` is the evidence it threw.
+pub fn run_eval_main_script(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
+    let id = "internal/main/eval_string";
+    let builtin = rn_js2c::builtin_by_id(id).ok_or("internal/main/eval_string is not bundled")?;
+    let function = rn_builtins::compile(scope, builtin.id(), builtin.source(), builtin.kind())
+        .ok_or("internal/main/eval_string could not be compiled")?;
+    let global = scope.get_current_context().global(scope);
+    let process =
+        get_property(scope, global.into(), "process").ok_or("the realm has no process object")?;
+    let require = rn_core::hook_slot::require(scope).ok_or("the realm left no require")?;
+    let internal_binding =
+        rn_core::hook_slot::internal_binding(scope).ok_or("the realm left no internalBinding")?;
+    let primordials = primordials_from_global(scope).ok_or("the realm left no primordials")?;
+    let arguments = [
+        process,
+        require.into(),
+        internal_binding.into(),
+        primordials,
+    ];
+    // The call itself is deliberately unchecked: a throwing entry point leaves
+    // the exception in `scope`, and `main` reports it through
+    // `report_uncaught_exception`. Only a *missing* function is an error here,
+    // because that is a rustnode defect rather than anything the user's code
+    // did.
+    let _ = function.call(scope, v8::undefined(scope).into(), &arguments);
+    Ok(())
+}
+
 /// Runs one `internal/main/**` script from substituted source under its own id.
 ///
 /// The only caller is `--help`: `internal/main/print_help.js` writes its usage

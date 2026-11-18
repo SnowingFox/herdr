@@ -248,12 +248,18 @@ fn private_symbols_are_all_present_and_distinct() {
     //
     // Asserting the count and the distinctness together is what makes that
     // failure loud: absent names collapse to one shared `undefined`.
+    // `--expose-internals` is what makes `internal/*` requireable from `-e`, and
+    // `internal/test/binding` is the module Node itself exposes the bindings
+    // through for tests — `internal/bootstrap/realm` is deliberately excluded
+    // from the requireable id list (`BuiltinModule.normalizeRequirableId`), so
+    // requiring it here worked only while the CLI installed an unrestricted
+    // realm loader as the global `require`, and the oracle refuses it.
     let out = Command::new(env!("CARGO_BIN_EXE_rustnode"))
         .args([
             "--expose-internals",
             "-e",
-            "const realm = require('internal/bootstrap/realm');\n\
-             const symbols = realm.internalBinding('util').privateSymbols;\n\
+            "const { internalBinding } = require('internal/test/binding');\n\
+             const symbols = internalBinding('util').privateSymbols;\n\
              const names = Object.keys(symbols);\n\
              const missing = names.filter((name) => symbols[name] === undefined);\n\
              const values = names.map((name) => symbols[name]);\n\

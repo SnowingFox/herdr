@@ -19,12 +19,16 @@ use std::collections::BTreeSet;
 
 /// Why the process may not start.
 ///
-/// The three sources print differently, and the difference is Node's, not
-/// cosmetic:
+/// The three sources all print through `StartInternal`'s loop, which is
+/// `"%s: %s\n"` against `argv[0]` verbatim (`src/node.cc`), so the program name
+/// is what makes the output byte-identical to the oracle's rather than merely
+/// similar. They stay distinct variants because the call sites differ in what
+/// they know — a walk-time rejection versus a post-walk `CheckOptions` verdict —
+/// not because the rendering differs.
 ///
-/// * a bad command-line flag is `rustnode: <message>` (Node prints
-///   `<program>: bad option: <flag>`, which this parser's own message shape has
-///   never matched — see F16 in the loader review);
+/// * a bad command-line flag is `<program>: <message>`, where the message keeps
+///   Node's own wording: `bad option: <flag>` for a flag V8 refused and
+///   `<flag> requires an argument` for a value the walk did not get;
 /// * a bad `NODE_OPTIONS` is `<program>: <message>`, because
 ///   `StartInternal` prints every collected error as
 ///   `"%s: %s\n", result->args().at(0), error` and the message is Node's own
@@ -375,12 +379,22 @@ pub enum Source {
     /// `(process, require, internalBinding, primordials)` and calls
     /// `prepareMainThreadExecution()` itself.
     Repl,
-    /// `-e` or `-p`.
-    Eval {
-        code: String,
-        /// `-p` prints the result of the expression.
-        print: bool,
-    },
+    /// `-e`, `-p` or `-pe`: `internal/main/eval_string`.
+    ///
+    /// A [`Source`] that names a main script rather than a flag, for the same
+    /// reason as [`Self::CheckSyntax`]: `eval_string.js` reads the code out of
+    /// the option store (`getOptionValue('--eval')`), chooses between
+    /// `evalModuleEntryPoint` and `evalScript` from `--input-type`, calls
+    /// `addBuiltinLibsToObject` for the builtin globals, and honours `--print`.
+    /// Driving the eval from the CLI instead made `module`, `exports`,
+    /// `__filename` and `__dirname` undefined and left `--input-type` with no
+    /// reader, because the CLI's own `evaluate_script` is a bare
+    /// `v8::Script::compile` against the global object.
+    ///
+    /// The code itself already travelled in `exec_argv` (it is what makes
+    /// `process.execArgv` report `['-e', 'code']`), and `finish` feeds that
+    /// vector to the option store, so nothing has to be carried here.
+    Eval,
     /// A script path.
     File(String),
     /// Standard input, run as a CommonJS module by `internal/main/eval_stdin`.
@@ -454,6 +468,7 @@ impl Source {
                 | Self::Test
                 | Self::Repl
                 | Self::CheckSyntax
+                | Self::Eval { .. }
         )
     }
 
@@ -466,6 +481,7 @@ impl Source {
             Self::Test => Some("internal/main/test_runner"),
             Self::Repl => Some("internal/main/repl"),
             Self::CheckSyntax => Some("internal/main/check_syntax"),
+            Self::Eval { .. } => Some("internal/main/eval_string"),
             _ => None,
         }
     }
@@ -991,12 +1007,13 @@ pub fn parse_with_env(
     }
 
     let mut unimplemented = BTreeSet::new();
-    // The code `-e`/`--eval` named, and whether `-p`/`--print` asked for the
-    // result. Node's parser records these as two independent option fields
-    // (`eval_string` and `print_eval`), which is why `-p 1+1 -e 'x'` prints the
-    // result of `x`: the last `--eval` wins while the print request stands.
+    // The code `-e`/`--eval` named. Node's parser records that as one option
+    // field (`eval_string`) beside `print_eval`, which is why `-p 1+1 -e 'x'`
+    // prints the result of `x`: the last `--eval` wins while the print request
+    // stands. Both reach `lib/**` through the option store, so only the
+    // "was there an eval at all" question is kept here — that is the
+    // `has_eval_string` `StartExecution` tests at `src/node.cc:380`.
     let mut eval_code: Option<String> = None;
-    let mut print_eval = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -1043,7 +1060,6 @@ pub fn parse_with_env(
             options.exec_argv.push(argument.clone());
             options.exec_argv.push(code.clone());
             eval_code = Some(code.clone());
-            print_eval = true;
             index += 2;
             continue;
         }
@@ -1068,7 +1084,6 @@ pub fn parse_with_env(
         // the source empty and prints the result of an empty program.
         if argument == "-p" || argument == "--print" {
             options.exec_argv.push(argument.clone());
-            print_eval = true;
             match args.get(index + 1).filter(|next| !next.starts_with('-')) {
                 Some(code) => {
                     options.exec_argv.push(code.clone());
@@ -1084,7 +1099,6 @@ pub fn parse_with_env(
         // option's type is `kBoolean` and `Parse` never reads one for it.
         if argument.starts_with("--print=") {
             options.exec_argv.push(argument.clone());
-            print_eval = true;
             index += 1;
             continue;
         }
@@ -1368,6 +1382,53 @@ pub fn parse_with_env(
             continue;
         }
 
+        // A declared option rustnode does not act on still takes its value the
+        // way `Parse` does. Without this, `--input-type module` reported
+        // `unsupported option '--input-type'` and then treated `module` as the
+        // script path — a rejection that named the wrong problem, with a
+        // second one hiding behind it.
+        //
+        // `--flag=value` carries its own value, so it is recorded as typed. The
+        // separate spelling is joined into the same shape, because one
+        // `exec_argv` form is what the option store and `process.execArgv`
+        // already agree on. A separate value may not start with `-`:
+        // `Parse` calls `missing_argument()` there. `--run` is the one option
+        // whose value is optional, so a following flag is not an error for it;
+        // Node lists the package's scripts instead.
+        if rn_bind_options::takes_separate_value(argument) {
+            if !argument.starts_with("--") || !argument.contains('=') {
+                match args.get(index + 1) {
+                    Some(value) if !value.starts_with('-') => {
+                        options.exec_argv.push(format!("{argument}={value}"));
+                        if UNIMPLEMENTED.contains(&argument.as_str()) {
+                            unimplemented.insert(argument.clone());
+                        }
+                        index += 2;
+                        continue;
+                    }
+                    _ if argument == "--run" => {
+                        options.exec_argv.push(argument.clone());
+                        index += 1;
+                        continue;
+                    }
+                    _ => {
+                        return Err(ParseError::Cli(format!("{argument} requires an argument")));
+                    }
+                }
+            }
+            // The inline form: the value is already attached, so it is recorded
+            // as typed and the walk moves past this one argument.
+            if UNIMPLEMENTED
+                .iter()
+                .any(|flag| argument.starts_with(&format!("{flag}=")))
+            {
+                unimplemented.insert(argument.clone());
+            }
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
         // Everything the table declares is either handled above or is a flag
         // rustnode has not implemented, which is reported rather than forwarded:
         // handing it to V8 would change V8's behaviour behind rustnode's back,
@@ -1416,7 +1477,7 @@ pub fn parse_with_env(
     } else if run_test {
         options.script_args = positional.to_vec();
         Source::Test
-    } else if let Some(code) = eval_code {
+    } else if eval_code.is_some() {
         // `-e`/`-p` ran: their arguments are `argv.slice(1)`, with an explicit
         // `--` consumed by the flag walk above rather than forwarded.
         //
@@ -1425,15 +1486,18 @@ pub fn parse_with_env(
         // `node -i -e 42` starts the REPL and evaluates `42` inside it. The
         // eval code still travels in `exec_argv`, where `internal/main/repl`
         // reads it back through `getOptionValue('--eval')`.
+        //
+        // The code is not carried into [`Source::Eval`]: `finish` applies
+        // `exec_argv` to the option store, and `eval_string.js` reads it back
+        // with `getOptionValue('--eval')`. The `eval_code` binding exists to
+        // decide *that* there is an eval at all, which is what
+        // `has_eval_string` means to `StartExecution`.
         if options.force_repl {
             options.script_args = positional.to_vec();
             Source::Repl
         } else {
             options.script_args = positional.to_vec();
-            Source::Eval {
-                code,
-                print: print_eval,
-            }
+            Source::Eval
         }
     } else if options.syntax_check_only {
         // `StartExecution` reaches `syntax_check_only` only after
@@ -1698,7 +1762,7 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Result<Optio
     // pair by name. Node's dispatch would otherwise reach `--eval` first
     // (`src/node.cc:380` before `:384`), so without the check the command would
     // quietly evaluate the string and never say the two cannot be combined.
-    if options.syntax_check_only && matches!(options.source, Source::Eval { .. }) {
+    if options.syntax_check_only && matches!(options.source, Source::Eval) {
         return Err(ParseError::OptionValue(
             "either --check or --eval can be used, not both".to_string(),
         ));
@@ -1835,13 +1899,30 @@ mod tests {
         })
     }
 
+    /// `-e` and `-p` both select `internal/main/eval_string`; they differ only in
+    /// the `--print` option value that script reads.
+    ///
+    /// The source is deliberately identical for the two: `eval_string.js` is
+    /// what branches on `getOptionValue('--print')`, so a second Rust-side
+    /// `print` field would be a flag nothing reads. Asserting on the store is
+    /// asserting on what the script actually sees.
     #[test]
-    fn eval_and_print_are_distinguished() {
+    fn eval_and_print_are_distinguished_by_the_print_option() {
         let options = parse_of(&["-e", "1+1"]).expect("parses");
-        assert!(matches!(options.source, Source::Eval { print: false, .. }));
+        assert!(matches!(options.source, Source::Eval));
+        assert_eq!(
+            options.parsed.value_of("--print"),
+            Some(rn_bind_options::parsed::ParsedValue::Bool(false)),
+            "-e must leave --print false"
+        );
 
         let options = parse_of(&["-p", "1+1"]).expect("parses");
-        assert!(matches!(options.source, Source::Eval { print: true, .. }));
+        assert!(matches!(options.source, Source::Eval));
+        assert_eq!(
+            options.parsed.value_of("--print"),
+            Some(rn_bind_options::parsed::ParsedValue::Bool(true)),
+            "-p must set --print, which eval_string reads"
+        );
     }
 
     #[test]
@@ -1915,7 +1996,7 @@ mod tests {
             separate.permission.check_fs_read("/tmp/x").is_ok(),
             "the separate form must grant the path"
         );
-        assert!(matches!(separate.source, Source::Eval { .. }));
+        assert!(matches!(separate.source, Source::Eval));
     }
 
     #[test]
@@ -1993,7 +2074,7 @@ mod tests {
         let options =
             parse_of(&["--disable-warning=ExperimentalWarning", "-e", "1"]).expect("parses");
         assert!(options.unimplemented.is_empty());
-        assert!(matches!(options.source, Source::Eval { .. }));
+        assert!(matches!(options.source, Source::Eval));
     }
 
     #[test]
@@ -2002,7 +2083,7 @@ mod tests {
         // The value is joined into one entry, and the entry point follows it, so
         // `execArgv` reproduces the whole invocation minus the script path.
         assert_eq!(options.exec_argv, ["--require=preload.js", "-e", "1"]);
-        assert!(matches!(options.source, Source::Eval { .. }));
+        assert!(matches!(options.source, Source::Eval));
     }
 
     #[test]
@@ -2014,7 +2095,7 @@ mod tests {
         // which is the shape this pins.
         let options = parse_of(&["-r", "/tmp/pre.js", "-e", "1"]).expect("parses");
         assert_eq!(options.exec_argv, ["-r", "/tmp/pre.js", "-e", "1"]);
-        assert!(matches!(options.source, Source::Eval { .. }));
+        assert!(matches!(options.source, Source::Eval));
     }
 
     #[test]
@@ -2523,14 +2604,23 @@ mod tests {
     }
 
     /// The last `--eval` wins while `--print` stands, because Node records them
-    /// as two independent option fields (`eval_string`, `print_eval`).
+    /// as two independent option fields (`eval_string`, `print_eval`). Both are
+    /// read back by `internal/main/eval_string` from the option store, so the
+    /// store is where the pair is asserted.
     #[test]
     fn print_and_eval_compose_as_two_option_fields() {
         let options = parse_of(&["-e", "1", "-p", "2"]).expect("parses");
-        assert!(matches!(
-            &options.source,
-            Source::Eval { code, print: true } if code == "2"
-        ));
+        assert!(matches!(options.source, Source::Eval));
+        assert_eq!(
+            options.parsed.value_of("--eval"),
+            Some(rn_bind_options::parsed::ParsedValue::Text("2".to_string())),
+            "the last --eval is the code eval_string runs"
+        );
+        assert_eq!(
+            options.parsed.value_of("--print"),
+            Some(rn_bind_options::parsed::ParsedValue::Bool(true)),
+            "the earlier -p still asks for the result to be printed"
+        );
 
         // `-p` alone has no source, so it falls through to the stdin entry
         // point, which reads `--print` from the option store. That is how
