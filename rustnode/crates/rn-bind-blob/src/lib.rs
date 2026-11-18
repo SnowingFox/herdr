@@ -456,11 +456,39 @@ fn get_data_object(
     rv.set(array.into());
 }
 
+/// The object-url id in `blob:nodedata:<id>`, if `url` is that shape.
+///
+/// `internal/blob.js`'s `resolveObjectURL` parses the URL and splits its
+/// **pathname** on `:` into at most three parts, requiring exactly two; this is
+/// the same rule over the string `internal/url.js` hands to `revokeObjectURL`.
+///
+/// The id is the *second* segment, not the first. `storeDataObject` keys its map
+/// on the bare UUID that `createObjectURL` generated, so the segment after
+/// `blob:` is the literal `nodedata` and treating it as the id removes nothing
+/// while reporting success — which is exactly what this did before
+/// `test-webworker-importscripts-conversion.js` needed a `blob:` URL to stop
+/// resolving after `revokeObjectURL`.
+fn object_url_id(url: &str) -> Option<&str> {
+    let (scheme, rest) = url.split_once(':')?;
+    if scheme != "blob" {
+        return None;
+    }
+    // A query or fragment is not part of the pathname, so it cannot contribute a
+    // segment. Node reaches the pathname through `new URL`, which drops both.
+    let path = rest.split(['?', '#']).next()?;
+    let mut parts = path.splitn(3, ':');
+    let base = parts.next()?;
+    let id = parts.next()?;
+    if base != "nodedata" || parts.next().is_some() || id.is_empty() {
+        return None;
+    }
+    Some(id)
+}
+
 /// `revokeObjectURL(url)`: forgets the object URL's stored blob.
 ///
-/// Only the id matters, and it is the pathname segment after the scheme, so a
-/// URL that is not a `blob:nodedata:<id>` shape is ignored rather than reported.
-/// Node's own implementation returns nothing either way.
+/// A URL that is not a `blob:nodedata:<id>` shape is ignored rather than
+/// reported; Node's own implementation returns nothing either way.
 fn revoke_object_url(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -470,13 +498,10 @@ fn revoke_object_url(
         return;
     };
     let url = url.to_rust_string_lossy(scope);
-    let Some(rest) = url.split_once(':').map(|(_, rest)| rest) else {
+    let Some(id) = object_url_id(&url) else {
         return;
     };
-    let id = rest.split(':').next().unwrap_or_default().to_string();
-    if id.is_empty() {
-        return;
-    }
+    let id = id.to_string();
     DATA_OBJECTS.with(|slot| {
         slot.borrow_mut().remove(&id);
     });
@@ -894,6 +919,42 @@ mod tests {
         );
         for (member, reason) in DEFERRED {
             assert!(!reason.is_empty(), "{member} needs a reason");
+        }
+    }
+
+    #[test]
+    fn object_url_id_is_the_segment_after_nodedata() {
+        // `storeDataObject` keys on the bare UUID, so this is the id that has to
+        // come back out. Reading the first segment instead yields `nodedata`,
+        // which is not a key, and the revoke then silently does nothing.
+        assert_eq!(
+            object_url_id("blob:nodedata:0f8a1c2e-1111-4222-8333-444455556666"),
+            Some("0f8a1c2e-1111-4222-8333-444455556666")
+        );
+        // A query or fragment is not part of the pathname, so it cannot become
+        // part of the id or add a segment.
+        assert_eq!(object_url_id("blob:nodedata:abc?x=1"), Some("abc"));
+        assert_eq!(object_url_id("blob:nodedata:abc#frag"), Some("abc"));
+    }
+
+    #[test]
+    fn object_url_id_rejects_shapes_it_cannot_have_written() {
+        for url in [
+            // Not a blob: URL at all.
+            "https://example.com/nodedata:abc",
+            "file:///tmp/nodedata:abc",
+            // Right scheme, wrong store prefix.
+            "blob:other:abc",
+            // The bare scheme, no store segment, and an empty id.
+            "blob:",
+            "blob:nodedata:",
+            "blob:nodedata",
+            // Three segments: `resolveObjectURL` requires exactly two.
+            "blob:nodedata:a:b",
+            // No scheme.
+            "nodedata:abc",
+        ] {
+            assert_eq!(object_url_id(url), None, "{url} should not parse");
         }
     }
 

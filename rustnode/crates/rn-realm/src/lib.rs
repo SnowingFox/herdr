@@ -430,6 +430,35 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
         let _ = expose_lazy.call(scope, util, &[global.into(), id.into(), array.into()]);
     }
 
+    // `Worker` is the web Worker API from `internal/webworker`, and Node exposes
+    // it unconditionally at `exposed-window-or-worker.js:55` — the
+    // `--experimental-web-worker` gate is applied afterwards, by
+    // `pre_execution.js`'s `removeWebWorkersIfDisabled`, which deletes the global
+    // when the option is false. Installing it only when the flag is set would be
+    // a different runtime: `internal/main/worker_thread.js` reads
+    // `webWorkerData` to install `DedicatedWorkerGlobalScope`, and the global has
+    // to exist before `prepare_execution` runs for the deletion to be the thing
+    // that removes it.
+    //
+    // The install order matches Node's file: after `MessageChannel`,
+    // `MessagePort` and `BroadcastChannel`, because `internal/webworker`
+    // destructures both from `internal/worker/io` and a worker's inside port has
+    // to exist before a `Worker` can forward its events.
+    //
+    // It stays lazy for the same reason the rest of `exposed-window-or-worker`
+    // does: `internal/webworker` pulls `internal/webidl`, `internal/navigator`,
+    // `internal/data_url` and `internal/mime` in at module scope, and none of
+    // that belongs on the startup path of a script that never names `Worker`.
+    {
+        let (Some(id), Some(array)) = (
+            v8::String::new(scope, "internal/webworker"),
+            names_array(scope, &["Worker"]),
+        ) else {
+            return;
+        };
+        let _ = expose_lazy.call(scope, util, &[global.into(), id.into(), array.into()]);
+    }
+
     // WebCrypto, from the `exposed-window-or-worker` half of Node's web
     // bootstrap. It is not in `exposed-wildcard`, so the loop above never
     // installs it, and a script run as a file therefore had no `crypto` global
@@ -513,6 +542,27 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
         for name in ["URL", "URLSearchParams", "URLPattern"] {
             if let Some(value) = get_property(scope, url, name) {
                 let _ = set_global(scope, global, name, value);
+            }
+        }
+        // `URL.createObjectURL` and `URL.revokeObjectURL` are installed by the
+        // same file, one call below `URLPattern`:
+        //
+        //   installObjectURLMethods();          // exposed-window-or-worker.js:70
+        //
+        // They are not properties of the module's exports, so the loop above
+        // cannot reach them: the function defines them on the `URL` constructor
+        // it is handed. Without this call `URL.createObjectURL` is `undefined`,
+        // which is what `test-webworker-blob-module-url.js` and
+        // `test-worker-spec-differences.js` both trip over — a `blob:` worker
+        // URL cannot be created, so the web Worker blob path has no entry.
+        //
+        // Node calls it unconditionally, in every context, so this is not gated
+        // on the web Worker option. It is also why the call sits inside this
+        // block rather than next to the `Worker` install: `internal/url` has to
+        // be resident, which it already is here.
+        if let Some(install) = get_property(scope, url, "installObjectURLMethods") {
+            if let Ok(install) = v8::Local::<v8::Function>::try_from(install) {
+                let _ = install.call(scope, url, &[]);
             }
         }
     }
