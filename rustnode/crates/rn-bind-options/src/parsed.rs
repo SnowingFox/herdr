@@ -522,6 +522,14 @@ pub fn declares(argument: &str) -> bool {
 /// A negation of a non-boolean is not a value-taking option: `Parse` rejects the
 /// spelling itself with `NegationImpliesBooleanError`, so this answers `false`
 /// and the caller refuses it the way it refuses any other unknown flag.
+///
+/// `--stack-trace-limit` is the one option that is both an `kInteger` and
+/// forwarded to V8 (`src/node_options-inl.h:501-504` pushes it onto the V8
+/// argument vector). It still takes a value, so it answers `true` here — but a
+/// caller that answers only this is what silently dropped the flag: the value
+/// was consumed and recorded, and `record_v8_flag` never ran, so
+/// `Error.stackTraceLimit` stayed at V8's default of 10. [`is_v8_flag`] is the
+/// other half of the answer, and a caller must consult both.
 #[must_use]
 pub fn takes_separate_value(argument: &str) -> bool {
     if is_negation(&normalize_underscores(

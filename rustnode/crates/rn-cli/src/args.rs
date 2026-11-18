@@ -216,6 +216,13 @@ pub struct Options {
     /// `Thrown at:` block from that capture instead of the
     /// `(Use \`node --trace-uncaught ...\`)` hint.
     pub trace_uncaught: bool,
+    /// `--bench`: run Node's benchmark runner instead of a script.
+    ///
+    /// `EnvironmentOptions::bench_runner` (`src/node_options.h`), read by
+    /// `StartExecution` at `src/node.cc:388`. It selects
+    /// [`Source::Bench`], and `CheckOptions` rejects it alongside `--test`,
+    /// `--check`, `--eval` and `--interactive`.
+    pub bench_runner: bool,
     /// `--env-file` and `--env-file-if-exists`, in the order they were given.
     ///
     /// Node records these as two `kStringList` fields (`env_file` and
@@ -269,6 +276,7 @@ impl Options {
             syntax_check_only: false,
             trace_exit: false,
             trace_uncaught: false,
+            bench_runner: false,
             env_files: Vec::new(),
             env_file_store: std::collections::BTreeMap::new(),
         }
@@ -513,6 +521,18 @@ pub enum Source {
     /// there is one, stays in `process.argv`, because that is where
     /// `check_syntax.js` reads it from (it resolves `process.argv[1]` itself).
     CheckSyntax,
+    /// `--bench`: Node's benchmark runner, `internal/main/bench_runner`.
+    ///
+    /// `StartExecution` reaches it at `src/node.cc:388`, ahead of `--test`
+    /// (`:392`), which is why `CheckOptions` rejects the two together rather
+    /// than letting one silently win. The runner itself is entirely
+    /// JavaScript — `internal/bench_runner/**` is vendored byte-identical — so
+    /// nothing is reimplemented here; the flag only has to select it.
+    ///
+    /// `OptionParser` rejects `--bench` without `--experimental-bench`
+    /// (`CheckBenchOptions`, `src/node_options.cc:375`), and `finish`
+    /// reproduces that before a [`Source`] is chosen.
+    Bench,
 }
 
 impl Source {
@@ -533,6 +553,7 @@ impl Source {
                 | Self::Test
                 | Self::Repl
                 | Self::CheckSyntax
+                | Self::Bench
                 | Self::Eval { .. }
         )
     }
@@ -546,6 +567,7 @@ impl Source {
             Self::Test => Some("internal/main/test_runner"),
             Self::Repl => Some("internal/main/repl"),
             Self::CheckSyntax => Some("internal/main/check_syntax"),
+            Self::Bench => Some("internal/main/bench_runner"),
             Self::Eval { .. } => Some("internal/main/eval_string"),
             _ => None,
         }
@@ -1451,6 +1473,19 @@ pub fn parse_with_env(
                     index += 1;
                     continue;
                 }
+                // `--bench` is `kDisallowedInEnvvar`, so it can only arrive
+                // here from the command line; `NODE_OPTIONS=--bench` is refused
+                // by `rn_bind_options::parse_env` before the walk starts.
+                //
+                // It is recorded rather than left to the generic "declared but
+                // not acted on" branch because `CheckOptions` has four
+                // combinations to reject and `StartExecution` dispatches on it.
+                "--bench" => {
+                    options.bench_runner = sets;
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -1652,11 +1687,25 @@ pub fn parse_with_env(
         // the one option whose value is optional, so a following flag is not an
         // error for it; Node lists the package's scripts instead.
         if rn_bind_options::takes_separate_value(argument) {
+            // `--stack-trace-limit` is the one option that is both an
+            // `kInteger` and V8's (`src/node_options-inl.h:501-504`). It has to
+            // keep its value *and* reach the V8 argument vector, and this branch
+            // used to do only the first: the flag was recorded for
+            // `process.execArgv`, `record_v8_flag` never ran, and
+            // `Error.stackTraceLimit` stayed at V8's default of 10 no matter
+            // what the command line said.
+            let also_v8 = rn_bind_options::is_v8_flag(argument);
+            let record = |options: &mut Options, text: &str| {
+                options.exec_argv.push(text.to_string());
+                if also_v8 {
+                    options.v8_args.push(text.to_string());
+                }
+            };
             if !argument.starts_with("--") || !argument.contains('=') {
                 match args.get(index + 1) {
                     Some(value) if !value.starts_with('-') => {
-                        options.exec_argv.push(argument.clone());
-                        options.exec_argv.push(value.clone());
+                        record(&mut options, argument);
+                        record(&mut options, value);
                         if UNIMPLEMENTED.contains(&argument.as_str()) {
                             unimplemented.insert(argument.clone());
                         }
@@ -1681,7 +1730,7 @@ pub fn parse_with_env(
             {
                 unimplemented.insert(argument.clone());
             }
-            options.exec_argv.push(argument.clone());
+            record(&mut options, argument);
             index += 1;
             continue;
         }
@@ -1734,6 +1783,14 @@ pub fn parse_with_env(
     } else if run_test {
         options.script_args = positional.to_vec();
         Source::Test
+    } else if options.bench_runner {
+        // `src/node.cc:388`, after `syntax_check_only` (`:384`) and before
+        // `test_runner` (`:392`). The four combinations `CheckOptions` rejects
+        // are refused in [`finish`], so reaching here means `--bench` is the
+        // only entry point asked for. The glob patterns are `process.argv[1..]`,
+        // which is what `bench_runner.js` slices.
+        options.script_args = positional.to_vec();
+        Source::Bench
     } else if eval_code.is_some() {
         // `-e`/`-p` ran: their arguments are `argv.slice(1)`, with an explicit
         // `--` consumed by the flag walk above rather than forwarded.
@@ -1843,11 +1900,13 @@ fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
         "--check" | "-c" => Some(("--check", false)),
         "--trace-exit" => Some(("--trace-exit", false)),
         "--trace-uncaught" => Some(("--trace-uncaught", false)),
+        "--bench" => Some(("--bench", false)),
         "--no-version" => Some(("--version", true)),
         "--no-help" => Some(("--help", true)),
         "--no-check" => Some(("--check", true)),
         "--no-trace-exit" => Some(("--trace-exit", true)),
         "--no-trace-uncaught" => Some(("--trace-uncaught", true)),
+        "--no-bench" => Some(("--bench", true)),
         _ => None,
     }
 }
@@ -1864,6 +1923,31 @@ fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
 fn record_v8_flag(options: &mut Options, argument: &str) {
     options.exec_argv.push(argument.to_string());
     options.v8_args.push(argument.to_string());
+}
+
+/// One option's value from a raw argument list, in either spelling.
+///
+/// `--flag=value` and `--flag value` both count, because `Parse` accepts both for
+/// every non-boolean non-V8 option and rustnode records the separate form as two
+/// entries. Returns the last occurrence, which is the last-write-wins rule
+/// `Parse` applies to a scalar.
+fn option_value(argv: &[String], name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    let mut found = None;
+    let mut index = 0;
+    while index < argv.len() {
+        let argument = &argv[index];
+        if let Some(value) = argument.strip_prefix(&prefix) {
+            found = Some(value.to_string());
+        } else if argument == name {
+            if let Some(value) = argv.get(index + 1) {
+                found = Some(value.clone());
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    found
 }
 
 /// Whether `argument` is `--max-old-space-size-percentage`, in either spelling
@@ -2042,6 +2126,116 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Result<Optio
         return Err(ParseError::OptionValue(
             "either --check or --eval can be used, not both".to_string(),
         ));
+    }
+    // `CheckBenchOptions` (`src/node_options.cc:375`) needs every option source
+    // parsed before it can look at `--experimental-bench`, so it runs here rather
+    // than during the walk. Each message is Node's own sentence; the first four
+    // are `CheckOptions`' `bench_runner` block and the last is the separate
+    // "is the experimental flag present" check.
+    //
+    // Order matters: Node reports the combination errors from `CheckOptions`
+    // before `CheckBenchOptions` runs, which is why `--bench --test` names the
+    // pair rather than the missing `--experimental-bench`.
+    //
+    // The experimental check gates more than `--bench` itself: every
+    // `--bench-*` option is in the same `kBenchRunnerNamespace`, and
+    // `CheckBenchOptions` asks `has_bench_options` rather than `bench_runner`
+    // alone, so `--bench-samples=1` without `--experimental-bench` is rejected
+    // exactly like `--bench`. `test-bench-cli.js` walks all seven spellings.
+    let has_bench_options = options.bench_runner
+        || options
+            .exec_argv
+            .iter()
+            .chain(options.env_argv.iter())
+            .any(|flag| {
+                let name = flag.split_once('=').map_or(flag.as_str(), |(name, _)| name);
+                name.starts_with("--bench-")
+            });
+    // The four combination errors are inside `if (bench_runner)`, not
+    // `if (has_bench_options)`: a bare `--bench-samples=1` alongside `--test`
+    // is only the missing-experimental-flag error, never the pairing one.
+    if options.bench_runner {
+        if options.exec_argv.iter().any(|flag| flag == "--test")
+            || options.env_argv.iter().any(|flag| flag == "--test")
+        {
+            return Err(ParseError::OptionValue(
+                "either --bench or --test can be used, not both".to_string(),
+            ));
+        }
+        if options.syntax_check_only {
+            return Err(ParseError::OptionValue(
+                "either --bench or --check can be used, not both".to_string(),
+            ));
+        }
+        if options
+            .exec_argv
+            .iter()
+            .any(|flag| flag == "-e" || flag == "--eval")
+            || options
+                .env_argv
+                .iter()
+                .any(|flag| flag == "-e" || flag == "--eval")
+        {
+            return Err(ParseError::OptionValue(
+                "either --bench or --eval can be used, not both".to_string(),
+            ));
+        }
+        if options.force_repl {
+            return Err(ParseError::OptionValue(
+                "either --bench or --interactive can be used, not both".to_string(),
+            ));
+        }
+        if options
+            .exec_argv
+            .iter()
+            .chain(options.env_argv.iter())
+            .any(|flag| flag == "--watch" || flag.starts_with("--watch-path="))
+        {
+            return Err(ParseError::OptionValue(
+                "either --bench or --watch can be used, not both".to_string(),
+            ));
+        }
+        // `--bench-isolation` accepts only `none` and `process`
+        // (`src/node_options.cc:383`). A bare `--bench-isolation` gets the
+        // default `process`; anything else is rejected by name.
+        if let Some(value) = option_value(&options.exec_argv, "--bench-isolation") {
+            if value != "none" && value != "process" {
+                return Err(ParseError::OptionValue(
+                    "invalid value for --bench-isolation".to_string(),
+                ));
+            }
+        }
+        // `has_bench_samples` distinguishes "not given" from "given as 0", so a
+        // zero that arrived from the command line is an error while the absent
+        // default is not.
+        if option_value(&options.exec_argv, "--bench-samples").as_deref() == Some("0") {
+            return Err(ParseError::OptionValue(
+                "--bench-samples must be greater than 0".to_string(),
+            ));
+        }
+    }
+    if has_bench_options {
+        // `CheckBenchOptions`: `--experimental-bench` is what makes
+        // `node:bench` requireable, and the runner cannot load without it. The
+        // message names the flag and is printed with exit 9, like every other
+        // rejected option.
+        //
+        // Read from the raw argv rather than from `options.parsed`, because this
+        // check runs before `parsed.apply` below feeds the store — the same
+        // reason the `--test` check above scans `exec_argv`. Both sources count:
+        // the flag is `kDisallowedInEnvvar`, so only `NODE_OPTIONS` rejection
+        // already removed it from `env_argv`, but scanning both keeps this
+        // honest if that ever changes.
+        let experimental = options
+            .exec_argv
+            .iter()
+            .chain(options.env_argv.iter())
+            .any(|flag| flag == "--experimental-bench");
+        if !experimental {
+            return Err(ParseError::OptionValue(
+                "--experimental-bench is required to use --bench or related options".to_string(),
+            ));
+        }
     }
     // `PerIsolateOptions::CheckOptions` converts the percentage before V8 ever
     // sees a flag, and appends its answer as `--max_old_space_size=<mb>`. That

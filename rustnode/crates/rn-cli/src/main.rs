@@ -743,7 +743,8 @@ fn main() {
         | args::Source::Inspect
         | args::Source::Test
         | args::Source::Repl
-        | args::Source::CheckSyntax => {
+        | args::Source::CheckSyntax
+        | args::Source::Bench => {
             let id = options
                 .source
                 .main_script_id()
