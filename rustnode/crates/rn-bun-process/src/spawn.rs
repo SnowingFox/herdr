@@ -758,6 +758,7 @@ pub(crate) fn run(
                     throw_uv(scope, status, &options.program);
                     return Err(ParseFailed);
                 }
+                rn_uv::ledger::record_created();
                 // Both direction flags, which is what `src/process_wrap.cc`'s
                 // `'pipe'` case sets: libuv then creates a duplex pipe and the
                 // side this process does not use is simply never touched. Setting
@@ -799,12 +800,19 @@ pub(crate) fn run(
         // is what stops libuv's SIGCHLD watcher, which `uv_loop_close` would
         // otherwise refuse and a second `uv_signal_start` would then walk.
         // `rn-bind-spawn-sync` documents this failure mode at length.
+        //
+        // Counted before closing, for the same reason a successful spawn is: the
+        // ledger's `created == closed` invariant is what proves the close ran,
+        // and a handle that is only counted when the child exists would let this
+        // path leak without the ledger noticing.
+        rn_uv::ledger::record_created();
         close_handles(loop_pointer, &mut process, &mut pipes, &mut []);
         // SAFETY: the allocation was made above and nothing else refers to it.
         drop(unsafe { Box::from_raw(state_pointer) });
         throw_uv(scope, status, &options.program);
         return Err(ParseFailed);
     }
+    rn_uv::ledger::record_created();
 
     process.data = ptr::from_mut(state).cast();
     state.process = ptr::from_mut(&mut *process);
@@ -861,6 +869,7 @@ pub(crate) fn run(
         });
         // SAFETY: the loop is live and the storage is zeroed.
         if unsafe { uv::uv_timer_init(loop_pointer, &mut *handle) } == 0 {
+            rn_uv::ledger::record_created();
             handle.data = ptr::from_mut(state).cast();
             // SAFETY: the timer is live; it is unref'd so it cannot keep the loop
             // alive on its own.
@@ -895,17 +904,24 @@ pub(crate) fn run(
         }
     }
 
-    if let Some(timer) = timer {
-        // SAFETY: the timer is live and not closing.
-        unsafe {
-            let raw = Box::into_raw(timer).cast::<uv::uv_handle_t>();
-            uv::uv_close(raw, None);
-        }
-        // SAFETY: the loop is live.
-        unsafe { uv::uv_run(loop_pointer, uv::uv_run_mode_UV_RUN_NOWAIT) };
-    } else {
-        close_handles(loop_pointer, &mut process, &mut pipes, &mut []);
+    // Every handle this function created is closed here, whatever path got us
+    // this far. The timer used to be closed *instead of* the rest, which left the
+    // `uv_process_t` and every `uv_pipe_t` on the loop's `handle_queue` while
+    // their `Box` storage — and the `SyncState` each handle's `data` points at —
+    // was freed when this function returned.
+    //
+    // `uv_spawn` and `uv_pipe_init` both call `uv__handle_init`, which links the
+    // handle into that intrusive queue, and only `uv_close` unlinks it. A queue
+    // node in freed memory is what the next `uv_run` walks; the measured symptom
+    // was a SIGSEGV in `v8::internal::Scavenger::ScavengePage` on a worker
+    // thread, with the corruption surfacing wherever the reused storage happened
+    // to be. `rn-bind-spawn-sync` hit the same defect through its failed-`exec`
+    // path and its docs name `uv__handle_init` and the process-global signal
+    // tree; this is the same fix one crate over.
+    if let Some(mut timer) = timer {
+        close_spawn_timer(&mut timer);
     }
+    close_handles(loop_pointer, &mut process, &mut pipes, &mut []);
 
     let completed = Completed {
         exit_code: state.exit_code,
@@ -1138,11 +1154,40 @@ fn write_and_shutdown(stream: *mut uv::uv_stream_t, bytes: &mut [u8]) {
         }
     }
     // SAFETY: the stream is live and not closing.
-    unsafe { uv::uv_close(stream.cast(), None) };
+    unsafe { uv::uv_close(stream.cast(), Some(record_handle_closed)) };
+}
+
+/// Closes the timeout timer a spawn created, if it created one.
+///
+/// `uv_ref` first: the timer was unref'd when it was created so it could not keep
+/// the loop alive on its own, and a closing handle that is still unref'd does not
+/// make `uv_run(UV_RUN_DEFAULT)` keep running. Without the ref the close callback
+/// is never delivered, the handle stays in the loop's `closing_handles` queue, and
+/// freeing its `Box` recreates the same dangling-node defect the rest of this
+/// teardown exists to avoid. `rn-bind-spawn-sync`'s `CloseKillTimer` refs for
+/// exactly this reason.
+///
+/// A free function rather than three inlined statements because the regression
+/// test drives the same sequence: when the test spelled it out separately, it
+/// omitted the `uv_ref` and the ledger caught the difference. One function means
+/// the two cannot disagree about what the teardown is.
+fn close_spawn_timer(timer: &mut Box<uv::uv_timer_t>) {
+    // SAFETY: the caller owns a live, initialised timer that is not closing.
+    unsafe {
+        let raw = (&mut **timer as *mut uv::uv_timer_t).cast::<uv::uv_handle_t>();
+        if uv::uv_is_closing(raw) == 0 {
+            uv::uv_ref(raw);
+            uv::uv_close(raw, Some(record_handle_closed));
+        }
+    }
 }
 
 /// Closes the process handle and every pipe, then drains the loop so the close
 /// callbacks run.
+///
+/// The callbacks are [`record_handle_closed`] rather than `None` because a handle
+/// libuv releases without a callback would never be counted, and the ledger's
+/// `created == closed` invariant is what proves this teardown happened.
 fn close_handles(
     loop_pointer: *mut uv::uv_loop_t,
     process: &mut uv::uv_process_t,
@@ -1154,7 +1199,7 @@ fn close_handles(
         unsafe {
             let handle = std::ptr::from_mut(&mut **pipe).cast::<uv::uv_handle_t>();
             if uv::uv_is_closing(handle) == 0 {
-                uv::uv_close(handle, None);
+                uv::uv_close(handle, Some(record_handle_closed));
             }
         }
     }
@@ -1163,7 +1208,7 @@ fn close_handles(
         unsafe {
             let handle = std::ptr::from_mut(&mut **pipe).cast::<uv::uv_handle_t>();
             if uv::uv_is_closing(handle) == 0 {
-                uv::uv_close(handle, None);
+                uv::uv_close(handle, Some(record_handle_closed));
             }
         }
     }
@@ -1172,11 +1217,23 @@ fn close_handles(
     unsafe {
         let handle = (process as *mut uv::uv_process_t).cast::<uv::uv_handle_t>();
         if uv::uv_is_closing(handle) == 0 {
-            uv::uv_close(handle, None);
+            uv::uv_close(handle, Some(record_handle_closed));
         }
     }
     // SAFETY: the loop is live and nothing else is running on it.
     unsafe { uv::uv_run(loop_pointer, uv::uv_run_mode_UV_RUN_DEFAULT) };
+}
+
+/// libuv's close callback: records the handle against the ledger.
+///
+/// Touches no handle state, so it is safe to run for a handle whose storage is
+/// about to be released by its `Box`.
+///
+/// # Safety
+///
+/// Called by libuv once per handle passed to `uv_close`.
+unsafe extern "C" fn record_handle_closed(_handle: *mut uv::uv_handle_t) {
+    rn_uv::ledger::record_closed();
 }
 
 /// Throws a libuv status the way Bun reports a `posix_spawn` failure.
@@ -2045,5 +2102,138 @@ mod tests {
         let pointers: Vec<*mut c_char> = vec![ptr::null_mut()];
         assert_eq!(pointers.len(), 1);
         assert!(pointers[0].is_null());
+    }
+
+    /// The teardown closes *every* handle it is given, including when a timeout
+    /// timer exists.
+    ///
+    /// This is the invariant the `Scavenger::ScavengePage` SIGSEGV turned out to
+    /// be about. `run` used to close the timer *instead of* the process handle
+    /// and pipes when `options.timeout > 0`, so those handles stayed linked in
+    /// libuv's intrusive `handle_queue` while their `Box` storage was freed, and
+    /// the next `uv_run` walked the freed nodes.
+    ///
+    /// The assertion is on `rn_uv::ledger`, which counts each handle at
+    /// `uv_*_init` and each close callback as it runs. That makes the defect a
+    /// number rather than a crash: the unfixed path left `created > closed`.
+    /// A crash would be the symptom, and it only appears when the freed memory is
+    /// reused before the queue is walked, which is why the real differential
+    /// probe passed 40 isolated runs on the unfixed binary and a repeated spawn
+    /// failed 27 of 60.
+    ///
+    /// Real handles are built on the real loop rather than mocked, because the
+    /// thing under test *is* what libuv does with them.
+    #[test]
+    fn the_teardown_closes_the_process_pipes_and_timer_together() {
+        // `ledger::thread_snapshot` is per-thread, so no other test's handles
+        // appear here and this case needs no process-wide lock.
+        //
+        // Taken *after* the loop is created, because the loop's own keepalive
+        // handle is counted too and is created on first use.
+        let Some(loop_pointer) = rn_uv::uv_loop::loop_ptr() else {
+            panic!("the process loop must be creatable");
+        };
+        let before = rn_uv::ledger::thread_snapshot();
+
+        // A process handle registered by a failed `exec`, which is the shape
+        // `uv_spawn` leaves behind: initialised and queued, with no child.
+        let mut process = Box::new(unsafe {
+            // SAFETY: `uv_process_t` is plain C data and `uv_spawn` fills it.
+            std::mem::zeroed::<uv::uv_process_t>()
+        });
+        let mut argv = [
+            c"rustnode-test-placeholder".as_ptr().cast_mut(),
+            ptr::null_mut(),
+        ];
+        let missing = c"/nonexistent/rn-bun-process-teardown-test";
+        let mut containers = [uv::uv_stdio_container_t {
+            flags: uv::uv_stdio_flags_UV_IGNORE,
+            // SAFETY: the union's variants are plain data.
+            data: unsafe { std::mem::zeroed() },
+        }];
+        let native = uv::uv_process_options_t {
+            exit_cb: Some(on_exit),
+            file: missing.as_ptr(),
+            args: argv.as_mut_ptr(),
+            env: ptr::null_mut(),
+            cwd: ptr::null(),
+            flags: 0,
+            stdio_count: containers.len() as i32,
+            stdio: containers.as_mut_ptr(),
+            uid: 0,
+            gid: 0,
+        };
+        // SAFETY: the loop is live, the storage is zeroed, and every pointer
+        // `native` holds borrows a local that outlives the call.
+        let status = unsafe { uv::uv_spawn(loop_pointer, &mut *process, &native) };
+        // The binary does not exist, so this must fail — and it is exactly the
+        // failure path that still registers the handle.
+        assert_ne!(status, 0, "the placeholder binary must not exist");
+        rn_uv::ledger::record_created();
+
+        // A pipe and an unref'd timer, the three handle kinds one `run` makes.
+        let mut pipe = Box::new(unsafe {
+            // SAFETY: plain C data.
+            std::mem::zeroed::<uv::uv_pipe_t>()
+        });
+        // SAFETY: the loop is live and the storage is a zeroed pipe.
+        assert_eq!(
+            unsafe { uv::uv_pipe_init(loop_pointer, &mut *pipe, 0) },
+            0,
+            "the pipe must initialise"
+        );
+        rn_uv::ledger::record_created();
+
+        let mut timer = Box::new(unsafe {
+            // SAFETY: plain C data.
+            std::mem::zeroed::<uv::uv_timer_t>()
+        });
+        // SAFETY: the loop is live and the storage is a zeroed timer.
+        assert_eq!(
+            unsafe { uv::uv_timer_init(loop_pointer, &mut *timer) },
+            0,
+            "the timer must initialise"
+        );
+        rn_uv::ledger::record_created();
+        // Through the production helper, not a hand-written close: when this test
+        // spelled the sequence out itself it omitted the `uv_ref` that the
+        // unref'd timer needs, and the ledger caught the difference — which is
+        // exactly the divergence this test exists to prevent.
+        close_spawn_timer(&mut timer);
+
+        let mut pipes = [pipe];
+        close_handles(loop_pointer, &mut process, &mut pipes, &mut []);
+
+        let after = rn_uv::ledger::thread_snapshot();
+        assert_eq!(
+            after.created,
+            before.created + 3,
+            "this case must have created exactly the three handles it inspects"
+        );
+        // The *delta* is what this case owns. The loop's keepalive handle is
+        // created on first use and deliberately outlives everything — it is
+        // unref'd so it cannot keep the loop alive, and it is what gives the
+        // backend a descriptor to sleep on — so `before` already holds it as
+        // outstanding and subtracting the baselines is the only correct
+        // comparison. An absolute `outstanding() == 0` would instead assert that
+        // the runtime never created a loop at all.
+        assert_eq!(
+            after.closed - before.closed,
+            3,
+            "the teardown left one of the three handles with no close callback: \
+             {} — libuv keeps a queue node for each, and the storage behind it is \
+             freed when the spawn returns, so the next `uv_run` walks freed memory",
+            after
+        );
+        assert_eq!(
+            after.outstanding(),
+            before.outstanding(),
+            "the teardown changed how many handles are open in this process: {}",
+            after
+        );
+        // The timer is still owned by its `Box`, so it is released here after the
+        // close callback has run — the same order `run` relies on.
+        drop(timer);
+        drop(process);
     }
 }
