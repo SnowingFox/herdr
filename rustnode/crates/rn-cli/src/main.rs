@@ -672,7 +672,8 @@ fn main() {
         args::Source::Stdin { .. }
         | args::Source::Help
         | args::Source::Inspect
-        | args::Source::Test => {
+        | args::Source::Test
+        | args::Source::Repl => {
             let id = options
                 .source
                 .main_script_id()

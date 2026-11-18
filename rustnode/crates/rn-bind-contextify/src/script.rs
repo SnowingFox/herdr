@@ -261,6 +261,20 @@ pub fn make_context<'s>(
         rn_core::define_mark(scope, global, symbol, id);
     }
 
+    // `vm.createContext` registers the realm with the inspector, which is
+    // `Environment::AssignToContext` in Node (`src/env.cc:747`, called from
+    // `ContextifyContext::CreateV8Context` at `src/node_contextify.cc:349`).
+    // V8 is what numbers the context, so the id a session reports comes from
+    // here — without this call `Runtime.executionContextCreated` never fires
+    // for a `vm` context, `internal/repl/inspector.js`'s
+    // `captureExecutionContextId` never resolves, and every REPL line is
+    // evaluated in the main context.
+    //
+    // `is_default` is false for every contextify context: DevTools' aux data
+    // distinguishes "the page's default context" from "a plain realm", and only
+    // the main context is the former.
+    rn_bind_inspector::context_created(scope, context, &name, false);
+
     let key = i32::from(context.global(scope).get_identity_hash()) as u64;
     store(
         key,

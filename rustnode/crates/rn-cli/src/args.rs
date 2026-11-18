@@ -166,6 +166,19 @@ pub struct Options {
     /// that runs after the realm is up, so it needs the whole bootstrap, and
     /// Node checks the version first when both are given.
     pub print_help: bool,
+    /// `-i`/`--interactive`: enter the REPL even when stdin is not a terminal.
+    ///
+    /// Node's `force_repl` (`src/node_options.h:300`, set by
+    /// `--interactive` at `src/node_options.cc:1496`). It does two things
+    /// `StartExecution` depends on: it selects `internal/main/repl` over
+    /// `eval_string` when `-e` was also given (`src/node.cc:380` tests
+    /// `has_eval_string && !force_repl`), and it selects the REPL over
+    /// `eval_stdin` when stdin is a pipe (`src/node.cc:407`).
+    ///
+    /// `NODE_OPTIONS=--interactive` sets it too, because the option is
+    /// `kAllowedInEnvvar` — so it is read from the environment's store rather
+    /// than only from the command-line walk.
+    pub force_repl: bool,
 }
 
 impl Options {
@@ -194,6 +207,7 @@ impl Options {
             max_old_space_size_percentage: None,
             print_version: false,
             print_help: false,
+            force_repl: false,
         }
     }
 
@@ -335,11 +349,24 @@ fn parse_inspect_port(port: &str, message: &str) -> Result<u16, String> {
 pub enum Source {
     /// Nothing to run: behaves like `-e ''`.
     ///
-    /// Only reachable when standard input is a terminal. Node starts the REPL
-    /// there, which rustnode does not have, so the closest honest behaviour is
-    /// the empty program — an interactive terminal is not a script.
+    /// Reachable only when stdin is a terminal and no `-i` asked for the REPL,
+    /// which is a state Node reaches by starting the REPL anyway: `StartExecution`
+    /// tests `force_repl || uv_guess_handle(STDIN_FILENO) == UV_TTY`. A terminal
+    /// therefore means [`Source::Repl`], so this variant is only the fallback for
+    /// a process whose stdin kind was never probed — the parser's own tests, and
+    /// a caller that has no descriptor to ask.
     #[default]
     Empty,
+    /// `-i`/`--interactive`, or a bare `node` on a terminal:
+    /// `internal/main/repl`.
+    ///
+    /// `StartExecution` reaches this after every other entry point is ruled out
+    /// (`src/node.cc:407`), and `internal/main/repl.js` is what builds the REPL
+    /// out of the vendored `lib/repl.js`. Nothing is reimplemented here: the
+    /// entry point is a `kMainScript` like `eval_stdin`, so it compiles with
+    /// `(process, require, internalBinding, primordials)` and calls
+    /// `prepareMainThreadExecution()` itself.
+    Repl,
     /// `-e` or `-p`.
     Eval {
         code: String,
@@ -402,7 +429,7 @@ impl Source {
     pub fn uses_main_script(&self) -> bool {
         matches!(
             self,
-            Self::Stdin { .. } | Self::Help | Self::Inspect | Self::Test
+            Self::Stdin { .. } | Self::Help | Self::Inspect | Self::Test | Self::Repl
         )
     }
 
@@ -413,6 +440,7 @@ impl Source {
             Self::Help => Some("internal/main/print_help"),
             Self::Inspect => Some("internal/main/inspect"),
             Self::Test => Some("internal/main/test_runner"),
+            Self::Repl => Some("internal/main/repl"),
             _ => None,
         }
     }
@@ -1058,6 +1086,26 @@ pub fn parse_with_env(
             }
         }
 
+        // `-i`/`--interactive`. Both spellings name the same `kBoolean`
+        // option, so `-i` is expanded here rather than left to the alias table,
+        // which the CLI does not consult while walking. The `=value` form is
+        // accepted and ignored like `--print`'s, and `--no-interactive` clears
+        // what an earlier `-i` set — which is what makes
+        // `NODE_OPTIONS=--interactive` overridable on the command line.
+        if argument == "-i" || argument == "--interactive" || argument.starts_with("--interactive=")
+        {
+            options.force_repl = true;
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        if argument == "--no-interactive" {
+            options.force_repl = false;
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
         if UNIMPLEMENTED.contains(&argument.as_str()) {
             unimplemented.insert(argument.clone());
             options.exec_argv.push(argument.clone());
@@ -1333,32 +1381,61 @@ pub fn parse_with_env(
     } else if let Some(code) = eval_code {
         // `-e`/`-p` ran: their arguments are `argv.slice(1)`, with an explicit
         // `--` consumed by the flag walk above rather than forwarded.
-        options.script_args = positional.to_vec();
-        Source::Eval {
-            code,
-            print: print_eval,
+        //
+        // `-i` beats `-e`: `StartExecution` reaches `eval_string` only when
+        // `has_eval_string && !force_repl` (`src/node.cc:380`), so
+        // `node -i -e 42` starts the REPL and evaluates `42` inside it. The
+        // eval code still travels in `exec_argv`, where `internal/main/repl`
+        // reads it back through `getOptionValue('--eval')`.
+        if options.force_repl {
+            options.script_args = positional.to_vec();
+            Source::Repl
+        } else {
+            options.script_args = positional.to_vec();
+            Source::Eval {
+                code,
+                print: print_eval,
+            }
         }
     } else if let Some((script, rest)) = positional.split_first() {
         // A positional is the script path, and `-` is the marker for stdin
         // rather than a file named `-`: `run_main_module` is skipped for it
-        // (`src/node.cc:400`) and `eval_stdin` runs instead, with the marker
+        // (`src/node.cc:403`) and `eval_stdin` runs instead, with the marker
         // left in `process.argv`.
+        //
+        // A real path outranks `-i`: `StartExecution` tests the positional at
+        // `:403` and `force_repl` only at `:407`, so `node -i file.js` runs the
+        // file and never shows a prompt. The `-` marker is the exception,
+        // because `:403` excludes it by name — `node -i -` is a REPL session.
         if script == "-" {
-            options.script_args = rest.to_vec();
-            Source::Stdin { marker: true }
+            if options.force_repl {
+                options.script_args = positional.to_vec();
+                Source::Repl
+            } else {
+                options.script_args = rest.to_vec();
+                Source::Stdin { marker: true }
+            }
         } else {
             options.script_args = rest.to_vec();
             Source::File(script.clone())
         }
+    } else if options.force_repl {
+        // `-i` with a pipe on stdin: the REPL is entered even though nothing
+        // looks like a terminal (`src/node.cc:407`). This is the case every
+        // `spawn(process.execPath, ['--interactive'])` test in the suite drives,
+        // and the one `-i -e <code>` reaches after `:380` declines `-e`.
+        options.script_args = positional.to_vec();
+        Source::Repl
     } else if stdin == StdinKind::Redirected {
         // No script, standard input is not a terminal: Node reads it as a
         // CommonJS module. This is the case that used to evaluate `"0"` and
         // exit 0 without printing anything.
         Source::Stdin { marker: false }
     } else {
-        // A terminal. Node starts the REPL here; rustnode has none, so the
-        // empty program is the honest stand-in.
-        Source::Empty
+        // A terminal with no script and no `-i`. `StartExecution`'s last test
+        // is `uv_guess_handle(STDIN_FILENO) == UV_TTY` (`src/node.cc:407`),
+        // which this is, so Node starts the REPL here too.
+        Source::Repl
     };
 
     finish(options, unimplemented)
@@ -1967,10 +2044,103 @@ mod tests {
         assert!(matches!(options.source, Source::File(path) if path == "--looks-like-a-flag"));
     }
 
+    /// No arguments on a terminal is the REPL, which is `StartExecution`'s last
+    /// test (`src/node.cc:407`: `force_repl || uv_guess_handle(STDIN_FILENO) ==
+    /// UV_TTY`). `parse_of` passes `StdinKind::Terminal`, so this is the branch
+    /// a user typing bare `node` reaches.
     #[test]
-    fn no_arguments_means_nothing_to_run() {
+    fn no_arguments_on_a_terminal_start_the_repl() {
         let options = parse_of(&[]).expect("parses");
-        assert!(matches!(options.source, Source::Empty));
+        assert!(matches!(options.source, Source::Repl));
+        assert!(!options.force_repl, "the REPL here comes from the terminal");
+    }
+
+    /// `-i`/`--interactive` selects the REPL when stdin is a pipe.
+    ///
+    /// This is the flag the whole `test/parallel/test-repl-*` cluster spawns its
+    /// children with, and it used to be `unsupported option '--interactive'`
+    /// (exit 9). The oracle is `spawn(process.execPath, ['--interactive'])`
+    /// printing the banner and evaluating each line on a pipe.
+    #[test]
+    fn interactive_selects_the_repl_on_a_pipe() {
+        for spelling in ["-i", "--interactive"] {
+            let options = parse_of(&[spelling]).expect("parses");
+            assert!(options.force_repl, "{spelling} sets force_repl");
+            assert!(matches!(options.source, Source::Repl), "{spelling}");
+            // `internal/main/repl` is a main script and calls
+            // `prepareMainThreadExecution()` itself; the CLI must not.
+            assert!(options.source.uses_main_script(), "{spelling}");
+            assert_eq!(
+                options.source.main_script_id(),
+                Some("internal/main/repl"),
+                "{spelling}"
+            );
+        }
+        // The pipe is what makes this the interesting case: without `-i` it
+        // would be `eval_stdin`.
+        let options =
+            parse_with_env(&["-i".to_string()], None, StdinKind::Redirected).expect("parses");
+        assert!(matches!(options.source, Source::Repl));
+    }
+
+    /// A real script path outranks `-i`, which `StartExecution` decides by
+    /// testing the positional at `src/node.cc:403` before `force_repl` at
+    /// `:407`. `node -i file.js` runs the file and never shows a prompt.
+    #[test]
+    fn interactive_does_not_swallow_a_script_argument() {
+        let options = parse_of(&["-i", "app.js"]).expect("parses");
+        assert!(options.force_repl);
+        assert!(matches!(options.source, Source::File(path) if path == "app.js"));
+    }
+
+    /// `-` is the exception to that ordering: `src/node.cc:403` excludes the
+    /// marker by name, so `node -i -` is a REPL session whose `argv[1]` is `-`.
+    #[test]
+    fn interactive_with_the_stdin_marker_still_reaches_the_repl() {
+        let options = parse_of(&["-i", "-"]).expect("parses");
+        assert!(matches!(options.source, Source::Repl));
+    }
+
+    /// `-i` beats `-e`: `src/node.cc:380` is `has_eval_string && !force_repl`.
+    /// The REPL then evaluates the code itself from `getOptionValue('--eval')`,
+    /// which is why `node -i -e 'x'` prints the banner first and the eval output
+    /// after it.
+    #[test]
+    fn interactive_takes_precedence_over_eval() {
+        let options = parse_of(&["-i", "-e", "42"]).expect("parses");
+        assert!(matches!(options.source, Source::Repl));
+        // The code and its flag stay in `execArgv`, which is what makes
+        // `process.execArgv` match the oracle's `["-i", "-e", "42"]` and lets
+        // `internal/main/repl` read the code back.
+        assert_eq!(options.exec_argv, ["-i", "-e", "42"]);
+    }
+
+    /// `--no-interactive` clears what an earlier spelling set, which is what
+    /// makes `NODE_OPTIONS=--interactive` overridable on the command line.
+    #[test]
+    fn no_interactive_clears_the_request() {
+        let args = ["--interactive".to_string(), "--no-interactive".to_string()];
+        let options = parse_with_env(&args, None, StdinKind::Redirected).expect("parses");
+        assert!(!options.force_repl);
+        assert!(matches!(options.source, Source::Stdin { marker: false }));
+    }
+
+    /// `--interactive` is `kDisallowedInEnvvar` in Node's table
+    /// (`src/node_options.cc:1496` passes no `kAllowedInEnvvar`), and the
+    /// oracle rejects it with `--interactive is not allowed in NODE_OPTIONS`.
+    /// Recording that here keeps the CLI from reading a value the environment
+    /// parser already refused.
+    #[test]
+    fn interactive_is_not_allowed_in_node_options() {
+        let error = rn_bind_options::parse_env("--interactive")
+            .expect_err("NODE_OPTIONS must refuse --interactive");
+        assert!(
+            error
+                .message()
+                .contains("--interactive is not allowed in NODE_OPTIONS"),
+            "{}",
+            error.message()
+        );
     }
 
     /// `node inspect` selects Node's debugger client, not a file named `inspect`.
@@ -2109,13 +2279,14 @@ mod tests {
         assert!(options.script_args.is_empty());
     }
 
-    /// A bare pipe runs stdin; a terminal does not.
+    /// A bare pipe runs stdin; a terminal starts the REPL.
     ///
-    /// This is the whole of Node's dispatch at `src/node.cc:400-405`:
-    /// `first_argv.empty() && uv_guess_handle(STDIN_FILENO) != UV_TTY` means
-    /// `internal/main/eval_stdin`. Before this, both cases fell through to the
-    /// empty program, which evaluated `"0"` and exited 0 while printing
-    /// nothing — a silent success for a script that never ran.
+    /// This is Node's dispatch at `src/node.cc:403-409`: no positional means
+    /// `force_repl || uv_guess_handle(STDIN_FILENO) == UV_TTY` decides between
+    /// `internal/main/repl` and `internal/main/eval_stdin`. Before this, both
+    /// cases fell through to the empty program, which evaluated `"0"` and
+    /// exited 0 while printing nothing — a silent success for a script that
+    /// never ran.
     #[test]
     fn no_argument_reads_stdin_only_when_it_is_not_a_terminal() {
         let options = parse_with_env(&[], None, StdinKind::Redirected).expect("parses");
@@ -2123,7 +2294,7 @@ mod tests {
         assert!(options.script_args.is_empty());
 
         let options = parse_with_env(&[], None, StdinKind::Terminal).expect("parses");
-        assert!(matches!(options.source, Source::Empty));
+        assert!(matches!(options.source, Source::Repl));
     }
 
     /// `-` is the stdin marker, and it stays in `process.argv`.
@@ -2192,9 +2363,9 @@ mod tests {
 
         let options = parse_of(&["--help", "--no-help"]).expect("parses");
         assert!(!options.print_help);
-        // With the request cleared there is nothing to run, and a terminal is
-        // the only case that reaches the empty program.
-        assert!(matches!(options.source, Source::Empty));
+        // With the request cleared there is no script and no flag left, so a
+        // terminal means the REPL.
+        assert!(matches!(options.source, Source::Repl));
     }
 
     /// A rejected flag still wins over `--version`, which is the ordering
