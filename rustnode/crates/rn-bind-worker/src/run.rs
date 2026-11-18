@@ -79,6 +79,55 @@ pub struct WorkerThread {
     pub out_of_memory: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// The diagnostic options a worker was started with.
+///
+/// Resolved once in [`WorkerThread::run_inner`], before the isolate exists,
+/// because `--trace-uncaught` has to be registered on `&mut Isolate` while
+/// `--trace-exit` and `--stack-trace-limit` are read later by the exit path.
+/// Node keeps the same three on `EnvironmentOptions` and reads them at the same
+/// two points (`WorkerThreadData`'s constructor for the capture,
+/// `Environment::Exit` for the warning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerDiagnostics {
+    /// `--trace-exit`, for the environment-exit warning.
+    pub trace_exit: bool,
+    /// `--trace-uncaught`, for both the V8 capture and the `Thrown at:` block.
+    pub trace_uncaught: bool,
+    /// `--stack-trace-limit`, which both of the above use for their frame count.
+    pub stack_trace_limit: i32,
+}
+
+impl WorkerDiagnostics {
+    /// Reads the three options out of a parsed store.
+    ///
+    /// The store is the worker's own `execArgv` — either the explicit list the
+    /// constructor was given or the parent's, which
+    /// `src/node_worker.cc:701` inherits when `options.execArgv` was absent.
+    #[must_use]
+    pub fn from_store(store: &rn_bind_options::Store) -> Self {
+        let flag = |name: &str| {
+            matches!(
+                store.value_of(name),
+                Some(rn_bind_options::ParsedValue::Bool(true))
+            )
+        };
+        // `--stack-trace-limit` is an `int64` option and V8 takes an `i32`, so
+        // the conversion saturates rather than truncating: a limit beyond
+        // `i32::MAX` asks for everything, and a negative one asks for nothing.
+        let stack_trace_limit = match store.value_of("--stack-trace-limit") {
+            Some(rn_bind_options::ParsedValue::Int(value)) => {
+                i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
+            }
+            Some(_) | None => 10,
+        };
+        Self {
+            trace_exit: flag("--trace-exit"),
+            trace_uncaught: flag("--trace-uncaught"),
+            stack_trace_limit,
+        }
+    }
+}
+
 impl WorkerThread {
     /// Runs the worker to completion on the current thread.
     ///
@@ -104,6 +153,31 @@ impl WorkerThread {
     }
 
     fn run_inner(&self) -> i32 {
+        // `src/node_worker.cc:701`: when `options.execArgv` was not an array,
+        // the worker inherits the parent's `env->exec_argv()`, and
+        // `per_isolate_opts` is the parent's clone. rustnode records the parent's
+        // list in the hook slot for exactly this.
+        //
+        // Resolved here, before the isolate exists, because two of the values
+        // are isolate-level: `--trace-uncaught` turns on V8's capture of the
+        // stack behind an uncaught exception, which can only be set on
+        // `&mut Isolate`. Node makes the same decision at the same point, in
+        // `WorkerThreadData`'s constructor before `NewIsolate`.
+        let inherited_argv = self.exec_argv.is_empty();
+        let exec_argv = if inherited_argv {
+            rn_core::hook_slot::exec_argv()
+        } else {
+            self.exec_argv.clone()
+        };
+        // The inherited list is re-parsed with the real option parser rather
+        // than scanned, so `--no-trace-exit` after `--trace-exit` keeps its
+        // meaning and a worker cannot end up with a value the parent's own
+        // parser disagreed with.
+        let worker_options = rn_bind_options::Store::parse(&exec_argv);
+        let diagnostics = WorkerDiagnostics::from_store(&worker_options);
+        let worker_trace_uncaught = diagnostics.trace_uncaught;
+        let worker_stack_trace_limit = diagnostics.stack_trace_limit;
+
         // ---- 1. the isolate -------------------------------------------------
         // `WorkerThreadData` calls `SetIsolateCreateParamsForNode` and then
         // `UpdateResourceConstraints` (`src/node_worker.cc:180-182`), in that
@@ -154,6 +228,14 @@ impl WorkerThread {
         // queue must beat a `.then`, and the default `Auto` policy would invert
         // that.
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+        // `Environment::InitializeDiagnostics` for this environment: the same
+        // capture the main thread's isolate gets, driven by the worker's own
+        // `--trace-uncaught` rather than the parent's. A worker started with
+        // `execArgv: ['--trace-uncaught']` under a parent that lacks it must
+        // still trace, and the reverse must not.
+        if worker_trace_uncaught {
+            isolate.set_capture_stack_trace_for_uncaught_exceptions(true, worker_stack_trace_limit);
+        }
         // `import.meta` and `import()` are dispatched through isolate-level
         // handlers, and a worker can `import()` too.
         rn_module_wrap::install_isolate_callbacks(&mut isolate);
@@ -227,7 +309,7 @@ impl WorkerThread {
             return 0;
         }
 
-        let code = self.boot_and_run(scope);
+        let code = self.boot_and_run(scope, &diagnostics, &exec_argv);
 
         // ---- 6. drain deferred Node-API finalizers -------------------------
         // A buffer created by an addon and owned by this worker is released when
@@ -287,7 +369,17 @@ impl WorkerThread {
     }
 
     /// Boots the realm, runs `worker_thread.js`, and drives the loop.
-    fn boot_and_run(&self, scope: &mut v8::PinScope<'_, '_>) -> i32 {
+    ///
+    /// `diagnostics` and `exec_argv` are resolved by [`Self::run_inner`] before
+    /// the isolate exists, because one of those options is an isolate-level V8
+    /// setting; passing them in keeps that ordering explicit rather than having
+    /// this method re-read the environment.
+    fn boot_and_run(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        diagnostics: &WorkerDiagnostics,
+        exec_argv: &[String],
+    ) -> i32 {
         let registry = match crate::registry::build() {
             Ok(registry) => registry,
             Err(message) => {
@@ -313,6 +405,22 @@ impl WorkerThread {
         );
         crate::publish_stop_flag(Arc::clone(&self.stopping));
         crate::clear_exit_code();
+        // `(node:PID)` versus `(node:PID, thread:N)` is the one observable
+        // difference between a main-thread and a worker `--trace-exit` warning,
+        // and `test-trace-exit.js` matches the second shape for its worker
+        // cases. Node reads `is_main_thread()` off the `Environment` at exit
+        // time, so this has to be recorded on the thread that exits.
+        rn_core::exit_state::set_environment_identity(rn_core::exit_state::EnvironmentIdentity {
+            is_main_thread: false,
+            thread_id: self.thread_id,
+        });
+
+        // The per-thread trace state, before the realm bootstrap reads it. The
+        // isolate-level half was already set in `run_inner`; these are the two
+        // flags the exit and report paths read.
+        rn_core::hook_slot::set_trace_exit(diagnostics.trace_exit);
+        rn_core::hook_slot::set_trace_uncaught(diagnostics.trace_uncaught);
+        rn_core::hook_slot::set_stack_trace_limit(i64::from(diagnostics.stack_trace_limit));
 
         let mut argv = vec![exec_path()];
         argv.extend(self.request.argv.iter().cloned());
@@ -324,7 +432,7 @@ impl WorkerThread {
         let loaders = match rn_realm::bootstrap_realm(
             scope,
             &argv[1..],
-            &self.exec_argv,
+            exec_argv,
             rn_realm::ProcessState::worker(),
         ) {
             Ok(loaders) => loaders,

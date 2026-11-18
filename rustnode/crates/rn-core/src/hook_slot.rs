@@ -252,7 +252,6 @@ thread_local! {
     static STATE: RefCell<HookState> = RefCell::new(HookState::default());
 }
 
-#[derive(Default)]
 struct HookState {
     prepare_stack_trace: Option<v8::Global<v8::Function>>,
     dynamic_import: Option<v8::Global<v8::Function>>,
@@ -263,6 +262,35 @@ struct HookState {
     stderr: Option<StderrWriter>,
     abort_toggle: Option<crate::AliasedUint8Array>,
     abort_on_uncaught_exception: bool,
+    trace_exit: bool,
+    trace_uncaught: bool,
+    stack_trace_limit: i64,
+}
+
+/// Node's `PerIsolateOptions::stack_trace_limit` default (`src/node_options.h:359`).
+///
+/// Spelled here rather than defaulted to `0` because `0` is a *meaningful* value
+/// for the option — it prints no frames — so a default of zero would make "the
+/// limit was never recorded" and "the limit was set to zero" the same state.
+const DEFAULT_STACK_TRACE_LIMIT: i64 = 10;
+
+impl Default for HookState {
+    fn default() -> Self {
+        Self {
+            prepare_stack_trace: None,
+            dynamic_import: None,
+            import_meta: None,
+            import_meta_resolve: None,
+            source_maps_enabled: false,
+            exit_requested: false,
+            stderr: None,
+            abort_toggle: None,
+            abort_on_uncaught_exception: false,
+            trace_exit: false,
+            trace_uncaught: false,
+            stack_trace_limit: DEFAULT_STACK_TRACE_LIMIT,
+        }
+    }
 }
 
 /// Records the `Uint8Array(1)` `internalBinding('util')` publishes as
@@ -310,6 +338,103 @@ pub fn set_abort_on_uncaught_exception(value: bool) {
 /// Whether an uncaught exception must abort the process.
 pub fn abort_on_uncaught_exception() -> bool {
     STATE.with(|state| state.borrow().abort_on_uncaught_exception)
+}
+
+/// Records whether `--trace-exit` was on the command line.
+///
+/// This is `EnvironmentOptions::trace_exit`, which `Environment::Exit` reads to
+/// print the `WARNING: Exited the environment with code N` line and the stack
+/// that led there. It lives here rather than in the CLI for the same reason
+/// [`abort_on_uncaught_exception`] does: the exit happens in whichever crate
+/// owns the exit path — `process.reallyExit` in `rn-bind-process-methods`, the
+/// CLI's own `terminate`, a worker's environment teardown — and every one of
+/// them has to see the same value.
+///
+/// Node reads the option from the environment rather than from the option
+/// layer at exit time, so `v8.setFlagsFromString` cannot change it; the same
+/// holds here.
+pub fn set_trace_exit(value: bool) {
+    STATE.with(|state| {
+        state.borrow_mut().trace_exit = value;
+    });
+}
+
+/// Whether `--trace-exit` was given.
+#[must_use]
+pub fn trace_exit() -> bool {
+    STATE.with(|state| state.borrow().trace_exit)
+}
+
+/// Records whether `--trace-uncaught` was on the command line.
+///
+/// `EnvironmentOptions::trace_uncaught`. Two things read it, and they are the
+/// two halves of what the flag does: `Environment::InitializeDiagnostics` turns
+/// on V8's capture of the stack behind an uncaught exception, and
+/// `ReportException` prints the `Thrown at:` block from that capture instead of
+/// the `(Use \`node --trace-uncaught ...\`)` hint.
+pub fn set_trace_uncaught(value: bool) {
+    STATE.with(|state| {
+        state.borrow_mut().trace_uncaught = value;
+    });
+}
+
+/// Whether `--trace-uncaught` was given.
+#[must_use]
+pub fn trace_uncaught() -> bool {
+    STATE.with(|state| state.borrow().trace_uncaught)
+}
+
+/// The flags this environment was started with, for `process.execArgv`.
+///
+/// Node keeps these on `Environment` (`env->exec_argv()`), and they are the
+/// *parent's* list in a worker whose `execArgv` was not given:
+/// `src/node_worker.cc:664` copies `env->exec_argv()` into the worker's own list
+/// when `options.execArgv` is absent. That inheritance is why `--trace-exit` on
+/// the parent is visible inside a worker, which is what `test-trace-exit.js`'s
+/// two worker cases assert.
+///
+/// Process-wide rather than a thread-local, because a worker is the reader: its
+/// thread starts with empty thread-locals, so a thread-local record of the
+/// parent's argv would be invisible exactly where the inheritance has to happen.
+/// Node's worker constructor reads the parent `Environment`'s field across the
+/// same boundary, from the thread that is still the parent. Writing happens once,
+/// from the CLI before any worker exists, so the lock is uncontended in practice.
+static EXEC_ARGV_SHARED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Records the flags this environment was started with.
+pub fn set_exec_argv(argv: Vec<String>) {
+    if let Ok(mut slot) = EXEC_ARGV_SHARED.lock() {
+        *slot = argv;
+    }
+}
+
+/// The flags this environment was started with.
+#[must_use]
+pub fn exec_argv() -> Vec<String> {
+    EXEC_ARGV_SHARED
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
+/// Records this environment's `--stack-trace-limit`.
+///
+/// `PerIsolateOptions::stack_trace_limit`, which `Environment::stack_trace_limit()`
+/// reports and both `Environment::Exit`'s trace and `Error.stackTraceLimit`
+/// read. It is recorded rather than looked up from the option store because the
+/// store is `rn-bind-options`' and this crate is below it; the CLI and the
+/// worker bootstrap are the two places that know the parsed value, and both run
+/// before any exit can be traced.
+pub fn set_stack_trace_limit(value: i64) {
+    STATE.with(|state| {
+        state.borrow_mut().stack_trace_limit = value;
+    });
+}
+
+/// This environment's `--stack-trace-limit`, defaulting to Node's `10`.
+#[must_use]
+pub fn stack_trace_limit() -> i64 {
+    STATE.with(|state| state.borrow().stack_trace_limit)
 }
 
 /// Installs a closure that writes to the process's standard error.

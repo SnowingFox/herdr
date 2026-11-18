@@ -197,6 +197,25 @@ pub struct Options {
     /// `options()->syntax_check_only`, and because the flag can appear on either
     /// side of the script argument's position.
     pub syntax_check_only: bool,
+    /// `--trace-exit`: print a stack when this environment ends.
+    ///
+    /// Node's `EnvironmentOptions::trace_exit` (`src/node_options.h:282`), read
+    /// by `Environment::Exit`. Recorded here *and* in
+    /// [`rn_core::hook_slot::set_trace_exit`], because the exit itself happens
+    /// in three crates that cannot see this struct: `process.reallyExit` in
+    /// `rn-bind-process-methods`, the fatal path in `rn-errors`, and the CLI's
+    /// own `terminate`.
+    pub trace_exit: bool,
+    /// `--trace-uncaught`: show where the `throw` behind an uncaught exception
+    /// happened.
+    ///
+    /// Node's `EnvironmentOptions::trace_uncaught` (`src/node_options.h:285`).
+    /// It does two things and both are needed for the flag to be honest:
+    /// `Environment::InitializeDiagnostics` turns on V8's capture of the stack
+    /// behind an uncaught exception, and `ReportException` prints the
+    /// `Thrown at:` block from that capture instead of the
+    /// `(Use \`node --trace-uncaught ...\`)` hint.
+    pub trace_uncaught: bool,
     /// `--env-file` and `--env-file-if-exists`, in the order they were given.
     ///
     /// Node records these as two `kStringList` fields (`env_file` and
@@ -248,6 +267,8 @@ impl Options {
             print_help: false,
             force_repl: false,
             syntax_check_only: false,
+            trace_exit: false,
+            trace_uncaught: false,
             env_files: Vec::new(),
             env_file_store: std::collections::BTreeMap::new(),
         }
@@ -1178,6 +1199,21 @@ pub fn parse_with_env(
         // one the variable set. They are handed to V8 in this order too.
         options.v8_args.clone_from(&env.v8_args);
         options.env_argv.clone_from(&env.argv);
+        // `--trace-exit` and `--trace-uncaught` are `kAllowedInEnvvar`, and both
+        // are read by the CLI rather than by `lib/**`, so the variable's values
+        // have to be taken from the store here — the command-line walk below
+        // only ever sees the command line. Reading them before that walk is what
+        // gives `NODE_OPTIONS=--trace-exit --no-trace-exit` the command line's
+        // answer, which is Node's two-pass order.
+        if let Some(rn_bind_options::ParsedValue::Bool(value)) = env_store.value_of("--trace-exit")
+        {
+            options.trace_exit = value;
+        }
+        if let Some(rn_bind_options::ParsedValue::Bool(value)) =
+            env_store.value_of("--trace-uncaught")
+        {
+            options.trace_uncaught = value;
+        }
         // The environment's values become the base the command line is applied
         // to, which is Node's two-pass order rather than a merge of two lists.
         options.parsed = env_store;
@@ -1387,6 +1423,36 @@ pub fn parse_with_env(
             options.exec_argv.push(argument.clone());
             index += 1;
             continue;
+        }
+
+        // `--trace-exit` and `--trace-uncaught` are the two flags that add
+        // diagnostics to a *fatal* path, so accepting them without acting on
+        // them would be invisible: the process still exits with the right
+        // status, just silently. Both are parsed here rather than left to the
+        // generic "declared but not acted on" branch for that reason.
+        //
+        // They are booleans in Node's table, so the `=value` form is accepted
+        // and discarded, and `--no-` clears what an earlier source set. That is
+        // the same rule `--trace-warnings` and every other boolean follows;
+        // these two differ only in that the CLI itself, not `lib/**`, is what
+        // reads them.
+        if let Some((name, negated)) = flag_name(argument) {
+            let sets = !negated;
+            match name {
+                "--trace-exit" => {
+                    options.trace_exit = sets;
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
+                "--trace-uncaught" => {
+                    options.trace_uncaught = sets;
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
+                _ => {}
+            }
         }
 
         // `--use-system-ca` and `--use-openssl-ca` choose where the default
@@ -1775,9 +1841,13 @@ fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
         "--version" | "-v" => Some(("--version", false)),
         "--help" | "-h" => Some(("--help", false)),
         "--check" | "-c" => Some(("--check", false)),
+        "--trace-exit" => Some(("--trace-exit", false)),
+        "--trace-uncaught" => Some(("--trace-uncaught", false)),
         "--no-version" => Some(("--version", true)),
         "--no-help" => Some(("--help", true)),
         "--no-check" => Some(("--check", true)),
+        "--no-trace-exit" => Some(("--trace-exit", true)),
+        "--no-trace-uncaught" => Some(("--trace-uncaught", true)),
         _ => None,
     }
 }
