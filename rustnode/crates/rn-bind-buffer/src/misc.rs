@@ -168,6 +168,13 @@ pub(crate) fn set_buffer_prototype(
 /// to fill it, and `createUnsafeAlignedBuffer` computes the padding itself.
 /// Zero-filling would trade that speed for a guarantee nobody asked for.
 ///
+/// The exception is `--zero-fill-buffers`, which is what asks for that
+/// guarantee: `AllocateUnsafeArrayBuffer` (`src/node_buffer.cc:1827`) takes the
+/// zeroing branch when `per_process::cli_options->zero_fill_all_buffers` is set,
+/// and every `allocUnsafe` path reaches this function. The flag is read through
+/// `rn_core::hook_slot` rather than from the option store because this crate
+/// allocates on whichever thread asks, and a worker carries its own value.
+///
 /// The `size == 0` and "building a snapshot" cases fall back to a zeroed buffer
 /// in Node; a zero-length backing store has nothing to leave uninitialised, so
 /// the distinction only matters for the snapshot path, which rustnode does not
@@ -184,8 +191,8 @@ pub(crate) fn create_unsafe_array_buffer<'s>(
         args::throw_range_error(scope, "Invalid array buffer length");
         return None;
     };
-    if size == 0 {
-        return Some(v8::ArrayBuffer::new(scope, 0));
+    if size == 0 || rn_core::hook_slot::zero_fill_buffers() {
+        return Some(v8::ArrayBuffer::new(scope, size));
     }
     let store = v8::ArrayBuffer::new_backing_store(scope, size).make_shared();
     Some(v8::ArrayBuffer::with_backing_store(scope, &store))

@@ -117,6 +117,39 @@ fn main() {
     // `test-process-exception-capture-should-abort-on-uncaught-setflagsfromstring.js`
     // behaves differently from the command-line form.
     rn_core::hook_slot::set_abort_on_uncaught_exception(options.abort_on_uncaught_exception);
+    // The two `--trace-*` diagnostics are recorded at the same point and for the
+    // same reason: Node reads them from `EnvironmentOptions` at the moment the
+    // environment reports or exits, never from the option layer, so nothing a
+    // script does later can turn them on.
+    rn_core::hook_slot::set_trace_exit(options.trace_exit);
+    rn_core::hook_slot::set_trace_uncaught(options.trace_uncaught);
+    // `--zero-fill-buffers` decides how `createUnsafeArrayBuffer` allocates, and
+    // that call happens in `rn-bind-buffer` on whichever thread asks, so the
+    // decision travels in the shared slot rather than in this struct.
+    rn_core::hook_slot::set_zero_fill_buffers(options.zero_fill_buffers);
+    // `ReportException` ends every uncaught report with `Node.js <version>`
+    // unless `--no-extra-info-on-fatal-exception` cleared it. The text lives in
+    // `rn-realm`, which depends on `rn-errors`, so the version is recorded here
+    // and read back from the slot rather than making that edge a cycle.
+    rn_core::hook_slot::set_node_version(rn_realm::versions::process_version_string().to_string());
+    if let Some(rn_bind_options::ParsedValue::Bool(value)) =
+        options.parsed.value_of("--extra-info-on-fatal-exception")
+    {
+        rn_core::hook_slot::set_extra_info_on_fatal_exception(value);
+    }
+    // `CallbackIntoModule`'s policy switch, read by `rn-napi` on every addon
+    // throw. Recorded here because the binding crate cannot see `Options`.
+    if let Some(rn_bind_options::ParsedValue::Bool(value)) = options
+        .parsed
+        .value_of("--force-node-api-uncaught-exceptions-policy")
+    {
+        rn_core::hook_slot::set_force_node_api_uncaught_exceptions_policy(value);
+    }
+    // `env->exec_argv()`, which a worker without its own `options.execArgv`
+    // inherits (`src/node_worker.cc:664`). Recording it here is what makes the
+    // parent's `--trace-exit` reach a worker: the worker re-parses this list
+    // into its own `EnvironmentOptions`.
+    rn_core::hook_slot::set_exec_argv(options.exec_argv.clone());
 
     // `Environment::Initialize` records the IPC channel's descriptor from
     // `NODE_CHANNEL_FD` before any JavaScript runs, so that a later change to the
@@ -257,6 +290,19 @@ fn main() {
         terminate(0);
     }
 
+    // `--v8-options`, answered at `src/node.cc:1297`: immediately after the
+    // version and before `V8::Initialize`, by handing V8 its own `--help`. V8
+    // writes the list, so the text is generated from the flags this build
+    // actually has rather than transcribed — which is the only way the answer
+    // can stay true across a V8 bump.
+    //
+    // Ordering is observable in the same way `--version`'s is: a bad flag still
+    // wins, because the V8 argument vector was applied a few lines up.
+    if options.print_v8_options {
+        v8::V8::set_flags_from_string("--help");
+        terminate(0);
+    }
+
     let platform = v8::new_default_platform(0, false).make_shared();
     v8::V8::initialize_platform(platform);
     v8::V8::initialize();
@@ -310,6 +356,19 @@ fn main() {
     // zero, which would run promise callbacks *before* the tick queue and make
     // `process.nextTick` lose to a `.then` — Node guarantees the opposite.
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+
+    // `Environment::InitializeDiagnostics` (`src/node.cc:245`) turns on V8's
+    // capture of the stack behind an uncaught exception, but only under
+    // `--trace-uncaught`. That capture is what `Message::GetStackTrace` reads
+    // when the exception is reported, and it is why the flag reports the throw
+    // site for a value that has no `stack` of its own — a thrown `null`, or an
+    // object whose `stack` getter throws. The frame limit is
+    // `--stack-trace-limit`, the same value `Error.stackTraceLimit` uses.
+    if options.trace_uncaught {
+        let limit = stack_trace_limit(&options);
+        isolate.set_capture_stack_trace_for_uncaught_exceptions(true, limit);
+    }
+    rn_core::hook_slot::set_stack_trace_limit(i64::from(stack_trace_limit(&options)));
     let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
     let scope = &mut scope.init();
     let context = v8::Context::new(scope, Default::default());
@@ -719,7 +778,8 @@ fn main() {
         | args::Source::Inspect
         | args::Source::Test
         | args::Source::Repl
-        | args::Source::CheckSyntax => {
+        | args::Source::CheckSyntax
+        | args::Source::Bench => {
             let id = options
                 .source
                 .main_script_id()
@@ -804,9 +864,22 @@ fn main() {
                 eprintln!("rustnode: {message}");
                 entry_fatal = true;
             }
+            // The message comes from the live `TryCatch`, not from a fresh
+            // `Exception::CreateMessage`: V8 captures the throw-site stack into
+            // the message it makes at throw time, and a message made here would
+            // carry this report site instead. `--trace-uncaught` reads it, and
+            // `throw null` — which has no error object to take a stack from —
+            // is exactly the case where the difference is visible.
+            let message = if rn_core::hook_slot::trace_uncaught() {
+                scope.message()
+            } else {
+                None
+            };
             let handled = if scope.has_caught() && !scope.has_terminated() {
                 match scope.exception() {
-                    Some(exception) => rn_errors::report_uncaught_exception(scope, exception),
+                    Some(exception) => {
+                        rn_errors::report_uncaught_exception_with_message(scope, exception, message)
+                    }
                     None => true,
                 }
             } else {
@@ -948,6 +1021,27 @@ fn terminate(code: i32) -> ! {
     rn_bindings::run_addon_teardowns();
     rn_uv::threadpool::drain();
     std::process::exit(code);
+}
+
+/// This process's `--stack-trace-limit`, as V8's capture and `--trace-exit` both
+/// want it.
+///
+/// Node keeps one value for both: `PerIsolateOptions::stack_trace_limit`
+/// (`src/node_options.h:359`), which `Environment::stack_trace_limit()` reports
+/// and `Environment::Exit` passes to `StackTrace::CurrentStackTrace`. V8's
+/// `set_capture_stack_trace_for_uncaught_exceptions` takes an `i32` and
+/// `--stack-trace-limit` is an `int64` option, so the conversion is explicit and
+/// saturating rather than a cast: a limit beyond `i32::MAX` is the same request
+/// as `i32::MAX`, and a negative one means "no frames" to V8.
+fn stack_trace_limit(options: &args::Options) -> i32 {
+    let limit = match options.parsed.value_of("--stack-trace-limit") {
+        Some(rn_bind_options::ParsedValue::Int(value)) => value,
+        // The table's declared default (`10`) covers every other case, and
+        // reading it from the store rather than restating it here means a
+        // re-pinned table moves this with it.
+        Some(_) | None => 10,
+    };
+    i32::try_from(limit).unwrap_or(if limit < 0 { i32::MIN } else { i32::MAX })
 }
 
 fn missing_test_runner_path(options: &args::Options) -> Option<&str> {

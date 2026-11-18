@@ -242,7 +242,7 @@ fn trigger_uncaught_exception(
     // the two cannot disagree about the `_fatalException` ordering.
     let error = args.get(0);
     let from_promise = args.get(1).is_true();
-    report_uncaught(scope, error, from_promise);
+    report_uncaught(scope, error, from_promise, None);
 }
 
 /// Reports an uncaught exception the way Node does, giving `process` the first
@@ -266,6 +266,28 @@ fn trigger_uncaught_exception(
 pub fn report_uncaught_exception(
     scope: &mut v8::PinScope<'_, '_>,
     error: v8::Local<v8::Value>,
+) -> bool {
+    report_uncaught_exception_with_message(scope, error, None)
+}
+
+/// [`report_uncaught_exception`], with the message V8 captured at the `throw`.
+///
+/// Node's overload takes the `v8::TryCatch` itself and reads
+/// `try_catch.Message()` (`src/node_errors.cc:1437`), because that message is
+/// the only object carrying the *throw-site* stack:
+/// `Isolate::CreateMessage` captures one only when the message does not already
+/// exist (`deps/v8/src/execution/isolate.cc:3709`), so a message created at
+/// report time describes the reporter, not the throw. That is invisible for a
+/// plain `throw new Error(...)` — the stack comes from the error object — but it
+/// is the whole point of `--trace-uncaught` for a thrown `null`, a thrown
+/// primitive, or an object whose `stack` getter throws.
+///
+/// `None` falls back to `Exception::CreateMessage`, which is Node's own
+/// fallback for the paths that reach here without a `TryCatch` in hand.
+pub fn report_uncaught_exception_with_message(
+    scope: &mut v8::PinScope<'_, '_>,
+    error: v8::Local<v8::Value>,
+    message: Option<v8::Local<'_, v8::Message>>,
 ) -> bool {
     // A terminated isolate is not reporting an exception: V8's
     // `TerminateExecution` unwinds every JavaScript frame with an exception that
@@ -293,7 +315,7 @@ pub fn report_uncaught_exception(
     // recording it here keeps that rule in one place instead of in twenty
     // callback bodies.
     rn_core::task_queue::note_callback_failed();
-    report_uncaught(scope, error, false)
+    report_uncaught(scope, error, false, message)
 }
 
 /// [`report_uncaught_exception`] for a rejection, which Node frames differently.
@@ -308,7 +330,7 @@ pub fn report_uncaught_rejection(
     scope: &mut v8::PinScope<'_, '_>,
     error: v8::Local<v8::Value>,
 ) -> bool {
-    report_uncaught(scope, error, true)
+    report_uncaught(scope, error, true, None)
 }
 
 thread_local! {
@@ -402,6 +424,7 @@ fn report_uncaught(
     scope: &mut v8::PinScope<'_, '_>,
     error: v8::Local<v8::Value>,
     from_promise: bool,
+    message: Option<v8::Local<'_, v8::Message>>,
 ) -> bool {
     // `is_in_uncaught_exception` (`src/node_errors.cc:1314`): a handler that
     // throws while an uncaught exception is already being reported cannot be
@@ -449,7 +472,7 @@ fn report_uncaught(
     // everything below: `ABORT()` above never reaches the restore, which is
     // intentional because the process is terminating either way.
     REPORTING.set(true);
-    let result = report_uncaught_inner(scope, error, from_promise);
+    let result = report_uncaught_inner(scope, error, from_promise, message);
     REPORTING.set(false);
     result
 }
@@ -459,6 +482,7 @@ fn report_uncaught_inner(
     scope: &mut v8::PinScope<'_, '_>,
     error: v8::Local<v8::Value>,
     from_promise: bool,
+    message: Option<v8::Local<'_, v8::Message>>,
 ) -> bool {
     if let Some(handler) = process_fatal_exception_handler(scope) {
         let flag = v8::Boolean::new(scope, from_promise);
@@ -514,7 +538,7 @@ fn report_uncaught_inner(
                     rn_core::hook_slot::write_stderr(&text);
                     std::process::abort();
                 }
-                report(scope, rethrown, from_promise);
+                report(scope, rethrown, from_promise, None);
                 return false;
             }
         }
@@ -527,7 +551,7 @@ fn report_uncaught_inner(
             return true;
         }
     }
-    report(scope, error, from_promise);
+    report(scope, error, from_promise, message);
     false
 }
 
@@ -548,9 +572,154 @@ fn process_fatal_exception_handler<'s>(
 }
 
 /// Prints the exception and sets the process exit code.
-fn report(scope: &mut v8::PinScope, error: v8::Local<v8::Value>, from_promise: bool) {
+fn report(
+    scope: &mut v8::PinScope,
+    error: v8::Local<v8::Value>,
+    from_promise: bool,
+    message: Option<v8::Local<'_, v8::Message>>,
+) {
     let text = format_exception(scope, error, from_promise);
     write_uncaught(scope, &text);
+
+    // `src/node_errors.cc:582`: with `--trace-uncaught`, the frames behind the
+    // `throw` follow the exception. They come from V8's *message*, not from
+    // `error.stack`, and that distinction is the whole point of the flag: a
+    // thrown object with no `stack` of its own, or one whose `stack` getter
+    // throws, still reports where it was thrown from. `--trace-uncaught` is what
+    // makes V8 capture that trace at throw time
+    // (`Isolate::SetCaptureStackTraceForUncaughtExceptions`, which
+    // `Environment::InitializeDiagnostics` turns on), so the message carries it
+    // here without the error object being readable at all.
+    //
+    // The message is taken from the caller's `TryCatch` when there is one. A
+    // message created here instead would be built at *report* time: V8 only
+    // captures a throw-site trace when no message exists yet
+    // (`deps/v8/src/execution/isolate.cc:3709`), so a report-time message
+    // describes the reporter and `throw null` printed an empty `Thrown at:`.
+    if rn_core::hook_slot::trace_uncaught() {
+        let message = message.unwrap_or_else(|| v8::Exception::create_message(scope, error));
+        if let Some(trace) = message.get_stack_trace(scope) {
+            let frames = format_stack_trace(scope, &trace);
+            rn_core::hook_slot::write_stderr(&format!("Thrown at:\n{frames}\n"));
+        }
+    }
+    // `src/node_errors.cc:590`, the last thing `ReportException` writes. It is
+    // printed here rather than by the caller because this is the one place that
+    // produces the uncaught text, and the ordering (after `Thrown at:`) is part
+    // of what the oracle's output has.
+    if let Some(trailer) = extra_info_on_fatal_exception_text() {
+        rn_core::hook_slot::write_stderr(&trailer);
+    }
+}
+
+/// Formats a V8 [`v8::StackTrace`] the way Node's `FormatStackTrace` does.
+///
+/// `src/node_errors.cc:262`. Two details are not obvious from the shape and both
+/// are load-bearing for the oracle comparison:
+///
+/// * A frame compiled from `eval` prints as `[eval]:LINE:COL` when V8 recorded no
+///   script id for it, and as `[eval] (SCRIPT:LINE:COL)` when it did, with the
+///   resource name in parentheses.
+/// * The first eval frame ends the trace. That is a literal `break` in Node, not
+///   a filter: everything below an eval frame belongs to the code that called
+///   `eval`, which is not where the exception came from.
+///
+/// The returned text has no trailing newline; callers add the one
+/// `PrintToStderrAndFlush` adds.
+pub fn format_stack_trace(scope: &mut v8::PinScope, trace: &v8::StackTrace) -> String {
+    // `Message::kNoScriptIdInfo`, which V8 reports for a script it did not
+    // register — the `-1` sentinel arrives here through the crate's `usize`.
+    const NO_SCRIPT_ID: usize = usize::MAX;
+    let mut result = String::new();
+    for index in 0..trace.get_frame_count() {
+        let Some(frame) = trace.get_frame(scope, index) else {
+            continue;
+        };
+        let function_name = frame
+            .get_function_name(scope)
+            .map(|name| name.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        let script_name = frame
+            .get_script_name(scope)
+            .map(|name| name.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        let line = frame.get_line_number();
+        let column = frame.get_column();
+        if frame.is_eval() {
+            if frame.get_script_id() == NO_SCRIPT_ID {
+                result.push_str(&format!("    at [eval]:{line}:{column}\n"));
+            } else {
+                result.push_str(&format!("    at [eval] ({script_name}:{line}:{column})\n"));
+            }
+            break;
+        }
+        if function_name.is_empty() {
+            result.push_str(&format!("    at {script_name}:{line}:{column}\n"));
+        } else {
+            result.push_str(&format!(
+                "    at {function_name} ({script_name}:{line}:{column})\n"
+            ));
+        }
+    }
+    result
+}
+
+/// The `Node.js <version>` trailer `ReportException` ends with, if it is wanted.
+///
+/// `src/node_errors.cc:588-591`: after the exception and any `Thrown at:` block,
+/// Node writes a blank line and then `Node.js ` plus the version, unless
+/// `--no-extra-info-on-fatal-exception` cleared `extra_info_on_fatal_exception`
+/// (which defaults to true — `src/node_options.cc:1419`). It is the marker a
+/// reader uses to tell "the process died of an uncaught exception" from "it
+/// printed something and exited", so an oracle comparison of any uncaught throw
+/// depends on it.
+///
+/// Returns the text rather than writing it because the version string lives in
+/// `rn-realm`, which already depends on this crate — writing it here would need
+/// the reverse edge and make a cycle. The caller that has both writes the
+/// result.
+#[must_use]
+pub fn extra_info_on_fatal_exception_text() -> Option<String> {
+    rn_core::hook_slot::extra_info_on_fatal_exception()
+        .then(|| format!("\nNode.js {}\n", rn_core::hook_slot::node_version()))
+}
+
+/// Prints the `--trace-exit` warning for an environment that is ending.
+///
+/// This is the body of `Environment::Exit` between its two real jobs (stopping
+/// the loop and setting the status), `src/env.cc:2147`: the thread identity, the
+/// `WARNING:` line, and the JavaScript stack that led to the exit. It is a
+/// function rather than inline code because three separate places reach an
+/// environment exit — `process.reallyExit`, the fatal-exception path, and a
+/// worker's teardown — and all three must produce the same text.
+///
+/// A worker prints `(node:PID, thread:ID)` and the main thread prints
+/// `(node:PID)`, which is Node's `is_main_thread()` branch. The frame limit is
+/// `--stack-trace-limit`, which is that same limit `error.stack` uses; a limit
+/// of 0 prints no frames at all, and the caller still prints the blank line
+/// `PrintToStderrAndFlush` adds.
+pub fn trace_exit_warning(scope: &mut v8::PinScope, code: i32) {
+    if !rn_core::hook_slot::trace_exit() {
+        return;
+    }
+    let pid = std::process::id();
+    let facts = rn_core::exit_state::environment_identity();
+    let identity = if facts.is_main_thread {
+        format!("(node:{pid}) ")
+    } else {
+        format!("(node:{pid}, thread:{}) ", facts.thread_id)
+    };
+    let limit = rn_core::hook_slot::stack_trace_limit();
+    let frames = if limit > 0 {
+        v8::StackTrace::current_stack_trace(scope, limit as usize)
+            .map(|trace| format_stack_trace(scope, &trace))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    rn_core::hook_slot::write_stderr(&format!(
+        "{identity}WARNING: Exited the environment with code {code}\n{frames}\n"
+    ));
 }
 
 /// Writes an already-formatted uncaught exception to standard error and asks

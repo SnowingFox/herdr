@@ -27,6 +27,10 @@ rn-uv.workspace = true
 # the `--addons` option value. Reading it from the option store keeps one
 # interpretation of the flag rather than a second parser here.
 rn-bind-options = { path = "../rn-bind-options" }
+# `process.reallyExit` prints the `--trace-exit` warning, which is
+# `Environment::Exit`'s body. That formatter lives with the other stack-printing
+# code in `rn-errors` so the fatal path and this one cannot drift.
+rn-errors.workspace = true
 # The other half of that answer comes from the model: `InitializePermission`
 # clears `allow_native_addons` when a bare `--permission` did not grant `addon`,
 # so the check has to ask the same model the `dlopen` scope check uses.

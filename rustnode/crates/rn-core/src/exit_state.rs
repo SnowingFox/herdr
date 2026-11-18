@@ -97,6 +97,52 @@ pub fn reset() {
     });
 }
 
+/// Who this environment is, for the diagnostics that name it.
+///
+/// Node's `Environment::Exit` writes `(node:PID)` on the main thread and
+/// `(node:PID, thread:ID)` in a worker (`src/env.cc:2152-2158`), and the two
+/// `--trace-exit` shapes are exactly those prefixes. That is the only consumer,
+/// which is why this is one small fact rather than a general realm registry.
+///
+/// `is_main_thread` is the default because a thread that never recorded a realm
+/// is the main thread — the same reason [`crate::realm`]'s registry defaults to
+/// nothing installed rather than to a worker. The worker bootstrap calls
+/// [`set_environment_identity`] before its realm runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvironmentIdentity {
+    /// Whether this environment is the process's main one.
+    pub is_main_thread: bool,
+    /// `AllocateEnvironmentThreadId()`'s id: `0` on the main thread.
+    pub thread_id: i32,
+}
+
+impl Default for EnvironmentIdentity {
+    fn default() -> Self {
+        Self {
+            is_main_thread: true,
+            thread_id: 0,
+        }
+    }
+}
+
+thread_local! {
+    static IDENTITY: Cell<EnvironmentIdentity> = const { Cell::new(EnvironmentIdentity {
+        is_main_thread: true,
+        thread_id: 0,
+    }) };
+}
+
+/// Records whether this thread hosts the main environment, and its thread id.
+pub fn set_environment_identity(identity: EnvironmentIdentity) {
+    IDENTITY.with(|slot| slot.set(identity));
+}
+
+/// This thread's environment identity.
+#[must_use]
+pub fn environment_identity() -> EnvironmentIdentity {
+    IDENTITY.with(Cell::get)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

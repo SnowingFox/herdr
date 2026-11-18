@@ -1291,6 +1291,7 @@ dependencies = [
  "rn-bind-worker",
  "rn-core",
  "rn-env",
+ "rn-errors",
  "rn-napi",
  "rn-permission",
  "rn-uv",

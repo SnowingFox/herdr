@@ -135,6 +135,26 @@ pub(crate) unsafe fn trigger_fatal_exception(env: *mut NapiEnv, error: *mut crat
     let Some(environment) = (unsafe { env_from(env) }) else {
         return;
     };
+    // `CallbackIntoModule`'s `enforceUncaughtExceptionPolicy` branch
+    // (`src/node_api.cc:140-160`). An addon built against module API version 9
+    // or older that throws out of a callback gets a DEP0168 deprecation warning
+    // instead of a fatal uncaught exception, unless
+    // `--force-node-api-uncaught-exceptions-policy` was passed. Version 10 and
+    // later always take the fatal path.
+    //
+    // The warning is the whole point of the flag: without it an old addon's
+    // throw is invisible to `process.on('uncaughtException')`, and with it the
+    // throw is reported like any other asynchronous exception.
+    let enforcement = rn_core::hook_slot::force_node_api_uncaught_exceptions_policy();
+    if environment.module_api_version() < 10 && !enforcement {
+        let message = "Uncaught Node-API callback exception detected, please run node \
+                       with option --force-node-api-uncaught-exceptions-policy=true to \
+                       handle those exceptions properly.";
+        crate::scope::with_owner_context(env, |scope| {
+            rn_core::hook_slot::emit_warning(scope, message);
+        });
+        return;
+    }
     let owner = environment.owner_thread();
     let env_address = env as usize;
     let error_address = error as usize;

@@ -386,6 +386,13 @@ fn really_exit(
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 
+    // `Environment::Exit` (`src/env.cc:2147`) traces before it does anything
+    // else, and `ReallyExit` is the one caller on the normal path. The trace has
+    // to happen here rather than in the CLI's `terminate`, because by the time
+    // the CLI sees an exit the JavaScript frames are gone: this is the only
+    // point where `process.exit()`'s own caller is still on the stack.
+    rn_errors::trace_exit_warning(scope, code);
+
     if rn_bind_worker::realm_facts().is_main_thread {
         // `lib/internal/process/per_thread.js::exit` has already emitted 'exit',
         // and this is the point Node's `Environment::ExitEnv` stops the
