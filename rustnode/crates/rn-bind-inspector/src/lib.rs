@@ -52,7 +52,7 @@ mod session;
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
-pub use agent::{ensure_inspector, set_isolate};
+pub use agent::{context_created, ensure_inspector, set_isolate};
 pub use server::{format_ws_address, target_list_json, version_json, Server, Shared, Target};
 
 /// The version string `/json/version` reports, matching `process.version`.

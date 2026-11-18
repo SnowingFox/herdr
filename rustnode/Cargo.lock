@@ -950,6 +950,7 @@ name = "rn-bind-contextify"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rn-bind-inspector",
  "rn-bind-modules",
  "rn-core",
  "rn-v8-sys",

@@ -298,6 +298,61 @@ unsafe fn leak_local<'s, T>(local: v8::Local<'_, T>) -> v8::Local<'s, T> {
     unsafe { std::mem::transmute(local) }
 }
 
+/// Registers a `vm` context with the inspector so a session can evaluate in it.
+///
+/// Node does this from `Environment::AssignToContext` (`src/env.cc:747`), which
+/// `ContextifyContext::CreateV8Context` calls for every `vm.createContext`
+/// (`src/node_contextify.cc:349`). Without it V8 never learns the context
+/// exists, and the two things `internal/repl/inspector.js` depends on both fail:
+///
+/// * `Runtime.executionContextCreated` is not emitted, so
+///   `captureExecutionContextId`'s `session.once` never fires and the REPL's
+///   `kContextId` stays `undefined`. `createReplEval` then omits `contextId`
+///   from `Runtime.evaluate`, and every line is evaluated in the *main* context.
+/// * `ensureDefaultContextInGroup` still answers with the main context, so even
+///   an explicit `contextId` would resolve to the wrong realm.
+///
+/// The visible defect is `var`/`function` from a REPL line landing on the real
+/// `globalThis` instead of the REPL's context — which `test/common`'s exit-time
+/// globals audit reports as `Unexpected global(s) found: ...`.
+///
+/// `name` is Node's human-readable context name (`"VM Context 1"` for the first
+/// `vm` context), and `is_default` is false for every contextify context, so the
+/// aux data tells DevTools this is a plain realm rather than the page default.
+///
+/// A process with no inspector registered simply has nothing to tell, so this is
+/// a no-op there rather than an error: `vm` works without `--inspect`, and every
+/// `test-vm-*` file runs that way.
+pub fn context_created(
+    scope: &mut v8::PinScope<'_, '_>,
+    context: v8::Local<v8::Context>,
+    name: &str,
+    is_default: bool,
+) {
+    let _ = scope;
+    let current = ISOLATE.with(|slot| slot.get().map(pointer_address));
+    STATE.with(|state| {
+        let state = state.borrow();
+        if state.isolate != current {
+            return;
+        }
+        let Some(inspector) = state.inspector else {
+            return;
+        };
+        let aux_data = if is_default {
+            r#"{"isDefault":true}"#
+        } else {
+            r#"{"isDefault":false}"#
+        };
+        inspector.context_created(
+            context,
+            CONTEXT_GROUP_ID,
+            v8::inspector::StringView::from(name.as_bytes()),
+            v8::inspector::StringView::from(aux_data.as_bytes()),
+        );
+    });
+}
+
 /// Creates the inspector and registers the current context with it, once.
 ///
 /// `contextCreated` is what makes V8 build the `InspectedContext` a session

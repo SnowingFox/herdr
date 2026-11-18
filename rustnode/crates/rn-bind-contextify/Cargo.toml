@@ -10,6 +10,12 @@ description = "internalBinding('contextify') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
+# `vm.createContext` has to register the realm with the inspector, which is what
+# `Environment::AssignToContext` does in Node (`src/env.cc:747`). Without it the
+# REPL's context is invisible to `Runtime.evaluate` and its `var` declarations
+# land on the main `globalThis`. The dependency is one-way: the inspector knows
+# nothing about `vm`.
+rn-bind-inspector = { path = "../rn-bind-inspector" }
 # The on-disk compile cache and its key derivation live in the `modules`
 # namespace crate because `module.enableCompileCache()` owns them there. The
 # CommonJS loader's compile step reads the same store, so reusing it keeps one
