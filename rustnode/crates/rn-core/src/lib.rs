@@ -23,6 +23,7 @@ pub mod host_object;
 pub mod isolate_params;
 pub mod native_immediates;
 pub mod per_context;
+pub mod platform_tasks;
 pub mod profile;
 pub mod queue;
 pub mod realm;

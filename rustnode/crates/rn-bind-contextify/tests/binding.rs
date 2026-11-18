@@ -106,7 +106,7 @@ fn the_namespace_exposes_every_claimed_member() {
         "ContextifyScript:function,compileFunction:function,\
          compileFunctionForCJSLoader:function,constants:object,\
          containsModuleSyntax:function,makeContext:function,\
-         measureMemory:undefined,runInterruptible:function"
+         measureMemory:function,runInterruptible:function"
             .replace(' ', "")
     );
 }
@@ -552,15 +552,19 @@ fn run_interruptible_propagates_a_real_exception() {
 }
 
 #[test]
-fn measure_memory_is_absent_rather_than_faked() {
-    // The one member this crate defers: the `v8` crate binds neither
-    // `Isolate::MeasureMemory` nor `MeasureMemoryDelegate`. An absent member is
-    // honest; a stub returning a resolved promise would look like it worked.
+fn measure_memory_is_exposed_and_returns_a_promise() {
+    // `lib/vm.js` expects a function that returns a promise. The result shape is
+    // covered by `tests/measure_memory.rs`, which has to pump V8's platform task
+    // queue for the promise to settle at all.
     let result = run(r#"
+        const result = contextify.measureMemory(
+          contextify.constants.measureMemory.mode.SUMMARY,
+          contextify.constants.measureMemory.execution.DEFAULT,
+        );
         __out = JSON.stringify({
           typeof: typeof contextify.measureMemory,
-          constantsPresent: typeof contextify.constants.measureMemory === 'object',
+          then: typeof result.then,
         });
         "#);
-    assert_eq!(result, r#"{"typeof":"undefined","constantsPresent":true}"#);
+    assert_eq!(result, r#"{"typeof":"function","then":"function"}"#);
 }
