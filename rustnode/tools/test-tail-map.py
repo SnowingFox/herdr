@@ -66,7 +66,16 @@ KEEP_BYTES = 512 * 1024
 
 # Ambient variables that change test outcomes and are not part of the runtime
 # under test. Removed for both binaries so the comparison is like for like.
-SCRUBBED_ENV = ("NODE_DISABLE_COMPILE_CACHE", "NO_COLOR", "FORCE_COLOR")
+# `NODE_CLUSTER_SCHED_POLICY` changes which cluster tests reach which code path:
+# `none` shares the listening handle, `rr` transfers accepted sockets. Leaving a
+# caller's value in place shifts which files time out, so a baseline measured
+# from a shell that had exported it is not comparable to one that had not.
+SCRUBBED_ENV = (
+    "NODE_DISABLE_COMPILE_CACHE",
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "NODE_CLUSTER_SCHED_POLICY",
+)
 
 # `TERM=dumb` makes the REPL report no cursor/colour support, so tests that
 # assert on REPL editing behaviour fail for a reason that has nothing to do with
