@@ -46,6 +46,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr};
+use std::sync::Mutex;
 
 use openssl::symm::Cipher;
 
@@ -264,6 +265,92 @@ fn is_dotted_decimal(name: &str) -> bool {
     name.contains('.') && name.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
+/// Serialises every enumeration against every other enumeration, and forces
+/// OpenSSL's one-time algorithm registration to finish before any walk starts.
+///
+/// # The defect
+///
+/// `OBJ_NAME_do_all_sorted` sizes a stack from `lh_OBJ_NAME_num_items()` and then
+/// walks the lhash through `OBJ_NAME_do_all`, which holds **no lock** and writes
+/// through an unchecked `d->names[d->n++]`.
+///
+/// The table it walks is populated by OpenSSL's one-time
+/// `openssl_add_all_digests_int()` / `openssl_add_all_ciphers_int()`, reached
+/// through `OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_DIGESTS | ..._CIPHERS)`.
+/// Both `EVP_get_digestbyname` and `EVP_get_cipherbyname` call that init on their
+/// first invocation, and it inserts dozens of entries. When the insert pushes the
+/// lhash past its load factor, `expand()` **reallocs `lh->b` and relinks nodes
+/// between buckets**; a traversal holding a stale index or a stale `->next` then
+/// silently skips entries. That is why the names that vanish are always a
+/// `pkey_type` alias pair (`RSA-SHA512` + `sha512WithRSAEncryption`,
+/// `RSA-SHA3-224`): `EVP_add_digest` registers those last, so they live in the
+/// buckets that `expand()` moves.
+///
+/// This is a genuine race and it is *ours to lose*: any thread that resolves a
+/// digest or cipher by name can trigger the registration while another thread is
+/// walking. Measured on this build, one walk racing one `EVP_get_digestbyname` +
+/// `EVP_get_cipherbyname` call on another thread lost names on **31 of 80**
+/// fresh-process runs (55-58 entries instead of 59); the same walk with the other
+/// thread doing nothing lost none (0 of 80).
+///
+/// # The fix
+///
+/// Complete the registration *before* walking, once per process, while holding
+/// this lock. After that the table is immutable for the life of the process (no
+/// `OBJ_NAME_add` runs after init; the only other mutator is
+/// `OBJ_NAME_cleanup`, which is not reached here), so a walk cannot race a
+/// resize. The lock also keeps the fetches in each enumerator's second phase from
+/// overlapping another thread's traversal, since digests, ciphers and MACs all
+/// share this single `names_lh` table.
+///
+/// The registration is driven through `EVP_get_digestbyname`/`EVP_get_cipherbyname`
+/// rather than by calling `OPENSSL_init_crypto` directly, so this touches only
+/// the public API `openssl-sys` already exposes and asks for exactly the init the
+/// walkers themselves request.
+///
+/// This is a leaf lock — nothing here calls back into another enumerator — so a
+/// plain `Mutex` is enough, and its poisoning is deliberately ignored: a panic
+/// while holding it cannot leave OpenSSL's tables in a state a retry would make
+/// worse, and refusing every later `getHashes()` would be a far worse failure
+/// than re-running a read-only walk.
+static ENUMERATION: Mutex<()> = Mutex::new(());
+
+/// Runs `walk` with the enumeration lock held and the algorithm table ready.
+///
+/// The lock is held for the whole enumeration, not just the registration: phase
+/// two's `EVP_*_fetch` calls can themselves reach OpenSSL's init and config
+/// machinery, and overlapping that with another thread's traversal is the same
+/// hazard one level down.
+fn serialised<T>(walk: impl FnOnce() -> T) -> T {
+    let _guard = ENUMERATION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    register_legacy_algorithms_once();
+    walk()
+}
+
+/// Makes OpenSSL register every legacy digest and cipher, exactly once.
+///
+/// Called with [`ENUMERATION`] held. `EVP_get_digestbyname` and
+/// `EVP_get_cipherbyname` each begin with `OPENSSL_init_crypto(...)` for the
+/// matching `ADD_ALL_*` flag, so one call to each runs
+/// `openssl_add_all_digests_int()` and `openssl_add_all_ciphers_int()` to
+/// completion. Both are `RUN_ONCE`-guarded, so after the first call this is two
+/// hash lookups.
+fn register_legacy_algorithms_once() {
+    // Names that are definitely present, so neither lookup can fail for its own
+    // reasons: the point is the init each lookup performs, not its answer.
+    let digest = c"sha256";
+    let cipher = c"aes-128-cbc";
+    // SAFETY: both literals are NUL-terminated C strings that outlive the calls,
+    // and the lookups only read them. The return values are unused: each call
+    // exists for its side effect of completing the matching `ADD_ALL_*` init.
+    unsafe {
+        openssl_sys::EVP_get_digestbyname(digest.as_ptr());
+        openssl_sys::EVP_get_cipherbyname(cipher.as_ptr());
+    }
+}
+
 /// Reproduces `filterDuplicateStrings` from `lib/internal/util.js`.
 ///
 /// A `SafeMap` keyed by the lowercased name, so the *last* spelling of a name
@@ -381,7 +468,15 @@ unsafe fn is_supported_fetched_cipher(cipher: *const c_void) -> bool {
     read != 1 || encrypt_then_mac == 0
 }
 
-/// The digest names Node reports, in the order the walkers produce them.
+/// Collects the `from` name of every entry `EVP_MD_do_all_sorted` visits.
+///
+/// This callback must stay free of `EVP_*_fetch` and any other call that can
+/// reach OpenSSL's init path. See [`ENUMERATION`]: fetching from inside this walk
+/// re-enters the machinery that populates the very table being traversed, which
+/// makes OpenSSL's walker skip entries. That is how `getHashes()` came to lose
+/// `RSA-SHA512`, `sha512WithRSAEncryption` and `RSA-SHA3-224`. The resolvability
+/// test that used to live here now runs in a second pass, after the walk has
+/// returned, in [`digest_names`].
 ///
 /// # Safety
 ///
@@ -397,39 +492,25 @@ unsafe extern "C" fn digest_alias_callback(
     if from.is_null() || argument.is_null() {
         return;
     }
+    // SAFETY: `from` is a NUL-terminated OpenSSL-owned string, and the spelling
+    // is preserved because Node preserves it (`RSA-SHA256` stays mixed case).
+    let Some(name) = (unsafe { read_cstr(from) }) else {
+        return;
+    };
+    if name.is_empty() {
+        return;
+    }
     // SAFETY: the caller guarantees `argument` points to a live
     // `Vec<String>` that outlives this synchronous walk.
     let names: &mut Vec<String> = unsafe { &mut *(argument as *mut Vec<String>) };
-
-    // The legacy lookup decides which canonical implementation the name maps to.
-    // A name OpenSSL cannot resolve at all is not a digest Node could use.
-    // SAFETY: `from` is a valid C string.
-    let legacy = unsafe { openssl_sys::EVP_get_digestbyname(from) };
-    if legacy.is_null() {
-        return;
-    }
-    // SAFETY: `legacy` is a live `EVP_MD` from OpenSSL's table.
-    let canonical = unsafe { EVP_MD_get0_name(legacy.cast()) };
-    if canonical.is_null() {
-        return;
-    }
-    // SAFETY: `canonical` is a NUL-terminated OpenSSL-owned string.
-    let Some(fetched) = (unsafe { fetch_supported_digest(canonical) }) else {
-        return;
-    };
-    // SAFETY: `from` is a NUL-terminated OpenSSL-owned string, and the spelling
-    // is preserved because Node preserves it (`RSA-SHA256` stays mixed case).
-    if let Some(name) = unsafe { read_cstr(from) } {
-        if !name.is_empty() {
-            names.push(name);
-        }
-    }
-    // SAFETY: `fetched` came from `EVP_MD_fetch` and is owned here.
-    unsafe { openssl_sys::EVP_MD_free(fetched) };
+    names.push(name);
 }
 
 /// `SaveSupportedProviderHashName`: lowercases a provider name and drops a
 /// dotted-decimal OID.
+///
+/// Like [`digest_alias_callback`] this only records the name; the fetch that
+/// decides whether it is usable runs in a second pass, outside the traversal.
 ///
 /// # Safety
 ///
@@ -446,53 +527,41 @@ unsafe extern "C" fn provider_digest_name_callback(name: *const c_char, argument
     if is_dotted_decimal(&name) {
         return;
     }
-    let normalized = name.to_ascii_lowercase();
-    // `FetchAndMaybeCacheMD(env, normalized, {}, normalized)`: a provider name is
-    // only usable if fetching it by that exact lowercased spelling succeeds.
-    let Ok(text) = std::ffi::CString::new(normalized.clone()) else {
-        return;
-    };
-    // SAFETY: `text` is a valid NUL-terminated C string.
-    let Some(fetched) = (unsafe { fetch_supported_digest(text.as_ptr()) }) else {
-        return;
-    };
     // SAFETY: `argument` is the live `Vec<String>` the caller passed.
     let names: &mut Vec<String> = unsafe { &mut *(argument as *mut Vec<String>) };
-    names.push(normalized);
-    // SAFETY: `fetched` came from `EVP_MD_fetch` and is owned here.
-    unsafe { openssl_sys::EVP_MD_free(fetched) };
+    names.push(name.to_ascii_lowercase());
 }
 
-/// `SaveSupportedProviderHashAlgorithms`: fetches a provider digest, then walks
-/// every name it answers to.
+/// `SaveSupportedProviderHashAlgorithms`: records the canonical name of every
+/// digest the provider walker hands over.
+///
+/// The fetch and the `EVP_MD_names_do_all` expansion that Node does here both
+/// happen in [`provider_names_of`], after the traversal has returned.
 unsafe extern "C" fn provider_digest_callback(md: *mut c_void, argument: *mut c_void) {
-    if md.is_null() {
+    if md.is_null() || argument.is_null() {
         return;
     }
     // SAFETY: `md` is live and its name is an OpenSSL-owned string.
     let name = unsafe { EVP_MD_get0_name(md.cast()) };
-    if name.is_null() {
-        return;
-    }
-    // SAFETY: `name` is a valid C string.
-    let Some(fetched) = (unsafe { fetch_supported_digest(name) }) else {
+    // SAFETY: `name` is a NUL-terminated OpenSSL-owned string.
+    let Some(name) = (unsafe { read_cstr(name) }) else {
         return;
     };
-    // SAFETY: the walker invokes the callback synchronously with `argument`, and
-    // `fetched` is live for the duration.
-    unsafe {
-        EVP_MD_names_do_all(
-            fetched.cast(),
-            Some(provider_digest_name_callback),
-            argument,
-        )
-    };
-    // SAFETY: `fetched` came from `EVP_MD_fetch` and is owned here.
-    unsafe { openssl_sys::EVP_MD_free(fetched) };
+    // SAFETY: `argument` is the live `Vec<String>` the caller passed.
+    let names: &mut Vec<String> = unsafe { &mut *(argument as *mut Vec<String>) };
+    names.push(name);
 }
 
-/// `array_push_back` from `deps/ncrypto/ncrypto.cc`: resolves `from` through the
-/// legacy table, fetches the canonical implementation, and keeps `from`.
+/// Collects the `from` name of every entry `EVP_CIPHER_do_all_sorted` visits.
+///
+/// Like [`digest_alias_callback`] this only records the name. `EVP_CIPHER_fetch`
+/// is the accept test Node applies, and it runs in [`cipher_names`]'s second
+/// phase: fetching from inside the traversal makes `OBJ_NAME_do_all` skip
+/// entries, which is the defect [`ENUMERATION`] documents.
+///
+/// # Safety
+///
+/// Every pointer the walker hands a callback is OpenSSL-owned and only read.
 unsafe extern "C" fn cipher_alias_callback(
     _cipher: *const c_void,
     from: *const c_char,
@@ -502,40 +571,17 @@ unsafe extern "C" fn cipher_alias_callback(
     if from.is_null() || argument.is_null() {
         return;
     }
-    // SAFETY: `from` is a valid C string.
-    let real = unsafe { openssl_sys::EVP_get_cipherbyname(from) };
-    if real.is_null() {
+    // SAFETY: `from` is an OpenSSL-owned NUL-terminated string, and the spelling
+    // is preserved because that is the spelling Node reports.
+    let Some(name) = (unsafe { read_cstr(from) }) else {
+        return;
+    };
+    if name.is_empty() {
         return;
     }
-    // SAFETY: `real` is a live `EVP_CIPHER` from OpenSSL's table.
-    let real_name = unsafe { EVP_CIPHER_get0_name(real.cast()) };
-    if real_name.is_null() {
-        return;
-    }
-    // `EVP_CIPHER_fetch` is the filter: it only returns an instance the public
-    // API can actually construct, so a cipher that lives in an unloaded provider
-    // (`bf-cbc`, `rc4`) never reaches the list.
-    // SAFETY: `real_name` is a valid C string and a null property query is the
-    // default properties.
-    let fetched =
-        unsafe { openssl_sys::EVP_CIPHER_fetch(std::ptr::null_mut(), real_name, std::ptr::null()) };
-    if fetched.is_null() {
-        return;
-    }
-    // SAFETY: `fetched` is a live `EVP_CIPHER` this function owns.
-    let supported = unsafe { is_supported_fetched_cipher(fetched.cast()) };
-    if supported {
-        // SAFETY: `argument` is the live `Vec<String>` the caller passed.
-        let names: &mut Vec<String> = unsafe { &mut *(argument as *mut Vec<String>) };
-        // SAFETY: `from` is an OpenSSL-owned NUL-terminated string.
-        if let Some(name) = unsafe { read_cstr(from) } {
-            if !name.is_empty() {
-                names.push(name);
-            }
-        }
-    }
-    // SAFETY: `fetched` came from `EVP_CIPHER_fetch` and is owned here.
-    unsafe { openssl_sys::EVP_CIPHER_free(fetched) };
+    // SAFETY: `argument` is the live `Vec<String>` the caller passed.
+    let names: &mut Vec<String> = unsafe { &mut *(argument as *mut Vec<String>) };
+    names.push(name);
 }
 
 /// `array_push_back_provider_name`: lowercases and drops a dotted-decimal OID.
@@ -555,36 +601,21 @@ unsafe extern "C" fn provider_cipher_name_callback(name: *const c_char, argument
     names.push(name.to_ascii_lowercase());
 }
 
-/// `array_push_back_provider`: fetches a provider cipher, then walks its names.
+/// `array_push_back_provider`: records the canonical name of every cipher the
+/// provider walker hands over; [`cipher_names`] does the fetch afterwards.
 unsafe extern "C" fn provider_cipher_callback(cipher: *mut c_void, argument: *mut c_void) {
-    if cipher.is_null() {
+    if cipher.is_null() || argument.is_null() {
         return;
     }
     // SAFETY: `cipher` is live and its name is an OpenSSL-owned string.
     let name = unsafe { EVP_CIPHER_get0_name(cipher.cast()) };
-    if name.is_null() {
+    // SAFETY: `name` is an OpenSSL-owned NUL-terminated string.
+    let Some(name) = (unsafe { read_cstr(name) }) else {
         return;
-    }
-    // SAFETY: `name` is a valid C string.
-    let fetched =
-        unsafe { openssl_sys::EVP_CIPHER_fetch(std::ptr::null_mut(), name, std::ptr::null()) };
-    if fetched.is_null() {
-        return;
-    }
-    // SAFETY: `fetched` is a live `EVP_CIPHER` this function owns.
-    if unsafe { is_supported_fetched_cipher(fetched.cast()) } {
-        // SAFETY: the walker invokes the callback synchronously with `argument`,
-        // and `fetched` is live for the duration.
-        unsafe {
-            EVP_CIPHER_names_do_all(
-                fetched.cast(),
-                Some(provider_cipher_name_callback),
-                argument,
-            )
-        };
-    }
-    // SAFETY: `fetched` came from `EVP_CIPHER_fetch` and is owned here.
-    unsafe { openssl_sys::EVP_CIPHER_free(fetched) };
+    };
+    // SAFETY: `argument` is the live `Vec<String>` the caller passed.
+    let names: &mut Vec<String> = unsafe { &mut *(argument as *mut Vec<String>) };
+    names.push(name);
 }
 
 /// `SaveMacName`: lowercases a provider MAC name and drops a dotted-decimal OID.
@@ -604,30 +635,24 @@ unsafe extern "C" fn mac_name_callback(name: *const c_char, argument: *mut c_voi
     names.push(name.to_ascii_lowercase());
 }
 
-/// `SaveSupportedProviderMac`: fetches a MAC, then walks every name it answers
-/// to. `KMAC-128` answers to both `KMAC-128` and `KMAC128`, which is exactly the
-/// pair Node's `getMacs()` reports.
+/// `SaveSupportedProviderMac`: records the canonical name of every MAC the
+/// provider walker hands over; [`mac_names`] fetches and expands it afterwards.
+///
+/// `KMAC-128` answers to both `KMAC-128` and `KMAC128`, which is exactly the pair
+/// Node's `getMacs()` reports.
 unsafe extern "C" fn mac_callback(mac: *mut c_void, argument: *mut c_void) {
-    if mac.is_null() {
+    if mac.is_null() || argument.is_null() {
         return;
     }
     // SAFETY: `mac` is live and its name is an OpenSSL-owned string.
     let name = unsafe { EVP_MAC_get0_name(mac.cast()) };
-    if name.is_null() {
+    // SAFETY: `name` is an OpenSSL-owned NUL-terminated string.
+    let Some(name) = (unsafe { read_cstr(name) }) else {
         return;
-    }
-    // SAFETY: `name` is a valid C string and a null property query means the
-    // default properties.
-    let fetched =
-        unsafe { openssl_sys::EVP_MAC_fetch(std::ptr::null_mut(), name, std::ptr::null()) };
-    if fetched.is_null() {
-        return;
-    }
-    // SAFETY: the walker invokes the callback synchronously with `argument`, and
-    // `fetched` is live for the duration.
-    unsafe { EVP_MAC_names_do_all(fetched.cast(), Some(mac_name_callback), argument) };
-    // SAFETY: `fetched` came from `EVP_MAC_fetch` and is owned here.
-    unsafe { openssl_sys::EVP_MAC_free(fetched) };
+    };
+    // SAFETY: `argument` is the live `Vec<String>` the caller passed.
+    let names: &mut Vec<String> = unsafe { &mut *(argument as *mut Vec<String>) };
+    names.push(name);
 }
 
 /// `EVP_MD_get_flags` for a digest, so the XOF check does not need its own FFI
@@ -767,6 +792,25 @@ fn resolvable_digest(name: &str) -> bool {
 /// * `do_all_provided` is the only source of algorithms that exist only as
 ///   providers, such as `KECCAK-256` and `SHA2-256/192`.
 ///
+/// # Two phases, because OpenSSL's walkers are not re-entrant-safe
+///
+/// Phase one runs the two traversals and records every name they report, with
+/// callbacks that touch nothing but the string being handed over. Phase two does
+/// the resolving, the provider name expansion, and the "does it initialise"
+/// filter, all after both traversals have returned.
+///
+/// The split is not cosmetic. `EVP_MD_do_all_sorted` walks `OBJ_NAME`'s lhash
+/// through `OBJ_NAME_do_all`, which holds no lock and writes through an
+/// unchecked `d->names[d->n++]` into a stack sized before the walk began;
+/// calling `EVP_MD_fetch` from inside the callback — which is what this function
+/// used to do, to decide whether each name was usable — re-enters OpenSSL's init
+/// and provider machinery mid-traversal and makes entries disappear. That is the
+/// defect: `getHashes()` lost `RSA-SHA512` and `sha512WithRSAEncryption` on one
+/// gate run and `RSA-SHA3-224` on another. It needed no CPU load, only another
+/// thread in the same process resolving a digest or cipher by name, because that
+/// call completes OpenSSL's one-time algorithm registration and can resize the
+/// table mid-walk. See [`ENUMERATION`] for the measurements and the fix.
+///
 /// # The six names this list cannot contain on OpenSSL 3.6.3
 ///
 /// `KNOWN_ABSENT_DIGESTS` names them and why. They are cSHAKE, which is not in
@@ -774,26 +818,128 @@ fn resolvable_digest(name: &str) -> bool {
 /// future fix needs. Nothing here filters them out — the walk simply never sees
 /// them, which is the property that makes the list truthful rather than curated.
 pub fn digest_names() -> Vec<String> {
+    serialised(|| {
+        // Phase one: record what the walkers report. No OpenSSL calls beyond the
+        // walks themselves, so nothing can perturb a traversal in progress.
+        let mut legacy: Vec<String> = Vec::new();
+        let argument = (&mut legacy) as *mut Vec<String> as *mut c_void;
+        // SAFETY: the walker invokes `digest_alias_callback` synchronously with
+        // `argument` as its fourth parameter, and `legacy` outlives the call.
+        // The legacy walker reports null `from` values, which the callback
+        // checks.
+        unsafe { EVP_MD_do_all_sorted(Some(digest_alias_callback), argument) };
+
+        let mut provider: Vec<String> = Vec::new();
+        let argument = (&mut provider) as *mut Vec<String> as *mut c_void;
+        // SAFETY: same shape; a null `libctx` means the default context.
+        unsafe {
+            EVP_MD_do_all_provided(
+                std::ptr::null_mut(),
+                Some(provider_digest_callback),
+                argument,
+            )
+        };
+
+        // Phase two: everything that can reach OpenSSL's init path, now that no
+        // traversal is running. It stays inside the lock on purpose: `EVP_*_fetch`
+        // can *insert* into `OBJ_NAME`'s table, and that table is shared by
+        // digests, ciphers and MACs alike, so a concurrent `cipher_names()` on
+        // another thread would otherwise mutate the table this thread just read.
+        let mut names: Vec<String> = legacy
+            .into_iter()
+            // `SaveSupportedHashAlgorithmsAndCacheMD` keeps only names whose
+            // canonical implementation this build can actually fetch.
+            .filter(|name| legacy_digest_is_supported(name))
+            .collect();
+        for name in provider {
+            names.extend(provider_digest_names_of(&name));
+        }
+
+        filter_duplicate_strings(names, false)
+            .into_iter()
+            // Keep only names that actually initialise. A provider can register
+            // a name whose implementation is present but unusable, and
+            // advertising it would be the exact lie this module exists to
+            // prevent.
+            .filter(|name| resolvable_digest(name))
+            .collect()
+    })
+}
+
+/// Whether a legacy `OBJ_NAME` entry names a digest this build can fetch.
+///
+/// This is the accept test `SaveSupportedHashAlgorithmsAndCacheMD` applies: look
+/// the name up in the legacy table, read the canonical implementation's name, and
+/// keep the entry only if that canonical name fetches.
+fn legacy_digest_is_supported(name: &str) -> bool {
+    let Ok(text) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: `text` is a valid NUL-terminated C string for the duration of the
+    // call and the lookup only reads it.
+    let legacy = unsafe { openssl_sys::EVP_get_digestbyname(text.as_ptr()) };
+    if legacy.is_null() {
+        return false;
+    }
+    // SAFETY: `legacy` is a live `EVP_MD` from OpenSSL's table.
+    let canonical = unsafe { EVP_MD_get0_name(legacy.cast()) };
+    // SAFETY: `canonical` is a NUL-terminated OpenSSL-owned string, which the
+    // fetch only reads.
+    let fetched = unsafe { fetch_supported_digest(canonical) };
+    let Some(fetched) = fetched else {
+        return false;
+    };
+    // SAFETY: `fetched` came from `EVP_MD_fetch` and is owned here; the caller
+    // only wanted the accept decision.
+    unsafe { openssl_sys::EVP_MD_free(fetched) };
+    true
+}
+
+/// `SaveSupportedProviderHashAlgorithms`'s per-digest expansion: fetch the
+/// provider digest and return every lowercased alias it answers to.
+///
+/// The alias names are collected inside `EVP_MD_names_do_all` but fetched only
+/// afterwards, so the traversal never re-enters OpenSSL's init path. Each alias
+/// still has to fetch on its own, which is the test Node applies: a provider can
+/// register a name whose implementation is unusable.
+fn provider_digest_names_of(name: &str) -> Vec<String> {
+    let Ok(text) = std::ffi::CString::new(name) else {
+        return Vec::new();
+    };
+    // SAFETY: `text` is a valid NUL-terminated C string and a null property query
+    // is the default properties.
+    let Some(fetched) = (unsafe { fetch_supported_digest(text.as_ptr()) }) else {
+        return Vec::new();
+    };
     let mut names: Vec<String> = Vec::new();
     let argument = (&mut names) as *mut Vec<String> as *mut c_void;
-    // SAFETY: the walker invokes `digest_alias_callback` synchronously with
-    // `argument` as its fourth parameter, and `names` outlives the call. The
-    // legacy walker reports null `from` values, which the callback checks.
-    unsafe { EVP_MD_do_all_sorted(Some(digest_alias_callback), argument) };
-    // SAFETY: same vec, same lifetime; a null `libctx` means the default context.
+    // SAFETY: the walker invokes the callback synchronously with `argument`, and
+    // `fetched` is live for the duration.
     unsafe {
-        EVP_MD_do_all_provided(
-            std::ptr::null_mut(),
-            Some(provider_digest_callback),
+        EVP_MD_names_do_all(
+            fetched.cast(),
+            Some(provider_digest_name_callback),
             argument,
         )
     };
-    filter_duplicate_strings(names, false)
+    // SAFETY: `fetched` came from `EVP_MD_fetch` and is owned here.
+    unsafe { openssl_sys::EVP_MD_free(fetched) };
+
+    names
         .into_iter()
-        // Keep only names that actually initialise. A provider can register a
-        // name whose implementation is present but unusable, and advertising it
-        // would be the exact lie this module exists to prevent.
-        .filter(|name| resolvable_digest(name))
+        .filter(|alias| {
+            let Ok(alias_text) = std::ffi::CString::new(alias.as_str()) else {
+                return false;
+            };
+            // SAFETY: `alias_text` is a valid NUL-terminated C string.
+            let alias_fetched = unsafe { fetch_supported_digest(alias_text.as_ptr()) };
+            let Some(alias_fetched) = alias_fetched else {
+                return false;
+            };
+            // SAFETY: `alias_fetched` came from `EVP_MD_fetch` and is owned here.
+            unsafe { openssl_sys::EVP_MD_free(alias_fetched) };
+            true
+        })
         .collect()
 }
 
@@ -804,26 +950,137 @@ pub fn digest_names() -> Vec<String> {
 /// composites. Those entries stay out because they do not fetch or because their
 /// flags say they are not a plain cipher, which is why this list needs no
 /// hand-maintained table that could drift from the linked library.
+///
+/// The walk and the accept tests are split into two phases for the reason
+/// [`ENUMERATION`] records: `EVP_CIPHER_fetch` from inside `OBJ_NAME_do_all`'s
+/// traversal makes OpenSSL's walker skip entries.
 pub fn cipher_names() -> Vec<String> {
+    serialised(|| {
+        let mut legacy: Vec<String> = Vec::new();
+        let argument = (&mut legacy) as *mut Vec<String> as *mut c_void;
+        // SAFETY: the walker calls the callback synchronously and `legacy`
+        // outlives it.
+        unsafe { EVP_CIPHER_do_all_sorted(Some(cipher_alias_callback), argument) };
+
+        let mut provider: Vec<String> = Vec::new();
+        let argument = (&mut provider) as *mut Vec<String> as *mut c_void;
+        // SAFETY: same shape, same lifetime.
+        unsafe {
+            EVP_CIPHER_do_all_provided(
+                std::ptr::null_mut(),
+                Some(provider_cipher_callback),
+                argument,
+            )
+        };
+
+        // Inside the lock, for the reason `digest_names` records: the fetch can
+        // insert into the `OBJ_NAME` table that all three enumerators share.
+        let mut names: Vec<String> = legacy
+            .into_iter()
+            .filter(|name| legacy_cipher_is_supported(name))
+            .collect();
+        for name in provider {
+            names.extend(provider_cipher_names_of(&name));
+        }
+
+        filter_duplicate_strings(names, false)
+            .into_iter()
+            // The accept test is the one `createCipheriv` uses, so a name that
+            // survives this cannot then fail to construct.
+            .filter(|name| cipher_is_constructible(name))
+            .collect()
+    })
+}
+
+/// Whether a legacy `OBJ_NAME` cipher entry names an implementation this build
+/// can actually construct.
+///
+/// This is `array_push_back`'s accept test from `deps/ncrypto/ncrypto.cc`: the
+/// legacy lookup finds the real cipher, and `EVP_CIPHER_fetch` on its canonical
+/// name decides whether the public API can build it. A cipher that lives in an
+/// unloaded provider (`bf-cbc`, `rc4`) fails the fetch and stays out.
+fn legacy_cipher_is_supported(name: &str) -> bool {
+    let Ok(text) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // SAFETY: `text` is a valid NUL-terminated C string for the duration of the
+    // call and the lookup only reads it.
+    let real = unsafe { openssl_sys::EVP_get_cipherbyname(text.as_ptr()) };
+    if real.is_null() {
+        return false;
+    }
+    // SAFETY: `real` is a live `EVP_CIPHER` from OpenSSL's table, and its
+    // canonical name is an OpenSSL-owned NUL-terminated string.
+    unsafe { fetch_cipher_is_supported(EVP_CIPHER_get0_name(real.cast())) }
+}
+
+/// `array_push_back_provider`: every lowercased alias the provider cipher
+/// answers to.
+///
+/// The aliases are collected inside `EVP_CIPHER_names_do_all` but fetched only
+/// afterwards, so the traversal never re-enters OpenSSL's init path.
+fn provider_cipher_names_of(name: &str) -> Vec<String> {
+    let Ok(text) = std::ffi::CString::new(name) else {
+        return Vec::new();
+    };
+    // SAFETY: `text` is a valid NUL-terminated C string.
+    let fetched = unsafe { fetch_cipher(text.as_ptr()) };
+    let Some(fetched) = fetched else {
+        return Vec::new();
+    };
+    if !unsafe { is_supported_fetched_cipher(fetched.cast()) } {
+        // SAFETY: `fetched` came from `EVP_CIPHER_fetch` and is owned here.
+        unsafe { openssl_sys::EVP_CIPHER_free(fetched) };
+        return Vec::new();
+    }
     let mut names: Vec<String> = Vec::new();
     let argument = (&mut names) as *mut Vec<String> as *mut c_void;
-    // SAFETY: as in `digest_names`: the walker calls the callback synchronously
-    // and `names` outlives it.
-    unsafe { EVP_CIPHER_do_all_sorted(Some(cipher_alias_callback), argument) };
-    // SAFETY: same vec, same lifetime.
+    // SAFETY: the walker invokes the callback synchronously with `argument`, and
+    // `fetched` is live for the duration.
     unsafe {
-        EVP_CIPHER_do_all_provided(
-            std::ptr::null_mut(),
-            Some(provider_cipher_callback),
+        EVP_CIPHER_names_do_all(
+            fetched.cast(),
+            Some(provider_cipher_name_callback),
             argument,
         )
     };
-    filter_duplicate_strings(names, false)
-        .into_iter()
-        // The accept test is the one `createCipheriv` uses, so a name that
-        // survives this cannot then fail to construct.
-        .filter(|name| cipher_is_constructible(name))
-        .collect()
+    // SAFETY: `fetched` came from `EVP_CIPHER_fetch` and is owned here.
+    unsafe { openssl_sys::EVP_CIPHER_free(fetched) };
+    names
+}
+
+/// `EVP_CIPHER_fetch` for a NUL-terminated name pointer.
+///
+/// # Safety
+///
+/// `name` must be null or a NUL-terminated string. The returned pointer is owned
+/// by the caller and needs `EVP_CIPHER_free`.
+unsafe fn fetch_cipher(name: *const c_char) -> Option<*mut openssl_sys::EVP_CIPHER> {
+    if name.is_null() {
+        return None;
+    }
+    // SAFETY: the name is valid and a null property query means the default
+    // properties.
+    let fetched =
+        unsafe { openssl_sys::EVP_CIPHER_fetch(std::ptr::null_mut(), name, std::ptr::null()) };
+    (!fetched.is_null()).then_some(fetched)
+}
+
+/// Whether `EVP_CIPHER_fetch` on a name pointer succeeds and the result passes
+/// `IsSupportedFetchedCipher`.
+///
+/// # Safety
+///
+/// `name` must be null or a NUL-terminated string.
+unsafe fn fetch_cipher_is_supported(name: *const c_char) -> bool {
+    let Some(fetched) = (unsafe { fetch_cipher(name) }) else {
+        return false;
+    };
+    // SAFETY: `fetched` is live and owned here.
+    let supported = unsafe { is_supported_fetched_cipher(fetched.cast()) };
+    // SAFETY: `fetched` came from `EVP_CIPHER_fetch` and is owned here.
+    unsafe { openssl_sys::EVP_CIPHER_free(fetched) };
+    supported
 }
 
 /// Whether `rn_bind_crypto_cipher`'s lookup — the path `createCipheriv` takes —
@@ -993,19 +1250,57 @@ pub fn ssl_cipher_names() -> Vec<String> {
 /// makes `kmac128` appear beside `kmac-128`: they are two names for one provider
 /// MAC, and Node reports both.
 pub fn mac_names() -> Vec<String> {
+    serialised(|| {
+        // Phase one: record the canonical names the provider walker reports. See
+        // [`ENUMERATION`]; the fetch below must not run inside the traversal.
+        let mut canonical: Vec<String> = Vec::new();
+        let argument = (&mut canonical) as *mut Vec<String> as *mut c_void;
+        // SAFETY: the walker invokes the callback synchronously with `argument`,
+        // and `canonical` outlives the call; a null `libctx` means the default
+        // context.
+        unsafe { EVP_MAC_do_all_provided(std::ptr::null_mut(), Some(mac_callback), argument) };
+
+        // Phase two: expand each canonical name into the aliases it answers to,
+        // inside the lock so no concurrent enumerator can mutate the shared
+        // `OBJ_NAME` table mid-read.
+        let mut names: Vec<String> = Vec::new();
+        for name in canonical {
+            names.extend(mac_aliases_of(&name));
+        }
+
+        // `getMacs` is `filterDuplicateStrings(_getMacs(), true)`, so the values
+        // are lowercased and the dedupe keeps the lowercase spelling.
+        filter_duplicate_strings(names, true)
+            .into_iter()
+            // The same rule as the other two lists: a name that is advertised
+            // but cannot be fetched is worse than an absent one.
+            .filter(|name| mac_is_fetchable(name))
+            .collect()
+    })
+}
+
+/// `SaveSupportedProviderMac`'s per-MAC expansion: fetch the MAC and return every
+/// lowercased alias it answers to.
+fn mac_aliases_of(name: &str) -> Vec<String> {
+    let Ok(text) = std::ffi::CString::new(name) else {
+        return Vec::new();
+    };
+    // SAFETY: `text` is a valid NUL-terminated C string and a null property query
+    // means the default properties.
+    let fetched = unsafe {
+        openssl_sys::EVP_MAC_fetch(std::ptr::null_mut(), text.as_ptr(), std::ptr::null())
+    };
+    if fetched.is_null() {
+        return Vec::new();
+    }
     let mut names: Vec<String> = Vec::new();
     let argument = (&mut names) as *mut Vec<String> as *mut c_void;
     // SAFETY: the walker invokes the callback synchronously with `argument`, and
-    // `names` outlives the call; a null `libctx` means the default context.
-    unsafe { EVP_MAC_do_all_provided(std::ptr::null_mut(), Some(mac_callback), argument) };
-    // `getMacs` is `filterDuplicateStrings(_getMacs(), true)`, so the values are
-    // lowercased and the dedupe keeps the lowercase spelling.
-    filter_duplicate_strings(names, true)
-        .into_iter()
-        // The same rule as the other two lists: a name that is advertised but
-        // cannot be fetched is worse than an absent one.
-        .filter(|name| mac_is_fetchable(name))
-        .collect()
+    // `fetched` is live for the duration.
+    unsafe { EVP_MAC_names_do_all(fetched.cast(), Some(mac_name_callback), argument) };
+    // SAFETY: `fetched` came from `EVP_MAC_fetch` and is owned here.
+    unsafe { openssl_sys::EVP_MAC_free(fetched) };
+    names
 }
 
 /// Whether a MAC name fetches, which is the accept test Node's walk implies.
@@ -1356,5 +1651,138 @@ mod tests {
         // lookup, so the alias behaviour there must not have shifted.
         assert!(MessageDigest::from_name("RSA-SHA256").is_some());
         assert!(MessageDigest::from_name("sha-1").is_some());
+    }
+
+    /// The environment variable that marks a child of
+    /// [`a_walk_racing_openssl_registration_loses_no_names`].
+    const REGISTRATION_CHILD: &str = "RN_BIND_CRYPTO_REGISTRATION_CHILD";
+
+    /// How many cold children the parent requires to pass.
+    ///
+    /// Racing one walk against one registration lost names on 31 of 80 fresh
+    /// children pre-fix, so 20 children all passing by chance is about
+    /// (49/80)^20 ≈ 7e-5. Each child is milliseconds of work, and the whole test
+    /// is bounded by [`REGISTRATION_DEADLINE`] so a hang cannot wedge the suite.
+    const REGISTRATION_ATTEMPTS: usize = 20;
+
+    /// Wall-clock ceiling for the whole test, including every child.
+    const REGISTRATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// A walk must not lose names when OpenSSL's one-time registration runs
+    /// beside it.
+    ///
+    /// This is the regression test for the gate failures that made
+    /// `get_hashes_matches_node_except_the_declared_gap` lose `RSA-SHA512` +
+    /// `sha512WithRSAEncryption` once and `RSA-SHA3-224` another time, while
+    /// passing 6/6 in isolation.
+    ///
+    /// # Why this shape, and not a thread storm
+    ///
+    /// CPU load is irrelevant: four busy-loop threads beside the filtered test
+    /// changed nothing. So did 16 threads merely calling `digest_names()`
+    /// together, once the fetches stopped re-entering the walk. What does
+    /// reproduce it is one thread walking while another makes the *first*
+    /// `EVP_get_digestbyname`/`EVP_get_cipherbyname` call in the process: those
+    /// run `OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_DIGESTS | ..._CIPHERS)`,
+    /// whose `openssl_add_all_*_int()` inserts dozens of entries into the shared
+    /// `OBJ_NAME` lhash. The insert can trigger `expand()`, which reallocs the
+    /// bucket array and relinks nodes mid-traversal, and `OBJ_NAME_do_all` holds
+    /// no lock while indexing that array. Pre-fix that lost names on 31 of 80
+    /// fresh children; with the walk alone it never lost one (0 of 80).
+    ///
+    /// That is also why it needs the whole differential binary: the other tests
+    /// resolve digests and ciphers by name, so they are what performs the first
+    /// registration. Run alone against a warm process, the enumeration is stable.
+    ///
+    /// # Why the expectation is not hardcoded
+    ///
+    /// The child compares the racing walk against a walk taken *afterwards*, when
+    /// nothing is in flight. That follows whatever this build's OpenSSL supplies
+    /// and still fails the instant timing changes the answer, which is the
+    /// property the list promises: `digest_names()` is a function of the linked
+    /// library, never of scheduling.
+    #[test]
+    fn a_walk_racing_openssl_registration_loses_no_names() {
+        if std::env::var_os(REGISTRATION_CHILD).is_some() {
+            walk_racing_registration();
+            return;
+        }
+
+        let executable = std::env::current_exe().expect("the test binary has a path");
+        let started = std::time::Instant::now();
+        for attempt in 0..REGISTRATION_ATTEMPTS {
+            assert!(
+                started.elapsed() < REGISTRATION_DEADLINE,
+                "the registration probe exceeded {REGISTRATION_DEADLINE:?} after \
+                 {attempt} of {REGISTRATION_ATTEMPTS} children"
+            );
+            let output = std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "enumerate::tests::a_walk_racing_openssl_registration_loses_no_names",
+                    "--nocapture",
+                ])
+                .env(REGISTRATION_CHILD, "1")
+                .output()
+                .expect("spawn the probe child");
+            assert!(
+                output.status.success(),
+                "cold child {attempt} lost names while OpenSSL registered its \
+                 algorithms\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// The child half of
+    /// [`a_walk_racing_openssl_registration_loses_no_names`].
+    ///
+    /// Two threads leave a barrier together: one walks, the other performs the
+    /// process's first `EVP_get_digestbyname`/`EVP_get_cipherbyname` calls. The
+    /// walker then has to match a walk taken after both have finished.
+    fn walk_racing_registration() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let walker_barrier = std::sync::Arc::clone(&barrier);
+        let walker = std::thread::spawn(move || {
+            walker_barrier.wait();
+            digest_names()
+        });
+        let registrar_barrier = std::sync::Arc::clone(&barrier);
+        let registrar = std::thread::spawn(move || {
+            registrar_barrier.wait();
+            // Exactly the calls the other tests make, and exactly what
+            // `serialised` front-loads. Deliberately *not* `serialised`, so this
+            // reproduces a caller that resolves a digest without enumerating
+            // first — which is what the differential binary does.
+            for name in [c"sha256".as_ptr(), c"aes-128-cbc".as_ptr()] {
+                // SAFETY: both literals are static NUL-terminated C strings and
+                // the lookups only read them.
+                unsafe {
+                    openssl_sys::EVP_get_digestbyname(name);
+                    openssl_sys::EVP_get_cipherbyname(name);
+                }
+            }
+        });
+
+        let raced = walker.join().expect("the walking thread finished");
+        registrar.join().expect("the registering thread finished");
+
+        // Nothing is in flight now, so this is what a quiet process reports.
+        let settled = digest_names();
+        assert!(!settled.is_empty(), "a settled walk reported no digests");
+        assert_eq!(
+            raced,
+            settled,
+            "the walk saw {} digests but a settled walk sees {}; the enumeration \
+             is not deterministic across OpenSSL's algorithm registration.\n\
+             missing: {:?}",
+            raced.len(),
+            settled.len(),
+            settled
+                .iter()
+                .filter(|name| !raced.contains(name))
+                .collect::<Vec<_>>()
+        );
     }
 }
