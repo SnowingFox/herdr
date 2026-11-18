@@ -219,6 +219,36 @@ pub fn compile_function<'s>(
         return;
     };
 
+    // `hostDefinedOptionId` is how `internal/modules/esm/utils.js` finds this
+    // function's registry. `lib/internal/vm.js`'s
+    // `registerImportModuleDynamically` is called with the *compiled function* and
+    // `registerModule` reads `referrer[host_defined_option_symbol]` off it, then
+    // uses that value as a `WeakMap` key. Node sets it here as a private on the
+    // function (`src/node_contextify.cc:1552`,
+    // `fn->SetPrivate(context, env->host_defined_option_symbol(), id_symbol)`) and
+    // not through the `ScriptOrigin` — the origin only feeds V8's own
+    // `import()` callback, which is why `get_script_origin` below cannot answer
+    // this question.
+    //
+    // Without the mark the read is `undefined`. `registerModule` early-returns for
+    // four sentinel symbols and `undefined` matches none of them, so it reaches
+    // `moduleRegistries.set(undefined, registry)` and throws
+    // `TypeError: Invalid value used as weak map key` — the failure
+    // `test-vm-module-basic.js` reports. The sentinel the oracle carries for a
+    // function compiled *without* the option is
+    // `Symbol(vm_dynamic_import_no_callback)`, which is exactly the value the JS
+    // layer hands in as `hostDefinedOptionId` in that case.
+    //
+    // `rn_core::define_mark` writes an own symbol-keyed property rather than a
+    // `v8::Private`, which is the same substitution `script.rs` documents: `lib/**`
+    // reads it as `referrer[symbol]`, so a registered `v8::Symbol` is what it can
+    // see.
+    if let Some(symbol) = symbol {
+        let mark = rn_core::symbol(scope, rn_core::HOST_DEFINED_OPTION);
+        let as_object: v8::Local<v8::Object> = function.into();
+        rn_core::define_mark(scope, as_object, mark, symbol.into());
+    }
+
     let new_cached_data = if produce_cached_data {
         function.create_code_cache()
     } else {
