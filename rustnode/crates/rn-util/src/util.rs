@@ -1111,8 +1111,15 @@ fn dotenv_trim(input: &str) -> &str {
     input.trim_matches([' ', '\t', '\n'])
 }
 
-/// `Dotenv::ParseContent`, transliterated.
-fn dotenv_parse(input: &str) -> BTreeMap<String, String> {
+/// `Dotenv::ParseContent` from `src/node_dotenv.cc`, transliterated.
+///
+/// Public because `--env-file` is the same parser on a different input:
+/// `per_process::dotenv_file.ParsePath(path)` reads the file and hands the text
+/// to `ParseContent`, so the CLI reuses this rather than growing a second
+/// interpretation of a `.env` file that could disagree with
+/// `process.loadEnvFile()` and `util.parseEnv()`.
+#[must_use]
+pub fn dotenv_parse(input: &str) -> BTreeMap<String, String> {
     let mut store: BTreeMap<String, String> = BTreeMap::new();
 
     // "Handle windows newlines "\r\n": remove "\r" and keep only "\n"" — every

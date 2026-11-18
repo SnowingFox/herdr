@@ -85,6 +85,16 @@ fn main() {
                 eprintln!("{}: {message}", args::program_name());
                 terminate(9);
             }
+            // A bad `--env-file` is one line per file, each with the same
+            // `<program>: <message>` shape, because Node pushes each into its
+            // error vector and `StartInternal` prints them in a loop.
+            args::ParseError::EnvFile(messages) => {
+                let program = args::program_name();
+                for message in messages {
+                    eprintln!("{program}: {message}");
+                }
+                terminate(9);
+            }
         },
     };
     // A flag whose feature has not landed must not pass silently, or a test
@@ -134,6 +144,10 @@ fn main() {
     // name prefix followed by '*'`), and it exits with 9 like every other
     // rejected flag.
     let allow_env = rn_permission::env::parse_allow_list(&options.permission_config.allow_env);
+    // The names the scrub took away, so `--env-file` can tell "the parent set this
+    // and it wins" from "the permission model removed it and the file may restore
+    // it". Empty unless the model is enforcing.
+    let mut scrubbed: Vec<String> = Vec::new();
     if options.permission_config.enabled {
         if allow_env
             .iter()
@@ -156,8 +170,34 @@ fn main() {
             rn_permission::runtime::record_audited_env_vars(denied);
         } else {
             let removed = rn_permission::env::scrub(&allow_env);
-            options.permission.record_removed_env_vars(removed);
+            options.permission.record_removed_env_vars(removed.clone());
+            scrubbed = removed;
         }
+    }
+
+    // `--env-file`'s values are installed here, after the scrub above and before
+    // anything reads the environment. This is `Environment::Initialize`'s
+    // position (`src/node.cc:343`), and the order is the whole point: the scrub
+    // removes every name `--allow-env` does not grant, so an inherited value for
+    // a name the file also defines is gone by now and the file's value takes
+    // effect. `test-permission-env-file.js` asserts exactly that.
+    args::install_env_files(&options.env_file_store, &scrubbed);
+    // A name the scrub removed and an env file put back must stop reporting a
+    // denial: without this the store holds the file's value while
+    // `process.env.X` still answers `undefined` with a "removed at startup"
+    // warning, which is the state `test-permission-env-file.js` failed on.
+    //
+    // Only the names the files actually define are restored. Clearing the whole
+    // scrub record would silence the denial for a variable no file mentioned,
+    // which is what `node:permission-model:env` and the one-time warning exist to
+    // report.
+    let restored: Vec<String> = scrubbed
+        .iter()
+        .filter(|name| options.env_file_store.contains_key(*name))
+        .cloned()
+        .collect();
+    if !restored.is_empty() {
+        options.permission.record_env_vars_restored(&restored);
     }
 
     let mut env = Env::new();

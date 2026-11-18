@@ -13,6 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 rn-util = { path = "../rn-util" }
+# `--env-file` installs variables through the same store `process.env` reads and
+# writes, so the file's values are visible to the process and to its children
+# rather than living in a CLI-side map nothing consults.
+rn-env = { path = "../rn-env" }
 rn-module-wrap = { path = "../rn-module-wrap" }
 rn-bind-heap-utils = { path = "../rn-bind-heap-utils" }
 rn-errors = { path = "../rn-errors" }
