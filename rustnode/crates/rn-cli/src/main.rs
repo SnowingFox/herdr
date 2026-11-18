@@ -673,7 +673,8 @@ fn main() {
         | args::Source::Help
         | args::Source::Inspect
         | args::Source::Test
-        | args::Source::Repl => {
+        | args::Source::Repl
+        | args::Source::CheckSyntax => {
             let id = options
                 .source
                 .main_script_id()
@@ -700,6 +701,14 @@ fn main() {
                 }
                 _ => bootstrap::run_main_script(scope, id),
             };
+            // A main script that threw and left no live exception behind is
+            // still fatal. `run_main_script` opens its own `TryCatch`, so by the
+            // time it returns the caught flag is cleared and `handled` reads
+            // true even though the script aborted — which made `--check` on a
+            // missing file print `Cannot find module` and exit 0. Its `failure`
+            // is the only surviving evidence, and Node's `StartExecution`
+            // treats a throwing entry point as a startup failure.
+            let failed = failure.is_some();
             if let Some(message) = failure {
                 eprintln!("{message}");
             }
@@ -711,7 +720,7 @@ fn main() {
             } else {
                 true
             };
-            entry_fatal = !handled;
+            entry_fatal = !handled || failed;
         }
         args::Source::Empty => {
             value = evaluate_script(scope, "0").map(|value| v8::Global::new(scope, value));
