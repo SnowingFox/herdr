@@ -85,8 +85,28 @@ pub fn write_buffer<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     handle: &mut impl StreamHandle,
     request: Option<v8::Local<'s, v8::Object>>,
-    buffer: v8::Local<v8::Value>,
+    buffer: v8::Local<'s, v8::Value>,
     owner: v8::Local<'s, v8::Object>,
+) -> WriteResult<'s> {
+    write_buffer_with_handle(scope, handle, request, buffer, owner, None)
+}
+
+/// [`write_buffer`] with the `handle` argument `StreamBase::WriteBuffer` reads.
+///
+/// Node's signature is `writeBuffer(req, buffer, handle)`, and the third argument
+/// is the descriptor to send: `child_process`'s
+/// `serialization.js::writeChannelMessage` calls
+/// `channel.writeBuffer(req, serializedMessage, handle)` whenever a message
+/// carries one. Only an IPC pipe acts on it (`args[2]->IsObject() && IsIPCPipe()`);
+/// for every other stream the argument is ignored, which is why this takes the
+/// already-resolved handle rather than the raw value.
+pub fn write_buffer_with_handle<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    handle: &mut impl StreamHandle,
+    request: Option<v8::Local<'s, v8::Object>>,
+    buffer: v8::Local<'s, v8::Value>,
+    owner: v8::Local<'s, v8::Object>,
+    send_handle: Option<crate::handle_transfer::SendHandle>,
 ) -> WriteResult<'s> {
     // SAFETY: `stream_base_commons` keeps the buffer alive on `req.buffer`.
     let Some(buffer) = (unsafe { view_buffer(buffer) }) else {
@@ -99,6 +119,7 @@ pub fn write_buffer<'s>(
         WriteBuffers::One(buffer),
         Vec::new(),
         owner,
+        send_handle,
     )
 }
 
@@ -136,6 +157,7 @@ fn dispatch<'s>(
     mut buffers: WriteBuffers,
     owned: Vec<Box<[u8]>>,
     owner: v8::Local<'s, v8::Object>,
+    send_handle: Option<crate::handle_transfer::SendHandle>,
 ) -> WriteResult<'s> {
     let total = buffers.total();
     let state = handle.stream_state();
@@ -147,10 +169,18 @@ fn dispatch<'s>(
     state.bytes_written += total as u64;
     let stream = state.stream;
 
-    // SAFETY: the stream is live and the buffers are valid for the call. If a
-    // request is queued below, the storage the buffers point at is kept alive by
-    // `owned` (strings) or by `req.buffer` (views).
-    let written = unsafe { buffers.try_write(stream) };
+    // `src/stream_base.cc:96`: `if (send_handle == nullptr && HasDoTryWrite() &&
+    // !skip_try_write)`. A transfer must never take this shortcut — `uv_try_write`
+    // cannot carry a descriptor, so the handle would be dropped while the bytes
+    // went out, which is precisely the failure this send path exists to fix.
+    let written = if send_handle.is_none() {
+        // SAFETY: the stream is live and the buffers are valid for the call. If a
+        // request is queued below, the storage the buffers point at is kept alive
+        // by `owned` (strings) or by `req.buffer` (views).
+        unsafe { buffers.try_write(stream) }
+    } else {
+        0
+    };
     if written >= total {
         // Everything was taken, so no request is created; `afterWriteDispatched`
         // reads the zero as "completed synchronously".
@@ -173,8 +203,18 @@ fn dispatch<'s>(
     };
     // SAFETY: the stream is live; `owned` keeps any flattened string bytes alive
     // until the completion runs.
-    let status =
-        unsafe { stream::queue_write(scope, stream, buffers, pending, request, owner, owned) };
+    let status = unsafe {
+        stream::queue_write_with_handle(
+            scope,
+            stream,
+            buffers,
+            pending,
+            request,
+            owner,
+            owned,
+            send_handle,
+        )
+    };
     // `FinishWrite`: the request object is the return value only when the caller
     // did not supply one. `lib/internal/child_process/serialization.js` passes
     // its own `req` and reads the result as a status code
@@ -390,6 +430,7 @@ pub fn writev<'s>(
         WriteBuffers::Many(buffers),
         owned,
         owner,
+        None,
     )
 }
 
@@ -411,6 +452,27 @@ pub fn write_string<'s>(
     text: v8::Local<v8::String>,
     encoding: rn_core::Encoding,
     owner: v8::Local<'s, v8::Object>,
+) -> WriteResult<'s> {
+    write_string_with_handle(scope, handle, request, text, encoding, owner, None)
+}
+
+/// [`write_string`] with the `handle` argument `StreamBase::WriteString` reads.
+///
+/// The default IPC serialization mode is JSON, and
+/// `serialization.js`'s `json.writeChannelMessage` calls
+/// `channel.writeUtf8String(req, string, handle)` — the *string* form, not the
+/// buffer one. Implementing the send path only for `writeBuffer` therefore left
+/// every default-mode `child.send(msg, handle)` dropping its handle, which is the
+/// shape `cluster`'s own control messages use.
+#[allow(clippy::too_many_arguments)]
+pub fn write_string_with_handle<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    handle: &mut impl StreamHandle,
+    request: Option<v8::Local<'s, v8::Object>>,
+    text: v8::Local<v8::String>,
+    encoding: rn_core::Encoding,
+    owner: v8::Local<'s, v8::Object>,
+    send_handle: Option<crate::handle_transfer::SendHandle>,
 ) -> WriteResult<'s> {
     // `utf8` is the one encoding `StringBytes::Write` can produce without
     // materialising the code units first, so it takes V8's own writer. Node
@@ -441,6 +503,7 @@ pub fn write_string<'s>(
         WriteBuffers::One(buffer),
         vec![storage],
         owner,
+        send_handle,
     )
 }
 

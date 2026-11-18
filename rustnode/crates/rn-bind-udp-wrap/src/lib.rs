@@ -104,6 +104,17 @@ impl BindingModule for UdpWrap {
         // second, and `Object.keys()` exposes that order.
         let udp = handle::constructor(scope)?;
         set(scope, object, "UDP", udp)?;
+        // A datagram socket can cross an IPC channel and can be the object a
+        // transferred descriptor is delivered into, so the shared transfer layer
+        // has to be able to build one and to recognise one.
+        let Ok(constructor) = v8::Local::<v8::Function>::try_from(udp) else {
+            return Err("UDP is not a function".to_string());
+        };
+        rn_uv::handle_transfer::register_resolver(scope, constructor, handle::transfer_lookup);
+        rn_uv::handle_transfer::register_acceptor(
+            uv::uv_handle_type_UV_UDP,
+            handle::accept_transferred,
+        );
 
         let send_wrap = send::constructor(scope)?;
         set(scope, object, "SendWrap", send_wrap)?;

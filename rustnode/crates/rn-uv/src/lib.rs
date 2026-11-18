@@ -37,6 +37,7 @@
 pub mod addr;
 pub mod callback;
 pub mod handle;
+pub mod handle_transfer;
 pub mod ledger;
 pub mod listener;
 pub mod memory;

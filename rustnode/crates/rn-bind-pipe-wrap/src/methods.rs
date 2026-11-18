@@ -58,6 +58,10 @@ pub fn close(
 ///
 /// Called by libuv with a handle this crate initialised.
 pub unsafe extern "C" fn after_close(handle_pointer: *mut uv::uv_handle_t) {
+    // The pipe is gone, so its address may be reused by an unrelated handle;
+    // leaving it in the IPC set would make that handle look like a channel that
+    // can carry descriptors.
+    rn_uv::handle_transfer::forget_ipc_pipe(handle_pointer);
     // SAFETY: the handle's `data` is the `StreamState` the constructor stored.
     let Some(state) = (unsafe { handle::owner(handle_pointer.cast::<uv::uv_stream_t>()) }) else {
         return;
@@ -191,6 +195,20 @@ pub fn shutdown(
 }
 
 /// `StreamBase::WriteBuffer`.
+///
+/// The third argument is the descriptor to transfer, which Node only acts on when
+/// the stream is an IPC pipe:
+///
+/// ```c
+/// if (args[2]->IsObject() && IsIPCPipe()) {
+///   ASSIGN_OR_RETURN_UNWRAP(&wrap, send_handle_obj, UV_EINVAL);
+///   send_handle = reinterpret_cast<uv_stream_t*>(wrap->GetHandle());
+/// }
+/// ```
+///
+/// Without this the handle was silently dropped and only the message went out, so
+/// `child.send(msg, socket)` and every `cluster` connection handoff delivered
+/// nothing on the far side.
 pub fn write_buffer<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -198,13 +216,44 @@ pub fn write_buffer<'s>(
 ) {
     let object = args.this();
     let request = v8::Local::<v8::Object>::try_from(args.get(0)).ok();
+    let send_handle = send_handle_argument(scope, &args, object);
     let result = pipe::with_handle(object, |handle| {
-        stream_base::write_buffer(scope, handle, request, args.get(1), object)
+        stream_base::write_buffer_with_handle(
+            scope,
+            handle,
+            request,
+            args.get(1),
+            object,
+            send_handle,
+        )
     });
     match result {
         Some(result) => result.apply(scope, &mut rv),
         None => rv.set(v8::Integer::new(scope, EBADF).into()),
     }
+}
+
+/// Resolves `writeBuffer`'s third argument, when this stream is an IPC pipe.
+///
+/// Returns `None` for every other stream, which is Node's `IsIPCPipe()` gate: an
+/// ordinary pipe or socket ignores the argument entirely rather than failing.
+fn send_handle_argument<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<rn_uv::handle_transfer::SendHandle> {
+    let value = args.get(2);
+    if !value.is_object() {
+        return None;
+    }
+    let is_ipc = pipe::with_handle(object, |handle| {
+        rn_uv::handle_transfer::is_ipc_pipe(rn_uv::handle::as_handle(handle.stream()))
+    })
+    .unwrap_or(false);
+    if !is_ipc {
+        return None;
+    }
+    rn_uv::handle_transfer::SendHandle::from_value(scope, value)
 }
 
 /// `StreamBase::Writev`.
@@ -277,8 +326,21 @@ fn write_string<'s>(
         rv.set(v8::Integer::new(scope, EINVAL).into());
         return;
     };
+    // The third argument is the descriptor to send. The default IPC
+    // serialization mode is JSON, and `serialization.js` sends it through this
+    // string form rather than `writeBuffer`, so this is the path a plain
+    // `cluster` control message takes.
+    let send_handle = send_handle_argument(scope, args, object);
     let result = pipe::with_handle(object, |handle| {
-        stream_base::write_string(scope, handle, request, text, encoding, object)
+        stream_base::write_string_with_handle(
+            scope,
+            handle,
+            request,
+            text,
+            encoding,
+            object,
+            send_handle,
+        )
     });
     match result {
         Some(result) => result.apply(scope, rv),

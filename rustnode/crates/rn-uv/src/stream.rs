@@ -189,12 +189,57 @@ pub unsafe fn try_write(stream: *mut uv::uv_stream_t, buffers: &mut [uv::uv_buf_
 pub unsafe fn queue_write(
     scope: &mut v8::PinScope<'_, '_>,
     stream: *mut uv::uv_stream_t,
-    mut buffers: Vec<uv::uv_buf_t>,
+    buffers: Vec<uv::uv_buf_t>,
     total_bytes: usize,
     request: v8::Local<v8::Object>,
     handle_object: v8::Local<v8::Object>,
     owned: Vec<Box<[u8]>>,
 ) -> i32 {
+    queue_write_with_handle(
+        scope,
+        stream,
+        buffers,
+        total_bytes,
+        request,
+        handle_object,
+        owned,
+        None,
+    )
+}
+
+/// [`queue_write`] with a descriptor to transfer alongside the bytes.
+///
+/// This is the `uv_write2` half of `StreamBase::Write`:
+/// `LibuvStreamWrap::DoWrite` passes `send_handle` straight through, and libuv
+/// uses `uv_write2` only when it is non-null. Everything else — the completion
+/// bookkeeping, the owned storage, the status publication — is identical, so both
+/// entry points share this body rather than duplicating the allocation dance.
+///
+/// `send_handle` is the *rooted* handle object from
+/// [`crate::handle_transfer::SendHandle`], which keeps the sender's wrapper alive
+/// until the completion fires; without that the finalizer could `uv_close` a
+/// descriptor libuv is still transferring.
+///
+/// # Safety
+///
+/// As [`queue_write`], plus: `send_handle.handle` must be a live handle owned by
+/// this thread.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn queue_write_with_handle(
+    scope: &mut v8::PinScope<'_, '_>,
+    stream: *mut uv::uv_stream_t,
+    mut buffers: Vec<uv::uv_buf_t>,
+    total_bytes: usize,
+    request: v8::Local<v8::Object>,
+    handle_object: v8::Local<v8::Object>,
+    owned: Vec<Box<[u8]>>,
+    send_handle: Option<crate::handle_transfer::SendHandle>,
+) -> i32 {
+    // The descriptor travels with the write, but the rooted object stays here:
+    // `uv_write2` reads the handle synchronously, while the object has to live
+    // until the completion. Taking it out first leaves `send_handle` readable for
+    // the dispatch below.
+    let send_object = send_handle.as_ref().map(|send| send.object.clone());
     let completion = Box::new(WriteCompletion {
         request: v8::Global::new(scope.as_ref(), request),
         handle: v8::Global::new(scope.as_ref(), handle_object),
@@ -202,6 +247,9 @@ pub unsafe fn queue_write(
         // `data` is its `StreamState`.
         state: unsafe { handle::owner(stream) }.unwrap_or(ptr::null_mut()),
         owned,
+        // Rooted for as long as the write is in flight. Dropped with this struct,
+        // which is what releases the sender's handle object.
+        send_handle: send_object,
     });
     let completion = Box::into_raw(completion);
 
@@ -215,13 +263,27 @@ pub unsafe fn queue_write(
 
     // SAFETY: the caller guarantees the stream and buffers stay valid.
     let status = unsafe {
-        uv::uv_write(
-            request_ref,
-            stream,
-            buffers.as_mut_ptr(),
-            buffers.len() as u32,
-            Some(after_write),
-        )
+        match send_handle.as_ref() {
+            // `uv_write2` is the only call that carries a descriptor across an
+            // IPC pipe; `uv_write` ignores one entirely, which is what made a
+            // cluster handoff deliver its `{act: 'newconn'}` message without the
+            // connection.
+            Some(send) => uv::uv_write2(
+                request_ref,
+                stream,
+                buffers.as_mut_ptr(),
+                buffers.len() as u32,
+                send.handle.cast::<uv::uv_stream_t>(),
+                Some(after_write),
+            ),
+            None => uv::uv_write(
+                request_ref,
+                stream,
+                buffers.as_mut_ptr(),
+                buffers.len() as u32,
+                Some(after_write),
+            ),
+        }
     };
 
     if status != 0 {
@@ -261,6 +323,14 @@ struct WriteCompletion {
     /// String backing storage, freed with this struct.
     #[allow(dead_code)]
     owned: Vec<Box<[u8]>>,
+    /// The sender's handle object, when this write transferred a descriptor.
+    ///
+    /// `StreamBase::WriteBuffer` parks the same object on `req_wrap_obj` as
+    /// `env->handle_string()`; here it is a `Global` because the completion runs
+    /// from `uv_run`, where the wrapper must already be reachable. Holding it also
+    /// keeps the sender's finalizer from closing a handle libuv is still moving.
+    #[allow(dead_code)]
+    send_handle: Option<v8::Global<v8::Object>>,
 }
 
 /// libuv's write completion.

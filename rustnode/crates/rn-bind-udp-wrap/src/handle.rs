@@ -142,6 +142,114 @@ pub fn with_handle<R>(
     Some(body(unsafe { &mut *pointer }))
 }
 
+thread_local! {
+    /// A handle an accept prepared, waiting for the `UDP` constructor to adopt it.
+    ///
+    /// `uv_accept` fills an already-initialised `uv_udp_t`, and a handle must not
+    /// move after `uv_udp_init`, so the received one is parked here and the
+    /// constructor adopts it instead of initialising another.
+    static PENDING_ACCEPT: std::cell::RefCell<Option<Box<UdpHandle>>> =
+        const { std::cell::RefCell::new(None) };
+    /// The constructor, so native code can instantiate one for a received socket.
+    static CONSTRUCTOR: std::cell::RefCell<Option<v8::Global<v8::Function>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Parks a handle for the next `UDP` construction to adopt.
+fn park_accept(handle: Box<UdpHandle>) {
+    PENDING_ACCEPT.with(|slot| *slot.borrow_mut() = Some(handle));
+}
+
+/// Takes the parked accept handle, if there is one.
+fn take_pending_accept() -> Option<Box<UdpHandle>> {
+    PENDING_ACCEPT.with(|slot| slot.borrow_mut().take())
+}
+
+/// Closes a handle no wrapper adopted, so its descriptor cannot leak.
+fn close_unadopted(mut handle: UdpHandle) {
+    // SAFETY: nothing else holds this handle, so closing it here is the only
+    // reference and no close callback is needed.
+    unsafe { uv::uv_close(crate::as_handle(handle.raw()), None) };
+}
+
+/// Instantiates a `UDP` from native code, for a received datagram socket.
+///
+/// The constructor adopts whatever [`park_accept`] put aside, so this is the same
+/// shape `ConnectionWrap::Instantiate` uses for TCP.
+fn instantiate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    let constructor = CONSTRUCTOR.with(|slot| slot.borrow().clone())?;
+    let constructor: v8::Local<v8::Function> = v8::Local::new(scope, &constructor);
+    let receiver: v8::Local<v8::Value> = v8::undefined(&**scope).into();
+    let _ = receiver;
+    constructor.new_instance(&*scope, &[])
+}
+
+/// A `UDP` handed to `child.send` or `cluster`, as `uv_write2` sees it.
+///
+/// `cluster`'s `SharedHandle` sends a datagram socket's listening handle so every
+/// worker can `recvStart` on the same descriptor, which only works if the handle
+/// can cross the IPC channel.
+struct Transfer<'a>(&'a UdpHandle);
+
+impl rn_uv::handle_transfer::Transferable for Transfer<'_> {
+    fn transfer_handle(&self) -> *mut uv::uv_handle_t {
+        crate::as_handle(self.0.udp.as_ref() as *const _ as *mut uv::uv_udp_t)
+    }
+
+    fn transfer_is_alive(&self) -> bool {
+        self.0.is_alive()
+    }
+}
+
+/// Reads a `UDP` out of a value the resolver has already matched to this class.
+///
+/// Only called after `[[HasInstance]]` established the class, because every
+/// handle binding stores its pointer in internal field 0 and a blind read would
+/// cast one binding's allocation to another's type.
+pub(crate) fn transfer_lookup<'s>(
+    _scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<Box<dyn rn_uv::handle_transfer::Transferable>> {
+    let pointer = raw_handle(object)?;
+    // SAFETY: `raw_handle` proved the pointer came from `install`, so it points at
+    // a live `UdpHandle`. The borrowed value only lives for the send call.
+    let handle = unsafe { &*pointer };
+    Some(Box::new(Transfer(handle)))
+}
+
+/// Accepts a datagram descriptor `uv_write2` delivered, as `AcceptHandle<UDPWrap>`.
+///
+/// # Safety
+///
+/// `parent` must be a live IPC pipe with a descriptor pending on it.
+pub(crate) unsafe fn accept_transferred<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    parent: *mut uv::uv_stream_t,
+    _kind: uv::uv_handle_type,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let mut client = UdpHandle::new()?;
+    // SAFETY: the client's handle is live and `parent` holds the pending
+    // descriptor. `AcceptHandle<UDPWrap>` casts the `uv_udp_t` to a
+    // `uv_stream_t` for `uv_accept`, which is how libuv moves a datagram
+    // descriptor between handles.
+    let status = unsafe { uv::uv_accept(parent, client.raw().cast::<uv::uv_stream_t>()) };
+    if status != 0 {
+        tracing::error!(status, "uv_accept failed for a transferred udp handle");
+        crate::handle::close_unadopted(*client);
+        return None;
+    }
+    // The constructor adopts the parked handle the same way it adopts one for a
+    // worker's own `dgram.createSocket`.
+    crate::handle::park_accept(client);
+    let object = instantiate(scope);
+    if object.is_none() {
+        if let Some(orphan) = take_pending_accept() {
+            crate::handle::close_unadopted(*orphan);
+        }
+    }
+    object
+}
+
 /// Builds the `UDP` constructor and its prototype.
 pub fn constructor<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -251,6 +359,10 @@ pub fn constructor<'s>(
     let function = template.get_function(scope).ok_or("cannot allocate UDP")?;
     function.set_name(name);
 
+    // Parked so a received datagram descriptor can be wrapped in a `UDP` object
+    // without re-running the constructor's `UdpHandle::new`.
+    CONSTRUCTOR.with(|slot| *slot.borrow_mut() = Some(v8::Global::new(scope.as_ref(), function)));
+
     Ok(function.into())
 }
 
@@ -285,7 +397,9 @@ fn new(
         return;
     }
 
-    let Some(handle) = UdpHandle::new() else {
+    // A receive in flight supplies the handle; anything else initialises one.
+    let handle = take_pending_accept().or_else(UdpHandle::new);
+    let Some(handle) = handle else {
         // `src/udp_wrap.cc` `CHECK_EQ(uv_udp_init(...), 0)`.
         crate::throw_error(scope, "uv_udp_init failed");
         return;
