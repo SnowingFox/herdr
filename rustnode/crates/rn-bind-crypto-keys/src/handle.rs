@@ -725,13 +725,16 @@ fn throw_encoding_error(scope: &mut v8::PinScope<'_, '_>, error: EncodingError) 
 }
 
 /// Reports a failed parse with the shape `ThrowCryptoError` builds.
-fn report_parse_failure(
+pub(crate) fn report_parse_failure(
     scope: &mut v8::PinScope<'_, '_>,
     failure: &rn_crypto_openssl::ParseFailure,
     message: &'static str,
 ) {
     match failure.kind {
         rn_crypto_openssl::ParseError::NeedPassphrase => throw(scope, &KeyError::MissingPassphrase),
+        // `THROW_ERR_CRYPTO_UNKNOWN_CIPHER`: the name did not resolve, so there
+        // is no OpenSSL detail to report and the code is the template's own.
+        rn_crypto_openssl::ParseError::UnknownCipher => throw(scope, &KeyError::UnknownCipher),
         rn_crypto_openssl::ParseError::NotRecognized | rn_crypto_openssl::ParseError::Failed => {
             throw(
                 scope,
@@ -1708,7 +1711,7 @@ pub(crate) fn export_jwk_fields(
     }
     let key = data.asymmetric_key().ok_or(KeyError::InvalidKeyType)?;
     let Some(algorithm) = key.algorithm() else {
-        return Err(KeyError::InvalidJwk("Unsupported JWK key type"));
+        return Err(KeyError::JwkUnsupportedKeyType);
     };
     if algorithm.is_rsa() || (handle_rsa_pss && algorithm == rn_crypto_openssl::RSA_PSS) {
         let detail = key.rsa_detail().ok_or(KeyError::InvalidKeyType)?;
@@ -1846,7 +1849,7 @@ pub(crate) fn export_jwk_fields(
         }
         return Ok(fields);
     }
-    Err(KeyError::InvalidJwk("Unsupported JWK key type"))
+    Err(KeyError::JwkUnsupportedKeyType)
 }
 
 /// The JWK `crv` name for an EC group, which is not the OpenSSL short name for

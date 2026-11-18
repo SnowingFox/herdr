@@ -24,7 +24,7 @@ use openssl::rsa::Padding;
 
 use crate::algorithm::{KeyAlgorithm, EC};
 use crate::encode::{KeyEncoding, KeyFormat, PrivateKeyEncoding, PublicKeyEncoding};
-use crate::error::{failure, failure_with_passphrase, ParseFailure, ParseResult};
+use crate::error::{failure, failure_with_passphrase, ParseError, ParseFailure, ParseResult};
 
 /// The EC point conversion form, from `internalBinding('constants').crypto`.
 ///
@@ -302,10 +302,20 @@ impl PKey {
                 // `GetPrivateKeyEncodingFromJs` has already rejected the other
                 // formats.
                 let Some(nid) = nid_of_cipher(name) else {
-                    return Err(failure(true));
+                    // `THROW_ERR_CRYPTO_UNKNOWN_CIPHER` in `crypto_keys.cc`'s
+                    // `GetPrivateKeyEncodingFromJs` caller, not a parse outcome:
+                    // `test-crypto-keygen.js` asserts `code` and message for a
+                    // `cipher: 'foo'` generate.
+                    return Err(ParseFailure {
+                        kind: ParseError::UnknownCipher,
+                        openssl_error: None,
+                    });
                 };
                 let Some(cipher) = openssl::symm::Cipher::from_nid(nid) else {
-                    return Err(failure(true));
+                    return Err(ParseFailure {
+                        kind: ParseError::UnknownCipher,
+                        openssl_error: None,
+                    });
                 };
                 Some(cipher)
             }

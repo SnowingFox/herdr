@@ -24,6 +24,7 @@
 mod algorithm;
 mod encode;
 mod error;
+mod keygen;
 mod parse;
 mod pkey;
 mod raw;
@@ -37,6 +38,10 @@ pub use encode::{KeyEncoding, KeyFormat, PrivateKeyEncoding, PublicKeyEncoding};
 pub use error::{
     clear_error, failure, failure_from, failure_with_passphrase, from_error_stack, openssl_error,
     openssl_error_for, ossl_code_for, OpenSslError, ParseError, ParseFailure, ParseResult,
+};
+pub use keygen::{
+    dh_group_prime, generate_dh_from_prime, generate_dh_group, generate_dh_parameters,
+    generate_dsa, KeyGenError, DH_GROUPS,
 };
 pub use parse::{
     parse_private_key, parse_private_key_der, parse_private_key_pem, parse_public_key,

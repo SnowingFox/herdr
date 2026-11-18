@@ -97,13 +97,16 @@ pub const MEMBERS: &[&str] = &[
     "KeyObjectHandle",
     "getKeyObjectSlots",
     "isKeyObject",
-    // The key-generation jobs. `SecretKeyGenJob` and the three key-pair jobs the
-    // traditional API uses are here; `DsaKeyPairGenJob` and `DhKeyPairGenJob`
-    // stay deferred with their own slices.
+    // The key-generation jobs. `SecretKeyGenJob` and all five key-pair jobs the
+    // traditional API builds are here; `DsaKeyPairGenJob` and `DhKeyPairGenJob`
+    // live in `rn-bind-crypto-keys` too, because they share the `[error, keys]`
+    // dispatch and the encoding tail the other three use.
     "SecretKeyGenJob",
     "RsaKeyPairGenJob",
     "EcKeyPairGenJob",
     "NamedKeyPairGenJob",
+    "DsaKeyPairGenJob",
+    "DhKeyPairGenJob",
     // The shared-secret derivation job, installed by `rn-bind-crypto-keys` from
     // `crypto_dh.cc` alongside the rest of the key surface.
     // `lib/internal/crypto/diffiehellman.js` builds it for
@@ -287,19 +290,6 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "The WebCrypto ChaCha20-Poly1305 job. The algorithm is available \
          (`getCiphers()` lists `chacha20-poly1305`), so this is the job class and the \
          WebCrypto key plumbing rather than a missing primitive.",
-    ),
-    (
-        "DhKeyPairGenJob",
-        "`generateKeyPairSync('dh', ...)`. The `KeyObject` surface it was deferred with is \
-         installed (`generateKeyPairSync('ec')` and `('rsa')` both work), so the gap is \
-         this job: `DhKeyGenTraits::Setup`, which builds a `DH` key from a group name, a \
-         prime or a prime length.",
-    ),
-    (
-        "DsaKeyPairGenJob",
-        "`generateKeyPairSync('dsa', ...)`. Deferred with `KeyObject` was inaccurate now \
-         that surface works; the gap is `DsaKeyGenTraits::Setup`'s `DSA` parameter \
-         generation, which no other job needs.",
     ),
     (
         "KEMDecapsulateJob",
