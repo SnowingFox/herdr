@@ -943,6 +943,14 @@ fn main() {
     // handler scheduled still fires.
     if entry_fatal {
         let code = rn_realm::runtime::emit_exit_after_failure(scope);
+        // Before terminating, because this branch exits without reaching the
+        // `flush_coverage` below it. Node writes `NODE_V8_COVERAGE` from the
+        // `V8CoverageConnection` destructor during environment teardown, and
+        // `std::process::exit` skips destructors — so a run that died on an
+        // uncaught error produced no coverage file at all, where the oracle still
+        // writes one. A coverage consumer therefore lost the whole run rather
+        // than the single failing test.
+        rn_bind_inspector::flush_coverage(scope);
         terminate(if code == 0 { 1 } else { code });
     }
 
