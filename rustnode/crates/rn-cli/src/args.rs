@@ -1784,11 +1784,33 @@ pub fn parse_with_env(
         // the one option whose value is optional, so a following flag is not an
         // error for it; Node lists the package's scripts instead.
         if rn_bind_options::takes_separate_value(argument) {
+            // `--stack-trace-limit` is the one option that is both an `kInteger`
+            // and forwarded to V8. Node's `Parse` pushes `arg` — the argument
+            // *as typed* — onto `v8_args` for it
+            // (`src/node_options-inl.h:503`), and that one line produces three
+            // different behaviours, all of which the oracle exhibits:
+            //
+            // * `--stack-trace-limit=42` pushes `--stack-trace-limit=42`, which
+            //   V8 accepts, so the limit really changes.
+            // * `--stack-trace-limit 42` pushes the *bare* `--stack-trace-limit`,
+            //   which V8 rejects with `missing value for flag … of type int` and
+            //   exits 9. The separate form is therefore not supported by Node at
+            //   all, and reproducing the forwarding reproduces the rejection.
+            // * `NODE_OPTIONS=--stack-trace-limit=42` takes `env.rs`'s own
+            //   `kInteger` branch, which does the same thing for the variable.
+            //
+            // Forwarding only the inline form would accept a command line the
+            // oracle refuses, which is the divergence this branch is meant to
+            // remove, so the argument goes over exactly as typed.
+            let also_v8 = rn_bind_options::is_v8_flag(argument);
             if !argument.starts_with("--") || !argument.contains('=') {
                 match args.get(index + 1) {
                     Some(value) if !value.starts_with('-') => {
                         options.exec_argv.push(argument.clone());
                         options.exec_argv.push(value.clone());
+                        if also_v8 {
+                            options.v8_args.push(argument.clone());
+                        }
                         if UNIMPLEMENTED.contains(&argument.as_str()) {
                             unimplemented.insert(argument.clone());
                         }
@@ -1814,6 +1836,9 @@ pub fn parse_with_env(
                 unimplemented.insert(argument.clone());
             }
             options.exec_argv.push(argument.clone());
+            if also_v8 {
+                options.v8_args.push(argument.clone());
+            }
             index += 1;
             continue;
         }
