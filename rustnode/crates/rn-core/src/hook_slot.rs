@@ -26,6 +26,11 @@ pub enum Hook {
     ImportMeta,
     /// `setImportMetaResolveInitializer`: backs `import.meta.resolve`.
     ImportMetaResolve,
+    /// `setEnhanceStackForFatalException`'s first callback.
+    EnhanceStackBeforeInspector,
+    /// `setEnhanceStackForFatalException`'s second callback: its *return value* is
+    /// the text a fatal error prints, `util.inspect`'s rendering of the error.
+    EnhanceStackAfterInspector,
 }
 
 /// V8 calls this to turn a stack trace into the `error.stack` string.
@@ -40,6 +45,11 @@ pub const DYNAMIC_IMPORT: Hook = Hook::DynamicImport;
 pub const IMPORT_META: Hook = Hook::ImportMeta;
 /// Callback behind `import.meta.resolve`.
 pub const IMPORT_META_RESOLVE: Hook = Hook::ImportMetaResolve;
+/// First half of `setEnhanceStackForFatalException`.
+pub const ENHANCE_STACK_BEFORE: Hook = Hook::EnhanceStackBeforeInspector;
+/// Second half of `setEnhanceStackForFatalException`. Its return value is the
+/// text a fatal error prints.
+pub const ENHANCE_STACK_AFTER: Hook = Hook::EnhanceStackAfterInspector;
 
 /// The loaders `realm.js` installs, once it has.
 type Loaders = (
@@ -432,6 +442,12 @@ thread_local! {
 
 struct HookState {
     prepare_stack_trace: Option<v8::Global<v8::Function>>,
+    /// `setEnhanceStackForFatalException`'s pair. Separate from
+    /// `prepare_stack_trace` because they are a different registration: sharing
+    /// one slot meant whichever `set*` ran last won, so `afterInspector` was
+    /// discarded at bootstrap and a fatal `ERR_*` printed no `code`.
+    enhance_stack_before: Option<v8::Global<v8::Function>>,
+    enhance_stack_after: Option<v8::Global<v8::Function>>,
     source_maps_enabled: bool,
     exit_requested: bool,
     stderr: Option<StderrWriter>,
@@ -481,6 +497,8 @@ impl Default for HookState {
     fn default() -> Self {
         Self {
             prepare_stack_trace: None,
+            enhance_stack_before: None,
+            enhance_stack_after: None,
             source_maps_enabled: false,
             exit_requested: false,
             stderr: None,
@@ -790,7 +808,11 @@ pub fn store(scope: &mut v8::PinScope, hook: Hook, callback: v8::Global<v8::Func
                 Hook::DynamicImport => hooks.dynamic_import = Some(callback),
                 Hook::ImportMeta => hooks.import_meta = Some(callback),
                 Hook::ImportMetaResolve => hooks.import_meta_resolve = Some(callback),
-                Hook::PrepareStackTrace | Hook::SourceMaps | Hook::ExitRequested => {}
+                Hook::PrepareStackTrace
+                | Hook::SourceMaps
+                | Hook::ExitRequested
+                | Hook::EnhanceStackBeforeInspector
+                | Hook::EnhanceStackAfterInspector => {}
             });
         }
         _ => {
@@ -798,6 +820,10 @@ pub fn store(scope: &mut v8::PinScope, hook: Hook, callback: v8::Global<v8::Func
                 let mut state = state.borrow_mut();
                 match hook {
                     Hook::PrepareStackTrace => state.prepare_stack_trace = Some(callback),
+                    Hook::EnhanceStackBeforeInspector => {
+                        state.enhance_stack_before = Some(callback)
+                    }
+                    Hook::EnhanceStackAfterInspector => state.enhance_stack_after = Some(callback),
                     Hook::SourceMaps | Hook::ExitRequested => {}
                     Hook::DynamicImport | Hook::ImportMeta | Hook::ImportMetaResolve => {}
                 }
@@ -875,8 +901,35 @@ fn stored<'s>(scope: &mut v8::PinScope<'s, '_>, hook: Hook) -> Option<v8::Local<
                 .as_ref()
                 .map(|callback| v8::Local::new(scope, callback))
         }),
+        Hook::EnhanceStackBeforeInspector => STATE.with(|state| {
+            let state = state.borrow();
+            state
+                .enhance_stack_before
+                .as_ref()
+                .map(|callback| v8::Local::new(scope, callback))
+        }),
+        Hook::EnhanceStackAfterInspector => STATE.with(|state| {
+            let state = state.borrow();
+            state
+                .enhance_stack_after
+                .as_ref()
+                .map(|callback| v8::Local::new(scope, callback))
+        }),
         Hook::SourceMaps | Hook::ExitRequested => None,
     }
+}
+
+/// `setEnhanceStackForFatalException`'s pair, for the uncaught reporter.
+pub fn enhance_stack_pair<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> (
+    Option<v8::Local<'s, v8::Function>>,
+    Option<v8::Local<'s, v8::Function>>,
+) {
+    (
+        stored(scope, Hook::EnhanceStackBeforeInspector),
+        stored(scope, Hook::EnhanceStackAfterInspector),
+    )
 }
 
 /// The `import()` callback `internal/modules/esm/utils.js` installs.
@@ -978,6 +1031,8 @@ pub fn set_flag(scope: &mut v8::PinScope, hook: Hook, value: bool) {
             Hook::SourceMaps => state.source_maps_enabled = value,
             Hook::ExitRequested => state.exit_requested = value,
             Hook::PrepareStackTrace
+            | Hook::EnhanceStackBeforeInspector
+            | Hook::EnhanceStackAfterInspector
             | Hook::DynamicImport
             | Hook::ImportMeta
             | Hook::ImportMetaResolve => {}
@@ -992,6 +1047,8 @@ pub fn flag(hook: Hook) -> bool {
             Hook::SourceMaps => state.source_maps_enabled,
             Hook::ExitRequested => state.exit_requested,
             Hook::PrepareStackTrace
+            | Hook::EnhanceStackBeforeInspector
+            | Hook::EnhanceStackAfterInspector
             | Hook::DynamicImport
             | Hook::ImportMeta
             | Hook::ImportMetaResolve => false,

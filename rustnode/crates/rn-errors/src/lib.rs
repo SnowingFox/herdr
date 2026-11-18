@@ -94,7 +94,11 @@ impl BindingModule for Errors {
             ),
             (
                 "setEnhanceStackForFatalException",
-                function(scope, "setEnhanceStackForFatalException", store_callback)?,
+                function(
+                    scope,
+                    "setEnhanceStackForFatalException",
+                    store_enhance_stack_pair,
+                )?,
             ),
             (
                 "setGetSourceMapErrorSource",
@@ -218,6 +222,31 @@ fn store_callback(
     };
     let global = v8::Global::new(scope, callback);
     rn_core::hook_slot::store(scope, rn_core::hook_slot::CALLBACK, global);
+}
+
+/// Stores `setEnhanceStackForFatalException`'s two callbacks, each in its own
+/// slot.
+///
+/// They arrive as one call with two arguments and are two different hooks: the
+/// first runs before an uncaught error reaches the inspector, the second after.
+/// Routing this through [`store_callback`] kept only the first, so
+/// `afterInspector` was never called and a fatal `ERR_*` printed a bare stack
+/// with no `code`.
+fn store_enhance_stack_pair(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
+    for (index, hook) in [
+        (0, rn_core::hook_slot::ENHANCE_STACK_BEFORE),
+        (1, rn_core::hook_slot::ENHANCE_STACK_AFTER),
+    ] {
+        let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(index)) else {
+            continue;
+        };
+        let global = v8::Global::new(scope, callback);
+        rn_core::hook_slot::store(scope, hook, global);
+    }
 }
 
 fn set_source_maps_enabled(
@@ -740,12 +769,50 @@ pub fn write_uncaught(scope: &mut v8::PinScope, text: &str) {
 /// Node wraps an uncaught rejection's message in `UnhandledPromiseRejection`
 /// framing; keeping that exact wording matters because tests and log scrapers
 /// match on it.
+/// Runs `setEnhanceStackForFatalException`'s two callbacks and returns whatever
+/// the last one that produced a string answered.
+///
+/// `src/node_errors.cc:486-501`: Node keeps the *return value* in `stack_trace`
+/// and prints that instead of `error.stack`. The second callback is
+/// `internal/errors.js`'s `afterInspector`, which returns
+/// `util.inspect(error, { customInspect: false, depth: max(depth, 5) })` — the
+/// rendering that carries a fatal error's `{ code: 'ERR_…', … }` block.
+///
+/// An enhancer that throws is ignored, as in Node: this runs while an error is
+/// already being reported.
+fn enhance_stack_text(
+    scope: &mut v8::PinScope<'_, '_>,
+    error: v8::Local<'_, v8::Value>,
+) -> Option<String> {
+    if !error.is_object() {
+        return None;
+    }
+    let (before, after) = rn_core::hook_slot::enhance_stack_pair(scope);
+    let mut text = None;
+    for enhancer in [before, after].into_iter().flatten() {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let scope = &mut try_catch.init();
+        let arguments = [error];
+        let answer = enhancer.call(scope, v8::undefined(scope).into(), &arguments);
+        if scope.has_caught() && !scope.has_terminated() {
+            let _ = scope.exception();
+        }
+        if let Some(answer) = answer.filter(|answer| answer.is_string()) {
+            text = Some(answer.to_rust_string_lossy(scope));
+        }
+    }
+    text
+}
+
 pub fn format_exception(
     scope: &mut v8::PinScope,
     error: v8::Local<v8::Value>,
     from_promise: bool,
 ) -> String {
-    let detail = if error.is_object() {
+    let enhanced = enhance_stack_text(scope, error);
+    let detail = if let Some(enhanced) = enhanced {
+        enhanced
+    } else if error.is_object() {
         let object = v8::Local::<v8::Object>::try_from(error).ok();
         let stack = object
             .and_then(|object| {
