@@ -15,7 +15,7 @@
 //! neither — but `test/common/**` and V8's own `Object.getOwnPropertyDescriptor`
 //! based checks can.
 
-use rn_bind_worker::Worker;
+use rn_bind_worker::{SpawnRequest, Worker, WorkerEnv, WorkerHandle, WorkerInitFailure};
 use rn_core::{AsyncIds, BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
@@ -223,5 +223,68 @@ fn the_registry_hands_out_one_object_per_namespace() {
         let first = registry.install(scope, "worker").expect("first install");
         let second = registry.install(scope, "worker").expect("second install");
         assert!(first.strict_equals(second.into()));
+    });
+}
+
+#[test]
+fn an_init_failure_becomes_the_custom_error_onexit_reports() {
+    // `lib/internal/worker.js:403` raises `new errorCodes[customErr](reason)` when
+    // `onexit`'s second argument is truthy, so a worker whose own setup failed has
+    // to surface that pair or the parent sees a bare exit code and no `error`
+    // event. This is the `kOnExit` half of `test-worker-init-failure`: 256 workers
+    // are started against an exhausted fd table, about a third cannot build their
+    // platform state, and each of those must report `ERR_WORKER_INIT_FAILED`.
+    //
+    // A `WorkerHandle` is not `Send` and owns a `v8::Global`, so this drives the
+    // same accessors the check phase does rather than a whole worker.
+    with_context(|scope| {
+        let port = rn_bind_messaging::port::MessagePortData::new();
+        let child = rn_bind_messaging::port::MessagePortData::new();
+        rn_bind_messaging::port::MessagePortData::entangle(&port, &child);
+        let handle = WorkerHandle::new(
+            SpawnRequest {
+                filename: String::new(),
+                eval: true,
+                name: "WorkerThread".to_string(),
+                exec_argv: Vec::new(),
+                resource_limits: [-1.0; 4],
+                argv: Vec::new(),
+                env: WorkerEnv::Copy(Vec::new()),
+            },
+            // The parent port is a `v8::Global<v8::Object>`, and the object's
+            // identity is irrelevant here: `custom_error` never reads it. A plain
+            // object keeps this test on the accessor it is about instead of on
+            // `MessagePort`'s template install.
+            v8::Global::new(scope, v8::Object::new(scope)),
+            child,
+        );
+
+        // Nothing recorded yet: `onexit`'s custom-error arguments are both null,
+        // which is what a worker that ran normally reports.
+        let (code, reason) = handle.custom_error(scope);
+        assert!(
+            code.is_none() && reason.is_none(),
+            "no failure, no custom error"
+        );
+
+        handle
+            .init_failure_slot()
+            .lock()
+            .expect("the slot is not poisoned")
+            .replace(WorkerInitFailure::new("EMFILE"));
+
+        let (code, reason) = handle.custom_error(scope);
+        let code = code.expect("the code is reported");
+        let reason = reason.expect("the reason is reported");
+        assert_eq!(code.to_rust_string_lossy(scope), "ERR_WORKER_INIT_FAILED");
+        assert_eq!(reason.to_rust_string_lossy(scope), "EMFILE");
+        assert_eq!(
+            handle
+                .init_failure()
+                .as_ref()
+                .map(|failure| failure.reason.as_str()),
+            Some("EMFILE"),
+            "the failure stays readable after `custom_error` took it"
+        );
     });
 }

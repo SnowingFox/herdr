@@ -77,6 +77,15 @@ pub struct WorkerThread {
     /// Set by the near-heap-limit callback, so the parent raises
     /// `ERR_WORKER_OUT_OF_MEMORY` for this worker.
     pub out_of_memory: Arc<std::sync::atomic::AtomicBool>,
+    /// Where this thread records an `ERR_WORKER_INIT_FAILED` it hit while setting
+    /// itself up.
+    ///
+    /// `WorkerThreadData`'s constructor and `Worker::Run` both `Exit` with this
+    /// error before returning, which is what makes a worker that could not build
+    /// its loop or its realm raise `error` on the parent side instead of ending
+    /// silently. The slot is the handle's, so the parent's check phase reads what
+    /// this thread wrote.
+    pub init_failure: Arc<std::sync::Mutex<Option<crate::handle::WorkerInitFailure>>>,
 }
 
 /// The diagnostic options a worker was started with.
@@ -152,6 +161,27 @@ impl WorkerThread {
             // exit is reported. A foreign thread cannot touch that handle
             // directly, which is the whole reason this goes through the wake.
             let _ = parent.notify();
+        }
+    }
+
+    /// Records an `ERR_WORKER_INIT_FAILED` for the parent to raise.
+    ///
+    /// `w->Exit(ExitCode::kGenericUserError, "ERR_WORKER_INIT_FAILED", reason)` in
+    /// `src/node_worker.cc` does exactly two things this needs: it records the
+    /// custom error and exits with code 1. The exit code is the caller's return
+    /// value; the record is this, and the parent's check phase turns it into the
+    /// `error` event.
+    fn record_init_failure(&self, failure: crate::handle::WorkerInitFailure) {
+        match self.init_failure.lock() {
+            Ok(mut slot) => {
+                if slot.is_none() {
+                    *slot = Some(failure);
+                }
+            }
+            // A poisoned lock means the worker thread panicked while recording a
+            // failure, which is a bug in this module rather than in the worker.
+            // Losing the message is the only remaining option, so it is logged.
+            Err(_) => tracing::error!("a worker's init failure could not be recorded"),
         }
     }
 
@@ -393,6 +423,9 @@ impl WorkerThread {
             Ok(registry) => registry,
             Err(message) => {
                 tracing::error!(%message, "the worker's binding registry could not be built");
+                self.record_init_failure(crate::handle::WorkerInitFailure::new(
+                    REGISTRY_INIT_FAILURE_REASON,
+                ));
                 return 1;
             }
         };
@@ -436,6 +469,9 @@ impl WorkerThread {
         argv.extend(self.request.argv.iter().cloned());
         if let Err(message) = rn_realm::install_globals(scope, &argv) {
             tracing::error!(%message, "the worker's bootstrap globals failed");
+            self.record_init_failure(crate::handle::WorkerInitFailure::new(
+                BOOTSTRAP_FAILURE_REASON,
+            ));
             return 1;
         }
 
@@ -448,6 +484,9 @@ impl WorkerThread {
             Ok(loaders) => loaders,
             Err(message) => {
                 tracing::error!(%message, "the worker's realm bootstrap failed");
+                self.record_init_failure(crate::handle::WorkerInitFailure::new(
+                    BOOTSTRAP_FAILURE_REASON,
+                ));
                 return 1;
             }
         };
@@ -509,7 +548,24 @@ impl WorkerThread {
         //
         // Safe on a thread that already has the handle: the second call replaces
         // the wake closure and returns the existing token.
-        crate::install_check_phase();
+        //
+        // A failure here is a failed worker, not a warning: without this thread's
+        // `uv_async_t`, `ThreadToken::notify` from the parent finds nothing, so the
+        // `LOAD_SCRIPT` message the parent has already posted can never wake this
+        // loop. Before this was reported, the port's queue stayed non-empty while
+        // the loop spun in `has_external_work` with nothing able to drain it — the
+        // fd-exhaustion repro hung for exactly this reason, because the handle is
+        // created from a fresh pipe and there were none left.
+        if !crate::install_check_phase() {
+            tracing::error!(
+                thread_id = self.thread_id,
+                "the worker's cross-thread wake handle could not be created"
+            );
+            self.record_init_failure(crate::handle::WorkerInitFailure::new(
+                WAKE_INIT_FAILURE_REASON,
+            ));
+            return 1;
+        }
 
         // `worker_thread.js` waits for `LOAD_SCRIPT` on the port and runs the
         // user's script from that handler, so it has to run *before* the loop:
@@ -529,10 +585,24 @@ impl WorkerThread {
         install_fatal_handler_guard(scope);
 
         // ---- 5. the loop -----------------------------------------------------
-        let Ok(mut event_loop) = rn_io::Loop::new(rn_io::Backend::Libuv) else {
-            tracing::error!("the worker's event loop could not be created");
-            return 1;
+        // `WorkerThreadData`'s constructor starts with `uv_loop_init`, and a
+        // failure there is `w->Exit(kGenericUserError, "ERR_WORKER_INIT_FAILED",
+        // uv_err_name_r(ret))` rather than a silent return — which is what makes a
+        // worker that cannot allocate a loop (every fd in use, so libuv cannot
+        // create its async pipe) raise `error` on the parent instead of hanging
+        // it. `test-worker-init-failure` is the case: at `ulimit -n 128` most
+        // workers in a 256-worker batch fail exactly here.
+        let event_loop = match rn_io::Loop::new(rn_io::Backend::Libuv) {
+            Ok(event_loop) => event_loop,
+            Err(message) => {
+                tracing::error!(%message, "the worker's event loop could not be created");
+                self.record_init_failure(crate::handle::WorkerInitFailure::new(
+                    LOOP_INIT_FAILURE_REASON,
+                ));
+                return 1;
+            }
         };
+        let mut event_loop = event_loop;
         let mut scheduler = WorkerScheduler {
             scope,
             stopping: Arc::clone(&self.stopping),
@@ -548,6 +618,44 @@ impl WorkerThread {
 }
 
 /// The process's `execPath`, which `process.argv[0]` reports in a worker too.
+/// The reason a worker reports when its own event loop could not be created.
+///
+/// `WorkerThreadData`'s constructor reports `uv_err_name_r(ret)` here, which for
+/// an exhausted fd table is `EMFILE`. rustnode's `Loop::new` reports its failure
+/// as a message rather than a status, and the status is not one of the names
+/// `test-worker-init-failure` accepts, so the honest answer is the code that
+/// describes what happened: the loop is the platform setup that failed.
+const LOOP_INIT_FAILURE_REASON: &str = "Failed to initialize the worker's event loop";
+
+/// The reason a worker reports when its binding registry could not be built.
+///
+/// `internalBinding` is what every builtin module in the worker's realm resolves
+/// through, so a worker that cannot build it cannot run JavaScript at all. Node
+/// has no direct equivalent — its registry is built once per process — so the
+/// text is rustnode's own, but the code is the one Node uses for a worker that
+/// never got as far as running.
+const REGISTRY_INIT_FAILURE_REASON: &str = "Failed to create the worker's binding registry";
+
+/// The reason a worker reports when its realm bootstrap failed.
+///
+/// This is `Worker::Run`'s `"Failed to create new Context"` case in
+/// `src/node_worker.cc:378`: the isolate exists but the realm on top of it does
+/// not. rustnode's bootstrap covers the context and the registry together, so one
+/// constant covers both of its failure sites.
+const BOOTSTRAP_FAILURE_REASON: &str = "Failed to create new Context";
+
+/// The reason a worker reports when its cross-thread wake handle could not be
+/// created.
+///
+/// Node has no equivalent: a port's `uv_async_t` is created in `Worker::New` on
+/// the parent's loop, and a failure there is reported through
+/// `THROW_ERR_WORKER_INIT_FAILED` with the libuv name — `EMFILE` when the fd
+/// table is full, which is the case the fd-exhaustion repro exercises. The
+/// handle here is per thread rather than per port, so the failure lands on the
+/// worker's own thread instead, but the meaning to the caller is the same: this
+/// worker cannot receive anything.
+const WAKE_INIT_FAILURE_REASON: &str = "Failed to initialize the worker's message channel";
+
 fn exec_path() -> String {
     std::env::current_exe()
         .map(|path| path.to_string_lossy().into_owned())

@@ -102,7 +102,9 @@ use std::cell::RefCell;
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
 
-pub use crate::handle::{next_thread_id, SpawnRequest, WorkerHandle, JOIN_TIMEOUT};
+pub use crate::handle::{
+    next_thread_id, SpawnRequest, WorkerHandle, WorkerInitFailure, JOIN_TIMEOUT,
+};
 pub use crate::parent::{any_keeps_loop_alive, has_finished, report_finished, tracked_count};
 
 /// The worker crate's share of the check phase.
@@ -121,7 +123,15 @@ fn report_worker_exits(scope: &mut v8::PinScope<'_, '_>) {
 /// is what makes `worker.on('exit')` fire; in a worker it is harmless — that
 /// thread has no workers of its own unless the worker creates one, in which case
 /// it needs exactly the same wiring.
-pub fn install_check_phase() {
+///
+/// Returns whether this thread got a cross-thread wake handle. That is the one
+/// part of the wiring that can fail, and the failure is *not* cosmetic: without
+/// the handle, `ThreadToken::notify` finds nothing when another thread posts to a
+/// port this thread owns, so a worker's `parentPort` can never be woken. A worker
+/// that cannot be woken must be reported as a failed worker rather than left to
+/// wait for a message it will never observe — see [`crate::run`], which treats a
+/// `false` here as `ERR_WORKER_INIT_FAILED`.
+pub fn install_check_phase() -> bool {
     // The parent needs a `uv_async_t` of its own before any worker can tell it
     // anything: `ThreadToken::notify` finds no handle without one, so a worker's
     // finish would be a silent no-op. The callback runs on *this* thread, from
@@ -149,9 +159,10 @@ pub fn install_check_phase() {
     // after the loop has already decided it has nothing to do. A
     // `getHeapStatistics()` answer is the same kind of owed work.
     rn_bind_timers::add_check_phase_pending_predicate(has_finished);
+    token.is_some()
 }
 pub use crate::run::WorkerThread;
-pub use crate::worker::install_worker_constructor;
+pub use crate::worker::{install_worker_constructor, WorkerEnv};
 
 /// Members exposed on the namespace object, matching `contracts/worker.json`.
 pub const MEMBERS: &[&str] = &[

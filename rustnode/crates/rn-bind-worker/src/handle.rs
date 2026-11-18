@@ -143,13 +143,21 @@ pub struct WorkerHandle {
     /// `custom_error_`.
     ///
     /// An atomic rather than the two strings Node stores, because the only
-    /// custom error rustnode can produce is `ERR_WORKER_OUT_OF_MEMORY` with its
-    /// one fixed reason — that is the only place `Worker::Exit` is called with a
-    /// non-null `error_code`, and every other exit passes `nullptr`. The flag is
-    /// set on the worker's thread by the near-heap-limit callback and read on the
+    /// custom error of this kind rustnode can produce is
+    /// `ERR_WORKER_OUT_OF_MEMORY` with its one fixed reason. The flag is set on
+    /// the worker's thread by the near-heap-limit callback and read on the
     /// parent's once the thread has finished, which is what the release/acquire
     /// pair on `finished` orders.
     out_of_memory: Arc<AtomicBool>,
+    /// The custom error the worker's thread recorded when its own setup failed.
+    ///
+    /// This is [`WorkerInitFailure`], the second of Node's two `custom_error_`
+    /// producers. It has to cross from the worker's thread to the parent's, and
+    /// unlike the out-of-memory flag it carries a variable reason, so it is a
+    /// `Mutex<Option<..>>` rather than an atomic. Written once by
+    /// [`WorkerHandle::record_init_failure`] and read once by
+    /// [`WorkerHandle::custom_error`].
+    init_failure: Arc<Mutex<Option<WorkerInitFailure>>>,
     /// The taker objects waiting for this worker's heap statistics.
     ///
     /// `Worker::GetHeapStatistics` creates a `WorkerHeapStatisticsTaker` on the
@@ -188,6 +196,41 @@ pub struct WorkerHandle {
                   not an indirection the vector already provides"
     )]
     snapshot_interrupt_data: RefCell<Vec<Box<crate::heap_snapshot::InterruptData>>>,
+}
+
+/// The custom error a worker's thread recorded when its own setup failed.
+///
+/// `WorkerThreadData`'s constructor and `Worker::Run` both call
+/// `w->Exit(ExitCode::kGenericUserError, "ERR_WORKER_INIT_FAILED", reason)` and
+/// return, which is what turns a worker that could not build its loop, isolate
+/// or context into an `error` event instead of a silent thread that never
+/// reports. `kOnExit` in `lib/internal/worker.js` reads the code and reason back
+/// out of `onexit`'s second and third arguments.
+///
+/// Carried across the thread boundary because the failure happens on the
+/// worker's thread and the event is raised on the parent's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerInitFailure {
+    /// The `code` the emitted error carries: `ERR_WORKER_INIT_FAILED`.
+    pub code: String,
+    /// The reason Node would fill `%s` with.
+    ///
+    /// Node formats this with `uv_err_name_r`, so a failed loop shows up as
+    /// `EMFILE`; rustnode's setup steps report a message rather than a libuv
+    /// status, so these are fixed phrases describing which step failed. The
+    /// `code` is what a program branches on, and it matches Node exactly.
+    pub reason: String,
+}
+
+impl WorkerInitFailure {
+    /// `Worker::Run`'s `ERR_WORKER_INIT_FAILED` with a fixed reason.
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            code: "ERR_WORKER_INIT_FAILED".to_string(),
+            reason: reason.into(),
+        }
+    }
 }
 
 /// One `worker.getHeapStatistics()` call waiting for its numbers.
@@ -313,6 +356,7 @@ impl WorkerHandle {
             reported: Cell::new(false),
             object: RefCell::new(None),
             out_of_memory: Arc::new(AtomicBool::new(false)),
+            init_failure: Arc::new(Mutex::new(None)),
             pending_heap_statistics: RefCell::new(Vec::new()),
             interrupt_data: RefCell::new(Vec::new()),
             parent_wake: Cell::new(None),
@@ -431,8 +475,14 @@ impl WorkerHandle {
     /// `src/node_worker.cc:496-505` passes `custom_error_` and
     /// `custom_error_str_` as `Null` when they were never set, and `kOnExit` in
     /// `lib/internal/worker.js` tests the first for truthiness before raising
-    /// `new errorCodes[customErr](customErrReason)`. `ERR_WORKER_OUT_OF_MEMORY`
-    /// is the only one this runtime can produce, so the pair is fixed.
+    /// `new errorCodes[customErr](customErrReason)`.
+    ///
+    /// Two things set them, and both are reproduced here: `Worker::NearHeapLimit`
+    /// records `ERR_WORKER_OUT_OF_MEMORY`, and a worker whose own setup failed
+    /// records `ERR_WORKER_INIT_FAILED` with the reason. The init failure wins,
+    /// because it is recorded once and immediately ends the thread — a worker
+    /// that never got as far as running JavaScript cannot also have exhausted a
+    /// heap.
     #[must_use]
     pub fn custom_error<'s>(
         &self,
@@ -441,6 +491,11 @@ impl WorkerHandle {
         Option<v8::Local<'s, v8::Value>>,
         Option<v8::Local<'s, v8::Value>>,
     ) {
+        if let Some(failure) = self.init_failure() {
+            let code = v8::String::new(scope, &failure.code);
+            let reason = v8::String::new(scope, &failure.reason);
+            return (code.map(Into::into), reason.map(Into::into));
+        }
         if !self.out_of_memory.load(Ordering::SeqCst) {
             return (None, None);
         }
@@ -452,6 +507,16 @@ impl WorkerHandle {
     /// Records that this worker ran out of heap, the way `Worker::Exit` does.
     pub fn set_out_of_memory(&self) {
         self.out_of_memory.store(true, Ordering::SeqCst);
+    }
+
+    /// The recorded init failure, if the worker's thread hit one.
+    ///
+    /// Written by the worker's thread through [`WorkerHandle::init_failure_slot`],
+    /// never here: the failure is recorded at the point it happens, and the thread
+    /// then unwinds, so the first record is the only one the parent can read.
+    #[must_use]
+    pub fn init_failure(&self) -> Option<WorkerInitFailure> {
+        self.init_failure.lock().ok()?.clone()
     }
 
     /// Asks the worker's isolate to stop executing.
@@ -522,6 +587,16 @@ impl WorkerHandle {
     /// The isolate slot, for the worker thread to publish its handle into.
     pub(crate) fn isolate_slot(&self) -> Arc<Mutex<Option<v8::IsolateHandle>>> {
         Arc::clone(&self.isolate)
+    }
+
+    /// The init-failure slot, for the worker thread to record a setup failure in.
+    ///
+    /// This is how `w->Exit(kGenericUserError, "ERR_WORKER_INIT_FAILED", reason)`
+    /// crosses back to the parent: the failure happens on the worker's thread and
+    /// the `error` event is raised from the parent's check phase, so the message
+    /// has to be shared rather than returned.
+    pub fn init_failure_slot(&self) -> Arc<Mutex<Option<WorkerInitFailure>>> {
+        Arc::clone(&self.init_failure)
     }
 
     /// The exit-code slot, for the worker thread to write.
