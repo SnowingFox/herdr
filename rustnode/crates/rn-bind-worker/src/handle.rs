@@ -491,17 +491,26 @@ impl WorkerHandle {
         Option<v8::Local<'s, v8::Value>>,
         Option<v8::Local<'s, v8::Value>>,
     ) {
+        // Out of memory is checked first, and the order is load-bearing. Node
+        // has one `custom_error_` pair that `Worker::Exit` overwrites, and an
+        // OOM is reported by the worker's own near-heap-limit callback *after*
+        // its setup succeeded, so it can never coexist with an init failure
+        // there. Here the two live in different fields, and a worker that fails
+        // setup while the heap is already near its limit can carry both; taking
+        // the init failure first reported `ERR_WORKER_INIT_FAILED` where Node
+        // reports `ERR_WORKER_OUT_OF_MEMORY`, which is what
+        // `test-worker-nearheaplimit-deadlock.js` asserts.
+        if self.out_of_memory.load(Ordering::SeqCst) {
+            let code = v8::String::new(scope, "ERR_WORKER_OUT_OF_MEMORY");
+            let reason = v8::String::new(scope, "JS heap out of memory");
+            return (code.map(Into::into), reason.map(Into::into));
+        }
         if let Some(failure) = self.init_failure() {
             let code = v8::String::new(scope, &failure.code);
             let reason = v8::String::new(scope, &failure.reason);
             return (code.map(Into::into), reason.map(Into::into));
         }
-        if !self.out_of_memory.load(Ordering::SeqCst) {
-            return (None, None);
-        }
-        let code = v8::String::new(scope, "ERR_WORKER_OUT_OF_MEMORY");
-        let reason = v8::String::new(scope, "JS heap out of memory");
-        (code.map(Into::into), reason.map(Into::into))
+        (None, None)
     }
 
     /// Records that this worker ran out of heap, the way `Worker::Exit` does.

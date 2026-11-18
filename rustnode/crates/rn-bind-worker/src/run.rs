@@ -185,6 +185,23 @@ impl WorkerThread {
         }
     }
 
+    /// [`Self::record_init_failure`] for a setup step that can lose a race with
+    /// `terminate()`.
+    ///
+    /// A `terminate()` during startup is not an initialization failure: Node's
+    /// `Worker` reports the termination and nothing else, because
+    /// `test-worker-message-port-transfer-terminate.js` creates ten workers and
+    /// terminates each one on the next `setImmediate`, which regularly lands
+    /// mid-bootstrap. Recording the failure there turned a requested shutdown
+    /// into an `error` event carrying `ERR_WORKER_INIT_FAILED`, and that test
+    /// asserts the process does not crash on it.
+    fn record_init_failure_unless_stopping(&self, failure: crate::handle::WorkerInitFailure) {
+        if self.stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        self.record_init_failure(failure);
+    }
+
     fn run_inner(&self) -> i32 {
         // `src/node_worker.cc:701`: when `options.execArgv` was not an array,
         // the worker inherits the parent's `env->exec_argv()`, and
@@ -423,7 +440,7 @@ impl WorkerThread {
             Ok(registry) => registry,
             Err(message) => {
                 tracing::error!(%message, "the worker's binding registry could not be built");
-                self.record_init_failure(crate::handle::WorkerInitFailure::new(
+                self.record_init_failure_unless_stopping(crate::handle::WorkerInitFailure::new(
                     REGISTRY_INIT_FAILURE_REASON,
                 ));
                 return 1;
@@ -469,7 +486,7 @@ impl WorkerThread {
         argv.extend(self.request.argv.iter().cloned());
         if let Err(message) = rn_realm::install_globals(scope, &argv) {
             tracing::error!(%message, "the worker's bootstrap globals failed");
-            self.record_init_failure(crate::handle::WorkerInitFailure::new(
+            self.record_init_failure_unless_stopping(crate::handle::WorkerInitFailure::new(
                 BOOTSTRAP_FAILURE_REASON,
             ));
             return 1;
@@ -484,7 +501,7 @@ impl WorkerThread {
             Ok(loaders) => loaders,
             Err(message) => {
                 tracing::error!(%message, "the worker's realm bootstrap failed");
-                self.record_init_failure(crate::handle::WorkerInitFailure::new(
+                self.record_init_failure_unless_stopping(crate::handle::WorkerInitFailure::new(
                     BOOTSTRAP_FAILURE_REASON,
                 ));
                 return 1;
