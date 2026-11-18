@@ -468,6 +468,130 @@ pub(crate) fn throw_construct_call_required(scope: &mut v8::PinScope<'_, '_>) {
     scope.throw_exception(exception);
 }
 
+enum ErrorClass {
+    Type,
+    Range,
+}
+
+/// Throws a typed exception (`TypeError` or `RangeError`) with a Node-style
+/// `code` property.
+fn throw_with_code(
+    scope: &mut v8::PinScope<'_, '_>,
+    class: ErrorClass,
+    code: &'static str,
+    message: &str,
+) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = match class {
+        ErrorClass::Type => v8::Exception::type_error(scope, text),
+        ErrorClass::Range => v8::Exception::range_error(scope, text),
+    };
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
+        if let (Some(key), Some(value)) =
+            (v8::String::new(scope, "code"), v8::String::new(scope, code))
+        {
+            let _ = object.set(scope, key.into(), value.into());
+        }
+    }
+    scope.throw_exception(exception);
+}
+
+/// Formats the argument detail suffix used by Node's `ERR_INVALID_ARG_TYPE`.
+fn invalid_arg_type_suffix(scope: &mut v8::PinScope<'_, '_>, value: Local<v8::Value>) -> String {
+    if value.is_null() {
+        return " Received null".to_string();
+    }
+    if value.is_undefined() {
+        return " Received undefined".to_string();
+    }
+    if value.is_function() {
+        if let Ok(function) = Local::<v8::Function>::try_from(value) {
+            let name = function.get_name(scope);
+            let name = name.to_rust_string_lossy(scope);
+            if !name.is_empty() {
+                return format!(" Received function {name}");
+            }
+        }
+        return " Received function".to_string();
+    }
+    if value.is_object() {
+        if let Ok(object) = Local::<v8::Object>::try_from(value) {
+            let ctor_key = v8::String::new(scope, "constructor");
+            let name_key = v8::String::new(scope, "name");
+            if let (Some(ctor_key), Some(name_key)) = (ctor_key, name_key) {
+                if let Some(ctor) = object.get(scope, ctor_key.into()) {
+                    if ctor.is_object() {
+                        if let Ok(ctor_object) = Local::<v8::Object>::try_from(ctor) {
+                            if let Some(name) = ctor_object.get(scope, name_key.into()) {
+                                if name.is_string() {
+                                    if let Ok(name) = Local::<v8::String>::try_from(name) {
+                                        let name = name.to_rust_string_lossy(scope);
+                                        if !name.is_empty() {
+                                            return format!(" Received an instance of {name}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return " Received an instance of Object".to_string();
+    }
+    if value.is_boolean() {
+        let boolean = value.boolean_value(scope);
+        return format!(" Received type boolean ({boolean})");
+    }
+    if value.is_string() {
+        if let Ok(string) = Local::<v8::String>::try_from(value) {
+            let raw = string.to_rust_string_lossy(scope);
+            let escaped = raw
+                .replace('\\', "\\\\")
+                .replace('\'', "\\'")
+                .replace('\n', "\\n")
+                .replace('\r', "\\r")
+                .replace('\t', "\\t");
+            let mut inspected = format!("'{escaped}'");
+            if inspected.len() > 28 {
+                inspected.truncate(25);
+                inspected.push_str("...");
+            }
+            return format!(" Received type string ({inspected})");
+        }
+    }
+    if value.is_number() {
+        if let Some(number) = value.number_value(scope) {
+            return format!(" Received type number ({})", format_number(number));
+        }
+    }
+    " Received value".to_string()
+}
+
+/// Node's number formatting for argument diagnostics (`NaN`, `Infinity`,
+/// integers without `.0`).
+fn format_number(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".to_string();
+    }
+    if number.is_infinite() {
+        return if number.is_sign_negative() {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        };
+    }
+    if number == 0.0 {
+        return "0".to_string();
+    }
+    if number.fract() == 0.0 {
+        return format!("{number:.0}");
+    }
+    number.to_string()
+}
+
 /// The trailing argument of a call, which selects the delivery mode.
 fn tail<'s>(args: &v8::FunctionCallbackArguments<'s>) -> Option<Local<'s, v8::Value>> {
     if args.length() <= 0 {
@@ -492,6 +616,45 @@ fn required_path<'s>(
             None
         }
     }
+}
+
+/// Reads and validates an fd argument with Node's type/range diagnostics.
+fn required_fd<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: &v8::FunctionCallbackArguments<'s>,
+    index: i32,
+) -> Option<i32> {
+    let value = args.get(index);
+    if !value.is_number() {
+        let message = format!(
+            "The \"fd\" argument must be of type number.{}",
+            invalid_arg_type_suffix(scope, value)
+        );
+        throw_with_code(scope, ErrorClass::Type, "ERR_INVALID_ARG_TYPE", &message);
+        return None;
+    }
+    let Some(number) = value.number_value(scope) else {
+        let message = "The \"fd\" argument must be of type number. Received undefined".to_string();
+        throw_with_code(scope, ErrorClass::Type, "ERR_INVALID_ARG_TYPE", &message);
+        return None;
+    };
+    if !number.is_finite() || number.fract() != 0.0 {
+        let message = format!(
+            "The value of \"fd\" is out of range. It must be an integer. Received {}",
+            format_number(number)
+        );
+        throw_with_code(scope, ErrorClass::Range, "ERR_OUT_OF_RANGE", &message);
+        return None;
+    }
+    if !(0.0..=(i32::MAX as f64)).contains(&number) {
+        let message = format!(
+            "The value of \"fd\" is out of range. It must be >= 0 && <= 2147483647. Received {}",
+            format_number(number)
+        );
+        throw_with_code(scope, ErrorClass::Range, "ERR_OUT_OF_RANGE", &message);
+        return None;
+    }
+    Some(number as i32)
 }
 
 /// Wraps stat slots as the typed array the JS unpacks.
@@ -772,7 +935,9 @@ fn close_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let completion = Completion::from_result(fsops::close(fd));
     conclude!(scope, args, rv, completion);
 }
@@ -785,7 +950,9 @@ fn read_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let offset = crate::args::int64(scope, args.get(2)).unwrap_or(0).max(0) as usize;
     let length = crate::args::int64(scope, args.get(3)).unwrap_or(0).max(0) as usize;
     let position = crate::args::position(scope, args.get(4));
@@ -817,7 +984,9 @@ fn read_buffers_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let position = crate::args::position(scope, args.get(2));
     let Some(buffers) = view_array(scope, args.get(1)) else {
         throw_error(scope, &FsError::from_errno("read", libc::EINVAL));
@@ -867,7 +1036,9 @@ fn write_buffer_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let offset = crate::args::int64(scope, args.get(2)).unwrap_or(0).max(0) as usize;
     let length = crate::args::int64(scope, args.get(3)).unwrap_or(0).max(0) as usize;
     let position = crate::args::position(scope, args.get(4));
@@ -898,7 +1069,9 @@ fn write_buffers_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let position = crate::args::position(scope, args.get(2));
     let Some(buffers) = view_array(scope, args.get(1)) else {
         throw_error(scope, &FsError::from_errno("write", libc::EINVAL));
@@ -948,7 +1121,9 @@ fn write_string_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let position = crate::args::int64(scope, args.get(2)).unwrap_or(-1);
     let encoding = crate::args::Encoding::from_value(Some(args.get(3)), scope);
     let Ok(string) = Local::<v8::String>::try_from(args.get(1)) else {
@@ -973,7 +1148,9 @@ fn ftruncate_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let length = crate::args::int64(scope, args.get(1)).unwrap_or(0).max(0);
     let completion = Completion::from_result(fsops::ftruncate(fd, length));
     conclude!(scope, args, rv, completion);
@@ -985,7 +1162,9 @@ fn fsync_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let completion = Completion::from_result(fsops::fsync(fd));
     conclude!(scope, args, rv, completion);
 }
@@ -996,7 +1175,9 @@ fn fdatasync_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let completion = Completion::from_result(fsops::fdatasync(fd));
     conclude!(scope, args, rv, completion);
 }
@@ -1079,7 +1260,9 @@ fn fstat_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let bigint = args.length() > 1 && args.get(1).boolean_value(scope);
     let suppress = args.length() > 3 && args.get(3).is_true();
 
@@ -1749,7 +1932,9 @@ fn fchmod_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let mode = crate::args::uint32(scope, args.get(1)).unwrap_or(0o666);
     let completion = Completion::from_result(fsops::fchmod(fd, mode));
     conclude!(scope, args, rv, completion);
@@ -1797,7 +1982,9 @@ fn fchown_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let uid = crate::args::uint32(scope, args.get(1)).unwrap_or(0);
     let gid = crate::args::uint32(scope, args.get(2)).unwrap_or(0);
     let completion = Completion::from_result(fsops::fchown(fd, uid, gid));
@@ -1868,7 +2055,9 @@ fn futimes_binding<'a, 's, 'i>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let fd = crate::args::int32(scope, args.get(0)).unwrap_or(-1);
+    let Some(fd) = required_fd(scope, &args, 0) else {
+        return;
+    };
     let atime = time_spec(scope, args.get(1));
     let mtime = time_spec(scope, args.get(2));
     let completion = Completion::from_result(fsops::futimes(fd, atime, mtime));
