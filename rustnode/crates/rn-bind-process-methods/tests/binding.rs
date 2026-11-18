@@ -42,8 +42,8 @@ fn run(script: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-const PRELUDE: &str = "const realm = require('internal/bootstrap/realm');\
-const pm = realm.internalBinding('process_methods');";
+const PRELUDE: &str = "\
+const pm = require('internal/test/binding').internalBinding('process_methods');";
 
 #[test]
 fn cwd_matches_the_directory_the_process_runs_in() {
@@ -205,6 +205,11 @@ fn patching_the_process_object_sets_pid_and_ppid_read_only() {
 fn raw_debug_writes_to_stderr_not_stdout() {
     let output = Command::new(rustnode())
         .arg("--expose-internals")
+        // The stderr assertion below is exact, and `internal/test/binding` emits
+        // Node's own "for internal testing only" warning on stderr — the oracle
+        // does too. `--no-warnings` keeps the assertion about `_rawDebug` rather
+        // than about the prelude's own noise.
+        .arg("--no-warnings")
         .arg("-e")
         .arg(format!(
             "{PRELUDE} console.log('out'); pm._rawDebug('err');"

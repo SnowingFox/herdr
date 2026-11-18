@@ -1868,6 +1868,7 @@ dependencies = [
  "rn-bindings",
  "rn-builtins",
  "rn-core",
+ "rn-env",
  "rn-errors",
  "rn-io",
  "rn-js2c",

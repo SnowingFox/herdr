@@ -352,12 +352,21 @@ impl Store {
                 && option.kind != kind::NO_OP
                 && option.kind != kind::V8_OPTION
             {
+                // Whether the value arrived inline decides the leading-dash
+                // rule: `--eval=-0` carries `-0` as its value, while `-e -0` is
+                // `-e requires an argument` because `Parse` refuses a *separate*
+                // value starting with `-` (`src/node_options-inl.h:483`).
+                // Applying that rule to the inline form dropped the code
+                // entirely, which made `--print --eval=-0` print `undefined`
+                // where Node prints `-0`.
+                let from_argument = value.is_some();
                 let Some(value_text) = value.take().or_else(|| pending.pop_front()) else {
                     continue;
                 };
-                // A value may not begin with `-`: that would be a flag the user
-                // meant separately. A leading `\-` escapes one.
-                if value_text.starts_with("\\-") {
+                if from_argument {
+                    value = Some(value_text);
+                } else if value_text.starts_with("\\-") {
+                    // A leading `\-` escapes one.
                     value = Some(value_text[1..].to_string());
                 } else if value_text.starts_with('-') {
                     continue;
@@ -495,6 +504,35 @@ pub fn is_v8_flag(argument: &str) -> bool {
 #[must_use]
 pub fn declares(argument: &str) -> bool {
     lookup_argument(argument).is_some()
+}
+
+/// Whether Node's parser would read a *separate* argument for `argument`.
+///
+/// `Parse` gives every declared option that is not a boolean, a no-op or a V8
+/// flag a value, from either `--flag=value` or `--flag value`
+/// (`src/node_options-inl.h:466-489`). A caller walking argv itself has to know
+/// which spelling applies before it can decide whether the next argument is a
+/// value or the script, and that is exactly what this answers.
+///
+/// The value may not start with `-` unless the option is `--run`, whose value is
+/// optional — `Parse` calls `missing_argument()` in that case, which the caller
+/// reproduces as its own "requires an argument" error. That rule is the caller's
+/// because the message names the option and the caller already formats those.
+///
+/// A negation of a non-boolean is not a value-taking option: `Parse` rejects the
+/// spelling itself with `NegationImpliesBooleanError`, so this answers `false`
+/// and the caller refuses it the way it refuses any other unknown flag.
+#[must_use]
+pub fn takes_separate_value(argument: &str) -> bool {
+    if is_negation(&normalize_underscores(
+        argument.split_once('=').map_or(argument, |(name, _)| name),
+    )) {
+        return false;
+    }
+    match lookup_argument(argument) {
+        Some(option) => !matches!(option.kind, kind::BOOLEAN | kind::NO_OP | kind::V8_OPTION),
+        None => false,
+    }
 }
 
 /// Whether Node hands a *declared* `argument` to V8 as well as acting on it.

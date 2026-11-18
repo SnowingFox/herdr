@@ -1442,8 +1442,8 @@ fn promise_mode_fstat_resolves_through_its_own_request_slot() {
         &format!(
             r#"
 const fs = require('fs');
-const realm = require('internal/bootstrap/realm');
-const binding = realm.internalBinding('fs');
+const {{ internalBinding }} = require('internal/test/binding');
+const binding = internalBinding('fs');
 (async () => {{
   const fd = fs.openSync('{path}', 'r');
   // Four arguments, because that is the shape that distinguishes the two

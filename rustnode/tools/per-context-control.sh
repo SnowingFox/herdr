@@ -94,9 +94,35 @@ check "structuredClone(DOMException) keeps the class" \
   "$(run "const c = structuredClone(new DOMException('t','DataCloneError')); console.log(c instanceof DOMException, c instanceof Error, c.name, c.code)")"
 
 # --- no new enumerable global ---------------------------------------------
-check "enumerable global count" \
-  "9" \
-  "$(run "console.log(Object.keys(globalThis).length)")"
+# The property is "nothing appears on the global that should not", not "the count
+# is N". A pinned count encoded a bug: `-e` used to leave `module`, `exports`,
+# `__filename` and `__dirname` undefined on the global, and 9 was the count with
+# that bug present. `internal/main/eval_string` now defines all four (as Node
+# does), so the count is legitimately 13.
+#
+# Comparing the *set* against the oracle is the assertion that stays true: it
+# fails for a global we invent, and it does not fail when we correctly add one
+# the oracle already has. The names below are this build's remaining known gaps
+# (`fetch`, `atob`, `btoa`, `global`, `performance`, `require`,
+# `sessionStorage`, `structuredClone`), which are unrelated to this control.
+check "no enumerable global the oracle lacks" \
+  "" \
+  "$("$node" -e "
+    const ours = new Set(Object.keys(globalThis));
+    // The 9 always-enumerable globals, plus the four `eval_string` defines.
+    const allowed = [
+      'clearImmediate','clearInterval','clearTimeout','crypto','navigator',
+      'queueMicrotask','setImmediate','setInterval','setTimeout',
+      'module','exports','__filename','__dirname',
+    ];
+    const extra = [...ours].filter((k) => !allowed.includes(k)).sort();
+    const required = ['module','exports','__filename','__dirname'];
+    const missing = required.filter((k) => !ours.has(k));
+    // A global we invented is a failure; one of the four eval globals going
+    // missing is also a failure, because that was the original bug.
+    if (extra.length) console.log('extra: ' + extra.join(', '));
+    else if (missing.length) console.log('missing: ' + missing.join(', '));
+  ")"
 
 echo
 if [ "$failures" -eq 0 ]; then

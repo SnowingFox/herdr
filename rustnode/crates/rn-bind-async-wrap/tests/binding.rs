@@ -37,8 +37,20 @@ fn run(script: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-const PRELUDE: &str = "const realm = require('internal/bootstrap/realm');\
-const aw = realm.internalBinding('async_wrap');\
+/// The prelude every script here shares.
+///
+/// `internal/test/binding` is the module Node itself exposes the bindings
+/// through, and `internalBinding` is read off it once so each script can reach a
+/// namespace by name. It is deliberately *not*
+/// `require('internal/bootstrap/realm').internalBinding`: `realm.js` filters that
+/// id out of the user-requireable list even under `--expose-internals`
+/// (`internalBuiltinIds` skips `selfId`), Node's own
+/// `test-loaders-hidden-from-users.js` asserts the require throws
+/// `MODULE_NOT_FOUND`, and the oracle refuses it. rustnode's `-e` used to reach it
+/// only because the CLI installed the realm loader as an unrestricted global
+/// `require`, which was the bug rather than a capability.
+const PRELUDE: &str = "const { internalBinding } = require('internal/test/binding');\
+const aw = internalBinding('async_wrap');\
 const { constants } = aw;";
 
 #[test]
@@ -339,7 +351,7 @@ fn a_native_init_reaches_the_enabled_hook() {
             events.push([async_id, type, typeof trigger, typeof resource]);
           }},
         }}).enable();
-        const tcp = realm.internalBinding('tcp_wrap');
+        const tcp = internalBinding('tcp_wrap');
         const handle = new tcp.TCP(tcp.constants.SOCKET);
         const first = handle.getAsyncId();
         handle.asyncReset({{ tag: 'reused' }});

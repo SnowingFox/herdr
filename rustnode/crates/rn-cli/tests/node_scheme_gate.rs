@@ -310,17 +310,20 @@ fn a_worker_applies_the_same_gate() {
 
 #[test]
 fn the_realm_loader_still_serves_the_ids_only_it_can() {
-    // `internal/bootstrap/realm` is the one id `realm.js` keeps out of the list
-    // the CJS loader consults, so it must still come from the realm loader. If
-    // the scheme branch stopped falling back to it, every one of these would
-    // break — and with `--expose-internals` node's own test helpers depend on it.
+    // `internal/test/binding` is the id Node's own tests reach the bindings
+    // through, and it is requireable only with `--expose-internals` — which is
+    // the same requirement the oracle has. `internal/bootstrap/realm` is
+    // deliberately *not* in that list (`BuiltinModule.normalizeRequirableId`),
+    // so requiring it from `-e` worked only while the CLI installed the realm
+    // loader as an unrestricted global `require`; the oracle refuses it, and the
+    // supported route is this one.
     assert_eq!(
         eval(
             &["--expose-internals"],
-            "const realm = require('internal/bootstrap/realm');\n\
-             console.log(typeof realm.BuiltinModule, typeof realm.internalBinding);",
+            "const { internalBinding } = require('internal/test/binding');\n\
+             console.log(typeof internalBinding('util').defineLazyProperties);",
         ),
-        "function function"
+        "function"
     );
     assert_eq!(
         eval(

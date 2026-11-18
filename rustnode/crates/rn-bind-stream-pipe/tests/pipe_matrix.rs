@@ -77,6 +77,12 @@ fn run(script: &str) -> Option<(String, Duration, bool)> {
     // blocks forever on a hanging process; the scenario that hangs is exactly the
     // regression these tests guard.
     let mut child = Command::new(&binary)
+        // `internal/test/binding` is what Node exposes the bindings through, and
+        // it needs `--expose-internals` — the oracle has the same requirement. The
+        // prelude used to reach the namespaces through
+        // `require('internal/bootstrap/realm')`, which only worked because the CLI
+        // installed the realm loader as an unrestricted global `require`.
+        .arg("--expose-internals")
         .arg("-e")
         .arg(script)
         .stdout(std::process::Stdio::piped())

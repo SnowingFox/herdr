@@ -250,8 +250,8 @@ fn lazily_defined_properties_resolve_on_first_read() {
     let out = rustnode(&[
         "--expose-internals",
         "-e",
-        "const realm = require('internal/bootstrap/realm');\n\
-         const util = realm.internalBinding('util');\n\
+        "const { internalBinding } = require('internal/test/binding');\n\
+         const util = internalBinding('util');\n\
          const named = {};\n\
          util.defineLazyProperties(named, 'path', ['join']);\n\
          const whole = {};\n\
@@ -430,8 +430,8 @@ fn the_heap_size_limit_follows_max_old_space_size() {
         "--max-old-space-size=64",
         "--expose-internals",
         "-e",
-        "const realm = require('internal/bootstrap/realm');\n\
-         const binding = realm.internalBinding('v8');\n\
+        "const { internalBinding } = require('internal/test/binding');\n\
+         const binding = internalBinding('v8');\n\
          binding.updateHeapStatisticsBuffer();\n\
          console.log(binding.heapStatisticsBuffer[binding.kHeapSizeLimitIndex] < 400e6);",
     ]);
@@ -446,8 +446,8 @@ fn a_runtime_v8_flag_does_not_abort_the_process() {
     let out = rustnode(&[
         "--expose-internals",
         "-e",
-        "const realm = require('internal/bootstrap/realm');\n\
-         realm.internalBinding('v8').setFlagsFromString('--allow-natives-syntax');\n\
+        "const { internalBinding } = require('internal/test/binding');\n\
+         internalBinding('v8').setFlagsFromString('--allow-natives-syntax');\n\
          console.log('accepted');",
     ]);
     assert!(
@@ -646,9 +646,15 @@ fn no_per_context_global_is_enumerable() {
     // enumerable: `test/common/index.js` walks `globalThis` at exit and fails the
     // test for any name it does not recognise, which cost 388 files once.
     //
-    // The count is the ratchet. It was 9 before this change and must not grow:
-    // a new enumerable global would show up here rather than as hundreds of
-    // unrelated failures.
+    // The count is the ratchet, and the names are the point: it was 9 while the
+    // CLI compiled `-e` as a bare script, which is *not* what Node does. Node
+    // runs `internal/main/eval_string`, whose `evalScript` puts `module`,
+    // `exports`, `__filename`, `__dirname` and `require` on `globalThis` before
+    // running the code (`runScriptInContext`), so the oracle reports 21 names
+    // for `-e` and the five extra ones are exactly those. Routing `-e` through
+    // that script is what makes `typeof module` `"object"` instead of
+    // `"undefined"`, so the ratchet moves to 13 here rather than pretending the
+    // old 9 was correct.
     let out = rustnode(&[
         "-e",
         "const names = Object.keys(globalThis).sort();\n\
@@ -665,9 +671,9 @@ fn no_per_context_global_is_enumerable() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "9\n\
-         clearImmediate,clearInterval,clearTimeout,crypto,navigator,queueMicrotask,\
-         setImmediate,setInterval,setTimeout\n\
+        "13\n\
+         __dirname,__filename,clearImmediate,clearInterval,clearTimeout,crypto,exports,\
+         module,navigator,queueMicrotask,setImmediate,setInterval,setTimeout\n\
          false\nfalse\nfalse"
     );
 }

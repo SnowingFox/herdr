@@ -36,8 +36,8 @@ fn run(script: &str) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-const PRELUDE: &str = "const realm = require('internal/bootstrap/realm');\
-const perf = realm.internalBinding('performance');\
+const PRELUDE: &str = "\
+const perf = require('internal/test/binding').internalBinding('performance');\
 const C = perf.constants;";
 
 #[test]
@@ -66,15 +66,25 @@ fn unreached_milestones_stay_at_the_negative_sentinel() {
 
 #[test]
 fn mark_bootstrap_complete_records_the_final_milestone() {
+    // `eval_string` calls `markBootstrapComplete()` itself, so by the time user
+    // code runs the milestone is already set — that is what Node reports, and the
+    // oracle confirms it (`before` is a real timestamp in `node --expose-internals
+    // -e`, not the `-1` sentinel). This test used to expect `-1`, which encoded
+    // the old `-e` path: the CLI compiled a bare `v8::Script`, nothing called
+    // `markBootstrapComplete`, and the milestone stayed unset.
+    //
+    // What the milestone means is unchanged, so the assertions are on the
+    // contract rather than on the exact timestamp: it is set, and calling the
+    // marker again leaves it set.
     let output = run(&format!(
         "{PRELUDE}
         const index = C.NODE_PERFORMANCE_MILESTONE_BOOTSTRAP_COMPLETE;
         const before = perf.milestones[index];
         perf.markBootstrapComplete();
         const after = perf.milestones[index];
-        console.log(before, after >= 0);"
+        console.log(before >= 0, after >= 0);"
     ));
-    assert_eq!(output, "-1 true");
+    assert_eq!(output, "true true");
 }
 
 #[test]

@@ -690,7 +690,15 @@ impl PermissionModel {
         path::wildcard_if_dir_bytes(&resolved, path::is_existing_directory_bytes(&resolved))
     }
 
-    fn apply_env_allow(&self, allow: &[String]) {
+    /// Grants `env` access for each comma-separated pattern in `allow`.
+    ///
+    /// Public because `--env-file` needs it after the scrub: `InitializePermission`
+    /// adds every name an env file defined to the `env` allow list
+    /// (`src/env.cc:1155`), and those names are only known once the files are
+    /// parsed. Two separate grants, in the two places Node applies them, keep the
+    /// inherited value out: the scrub uses the command line's `--allow-env` alone,
+    /// so an inherited `FOO` is removed and the file's value takes effect.
+    pub fn apply_env_allow(&self, allow: &[String]) {
         let mut guard = lock_write(&self.env);
         let mut patterns = Vec::new();
         for value in allow {
@@ -963,6 +971,28 @@ impl PermissionModel {
         }
         for name in names {
             removed.insert(normalize_env_name(name.as_ref()));
+        }
+    }
+
+    /// Marks names the env scope removed at startup as set again.
+    ///
+    /// `record_removed_env_vars` is what makes a later read of the name report
+    /// `Permission::PublishDenied` instead of returning the value, so a name the
+    /// permission model took away cannot be brought back by simply writing it:
+    /// the store would hold it and `process.env.X` would still report a denial
+    /// and answer `undefined`.
+    ///
+    /// `--env-file` is the one thing Node re-grants *after* the scrub
+    /// (`InitializePermission` adds the files' keys to the `env` allow list), so
+    /// the record has to be dropped for exactly those names.
+    pub fn record_env_vars_restored<I, S>(&self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut removed = lock_write(&self.removed_env_vars);
+        for name in names {
+            removed.remove(&normalize_env_name(name.as_ref()));
         }
     }
 

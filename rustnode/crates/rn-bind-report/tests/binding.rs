@@ -67,8 +67,8 @@ fn scratch_dir() -> PathBuf {
     path
 }
 
-const PRELUDE: &str = "const realm = require('internal/bootstrap/realm');\
-const report = realm.internalBinding('report');";
+const PRELUDE: &str = "\
+const report = require('internal/test/binding').internalBinding('report');";
 
 #[test]
 fn the_settings_round_trip_through_the_binding() {
@@ -270,8 +270,8 @@ fn write_report_prints_nodes_banners_and_returns_the_given_name() {
         .arg("--expose-internals")
         .arg("-e")
         .arg(format!(
-            "const realm = require('internal/bootstrap/realm');\
-             const report = realm.internalBinding('report');\
+            "\
+             const report = require('internal/test/binding').internalBinding('report');\
              report.setDirectory('{directory}');\
              report.setFilename('banner.json');\
              console.log(report.writeReport('event', 'API', undefined, null));",

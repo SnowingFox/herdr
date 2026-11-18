@@ -115,4 +115,19 @@ pub const CACHED_BUILTINS: &[&str] = &[
     "internal/tty",
     "internal/fs/sync_write_stream",
     "internal/util/colors",
+    // The ES module graph, reached because `-e`, stdin, `--check` and
+    // `--input-type` all run through Node's own `internal/main/**` scripts and
+    // `prepareMainThreadExecution` initialises the module loaders. It is the
+    // same load order the loader itself produces.
+    "module",
+    "internal/modules/esm/assert",
+    "internal/modules/esm/load",
+    "internal/modules/esm/loader",
+    "internal/modules/esm/module_job",
+    "internal/modules/esm/module_map",
+    "internal/modules/esm/resolve",
+    "internal/modules/esm/translators",
+    "internal/modules/typescript",
+    "internal/source_map/source_map",
+    "internal/vm/module",
 ];
