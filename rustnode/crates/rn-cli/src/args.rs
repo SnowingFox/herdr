@@ -994,6 +994,15 @@ const UNIMPLEMENTED: &[&str] = &[
 /// the same code Node gives for a builtin it does not expose.
 const IMPLEMENTED_EXPERIMENTAL: &[&str] = &[
     "--experimental-bench",
+    // Gates whether `import.meta.resolve(specifier, parentURL)` honours its
+    // second argument: `lib/internal/modules/esm/loader.js:973` reads the option
+    // once and then picks `parentURL ?? moduleURL` over a bare `moduleURL`. The
+    // value reaches the store and the vendored loader acts on it, so the
+    // observable parity is exact — with the flag, `import.meta.resolve('./x.js',
+    // 'file:///tmp/other/base.js')` answers `file:///tmp/other/x.js`; without it,
+    // the parent is ignored and it answers relative to the importing module. Both
+    // runtimes agree on both spellings.
+    "--experimental-import-meta-resolve",
     "--experimental-shadow-realm",
     "--experimental-stream-iter",
     "--experimental-sqlite",
