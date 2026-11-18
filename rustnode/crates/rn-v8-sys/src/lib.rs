@@ -17,6 +17,19 @@ unsafe extern "C" {
         mode: i32,
         execution: i32,
     ) -> bool;
+    /// `v8::HeapProfiler::QueryObjects`, via the shim in this crate.
+    ///
+    /// `filter` is called once per heap object with `user` and the object's raw
+    /// pointer; it answers whether the object matches. The return value is a raw
+    /// `v8::Array*` — the tagged pointer a `v8::Local` holds — or null when the
+    /// shim refused its arguments.
+    fn rn_v8_sys__query_objects(
+        isolate: v8::UnsafeRawIsolatePtr,
+        context: *const v8::Context,
+        filter: extern "C" fn(*mut std::ffi::c_void, *const v8::Object) -> bool,
+        user: *mut std::ffi::c_void,
+        out: *mut *mut v8::Array,
+    ) -> bool;
 }
 
 /// Sets `v8::Isolate::SetStackLimit` on the current isolate.
@@ -79,8 +92,136 @@ pub unsafe fn measure_memory<'s>(
     Some(resolver.get_promise(scope))
 }
 
-/// Runs the tasks V8 has queued for this isolate on the process' platform.
+/// The state `query_objects` hands to the shim's predicate callback.
+struct QueryFilter<'s> {
+    /// The scope `query_objects` is running under, as a raw pointer.
+    ///
+    /// Stored raw rather than as `&PinScope` because V8 calls the predicate while
+    /// `query_objects` already holds the `&mut PinScope` it passed to the shim;
+    /// a second mutable borrow is impossible, and a `&` borrow taken here would
+    /// have to be alive across the FFI call that owns the `&mut`. The pointee
+    /// outlives every callback: it is the caller's scope, and V8 calls `Filter`
+    /// synchronously inside `QueryObjects`.
+    scope: *const v8::PinScope<'s, 's>,
+    context: v8::Local<'s, v8::Context>,
+    search: v8::Local<'s, v8::Object>,
+}
+
+/// `Histogram`-free `PrototypeChainHas::Filter`: does `object` belong to this
+/// context and have `search` in its prototype chain?
 ///
+/// This is `src/internal_only_v8.cc:23` written against the crate's own bindings.
+/// The creation-context test comes first and is what keeps an object from another
+/// realm out of the result — `test-v8-query-objects.js` builds a second `vm`
+/// context and asserts its objects are not counted.
+fn object_matches(
+    scope: &v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+    context: v8::Local<'_, v8::Context>,
+    search: v8::Local<'_, v8::Object>,
+) -> bool {
+    // `GetCreationContext().ToLocal(&creation_context)`: a `MaybeLocal` that is
+    // empty for an object with no creation context (a handle from a detached
+    // isolate, or one V8 has no record for).
+    let Some(creation_context) = object.get_creation_context(scope) else {
+        return false;
+    };
+    if creation_context != context {
+        return false;
+    }
+    // `for (proto = object->GetPrototype(); proto->IsObject(); proto =
+    // proto->GetPrototype())`: walk to the end of the chain, which is `null` (not
+    // an object) and ends the loop.
+    let mut proto = object.get_prototype(scope);
+    while let Some(current) = proto {
+        if !current.is_object() {
+            break;
+        }
+        if current == v8::Local::<v8::Value>::from(search) {
+            return true;
+        }
+        let Ok(current) = v8::Local::<v8::Object>::try_from(current) else {
+            break;
+        };
+        proto = current.get_prototype(scope);
+    }
+    false
+}
+
+/// The `extern "C"` trampoline the shim calls once per heap object.
+///
+/// # Safety
+///
+/// `user` must be the `*mut QueryFilter` `query_objects` passed for the duration of
+/// one shim call, and `object` must be a live V8 object pointer for the same call.
+extern "C" fn query_filter_trampoline(
+    user: *mut std::ffi::c_void,
+    object: *const v8::Object,
+) -> bool {
+    // SAFETY: `query_objects` guarantees both come from its own frame, and V8 calls
+    // the predicate synchronously inside `QueryObjects`.
+    let state = unsafe { &*(user as *const QueryFilter<'_>) };
+    let Some(object) = (unsafe { object.as_ref() }) else {
+        return false;
+    };
+    // The pointer is the tagged object the shim read out of its own `Local`, so it
+    // is the same handle by construction. `v8::Local` is `#[repr(C)]` over
+    // `NonNull<T>`, which is what the shim's `operator*` returns.
+    let object =
+        unsafe { std::mem::transmute::<*const v8::Object, v8::Local<'_, v8::Object>>(object) };
+    // SAFETY: see `QueryFilter::scope` — the pointee is the caller's live scope and
+    // `Filter` runs synchronously inside the call that borrowed it mutably.
+    let scope = unsafe { &*state.scope };
+    object_matches(scope, object, state.context, state.search)
+}
+
+/// `v8::HeapProfiler::QueryObjects`: the `v8.queryObjects` walk.
+///
+/// Returns every object in `scope`'s current context whose prototype chain
+/// contains `search`.
+///
+/// # Safety
+///
+/// `scope` must be a live scope in the isolate being queried, and `search` must be
+/// an object from it. The shim hands raw pointers back to `query_filter_trampoline`
+/// while V8 holds them, so no handle may be collected during the call — which the
+/// entered scope guarantees.
+pub unsafe fn query_objects<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    search: v8::Local<'s, v8::Object>,
+) -> Option<v8::Local<'s, v8::Array>> {
+    let isolate: &v8::Isolate = scope.as_ref();
+    let context = scope.get_current_context();
+    let filter = QueryFilter {
+        scope: (scope as *const v8::PinScope<'_, '_>).cast(),
+        context,
+        search,
+    };
+    let user = (&filter as *const QueryFilter<'_>).cast_mut().cast();
+    // The shim writes a `v8::Local<v8::Array>` into this slot. `v8::Local` is
+    // `#[repr(C)]` over `NonNull<T>` (the crate's own declaration), so a
+    // `Local<Array>` and a `*mut Array` have the same size and pass identically.
+    let mut array: *mut v8::Array = std::ptr::null_mut();
+    // SAFETY: the filter lives for the whole call, the isolate and context come
+    // from the same entered scope, and `array` is a live out-slot for the duration.
+    let found = unsafe {
+        rn_v8_sys__query_objects(
+            isolate.as_raw_isolate_ptr(),
+            &*context,
+            query_filter_trampoline,
+            user,
+            (&mut array as *mut *mut v8::Array).cast(),
+        )
+    };
+    if !found || array.is_null() {
+        return None;
+    }
+    // SAFETY: the shim just wrote a handle this scope owns into `array`, and
+    // `Local` is `#[repr(C)]` over the same `NonNull<T>` a `*mut T` is.
+    Some(unsafe { std::mem::transmute::<*mut v8::Array, v8::Local<'s, v8::Array>>(array) })
+}
+
+/// Runs the tasks V8 has queued for this isolate on the process' platform.
 /// Returns whether any task ran. `wait_for_work` is false throughout: the queue
 /// is drained from the event loop's per-iteration checkpoint, so blocking there
 /// would stall the loop whenever nothing was posted.
