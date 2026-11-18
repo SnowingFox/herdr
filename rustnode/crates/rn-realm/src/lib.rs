@@ -19,6 +19,7 @@
 
 pub mod process_env;
 pub mod runtime;
+pub mod shadow_realm;
 pub mod versions;
 
 use rn_js2c::builtin_by_id;
@@ -1283,7 +1284,7 @@ fn run_bootstrap_script_from(
 }
 
 /// An exception's `stack` when it has one, which is what identifies the site.
-fn exception_stack(
+pub(crate) fn exception_stack(
     scope: &mut v8::PinScope<'_, '_>,
     exception: v8::Local<'_, v8::Value>,
 ) -> Option<String> {
@@ -1525,7 +1526,7 @@ fn call_with_string<'s>(
     function.call(scope, v8::undefined(scope).into(), &[argument.into()])
 }
 
-fn get_property<'s>(
+pub(crate) fn get_property<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     object: v8::Local<'s, v8::Value>,
     name: &str,
@@ -1625,24 +1626,51 @@ pub fn run_main<'s>(
     execute.call(scope, v8::undefined(scope).into(), &[filename.into()])
 }
 
-/// The `process` state that belongs to the main thread's environment.
+/// The `process` state that belongs to one environment.
 ///
-/// Node decides per thread whether it may mutate process-wide state:
+/// Node decides per environment whether it may mutate process-wide state:
 /// `PatchProcessObject` passes `env->owns_process_state() ? ProcessTitleSetter :
 /// nullptr`, so a worker's `process.title` reads the main thread's title and is
 /// read-only. `debugPort` follows the same shape. Modelling it as one value keeps
-/// the two decisions together instead of threading two booleans through every
+/// the decisions together instead of threading several booleans through every
 /// call.
+///
+/// # The three kinds
+///
+/// Node has three environments with three different relationships to the
+/// process object, and each one runs a different
+/// `internal/bootstrap/switches/**` file:
+///
+/// * the **main thread** owns the process, so it runs `does_own_process_state`
+///   and gets the writable `title`/`debugPort` setters;
+/// * a **worker thread** shares it, so it runs `is_not_main_thread` (stdio
+///   becomes port-backed) and its `title`/`debugPort` lose their setters;
+/// * a **ShadowRealm** is a second realm inside an environment that already owns
+///   the process. It must not re-run `internal/bootstrap/node` (that installs
+///   globals and per-isolate callbacks) and it must not expose `process` as a
+///   global at all, but builtins loaded inside it still need `process.cwd()`,
+///   `process.env` and the rest. That is what
+///   `internal/bootstrap/switches/does_not_own_process_state` provides:
+///   `cwd`/`umask`/`chdir`/`abort` and the credential setters, with the mutating
+///   ones replaced by `ERR_WORKER_UNSUPPORTED_OPERATION` stubs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessState {
     /// The port `process.debugPort` reports, from `--inspect-port`.
     pub debug_port: u16,
-    /// Whether this thread owns process-wide state, i.e. is the main thread.
-    ///
-    /// A worker passes `false`: its `title` and `debugPort` become getters with
-    /// no setter, so a worker cannot rename the process or move the parent's
-    /// inspector port.
-    pub owns_process_state: bool,
+    /// Which `internal/bootstrap/switches/**` file this environment runs.
+    pub ownership: ProcessOwnership,
+}
+
+/// Which relationship an environment has to the process object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessOwnership {
+    /// The main thread: owns the process and reports `debug_port`.
+    MainThread,
+    /// A worker thread: reads the process's port but may not change it.
+    Worker,
+    /// A ShadowRealm: no `process` global, and only the read-only subset plus
+    /// the `unavailable()` stubs of `does_not_own_process_state`.
+    ShadowRealm,
 }
 
 impl ProcessState {
@@ -1650,7 +1678,7 @@ impl ProcessState {
     pub fn main_thread(debug_port: u16) -> Self {
         Self {
             debug_port,
-            owns_process_state: true,
+            ownership: ProcessOwnership::MainThread,
         }
     }
 
@@ -1658,8 +1686,28 @@ impl ProcessState {
     pub fn worker() -> Self {
         Self {
             debug_port: rn_uv::process_title::debug_port(),
-            owns_process_state: false,
+            ownership: ProcessOwnership::Worker,
         }
+    }
+
+    /// A ShadowRealm's state, inside an environment that owns the process.
+    ///
+    /// It reports the *real* `debug_port` because the realm never exposes
+    /// `process.debugPort` as a global, and a builtin that reads it should see
+    /// the value the process actually has rather than a placeholder.
+    pub fn shadow_realm() -> Self {
+        Self {
+            debug_port: rn_uv::process_title::debug_port(),
+            ownership: ProcessOwnership::ShadowRealm,
+        }
+    }
+
+    /// Whether this environment owns process-wide state, i.e. is the main thread.
+    ///
+    /// `PatchProcessObject` passes the title and debug-port setters only when
+    /// this is true, so a worker's `process.title` is a getter with no setter.
+    pub fn owns_process_state(&self) -> bool {
+        self.ownership == ProcessOwnership::MainThread
     }
 }
 
@@ -1814,7 +1862,7 @@ const PER_CONTEXT_FILES: &[&str] = &[
 /// `internalBinding('messaging')` can return the *identical* constructor the
 /// global `DOMException` is, rather than a second class that would fail
 /// `instanceof`.
-fn run_per_context(
+pub(crate) fn run_per_context(
     scope: &mut v8::PinScope,
     primordials: v8::Local<v8::Object>,
 ) -> Result<(), String> {
@@ -1858,7 +1906,7 @@ fn run_per_context(
 /// far more of the runtime than exists yet. This is the subset `realm.js` itself
 /// touches: the load-list array it appends to, and the accessors it defines.
 /// Builds the `process` object, including the script arguments as `argv`.
-fn process_object<'s>(
+pub(crate) fn process_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     script_args: &[String],
     exec_argv: &[String],
@@ -2103,7 +2151,7 @@ fn install_process_state(
     process: v8::Local<v8::Object>,
     state: ProcessState,
 ) -> Result<(), String> {
-    install_title(scope, process, state.owns_process_state)?;
+    install_title(scope, process, state.owns_process_state())?;
     install_debug_port(scope, process, state)?;
     install_domain(scope, process)?;
     install_max_listeners(scope, process)?;
@@ -2440,11 +2488,11 @@ fn install_debug_port(
 ) -> Result<(), String> {
     // Only the owning thread records the port; a worker reads what the main
     // thread stored rather than overwriting it with its own (identical) value.
-    if state.owns_process_state {
+    if state.owns_process_state() {
         rn_uv::process_title::set_debug_port(state.debug_port);
     }
     let key = v8::String::new(scope, "debugPort").ok_or("cannot allocate process.debugPort")?;
-    let configuration = if state.owns_process_state {
+    let configuration = if state.owns_process_state() {
         v8::AccessorConfiguration::new(process_debug_port_getter)
             .setter(process_debug_port_setter)
             .property_attribute(v8::PropertyAttribute::NONE)
@@ -2726,7 +2774,7 @@ fn node_platform() -> &'static str {
 /// belonging to one isolate. `rn_core::realm` keeps the registry for the thread
 /// that is bootstrapping, so the lookup is a thread-local read and the pointer
 /// never has to outlive anything.
-fn internal_binding_dispatcher<'s>(
+pub(crate) fn internal_binding_dispatcher<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
     let template = rn_core::class(get_internal_binding).build(scope);
@@ -2760,7 +2808,7 @@ fn get_internal_binding(
     }
 }
 
-fn set(
+pub(crate) fn set(
     scope: &mut v8::PinScope,
     object: v8::Local<v8::Object>,
     name: &str,
@@ -2831,7 +2879,7 @@ fn define_read_only_frozen(
 /// used to clear only `enumerable`. There is no single V8 call in this crate
 /// that sets all three flags at once, and doing the second half in JavaScript
 /// states the intent in one line instead of juggling three descriptors.
-fn set_global(
+pub(crate) fn set_global(
     scope: &mut v8::PinScope,
     global: v8::Local<v8::Object>,
     name: &str,
@@ -2889,7 +2937,7 @@ fn object_define_property<'s>(
 /// binding gives. `Environment::no_addon_permission_for_linked_bindings` is a
 /// worker-only exemption; a worker copies the model onto its own thread, and this
 /// thread-local check would then run there too, so the flag is not modelled.
-fn get_linked_binding(
+pub(crate) fn get_linked_binding(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
@@ -2924,7 +2972,7 @@ fn throw_invalid_module(scope: &mut v8::PinScope<'_, '_>, name: &str) {
     scope.throw_exception(exception);
 }
 
-fn function_of<'s>(
+pub(crate) fn function_of<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
@@ -2945,7 +2993,7 @@ fn function_of<'s>(
 /// a missing namespace from a typo or a failed load. `node:ffi` is the case that
 /// made this visible — the module loaded, warned that it was experimental, and
 /// then failed with `code: undefined`, which reads as a bug in the caller.
-fn throw(scope: &mut v8::PinScope, message: &str) {
+pub(crate) fn throw(scope: &mut v8::PinScope, message: &str) {
     let Some(message) = v8::String::new(scope, message) else {
         return;
     };

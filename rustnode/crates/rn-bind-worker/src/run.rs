@@ -242,6 +242,12 @@ impl WorkerThread {
         // `import.meta` and `import()` are dispatched through isolate-level
         // handlers, and a worker can `import()` too.
         rn_module_wrap::install_isolate_callbacks(&mut isolate);
+        // A worker's isolate needs its own `new ShadowRealm()` hook for the same
+        // reason it needs its own ESM handlers: the callback is isolate-level, so a
+        // worker that skipped this would answer every `new ShadowRealm()` with
+        // V8's bare `Not supported`. `test-shadow-realm-gc.js` constructs a realm
+        // on the worker thread and asserts the worker exits 0.
+        rn_realm::shadow_realm::install_callback(&mut isolate);
         // The promise rejection callback is per-isolate state, exactly as Node
         // sets it in `CreateIsolateData` for every isolate a worker creates. A
         // worker that skipped it would never run its own

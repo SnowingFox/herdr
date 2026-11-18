@@ -399,6 +399,7 @@ fn set_internal_loaders(
         return;
     };
     rn_core::hook_slot::set_internal_loaders(
+        scope,
         v8::Global::new(scope, internal_binding),
         v8::Global::new(scope, require),
     );

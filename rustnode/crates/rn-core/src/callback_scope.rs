@@ -296,9 +296,7 @@ mod tests {
         // before `async_wrap` installs is not silently dropped.
         HOOKS.with(|slot| *slot.borrow_mut() = None);
         assert!(!is_installed());
-        let platform = v8::new_default_platform(0, false).make_shared();
-        v8::V8::initialize_platform(platform);
-        v8::V8::initialize();
+        crate::test_support::initialize_v8();
         let mut isolate = v8::Isolate::new(Default::default());
         let storage = std::pin::pin!(v8::HandleScope::new(&mut isolate));
         let scope = &mut storage.init();

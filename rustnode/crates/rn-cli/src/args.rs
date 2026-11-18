@@ -976,7 +976,6 @@ const PERMISSION_BOOLEAN_GRANTS: &[&str] = &[
 /// driven by the option table so a `NoOp{}` name can never be mis-declared.
 const UNIMPLEMENTED: &[&str] = &[
     "--experimental-network-inspection",
-    "--experimental-shadow-realm",
     "--experimental-web-worker",
     "--experimental-eventsource",
 ];
@@ -996,6 +995,7 @@ const UNIMPLEMENTED: &[&str] = &[
 /// the same code Node gives for a builtin it does not expose.
 const IMPLEMENTED_EXPERIMENTAL: &[&str] = &[
     "--experimental-bench",
+    "--experimental-shadow-realm",
     "--experimental-stream-iter",
     "--experimental-sqlite",
     // `--experimental-vm-modules` is a `BOOL_FIELD` whose value rustnode both
@@ -2283,6 +2283,50 @@ fn apply_abort(argument: &str, options: &mut Options) {
     }
 }
 
+/// Pushes the V8 options that accepted flags imply onto `v8_args`.
+///
+/// This is `Parse`'s implication block (`src/node_options-inl.h:438-454`): for
+/// each argument, every `Implies` entry whose target is a `kV8Option` contributes
+/// that target's *name* to `v8_args`. Node applies the block before it decides
+/// whether the argument itself is V8's, so an implied flag is queued ahead of the
+/// argument that asked for it.
+///
+/// Only the V8-option half is done here. A `kBoolean` implication writes a field
+/// on the option struct, which `rn-bind-options`' store already does through
+/// [`rn_bind_options::Store::apply`], so doing it here as well would apply the
+/// same implication twice.
+///
+/// Both sources are walked, in Node's order — `NODE_OPTIONS` and then the command
+/// line — because the environment's flags reach `v8_args` through this same path
+/// in Node. A duplicate is skipped: `--experimental-shadow-realm` and
+/// `--harmony-shadow-realm` imply each other, so passing both would otherwise
+/// queue `--harmony-shadow-realm` twice.
+fn expand_implied_v8_options(options: &mut Options) {
+    let mut implied: Vec<String> = Vec::new();
+    for argument in options.env_argv.iter().chain(options.exec_argv.iter()) {
+        let name = argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(name, _)| name);
+        for (source, target, _) in rn_bind_options::parsed::IMPLIES {
+            if *source != name {
+                continue;
+            }
+            // A declared `V8Option` is what Node pushes. A target Node's table
+            // does not declare is not an implication at all, and a declared
+            // boolean target is the field write `apply` already did.
+            if !rn_bind_options::declares(target) || !rn_bind_options::is_v8_flag(target) {
+                continue;
+            }
+            if !implied.iter().any(|queued| queued == target)
+                && !options.v8_args.iter().any(|queued| queued == target)
+            {
+                implied.push((*target).to_string());
+            }
+        }
+    }
+    options.v8_args.extend(implied);
+}
+
 /// The final pass Node runs after the command-line walk: `CheckOptions`.
 ///
 /// Returns a [`ParseError::OptionValue`] for a value the walk accepted but
@@ -2446,6 +2490,14 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Result<Optio
     // places take the command line's value while `--require` keeps both, and it
     // is why the environment's parse has to have happened first.
     options.parsed.apply(&options.exec_argv);
+    // Node pushes an implied `kV8Option` onto `v8_args` as its own argument
+    // (`src/node_options-inl.h:449`), which for the shadow-realm pair is what
+    // turns `--experimental-shadow-realm` into a V8 flag at all: V8 only knows
+    // `--harmony-shadow-realm`, and it is the flag that actually enables the
+    // `ShadowRealm` global. `NODE_OPTIONS` contributes the same way, because
+    // Node parses the environment and the command line into one option set and
+    // every implication fires during both passes.
+    expand_implied_v8_options(&mut options);
     // `Environment::InitializePermission` clears `allow_native_addons` when
     // `--permission` (not `--permission-audit`) was given without
     // `--allow-addons`, which is what makes `process.dlopen` throw
@@ -3062,9 +3114,22 @@ mod tests {
             options.unimplemented
         );
 
-        let options = parse_of(&["--experimental-shadow-realm", "-e", "1"]).expect("parses");
-        assert_eq!(options.unimplemented, ["--experimental-shadow-realm"]);
-        assert!(options.v8_args.is_empty(), "{:?}", options.v8_args);
+        // `--experimental-shadow-realm` implies `--harmony-shadow-realm`
+        // (`src/node_options.cc:1624`), so the V8 half is forwarded under the
+        // name V8 knows. That makes this a paired flag rather than an
+        // unimplemented one: `ShadowRealm` exists in the runtime, gated on the
+        // table entry exactly as Node gates it.
+        //
+        // The first assertion is the one that matters: an undeclared name would
+        // fall through to the V8 split and be accepted by accident, which is
+        // the regression this test names.
+        let shadow = parse_of(&["--experimental-shadow-realm", "-e", "1"]).expect("parses");
+        assert!(
+            shadow.unimplemented.is_empty(),
+            "{:?}",
+            shadow.unimplemented
+        );
+        assert_eq!(shadow.v8_args, ["--harmony-shadow-realm"]);
     }
 
     /// `--require-module` defaults to true, and the `--no-` spellings both clear

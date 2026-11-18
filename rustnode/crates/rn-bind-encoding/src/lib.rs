@@ -51,7 +51,13 @@ pub const READ: usize = 0;
 pub const WRITTEN: usize = 1;
 
 thread_local! {
-    static RESULTS: RefCell<Option<AliasedUint8Array>> = const { RefCell::new(None) };
+    /// The `encodeInto` results buffer, per realm.
+    ///
+    /// Node allocates it in the binding's `BindingData`, which lives on the
+    /// `Realm`. Sharing one slot across realms would let a `ShadowRealm`'s install
+    /// replace the array the principal realm's `encodeInto` writes into, so a
+    /// caller there would read back the wrong byte counts.
+    static RESULTS: RefCell<Vec<(f64, AliasedUint8Array)>> = const { RefCell::new(Vec::new()) };
 }
 
 pub struct EncodingBinding;
@@ -72,7 +78,14 @@ impl BindingModule for EncodingBinding {
     ) -> Result<v8::Local<'s, v8::Object>, String> {
         let results = AliasedUint8Array::new(scope, ENCODE_INTO_RESULTS_LENGTH, Element::Word)?;
         let results_array = results.array(scope);
-        RESULTS.with(|slot| *slot.borrow_mut() = Some(results));
+        let realm = rn_core::hook_slot::current_realm_id(scope);
+        RESULTS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.iter_mut().find(|(key, _)| *key == realm) {
+                Some((_, existing)) => *existing = results,
+                None => slot.push((realm, results)),
+            }
+        });
 
         let object = v8::Object::new(scope);
         let values: [(&str, v8::Local<v8::Value>); 6] = [
@@ -107,11 +120,11 @@ fn encode_into(
     // `{ read: 0, written: 0 }` rather than throwing, which is what
     // `TextEncoder.encodeInto` specifies.
     let Ok(source) = v8::Local::<v8::String>::try_from(args.get(0)) else {
-        record(0, 0);
+        record(scope, 0, 0);
         return;
     };
     let Ok(destination) = v8::Local::<v8::Uint8Array>::try_from(args.get(1)) else {
-        record(0, 0);
+        record(scope, 0, 0);
         return;
     };
 
@@ -134,7 +147,7 @@ fn encode_into(
             Some(&mut read),
         )
     });
-    record(read as u32, written as u32);
+    record(scope, read as u32, written as u32);
 }
 
 /// Writes into a typed array's backing store, bypassing the V8 property API.
@@ -165,12 +178,15 @@ fn with_bytes_mut<T>(view: &v8::Uint8Array, write: impl FnOnce(&mut [u8]) -> T) 
     write(bytes)
 }
 
-fn record(read: u32, written: u32) {
+fn record(scope: &mut rn_v8_sys::v8::PinScope<'_, '_>, read: u32, written: u32) {
+    let realm = rn_core::hook_slot::current_realm_id(scope);
     RESULTS.with(|slot| {
-        if let Some(results) = slot.borrow().as_ref() {
-            results.set(READ, read);
-            results.set(WRITTEN, written);
-        }
+        let slot = slot.borrow();
+        let Some((_, results)) = slot.iter().find(|(key, _)| *key == realm) else {
+            return;
+        };
+        results.set(READ, read);
+        results.set(WRITTEN, written);
     });
 }
 

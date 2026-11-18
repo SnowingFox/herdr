@@ -29,6 +29,8 @@ pub mod queue;
 pub mod realm;
 pub mod symbol;
 pub mod task_queue;
+#[cfg(test)]
+mod test_support;
 
 pub use abi::{BindingModule, InstallCtx};
 pub use aliased_buffer::{AliasedUint8Array, Element};
