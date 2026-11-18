@@ -281,13 +281,26 @@ fn snapshot_options(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value
     (flag(0), flag(1))
 }
 
-/// `DiagnosticFilename(id, prefix, ext)`: `Heap.<yyyymmdd>.<hhmmss>.<pid>.heapsnapshot`.
+/// `DiagnosticFilename::MakeFilename`: `Heap.<yyyymmdd>.<hhmmss>.<pid>.<tid>.<seq>.<ext>`.
 ///
-/// `MakeFilename` in `src/util.cc` is `prefix`, the local date, the local time,
-/// the process id and the extension, each dot-separated and zero-padded. The
-/// process id is what keeps two snapshots in one second apart.
+/// `MakeFilename` in `src/util.cc:247` writes the prefix, the local date, the
+/// local time, the process id, the thread id, a zero-padded three-digit sequence
+/// and the extension, dot-separated.
+///
+/// The thread id and the sequence are what keep two snapshots apart. A name of
+/// `<date>.<time>.<pid>` collides whenever two snapshots are taken in the same
+/// second, and the second silently overwrites the first — which is exactly what
+/// `test/sequential/test-heapdump-flag.js` catches, because it raises SIGUSR2
+/// twice in a row and expects two files. The sequence is process-wide rather
+/// than per-thread, so two threads snapshotting in the same second also differ.
 fn diagnostic_filename(prefix: &str, extension: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// `MakeFilename`'s `static unsigned int seq`, which starts at zero and is
+    /// pre-incremented, so the first name ends in `001`.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -295,10 +308,39 @@ fn diagnostic_filename(prefix: &str, extension: &str) -> String {
     // `LocalTime` in Node; UTC here because converting needs a timezone
     // database, and the name only has to be unique and sortable.
     let (year, month, day, hour, minute, second) = civil_from_unix(now);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     format!(
-        "{prefix}.{year:04}{month:02}{day:02}.{hour:02}{minute:02}{second:02}.{}.{extension}",
-        std::process::id()
+        "{prefix}.{year:04}{month:02}{day:02}.{hour:02}{minute:02}{second:02}.{}.{}.{sequence:03}.{extension}",
+        std::process::id(),
+        thread_identifier(),
     )
+}
+
+/// The `thread_id` `MakeFilename` takes: a stable, numeric, per-thread value.
+///
+/// Node passes `env->thread_id()`, an `Environment`-level counter that is 0 for
+/// the main thread. rustnode has no environment-level counter to read here, and
+/// a `std::thread::ThreadId` cannot be turned into a number, so the value is
+/// derived from the thread's name when the caller set one and otherwise from a
+/// per-thread counter assigned on first use. The only requirement the filename
+/// has is that two threads do not agree, which either source satisfies.
+fn thread_identifier() -> u64 {
+    use std::cell::Cell;
+
+    thread_local! {
+        static THIS_THREAD: Cell<u64> = const { Cell::new(0) };
+    }
+    static NEXT_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    THIS_THREAD.with(|slot| {
+        let assigned = slot.get();
+        if assigned != 0 {
+            return assigned;
+        }
+        let value = NEXT_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        slot.set(value);
+        value
+    })
 }
 
 /// Converts a Unix timestamp to a proleptic Gregorian date and time of day.
