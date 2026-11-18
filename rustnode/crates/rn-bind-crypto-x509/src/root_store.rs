@@ -50,6 +50,25 @@ fn user_roots() -> &'static Mutex<Vec<String>> {
     USER.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Whether `tls.setDefaultCACertificates` has replaced the default trust set.
+///
+/// Node keeps this as `certs_from_users != nullptr` rather than "the list is
+/// non-empty", and the difference is observable: resetting to an empty array
+/// installs an empty set, which makes every handshake fail instead of falling
+/// back to the bundled roots. `NewRootCertStore`
+/// (`crypto_context.cc:1054-1061`) checks only whether the set exists, so a
+/// plain emptiness check would silently restore the bundled roots after
+/// `tls.setDefaultCACertificates([])`.
+fn user_roots_replaced() -> &'static std::sync::atomic::AtomicBool {
+    static REPLACED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &REPLACED
+}
+
+/// True once `resetRootCertStore` has been called, whatever it was called with.
+pub fn user_store_is_replaced() -> bool {
+    user_roots_replaced().load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `getBundledRootCertificates()`: what this build compiles in.
 ///
 /// The strings are `src/node_root_certs.h`'s `root_certs` array, already PEM
@@ -147,56 +166,110 @@ pub fn user() -> Vec<String> {
 /// `resetRootCertStore(certificates)`: replaces the user list.
 ///
 /// An empty array clears the list, which is `root_certs->certs_from_users =
-/// std::make_unique<X509Set>()` in `ResetRootCertStore`. Every entry must parse,
-/// which is why this reports the failure rather than storing a partial list: a
-/// half-populated store would verify some chains and not others.
-pub fn reset(pem_strings: &[Vec<u8>]) -> Option<usize> {
+/// std::make_unique<X509Set>()` in `ResetRootCertStore`.
+///
+/// Returns `Ok(count)` after storing at least one certificate. `Err(())` means
+/// the store was left untouched and the caller must throw: Node parses every
+/// entry first and only swaps the store once all of them succeeded
+/// (`crypto_context.cc:1252-1268`), so a bad entry never leaves a half-applied
+/// list behind. `resetRootCertStore` also reports `No valid certificates found
+/// in the provided array` when entries parse but yield nothing, which is the
+/// case `test-tls-set-default-ca-certificates-recovery.js` asserts.
+pub fn reset(pem_strings: &[Vec<u8>]) -> Result<usize, ResetError> {
+    if pem_strings.is_empty() {
+        let mut roots = user_roots()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        roots.clear();
+        user_roots_replaced().store(true, std::sync::atomic::Ordering::Relaxed);
+        return Ok(0);
+    }
     let mut parsed = Vec::with_capacity(pem_strings.len());
     for entry in pem_strings {
         // Store PEM, because that is the shape all five getters return; parsing
         // and re-encoding here is what proves the entry is a certificate.
-        let certificates = pem_certificates(entry)?;
+        let certificates = pem_certificates(entry).map_err(ResetError::OpenSsl)?;
         parsed.extend(certificates);
     }
+    if parsed.is_empty() {
+        return Err(ResetError::NoValidCertificates);
+    }
+    // `X509Set` is an `X509` comparator set, so the same certificate three times
+    // is stored once. Deduplicating here keeps `getCACertificates('default')`
+    // the same length as Node's for a duplicate input, which
+    // `test-tls-set-default-ca-certificates-basic.js` asserts at its last line.
+    let mut seen = std::collections::BTreeSet::new();
+    parsed.retain(|pem| seen.insert(pem.clone()));
     let count = parsed.len();
     let mut roots = user_roots()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     *roots = parsed;
-    Some(count)
+    user_roots_replaced().store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(count)
+}
+
+/// Why [`reset`] refused to change the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetError {
+    /// One entry held PEM armour around content that is not a certificate.
+    /// Carries the packed OpenSSL error so the caller can derive Node's
+    /// `ERR_OSSL_*` code from it rather than inventing one.
+    OpenSsl(u64),
+    /// Every entry parsed, but the array held no certificate at all.
+    NoValidCertificates,
 }
 
 /// Every certificate in a PEM blob, re-encoded as PEM.
 ///
 /// One input string may hold several certificates; Node's `LoadCertsFromBIO`
 /// reads all of them, so a bundle file works and a single certificate works.
-fn pem_certificates(bytes: &[u8]) -> Option<Vec<String>> {
+fn pem_certificates(bytes: &[u8]) -> Result<Vec<String>, u64> {
     let certificates = parse_pem(bytes)?;
     // `X509::stack_from_pem` returns an empty vector for input that holds no
-    // certificate at all rather than failing, so an entry that parses to nothing
-    // is an error here. Without this a caller could pass garbage and have the
-    // store silently reset to empty, which looks like success.
-    if certificates.is_empty() {
-        return None;
-    }
+    // certificate at all rather than failing, and Node deliberately treats that
+    // as zero certificates rather than an error: `LoadCertsFromBIO` ignores
+    // `PEM_R_NO_START_LINE` (`crypto_context.cc:268-273`), so a string like
+    // `'not a valid certificate'` contributes nothing and the caller's
+    // "no valid certificates" check is what rejects the array.
     certificates
         .into_iter()
         .map(|der| {
-            let certificate = X509::from_der(&der).ok()?;
-            let pem = certificate.to_pem().ok()?;
-            String::from_utf8(pem).ok()
+            let certificate = X509::from_der(&der).map_err(|_| 0u64)?;
+            let pem = certificate.to_pem().map_err(|_| 0u64)?;
+            String::from_utf8(pem).map_err(|_| 0u64)
         })
-        .collect::<Option<Vec<String>>>()
+        .collect::<Result<Vec<String>, u64>>()
 }
 
-/// Every certificate in a PEM blob, as DER.
-fn parse_pem(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let certificates = X509::stack_from_pem(bytes).ok()?;
+/// Every certificate in a PEM blob, as DER, or the OpenSSL error that stopped it.
+///
+/// The error is the packed `ERR_*` value from the queue rather than a fixed
+/// code, because Node's `ArrayOfStringsToX509s` calls
+/// `ThrowCryptoError(env, err, "Failed to parse certificate")`
+/// (`crypto_context.cc:1178`) and that constructor derives the JS `code` from
+/// the OpenSSL library and reason — `ERR_OSSL_PEM_ASN1_LIB` for a blob with PEM
+/// armour around garbage, for instance. A single fixed code would not match.
+/// Every certificate in a PEM blob, as DER, or the OpenSSL error that stopped it.
+///
+/// The error is the packed `ERR_*` value rather than a fixed code, because
+/// Node's `ArrayOfStringsToX509s` calls
+/// `ThrowCryptoError(env, err, "Failed to parse certificate")`
+/// (`crypto_context.cc:1178`) and that constructor derives the JS `code` from
+/// the OpenSSL library and reason — `ERR_OSSL_PEM_ASN1_LIB` for a blob with PEM
+/// armour around garbage, for instance. A single fixed code would not match.
+///
+/// `ErrorStack` keeps each error's original packed `code()`, which is the value
+/// Node reads with `ERR_get_error`, so going through it loses nothing and avoids
+/// re-deriving the queue depth here.
+fn parse_pem(bytes: &[u8]) -> Result<Vec<Vec<u8>>, u64> {
+    let certificates = X509::stack_from_pem(bytes)
+        .map_err(|stack| stack.errors().last().map(|error| error.code()).unwrap_or(0))?;
     let mut encoded = Vec::with_capacity(certificates.len());
     for certificate in certificates {
-        encoded.push(certificate.to_der().ok()?);
+        encoded.push(certificate.to_der().unwrap_or_default());
     }
-    Some(encoded)
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -276,20 +349,27 @@ mod tests {
     fn resetting_the_user_store_replaces_it() {
         let first = self_signed("first");
         let second = self_signed("second");
-        assert_eq!(reset(&[first]), Some(1));
+        assert_eq!(reset(&[first]), Ok(1));
         assert_eq!(user().len(), 1);
-        assert_eq!(reset(&[second.clone(), second]), Some(2));
-        assert_eq!(user().len(), 2);
+        // The same certificate twice is one entry, because Node stores them in
+        // the `X509Set` comparator, not a vector.
+        assert_eq!(reset(&[second.clone(), second]), Ok(1));
+        assert_eq!(user().len(), 1);
         // An empty array clears it, which `ResetRootCertStore` special-cases.
-        assert_eq!(reset(&[]), Some(0));
+        assert_eq!(reset(&[]), Ok(0));
         assert!(user().is_empty());
     }
 
     #[test]
-    fn an_unparseable_entry_rejects_the_whole_reset() {
-        // A half-applied store would verify some chains and not others, so the
-        // failure is all-or-nothing.
-        assert!(reset(&[b"not a certificate".to_vec()]).is_none());
+    fn an_entry_with_no_certificate_leaves_the_store_untouched() {
+        // `LoadCertsFromBIO` ignores `PEM_R_NO_START_LINE`, so a string holding
+        // no PEM contributes zero certificates instead of failing the parse.
+        // `ResetRootCertStore` then reports "no valid certificates" and the
+        // store keeps its previous contents.
+        assert_eq!(
+            reset(&[b"not a certificate".to_vec()]),
+            Err(ResetError::NoValidCertificates)
+        );
         assert!(user().is_empty());
     }
 
