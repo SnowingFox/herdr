@@ -78,6 +78,7 @@ pub const CACHED_BUILTINS: &[&str] = &[
     "internal/util",
     "internal/util/debuglog",
     "internal/util/inspect",
+    "internal/util/inspector",
     "internal/util/types",
     "internal/v8/startup_snapshot",
     "internal/validators",

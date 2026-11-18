@@ -125,6 +125,14 @@ pub struct Options {
     pub inspect_enabled: bool,
     /// `--inspect-brk`: block until a client attaches before running user code.
     pub inspect_wait: bool,
+    /// `--inspect-brk-node`: break at Node bootstrap after waiting.
+    ///
+    /// Node distinguishes this from `--inspect-brk`: plain `--inspect-brk`
+    /// breaks at user-script start through JavaScript `callAndPauseOnStart`,
+    /// while `--inspect-brk-node` additionally asks the native agent to break
+    /// on bootstrap (`break_node_first_line`). rustnode's CLI mirrors that
+    /// split so `node inspect <file>` does not stop in bootstrap internals.
+    pub inspect_break_node: bool,
     /// Where the inspector would listen: `--inspect-port`'s value, or
     /// `--inspect`'s when it carried one, or the default.
     ///
@@ -181,6 +189,7 @@ impl Options {
             env_argv: Vec::new(),
             inspect_enabled: false,
             inspect_wait: false,
+            inspect_break_node: false,
             debug_port: InspectRequest::default_endpoint(),
             max_old_space_size_percentage: None,
             print_version: false,
@@ -1442,12 +1451,12 @@ fn validate_percentage(value: &str) -> Result<String, String> {
 }
 
 /// Whether `argument` is `--inspect`, `--inspect-port`, `--inspect-brk`,
-/// `--inspect-wait` or one of their `=value` forms.
+/// `--inspect-brk-node`, `--inspect-wait` or one of their `=value` forms.
 fn is_inspect_flag(argument: &str) -> bool {
     let name = argument.split_once('=').map_or(argument, |(name, _)| name);
     matches!(
         name,
-        "--inspect" | "--inspect-port" | "--inspect-brk" | "--inspect-wait"
+        "--inspect" | "--inspect-port" | "--inspect-brk" | "--inspect-brk-node" | "--inspect-wait"
     )
 }
 
@@ -1464,6 +1473,8 @@ fn is_inspect_flag(argument: &str) -> bool {
 ///   value, so `NODE_OPTIONS=--inspect-port=9339` and `--inspect` on the command
 ///   line listen on 9339.
 /// * `--inspect-brk` does the same and also waits for a client.
+/// * `--inspect-brk-node` additionally asks the native agent to break at
+///   bootstrap after waiting.
 /// * A later `--inspect-port` still moves the port of an inspector that has
 ///   already been asked for, which is `NODE_OPTIONS=--inspect` plus
 ///   `--inspect-port=9338`.
@@ -1499,14 +1510,30 @@ fn apply_inspect(argument: &str, options: &mut Options) -> Result<(), String> {
             // Only the address changes; whether to listen is a separate flag.
             options.debug_port = parsed;
         }
-        "--inspect" | "--inspect-wait" => {
+        "--inspect" => {
             options.debug_port = parsed;
             options.inspect_enabled = true;
+        }
+        // `--inspect-wait` opens the endpoint and blocks for a client like
+        // `--inspect-brk`, but arms no break-on-start: Node's `wait_for_connect()`
+        // is true while `break_node_first_line` stays false, so
+        // `WaitForConnectByOptions` waits and then runs straight into user code.
+        // Treating it as plain `--inspect` made the process never wait at all.
+        "--inspect-wait" => {
+            options.debug_port = parsed;
+            options.inspect_enabled = true;
+            options.inspect_wait = true;
         }
         "--inspect-brk" => {
             options.debug_port = parsed;
             options.inspect_enabled = true;
             options.inspect_wait = true;
+        }
+        "--inspect-brk-node" => {
+            options.debug_port = parsed;
+            options.inspect_enabled = true;
+            options.inspect_wait = true;
+            options.inspect_break_node = true;
         }
         _ => {}
     }
@@ -2253,6 +2280,7 @@ mod tests {
         let options = parse_of(&["--inspect=0.0.0.0:9339"]).expect("parses");
         assert!(options.inspect_enabled);
         assert!(!options.inspect_wait);
+        assert!(!options.inspect_break_node);
         assert_eq!(options.debug_port.port, 9339);
         assert_eq!(options.debug_port.host, "0.0.0.0");
     }
@@ -2262,6 +2290,33 @@ mod tests {
         let options = parse_of(&["--inspect-brk=9339"]).expect("parses");
         assert!(options.inspect_enabled);
         assert!(options.inspect_wait);
+        assert!(!options.inspect_break_node);
+        assert_eq!(options.debug_port.port, 9339);
+    }
+
+    #[test]
+    fn inspect_brk_node_marks_a_bootstrap_break() {
+        let options = parse_of(&["--inspect-brk-node=9339"]).expect("parses");
+        assert!(options.inspect_enabled);
+        assert!(options.inspect_wait);
+        assert!(options.inspect_break_node);
+        assert_eq!(options.debug_port.port, 9339);
+    }
+
+    /// `--inspect-wait` waits for a client but arms no break-on-start.
+    ///
+    /// Node's `DebugOptions` sets `wait_for_connect()` for `--inspect-wait` and
+    /// leaves `break_node_first_line` false, so `WaitForConnectByOptions` blocks
+    /// and then runs user code without pausing. The oracle shows the difference:
+    /// `node --inspect-wait=0 -e "..."` prints only the listening banner and never
+    /// the script's output until a client connects. Treating the flag as plain
+    /// `--inspect` made rustnode run the script immediately.
+    #[test]
+    fn inspect_wait_waits_without_breaking() {
+        let options = parse_of(&["--inspect-wait=9339"]).expect("parses");
+        assert!(options.inspect_enabled);
+        assert!(options.inspect_wait);
+        assert!(!options.inspect_break_node);
         assert_eq!(options.debug_port.port, 9339);
     }
 

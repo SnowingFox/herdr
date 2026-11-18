@@ -94,6 +94,14 @@ struct Paused {
     /// ends the loop: a pause ends on `Debugger.resume`, and this ends on the
     /// client saying "run", which is a different command and a different event.
     waiting_for_frontend: bool,
+    /// Set while the process is holding its exit open for a connected frontend.
+    ///
+    /// Node's `Agent::WaitForDisconnect` (`inspector_agent.cc:1063`) sets
+    /// `waiting_for_sessions_disconnect_` and enters `runMessageLoop()` once the
+    /// `exit` handlers have run. It ends when the last frontend disconnects, which
+    /// is why `should_run` consults `attached` for it exactly as it does for the
+    /// pre-execution wait.
+    waiting_for_sessions_disconnect: bool,
     /// Incremented by anything that wants the paused loop to look again.
     generation: u32,
 }
@@ -103,6 +111,7 @@ static PAUSED: Mutex<Paused> = Mutex::new(Paused {
     resumed: false,
     attached: false,
     waiting_for_frontend: false,
+    waiting_for_sessions_disconnect: false,
     generation: 0,
 });
 static WAKEUP: Condvar = Condvar::new();
@@ -225,7 +234,7 @@ pub fn arm() {
 /// an ordinary pause, which ends on resume. Both require a connected frontend, or a
 /// client that disappeared would leave the process waiting for nobody.
 fn should_run(paused: &Paused) -> bool {
-    if paused.waiting_for_frontend {
+    if paused.waiting_for_frontend || paused.waiting_for_sessions_disconnect {
         return paused.attached;
     }
     paused.attached && !paused.resumed
@@ -332,6 +341,79 @@ pub fn wait_for_frontend_loop(
     let mut paused = PAUSED.lock().unwrap_or_else(|poison| poison.into_inner());
     paused.waiting = false;
     paused.waiting_for_frontend = false;
+    drop(paused);
+    true
+}
+
+/// Holds the process open at exit for a connected frontend, like Node does.
+///
+/// This is `Agent::WaitForDisconnect` (`inspector_agent.cc:1063`): when a debugger
+/// is still attached at process exit, Node prints
+/// `Waiting for the debugger to disconnect...` and blocks in the inspector message
+/// loop until the last frontend detaches. The script has already finished and the
+/// `exit` handlers have run; what the wait buys is a client the chance to gather
+/// final state (`Runtime.executionContextDestroyed`, a last `Runtime.evaluate`)
+/// before the process disappears.
+///
+/// Node gates both the message and the loop on `hasConnectedSessions()`, so a run
+/// with no client exits immediately and prints nothing. Without this, rustnode kept
+/// the loop alive off `is_attached()` alone: the process spun at 100% CPU, never
+/// printed the sentinel, and only reached the exit handlers once the client
+/// disconnected. `test/common/inspector-helper.js` and
+/// `internal/debugger/inspect_probe.js` both key their teardown on that line, so a
+/// missing sentinel turned into a full-timeout hang for every probe test.
+///
+/// Returns whether it waited. `dispatch` is the loop's second half for the same
+/// reason [`run_pause_loop`] takes it: `Debugger.resume`, `Runtime.evaluate` and the
+/// disconnect itself all arrive as queued messages the isolate has to dispatch.
+pub fn wait_for_disconnect_loop(
+    scope: &mut v8::PinScope<'_, '_>,
+    dispatch: impl Fn(&mut v8::PinScope<'_, '_>) -> usize,
+) -> bool {
+    {
+        let mut paused = PAUSED.lock().unwrap_or_else(|poison| poison.into_inner());
+        if !paused.attached {
+            return false;
+        }
+        // Node prints this from `Agent::WaitForDisconnect` before it starts waiting,
+        // and to stderr, where every test harness reads it.
+        eprintln!("Waiting for the debugger to disconnect...");
+        paused.waiting_for_sessions_disconnect = true;
+        paused.resumed = false;
+        paused.waiting = true;
+    }
+
+    // Node has no timeout here: the wait ends when the frontend disconnects, which is
+    // the client's own decision. `PAUSE_TIMEOUT` still bounds it so a client that
+    // vanishes without closing its socket cannot strand the process, and a real
+    // debugger never sees it.
+    let deadline = Instant::now() + PAUSE_TIMEOUT;
+    loop {
+        let dispatched = dispatch(scope);
+        let paused = PAUSED.lock().unwrap_or_else(|poison| poison.into_inner());
+        if !should_run(&paused) {
+            break;
+        }
+        if dispatched > 0 {
+            drop(paused);
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!(
+                "the debugger did not disconnect within {PAUSE_TIMEOUT:?}; continuing to exit"
+            );
+            break;
+        }
+        let (next, _timeout) = WAKEUP
+            .wait_timeout(paused, remaining)
+            .unwrap_or_else(|poison| poison.into_inner());
+        drop(next);
+    }
+
+    let mut paused = PAUSED.lock().unwrap_or_else(|poison| poison.into_inner());
+    paused.waiting = false;
+    paused.waiting_for_sessions_disconnect = false;
     drop(paused);
     true
 }

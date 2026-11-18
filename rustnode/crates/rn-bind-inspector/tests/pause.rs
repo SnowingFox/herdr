@@ -210,6 +210,72 @@ fn a_pause_with_no_frontend_does_not_wait() {
 }
 
 #[test]
+fn wait_for_disconnect_blocks_until_the_frontend_leaves() {
+    // `Agent::WaitForDisconnect` (`inspector_agent.cc:1063`) is the reason a debugged
+    // process stays alive after its script finishes. Without it the libuv loop was
+    // pinned by `is_attached()`, so the process spun at 100% CPU and never printed
+    // the `Waiting for the debugger to disconnect...` line every harness keys on.
+    //
+    // The observable asserted here is the wait itself: a frontend attached from the
+    // start must keep the call blocked well past the instant a no-op would return,
+    // and the detach is what ends it.
+    with_context(|scope| {
+        install(scope);
+        run(scope, FRONTEND);
+        rn_bind_inspector::set_frontend_attached(true);
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let detacher = std::thread::spawn(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the wait must announce that it started");
+            std::thread::sleep(Duration::from_millis(300));
+            rn_bind_inspector::set_frontend_attached(false);
+        });
+
+        started_tx.send(()).expect("announcing the wait");
+        let started = std::time::Instant::now();
+        let blocked = rn_bind_inspector::wait_for_disconnect_for_test(scope);
+        let waited = started.elapsed();
+        detacher.join().expect("the detacher thread");
+
+        assert!(
+            blocked,
+            "a connected frontend must hold the process open at exit"
+        );
+        assert!(
+            waited >= Duration::from_millis(250),
+            "the wait must last until the frontend disconnects, but returned after \
+             {waited:?}; returning immediately is what made the process race its own exit"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the detach must end the wait rather than letting it expire, waited {waited:?}"
+        );
+    });
+}
+
+#[test]
+fn wait_for_disconnect_is_a_no_op_with_no_frontend() {
+    // Node prints the sentinel and enters the message loop only under
+    // `hasConnectedSessions()`, so a run with nobody attached must exit at once and
+    // print nothing.
+    with_context(|scope| {
+        install(scope);
+        run(scope, FRONTEND);
+        rn_bind_inspector::set_frontend_attached(false);
+        let started = std::time::Instant::now();
+        let blocked = rn_bind_inspector::wait_for_disconnect_for_test(scope);
+        assert!(!blocked, "no frontend means nothing to wait for");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the no-frontend case must return immediately, took {:?}",
+            started.elapsed()
+        );
+    });
+}
+
+#[test]
 fn resume_from_another_thread_ends_the_pause() {
     // The real frontend resumes from its reader thread once it has processed
     // `Debugger.paused`. Asserting this needs the resume to come from elsewhere, or the

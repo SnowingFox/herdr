@@ -343,6 +343,36 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
         return;
     };
 
+    // `internal/bootstrap/web/exposed-wildcard.js` normally wraps the global
+    // console with inspector methods and installs the command-line API bridge:
+    //
+    //   inspector.wrapConsole(consoleFromNode);
+    //   setConsoleExtensionInstaller(inspector.installConsoleExtensions);
+    //
+    // This custom bootstrap path bypasses that module, so do the same wiring
+    // here when the inspector binding exists. Without it, `console.profile` and
+    // related methods are missing in paused user-script contexts
+    // (`test-debugger-profile.js`).
+    if let (Some(inspector_binding), Some(console_global), Some(inspector_util)) = (
+        call_with_string(scope, internal_binding.into(), "inspector"),
+        call_require(scope, require, "internal/console/global"),
+        call_require(scope, require, "internal/util/inspector"),
+    ) {
+        if let Some(wrap_console) = get_property(scope, inspector_util, "wrapConsole") {
+            if let Ok(wrap_console) = v8::Local::<v8::Function>::try_from(wrap_console) {
+                let _ = wrap_console.call(scope, inspector_util, &[console_global]);
+            }
+        }
+        if let (Some(set_installer), Some(installer)) = (
+            get_property(scope, inspector_binding, "setConsoleExtensionInstaller"),
+            get_property(scope, inspector_util, "installConsoleExtensions"),
+        ) {
+            if let Ok(set_installer) = v8::Local::<v8::Function>::try_from(set_installer) {
+                let _ = set_installer.call(scope, inspector_binding, &[installer]);
+            }
+        }
+    }
+
     let global = scope.get_current_context().global(scope);
     // `(target, moduleId, names)`.
     for (module, names) in [

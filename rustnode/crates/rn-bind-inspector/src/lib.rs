@@ -392,6 +392,24 @@ pub fn wait_for_frontend(scope: &mut v8::PinScope<'_, '_>) -> bool {
     pause::wait_for_frontend_loop(scope, drain_pending_messages, pause::ATTACH_TIMEOUT)
 }
 
+/// Holds the process open at exit for a connected frontend, like Node does.
+///
+/// This is `Agent::WaitForDisconnect` (`inspector_agent.cc:1063`). With a client
+/// attached it prints `Waiting for the debugger to disconnect...` and blocks in the
+/// inspector message loop until that client detaches; with nobody attached it
+/// returns immediately and prints nothing.
+///
+/// Node calls it from an `AtExit` hook, after `exit` has been emitted, which is why
+/// the CLI calls this from its own exit path. The sentinel line is a contract, not
+/// decoration: `test/common/inspector-helper.js` and
+/// `internal/debugger/inspect_probe.js` both use it to learn that the target has
+/// finished, so omitting it makes every one of their tests wait out its timeout.
+///
+/// Returns whether it waited.
+pub fn wait_for_disconnect(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    pause::wait_for_disconnect_loop(scope, drain_pending_messages)
+}
+
 /// Asks every attached session to pause before its next statement.
 ///
 /// `--inspect-brk`'s break on start, and `callAndPauseOnStart`'s. This is
@@ -474,6 +492,15 @@ pub fn pause_on_stack() -> bool {
 /// blocking without one would be testing a loop that cannot be resumed.
 pub fn run_pause_loop_for_test(scope: &mut v8::PinScope<'_, '_>) -> bool {
     pause::run_pause_loop(scope, drain_pending_messages)
+}
+
+/// [`wait_for_disconnect`] for a test, dispatching through `drain_pending_messages`.
+///
+/// Exists for the same reason [`run_pause_loop_for_test`] does: the production entry
+/// point is reachable only from the CLI's exit path, and a test that could not call
+/// it directly would have to spawn a process to observe the wait.
+pub fn wait_for_disconnect_for_test(scope: &mut v8::PinScope<'_, '_>) -> bool {
+    pause::wait_for_disconnect_loop(scope, drain_pending_messages)
 }
 
 /// [`run_pause_loop_for_test`] dispatching through a caller's own server.
