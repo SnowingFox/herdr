@@ -89,26 +89,102 @@ impl Runnable for DhBits {
 
 /// `EVP_PKEY_derive` between a private key and a peer's public half.
 ///
-/// `DHPointer::stateless` for the EC/X25519 families: `EVP_PKEY_derive_init` on
-/// the private key, `EVP_PKEY_derive_set_peer` with the public one, then two
-/// `EVP_PKEY_derive` calls to learn the length before writing it. The DH-specific
-/// size padding `DHPointer` applies is not part of this path — `stateless` skips
-/// it, which is why the EC secret is the field width rather than the padded
-/// prime width.
+/// This is `DHPointer::stateless`, operation for operation:
+///
+/// ```text
+/// EVP_PKEY_derive_init
+/// EVP_PKEY_derive_set_peer
+/// EVP_PKEY_derive(…, nullptr, &out_size)     // the padded length
+/// EVP_PKEY_derive(…, buffer, &out_size)      // the real write
+/// ```
+///
+/// `stateless` then left-pads to the first call's `out_size` when the second
+/// wrote fewer bytes, and that padding is observable: a 1536-bit DH shared secret
+/// whose leading byte is zero is 191 bytes unpadded and 192 padded, and
+/// `test-crypto-dh-stateless.js` compares the derived secret against
+/// `computeSecret`'s output byte for byte. `Deriver::derive_to_vec` cannot
+/// express this because it sizes the buffer from the first call and then
+/// truncates to what the second returned, dropping the leading zeros.
+///
+/// For EC the two calls agree, so the padding branch never runs.
 fn derive(private: &PKey, public: &PKey) -> Result<Vec<u8>, KeyError> {
     // `EVP_PKEY_derive_set_peer` accepts a `PKey<Private>` that holds only public
     // material, which is exactly what `KeyData::asymmetric(kKeyTypePublic, …)`
     // wraps: the public half of a generated pair. Rebuilding it as a
     // `PKey<Public>` would need a re-parse and could reject a key the caller
     // already proved it holds.
-    let mut deriver = openssl::derive::Deriver::new(private.openssl_ref())
-        .map_err(|_| KeyError::OperationFailed("Failed to derive the shared secret"))?;
-    deriver
-        .set_peer(public.openssl_ref())
-        .map_err(|_| KeyError::OperationFailed("Failed to derive the shared secret"))?;
-    deriver
-        .derive_to_vec()
-        .map_err(|_| KeyError::OperationFailed("Failed to derive the shared secret"))
+    //
+    // Every failure carries OpenSSL's packed entry rather than a generic
+    // `ERR_CRYPTO_OPERATION_FAILED`: two keys with different DH groups is
+    // `ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS`, and both
+    // `test-crypto-dh-stateless.js` and `test-crypto-job-error-parity.js`
+    // compare that code on the sync and the async path.
+    //
+    // The two-step length convention is spelled out here rather than taken from
+    // `Deriver`, whose `derive` takes a buffer and so can only report what it
+    // wrote — it has no length-only form. Making the calls against the context
+    // directly is what allows the padding below.
+    let mut context = openssl::pkey_ctx::PkeyCtx::new(private.openssl_ref())
+        .map_err(|error| derive_failure(&error))?;
+    context
+        .derive_init()
+        .map_err(|error| derive_failure(&error))?;
+    let context_pointer = foreign_types::ForeignType::as_ptr(&context);
+    // SAFETY: `context_pointer` is the live context just initialised, and
+    // `public.raw()` is the peer's `EVP_PKEY *`, which stays alive because the
+    // caller owns `public` for the duration of the call.
+    let set_peer = unsafe { openssl_sys::EVP_PKEY_derive_set_peer(context_pointer, public.raw()) };
+    if set_peer <= 0 {
+        return Err(derive_failure(&last_error()));
+    }
+    let mut length = 0usize;
+    // SAFETY: as above; a null output buffer asks OpenSSL for the required
+    // length and writes nothing.
+    let measured =
+        unsafe { openssl_sys::EVP_PKEY_derive(context_pointer, std::ptr::null_mut(), &mut length) };
+    if measured <= 0 || length == 0 {
+        return Err(derive_failure(&last_error()));
+    }
+    let mut secret = vec![0u8; length];
+    // SAFETY: the buffer is `length` bytes, which is the length OpenSSL just
+    // reported for this exact context and peer.
+    let written =
+        unsafe { openssl_sys::EVP_PKEY_derive(context_pointer, secret.as_mut_ptr(), &mut length) };
+    if written <= 0 {
+        return Err(derive_failure(&last_error()));
+    }
+    // `memmove` to the right, then zero the front: the same shift `stateless`
+    // does, expressed on a slice.
+    let total = secret.len();
+    if length < total {
+        let padding = total - length;
+        secret.copy_within(0..length, padding);
+        secret[..padding].fill(0);
+    } else {
+        secret.truncate(length);
+    }
+    Ok(secret)
+}
+
+/// The error `DHBitsTraits::DeriveBits` reports for an `EVP_PKEY_derive` step.
+///
+/// `CryptoErrorStore::Capture` in `crypto_util.cc` records the queue and the
+/// oldest entry becomes the exception's `code`, so the packed value is taken from
+/// the `ErrorStack` the safe crate already drained it into.
+fn derive_failure(error: &openssl::error::ErrorStack) -> KeyError {
+    let failure = rn_crypto_openssl::failure_from(error);
+    KeyError::OpenSsl {
+        message: "Failed to derive the shared secret",
+        packed: failure.packed(),
+    }
+}
+
+/// The entries a failed `EVP_PKEY_derive` left on the queue, as an `ErrorStack`.
+///
+/// The raw calls above do not drain the queue the way the safe wrapper does, so
+/// it is captured here for [`derive_failure`] to unpack.
+fn last_error() -> openssl::error::ErrorStack {
+    openssl::error::ErrorStack::get()
 }
 
 /// `new DHBitsJob(mode, pubData, pubFormat, pubType, pubPassphrase,

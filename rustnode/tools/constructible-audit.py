@@ -79,8 +79,6 @@ PROTOTYPE_EXEMPT = frozenset()
 # shipped. An entry whose member becomes installed fails the audit as stale.
 DEFERRED = (
     "crypto.ChaCha20Poly1305CipherJob",
-    "crypto.DhKeyPairGenJob",
-    "crypto.DsaKeyPairGenJob",
     "crypto.KEMDecapsulateJob",
     "crypto.KEMEncapsulateJob",
     "crypto.KangarooTwelveJob",
@@ -98,6 +96,11 @@ DEFERRED = (
     # `fs.CpDirJob` was here for the same reason and left the same way: it ships
     # now, so the line is gone. Covered by
     # `crates/rn-bind-fs/tests/cp_parity.rs`.
+    #
+    # `crypto.DhKeyPairGenJob` and `crypto.DsaKeyPairGenJob` left the same way:
+    # both are installed by `crates/rn-bind-crypto-keys/src/jobs.rs` now, so
+    # `generateKeyPairSync('dh'|'dsa', ...)` generates a real key. Covered by
+    # `crates/rn-bind-crypto-keys`'s job tests and eight Node suite files.
     #
     # `crypto.DHBitsJob` left the same way: `crates/rn-bind-crypto-keys/src/dhbits.rs`
     # now installs it, because `subtle.deriveBits`/`deriveKey` for ECDH and X25519

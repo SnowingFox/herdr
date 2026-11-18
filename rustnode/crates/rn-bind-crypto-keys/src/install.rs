@@ -43,14 +43,16 @@ use crate::templates::{self, set_key_data, with_key_data, INTERNAL_FIELD_COUNT};
 
 /// The members this crate installs, for the parent crate's `MEMBERS` list.
 ///
-/// Eleven names: the handle class, the three `KeyObject` class-protocol
-/// functions, the three `NativeCryptoKey` ones, and the four key-generation jobs.
+/// Thirteen names: the handle class, the three `KeyObject` class-protocol
+/// functions, the three `NativeCryptoKey` ones, and the six key-generation jobs.
 pub const MEMBERS: &[&str] = &[
     "KeyObjectHandle",
     "SecretKeyGenJob",
     "RsaKeyPairGenJob",
     "EcKeyPairGenJob",
     "NamedKeyPairGenJob",
+    "DsaKeyPairGenJob",
+    "DhKeyPairGenJob",
     "createNativeKeyObjectClass",
     "getKeyObjectSlots",
     "isKeyObject",
@@ -417,15 +419,20 @@ mod tests {
 
     #[test]
     fn the_member_list_is_the_class_protocol_plus_the_jobs() {
-        // These twelve are what `keys.js`, `keygen.js` and `webcrypto` destructure,
-        // and `rn-bind-crypto` moves exactly these from `DEFERRED` to `MEMBERS`.
+        // These fourteen are what `keys.js`, `keygen.js` and `webcrypto`
+        // destructure, and `rn-bind-crypto` moves exactly these from `DEFERRED`
+        // to `MEMBERS`.
         //
         // The three `NativeCryptoKey` members were added with the `isCryptoKey`
         // brand: `keys.js` destructures `createCryptoKeyClass` at module scope
         // and calls `getCryptoKeySlots`/`isCryptoKey` from the `CryptoKey`
         // getters, so all three have to exist or `util.types.isCryptoKey` throws
         // "isNativeCryptoKey is not a function".
-        assert_eq!(MEMBERS.len(), 12);
+        //
+        // `DsaKeyPairGenJob` and `DhKeyPairGenJob` are the two `keygen.js`
+        // destructures for `generateKeyPair('dsa', ...)` and `('dh', ...)`, and
+        // their absence is what made those two throw "is not a constructor".
+        assert_eq!(MEMBERS.len(), 14);
         for name in [
             "KeyObjectHandle",
             "createNativeKeyObjectClass",
@@ -443,6 +450,8 @@ mod tests {
             "RsaKeyPairGenJob",
             "EcKeyPairGenJob",
             "NamedKeyPairGenJob",
+            "DsaKeyPairGenJob",
+            "DhKeyPairGenJob",
         ] {
             assert!(MEMBERS.contains(&name), "{name}");
         }

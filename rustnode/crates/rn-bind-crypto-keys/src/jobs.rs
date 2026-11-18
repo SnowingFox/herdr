@@ -1,4 +1,4 @@
-//! The four key-generation jobs.
+//! The six key-generation jobs.
 //!
 //! `crypto_keygen.cc` and `crypto_keygen.h` are the sources. Each job reads its
 //! parameters from the constructor argument list, generates key material through
@@ -19,13 +19,17 @@
 //!                      privFormat, privType, cipher, passphrase)
 //! NamedKeyPairGenJob  (mode, type, pubFormat, pubType, privFormat, privType,
 //!                      cipher, passphrase)
+//! DsaKeyPairGenJob    (mode, modulusBits, divisorBits, pubFormat, pubType,
+//!                      privFormat, privType, cipher, passphrase)
+//! DhKeyPairGenJob     (mode, group) | (mode, primeOrPrimeLength, generator),
+//!                      then the same encoding tail
 //! ```
 //!
-//! `DsaKeyPairGenJob` and `DhKeyPairGenJob` are *not* here: they belong to the
-//! DH slice's crate and to the DSA surface respectively, and only their
-//! constructors need to exist for `keygen.js` to load. They are declared deferred
-//! by the parent crate rather than stubbed into something that silently returns
-//! the wrong shape.
+//! The DH job is the only one whose parameter count varies: `keygen.js` sends a
+//! single group-name string when `options.group` was given, and a prime (or a
+//! prime length) plus a generator otherwise. `DhKeyGenTraits::AdditionalConfig`
+//! in `crypto_dh.cc` decides which by testing `args[offset]->IsString()`, and
+//! that test is the only thing that distinguishes the two layouts.
 
 use openssl::pkey::PKey as OpenSslPKey;
 use rn_crypto_job::{dispatch, Completion, CryptoJobError, JobMode, Runnable};
@@ -50,7 +54,7 @@ const K_KEY_VARIANT_RSA_SSA_PKCS1_V1_5: i32 = 0;
 /// `kKeyVariantRSA_PSS`.
 const K_KEY_VARIANT_RSA_PSS: i32 = 1;
 
-/// Installs the four job classes.
+/// Installs the six job classes.
 pub fn install_classes<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     target: v8::Local<'s, v8::Object>,
@@ -73,6 +77,8 @@ pub fn install_classes<'s>(
     job_class!("RsaKeyPairGenJob" => rsa_constructor);
     job_class!("EcKeyPairGenJob" => ec_constructor);
     job_class!("NamedKeyPairGenJob" => named_constructor);
+    job_class!("DsaKeyPairGenJob" => dsa_constructor);
+    job_class!("DhKeyPairGenJob" => dh_constructor);
     Ok(())
 }
 
@@ -99,6 +105,24 @@ pub(crate) fn require_new(
     false
 }
 
+/// The DH parameters a `DhKeyPairGenJob` generates from.
+///
+/// `DhKeyPairParams` is a `std::variant<BignumPointer, int>`, and which arm it
+/// holds decides which OpenSSL call generates the parameters: a fixed prime is
+/// imported with `EVP_PKEY_fromdata`, while a bit length is generated with
+/// `EVP_PKEY_CTX_set_dh_paramgen_prime_len`. `keygen.js` sends the fixed prime
+/// for both `{ group }` and `{ prime }`, because it resolves the group name to
+/// its RFC prime before calling the constructor — so the group arm only exists
+/// here to keep the two spellings distinct in the error a bad name produces.
+enum DhSource {
+    /// `{ group: name }`, resolved through `dh_group_prime`.
+    Group(String),
+    /// `{ prime: <bytes> }`.
+    Prime(Vec<u8>),
+    /// `{ primeLength: bits }`.
+    Length(i32),
+}
+
 /// The parameters a key-pair job generates from.
 struct KeyPairSpec {
     algorithm: KeyAlgorithm,
@@ -113,6 +137,11 @@ struct KeyPairSpec {
     /// The EC curve, for an `EcKeyPairGenJob`.
     named_curve: Option<String>,
     ec_param_encoding: i32,
+    /// The `q` width for a `DsaKeyPairGenJob`, or `None` for every other family.
+    /// `-1` means keygen.js did not name one.
+    dsa_divisor_bits: Option<i32>,
+    /// The DH parameter source, or `None` for every other family.
+    dh: Option<(DhSource, i32)>,
     public_encoding: PublicKeyEncoding,
     private_encoding: PrivateKeyEncoding,
     /// How the result is presented, which is what the mode decides.
@@ -256,13 +285,31 @@ fn crypto_key<'s>(
 /// algorithm's public key bytes, and `raw-private`/`raw-seed` are the private
 /// scalar or seed. `write_public` answers `Ok(None)` for them, which the caller
 /// would otherwise turn into a missing array element.
+/// The JWK form of one half of a generated pair.
+///
+/// `KeyPairGenTraits::EncodeKey` calls `ToEncodedPublicKey`, whose JWK arm is
+/// `ExportJWKInner`; the fields come from the same place `KeyObject.export({
+/// format: 'jwk' })` gets them. A key type JWK cannot represent (DSA, DH) is
+/// `ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE`, thrown rather than dropped: `finish`
+/// runs under a `TryCatch`, so a throw becomes the `[error, undefined]` the
+/// caller's `handleError` reads. Returning `None` instead left both slots
+/// undefined and surfaced as "Cannot destructure property '0' of 'keys'".
 fn encode_jwk<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     key: &PKey,
     key_type: KeyType,
 ) -> Option<v8::Local<'s, v8::Value>> {
-    let data = KeyData::asymmetric(key_type, key.clone())?;
-    let fields = crate::handle::export_jwk_fields(&data, false).ok()?;
+    let Some(data) = KeyData::asymmetric(key_type, key.clone()) else {
+        throw(scope, &KeyError::InvalidKeyType);
+        return None;
+    };
+    let fields = match crate::handle::export_jwk_fields(&data, false) {
+        Ok(fields) => fields,
+        Err(error) => {
+            throw(scope, &error);
+            return None;
+        }
+    };
     let object = v8::Object::new(scope);
     for (name, value) in fields {
         let field = v8::String::new(scope, name)?;
@@ -298,8 +345,25 @@ fn encode_public<'s>(
     if encoding.format == Some(KeyFormat::Jwk) {
         return encode_jwk(scope, key, key_type);
     }
-    let encoded = key.write_public(encoding).ok()??;
-    emit_encoded(scope, &encoded)
+    // Same reasoning as `encode_private`: the write's failure is what JavaScript
+    // has to see, and `ok()??` discarded it.
+    match key.write_public(encoding) {
+        Ok(Some(encoded)) => emit_encoded(scope, &encoded),
+        Ok(None) => {
+            throw(
+                scope,
+                &KeyError::IncompatibleKeyOptions {
+                    encoding: "raw".to_string(),
+                    detail: "must be exported with the raw exporter",
+                },
+            );
+            None
+        }
+        Err(failure) => {
+            crate::handle::report_parse_failure(scope, &failure, "Failed to encode public key");
+            None
+        }
+    }
 }
 
 /// [`encode_public`] for the private half.
@@ -327,8 +391,34 @@ fn encode_private<'s>(
             crate::install::buffer_from(scope, &bytes)
         }
         _ => {
-            let encoded = key.write_private(encoding).ok()??;
-            emit_encoded(scope, &encoded)
+            // A `write_private` failure is `ThrowCryptoError` with the packed
+            // value it recorded — for an unknown cipher that is
+            // `ERR_CRYPTO_UNKNOWN_CIPHER`, and for a rejected format/type pair
+            // `ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS`. `ok()??` used to drop both,
+            // which turned every one of those into "keys is undefined" at the
+            // caller. `finish` runs under a `TryCatch`, so throwing here is how
+            // the failure reaches `handleError`.
+            match key.write_private(encoding) {
+                Ok(Some(encoded)) => emit_encoded(scope, &encoded),
+                Ok(None) => {
+                    throw(
+                        scope,
+                        &KeyError::IncompatibleKeyOptions {
+                            encoding: "raw".to_string(),
+                            detail: "must be exported with the raw exporter",
+                        },
+                    );
+                    None
+                }
+                Err(failure) => {
+                    crate::handle::report_parse_failure(
+                        scope,
+                        &failure,
+                        "Failed to encode private key",
+                    );
+                    None
+                }
+            }
         }
     }
 }
@@ -356,7 +446,86 @@ fn generate_key_pair(spec: &KeyPairSpec) -> Result<PKey, KeyError> {
     if spec.algorithm == rn_crypto_openssl::EC {
         return generate_ec(spec);
     }
+    if spec.algorithm == rn_crypto_openssl::DSA {
+        return generate_dsa(spec);
+    }
+    if spec.algorithm == rn_crypto_openssl::DH {
+        return generate_dh(spec);
+    }
     generate_named(spec)
+}
+
+/// Generates a DSA key pair, which is `DsaKeyGenTraits::Setup`.
+fn generate_dsa(spec: &KeyPairSpec) -> Result<PKey, KeyError> {
+    let divisor_bits = spec.dsa_divisor_bits.unwrap_or(-1);
+    rn_crypto_openssl::generate_dsa(spec.modulus_bits, divisor_bits)
+        .map_err(|error| keygen_error(&error))
+}
+
+/// Generates a DH key pair, which is `DhKeyGenTraits::Setup`.
+fn generate_dh(spec: &KeyPairSpec) -> Result<PKey, KeyError> {
+    let failed = || KeyError::OperationFailed("Failed to generate key pair");
+    let Some((source, generator)) = &spec.dh else {
+        return Err(KeyError::InvalidKeyType);
+    };
+    let generated = match source {
+        DhSource::Group(name) => rn_crypto_openssl::generate_dh_group(name),
+        DhSource::Prime(bytes) => {
+            let prime = openssl::bn::BigNum::from_slice(bytes).map_err(|_| failed())?;
+            rn_crypto_openssl::generate_dh_from_prime(&prime, *generator)
+        }
+        DhSource::Length(bits) => rn_crypto_openssl::generate_dh_parameters(*bits, *generator),
+    };
+    generated.map_err(|error| keygen_error(&error))
+}
+
+/// Maps a generation failure onto the error the job reports.
+///
+/// The two shapes are real and tested differently: an unknown group is
+/// `ERR_CRYPTO_UNKNOWN_DH_GROUP`, and everything else is `ThrowCryptoError` with
+/// the packed OpenSSL value, which is what gives
+/// `test-crypto-dh.js`/`test-crypto-keygen.js` a `code` to read.
+fn keygen_error(error: &rn_crypto_openssl::KeyGenError) -> KeyError {
+    match error {
+        rn_crypto_openssl::KeyGenError::UnknownGroup(_) => {
+            KeyError::UnknownDhGroup(error.message().to_string())
+        }
+        rn_crypto_openssl::KeyGenError::OpenSsl { message, packed } => KeyError::OpenSsl {
+            message,
+            packed: *packed,
+        },
+    }
+}
+
+/// The error a failed key generation reports, carrying OpenSSL's packed value
+/// when there is one.
+///
+/// `KeyGenJob::DoThreadPoolWork` captures the queue and only inserts
+/// `KEY_GENERATION_JOB_FAILED` when it is empty, so the OpenSSL detail is what
+/// reaches JavaScript whenever there is any.
+fn keygen_failure(message: &'static str) -> KeyError {
+    let packed = rn_crypto_openssl::openssl_error()
+        .map(|error| error.packed)
+        .unwrap_or(0);
+    KeyError::OpenSsl { message, packed }
+}
+
+/// [`keygen_failure`] for a failure `openssl` already drained into an
+/// `ErrorStack`.
+///
+/// The safe crate's calls return `ErrorStack`, which *is* the queue read at the
+/// moment it failed — draining it again finds nothing. `CryptoErrorStore::Capture`
+/// reports the oldest entry, which is the first one the stack holds.
+fn failed_from(error: &openssl::error::ErrorStack) -> KeyError {
+    let packed = error
+        .errors()
+        .first()
+        .map(|entry| entry.code())
+        .unwrap_or(0);
+    KeyError::OpenSsl {
+        message: "Failed to generate key pair",
+        packed,
+    }
 }
 
 /// Generates an RSA key, with the PSS restrictions when the variant asks for them.
@@ -383,15 +552,17 @@ fn generate_rsa(spec: &KeyPairSpec) -> Result<PKey, KeyError> {
     } else {
         openssl::pkey::Id::RSA
     };
-    let context = openssl::pkey_ctx::PkeyCtx::new_id(id)
-        .map_err(|_| KeyError::OperationFailed("Failed to generate key pair"))?;
+    // Every failure below comes from OpenSSL and carries its packed entry, which
+    // is what gives `publicExponent: 1` the `ERR_OSSL_RSA_PUB_EXPONENT_OUT_OF_RANGE`
+    // code `test-crypto-keygen.js` matches on `/exponent/` in the message.
+    // Reporting a bare `ERR_CRYPTO_OPERATION_FAILED` lost both.
+    let failed = || keygen_failure("Failed to generate key pair");
+    let context = openssl::pkey_ctx::PkeyCtx::new_id(id).map_err(|error| failed_from(&error))?;
     let mut context = context;
-    context
-        .keygen_init()
-        .map_err(|_| KeyError::OperationFailed("Failed to generate key pair"))?;
+    context.keygen_init().map_err(|error| failed_from(&error))?;
     context
         .set_rsa_keygen_bits(spec.modulus_bits)
-        .map_err(|_| KeyError::OperationFailed("Failed to generate key pair"))?;
+        .map_err(|error| failed_from(&error))?;
 
     // `set1` copies the exponent; the crate's `set_rsa_keygen_pubexp` would take
     // ownership of a value that dies at the end of this function.
@@ -406,7 +577,7 @@ fn generate_rsa(spec: &KeyPairSpec) -> Result<PKey, KeyError> {
         )
     };
     if copied != 1 {
-        return Err(KeyError::OperationFailed("Failed to generate key pair"));
+        return Err(failed());
     }
 
     if pss {
@@ -416,7 +587,7 @@ fn generate_rsa(spec: &KeyPairSpec) -> Result<PKey, KeyError> {
     context
         .keygen()
         .map(PKey::from_private)
-        .map_err(|_| KeyError::OperationFailed("Failed to generate key pair"))
+        .map_err(|error| failed_from(&error))
 }
 
 /// Applies the restrictions that make an `RSA-PSS` key restricted.
@@ -590,12 +761,10 @@ fn generate_named(spec: &KeyPairSpec) -> Result<PKey, KeyError> {
     use foreign_types::ForeignType;
     let mut context: openssl::pkey_ctx::PkeyCtx<openssl::pkey::Private> =
         unsafe { openssl::pkey_ctx::PkeyCtx::from_ptr(raw) };
-    context
-        .keygen_init()
-        .map_err(|_| KeyError::OperationFailed("Failed to generate key pair"))?;
-    let key = context
-        .keygen()
-        .map_err(|_| KeyError::OperationFailed("Failed to generate key pair"))?;
+    // Same reasoning as `generate_rsa`: the failure is OpenSSL's, and its packed
+    // entry is the `code` the caller reads.
+    context.keygen_init().map_err(|error| failed_from(&error))?;
+    let key = context.keygen().map_err(|error| failed_from(&error))?;
     Ok(PKey::from_private(key))
 }
 
@@ -800,13 +969,33 @@ fn rsa_constructor<'s>(
     // is why the offsets are variant-dependent.
     let (pss_hash, pss_mgf1_hash, pss_salt_length, mut offset) = if variant == K_KEY_VARIANT_RSA_PSS
     {
+        // A string-valued slot, or `None` when `keygen.js` passed `undefined`
+        // because the option was absent. `to_string` would stringify `undefined`
+        // into the literal `"undefined"`, which `digest_by_name` then fails to
+        // resolve.
+        let hash = string_arg(scope, &args, 4);
+        let mgf1 = string_arg(scope, &args, 5);
+        // `RsaKeyGenTraits::AdditionalConfig` resolves both names here, at
+        // construction time, and reports `ERR_CRYPTO_INVALID_DIGEST` — a
+        // `TypeError` whose message names the offending digest. The generation
+        // path would otherwise fail on the background thread with a generic
+        // `ERR_CRYPTO_OPERATION_FAILED`, which is what `test-crypto-keygen.js`
+        // catches on both the `hashAlgorithm` and `mgf1HashAlgorithm` cases.
+        for (name, label) in [(&hash, "Invalid digest"), (&mgf1, "Invalid MGF1 digest")] {
+            let Some(name) = name else { continue };
+            if digest_by_name(name).is_none() {
+                throw(
+                    scope,
+                    &KeyError::InvalidDigest {
+                        message: format!("{label}: {name}"),
+                    },
+                );
+                return;
+            }
+        }
         (
-            // A string-valued slot, or `None` when `keygen.js` passed
-            // `undefined` because the option was absent. `to_string` would
-            // stringify `undefined` into the literal `"undefined"`, which
-            // `digest_by_name` then fails to resolve.
-            string_arg(scope, &args, 4),
-            string_arg(scope, &args, 5),
+            hash,
+            mgf1,
             // `int32_value` returns 0 for a non-integer, which would silently
             // turn an absent `saltLength` into an explicit zero-length salt.
             int32_arg(scope, &args, 6).unwrap_or(-1),
@@ -846,6 +1035,8 @@ fn rsa_constructor<'s>(
         pss_salt_length,
         named_curve: None,
         ec_param_encoding: crate::constants::OPENSSL_EC_NAMED_CURVE,
+        dsa_divisor_bits: None,
+        dh: None,
         public_encoding,
         private_encoding,
         output,
@@ -911,6 +1102,8 @@ fn ec_constructor<'s>(
         pss_salt_length: -1,
         named_curve,
         ec_param_encoding,
+        dsa_divisor_bits: None,
+        dh: None,
         public_encoding,
         private_encoding,
         output,
@@ -986,9 +1179,145 @@ fn named_constructor<'s>(
         pss_salt_length: -1,
         named_curve: None,
         ec_param_encoding: crate::constants::OPENSSL_EC_NAMED_CURVE,
+        dsa_divisor_bits: None,
+        dh: None,
         public_encoding,
         private_encoding,
         output,
+    };
+    install_job(scope, this, mode, spec);
+    rv.set(this.into());
+}
+
+/// `new DsaKeyPairGenJob(mode, modulusBits, divisorBits, …encoding)`.
+///
+/// `DsaKeyGenTraits::AdditionalConfig` reads two `CHECK`ed arguments and leaves
+/// `offset` at 3, so the encoding tail is the same one every other job reads —
+/// but there is no WebCrypto branch, because `keygen.js` never builds a DSA job
+/// for `subtle`. Node would abort on a `kCryptoJobWebCrypto` DSA job rather than
+/// generate anything, so this rejects the mode instead of guessing at an
+/// argument layout that `lib/**` does not produce.
+fn dsa_constructor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    if !require_new(scope, &args) {
+        return;
+    }
+    let this: v8::Local<v8::Object> = args.this();
+    let Some(mode) = JobMode::from_raw(args.get(0).int32_value(scope).unwrap_or(-1)) else {
+        throw(scope, &KeyError::InvalidKeyType);
+        return;
+    };
+    if mode == JobMode::WebCrypto {
+        throw(scope, &KeyError::InvalidKeyType);
+        return;
+    }
+    let modulus_bits = args.get(1).uint32_value(scope).unwrap_or(0);
+    // `int32_value` reports 0 for anything that is not an integer, which would
+    // turn an absent `divisorLength` into an explicit zero-bit `q`; `keygen.js`
+    // sends -1 for the absent case, so the distinction is preserved here.
+    let divisor_bits = int32_arg(scope, &args, 2).unwrap_or(-1);
+    let mut offset = 3;
+    let values = values_of(scope, &args);
+    let Some((public_encoding, private_encoding)) =
+        read_encodings(scope, &values, &mut offset, mode, rn_crypto_openssl::DSA)
+    else {
+        return;
+    };
+    let spec = KeyPairSpec {
+        algorithm: rn_crypto_openssl::DSA,
+        rsa_variant: None,
+        modulus_bits,
+        exponent: 0,
+        pss_hash: None,
+        pss_mgf1_hash: None,
+        pss_salt_length: -1,
+        named_curve: None,
+        ec_param_encoding: crate::constants::OPENSSL_EC_NAMED_CURVE,
+        dsa_divisor_bits: Some(divisor_bits),
+        dh: None,
+        public_encoding,
+        private_encoding,
+        output: KeyGenOutput::EncodedPair,
+    };
+    install_job(scope, this, mode, spec);
+    rv.set(this.into());
+}
+
+/// `new DhKeyPairGenJob(mode, group, …encoding)` or
+/// `new DhKeyPairGenJob(mode, primeOrPrimeLength, generator, …encoding)`.
+///
+/// The two layouts are told apart exactly as `DhKeyGenTraits::AdditionalConfig`
+/// does it, by testing whether slot 1 is a string. A string is a group name and
+/// the tail starts at 2; anything else is a prime (bytes) or a prime length
+/// (int32) with the generator in slot 2, and the tail starts at 3.
+fn dh_constructor<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
+    mut rv: v8::ReturnValue,
+) {
+    if !require_new(scope, &args) {
+        return;
+    }
+    let this: v8::Local<v8::Object> = args.this();
+    let Some(mode) = JobMode::from_raw(args.get(0).int32_value(scope).unwrap_or(-1)) else {
+        throw(scope, &KeyError::InvalidKeyType);
+        return;
+    };
+    if mode == JobMode::WebCrypto {
+        // `keygen.js` has no WebCrypto DH branch: `subtle.generateKey` for DH is
+        // not part of WebCrypto, so Node reaches the same `CHECK` failure this
+        // rejects as an error rather than as an abort.
+        throw(scope, &KeyError::InvalidKeyType);
+        return;
+    }
+    let first = args.get(1);
+    let (source, generator, mut offset) = if let Ok(text) = v8::Local::<v8::String>::try_from(first)
+    {
+        // `{ group }`. `keygen.js` forbids a generator beside a group, so the
+        // standard generator 2 is not a default here: it is the only legal
+        // value, and `DhKeyGenTraits::Setup` supplies it the same way.
+        let name = text.to_rust_string_lossy(scope);
+        if rn_crypto_openssl::dh_group_prime(&name).is_none() {
+            throw(scope, &KeyError::UnknownDhGroup(name));
+            return;
+        }
+        (DhSource::Group(name), 2, 2)
+    } else if let Some(bytes) = crate::handle::bytes_of(first) {
+        // `{ prime }`. `keygen.js` has already validated that it is a buffer and
+        // rejected a `primeLength` beside it.
+        let generator = int32_arg(scope, &args, 2).unwrap_or(2);
+        (DhSource::Prime(bytes), generator, 3)
+    } else {
+        // `{ primeLength }`, which `keygen.js` validates as an int32 because
+        // that is the only remaining member of the union.
+        let bits = int32_arg(scope, &args, 1).unwrap_or(0);
+        let generator = int32_arg(scope, &args, 2).unwrap_or(2);
+        (DhSource::Length(bits), generator, 3)
+    };
+    let values = values_of(scope, &args);
+    let Some((public_encoding, private_encoding)) =
+        read_encodings(scope, &values, &mut offset, mode, rn_crypto_openssl::DH)
+    else {
+        return;
+    };
+    let spec = KeyPairSpec {
+        algorithm: rn_crypto_openssl::DH,
+        rsa_variant: None,
+        modulus_bits: 0,
+        exponent: 0,
+        pss_hash: None,
+        pss_mgf1_hash: None,
+        pss_salt_length: -1,
+        named_curve: None,
+        ec_param_encoding: crate::constants::OPENSSL_EC_NAMED_CURVE,
+        dsa_divisor_bits: None,
+        dh: Some((source, generator)),
+        public_encoding,
+        private_encoding,
+        output: KeyGenOutput::EncodedPair,
     };
     install_job(scope, this, mode, spec);
     rv.set(this.into());
@@ -1069,9 +1398,14 @@ fn read_encodings(
             {
                 throw(
                     scope,
+                    // `THROW_ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS(env)` with no
+                    // arguments, i.e. the template's own text, which never names
+                    // the algorithm. `test-crypto-keygen-raw.js` compares only
+                    // the code, but the message is what a caller reads and the
+                    // oracle's is this one.
                     &KeyError::IncompatibleKeyOptions {
-                        encoding: algorithm.name().to_string(),
-                        detail: "does not support this key encoding",
+                        encoding: String::new(),
+                        detail: "is incompatible with the key type",
                     },
                 );
                 return None;
@@ -1095,9 +1429,14 @@ fn read_encodings(
             if !supported {
                 throw(
                     scope,
+                    // `THROW_ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS(env)` with no
+                    // arguments, i.e. the template's own text, which never names
+                    // the algorithm. `test-crypto-keygen-raw.js` compares only
+                    // the code, but the message is what a caller reads and the
+                    // oracle's is this one.
                     &KeyError::IncompatibleKeyOptions {
-                        encoding: algorithm.name().to_string(),
-                        detail: "does not support this key encoding",
+                        encoding: String::new(),
+                        detail: "is incompatible with the key type",
                     },
                 );
                 return None;
@@ -1287,5 +1626,153 @@ mod tests {
             private.iter().any(|(name, _)| *name == "d"),
             "private JWK must include the private scalar"
         );
+    }
+
+    #[test]
+    fn a_dsa_spec_generates_a_key_with_the_requested_lengths() {
+        // `DsaKeyGenTraits::AdditionalConfig` reads the two lengths and nothing
+        // else, so a spec carrying them is the whole job. 1024/160 is the pair
+        // OpenSSL accepts without the FIPS restriction.
+        let spec = dsa_spec(1024, 160);
+        let key = generate_key_pair(&spec).expect("1024/160 generates");
+        let detail = key.dsa_detail().expect("a DSA key has p and q");
+        assert_eq!(detail.modulus_length, 1024);
+        assert_eq!(detail.divisor_length, 160);
+    }
+
+    #[test]
+    fn an_absent_dsa_divisor_length_is_passed_through_as_absences() {
+        // `keygen.js` sends -1 for an absent `divisorLength`, and passing 0
+        // instead is a different request: OpenSSL would be asked for a zero-bit
+        // `q`. The oracle reports 224 for a 1024-bit modulus, so this pins the
+        // pass-through rather than the number.
+        let spec = dsa_spec(1024, -1);
+        let key = generate_key_pair(&spec).expect("a default q generates");
+        let detail = key.dsa_detail().expect("a DSA key has p and q");
+        assert_eq!(detail.modulus_length, 1024);
+        assert_eq!(detail.divisor_length, 224);
+    }
+
+    #[test]
+    fn a_dsa_failure_reports_the_openssl_code_rather_than_a_generic_one() {
+        // 512/160 is refused by the provider, and the test that covers it reads
+        // `ERR_OSSL_DSA_BAD_FFC_PARAMETERS`. A generic
+        // `ERR_CRYPTO_OPERATION_FAILED` here would make that assertion fail on
+        // the code even though the generation failed as it should.
+        let error = generate_key_pair(&dsa_spec(512, 160)).expect_err("512/160 is refused");
+        assert_eq!(
+            error.code(),
+            None,
+            "the code is derived from the packed value"
+        );
+        let KeyError::OpenSsl { packed, .. } = error else {
+            panic!("expected an OpenSSL failure");
+        };
+        let detail = rn_crypto_openssl::openssl_error_for(packed).expect("resolves");
+        assert_eq!(detail.code(), "ERR_OSSL_DSA_BAD_FFC_PARAMETERS");
+    }
+
+    #[test]
+    fn a_dh_group_spec_generates_a_key_over_that_group() {
+        for (group, bits) in [("modp5", 1536), ("modp14", 2048)] {
+            let spec = dh_group_spec(group);
+            let key = generate_key_pair(&spec).expect("the group generates");
+            assert_eq!(key.bits(), bits, "{group} has {bits}-bit p");
+        }
+    }
+
+    #[test]
+    fn an_unknown_dh_group_is_the_dedicated_error() {
+        // `DhKeyGenTraits::AdditionalConfig` throws this before generating
+        // anything, and `test-crypto-keygen.js` asserts both the code and the
+        // exact message.
+        let error = generate_key_pair(&dh_group_spec("modp0")).expect_err("modp0 is not a group");
+        assert_eq!(error.code(), Some("ERR_CRYPTO_UNKNOWN_DH_GROUP"));
+        assert_eq!(error.message(), "Unknown DH group");
+    }
+
+    #[test]
+    fn a_dh_prime_length_spec_generates_a_prime_of_that_width() {
+        // 512 is the smallest the provider accepts, and the smallest the suite
+        // asks for; a larger one costs seconds per call.
+        let spec = dh_spec(DhSource::Length(512), 2);
+        let key = generate_key_pair(&spec).expect("512-bit parameters generate");
+        assert_eq!(key.bits(), 512);
+    }
+
+    #[test]
+    fn a_dh_prime_length_below_the_provider_minimum_reports_modulus_too_small() {
+        let error = generate_key_pair(&dh_spec(DhSource::Length(64), 2)).expect_err("64 is short");
+        let KeyError::OpenSsl { packed, .. } = error else {
+            panic!("expected an OpenSSL failure");
+        };
+        let detail = rn_crypto_openssl::openssl_error_for(packed).expect("resolves");
+        assert_eq!(detail.code(), "ERR_OSSL_DH_MODULUS_TOO_SMALL");
+    }
+
+    #[test]
+    fn a_dh_generator_below_two_reports_bad_generator() {
+        let error = generate_key_pair(&dh_spec(DhSource::Length(512), 1)).expect_err("gen 1");
+        let KeyError::OpenSsl { packed, .. } = error else {
+            panic!("expected an OpenSSL failure");
+        };
+        let detail = rn_crypto_openssl::openssl_error_for(packed).expect("resolves");
+        assert_eq!(detail.code(), "ERR_OSSL_DH_BAD_GENERATOR");
+    }
+
+    #[test]
+    fn an_explicit_dh_prime_behaves_like_the_group_it_came_from() {
+        // `generateKeyPairSync('dh', { prime: group.getPrime() })` is the same
+        // key as `{ group }` once the name is resolved, which is what
+        // `test-crypto-dh-stateless.js` compares the two exports through.
+        let prime = rn_crypto_openssl::dh_group_prime("modp5").expect("modp5");
+        let spec = dh_spec(DhSource::Prime(prime.to_vec()), 2);
+        let key = generate_key_pair(&spec).expect("an explicit prime generates");
+        assert_eq!(key.bits(), 1536);
+    }
+
+    /// A `KeyPairSpec` carrying only what a DSA job reads.
+    fn dsa_spec(modulus_bits: u32, divisor_bits: i32) -> KeyPairSpec {
+        KeyPairSpec {
+            algorithm: rn_crypto_openssl::DSA,
+            rsa_variant: None,
+            modulus_bits,
+            exponent: 0,
+            pss_hash: None,
+            pss_mgf1_hash: None,
+            pss_salt_length: -1,
+            named_curve: None,
+            ec_param_encoding: crate::constants::OPENSSL_EC_NAMED_CURVE,
+            dsa_divisor_bits: Some(divisor_bits),
+            dh: None,
+            public_encoding: PublicKeyEncoding::default(),
+            private_encoding: PrivateKeyEncoding::default(),
+            output: KeyGenOutput::EncodedPair,
+        }
+    }
+
+    /// A `KeyPairSpec` carrying a named-group DH request.
+    fn dh_group_spec(group: &str) -> KeyPairSpec {
+        dh_spec(DhSource::Group(group.to_string()), 2)
+    }
+
+    /// A `KeyPairSpec` carrying only what a DH job reads.
+    fn dh_spec(source: DhSource, generator: i32) -> KeyPairSpec {
+        KeyPairSpec {
+            algorithm: rn_crypto_openssl::DH,
+            rsa_variant: None,
+            modulus_bits: 0,
+            exponent: 0,
+            pss_hash: None,
+            pss_mgf1_hash: None,
+            pss_salt_length: -1,
+            named_curve: None,
+            ec_param_encoding: crate::constants::OPENSSL_EC_NAMED_CURVE,
+            dsa_divisor_bits: None,
+            dh: Some((source, generator)),
+            public_encoding: PublicKeyEncoding::default(),
+            private_encoding: PrivateKeyEncoding::default(),
+            output: KeyGenOutput::EncodedPair,
+        }
     }
 }

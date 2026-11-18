@@ -186,6 +186,13 @@ pub enum ParseError {
     NeedPassphrase,
     /// The input looked like a key and could not be parsed.
     Failed,
+    /// A cipher name that does not resolve.
+    ///
+    /// Not a parse outcome at all: `crypto_keys.cc`'s cipher lookup throws
+    /// `ERR_CRYPTO_UNKNOWN_CIPHER` through `THROW_CRYPTO_*` before any key is
+    /// written, so this variant carries no OpenSSL detail and reports a
+    /// `NodeError` rather than a `ThrowCryptoError`.
+    UnknownCipher,
 }
 
 /// A failed parse: which of the three outcomes, plus the OpenSSL detail.

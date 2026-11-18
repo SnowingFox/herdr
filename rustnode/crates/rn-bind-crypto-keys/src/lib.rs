@@ -16,6 +16,7 @@
 //! | `isKeyObject` | the brand check behind `util.types.isKeyObject` |
 //! | `SecretKeyGenJob` | `crypto.generateKeySync` |
 //! | `RsaKeyPairGenJob`, `EcKeyPairGenJob`, `NamedKeyPairGenJob` | `crypto.generateKeyPair*` |
+//! | `DsaKeyPairGenJob`, `DhKeyPairGenJob` | `crypto.generateKeyPair*` for `dsa`/`dh` |
 //!
 //! The first four are the class protocol and cannot be split: `keys.js` calls
 //! `createNativeKeyObjectClass` at module scope, so the namespace does not load

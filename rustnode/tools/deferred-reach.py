@@ -137,7 +137,6 @@ KNOWN_UNGUARDED = {
     #   crypto.checkPrime        TypeError: CheckPrimeJob is not a constructor
     #   crypto.createECDH        TypeError: _ECDH is not a constructor
     #   crypto.generatePrimeSync TypeError: RandomPrimeJob is not a constructor
-    #   crypto.generateKeyPairSync('dsa') TypeError: DsaKeyPairGenJob ...
     #   v8.startCpuProfile       TypeError: _startCpuProfile is not a function
     #   v8.startHeapProfile      TypeError: _startHeapProfile is not a function
     #   perf_hooks.createHistogram TypeError: _Histogram is not a constructor
@@ -151,9 +150,7 @@ KNOWN_UNGUARDED = {
     "blob.createBlobFromFilePath",
     "internal_only_v8.queryObjects",
     "crypto.CheckPrimeJob",
-    "crypto.DsaKeyPairGenJob",
     "crypto.DHBitsJob",
-    "crypto.DhKeyPairGenJob",
     "crypto.ECDH",
     "crypto.ECDHConvertKey",
     "crypto.KEMDecapsulateJob",

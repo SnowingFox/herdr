@@ -30,6 +30,22 @@ pub enum KeyError {
     InvalidKeyLength,
     /// `ERR_CRYPTO_INVALID_CURVE`, "Invalid EC curve name".
     InvalidCurve,
+    /// `ERR_CRYPTO_UNKNOWN_DH_GROUP`, "Unknown DH group".
+    ///
+    /// Thrown by `DhKeyGenTraits::AdditionalConfig` when `options.group` is not
+    /// one of the RFC groups, and by `getDiffieHellman` for the same name.
+    /// `test-crypto-keygen.js` asserts the code and the exact message.
+    UnknownDhGroup(String),
+    /// `ERR_CRYPTO_INVALID_DIGEST`, "Invalid digest: %s" or
+    /// "Invalid MGF1 digest: %s".
+    ///
+    /// A `TypeError` in `node_errors.h`, thrown by
+    /// `RsaKeyGenTraits::AdditionalConfig` at *construction* time — before any
+    /// work is queued — for a PSS job whose `hashAlgorithm` or
+    /// `mgf1HashAlgorithm` is not a digest name. Reporting it as a generic
+    /// `ERR_CRYPTO_OPERATION_FAILED` from the background thread made
+    /// `test-crypto-keygen.js` fail on both `code` and `name`.
+    InvalidDigest { message: String },
     /// `ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS`, "The selected key encoding %s %s".
     /// Both halves are supplied by the caller because Node appends its own detail.
     IncompatibleKeyOptions {
@@ -39,8 +55,22 @@ pub enum KeyError {
     /// `ERR_CRYPTO_INVALID_JWK`, with the caller's message, which is one of five
     /// fixed strings.
     InvalidJwk(&'static str),
+    /// `ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE`, "Unsupported JWK Key Type."
+    ///
+    /// Its own variant rather than another [`KeyError::InvalidJwk`] because the
+    /// two are different codes: `ExportJWKAsymmetricKey` reports this one for a
+    /// key type JWK has no representation for (DSA, DH), and
+    /// `test-crypto-keygen-invalid-parameter-encoding-dsa.js` asserts both the
+    /// code and the capitalisation of the template's text.
+    JwkUnsupportedKeyType,
     /// `ERR_MISSING_PASSPHRASE`, "Passphrase required for encrypted key".
     MissingPassphrase,
+    /// `ERR_CRYPTO_UNKNOWN_CIPHER`, "Unknown cipher".
+    ///
+    /// `crypto_keys.cc`'s `THROW_ERR_CRYPTO_UNKNOWN_CIPHER` for a cipher name an
+    /// export or generate asked for that does not resolve.
+    /// `test-crypto-keygen.js` asserts both the code and the message.
+    UnknownCipher,
     /// `ERR_CRYPTO_OPERATION_FAILED`, with the caller's message.
     OperationFailed(&'static str),
     /// `ERR_INVALID_THIS`, "Value of \"this\" must be of type %s".
@@ -78,9 +108,13 @@ impl KeyError {
             Self::InvalidKeyType => "ERR_CRYPTO_INVALID_KEYTYPE",
             Self::InvalidKeyLength => "ERR_CRYPTO_INVALID_KEYLEN",
             Self::InvalidCurve => "ERR_CRYPTO_INVALID_CURVE",
+            Self::UnknownDhGroup(_) => "ERR_CRYPTO_UNKNOWN_DH_GROUP",
+            Self::InvalidDigest { .. } => "ERR_CRYPTO_INVALID_DIGEST",
             Self::IncompatibleKeyOptions { .. } => "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS",
             Self::InvalidJwk(_) => "ERR_CRYPTO_INVALID_JWK",
+            Self::JwkUnsupportedKeyType => "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE",
             Self::MissingPassphrase => "ERR_MISSING_PASSPHRASE",
+            Self::UnknownCipher => "ERR_CRYPTO_UNKNOWN_CIPHER",
             Self::OperationFailed(_) => "ERR_CRYPTO_OPERATION_FAILED",
             Self::InvalidThis(_) => "ERR_INVALID_THIS",
             Self::ConstructCallRequired => "ERR_CONSTRUCT_CALL_REQUIRED",
@@ -99,12 +133,27 @@ impl KeyError {
     /// the code's prefix, and `E('ERR_INVALID_THIS', ...)` is declared with
     /// `TypeError`.
     pub fn is_type_error(&self) -> bool {
-        // `ERR_INVALID_THIS`, `ERR_INVALID_ARG_VALUE` and
-        // `ERR_CONSTRUCT_CALL_REQUIRED` are all `TypeError`s; `internal/errors`
+        // `ERR_INVALID_THIS`, `ERR_INVALID_ARG_VALUE`, `ERR_CONSTRUCT_CALL_REQUIRED`
+        // and `ERR_MISSING_PASSPHRASE` are all `TypeError`s; `internal/errors`
         // derives the constructor from the code.
+        //
+        // `ERR_MISSING_PASSPHRASE` is the one that is easy to get wrong:
+        // `node_errors.h` declares it as `V(ERR_MISSING_PASSPHRASE, TypeError)`,
+        // and `test-crypto-keygen-async-dsa.js` asserts `name: 'TypeError'` on
+        // the re-import of an encrypted key. Reporting a plain `Error` passed
+        // every check that only compared `code`.
         matches!(
             self,
-            Self::InvalidThis(_) | Self::UnsupportedKeyType(_) | Self::ConstructCallRequired
+            Self::InvalidThis(_)
+                | Self::UnsupportedKeyType(_)
+                | Self::ConstructCallRequired
+                | Self::MissingPassphrase
+                // `V(ERR_CRYPTO_INVALID_DIGEST, TypeError)`.
+                | Self::InvalidDigest { .. }
+                // `V(ERR_CRYPTO_INVALID_CURVE, TypeError)` in `node_errors.h`.
+                // `test-crypto-keygen.js` asserts `name: 'TypeError'` for
+                // `generateKeyPairSync('ec', { namedCurve: 'abcdef' })`.
+                | Self::InvalidCurve
         )
     }
 
@@ -114,11 +163,30 @@ impl KeyError {
             Self::InvalidKeyType => "Invalid key type".to_string(),
             Self::InvalidKeyLength => "Invalid key length".to_string(),
             Self::InvalidCurve => "Invalid EC curve name".to_string(),
+            // `DhKeyGenTraits::AdditionalConfig` throws the template's text, and
+            // the name the caller passed is not part of it.
+            Self::UnknownDhGroup(_) => "Unknown DH group".to_string(),
+            // The caller's name is part of the message, and which of the two
+            // templates applies is decided where the digest is read.
+            Self::InvalidDigest { message } => message.clone(),
             Self::IncompatibleKeyOptions { encoding, detail } => {
-                format!("The selected key encoding {encoding} {detail}")
+                if encoding.is_empty() {
+                    // `THROW_ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS(env)` with no
+                    // arguments uses the C++ message table's own text, which is
+                    // not the `%s %s` template `internal/errors.js` declares.
+                    // Rendering the empty case through the template would leave
+                    // a doubled space word the oracle does not produce.
+                    format!("The selected key encoding {detail}")
+                } else {
+                    format!("The selected key encoding {encoding} {detail}")
+                }
             }
             Self::InvalidJwk(message) => (*message).to_string(),
+            // `E('ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE', 'Unsupported JWK Key
+            // Type.')` — the capitalisation and the full stop are the template.
+            Self::JwkUnsupportedKeyType => "Unsupported JWK Key Type.".to_string(),
             Self::MissingPassphrase => "Passphrase required for encrypted key".to_string(),
+            Self::UnknownCipher => "Unknown cipher".to_string(),
             Self::OperationFailed(message) => (*message).to_string(),
             Self::InvalidThis(expected) => {
                 format!("Value of \"this\" must be of type {expected}")
@@ -230,9 +298,13 @@ fn code_static(code: &str) -> &'static str {
         "ERR_CRYPTO_INVALID_KEYTYPE" => "ERR_CRYPTO_INVALID_KEYTYPE",
         "ERR_CRYPTO_INVALID_KEYLEN" => "ERR_CRYPTO_INVALID_KEYLEN",
         "ERR_CRYPTO_INVALID_CURVE" => "ERR_CRYPTO_INVALID_CURVE",
+        "ERR_CRYPTO_UNKNOWN_DH_GROUP" => "ERR_CRYPTO_UNKNOWN_DH_GROUP",
+        "ERR_CRYPTO_INVALID_DIGEST" => "ERR_CRYPTO_INVALID_DIGEST",
         "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS" => "ERR_CRYPTO_INCOMPATIBLE_KEY_OPTIONS",
         "ERR_CRYPTO_INVALID_JWK" => "ERR_CRYPTO_INVALID_JWK",
+        "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE" => "ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE",
         "ERR_MISSING_PASSPHRASE" => "ERR_MISSING_PASSPHRASE",
+        "ERR_CRYPTO_UNKNOWN_CIPHER" => "ERR_CRYPTO_UNKNOWN_CIPHER",
         "ERR_CRYPTO_OPERATION_FAILED" => "ERR_CRYPTO_OPERATION_FAILED",
         "ERR_INVALID_THIS" => "ERR_INVALID_THIS",
         "ERR_CONSTRUCT_CALL_REQUIRED" => "ERR_CONSTRUCT_CALL_REQUIRED",
@@ -352,10 +424,29 @@ mod tests {
     }
 
     #[test]
-    fn only_invalid_this_is_a_type_error() {
+    fn only_the_codes_internal_errors_declares_as_type_errors_are_type_errors() {
+        // `node_errors.h` declares each of these with its constructor:
+        // `ERR_INVALID_THIS`, `ERR_INVALID_ARG_VALUE` and
+        // `ERR_CONSTRUCT_CALL_REQUIRED` are `TypeError`s, and so is
+        // `ERR_MISSING_PASSPHRASE` — `V(ERR_MISSING_PASSPHRASE, TypeError)`.
+        // Getting that last one wrong is invisible to a check that compares only
+        // `code`, which is how it survived until a job test compared `name` too.
         assert!(KeyError::InvalidThis("KeyObject").is_type_error());
+        assert!(KeyError::MissingPassphrase.is_type_error());
+        assert!(KeyError::ConstructCallRequired.is_type_error());
         assert!(!KeyError::InvalidKeyType.is_type_error());
-        assert!(!KeyError::MissingPassphrase.is_type_error());
+        assert!(!KeyError::InvalidKeyLength.is_type_error());
+    }
+
+    #[test]
+    fn the_jwk_unsupported_key_type_is_its_own_code_and_message() {
+        // `ExportJWKAsymmetricKey` throws this for DSA and DH, and
+        // `test-crypto-keygen-invalid-parameter-encoding-dsa.js` compares both
+        // the code and the template's capitalisation.
+        let error = KeyError::JwkUnsupportedKeyType;
+        assert_eq!(error.code(), Some("ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE"));
+        assert_eq!(error.message(), "Unsupported JWK Key Type.");
+        assert!(!error.is_type_error());
     }
 
     #[test]
