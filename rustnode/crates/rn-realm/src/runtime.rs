@@ -351,6 +351,16 @@ impl<'a, 's, 'i> V8Scheduler<'a, 's, 'i> {
 
 impl Scheduler for V8Scheduler<'_, '_, '_> {
     fn drain(&mut self) {
+        // V8 posts work that is not JavaScript to its platform's foreground task
+        // runner, and `vm.measureMemory()` is the caller that made this visible:
+        // its promise is resolved by a task posted there, so with no flush the
+        // promise never settles. Node flushes the same queue in the check phase
+        // of every iteration (`PerIsolatePlatformData::FlushForegroundTasksInternal`).
+        //
+        // First, because that is where a task belongs in the iteration: it is not
+        // a tick and must not observe queues a later phase left behind.
+        rn_core::platform_tasks::pump_foreground_tasks(self.scope);
+
         // The inspector's reader threads queue CDP messages and ask for a check phase
         // through `native_immediates`, but the immediate only runs if the loop reaches
         // the check phase — which it will not when a debugger is the only thing
@@ -415,6 +425,13 @@ impl Scheduler for V8Scheduler<'_, '_, '_> {
         // Checked before the worker/timer answer below, which is a call rather than a
         // predicate: this one is cheap and true exactly when a finalizer is waiting.
         if rn_core::finalizer::has_pending() {
+            return true;
+        }
+        // V8 has platform work queued that this loop, not libuv, has to run: a
+        // measure-memory GC task is the case that relies on it. The flag is
+        // optimistic and a flush that finds nothing clears it, so it can hold the
+        // process open for one iteration at most.
+        if rn_core::platform_tasks::maybe_pending() {
             return true;
         }
         // A running `Worker` has its own loop on another thread, so nothing on
