@@ -356,17 +356,18 @@ fn main() {
                             "rustnode: --inspect-brk found no client; running without waiting"
                         );
                     }
-                    // `PauseOnNextJavascriptStatement("Break at bootstrap")` runs
-                    // *after* the wait, which is `src/node.cc:231-232`: the client has
-                    // said "run", the session exists, and `Debugger.enable` has
-                    // created the agent that `schedulePauseOnNextStatement` needs.
-                    // Scheduling it before the wait is accepted by V8 and then has
-                    // no effect, because there is no debugger agent to arm yet.
+                    // Node only asks for this native post-wait pause in the
+                    // `--inspect-brk-node` mode (`break_node_first_line`), not for
+                    // plain `--inspect-brk`: normal break-on-start for user scripts
+                    // comes from JavaScript `callAndPauseOnStart`. Arming this
+                    // unconditionally moves `node inspect <file>`'s first visible
+                    // pause into bootstrap internals instead of the script itself.
+                    //
                     // `--test` enters through `internal/main/test_runner`, whose
                     // startup side effects (including the inspector concurrency
                     // warning) must run before any debugger pause in
                     // `test-runner-inspect.mjs`'s attach flow.
-                    if !matches!(options.source, args::Source::Test) {
+                    if options.inspect_break_node && !matches!(options.source, args::Source::Test) {
                         rn_bind_inspector::schedule_start_break();
                     }
                 }
