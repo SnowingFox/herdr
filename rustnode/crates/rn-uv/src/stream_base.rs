@@ -167,6 +167,7 @@ fn dispatch<'s>(
     let buffers = buffers.after_partial_write(written);
     let pending: usize = buffers.iter().map(|buffer| buffer.len).sum();
 
+    let lazy_request = request.is_none();
     let Some(request) = request.or_else(|| write_wrap(scope)) else {
         return WriteResult::Status(EINVAL);
     };
@@ -174,6 +175,14 @@ fn dispatch<'s>(
     // until the completion runs.
     let status =
         unsafe { stream::queue_write(scope, stream, buffers, pending, request, owner, owned) };
+    // `FinishWrite`: the request object is the return value only when the caller
+    // did not supply one. `lib/internal/child_process/serialization.js` passes
+    // its own `req` and reads the result as a status code
+    // (`new ErrnoException(err, 'write')`), so handing it a `WriteWrap` there
+    // made every IPC send throw `The "err" argument must be of type number`.
+    if !lazy_request {
+        return WriteResult::Status(status);
+    }
     WriteResult::from_status(status, request)
 }
 
