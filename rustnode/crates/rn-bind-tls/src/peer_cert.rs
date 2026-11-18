@@ -981,29 +981,36 @@ pub fn get_tls_ticket<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let ticket = with_state(args.this(), |state| {
-        let ssl = state.ssl_ptr();
-        if ssl.is_null() {
-            return None;
-        }
+    // The mirrored pointer is the fallback for the same reason as
+    // `get_protocol`: a `'session'` handler runs inside `SSL_do_handshake`, where
+    // `cycle` holds the state borrow. The ticket lives on the session the SSL
+    // reports, so both halves come from the same pointer either way.
+    let ssl = with_state(args.this(), |state| state.ssl_ptr())
+        .or_else(|| Some(crate::callback::ssl_of(args.this())))
+        .unwrap_or(std::ptr::null_mut());
+    let ticket = if ssl.is_null() {
+        None
+    } else {
         // SAFETY: `ssl` is live; the session and its ticket are owned by it.
         unsafe {
             let session = ffi::SSL_get_session(ssl);
             if session.is_null() {
-                return None;
+                None
+            } else {
+                let mut data: *const std::ffi::c_uchar = std::ptr::null();
+                let mut length: usize = 0;
+                // `SSL_SESSION_get0_ticket` returns void; a session with no ticket
+                // leaves `data` null. Node tests exactly that (`crypto_tls.cc:2244`).
+                SSL_SESSION_get0_ticket(session, &mut data, &mut length);
+                if data.is_null() || length == 0 {
+                    None
+                } else {
+                    Some(std::slice::from_raw_parts(data, length).to_vec())
+                }
             }
-            let mut data: *const std::ffi::c_uchar = std::ptr::null();
-            let mut length: usize = 0;
-            // `SSL_SESSION_get0_ticket` returns void; a session with no ticket
-            // leaves `data` null. Node tests exactly that (`crypto_tls.cc:2244`).
-            SSL_SESSION_get0_ticket(session, &mut data, &mut length);
-            if data.is_null() || length == 0 {
-                return None;
-            }
-            Some(std::slice::from_raw_parts(data, length).to_vec())
         }
-    });
-    let Some(Some(ticket)) = ticket else {
+    };
+    let Some(ticket) = ticket else {
         // The binding leaves the return value unset, which is `undefined`.
         rv.set(v8::undefined(scope).into());
         return;

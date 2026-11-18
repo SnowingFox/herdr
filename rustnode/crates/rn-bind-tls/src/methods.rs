@@ -329,36 +329,43 @@ fn get_session<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let der = with_state(args.this(), |state| {
-        let ssl = state.ssl_ptr();
-        if ssl.is_null() {
-            return None;
-        }
-        // SAFETY: `ssl` is live, checked above. The session is owned by the SSL.
+    // Same fallback as `get_protocol`: `getSession()` is reached from a
+    // `'session'` handler, which OpenSSL emits from inside `SSL_do_handshake`
+    // while `cycle` holds the state borrow.
+    let ssl = with_state(args.this(), |state| state.ssl_ptr())
+        .or_else(|| Some(crate::callback::ssl_of(args.this())))
+        .unwrap_or(std::ptr::null_mut());
+    let der = if ssl.is_null() {
+        None
+    } else {
+        // SAFETY: `ssl` is live; the session is owned by the SSL.
         let session = unsafe { openssl_sys::SSL_get_session(ssl) };
         if session.is_null() {
-            return None;
+            None
+        } else {
+            // SAFETY: `session` is live for the SSL's lifetime; a null output
+            // pointer asks only for the encoded length.
+            let length = unsafe { openssl_sys::i2d_SSL_SESSION(session, std::ptr::null_mut()) };
+            if length <= 0 {
+                None
+            } else {
+                let mut bytes = vec![0u8; length as usize];
+                let mut cursor = bytes.as_mut_ptr();
+                // SAFETY: `bytes` has exactly `length` bytes, and `i2d_SSL_SESSION`
+                // advances `cursor` past what it wrote without overrunning the
+                // buffer it was given room for.
+                let written = unsafe { openssl_sys::i2d_SSL_SESSION(session, &mut cursor) };
+                if written <= 0 {
+                    None
+                } else {
+                    bytes.truncate(written as usize);
+                    Some(bytes)
+                }
+            }
         }
-        // SAFETY: `session` is live for the SSL's lifetime; a null output pointer
-        // asks only for the encoded length.
-        let length = unsafe { openssl_sys::i2d_SSL_SESSION(session, std::ptr::null_mut()) };
-        if length <= 0 {
-            return None;
-        }
-        let mut bytes = vec![0u8; length as usize];
-        let mut cursor = bytes.as_mut_ptr();
-        // SAFETY: `bytes` has exactly `length` bytes, and `i2d_SSL_SESSION`
-        // advances `cursor` past what it wrote without overrunning the buffer it
-        // was given room for.
-        let written = unsafe { openssl_sys::i2d_SSL_SESSION(session, &mut cursor) };
-        if written <= 0 {
-            return None;
-        }
-        bytes.truncate(written as usize);
-        Some(bytes)
-    });
+    };
 
-    let Some(Some(bytes)) = der else {
+    let Some(bytes) = der else {
         // No session, or none that can be encoded: the binding leaves the return
         // value unset, which is `undefined`.
         rv.set(v8::undefined(scope).into());
@@ -959,21 +966,27 @@ fn get_protocol<'s>(
     args: v8::FunctionCallbackArguments<'s>,
     mut rv: v8::ReturnValue<'s>,
 ) {
-    let version = with_state(args.this(), |state| {
-        let ssl = state.ssl_ptr();
-        if ssl.is_null() {
-            return None;
-        }
-        // SAFETY: `ssl` is live, checked above.
-        let pointer = unsafe { openssl_sys::SSL_get_version(ssl) };
-        if pointer.is_null() {
-            return None;
-        }
-        // SAFETY: OpenSSL returns a static NUL-terminated string.
-        let text = unsafe { std::ffi::CStr::from_ptr(pointer) };
-        Some(text.to_string_lossy().into_owned())
-    });
-    match version.flatten() {
+    // The state borrow is unavailable while `cycle` holds it, which is the whole
+    // duration of `SSL_do_handshake` — and a `'session'` handler runs on that
+    // very stack, because OpenSSL's new-session callback emits it. Falling back
+    // to the mirrored pointer is what makes `getProtocol()` report `TLSv1.3`
+    // there instead of `null`; without it the `'session'` event could not be used
+    // to read anything about the connection it belongs to.
+    let version = with_state(args.this(), |state| state.ssl_ptr())
+        .or_else(|| Some(crate::callback::ssl_of(args.this())))
+        .filter(|ssl| !ssl.is_null())
+        .and_then(|ssl| {
+            // SAFETY: `ssl` is the live SSL of this wrap, from either the state
+            // or the callback slot's mirror of the same pointer.
+            let pointer = unsafe { openssl_sys::SSL_get_version(ssl) };
+            if pointer.is_null() {
+                return None;
+            }
+            // SAFETY: OpenSSL returns a static NUL-terminated string.
+            let text = unsafe { std::ffi::CStr::from_ptr(pointer) };
+            Some(text.to_string_lossy().into_owned())
+        });
+    match version {
         Some(text) => match v8::String::new(scope, &text) {
             Some(value) => rv.set(value.into()),
             None => rv.set(v8::null(scope).into()),
