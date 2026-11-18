@@ -7,6 +7,16 @@ use rn_core::{BindingModule, InstallCtx};
 use rn_module_wrap::ModuleWrapBinding;
 use rn_v8_sys::v8;
 
+/// V8 accepts exactly one `initialize_platform`/`initialize` pair per process.
+fn initialize_once() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+    });
+}
+
 #[test]
 fn modules_compile_instantiate_and_evaluate() {
     source_text_module_lifecycle();
@@ -14,9 +24,7 @@ fn modules_compile_instantiate_and_evaluate() {
 }
 
 fn source_text_module_lifecycle() {
-    let platform = v8::new_default_platform(0, false).make_shared();
-    v8::V8::initialize_platform(platform);
-    v8::V8::initialize();
+    initialize_once();
 
     let mut isolate = v8::Isolate::new(Default::default());
     let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
@@ -166,4 +174,83 @@ fn call_method<'s>(
     let function = wrapper.get(scope, key.into())?;
     let function = v8::Local::<v8::Function>::try_from(function).ok()?;
     function.call(scope, wrapper.into(), args)
+}
+
+/// `evaluate(timeout)` terminates a runaway module and reports the timeout.
+///
+/// `lib/internal/vm/module.js`'s `evaluate({ timeout })` passes the milliseconds
+/// and `-1` for "none"; `ModuleWrap::Evaluate` arms a `Watchdog` for a
+/// non-negative value (`src/module_wrap.cc:796`) and converts the resulting
+/// termination into `ERR_SCRIPT_EXECUTION_TIMEOUT` (`:860`).
+///
+/// Before this, the argument was ignored, so `while (true) {}` ran forever and a
+/// test that exercised it hung a runner rather than failing.
+#[test]
+fn evaluate_with_a_timeout_terminates_a_runaway_module() {
+    // V8 initialises once per process; the other test in this file does the same
+    // on its own, so both go through a shared guard.
+    initialize_once();
+
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let binding = ModuleWrapBinding;
+    let mut async_ids = rn_core::AsyncIds::new();
+    let mut ctx = InstallCtx {
+        async_ids: &mut async_ids,
+    };
+    let namespace = binding.install(scope, &mut ctx).expect("installs");
+
+    let key = v8::String::new(scope, "ModuleWrap").expect("key");
+    let constructor = namespace
+        .get(scope, key.into())
+        .expect("ModuleWrap present");
+    let constructor = v8::Local::<v8::Function>::try_from(constructor).expect("is a function");
+
+    let source = v8::String::new(scope, "while (true) {}").expect("source");
+    let url = v8::String::new(scope, "node:runaway").expect("url");
+    let undefined = v8::undefined(scope).into();
+    let zero = v8::Integer::new(scope, 0).into();
+    let argv = [url.into(), undefined, source.into(), zero, zero];
+    let wrapper = constructor
+        .new_instance(scope, &argv)
+        .expect("constructs")
+        .to_object(scope)
+        .expect("wrapper is an object");
+
+    let no_requests = v8::Array::new(scope, 0);
+    let _ = call_method(scope, wrapper, "link", &[no_requests.into()]);
+    let _ = call_method(scope, wrapper, "instantiate", &[]);
+
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut try_catch.init();
+    let timeout = v8::Integer::new(scope, 50).into();
+    let no_sigint = v8::Boolean::new(scope, false).into();
+    let result = call_method(scope, wrapper, "evaluate", &[timeout, no_sigint]);
+
+    assert!(
+        result.is_none(),
+        "a timed-out evaluation must not return a value"
+    );
+    assert!(
+        scope.has_caught(),
+        "the timeout must surface as an exception"
+    );
+    let exception = scope.exception().expect("exception present");
+    assert!(
+        !scope.is_execution_terminating(),
+        "the termination has to be cancelled, or the isolate cannot run again"
+    );
+    let exception = exception
+        .to_object(scope)
+        .expect("the timeout is an Error object");
+    let code_key = v8::String::new(scope, "code").expect("key");
+    let code = exception.get(scope, code_key.into()).expect("code present");
+    assert_eq!(
+        code.to_rust_string_lossy(scope),
+        "ERR_SCRIPT_EXECUTION_TIMEOUT"
+    );
 }
