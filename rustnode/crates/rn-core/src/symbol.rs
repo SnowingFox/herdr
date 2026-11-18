@@ -23,47 +23,28 @@
 //! symbol where it could not see a private name. Every mark installed here is
 //! defined non-enumerable so `Object.keys` and `for..in` stay clean.
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
-
 use rn_v8_sys::v8;
 
-thread_local! {
-    /// The symbols created so far, keyed by the Node name used as a description.
-    ///
-    /// A `v8::Global` keeps a symbol alive across handle scopes, which is what
-    /// makes its identity stable rather than merely equal.
-    static SYMBOLS: RefCell<BTreeMap<&'static str, v8::Global<v8::Symbol>>> =
-        const { RefCell::new(BTreeMap::new()) };
-}
-
-/// Returns the per-isolate symbol `name`, creating it on first use.
+/// Returns the symbol `name`, which is one identity across every realm.
+///
+/// `v8::Symbol::for_key` reads V8's per-isolate symbol registry, which is exactly
+/// the "same identity for the same description" contract these marks need, so
+/// there is nothing to cache: a second call for one name returns the identical
+/// symbol. A `v8::Global` cache was tried and removed — it keeps a handle alive
+/// past the isolate that owns it, and a test binary that creates and disposes one
+/// isolate per case then faults on the stale handle.
+///
+/// The description is the Node name itself: it is already namespaced with
+/// `node:`, so it shows up in a stack trace or devtools as the thing it is.
 pub fn symbol<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &'static str,
 ) -> v8::Local<'s, v8::Symbol> {
-    let existing = SYMBOLS.with(|symbols| {
-        symbols
-            .borrow()
-            .get(name)
-            .map(|symbol| v8::Local::new(scope, symbol))
-    });
-    if let Some(symbol) = existing {
-        return symbol;
-    }
-    // The description is the Node name itself: it is already namespaced with
-    // `node:`, so it shows up in a stack trace or devtools as the thing it is.
     let description = v8::String::new(scope, name);
-    let symbol = v8::Symbol::for_key(
+    v8::Symbol::for_key(
         scope,
         description.unwrap_or_else(|| v8::String::empty(scope)),
-    );
-    SYMBOLS.with(|symbols| {
-        symbols
-            .borrow_mut()
-            .insert(name, v8::Global::new(scope, symbol));
-    });
-    symbol
+    )
 }
 
 /// `contextify_context_private_symbol`: the mark that makes a sandbox a `vm`

@@ -53,7 +53,7 @@ pub fn parse<'s>(
 
     match ParsedUrl::parse(&input, base.as_deref()) {
         Ok(url) => {
-            write_components(Offsets::of(&url).as_array());
+            write_components(scope, Offsets::of(&url).as_array());
             match install::string(scope, url.href()) {
                 Ok(text) => rv.set(text.into()),
                 Err(message) => install::throw_error(scope, &message),
@@ -161,7 +161,7 @@ pub fn update<'s>(
     match update::update(&href, action, &value) {
         Ok(href) => match ParsedUrl::parse(&href, None) {
             Ok(url) => {
-                write_components(Offsets::of(&url).as_array());
+                write_components(scope, Offsets::of(&url).as_array());
                 match install::string(scope, &href) {
                     Ok(text) => rv.set(text.into()),
                     Err(message) => install::throw_error(scope, &message),
@@ -204,7 +204,7 @@ pub fn path_to_file_url<'s>(
     let encoded = path::encode_path(&input, path::PathFlavour::from_windows_flag(windows));
     match ParsedUrl::parse(&encoded, None) {
         Ok(url) => {
-            write_components(Offsets::of(&url).as_array());
+            write_components(scope, Offsets::of(&url).as_array());
             match install::string(scope, url.href()) {
                 Ok(text) => rv.set(text.into()),
                 Err(message) => install::throw_error(scope, &message),

@@ -54,7 +54,28 @@ thread_local! {
     /// Every builtin compiled after the bootstrap closes over these, and the CLI
     /// needs `require` to run a user script, so they have to outlive the call
     /// that stored them.
+    ///
+    /// This is the *principal* realm's pair: it is what
+    /// [`set_internal_loaders`] writes and what every reader gets unless the
+    /// current context has an entry of its own in [`REALM_LOADERS`].
     static LOADERS: RefCell<Loaders> = const { RefCell::new((None, None)) };
+
+    /// Loaders for realms other than the principal one.
+    ///
+    /// Node keeps `builtin_module_require` and `internal_binding_loader` on the
+    /// `Realm`, and `Realm::GetCurrent(context)` picks the one belonging to the
+    /// context that is running. One thread can host several realms at once — a
+    /// `ShadowRealm` lives inside the same isolate and the same thread as the
+    /// realm that created it — so a single slot would let the second realm's
+    /// `setInternalLoaders` overwrite the first's, and a builtin compiled in the
+    /// principal realm afterwards would close over the shadow realm's loader.
+    ///
+    /// Keyed by context identity. The lookup walks a short vector because a
+    /// process has one principal realm plus however many live `ShadowRealm`s,
+    /// which is a handful; a `HashMap` would need `Context` to be `Hash`, and
+    /// the crate exposes no identity hash for one.
+    static REALM_LOADERS: RefCell<std::collections::BTreeMap<u64, Loaders>> =
+        const { RefCell::new(std::collections::BTreeMap::new()) };
 
     /// The `emitWarningSync` function the process bootstrap installed.
     ///
@@ -166,36 +187,165 @@ fn process_emit_warning<'s>(
 }
 
 /// Records the loaders `realm.js` installed.
+///
+/// Written for whichever realm is current: the first realm to install a pair is
+/// the principal realm (its pair lives in [`LOADERS`]), and every later realm —
+/// a `ShadowRealm` — gets its own entry in [`REALM_LOADERS`]. `realm.js` calls
+/// `setInternalLoaders` once per realm, inside that realm's own context, so the
+/// current context is what identifies it.
 pub fn set_internal_loaders(
+    scope: &mut v8::PinScope,
     internal_binding: v8::Global<v8::Function>,
     require: v8::Global<v8::Function>,
 ) {
-    LOADERS.with(|loaders| {
-        *loaders.borrow_mut() = (Some(internal_binding), Some(require));
+    let loaders = (Some(internal_binding), Some(require));
+    if is_principal_realm(scope) {
+        LOADERS.with(|slot| *slot.borrow_mut() = loaders);
+        return;
+    }
+    let key = realm_key(scope);
+    REALM_LOADERS.with(|slot| {
+        slot.borrow_mut().insert(key, loaders);
     });
 }
 
-/// Returns a local handle to the installed `require`, if the bootstrap ran.
-pub fn require<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
-    LOADERS.with(|loaders| {
-        loaders
-            .borrow()
-            .1
-            .as_ref()
-            .map(|require| v8::Local::new(scope, require))
-    })
+/// The global property a realm's numeric id is stored on.
+///
+/// Node identifies a running realm by looking up the `Environment` on the context
+/// (`Realm::GetCurrent`), which it can do because `AssignToContext` parks a
+/// `ContextInfo` in embedder data. rustnode has no `Environment`, so it needs a
+/// per-context place to keep a small integer.
+///
+/// A registered `v8::Symbol` property on the global object, resolved through
+/// [`crate::symbol`] so every realm shares one identity. Two other mechanisms
+/// were tried and rejected:
+///
+/// * `Context::set_embedder_data` — the annex it grows does not survive the
+///   `ContextScope` the bootstrap enters, and a write there faults the process;
+/// * a `v8::Private` property — V8 does not forward private properties through the
+///   global *proxy* to the global object, so the read always missed.
+///
+/// A symbol is equally invisible to `JSON.stringify` and to
+/// `for..in`/`Object.keys`, and `rn_core::symbol` already installs every mark of
+/// this kind non-enumerably, so `test/common/index.js`'s globals audit stays clean.
+const REALM_ID_PROPERTY: &str = "node:rustnode:realm_id";
+
+/// The principal realm's id. Every other realm gets a fresh positive number.
+const PRINCIPAL_REALM_ID: f64 = 0.0;
+
+thread_local! {
+    /// The next realm id to hand out on this thread.
+    static NEXT_REALM_ID: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
 }
 
-/// Swaps the installed `require` for a wrapper around it.
+/// The id stored on the current context's global object, if there is one.
+fn read_realm_id(scope: &mut v8::PinScope) -> Option<f64> {
+    let symbol = crate::symbol(scope, REALM_ID_PROPERTY);
+    let global = scope.get_current_context().global(scope);
+    let value = global.get(scope, symbol.into())?;
+    if !value.is_number() {
+        return None;
+    }
+    value.number_value(scope)
+}
+
+/// Stores `id` on the current context's global object.
+///
+/// A plain `set` is enough: a symbol key is invisible to `Object.keys`,
+/// `for..in`, `JSON.stringify` and `Object.getOwnPropertyNames`, so which
+/// attribute it carries cannot reach any audit.
+fn write_realm_id(scope: &mut v8::PinScope, id: f64) {
+    let symbol = crate::symbol(scope, REALM_ID_PROPERTY);
+    let value = v8::Number::new(scope, id);
+    let global = scope.get_current_context().global(scope);
+    let _ = global.set(scope, symbol.into(), value.into());
+}
+
+/// The id of the realm that is running, assigning one if the global has none.
+///
+/// The first context to ask on a thread is the principal realm: it is the one the
+/// CLI bootstraps, and a `ShadowRealm` cannot exist before that has finished
+/// because it can only be constructed from user code. [`mark_realm`] lets the
+/// shadow-realm bootstrap claim a fresh id for its context first, so the
+/// assignment here is the fallback for a `vm` context that never ran `realm.js` —
+/// which gets the principal realm's treatment, the way
+/// `Realm::GetCurrent`-or-principal does in `module_wrap.cc`.
+fn realm_id(scope: &mut v8::PinScope) -> f64 {
+    if let Some(id) = read_realm_id(scope) {
+        return id;
+    }
+    write_realm_id(scope, PRINCIPAL_REALM_ID);
+    PRINCIPAL_REALM_ID
+}
+
+/// Whether the running realm is the principal one.
+fn is_principal_realm(scope: &mut v8::PinScope) -> bool {
+    realm_id(scope) == PRINCIPAL_REALM_ID
+}
+
+/// A hashable key for the running realm, for the per-realm maps.
+///
+/// `f64` is not `Ord`, and a `BTreeMap` is what these slots use so a lookup does
+/// not allocate; the ids are small non-negative integers handed out by
+/// [`mark_realm`], so their bit patterns order and hash consistently.
+fn realm_key(scope: &mut v8::PinScope) -> u64 {
+    realm_id(scope).to_bits()
+}
+
+/// Claims a fresh realm id for the current (newly created) context.
+///
+/// Called by the ShadowRealm bootstrap before it runs `internal/bootstrap/realm`,
+/// so every per-realm slot the bootstrap writes lands under this realm rather than
+/// the principal one. A no-op for a context that already has an id.
+pub fn mark_realm(scope: &mut v8::PinScope) {
+    if read_realm_id(scope).is_some() {
+        return;
+    }
+    let id = NEXT_REALM_ID.with(|next| {
+        let id = next.get();
+        next.set(id + 1.0);
+        id
+    });
+    write_realm_id(scope, id);
+}
+
+/// The running realm's id, for diagnostics and tests.
+pub fn current_realm_id(scope: &mut v8::PinScope) -> f64 {
+    realm_id(scope)
+}
+
+/// The loaders belonging to the realm that is running.
+///
+/// A context with its own entry answers from [`REALM_LOADERS`]; anything else —
+/// the principal realm, and a `vm` context that never ran `realm.js` and so falls
+/// back the way `Realm::GetCurrent` does — answers from [`LOADERS`].
+fn loaders(scope: &mut v8::PinScope) -> Loaders {
+    let found = REALM_LOADERS.with(|slot| slot.borrow().get(&realm_key(scope)).cloned());
+    found.unwrap_or_else(|| LOADERS.with(|slot| slot.borrow().clone()))
+}
+
+/// Returns a local handle to the installed `require`, if this realm has one.
+pub fn require<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Function>> {
+    loaders(scope)
+        .1
+        .map(|require| v8::Local::new(scope, require))
+}
+
+/// Swaps the installed `require` for a wrapper around it, in the current realm.
 ///
 /// Builtins compiled later close over whatever reference they were given at
 /// compile time, so replacing the slot only affects code that reads it from
 /// here on. The CLI installs the wrapper before running user code, which is the
 /// window that matters: a `node:` specifier is only ever typed by user code.
 pub fn replace_require(scope: &mut v8::PinScope, require: v8::Local<v8::Function>) {
-    let global = v8::Global::new(scope, require);
-    LOADERS.with(|loaders| {
-        loaders.borrow_mut().1 = Some(global);
+    let key = realm_key(scope);
+    let require = v8::Global::new(scope, require);
+    if is_principal_realm(scope) {
+        LOADERS.with(|slot| slot.borrow_mut().1 = Some(require));
+        return;
+    }
+    REALM_LOADERS.with(|slot| {
+        slot.borrow_mut().entry(key).or_default().1 = Some(require);
     });
 }
 
@@ -203,13 +353,9 @@ pub fn replace_require(scope: &mut v8::PinScope, require: v8::Local<v8::Function
 pub fn internal_binding<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Option<v8::Local<'s, v8::Function>> {
-    LOADERS.with(|loaders| {
-        loaders
-            .borrow()
-            .0
-            .as_ref()
-            .map(|binding| v8::Local::new(scope, binding))
-    })
+    loaders(scope)
+        .0
+        .map(|binding| v8::Local::new(scope, binding))
 }
 
 thread_local! {
@@ -227,21 +373,46 @@ thread_local! {
     /// `realm.js` built. Holding it here lets that call site hand over the real
     /// object while `globalThis` stays clean, which is what
     /// `test/common/index.js`'s globals audit requires.
+    ///
+    /// Per realm, not per thread: Node keeps `primordials` on the `Realm`, so a
+    /// `ShadowRealm` gets its own from its own `internal/per_context` run. Sharing
+    /// one slot would hand a bootstrap script in the second realm the first
+    /// realm's `SafeMap` and `ArrayPrototypeSlice`, which is both the wrong
+    /// intrinsics and a cross-realm object leak.
     static PRIMORDIALS: RefCell<Option<v8::Global<v8::Object>>> = const { RefCell::new(None) };
+
+    /// `primordials` for realms other than the principal one.
+    static REALM_PRIMORDIALS: RefCell<std::collections::BTreeMap<u64, v8::Global<v8::Object>>> =
+        const { RefCell::new(std::collections::BTreeMap::new()) };
 }
 
-/// Records the `primordials` object for later bootstrap scripts.
+/// Records the `primordials` object for the current realm's later bootstrap
+/// scripts.
 pub fn set_primordials(scope: &mut v8::PinScope, primordials: v8::Local<v8::Object>) {
-    let global = v8::Global::new(scope, primordials);
-    PRIMORDIALS.with(|slot| *slot.borrow_mut() = Some(global));
+    let key = realm_key(scope);
+    let primordials_global = v8::Global::new(scope, primordials);
+    if is_principal_realm(scope) {
+        PRIMORDIALS.with(|slot| *slot.borrow_mut() = Some(primordials_global));
+        return;
+    }
+    REALM_PRIMORDIALS.with(|slot| {
+        slot.borrow_mut().insert(key, primordials_global);
+    });
 }
 
-/// A local handle to the recorded `primordials`, if one was stored.
+/// A local handle to the current realm's `primordials`, if one was stored.
 pub fn primordials<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
-    PRIMORDIALS.with(|slot| {
+    let found = REALM_PRIMORDIALS.with(|slot| {
         slot.borrow()
-            .as_ref()
+            .get(&realm_key(scope))
             .map(|primordials| v8::Local::new(scope, primordials))
+    });
+    found.or_else(|| {
+        PRIMORDIALS.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|primordials| v8::Local::new(scope, primordials))
+        })
     })
 }
 
@@ -250,13 +421,17 @@ type StderrWriter = Box<dyn Fn(&str)>;
 
 thread_local! {
     static STATE: RefCell<HookState> = RefCell::new(HookState::default());
+
+    /// The principal realm's per-realm callbacks.
+    static PRINCIPAL_HOOKS: RefCell<RealmHooks> = RefCell::new(RealmHooks::default());
+
+    /// Per-realm callbacks for every realm other than the principal one.
+    static REALM_HOOKS: RefCell<std::collections::BTreeMap<u64, RealmHooks>> =
+        const { RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 struct HookState {
     prepare_stack_trace: Option<v8::Global<v8::Function>>,
-    dynamic_import: Option<v8::Global<v8::Function>>,
-    import_meta: Option<v8::Global<v8::Function>>,
-    import_meta_resolve: Option<v8::Global<v8::Function>>,
     source_maps_enabled: bool,
     exit_requested: bool,
     stderr: Option<StderrWriter>,
@@ -271,6 +446,30 @@ struct HookState {
     force_node_api_uncaught_exceptions_policy: bool,
 }
 
+/// The per-realm callbacks Node keeps on `Realm`.
+///
+/// `initializeESM()` runs once per realm and installs `import()`, `import.meta`
+/// and `import.meta.resolve` into `Realm::GetCurrent`. Three of the four hooks
+/// are therefore per realm: a `ShadowRealm` runs
+/// `internal/bootstrap/shadow_realm`, which calls `prepareShadowRealmExecution`
+/// and so `initializeESM` again, in a context whose `internal/modules/esm` copy
+/// is its own. Sharing one slot would make the principal realm's `import()`
+/// dispatch through the shadow realm's loader singleton — a different
+/// `BuiltinModule.map`, so a different `internal/modules/esm/loader` instance —
+/// and every module the principal realm imported would be evaluated by the wrong
+/// realm's registry.
+///
+/// `prepare_stack_trace` is deliberately *not* here. rustnode does not install an
+/// isolate `PrepareStackTraceCallback` at all, so V8's own per-context
+/// `Error.prepareStackTrace` is what formats a stack, and each realm's `Error`
+/// constructor therefore already works independently.
+#[derive(Clone, Default)]
+struct RealmHooks {
+    dynamic_import: Option<v8::Global<v8::Function>>,
+    import_meta: Option<v8::Global<v8::Function>>,
+    import_meta_resolve: Option<v8::Global<v8::Function>>,
+}
+
 /// Node's `PerIsolateOptions::stack_trace_limit` default (`src/node_options.h:359`).
 ///
 /// Spelled here rather than defaulted to `0` because `0` is a *meaningful* value
@@ -282,9 +481,6 @@ impl Default for HookState {
     fn default() -> Self {
         Self {
             prepare_stack_trace: None,
-            dynamic_import: None,
-            import_meta: None,
-            import_meta_resolve: None,
             source_maps_enabled: false,
             exit_requested: false,
             stderr: None,
@@ -545,18 +741,67 @@ pub fn write_stderr(text: &str) {
 }
 
 /// Stores the callback for a hook, replacing any previous one.
+///
+/// `DynamicImport`, `ImportMeta` and `ImportMetaResolve` are per realm, because
+/// `initializeESM()` installs them once per realm; see [`RealmHooks`]. The others
+/// are per thread, because there is exactly one of each per `Environment`.
 pub fn store(scope: &mut v8::PinScope, hook: Hook, callback: v8::Global<v8::Function>) {
-    let _ = scope;
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        match hook {
-            Hook::PrepareStackTrace => state.prepare_stack_trace = Some(callback),
-            Hook::DynamicImport => state.dynamic_import = Some(callback),
-            Hook::ImportMeta => state.import_meta = Some(callback),
-            Hook::ImportMetaResolve => state.import_meta_resolve = Some(callback),
-            Hook::SourceMaps | Hook::ExitRequested => {}
+    match hook {
+        Hook::DynamicImport | Hook::ImportMeta | Hook::ImportMetaResolve => {
+            realm_hooks_write(scope, |hooks| match hook {
+                Hook::DynamicImport => hooks.dynamic_import = Some(callback),
+                Hook::ImportMeta => hooks.import_meta = Some(callback),
+                Hook::ImportMetaResolve => hooks.import_meta_resolve = Some(callback),
+                Hook::PrepareStackTrace | Hook::SourceMaps | Hook::ExitRequested => {}
+            });
         }
+        _ => {
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                match hook {
+                    Hook::PrepareStackTrace => state.prepare_stack_trace = Some(callback),
+                    Hook::SourceMaps | Hook::ExitRequested => {}
+                    Hook::DynamicImport | Hook::ImportMeta | Hook::ImportMetaResolve => {}
+                }
+            });
+        }
+    }
+}
+
+/// Mutates the current realm's [`RealmHooks`] entry, creating it when absent.
+///
+/// The principal realm's entry lives in a plain slot; every other realm gets a
+/// vector entry keyed by context identity, the same arrangement [`REALM_LOADERS`]
+/// uses and for the same reason.
+fn realm_hooks_write(scope: &mut v8::PinScope, apply: impl FnOnce(&mut RealmHooks)) {
+    if is_principal_realm(scope) {
+        PRINCIPAL_HOOKS.with(|hooks| apply(&mut hooks.borrow_mut()));
+        return;
+    }
+    let key = realm_key(scope);
+    REALM_HOOKS.with(|slot| {
+        apply(slot.borrow_mut().entry(key).or_default());
     });
+}
+
+/// A local handle to one per-realm hook callback, from the current realm.
+fn realm_hooks_read<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    read: impl Fn(&RealmHooks) -> Option<&v8::Global<v8::Function>>,
+) -> Option<v8::Local<'s, v8::Function>> {
+    // The principal realm answers from its own slot; an unrecognised context
+    // (a `vm` context that never ran `realm.js`) falls through to the same one,
+    // which is Node's `Realm::GetCurrent`-or-principal fallback.
+    if is_principal_realm(scope) {
+        return PRINCIPAL_HOOKS
+            .with(|hooks| read(&hooks.borrow()).map(|callback| v8::Local::new(scope, callback)));
+    }
+    let key = realm_key(scope);
+    REALM_HOOKS.with(|slot| {
+        slot.borrow()
+            .get(&key)
+            .and_then(|hooks| read(hooks).map(|callback| v8::Local::new(scope, callback)))
+    })
 }
 
 /// Calls the stored `PrepareStackTraceCallback` if there is one.
@@ -579,17 +824,21 @@ pub fn prepare_stack_trace<'s>(
 
 /// Returns a local handle to one stored hook callback.
 fn stored<'s>(scope: &mut v8::PinScope<'s, '_>, hook: Hook) -> Option<v8::Local<'s, v8::Function>> {
-    STATE.with(|state| {
-        let state = state.borrow();
-        let callback = match hook {
-            Hook::PrepareStackTrace => state.prepare_stack_trace.as_ref(),
-            Hook::DynamicImport => state.dynamic_import.as_ref(),
-            Hook::ImportMeta => state.import_meta.as_ref(),
-            Hook::ImportMetaResolve => state.import_meta_resolve.as_ref(),
-            Hook::SourceMaps | Hook::ExitRequested => None,
-        }?;
-        Some(v8::Local::new(scope, callback))
-    })
+    match hook {
+        Hook::DynamicImport => realm_hooks_read(scope, |hooks| hooks.dynamic_import.as_ref()),
+        Hook::ImportMeta => realm_hooks_read(scope, |hooks| hooks.import_meta.as_ref()),
+        Hook::ImportMetaResolve => {
+            realm_hooks_read(scope, |hooks| hooks.import_meta_resolve.as_ref())
+        }
+        Hook::PrepareStackTrace => STATE.with(|state| {
+            let state = state.borrow();
+            state
+                .prepare_stack_trace
+                .as_ref()
+                .map(|callback| v8::Local::new(scope, callback))
+        }),
+        Hook::SourceMaps | Hook::ExitRequested => None,
+    }
 }
 
 /// The `import()` callback `internal/modules/esm/utils.js` installs.
@@ -604,16 +853,28 @@ pub fn dynamic_import<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<
 
 // Where `set_dynamic_import_referrer` parks the symbol, so
 // `dynamic_import_referrer` can hand it back. Documented on that function.
+//
+// Per realm, like the callback it accompanies: `setDynamicImportCallback` runs
+// from `initializeESM` once per realm. The *value* is the same
+// `vm_dynamic_import_default_internal` symbol in every realm, but which loader
+// consumes it is not, so the slot has to follow the realm rather than the thread.
 thread_local! {
     static DYNAMIC_IMPORT_REFERRER: RefCell<Option<v8::Global<v8::Value>>> =
         const { RefCell::new(None) };
+    static REALM_DYNAMIC_IMPORT_REFERRER: RefCell<std::collections::BTreeMap<u64, v8::Global<v8::Value>>> =
+        const { RefCell::new(std::collections::BTreeMap::new()) };
 }
 
 /// Records the sentinel symbol the dynamic-import callback receives.
 pub fn set_dynamic_import_referrer(scope: &mut v8::PinScope, referrer: v8::Local<v8::Value>) {
+    let key = realm_key(scope);
     let referrer = v8::Global::new(scope, referrer);
-    DYNAMIC_IMPORT_REFERRER.with(|slot| {
-        *slot.borrow_mut() = Some(referrer);
+    if is_principal_realm(scope) {
+        DYNAMIC_IMPORT_REFERRER.with(|slot| *slot.borrow_mut() = Some(referrer));
+        return;
+    }
+    REALM_DYNAMIC_IMPORT_REFERRER.with(|slot| {
+        slot.borrow_mut().insert(key, referrer);
     });
 }
 
@@ -634,9 +895,17 @@ pub fn set_dynamic_import_referrer(scope: &mut v8::PinScope, referrer: v8::Local
 pub fn dynamic_import_referrer<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> Option<v8::Local<'s, v8::Value>> {
-    DYNAMIC_IMPORT_REFERRER.with(|slot| {
+    if is_principal_realm(scope) {
+        return DYNAMIC_IMPORT_REFERRER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|referrer| v8::Local::new(scope, referrer))
+        });
+    }
+    let key = realm_key(scope);
+    REALM_DYNAMIC_IMPORT_REFERRER.with(|slot| {
         slot.borrow()
-            .as_ref()
+            .get(&key)
             .map(|referrer| v8::Local::new(scope, referrer))
     })
 }
@@ -647,8 +916,13 @@ pub fn import_meta<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s,
 }
 
 /// Whether `import.meta.resolve` has an initializer to hang its lazy getter on.
-pub fn has_import_meta_resolve() -> bool {
-    STATE.with(|state| state.borrow().import_meta_resolve.is_some())
+///
+/// Per realm: `initializeESM` installs the initializer once per realm, and a
+/// `ShadowRealm`'s `internal/modules/esm/loader` copy is its own, so asking the
+/// principal realm's slot from inside a shadow realm would answer for the wrong
+/// loader.
+pub fn has_import_meta_resolve(scope: &mut v8::PinScope) -> bool {
+    realm_hooks_read(scope, |hooks| hooks.import_meta_resolve.as_ref()).is_some()
 }
 
 /// The `import.meta.resolve` initializer, which closes over the loader.
@@ -695,6 +969,42 @@ pub fn clear_exit_request() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `body` with a fresh isolate, context and scope entered.
+    ///
+    /// Realm identity is per context, so anything that asks which realm is running
+    /// needs a real one; there is no way to exercise `mark_realm` or the per-realm
+    /// slots without a `v8::Context`.
+    fn with_context(body: impl FnOnce(&mut v8::PinScope)) {
+        crate::test_support::initialize_v8();
+        let mut isolate = v8::Isolate::new(Default::default());
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        body(scope);
+    }
+
+    // Realm isolation itself is covered end to end by the CLI's integration tests
+    // (a `ShadowRealm` that imports a module must not share the principal realm's
+    // loader), because exercising it here needs a second `v8::Context` that the
+    // test harness cannot enter the way the bootstrap does. What is unit-testable
+    // without that is the id bookkeeping, which is what this covers.
+    #[test]
+    fn the_principal_realm_is_id_zero_and_stays_there() {
+        with_context(|scope| {
+            assert_eq!(current_realm_id(scope), PRINCIPAL_REALM_ID);
+            // Asking again must not hand out a second id: `realm_id` runs on every
+            // `internalBinding` and hook access, and a re-assignment would look
+            // like a new realm.
+            assert_eq!(current_realm_id(scope), PRINCIPAL_REALM_ID);
+            // `mark_realm` is a no-op on a context that already has an id, which
+            // is what keeps the bootstrap from renumbering the principal realm if
+            // it were ever called from there.
+            mark_realm(scope);
+            assert_eq!(current_realm_id(scope), PRINCIPAL_REALM_ID);
+        });
+    }
 
     #[test]
     fn flags_default_to_false_and_round_trip() {

@@ -175,8 +175,17 @@ thread_local! {
     /// ->NewInstance(context)`, which creates the object *without* running the
     /// constructor callback. `Function::new_instance` would run it, and the
     /// constructor deliberately throws.
-    static INSTANCE_TEMPLATE: RefCell<Option<v8::Global<v8::ObjectTemplate>>> =
-        const { RefCell::new(None) };
+    ///
+    /// Per realm, because the template's prototype is the realm's own
+    /// `MessagePort.prototype` — `internal/worker/io.js` rewrites that object in
+    /// place, so a second realm installs a template over a *different* prototype.
+    /// One shared slot made the shadow realm's install replace the principal
+    /// realm's template, and `new Worker()`'s `this[kHandle].messagePort` was then
+    /// an object built from the wrong realm's template. Its prototype had no `on`,
+    /// which surfaced as `this[kPort].on is not a function` in
+    /// `lib/internal/worker.js:302`.
+    static INSTANCE_TEMPLATE: RefCell<Vec<(f64, v8::Global<v8::ObjectTemplate>)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// The state one `MessagePort` object points at.
@@ -371,7 +380,15 @@ fn install_message_port<'s>(
     // built from the same instance template every time; rooting it is what lets
     // a transferred port be rebuilt with the prototype `io.js` produced.
     let instance = template.instance_template(scope);
-    INSTANCE_TEMPLATE.with(|slot| *slot.borrow_mut() = Some(v8::Global::new(scope, instance)));
+    let realm = rn_core::hook_slot::current_realm_id(scope);
+    let instance = v8::Global::new(scope, instance);
+    INSTANCE_TEMPLATE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.iter_mut().find(|(key, _)| *key == realm) {
+            Some((_, existing)) => *existing = instance,
+            None => slot.push((realm, instance)),
+        }
+    });
     Ok(constructor.into())
 }
 
@@ -411,10 +428,12 @@ pub fn new_port_object<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     data: Arc<MessagePortData>,
 ) -> Result<v8::Local<'s, v8::Object>, String> {
+    let realm = rn_core::hook_slot::current_realm_id(scope);
     let instance_template = INSTANCE_TEMPLATE.with(|slot| {
         slot.borrow()
-            .as_ref()
-            .map(|template| v8::Local::new(scope, template))
+            .iter()
+            .find(|(key, _)| *key == realm)
+            .map(|(_, template)| v8::Local::new(scope, template))
     });
     let Some(instance_template) = instance_template else {
         return Err("the MessagePort instance template is not installed".to_string());

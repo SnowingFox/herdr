@@ -125,8 +125,19 @@ pub struct BindingRegistry {
     /// placeholder stays visible to `rn-compat` without pretending to work.
     installers: BTreeMap<String, Box<dyn Installer>>,
     /// Namespaces installed by this runtime, so a second `internalBinding` call
-    /// for the same name returns the same object.
-    installed: RefCell<BTreeMap<String, v8::Global<v8::Object>>>,
+    /// for the same name in the same realm returns the same object.
+    ///
+    /// Keyed by realm as well as by name, because a `ShadowRealm` is a second
+    /// realm in one isolate: Node keeps a `binding_data_store_` on each `Realm`
+    /// and rebuilds a namespace per realm, and rustnode has to match that for the
+    /// same reason. A shared object is not merely stale state — the functions on
+    /// it were created in the principal realm's context, so V8 runs their
+    /// callbacks there. `internalBinding('module_wrap')`'s
+    /// `setImportModuleDynamicallyCallback` would then file the shadow realm's ESM
+    /// loader under the principal realm, and `importValue` would evaluate the
+    /// module in the wrong realm (which is how `test-shadow-realm-module.js` first
+    /// failed, with a counter shared across the boundary).
+    installed: RefCell<BTreeMap<(u64, String), v8::Global<v8::Object>>>,
 }
 
 impl BindingRegistry {
@@ -169,18 +180,24 @@ impl BindingRegistry {
         self.installers.contains_key(name)
     }
 
-    /// Builds one namespace, reusing the object from an earlier call.
+    /// Builds one namespace, reusing the object from an earlier call in this realm.
     ///
-    /// Node caches bindings per isolate, and so must rustnode: `lib/**` relies
-    /// on `internalBinding('util')` returning the identical object twice, and
-    /// several namespaces hold state (zlib streams, the fs request table) that
-    /// would silently split if the second call rebuilt it.
+    /// Node caches bindings per realm, and so must rustnode: `lib/**` relies on
+    /// `internalBinding('util')` returning the identical object twice, and several
+    /// namespaces hold state (zlib streams, the fs request table) that would
+    /// silently split if the second call rebuilt it. The realm half of the key is
+    /// what keeps a `ShadowRealm` from inheriting the principal realm's objects;
+    /// see the field's doc comment.
     pub fn install<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
         name: &str,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
-        if let Some(existing) = self.installed.borrow().get(name) {
+        let key = (
+            crate::hook_slot::current_realm_id(scope).to_bits(),
+            name.to_string(),
+        );
+        if let Some(existing) = self.installed.borrow().get(&key) {
             return Ok(v8::Local::new(scope, existing));
         }
 
@@ -194,7 +211,7 @@ impl BindingRegistry {
         let object = installer.install(scope, &mut ctx)?;
         self.installed
             .borrow_mut()
-            .insert(name.to_string(), v8::Global::new(scope, object));
+            .insert(key, v8::Global::new(scope, object));
         Ok(object)
     }
 }

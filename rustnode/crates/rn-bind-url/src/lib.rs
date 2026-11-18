@@ -142,7 +142,7 @@ impl BindingModule for Url {
         // callbacks reach it without a receiver.
         let components = AliasedUint8Array::new(scope, COMPONENTS_LENGTH, Element::Word)?;
         let array = components.array(scope);
-        components_slot::set(components);
+        components_slot::set(scope, components);
 
         let object = v8::Object::new(scope);
         install::define_method(scope, object, "parse", callbacks::parse)?;
@@ -178,25 +178,48 @@ mod components_slot {
     use rn_core::AliasedUint8Array;
 
     thread_local! {
-        static COMPONENTS: RefCell<Option<AliasedUint8Array>> = const { RefCell::new(None) };
+        /// The components buffer, per realm.
+        ///
+        /// Node allocates this in the binding's `BindingData`, which lives on the
+        /// `Realm`, so a `ShadowRealm` gets a buffer of its own and the principal
+        /// realm's URLs keep theirs. Sharing one slot across realms is not
+        /// harmless: `URL` instances keep only offsets into this array, so a second
+        /// realm's `internal/url` install overwrote them and every URL created
+        /// before it read back the wrong components. That is how
+        /// `fileURLToPath(pathToFileURL(p))` started failing with "The URL must be
+        /// of scheme file" as soon as a shadow realm had been constructed.
+        ///
+        /// Keyed by the realm id `rn-core` assigns; see
+        /// `rn_core::hook_slot::realm_id`.
+        static COMPONENTS: RefCell<Vec<(f64, AliasedUint8Array)>> = const { RefCell::new(Vec::new()) };
     }
 
-    /// Records the components buffer created during install.
-    pub(super) fn set(components: AliasedUint8Array) {
-        COMPONENTS.with(|slot| *slot.borrow_mut() = Some(components));
+    /// Records the components buffer created during install, for this realm.
+    pub(super) fn set(scope: &mut rn_v8_sys::v8::PinScope, components: AliasedUint8Array) {
+        let realm = rn_core::hook_slot::current_realm_id(scope);
+        COMPONENTS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            match slot.iter_mut().find(|(key, _)| *key == realm) {
+                Some((_, existing)) => *existing = components,
+                None => slot.push((realm, components)),
+            }
+        });
     }
 
     /// Writes the nine offsets, in `urlComponents` order.
     ///
-    /// A missing buffer means `internalBinding('url')` was never installed, in
-    /// which case no member can have been called; the write is skipped rather
-    /// than panicking on a state that cannot occur.
-    pub(super) fn write(offsets: [u32; 9]) {
+    /// A missing buffer means `internalBinding('url')` was never installed in this
+    /// realm, in which case no member can have been called; the write is skipped
+    /// rather than panicking on a state that cannot occur.
+    pub(super) fn write(scope: &mut rn_v8_sys::v8::PinScope, offsets: [u32; 9]) {
+        let realm = rn_core::hook_slot::current_realm_id(scope);
         COMPONENTS.with(|slot| {
-            if let Some(components) = slot.borrow().as_ref() {
-                for (index, value) in offsets.iter().enumerate() {
-                    components.set(index, *value);
-                }
+            let slot = slot.borrow();
+            let Some((_, components)) = slot.iter().find(|(key, _)| *key == realm) else {
+                return;
+            };
+            for (index, value) in offsets.iter().enumerate() {
+                components.set(index, *value);
             }
         });
     }

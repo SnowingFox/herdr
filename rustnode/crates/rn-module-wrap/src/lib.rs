@@ -1263,6 +1263,25 @@ fn set_dynamic_import<'s>(
     }
 }
 
+/// The importing context's `globalThis[host_defined_option_symbol]`, when it has one.
+///
+/// `ModuleWrap.cc`'s fallback branch: when the host-defined options are not a
+/// module's own array, the referrer id comes from the *context's* global object
+/// under that private symbol. `prepareShadowRealmExecution` sets it in the realm
+/// it bootstraps, which is what keeps a shadow realm's `import()` inside that
+/// realm's loader.
+///
+/// rustnode publishes the symbol as a registered `v8::Symbol` rather than a
+/// `v8::Private` (see `rn_core::symbol`'s module docs for why), so the lookup is
+/// a plain property read.
+fn context_host_defined_option<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let global = scope.get_current_context().global(scope);
+    let symbol = rn_core::symbol(scope, rn_core::HOST_DEFINED_OPTION);
+    global.get(scope, symbol.into())
+}
+
 /// The isolate-level handler for `import()`.
 ///
 /// Node's `ImportModuleDynamically` resolves the referrer's host-defined option
@@ -1289,12 +1308,22 @@ fn host_dynamic_import<'s, 'i>(
         return None;
     };
     let attributes = import_attributes_from_flat(scope, &import_attributes)?;
-    // `vm_dynamic_import_default_internal` is the sentinel that makes the JS
-    // callback route an ordinary `import()` from a plain script to the default
-    // loader without emitting the `vm.USE_MAIN_CONTEXT_DEFAULT_LOADER`
-    // warning. It is the same value `prepareExecution` puts on the global for
-    // script contexts.
-    let referrer = rn_core::hook_slot::dynamic_import_referrer(scope)
+    // The referrer is the symbol this importing realm keeps under
+    // `host_defined_option_symbol`, which is `ModuleWrap.cc`'s
+    // `context->Global()->GetPrivate(context, env->host_defined_option_symbol())`
+    // branch — the one taken for every import that is not a compiled module's own
+    // hosted options.
+    //
+    // Reading it from the importing realm rather than from a thread slot is what
+    // keeps the two realms' loaders apart: `prepareShadowRealmExecution` sets that
+    // global to `vm_dynamic_import_default_internal` in the realm it bootstraps, and
+    // `defaultImportModuleDynamicallyForScript` then reaches *that* realm's
+    // `cascadedLoader`. With one thread-wide referrer both realms shared a loader,
+    // so a module imported inside a shadow realm was evaluated by — and its exports
+    // cached in — the principal realm.
+    let referrer = context_host_defined_option(scope)
+        .filter(|value| value.is_symbol())
+        .or_else(|| rn_core::hook_slot::dynamic_import_referrer(scope))
         .unwrap_or_else(|| v8::undefined(scope).into());
     let phase = v8::Integer::new(scope, K_EVALUATION_PHASE);
     let arguments = [
@@ -1487,7 +1516,7 @@ fn initialize_import_meta_default<'s>(
             meta.create_data_property(scope, key.into(), v8::Boolean::new(scope, is_main).into());
     }
 
-    if rn_core::hook_slot::has_import_meta_resolve() {
+    if rn_core::hook_slot::has_import_meta_resolve(scope) {
         if let Some(key) = v8::String::new(scope, "resolve") {
             let attributes = v8::PropertyAttribute::NONE;
             let _ = meta.set_lazy_data_property_with_data(
