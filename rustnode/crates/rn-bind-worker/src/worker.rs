@@ -297,13 +297,31 @@ fn start_thread(
         thread_id,
         parent_wake: rn_uv::wake::current_thread_token(),
         out_of_memory: handle.out_of_memory_flag(),
+        init_failure: handle.init_failure_slot(),
     };
     // The statistics interrupt runs on the worker's thread and can reach only
     // this handle's shared state, so the token it uses to wake *this* loop is
     // recorded here rather than passed through the thread.
     handle.set_parent_wake(thread.parent_wake);
-    if let Err(message) = handle.start(move || thread.run()) {
-        throw_type_error(scope, &message);
+    let started = handle.start(move || thread.run());
+    // The borrow ends here: `parent::unregister` needs the same `RefCell`, and
+    // holding it across the call would panic rather than report the failure.
+    drop(handle);
+    // `Worker::StartThread`'s own `uv_thread_create_ex` failure branch: the handle
+    // is discarded (`w->stopped_ = true`, `w->tid_.reset()`) and the constructor
+    // throws `ERR_WORKER_INIT_FAILED(isolate, uv_err_name(ret))`.
+    // `lib/internal/worker.js` calls `startThread()` from inside the `Worker`
+    // constructor, so that throw is what the caller of `new Worker()` sees.
+    //
+    // The handle must also stop being registered, because it never will start a
+    // thread: `register` reffed this loop's wake handle and armed a check phase on
+    // the promise that a thread would finish and be reported, and neither can
+    // happen now. Leaving it registered pinned the parent's loop open forever for
+    // a worker that does not exist.
+    if let Err(message) = started {
+        // SAFETY: as above; `slot` is live for the object's lifetime.
+        crate::parent::unregister(&unsafe { &*slot }.handle);
+        throw_worker_init_failed(scope, &message);
     }
 }
 
@@ -608,5 +626,27 @@ fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
         return;
     };
     let exception = v8::Exception::type_error(scope, text);
+    scope.throw_exception(exception);
+}
+
+/// Throws `ERR_WORKER_INIT_FAILED` with `reason`, as `Worker::StartThread` does.
+///
+/// `THROW_ERR_WORKER_INIT_FAILED(isolate, err_buf)` in `src/node_worker.cc:823`
+/// constructs the code's own `Error` and then assigns `code`, which is what lets
+/// `test-worker-init-failure` assert on `err.code`. A bare `TypeError` with the
+/// same text is a different thing to a program that branches on the code, and it
+/// is the difference between the error event the test accepts and one it rejects.
+fn throw_worker_init_failed(scope: &mut v8::PinScope<'_, '_>, reason: &str) {
+    let Some(text) = v8::String::new(scope, reason) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    if let (Ok(object), Some(key), Some(value)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, "code"),
+        v8::String::new(scope, "ERR_WORKER_INIT_FAILED"),
+    ) {
+        let _ = object.set(scope, key.into(), value.into());
+    }
     scope.throw_exception(exception);
 }
