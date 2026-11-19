@@ -101,6 +101,15 @@ pub fn with_state<R>(body: impl FnOnce(&rn_core::AliasedUint8Array) -> R) -> Opt
     STATE.with(|slot| slot.borrow().as_ref().map(body))
 }
 
+/// Drops the `streamBaseState` buffer.
+///
+/// Registered with `rn_core::snapshot_drain`: it is an `Int32Array` view over a
+/// V8-owned buffer, which the abort names among the typed arrays, and
+/// [`state_array`] recreates it on the first stream write after a load.
+pub fn forget_state() {
+    STATE.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// What a write did, in the three values `afterWriteDispatched` reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteOutcome {

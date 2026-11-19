@@ -15,6 +15,7 @@ pub mod env;
 pub mod env_proxy;
 pub mod error;
 pub mod exit_state;
+pub mod external_references;
 pub mod finalizer;
 pub mod function;
 pub mod handle;
@@ -28,6 +29,7 @@ pub mod platform_tasks;
 pub mod profile;
 pub mod queue;
 pub mod realm;
+pub mod snapshot_drain;
 pub mod symbol;
 pub mod task_queue;
 #[cfg(test)]

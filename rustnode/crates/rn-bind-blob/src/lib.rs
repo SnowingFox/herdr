@@ -1016,6 +1016,7 @@ fn throw_type_error(scope: &mut v8::PinScope, message: &str) {
 /// Registers the `blob` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Blob);
+    rn_core::snapshot_drain::register("rn-bind-blob", forget_realm_handles);
     // A blob *handle* is a host object, so `structuredClone` can rebuild it.
     // Without this the serialiser treats it as a plain object and the clone comes
     // back with the private byte range but none of the prototype's methods, so
@@ -1024,6 +1025,22 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
     // The reader is not marked: it is short-lived state a `Blob` creates on
     // demand, never something a user holds across a message.
     rn_core::host_object::register_kind(BLOB_HANDLE_KIND, blob_handle_clone);
+}
+
+/// Drops the cached private keys, instance templates and stored data objects.
+///
+/// Registered with `rn_core::snapshot_drain`: the keys are `Global<Private>`, the
+/// templates are `Global<ObjectTemplate>` (the abort names one as
+/// `OBJECT_TEMPLATE_INFO_TYPE`), and the stored data objects are `Global<Object>`.
+/// All are rebuilt on first use by the functions that create them, which is what
+/// makes dropping them safe where dropping a live blob would not be.
+///
+/// `DATA_OBJECTS` is empty at bootstrap time; it is cleared for the same reason
+/// rather than because it is known to hold anything.
+fn forget_realm_handles() {
+    KEYS.with(|slot| *slot.borrow_mut() = None);
+    TEMPLATES.with(|slot| *slot.borrow_mut() = None);
+    DATA_OBJECTS.with(|slot| slot.borrow_mut().clear());
 }
 
 /// The `host_object` kind name for a blob handle.

@@ -239,6 +239,16 @@ impl BindingModule for ProcessMethods {
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(ProcessMethods);
+    rn_core::snapshot_drain::register("rn-bind-process-methods", forget_realm_handles);
+}
+
+/// Drops the `hrtime` buffer this crate keeps for the realm.
+///
+/// Registered with `rn_core::snapshot_drain`: it is a `Uint32Array` view over a
+/// V8-owned buffer, which the abort names as `Uint32Array`, and it is recreated on
+/// the first `hrtime()` call after a load.
+fn forget_realm_handles() {
+    HRTIME_BUFFER.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// `per_process::node_start_time`, captured once so `process.uptime()` counts

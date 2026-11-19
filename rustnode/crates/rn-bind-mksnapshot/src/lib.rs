@@ -151,6 +151,19 @@ fn install_impl<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Mksnapshot);
+    rn_core::snapshot_drain::register("rn-bind-mksnapshot", forget_realm_handles);
+}
+
+/// Drops the startup-snapshot flag buffer and the snapshot callbacks.
+///
+/// Registered with `rn_core::snapshot_drain`: `BUILDING` is a one-byte
+/// `Uint8Array` view over a V8-owned buffer (the abort names it as `Uint8Array`)
+/// and the two callbacks are `Global` handles. All three are rebuilt by `install`,
+/// so a loaded realm gets its own rather than a handle into the isolate that built
+/// the blob.
+fn forget_realm_handles() {
+    BUILDING.with(|slot| *slot.borrow_mut() = None);
+    CALLBACKS.with(|slot| *slot.borrow_mut() = None);
 }
 
 fn set_serialize_callback(

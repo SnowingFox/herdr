@@ -194,6 +194,13 @@ mod components_slot {
         static COMPONENTS: RefCell<Vec<(f64, AliasedUint8Array)>> = const { RefCell::new(Vec::new()) };
     }
 
+    /// Drops every realm's components buffer.
+    ///
+    /// Called by the crate's snapshot drain; see `forget_realm_handles` there.
+    pub(super) fn clear() {
+        COMPONENTS.with(|slot| slot.borrow_mut().clear());
+    }
+
     /// Records the components buffer created during install, for this realm.
     pub(super) fn set(scope: &mut rn_v8_sys::v8::PinScope, components: AliasedUint8Array) {
         let realm = rn_core::hook_slot::current_realm_id(scope);
@@ -234,6 +241,16 @@ pub(crate) use components_slot::write as write_components;
 /// edited for `internalBinding('url')` to resolve.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Url);
+    rn_core::snapshot_drain::register("rn-bind-url", forget_realm_handles);
+}
+
+/// Drops the per-realm `urlComponentsArray` buffers.
+///
+/// Registered with `rn_core::snapshot_drain`: each entry is a `Uint32Array` view
+/// over a V8-owned buffer, which the abort names as `Uint32Array`, and `install`
+/// allocates a fresh one for a loaded realm.
+fn forget_realm_handles() {
+    components_slot::clear();
 }
 
 #[cfg(test)]

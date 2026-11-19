@@ -109,6 +109,16 @@ impl BindingModule for EncodingBinding {
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(EncodingBinding);
+    rn_core::snapshot_drain::register("rn-bind-encoding", forget_realm_handles);
+}
+
+/// Drops the per-realm `encodeInto` result buffers.
+///
+/// Registered with `rn_core::snapshot_drain`: each entry is a `Uint32Array` view
+/// over a V8-owned buffer, which the abort names as `Uint32Array`, and `install`
+/// allocates a fresh one for a loaded realm.
+fn forget_realm_handles() {
+    RESULTS.with(|slot| slot.borrow_mut().clear());
 }
 
 fn encode_into(

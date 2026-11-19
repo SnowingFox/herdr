@@ -433,6 +433,21 @@ pub fn ensure_inspector(scope: &mut v8::PinScope<'_, '_>) -> bool {
     true
 }
 
+/// Drops the inspected context handle.
+///
+/// Registered with `rn_core::snapshot_drain`. The context is a `Global` V8 cannot
+/// reach from a serialised context, and the abort names it as `NativeContext[308]`.
+/// `context_created` is cleared with it: the flag is what makes `contextCreated`
+/// run once, and leaving it set would stop a loaded realm from ever registering its
+/// own context with the inspector.
+pub fn forget_context() {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.default_context = None;
+        state.context_created = false;
+    });
+}
+
 /// Opens one session against the inspector.
 ///
 /// `state` is the value V8 hands back to a frontend that reconnects; it is empty

@@ -68,6 +68,19 @@ pub fn has_context() -> bool {
     CONTEXT.with(|slot| slot.borrow().is_some())
 }
 
+/// Drops the recorded isolate pointer and context handle.
+///
+/// Registered with `rn_core::snapshot_drain`. Both describe the realm on this
+/// thread, so a snapshot build has to drop them before serialising: the context is
+/// a `Global` V8 cannot reach from a serialised context (the abort names it as
+/// `NativeContext`), and the isolate pointer would otherwise outlive the isolate
+/// pass two serialises. Every binding's `install` calls [`remember_context`], so
+/// the load path repopulates both as it installs namespaces again.
+pub fn forget_context() {
+    ISOLATE.with(|slot| *slot.borrow_mut() = None);
+    CONTEXT.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// The address of the isolate this thread installed bindings into.
 ///
 /// The same value [`rn_v8_sys::platform::isolate_key`] derives from a scope, so

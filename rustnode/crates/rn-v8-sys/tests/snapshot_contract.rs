@@ -104,6 +104,29 @@
 //!    whatever drains the caches has to keep them reachable from a serialised
 //!    context rather than simply dropping them — a build that dropped them would
 //!    produce a blob that loads and cannot resolve a builtin.
+//!
+//! 5. **Wall 4 runs before wall 2.** With an unregistered external reference and
+//!    an unreachable global handle both present, `create_blob` reports only
+//!    `CheckGlobalAndEternalHandles failed` — the handle check — and never reaches
+//!    the `Unknown external reference` abort. That ordering matters for how a
+//!    build is debugged: a run that names handles is not yet telling you anything
+//!    about its external-reference table, and a fix to the table cannot be
+//!    measured through the handle list. The test below pins both directions so a
+//!    V8 bump that reorders them fails loudly rather than silently changing what
+//!    the abort means.
+//!
+//! 6. **`CreateParams::external_references` does not have to be sorted.** V8 scans
+//!    the table linearly, so registration order is fine. This is worth pinning
+//!    because V8's own `ExternalReferenceTable` *is* sorted by address, and a
+//!    reader could reasonably build a sorted table on the assumption that the
+//!    parameter is binary-searched. Both orderings build, which is what makes the
+//!    simpler registration-order table legitimate.
+//!
+//! 7. **A discovery pass cannot use `snapshot_creator`.** `OwnedIsolate::drop`
+//!    panics for a creator isolate ("you should use create_blob before dropping
+//!    an isolate"), and `create_blob` is exactly the check the discovery pass
+//!    exists to avoid. A plain `Isolate` builds the same templates and can be
+//!    dropped, so that is what a two-pass build has to use for its first pass.
 
 use std::borrow::Cow;
 use std::io::Write;
@@ -403,8 +426,9 @@ fn every_isolate_has_the_typed_array_intrinsics() {
 ///
 /// The failing case is recorded as its exact output in the module docs rather
 /// than asserted here, because a V8 fatal takes the whole test binary with it. It
-/// is deterministic: a `--build-snapshot` on a bootstrapped realm names 39
-/// handles, 3 runs of 3 identical.
+/// is deterministic: a `--build-snapshot` on a bootstrapped realm named 39
+/// handles, 3 runs of 3 identical, before the drains in `rn_core::snapshot_drain`
+/// took that to 8.
 #[test]
 fn a_blob_builds_only_when_no_unreachable_globals_are_alive() {
     with_v8(|| {
@@ -475,4 +499,174 @@ fn a_bare_blob_round_trips_into_a_second_isolate() {
             "a global set while building is present after loading"
         );
     });
+}
+
+/// Wall 4 and wall 2 are both defects, but V8 checks wall 4 first.
+///
+/// This is a measurement, not an inference from reading: each case is run in its
+/// own process because both aborts are V8 fatals that take the binary with them.
+/// `RN_SNAPSHOT_ORDER_CASE` selects the case and the test re-executes itself.
+///
+/// What it establishes, in the order the cases assert it:
+///
+/// * `thunk` — an unregistered external reference on its own aborts with
+///   `Unknown external reference`, which is wall 2.
+/// * `handle` — an unreachable global handle on its own aborts with
+///   `CheckGlobalAndEternalHandles failed`, which is wall 4.
+/// * `both` — with both present, only the *handle* message appears. So the handle
+///   check runs first, and a build reporting handles has not yet said anything
+///   about its external reference table.
+///
+/// The consequence for diagnosis is the point of the test: fixing the table
+/// cannot be observed through the handle list, because the table is not consulted
+/// until the handle list is empty.
+#[test]
+fn the_handle_check_runs_before_the_external_reference_check() {
+    let case = std::env::var("RN_SNAPSHOT_ORDER_CASE").unwrap_or_default();
+    if case.is_empty() {
+        // The parent re-runs this test binary once per case, so each abort is in a
+        // process of its own.
+        let exe = std::env::current_exe().expect("the test binary path");
+        for case in ["thunk", "handle", "both"] {
+            let output = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "the_handle_check_runs_before_the_external_reference_check",
+                    "--nocapture",
+                ])
+                .env("RN_SNAPSHOT_ORDER_CASE", case)
+                .output()
+                .expect("spawn the case");
+            let text = String::from_utf8_lossy(&output.stderr).into_owned()
+                + &String::from_utf8_lossy(&output.stdout);
+            let saw_handle = text.contains("handle not serialized");
+            let saw_thunk = text.contains("Unknown external reference");
+            say(&format!("{case}: handle={saw_handle} thunk={saw_thunk}"));
+            match case {
+                "thunk" => {
+                    assert!(saw_thunk, "wall 2 alone reports the external reference");
+                    assert!(!saw_handle, "there is no handle defect in this case");
+                }
+                "handle" => {
+                    assert!(saw_handle, "wall 4 alone reports the handle");
+                    assert!(!saw_thunk, "there is no thunk defect in this case");
+                }
+                _ => {
+                    assert!(
+                        saw_handle,
+                        "with both defects, the handle check is what reports"
+                    );
+                    assert!(
+                        !saw_thunk,
+                        "the external-reference check is never reached while a \
+                         handle is unreachable, so its message cannot appear"
+                    );
+                }
+            }
+        }
+        return;
+    }
+
+    with_v8(|| {
+        let with_thunk = case == "thunk" || case == "both";
+        let with_handle = case == "handle" || case == "both";
+        let params = v8::CreateParams::default().external_references(no_references());
+        let mut creator = v8::Isolate::snapshot_creator(None, Some(params));
+        {
+            let scope = std::pin::pin!(v8::HandleScope::new(&mut creator));
+            let scope = &mut scope.init();
+            let default_context = v8::Context::new(scope, Default::default());
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+            if with_thunk {
+                let global = scope.get_current_context().global(scope);
+                let template = v8::FunctionTemplate::builder(probe_callback).build(scope);
+                let function = template.get_function(scope).expect("a function");
+                let name = v8::String::new(scope, "native").expect("a name");
+                global.set(scope, name.into(), function.into());
+            }
+            if with_handle {
+                // Deliberately leaked: a `Global` nothing serialised reaches.
+                let leaked = v8::Global::new(scope, v8::Object::new(scope));
+                std::mem::forget(leaked);
+            }
+            scope.set_default_context(default_context);
+            let _ = scope.add_context(context);
+        }
+        // A V8 fatal ends the process here, which is the outcome the parent reads.
+        let _ = creator.create_blob(v8::FunctionCodeHandling::Clear);
+    });
+}
+
+/// `CreateParams::external_references` is scanned, so it need not be sorted.
+///
+/// V8's own `ExternalReferenceTable` is sorted by address, so a table built in
+/// registration order looks wrong until this is measured. Both thunks are
+/// registered in *descending* address order here, which a binary search over the
+/// table would make invisible to V8; the blob builds anyway, so the scan is
+/// linear and registration order is usable.
+#[test]
+fn a_descending_external_reference_table_still_builds() {
+    with_v8(|| {
+        let alpha: v8::FunctionCallback = v8::MapFnTo::map_fn_to(probe_callback);
+        let omega: v8::FunctionCallback = v8::MapFnTo::map_fn_to(second_probe_callback);
+        say(&format!(
+            "alpha {:#x} omega {:#x}",
+            alpha as usize, omega as usize
+        ));
+
+        // Descending by address, i.e. the opposite of what a sorted table holds.
+        let mut references = vec![
+            v8::ExternalReference {
+                pointer: alpha as *mut std::ffi::c_void,
+            },
+            v8::ExternalReference {
+                pointer: omega as *mut std::ffi::c_void,
+            },
+        ];
+        references.sort_by_key(|reference| {
+            // SAFETY: both entries were built from `pointer`, which is the field
+            // the union's `PartialEq` also reads.
+            std::cmp::Reverse(unsafe { reference.pointer as usize })
+        });
+
+        let (blob, index) = build_blob(&references, |scope| {
+            let global = scope.get_current_context().global(scope);
+            for (name, raw) in [("alpha", alpha), ("omega", omega)] {
+                let template = v8::FunctionTemplate::builder_raw(raw).build(scope);
+                let function = template.get_function(scope).expect("a function");
+                let key = v8::String::new(scope, name).expect("a name");
+                global.set(scope, key.into(), function.into());
+            }
+        });
+        say(&format!("descending-table blob {} bytes", blob.len()));
+
+        // The load half proves the table was usable rather than merely tolerated:
+        // V8 resolves each index back to the address it was given.
+        let params = v8::CreateParams::default()
+            .external_references(Cow::Owned(references))
+            .snapshot_blob(blob);
+        let mut isolate = v8::Isolate::new(params);
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::from_snapshot(scope, index, Default::default())
+            .expect("a context from the snapshot");
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let source = v8::String::new(scope, "typeof alpha + typeof omega").expect("a source");
+        let script = v8::Script::compile(scope, source, None).expect("a script");
+        let value = script.run(scope).expect("the loaded functions resolve");
+        assert_eq!(
+            value.to_rust_string_lossy(scope),
+            "functionfunction",
+            "both functions survive a descending table, so V8 scans rather than searches"
+        );
+    });
+}
+
+/// A second callback, so the table has two distinct addresses.
+fn second_probe_callback(
+    _scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue,
+) {
 }
