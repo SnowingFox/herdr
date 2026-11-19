@@ -147,11 +147,72 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Uv);
 }
 
+/// `ProcessEmitDeprecationWarning`'s "only once" latch for DEP0119.
+///
+/// Node's `Environment::EmitErrNameWarning()` flips the same bit, so the warning
+/// fires on the first `errname` call in the process and never again — a loop
+/// calling it must not flood stderr.
+static ERR_NAME_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Emits DEP0119, the pending deprecation for reading `errname` directly.
+///
+/// `src/uv.cc:74` gates this on `--pending-deprecation`, which is why an ordinary
+/// run says nothing. Routing it through `internal/process/warning` is the same
+/// path every other deprecation in this build takes, and a missing loader is a
+/// silent skip because `process.binding('uv')` can be reached before
+/// `emitWarning` exists.
+fn warn_errname_deprecated(scope: &mut v8::PinScope<'_, '_>) {
+    if !rn_core::hook_slot::pending_deprecation()
+        || ERR_NAME_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let Some(require) = rn_core::hook_slot::require(scope) else {
+        return;
+    };
+    let Some(id) = v8::String::new(scope, "internal/process/warning") else {
+        return;
+    };
+    let Some(warning) = require.call(scope, v8::undefined(scope).into(), &[id.into()]) else {
+        return;
+    };
+    let Ok(warning) = v8::Local::<v8::Object>::try_from(warning) else {
+        return;
+    };
+    let Some(key) = v8::String::new(scope, "emitWarning") else {
+        return;
+    };
+    let Some(emit) = warning.get(scope, key.into()) else {
+        return;
+    };
+    let Ok(emit) = v8::Local::<v8::Function>::try_from(emit) else {
+        return;
+    };
+    let (Some(message), Some(kind), Some(code)) = (
+        v8::String::new(
+            scope,
+            "Directly calling process.binding('uv').errname(<val>) is being deprecated. Please make sure to use util.getSystemErrorName() instead.",
+        ),
+        v8::String::new(scope, "DeprecationWarning"),
+        v8::String::new(scope, "DEP0119"),
+    ) else {
+        return;
+    };
+    let _ = emit.call(
+        scope,
+        warning.into(),
+        &[message.into(), kind.into(), code.into()],
+    );
+}
+
 fn errname_callback(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
+    // `src/uv.cc:74` emits DEP0119 before reading the argument, so an invalid
+    // code still warns once. Gated on `--pending-deprecation` inside.
+    warn_errname_deprecated(scope);
     let Some(errno) = int32_arg(scope, &args) else {
         return;
     };
