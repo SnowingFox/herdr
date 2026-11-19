@@ -28,6 +28,8 @@ use std::cell::RefCell;
 use rn_core::{AliasedUint8Array, BindingModule, Element, InstallCtx};
 use rn_v8_sys::v8;
 
+mod destroy_hook;
+
 /// Members exposed on the namespace object, matching `contracts/async_wrap.json`.
 pub const MEMBERS: &[&str] = &[
     "Providers",
@@ -427,6 +429,11 @@ impl BindingModule for AsyncWrap {
         // installed; `rn-uv` asks `rn-core` for a scope and never learns that
         // this crate answers.
         register_callback_scope();
+        // A registration holds a `v8::Weak` into this isolate, so the table has to
+        // be emptied when the realm that owns it goes away. A worker's thread may
+        // host another realm afterwards, and a leftover entry would point at an
+        // object from a disposed heap.
+        rn_core::hook_slot::add_teardown_hook(destroy_hook::clear_registrations);
         Ok(object)
     }
 }
@@ -1001,20 +1008,25 @@ fn tracing_error_unknown_provider(provider: u32) {
 /// `Environment::SetImmediate`, which is why a `destroy` is observable one check
 /// phase after the resource is gone rather than inline.
 pub fn emit_destroy(async_id: f64) {
-    // `if (fields()[kDestroy] == 0 || !can_call_into_js()) return;`. Queuing an
-    // id nobody will read would keep the loop awake for nothing.
-    let enabled = STATE.with(|state| {
+    if !destroy_enabled() {
+        return;
+    }
+    DESTROY_IDS.with(|ids| ids.borrow_mut().push(async_id));
+    rn_core::native_immediates::set_immediate(drain_destroy_ids);
+}
+
+/// `fields()[kDestroy] > 0`: whether any `destroy` hook is listening.
+///
+/// The count is maintained by `lib/internal/async_hooks.js` as hooks are enabled,
+/// so this is the same short circuit `AsyncWrap::Emit` takes on the hot path.
+pub fn destroy_enabled() -> bool {
+    STATE.with(|state| {
         state
             .borrow()
             .as_ref()
             .and_then(|state| state.hook_fields.get(HOOK_FIELDS[3].1))
             .unwrap_or(0)
-    });
-    if enabled == 0 {
-        return;
-    }
-    DESTROY_IDS.with(|ids| ids.borrow_mut().push(async_id));
-    rn_core::native_immediates::set_immediate(drain_destroy_ids);
+    }) > 0
 }
 
 /// `DestroyAsyncIdsCallback`: calls the `destroy` hook once per queued id.
@@ -1409,20 +1421,64 @@ fn queue_destroy_async_id(
 
 fn register_destroy_hook(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
 ) {
-    // `AsyncWrap::RegisterDestroyHook` ties a `destroy` hook to a *JavaScript
-    // object's* collection, which needs a weak handle plus the optional
-    // `destroyed` property bag. `v8::Weak`'s guaranteed finalizer runs with no
-    // scope, and the bag has to be read on the isolate thread before deciding,
-    // so a correct implementation needs a V8 callback context this layer does
-    // not have yet. Queuing the id unconditionally would emit a `destroy` for
-    // every promoted promise, which is worse than not emitting one.
+    // `AsyncWrap::RegisterDestroyHook` (`src/async_wrap.cc:252`):
     //
-    // Nothing on the TCP reset path needs it: a handle's destroy is driven by
-    // `AsyncReset` and `close`, not by collection. Declared in `DEFERRED`.
-    let _ = scope;
+    //     CHECK(args[0]->IsObject());
+    //     CHECK(args[1]->IsNumber());
+    //     CHECK(args.Length() == 2 || args[2]->IsObject());
+    //
+    // The arity check is `CHECK(args.Length() == 2 || args[2]->IsObject())`: a
+    // third argument that is not an object is a programming error rather than a
+    // bag to ignore.
+    if !args.get(0).is_object() || !args.get(1).is_number() {
+        throw_type_error(scope, "registerDestroyHook expects an object and a number");
+        return;
+    }
+    if args.length() != 2 && !args.get(2).is_object() {
+        throw_type_error(
+            scope,
+            "registerDestroyHook expects an object as its third argument",
+        );
+        return;
+    }
+    let Ok(target) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        throw_type_error(scope, "registerDestroyHook expects an object");
+        return;
+    };
+    let Some(async_id) = args.get(1).number_value(scope) else {
+        throw_type_error(scope, "registerDestroyHook expects a number");
+        return;
+    };
+    let bag = v8::Local::<v8::Object>::try_from(args.get(2)).ok();
+    destroy_hook::register(scope, target, async_id, bag);
+}
+
+/// Queues a check phase that reports collected resources.
+///
+/// Separate from [`emit_destroy`] because the collected registrations are in
+/// this crate's own table: `emit_destroy` refuses to queue when no `destroy`
+/// hook is enabled, and a resource that was registered before the last hook was
+/// disabled still has to have its registration forgotten.
+fn schedule_destroy_drain() {
+    rn_core::native_immediates::set_immediate(drain_collected_destroy_hooks);
+}
+
+/// Reports every [`destroy_hook::Collected`] waiting, then every queued id.
+///
+/// Node has two paths into `destroy`: the `destroy_async_id_list` that
+/// `emitDestroyScript` and `AsyncReset` push to, and `AsyncWrap::WeakCallback`,
+/// which calls `EmitDestroy` directly. Both end in the same queue, so both are
+/// drained here to keep one order rather than two.
+fn drain_collected_destroy_hooks(scope: &mut v8::PinScope<'_, '_>) {
+    for collected in destroy_hook::take_collected() {
+        if !collected.suppressed(scope) {
+            emit_destroy(collected.async_id());
+        }
+    }
+    drain_destroy_ids(scope);
 }
 
 fn set_callback_trampoline(

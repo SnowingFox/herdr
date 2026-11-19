@@ -23,8 +23,18 @@ fn rustnode() -> PathBuf {
 }
 
 fn run(script: &str) -> String {
+    run_with(&["--expose-internals"], script)
+}
+
+/// Runs a script that needs `--expose-gc` as well.
+///
+/// The three collection tests below are the only ones that do: `globalThis.gc`
+/// exists only when V8's own `--expose-gc` is forwarded, and a runtime that
+/// silently ignored the flag would fail them with a `TypeError` that says
+/// nothing about weak handles.
+fn run_with(flags: &[&str], script: &str) -> String {
     let output = Command::new(rustnode())
-        .arg("--expose-internals")
+        .args(flags)
         .arg("-e")
         .arg(script)
         .output()
@@ -423,4 +433,155 @@ fn queue_destroy_async_id_requires_a_number() {
         catch (error) {{ console.log(error.constructor.name); }}"
     ));
     assert_eq!(output, "TypeError");
+}
+
+/// A dropped, collected `AsyncResource` reports `destroy`.
+///
+/// This is the mechanism `test/parallel/test-async-hooks-destroy-on-gc.js`
+/// asserts, and it needs a garbage collection: `registerDestroyHook` installs a
+/// weak handle on the resource, so the hook can only fire once the object is
+/// gone. The `WeakRef` read back afterwards is the second half of the claim — a
+/// build that held the resource strongly would satisfy the collection assertion
+/// only by accident of when the collection happened.
+#[test]
+fn a_collected_async_resource_reports_destroy() {
+    let output = run_with(
+        &["--expose-internals", "--expose-gc"],
+        &format!(
+            "{PRELUDE}
+        const ah = require('async_hooks');
+        const seen = new Set();
+        ah.createHook({{ destroy(id) {{ seen.add(id); }} }}).enable();
+        let asyncId = null;
+        let ref = null;
+        {{
+          const res = new ah.AsyncResource('foobar');
+          asyncId = res.asyncId();
+          ref = new WeakRef(res);
+        }}
+        setImmediate(() => {{
+          globalThis.gc();
+          setImmediate(() => {{
+            console.log(JSON.stringify({{
+              destroyed: seen.has(asyncId),
+              collected: ref.deref() === undefined,
+            }}));
+          }});
+        }});"
+        ),
+    );
+    let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    assert_eq!(
+        value["collected"],
+        serde_json::json!(true),
+        "the resource must be collectable, or the destroy could never fire: {output}"
+    );
+    assert_eq!(
+        value["destroyed"],
+        serde_json::json!(true),
+        "a collected AsyncResource must report destroy: {output}"
+    );
+}
+
+/// A resource that is still referenced must not report `destroy`.
+///
+/// The other direction of the same weak handle: a registration that queued the
+/// id unconditionally would pass the test above and be wrong here.
+#[test]
+fn a_live_async_resource_does_not_report_destroy() {
+    let output = run_with(
+        &["--expose-internals", "--expose-gc"],
+        &format!(
+            "{PRELUDE}
+        const ah = require('async_hooks');
+        const seen = new Set();
+        ah.createHook({{ destroy(id) {{ seen.add(id); }} }}).enable();
+        const kept = new ah.AsyncResource('kept');
+        const asyncId = kept.asyncId();
+        setImmediate(() => {{
+          globalThis.gc();
+          setImmediate(() => {{
+            console.log(JSON.stringify({{
+              destroyed: seen.has(asyncId),
+              usable: kept.asyncId() === asyncId,
+            }}));
+          }});
+        }});"
+        ),
+    );
+    let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    assert_eq!(value["destroyed"], serde_json::json!(false), "{output}");
+    assert_eq!(value["usable"], serde_json::json!(true), "{output}");
+}
+
+/// `emitDestroy()` and collection report an id exactly once.
+///
+/// `lib/async_hooks.js` allocates `{ destroyed: false }` and passes it to
+/// `registerDestroyHook`; `emitDestroy()` sets the flag, and
+/// `AsyncWrap::WeakCallback` reads it to avoid a second report. Both halves are
+/// asserted here because either alone is satisfiable by doing nothing.
+#[test]
+fn a_manual_destroy_is_not_reported_again_on_collection() {
+    let output = run_with(
+        &["--expose-internals", "--expose-gc"],
+        &format!(
+            "{PRELUDE}
+        const ah = require('async_hooks');
+        const counts = new Map();
+        const hook = ah.createHook({{
+          destroy(id) {{ counts.set(id, (counts.get(id) || 0) + 1); }},
+        }}).enable();
+        const manual = new ah.AsyncResource('manual');
+        const manualId = manual.asyncId();
+        manual.emitDestroy();
+        const required = new ah.AsyncResource('required', {{
+          requireManualDestroy: true,
+        }});
+        const requiredId = required.asyncId();
+        setImmediate(() => {{
+          globalThis.gc();
+          setImmediate(() => {{
+            hook.disable();
+            console.log(JSON.stringify({{
+              manual: counts.get(manualId) || 0,
+              required: counts.get(requiredId) || 0,
+            }}));
+          }});
+        }});"
+        ),
+    );
+    let value: serde_json::Value = serde_json::from_str(&output).expect("valid JSON");
+    // One, from the explicit `emitDestroy()`; the collection sees the flag and
+    // stays quiet.
+    assert_eq!(value["manual"], serde_json::json!(1), "{output}");
+    // `requireManualDestroy` skips `registerDestroyHook` entirely, so collection
+    // reports nothing at all.
+    assert_eq!(value["required"], serde_json::json!(0), "{output}");
+}
+
+/// `registerDestroyHook` checks its arguments the way `CHECK` does.
+///
+/// Node's `CHECK(args[0]->IsObject())`, `CHECK(args[1]->IsNumber())` and
+/// `CHECK(args.Length() == 2 || args[2]->IsObject())` are aborts, not throws;
+/// this binding throws a `TypeError` instead, and the point of the test is that
+/// none of the three is silently accepted.
+#[test]
+fn register_destroy_hook_checks_its_arguments() {
+    let output = run(&format!(
+        "{PRELUDE}
+        const cases = [
+          () => aw.registerDestroyHook('not an object', 1),
+          () => aw.registerDestroyHook({{}}, 'not a number'),
+          () => aw.registerDestroyHook({{}}, 1, 'not an object'),
+          () => aw.registerDestroyHook({{}}, 1, {{}}),
+        ];
+        for (const call of cases) {{
+          try {{ call(); console.log('accepted'); }}
+          catch (error) {{ console.log(error.constructor.name); }}
+        }}"
+    ));
+    assert_eq!(
+        output, "TypeError\nTypeError\nTypeError\naccepted",
+        "only the three-argument object form may be accepted"
+    );
 }
