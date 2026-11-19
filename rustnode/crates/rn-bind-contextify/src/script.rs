@@ -867,34 +867,74 @@ fn run_script<'s>(
     _display_errors: bool,
     rv: &mut v8::ReturnValue<'s, v8::Value>,
 ) {
-    if timeout >= 0 {
-        return throw_error(
-            scope,
-            "runInContext: script timeouts need a V8 watchdog thread, which rustnode does not run",
-        );
-    }
+    // A non-negative timeout arms the watchdog, which terminates the isolate from
+    // another thread at the deadline. `-1` is `runInScript`'s "no timeout"; a
+    // `0` means the deadline has already passed, which Node treats the same way
+    // as any other expired timeout.
+    let watchdog =
+        (timeout >= 0).then(|| rn_core::watchdog::Watchdog::arm(scope.as_ref(), timeout as u64));
 
-    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
-    let scope = &mut try_catch.init();
-    let result = match context {
-        Some(context) => {
-            let mut context_scope = std::pin::pin!(v8::ContextScope::new(&mut **scope, context));
-            let scope: &mut v8::PinScope<'s, '_> = &mut context_scope;
-            script.bind_to_current_context(scope).run(scope)
-        }
-        None => {
-            let scope: &mut v8::PinScope<'s, '_> = scope;
-            script.bind_to_current_context(scope).run(scope)
-        }
-    };
-    match result {
-        Some(value) => rv.set(value),
-        None => {
-            if scope.has_caught() && !scope.has_terminated() {
-                scope.rethrow();
+    // The `TryCatch` and the run are inside an inner block so the `TryCatch` is
+    // dropped before the timeout is thrown. A `TryCatch` catches everything
+    // thrown while it is open, including an exception this function raises, so
+    // throwing inside it left the caller with `undefined` and no error at all —
+    // the loop was terminated and then reported as a successful run.
+    let (result, timed_out) = {
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let scope = &mut try_catch.init();
+        let result = match context {
+            Some(context) => {
+                let mut context_scope =
+                    std::pin::pin!(v8::ContextScope::new(&mut **scope, context));
+                let scope: &mut v8::PinScope<'s, '_> = &mut context_scope;
+                script.bind_to_current_context(scope).run(scope)
+            }
+            None => {
+                let scope: &mut v8::PinScope<'s, '_> = scope;
+                script.bind_to_current_context(scope).run(scope)
+            }
+        };
+        let timed_out = watchdog
+            .as_ref()
+            .is_some_and(rn_core::watchdog::Watchdog::fired);
+        if !timed_out {
+            match result {
+                Some(value) => rv.set(value),
+                None => {
+                    if scope.has_caught() && !scope.has_terminated() {
+                        scope.rethrow();
+                    }
+                }
             }
         }
+        (result, timed_out)
+    };
+    let _ = result;
+    drop(watchdog);
+    if timed_out {
+        // Cancelled first: an isolate left terminated cannot run again, so the
+        // caller's own `catch` block would never execute.
+        scope.cancel_terminate_execution();
+        let message = format!("Script execution timed out after {timeout}ms");
+        throw_coded(scope, "ERR_SCRIPT_EXECUTION_TIMEOUT", &message);
     }
+}
+
+/// Throws an `Error` carrying a `code`, the shape every `ERR_*` in Node has.
+fn throw_coded(scope: &mut v8::PinScope<'_, '_>, code: &str, message: &str) {
+    let Some(text) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    if let (Ok(object), Some(code_value)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, code),
+    ) {
+        if let Some(key) = v8::String::new(scope, "code") {
+            let _ = object.set(scope, key.into(), code_value.into());
+        }
+    }
+    scope.throw_exception(exception);
 }
 
 fn set(
