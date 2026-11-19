@@ -197,12 +197,14 @@ mod tests {
                 "ZlibContext",
             ),
             (
-                Backend::ZstdCompress(Box::new(crate::zstd::ZstdCompressStream::new())),
+                Backend::ZstdCompress(Box::new(crate::zstd::ZstdCompressStream::uninitialized())),
                 "ZstdStream",
                 "ZstdCompressContext",
             ),
             (
-                Backend::ZstdDecompress(Box::new(crate::zstd::ZstdDecompressStream::new())),
+                Backend::ZstdDecompress(Box::new(
+                    crate::zstd::ZstdDecompressStream::uninitialized(),
+                )),
                 "ZstdStream",
                 "ZstdDecompressContext",
             ),
@@ -213,5 +215,21 @@ mod tests {
             assert!(names.stream_size > 0);
             assert!(names.context_size > 0);
         }
+    }
+
+    /// Each backend reports its own class names, including the two Brotli
+    /// directions, which Node instantiates as separate templates.
+    #[test]
+    fn brotli_reports_the_direction_it_is() {
+        let encoder = Backend::Brotli(Box::new(crate::brotli::BrotliStream::encoder(&[])));
+        let decoder = Backend::Brotli(Box::new(crate::brotli::BrotliStream::decoder(&[])));
+        assert_eq!(names(&encoder).context, "BrotliEncoderContext");
+        assert_eq!(names(&decoder).context, "BrotliDecoderContext");
+        assert_eq!(names(&encoder).stream, names(&decoder).stream);
+        assert_ne!(
+            names(&encoder).stream_size,
+            names(&decoder).stream_size,
+            "the two instantiations are distinct classes with distinct sizes"
+        );
     }
 }

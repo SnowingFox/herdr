@@ -162,7 +162,10 @@ pub(crate) struct HandleState {
     /// cannot be used for this: it is dropped by the finalizer that frees this
     /// state, so describing a wrapper from it would be describing the object
     /// whose death cancelled it.
-    wrapper: v8::Weak<v8::Object>,
+    ///
+    /// `None` in a unit test that drives the backend without an isolate, where
+    /// there is no object to name.
+    wrapper: Option<v8::Weak<v8::Object>>,
 }
 
 /// A compression step that `write()` accepted but has not run yet.
@@ -182,6 +185,21 @@ struct DeferredStep {
 
 impl HandleState {
     fn new(backend: Backend, wrapper: v8::Weak<v8::Object>) -> Self {
+        Self::with_wrapper(backend, Some(wrapper))
+    }
+
+    /// A state with no wrapper, for a test that drives the backend only.
+    ///
+    /// The heap-snapshot walk needs a live `Weak` because the edge it adds names
+    /// the JavaScript object; a state built here has none, so
+    /// [`crate::retainers::describe`] reports nothing for it. That is the honest
+    /// answer for a unit test: there is no object to name.
+    #[cfg(test)]
+    fn without_wrapper(backend: Backend) -> Self {
+        Self::with_wrapper(backend, None)
+    }
+
+    fn with_wrapper(backend: Backend, wrapper: Option<v8::Weak<v8::Object>>) -> Self {
         Self {
             backend,
             weak: None,
@@ -459,7 +477,8 @@ fn install_state<'s>(
         let scope = &mut scope.init();
         let wrapper = state
             .wrapper
-            .to_local(scope)
+            .as_ref()
+            .and_then(|wrapper| wrapper.to_local(scope))
             .map(v8::Local::<v8::Value>::from);
         if let Some(node) = crate::retainers::describe(&state, wrapper) {
             rn_core::heap_retainers::add_node(graph, &node);
@@ -1441,7 +1460,7 @@ mod tests {
     use super::*;
 
     fn deflate_state() -> HandleState {
-        HandleState::new(Backend::Zlib(Box::new(ZlibStream::new(ZlibMode::Deflate))))
+        HandleState::without_wrapper(Backend::Zlib(Box::new(ZlibStream::new(ZlibMode::Deflate))))
     }
 
     #[test]
