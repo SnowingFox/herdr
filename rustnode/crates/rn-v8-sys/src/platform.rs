@@ -42,12 +42,27 @@
 //!
 //! `PostDelayedTask` carries a deadline; `Atomics.waitAsync` with a timeout posts
 //! its expiry this way. A delayed task must not run before its deadline, so
-//! [`drain`] promotes only the due ones and [`next_delayed_deadline_millis`] tells
-//! the loop how long it may sleep. Posting one also wakes the loop immediately,
-//! because the *deadline* is news even when the task is not due.
+//! [`drain`] promotes only the due ones and the deadline query answers how long
+//! the loop may sleep. Posting one also wakes the loop immediately, because the
+//! *deadline* is news even when the task is not due.
+//!
+//! The waking is not enough on its own: after the wake the loop has to sleep
+//! *until the deadline*, and libuv sizes its poll from its own timer heap, which
+//! does not contain this task. `rn-uv`'s `deadline` module is the other half — an
+//! unref'd libuv timer armed at this deadline on every iteration, so
+//! `uv__backend_timeout` accounts for it and libuv stays the only authority on
+//! how long the loop sleeps. A 300ms `Atomics.waitAsync` timeout next to a 1000ms
+//! interval settled at 905ms before that existed.
+//!
+//! [`remaining_until_isolate_millis`] is the form the loop uses, because the loop
+//! and the wake callback have no entered scope; [`next_delayed_deadline_millis`]
+//! is the same answer from a scope. Neither is a liveness answer: a pending
+//! delayed task does not keep a process alive, which is why the timer the loop
+//! arms is unref'd.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -85,6 +100,42 @@ fn queues() -> &'static Mutex<Queues> {
             delayed: Vec::new(),
         })
     })
+}
+
+/// How many delayed tasks exist anywhere, so the deadline query can answer
+/// "none" without taking the queue lock.
+///
+/// Read once per iteration by the revision cache below, and by
+/// [`remaining_until_isolate_millis`] before it takes the lock. A count of zero
+/// means the last completed mutation left the table empty; a push that races
+/// with a reader can still be missed, which is harmless because the push also
+/// wakes its isolate and the resulting drain writes the count again.
+static DELAYED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Bumped by every change to [`Queues::delayed`].
+///
+/// This is what lets the loop skip the deadline query on iterations where
+/// nothing about the delayed set changed. The count above answers "is there
+/// anything delayed", which is not the same question: V8 keeps a long-lived
+/// delayed task of its own in every process, so the count is non-zero for the
+/// whole run and a "nothing delayed" fast path would never be taken. A reader
+/// that remembers the revision it last acted on knows its decision is still
+/// current while this value is unchanged.
+///
+/// Relaxed ordering is enough. The pairing is "the reader saw revision R and
+/// acted on the table as it was at R"; a later mutation bumps the revision, so
+/// the next comparison fails and the reader recomputes. It cannot miss a change,
+/// because a missing change only means the old decision stands, which is true
+/// until the value moves.
+static DELAYED_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Marks the delayed set as changed, and keeps [`DELAYED_COUNT`] in step.
+///
+/// Called with [`queues`] held, so the two values cannot disagree with the table
+/// once the caller releases it.
+fn note_delayed_changed(guard: &Queues) {
+    DELAYED_COUNT.store(guard.delayed.len(), Ordering::Relaxed);
+    DELAYED_REVISION.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The instant deadlines are measured from, so an `f64` deadline means the same
@@ -174,6 +225,7 @@ fn post_delayed(isolate: usize, task: v8::Task, delay_seconds: f64) {
             isolate,
             task,
         });
+        note_delayed_changed(&guard);
     }
     wake(isolate);
 }
@@ -264,6 +316,7 @@ pub fn drain(scope: &v8::PinScope<'_, '_>) -> bool {
                 runnable.push(task);
             }
         }
+        let before = guard.delayed.len();
         let mut index = 0;
         while index < guard.delayed.len() {
             if guard.delayed[index].isolate == isolate && guard.delayed[index].deadline <= now {
@@ -271,6 +324,9 @@ pub fn drain(scope: &v8::PinScope<'_, '_>) -> bool {
             } else {
                 index += 1;
             }
+        }
+        if guard.delayed.len() != before {
+            note_delayed_changed(&guard);
         }
     }
 
@@ -281,24 +337,83 @@ pub fn drain(scope: &v8::PinScope<'_, '_>) -> bool {
     ran_any
 }
 
+/// Whether any isolate has a delayed task at all.
+///
+/// Answers the cheap half of the deadline query: no isolate delayed means the
+/// loop need not bound its sleep, and the caller can skip the table lock. Also
+/// `#[inline]` because its callers compare it once per loop iteration.
+#[inline]
+pub fn has_delayed_tasks() -> bool {
+    DELAYED_COUNT.load(Ordering::Relaxed) != 0
+}
+
+/// A token that changes whenever the delayed set does.
+///
+/// The loop caches the deadline it armed against the revision it read, so an
+/// iteration that changed nothing about the delayed set can skip the query
+/// entirely. Checking this is two inline loads with no lock; the query behind it
+/// takes the queue lock and scans the table, which is real work on a path that
+/// runs for every iteration of every program.
+#[inline]
+pub fn delayed_revision() -> u64 {
+    DELAYED_REVISION.load(Ordering::Relaxed)
+}
+
 /// How long until this isolate's next delayed task is due, in milliseconds.
 ///
 /// `None` when it has none. A pending delayed task does not keep a process alive
 /// on its own — Node exits with an `Atomics.waitAsync` timeout still pending — so
 /// this is for scheduling a sleep, never for liveness.
 pub fn next_delayed_deadline_millis(scope: &v8::PinScope<'_, '_>) -> Option<u64> {
-    let isolate = isolate_key(scope);
+    remaining_until(isolate_key(scope))
+}
+
+/// [`next_delayed_deadline_millis`] for a caller with no scope in hand.
+///
+/// The loop holds the isolate as the address V8 keys its queues by — the same
+/// value [`isolate_key`] derives — so the wake callback and the loop can ask this
+/// without an entered scope.
+pub fn remaining_until_isolate_millis(isolate: usize) -> Option<u64> {
+    if !has_delayed_tasks() {
+        return None;
+    }
+    remaining_until(isolate)
+}
+
+fn remaining_until(isolate: usize) -> Option<u64> {
     let guard = queues().lock().ok()?;
-    let earliest = guard
-        .delayed
-        .iter()
-        .filter(|entry| entry.isolate == isolate)
-        .map(|entry| entry.deadline)
+    earliest_remaining(
+        guard
+            .delayed
+            .iter()
+            .map(|entry| (entry.isolate, entry.deadline)),
+        isolate,
+        now_seconds(),
+    )
+}
+
+/// The delay from `now` until the earliest of `entries` that belongs to
+/// `isolate`, rounded up to whole milliseconds and clamped at zero.
+///
+/// Split out from [`remaining_until`] so it can be tested without a V8 task: a
+/// `v8::Task` cannot be constructed outside V8, and this is the part the loop's
+/// sleep depends on. The rules it encodes are all observable — another isolate's
+/// deadline must not shorten this one's sleep, a deadline already past must not
+/// report a negative delay, and a fractional millisecond must round up rather
+/// than down, because rounding down wakes libuv before the task is due.
+fn earliest_remaining(
+    entries: impl Iterator<Item = (usize, f64)>,
+    isolate: usize,
+    now: f64,
+) -> Option<u64> {
+    let earliest = entries
+        .filter(|(owner, _)| *owner == isolate)
+        .map(|(_, deadline)| deadline)
         .fold(f64::INFINITY, f64::min);
     if earliest.is_infinite() {
         return None;
     }
-    let remaining = earliest - now_seconds();
+    let remaining = earliest - now;
     Some(if remaining <= 0.0 {
         0
     } else {
@@ -314,6 +429,7 @@ pub fn forget_isolate(isolate: usize) {
     if let Ok(mut guard) = queues().lock() {
         guard.ready.remove(&isolate);
         guard.delayed.retain(|entry| entry.isolate != isolate);
+        note_delayed_changed(&guard);
     }
     unregister_waker(isolate);
 }
@@ -365,21 +481,85 @@ mod tests {
         wake(9999);
     }
 
-    /// The deadline query reports the delay, not the absolute deadline, because the
-    /// loop turns it into a poll timeout. An isolate with nothing queued must answer
-    /// `None` so the loop does not bound its sleep for no reason.
+    /// The deadline query answers the *delay*, not the absolute deadline,
+    /// because the loop turns it into a poll timeout. Each rule it encodes is a
+    /// way the loop's sleep can be wrong instead of merely late, so they are
+    /// asserted one at a time.
+    ///
+    /// The selection is tested through [`earliest_remaining`] rather than the
+    /// table: a `v8::Task` cannot be constructed outside V8, and the table only
+    /// feeds these entries to it.
     #[test]
-    fn delayed_deadlines_are_per_isolate() {
-        let key = 4244usize;
-        forget_isolate(key);
+    fn the_deadline_query_reports_the_scoped_isolates_earliest_delay() {
+        let me = 4244usize;
+        let other = 4245usize;
+        assert_eq!(
+            earliest_remaining(std::iter::empty(), me, 0.0),
+            None,
+            "nothing queued means no sleep bound"
+        );
+
+        // Deliberately out of order, and with another isolate's earlier deadline
+        // in the middle: an unsorted fold or an unfiltered one answers wrong.
+        let entries = [(me, 2.0), (other, 0.001), (me, 0.5)];
+        assert_eq!(
+            earliest_remaining(
+                entries.iter().map(|(owner, deadline)| (*owner, *deadline)),
+                me,
+                0.0
+            ),
+            Some(500),
+            "this isolate's earliest deadline is reported, not the minimum overall"
+        );
+        assert_eq!(
+            earliest_remaining(
+                entries.iter().map(|(owner, deadline)| (*owner, *deadline)),
+                other,
+                0.0
+            ),
+            Some(1),
+            "and each isolate gets its own answer"
+        );
+
+        // A deadline already past is "now", never a negative delay: libuv takes
+        // an unsigned millisecond timeout.
+        assert_eq!(
+            earliest_remaining(std::iter::once((me, 1.0)), me, 3.0),
+            Some(0)
+        );
+        // Rounded up, not down: arming 300ms for a 300.4ms deadline wakes the
+        // loop before the task is due, which costs a whole extra iteration.
+        assert_eq!(
+            earliest_remaining(std::iter::once((me, 1.3004)), me, 1.0),
+            Some(301)
+        );
+    }
+
+    /// The "is anything queued" counter and the revision are both derived from
+    /// the table, and the loop's fast path trusts them to agree with it: a
+    /// stale non-zero count would take the lock on every iteration forever, and
+    /// a revision that did not move after a real change would leave the loop
+    /// armed against a deadline that no longer exists.
+    ///
+    /// The transitions are driven by `forget_isolate` rather than by queueing a
+    /// task, because a `v8::Task` cannot be built outside V8. The queueing side
+    /// goes through the same `note_delayed_changed` this covers.
+    ///
+    /// The revision is process-wide and these tests run on parallel threads, so
+    /// the assertion is that it *moved*, not that it moved by one.
+    #[test]
+    fn forgetting_an_isolate_leaves_the_count_and_revision_matching_the_table() {
+        let before = delayed_revision();
+        forget_isolate(4246usize);
+        let queued = queues().lock().expect("not poisoned").delayed.len();
+        assert_eq!(
+            has_delayed_tasks(),
+            queued != 0,
+            "the count must report the table, not a second copy of it"
+        );
         assert!(
-            queues().lock().expect("not poisoned").delayed.is_empty()
-                || !queues()
-                    .lock()
-                    .expect("not poisoned")
-                    .delayed
-                    .iter()
-                    .any(|entry| entry.isolate == key)
+            delayed_revision() > before,
+            "and the teardown must have marked the delayed set as changed"
         );
     }
 }

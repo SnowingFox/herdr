@@ -31,6 +31,14 @@
 //!
 //! Latency, not just the eventual value. A test that waited for the promise
 //! without a bound would have passed on the broken build too, 5 seconds later.
+//!
+//! The third case is the same defect with no other thread in it: an
+//! `Atomics.waitAsync` **timeout** is a *delayed* platform task, so libuv never
+//! saw its deadline and slept past it. A 300ms timeout next to a 1000ms interval
+//! settled at 905ms — the right value at the interval's wake-up — and the fix is
+//! an unref'd libuv timer at that deadline, so the paired assertion that a
+//! pending timeout does not hold the process open is as load-bearing as the
+//! latency one.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -229,5 +237,80 @@ if (isMainThread) {
 "#,
         "settled: ok after",
         Duration::from_millis(1500),
+    );
+}
+
+/// `Atomics.waitAsync`'s timeout settles at its own deadline, not at the next
+/// unrelated wake-up.
+///
+/// The timeout is a V8 delayed task, so libuv never sees the deadline and sleeps
+/// past it: measured before the fix, a 300ms timeout next to a 1000ms interval
+/// settled at **905ms**, on the interval's wake-up. The value was right the whole
+/// time, which is why only the latency shows the defect.
+///
+/// The budget is well below the interval and well above the timeout, so a settle
+/// either belongs to the deadline or to the interval and there is no window in
+/// between where a slow machine could be mistaken for a correct one.
+#[test]
+fn a_wait_async_timeout_settles_at_its_own_deadline() {
+    expect_stdout_within(
+        "atomics-timeout-deadline",
+        r#"
+const sab = new SharedArrayBuffer(4);
+const ia = new Int32Array(sab);
+const started = Date.now();
+const r = Atomics.waitAsync(ia, 0, 0, 300);
+r.value.then((v) => {
+  console.log('settled:', v, 'after', Date.now() - started, 'ms');
+});
+const iv = setInterval(() => {}, 1000);
+setTimeout(() => { clearInterval(iv); }, 900);
+"#,
+        "settled: timed-out after",
+        Duration::from_millis(700),
+    );
+}
+
+/// A pending `Atomics.waitAsync` timeout does not keep the process alive.
+///
+/// This is the other half of the deadline work, and the half a ref'd timer would
+/// break: `node -e 'Atomics.waitAsync(...)'` exits immediately, and the promise
+/// never settles. Arming the deadline on a ref'd libuv handle would make the
+/// process wait out its longest timeout instead, which is why the handle is
+/// unref'd and why this is asserted rather than assumed.
+#[test]
+fn a_pending_wait_async_timeout_does_not_hold_the_process_open() {
+    let script = r#"
+const ia = new Int32Array(new SharedArrayBuffer(4));
+const r = Atomics.waitAsync(ia, 0, 0, 2000);
+r.value.then(() => console.log('settled'));
+console.log('done');
+"#;
+    let path = std::env::temp_dir().join("rustnode-posted-task-atomics-unref.js");
+    std::fs::write(&path, script)
+        .unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+    let actual = run_script(
+        env!("CARGO_BIN_EXE_rustnode"),
+        &path,
+        Duration::from_secs(20),
+    );
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        actual.success,
+        "the process did not exit with only a pending waitAsync timeout left \
+         ({} ms elapsed); stdout: {:?}; stderr: {:?}",
+        actual.elapsed.as_millis(),
+        actual.stdout,
+        actual.stderr
+    );
+    assert_eq!(
+        actual.stdout, "done",
+        "a pending waitAsync timeout settled without anything keeping the loop alive"
+    );
+    assert!(
+        actual.elapsed < Duration::from_secs(2),
+        "the pending timeout held the process open for {} ms",
+        actual.elapsed.as_millis()
     );
 }

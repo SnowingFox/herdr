@@ -541,16 +541,21 @@ pub unsafe fn query_objects<'s>(
     Some(unsafe { std::mem::transmute::<*mut v8::Array, v8::Local<'s, v8::Array>>(array) })
 }
 
-thread_local! {
-    /// Whether the platform installed into V8 is ours.
-    ///
-    /// A `CustomPlatform` diverts every foreground post to [`platform`]'s queue, so
-    /// `pump_message_loop` would then find an empty default queue and report that
-    /// nothing ran. The flag picks the right drain without a global lookup, and it
-    /// is per thread because "did *this* thread install the platform" is the
-    /// question — installation happens once, before any isolate exists.
-    static CUSTOM_PLATFORM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+/// Whether the platform installed into V8 is ours.
+///
+/// A `CustomPlatform` diverts every foreground post to [`platform`]'s queue, so
+/// `pump_message_loop` would then find an empty default queue and report that
+/// nothing ran. The flag picks the right drain without a global lookup.
+///
+/// It is process-wide rather than a thread-local, and that matters for worker
+/// threads: `V8::initialize_platform` is a process-wide call made once by the
+/// main thread before any isolate exists, so a worker's isolate also posts to
+/// [`platform`]'s queue — but a thread-local flag read on the worker's thread
+/// would still be `false` there, and the worker would ask V8's default runner for
+/// work that is in our queue instead. A worker's `Atomics.waitAsync` timeout never
+/// ran because of exactly that, and the deadline handle added for it then spun at
+/// zero delay because the task it was waiting for was never drained.
+static CUSTOM_PLATFORM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Records that [`platform::new_platform`] produced the installed platform.
 ///
@@ -558,7 +563,7 @@ thread_local! {
 /// `V8::initialize_platform`. Without this the drain would keep asking V8's default
 /// runner for work and never see a task posted through `PlatformImpl`.
 pub fn use_custom_platform() {
-    CUSTOM_PLATFORM.with(|slot| slot.set(true));
+    CUSTOM_PLATFORM.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Runs the tasks V8 has queued for this isolate.
@@ -584,7 +589,7 @@ pub fn pump_platform_tasks(scope: &v8::PinScope<'_, '_>) -> bool {
     /// Tasks one call will run before returning to the loop.
     const DRAIN_TASK_BUDGET: usize = 64;
 
-    if CUSTOM_PLATFORM.with(|slot| slot.get()) {
+    if CUSTOM_PLATFORM.load(std::sync::atomic::Ordering::Acquire) {
         return platform::drain(scope);
     }
 
