@@ -369,12 +369,19 @@ pub fn handle_from_ptr(pointer: *mut c_void) -> *mut uv::uv_handle_t {
 /// Node's `TCPWrap::TransferForMessaging` asks for this before it duplicates the
 /// socket. `None` means libuv has no descriptor to report, which is the ordinary
 /// answer for a handle that has not been opened yet.
-pub fn fileno(handle: *mut uv::uv_handle_t) -> Option<uv::uv_os_fd_t> {
+///
+/// # Safety
+///
+/// `handle` must point at a live libuv handle that has not been closed. A
+/// dangling pointer is read through `uv_fileno` and is not detectable here; the
+/// handle's owner is what guarantees it.
+pub unsafe fn fileno(handle: *mut uv::uv_handle_t) -> Option<uv::uv_os_fd_t> {
     if handle.is_null() {
         return None;
     }
     let mut descriptor: uv::uv_os_fd_t = -1;
-    // SAFETY: the caller passed a live handle, and `uv_fileno` only reads it.
+    // SAFETY: the caller's contract is that `handle` is live, and `uv_fileno`
+    // only reads it.
     let status = unsafe { uv::uv_fileno(handle, &mut descriptor) };
     (status == 0 && descriptor >= 0).then_some(descriptor)
 }

@@ -63,7 +63,9 @@ pub fn transfer_for_messaging<'s>(
     }
     let prepared = handle::with_handle(object, |handle| {
         let stream = rn_uv::handle::as_handle(handle.stream());
-        let descriptor = rn_uv::handle_transfer::fileno(stream)?;
+        // SAFETY: `handle.stream()` is the live stream this wrapper owns, and the
+        // wrapper has not been closed here.
+        let descriptor = unsafe { rn_uv::handle_transfer::fileno(stream) }?;
         let duplicate = rn_uv::handle_transfer::duplicate_descriptor(descriptor)?;
         // `uv_read_stop` before the sender lets go. `lib/net.js` starts reading on
         // every accepted socket, so the source almost always has a read in flight;
