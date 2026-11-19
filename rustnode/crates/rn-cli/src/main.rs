@@ -396,6 +396,13 @@ fn main() {
     // `getOptionValue`, which is the same source `InitializeDiagnostics` uses
     // (`EnvironmentOptions`).
     rn_realm::trace_promises::arm(options.trace_promises, &mut isolate);
+    // Node registers `Environment::BuildEmbedderGraph` at isolate creation
+    // (`src/node.cc:240`), which is what puts `Node / MessagePort` and the other
+    // native nodes into every snapshot. Without a callback V8 adds no embedder
+    // nodes at all, so `test/pummel/test-worker-take-heapsnapshot.js` would find
+    // none of the ones it looks for. This is the same registration, walking the
+    // retainers rustnode actually has.
+    install_embedder_graph(&mut isolate);
     // `V8Inspector::create` and V8's client callbacks need `&mut Isolate`, which a
     // binding cannot obtain soundly, so the inspector records the isolate here the
     // same way `heap_utils` does for heap snapshots.
@@ -1137,6 +1144,37 @@ fn main() {
 /// and terminates, and nothing observable to JavaScript runs in between. The cost
 /// is bounded by one in-flight job, not by the queue: see that module's notes on
 /// why this is a drain rather than a wait.
+/// Registers this isolate's embedder-graph walk.
+///
+/// Node does the same at isolate creation: `src/node.cc:240` registers
+/// `Environment::BuildEmbedderGraph`, and its `MemoryTracker` walk is what puts
+/// `Node / MessagePort` and the other native nodes into every heap snapshot.
+/// V8 adds no embedder nodes without a callback, so a snapshot taken here would
+/// otherwise contain none of them and `test/pummel/test-worker-take-heapsnapshot.js`
+/// would find nothing to assert on.
+///
+/// The walk itself lives with the retainers it describes:
+/// [`rn_bind_messaging::add_embedder_nodes`] reports the live message ports. It
+/// lives there rather than in `rn-bind-heap-utils` because that crate is what
+/// owns the ports, and a registration point here avoids making either crate
+/// depend on the other.
+fn install_embedder_graph(isolate: &mut v8::Isolate) {
+    let registered = unsafe {
+        rn_v8_sys::register_embedder_graph(
+            isolate,
+            rn_v8_sys::EmbedderGraphCallback {
+                build: Box::new(|graph| rn_bind_messaging::add_embedder_nodes(&graph)),
+            },
+        )
+    };
+    if !registered {
+        // A process without a heap profiler cannot take a snapshot at all, so
+        // every consumer of these nodes fails for a reason it can report itself.
+        // Logging keeps that from looking like "the walk found nothing".
+        tracing::debug!("no heap profiler; heap snapshots will have no embedder nodes");
+    }
+}
+
 fn terminate(code: i32) -> ! {
     rn_core::profile::mark("loop finished");
     rn_core::profile::report();

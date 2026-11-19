@@ -332,6 +332,31 @@ pub fn live_port_count() -> usize {
     })
 }
 
+/// The ports this thread still has, for the heap snapshot's embedder graph.
+///
+/// Node's `Environment::BuildEmbedderGraph` reaches every live `MessagePort`
+/// through its `MemoryRetainer` tree, so a snapshot contains one
+/// `Node / MessagePort` per port with a `data` edge to its `Node /
+/// MessagePortData`. This registry is the same set: [`PortInner::new`] records
+/// each port here and pruning drops the ones whose last reference is gone.
+///
+/// Returns `(port id, its queue)` pairs. The queue is Node's `data_`, which is
+/// what the `data` edge points at.
+#[must_use]
+pub fn live_ports() -> Vec<(u64, Arc<MessagePortData>)> {
+    LOCAL_PORTS.with(|ports| {
+        let mut ports = ports.borrow_mut();
+        ports.retain(|(_, port)| port.strong_count() > 0);
+        ports
+            .iter()
+            .filter_map(|(id, port)| {
+                let port = port.upgrade()?;
+                Some((*id, Arc::clone(&port.data)))
+            })
+            .collect()
+    })
+}
+
 /// Locks `mutex`, recovering a poisoned guard.
 ///
 /// A `Message` may now cross a thread (`TransferData: Send + Sync`), so this state
