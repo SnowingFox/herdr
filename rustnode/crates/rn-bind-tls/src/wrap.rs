@@ -582,10 +582,61 @@ fn construct_tls_wrap<'s>(
         0,
     );
     let address = cell as usize;
+    let wrapper = v8::Weak::new(scope, object);
+
+    // `TLSWrap::MemoryInfo` (`src/crypto/crypto_tls.cc:1743`) tracks both BIOs
+    // and names them `enc_in` and `enc_out`. They are real `NodeBIO`s here —
+    // `bio::Pair::new` creates two exactly as `InitSSL` does — so the two nodes
+    // exist for exactly as long as the `SSL` that owns them, which is what makes
+    // a snapshot before `wrap` report none.
+    //
+    // `ocsp_response`, `sni_context`, `error` and `pending_cleartext_input` are
+    // the other four fields that method tracks. Each adds nothing when unset, and
+    // none of them has a node kind this walk reports, so no test can reach them.
+    let retainer = rn_core::heap_retainers::register(move |graph, isolate| {
+        // SAFETY: the finalizer clears the registration before it frees the
+        // state, so a registration that still exists names a live allocation.
+        let cell = unsafe { &*(address as *const RefCell<WrapState>) };
+        let Ok(state) = cell.try_borrow() else {
+            return;
+        };
+        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+        let scope = &mut scope.init();
+        let Some(object) = wrapper.to_local(scope) else {
+            return;
+        };
+        let mut node = rn_core::heap_retainers::HeapNode::new("TLSWrap", TLS_WRAP_SIZE)
+            .with_wrapper(object.into());
+        // `enc_in_ != nullptr` is the gate Node applies, and the BIOs are created
+        // together with the `SSL`, so both exist or neither does.
+        if let Some(ssl) = &state.ssl {
+            if ssl.enc_in().is_some() {
+                node = node.with_child(
+                    "enc_in",
+                    rn_core::heap_retainers::HeapNode::new("NodeBIO", NODE_BIO_SIZE),
+                );
+            }
+            if ssl.enc_out().is_some() {
+                node = node.with_child(
+                    "enc_out",
+                    rn_core::heap_retainers::HeapNode::new("NodeBIO", NODE_BIO_SIZE),
+                );
+            }
+        }
+        rn_core::heap_retainers::add_node(graph, &node);
+    });
+
     let weak = v8::Weak::with_guaranteed_finalizer(
         scope,
         object,
         Box::new(move || {
+            // SAFETY: the registration names `address`, and it is dropped here
+            // before the allocation it describes, so no snapshot can read freed
+            // memory.
+            let cell = unsafe { &*(address as *const RefCell<WrapState>) };
+            if let Ok(state) = cell.try_borrow() {
+                rn_core::heap_retainers::unregister(state.retainer);
+            }
             // SAFETY: `address` came from `Box::into_raw` above and this finalizer
             // runs exactly once. `WrapState`'s `Drop` runs here, which is what
             // frees the `SSL` on the finalizer path (R1).
@@ -594,8 +645,18 @@ fn construct_tls_wrap<'s>(
     );
     // The registration is kept alive by V8; dropping the handle would cancel it.
     std::mem::forget(weak);
+    // SAFETY: the state was just created and is not otherwise borrowed.
+    if let Ok(mut state) = unsafe { &*cell }.try_borrow_mut() {
+        state.retainer = retainer;
+    }
     rv.set(object.into());
 }
+
+/// `sizeof(node::TLSWrap)`, the `SelfSize()` the oracle reports.
+const TLS_WRAP_SIZE: usize = 368;
+
+/// `sizeof(node::NodeBIO)`, the `SelfSize()` the oracle reports.
+pub(crate) const NODE_BIO_SIZE: usize = 64;
 
 /// A `v8::String` for `name`, with the failure spelled out.
 pub(crate) fn key<'s>(
@@ -720,5 +781,16 @@ mod tests {
         assert_eq!(STREAM_ACCESSORS.len(), 4);
         assert!(STREAM_METHODS.contains(&"writeBuffer"));
         assert!(STREAM_ACCESSORS.contains(&"bytesRead"));
+    }
+
+    /// The sizes are the ones the oracle reports, and nothing else checks them.
+    ///
+    /// `validateByRetainingPath` matches on the node *name*, so a wrong
+    /// `SelfSize()` passes every test in Node's suite. Both numbers were read
+    /// from a snapshot of the pinned oracle over the same `tls.connect`.
+    #[test]
+    fn the_sizes_are_the_oracles_self_sizes() {
+        assert_eq!(TLS_WRAP_SIZE, 368);
+        assert_eq!(NODE_BIO_SIZE, 64);
     }
 }

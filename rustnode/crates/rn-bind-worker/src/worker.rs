@@ -53,7 +53,25 @@ struct WorkerSlot {
     /// Dropping a `Weak` cancels its finalizer, so this has to sit somewhere the
     /// object owns.
     _weak: RefCell<Option<v8::Weak<v8::Object>>>,
+    /// The object, weakly, so the heap snapshot can name it.
+    ///
+    /// `Worker::MemoryInfo` is the inherited `AsyncWrap` implementation, which
+    /// tracks nothing (`src/async_wrap.h:229` names the class and no field), so
+    /// `Node / Worker` has exactly one edge: the `native_to_javascript` pair
+    /// `MemoryTracker::AddNode` adds around `WrappedObject()`. Weak for the same
+    /// reason `_weak` is: a strong handle here would keep the object, and
+    /// therefore this finalizer, alive forever.
+    object: v8::Weak<v8::Object>,
+    /// This worker's registration in the embedder graph.
+    retainer: rn_core::heap_retainers::RetainerId,
 }
+
+/// `sizeof(node::Worker)`, the `SelfSize()` the oracle reports.
+///
+/// Pinned by `the_worker_size_is_the_oracles_self_size` for the reason
+/// `MessagePort`'s is: `validateByRetainingPath` matches on the node *name*, so a
+/// wrong size passes the test and is still a wrong answer.
+const WORKER_SIZE: usize = 448;
 
 /// `worker.messagePort`, which `lib/internal/worker.js` reads as
 /// `this[kHandle].messagePort`.
@@ -255,17 +273,51 @@ fn worker_constructor(
     let slot = Box::into_raw(Box::new(WorkerSlot {
         handle: Rc::clone(&handle),
         _weak: RefCell::new(None),
+        object: v8::Weak::new(scope, this),
+        retainer: rn_core::heap_retainers::RetainerId::none(),
     }));
     // SAFETY: `slot` came from `Box::into_raw` and is freed exactly once, by the
     // guaranteed finalizer installed below.
     let external = v8::External::new(scope, slot.cast());
     this.set_internal_field(HANDLE_FIELD as usize, external.into());
 
+    // The snapshot reaches this worker through the registration rather than a
+    // `BaseObject` tree, and resolves the weak object inside the walk's own
+    // scope. `Node / Worker` reports one node and the wrapper edge pair, which is
+    // all the inherited `AsyncWrap::MemoryInfo` tracks.
+    //
+    // SAFETY: `slot` came from `Box::into_raw` just above and is not freed until
+    // the finalizer installed below runs, which cannot happen while the isolate
+    // is running this callback.
     let address = slot as usize;
+    let retainer = rn_core::heap_retainers::register(move |graph, isolate| {
+        // SAFETY: the finalizer clears the registration before it frees the
+        // slot, so a registration that still exists names a live allocation.
+        let slot = unsafe { &*(address as *const WorkerSlot) };
+        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+        let scope = &mut scope.init();
+        let Some(object) = slot.object.to_local(scope) else {
+            // The object has been collected; the slot is waiting for its
+            // finalizer, and reporting a worker nothing holds would be wrong.
+            return;
+        };
+        let node = rn_core::heap_retainers::HeapNode::new("Worker", WORKER_SIZE)
+            .with_wrapper(object.into());
+        rn_core::heap_retainers::add_node(graph, &node);
+    });
+    // SAFETY: `slot` is live and exclusively reachable through this local, which
+    // is why a mutable reference is sound here and nowhere else.
+    unsafe { &mut *slot }.retainer = retainer;
+
     let weak = v8::Weak::with_guaranteed_finalizer(
         scope,
         this,
         Box::new(move || {
+            // The registration outlives the slot it describes unless it is
+            // dropped first, and a stale one would read freed memory.
+            // SAFETY: the finalizer runs exactly once for this allocation.
+            let slot = unsafe { &*(address as *const WorkerSlot) };
+            rn_core::heap_retainers::unregister(slot.retainer);
             // SAFETY: as above; nothing else frees this allocation. Dropping a
             // still-running handle detaches its thread rather than blocking,
             // which is what keeps the finalizer safe to run from a GC.
@@ -692,4 +744,20 @@ fn throw_worker_init_failed(scope: &mut v8::PinScope<'_, '_>, reason: &str) {
         let _ = object.set(scope, key.into(), value.into());
     }
     scope.throw_exception(exception);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The size is the one the oracle reports, and nothing else checks it.
+    ///
+    /// `validateByRetainingPath` matches on the node *name*, so a wrong
+    /// `SelfSize()` passes every test in Node's suite. Node's `Worker` reports
+    /// `sizeof(node::Worker)` under `SET_SELF_SIZE`, which is 448 on the pinned
+    /// build; this pin is what keeps a typo from being invisible.
+    #[test]
+    fn the_worker_size_is_the_oracles_self_size() {
+        assert_eq!(WORKER_SIZE, 448);
+    }
 }

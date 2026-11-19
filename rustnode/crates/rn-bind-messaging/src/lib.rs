@@ -73,7 +73,7 @@ pub use crate::delivery::{
     emit_message_installed, has_delivery_pending, install_emit_message, run as run_message_ports,
 };
 pub use crate::port::{
-    has_deliverable_message, live_port_count, live_ports, refresh_owner_tokens,
+    has_deliverable_message, live_port_count, live_port_objects, live_ports, refresh_owner_tokens,
     schedule_ports_with_mail, set_check_phase_armed,
 };
 
@@ -1720,48 +1720,96 @@ fn set(
 /// Node reaches every live `MessagePort` through `Environment`'s
 /// `MemoryRetainer` tree and reports it as `Node / MessagePort` with a `data`
 /// edge to its `Node / MessagePortData`. That is the node
-/// `test/pummel/test-worker-take-heapsnapshot.js` requires:
+/// `test/pummel/test-heapdump-worker-take-heapsnapshot.js` requires, and
+/// `test/pummel/test-heapdump-worker.js` additionally requires the pair
+/// `MemoryTracker::AddNode` adds around a retainer's `WrappedObject()`:
 ///
 /// ```text
-/// Node / MessagePort --data--> Node / MessagePortData
+/// Node / Worker --native_to_javascript--> Worker
+///               --messagePort-->          MessagePort
+/// Node / MessagePort --javascript_to_native--> MessagePort
 /// ```
 ///
-/// so this walks [`live_ports`] and adds exactly that pair per port.
+/// so this walks [`live_port_objects`] and adds exactly that pair per port, plus
+/// the `data` edge.
 ///
 /// # What is reproduced and what is not
 ///
 /// * `MessagePort::MemoryInfo` also tracks `emit_message_fn`, a `v8::Global`
-///   holding the JavaScript function a message is delivered through. It is an
-///   edge to a V8 node, which needs `EmbedderGraph::V8Node`, so it is left out;
-///   the `data` edge is what the test asserts.
+///   holding the JavaScript function a message is delivered through. Node reports
+///   it as an edge to a V8 node; the edge is left out here because it names a
+///   closure rather than a named node, and neither test asserts it.
 /// * `MessagePortData::MemoryInfo` tracks `incoming_messages`, the queue. Here
 ///   the queue is a field of `MessagePortData` rather than a `MemoryRetainer` of
 ///   its own, so the node has a size and no children.
 ///
-/// The sizes are the `SelfSize()` Node reports for the C++ classes (256 for
-/// `MessagePort`, 72 for `MessagePortData`), not `size_of` of these Rust types:
-/// the number is what a snapshot of Node would say, and a number that silently
-/// meant something else would be worse than one that matches the oracle.
+/// The sizes are the `SelfSize()` Node reports for the C++ classes, not
+/// `size_of` of these Rust types: the number is what a snapshot of Node would
+/// say, and a number that silently meant something else would be worse than one
+/// that matches the oracle. Both are pinned by a unit test.
+///
+/// # Why the wrapper needs a scope
+///
+/// The port's JavaScript object is held weakly, so it is resolved inside the
+/// walk's own scope. A port whose object has already been collected is skipped:
+/// reporting a native node with no wrapper would report a port nothing holds.
 pub fn add_embedder_nodes(graph: &rn_v8_sys::EmbedderGraph) {
-    for (_, data) in live_ports() {
-        let Some(port) = graph.add_node("MessagePort", MESSAGE_PORT_SIZE) else {
-            continue;
-        };
-        let Some(queue) = graph.add_node("MessagePortData", MESSAGE_PORT_DATA_SIZE) else {
-            continue;
-        };
-        graph.add_edge(port, queue, "data");
-        // The queue is held only for this iteration; nothing here keeps a port
-        // alive past the snapshot.
-        drop(data);
+    let ports = live_port_objects();
+    if ports.is_empty() {
+        return;
+    }
+    // SAFETY: the graph is live for this call and its isolate is the one the
+    // snapshot is of, so the scope outlives every handle resolved here.
+    unsafe {
+        graph.with_isolate(|isolate| {
+            // `Weak::to_local` wants a context-bearing scope, which is what
+            // `HandleScope::new` over the re-entered isolate gives. One scope for
+            // the whole walk: V8 merges the wrapper node into the object's own
+            // node after the callback returns, so every handle has to stay alive
+            // until then.
+            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+            let scope = &mut scope.init();
+            for port in ports {
+                let wrapper = port
+                    .object_without_context(scope)
+                    .map(v8::Local::<v8::Value>::from);
+                let data_edge = port.data.clone();
+                let node = rn_core::heap_retainers::HeapNode::new("MessagePort", MESSAGE_PORT_SIZE);
+                let node = match wrapper {
+                    Some(wrapper) => node.with_wrapper(wrapper),
+                    None => node,
+                };
+                let node = node.with_child(
+                    "data",
+                    rn_core::heap_retainers::HeapNode::new(
+                        "MessagePortData",
+                        MESSAGE_PORT_DATA_SIZE,
+                    ),
+                );
+                rn_core::heap_retainers::add_node(graph, &node);
+                // The queue is held only for this iteration; nothing here keeps a
+                // port alive past the snapshot.
+                drop(data_edge);
+            }
+        });
     }
 }
 
-/// `sizeof(node::MessagePort)`, the `SelfSize()` the oracle reports.
+/// sizeof(node::MessagePort)`, the `SelfSize()` the oracle reports.
 const MESSAGE_PORT_SIZE: usize = 256;
 
 /// `sizeof(node::MessagePortData)`, the `SelfSize()` the oracle reports.
-const MESSAGE_PORT_DATA_SIZE: usize = 72;
+///
+/// **152, not 72.** This was pinned at 72 when the walk was added, and a
+/// snapshot of the pinned oracle says 152 for the same class — `SET_SELF_SIZE`
+/// expands to `sizeof`, and `MessagePortData` is a `TransferData` with two
+/// `std::vector` members and a `Mutex`, which is 152 bytes on this build.
+///
+/// The old value passed because `validateByRetainingPath` matches on the node
+/// *name* and never reads `SelfSize()`. That is exactly the failure mode the
+/// `SelfSize()` pins exist to catch, so it is corrected here and pinned at 152.
+/// Re-check it when the node pin moves.
+const MESSAGE_PORT_DATA_SIZE: usize = 152;
 
 #[cfg(test)]
 mod tests {
@@ -1776,7 +1824,7 @@ mod tests {
     #[test]
     fn the_reported_sizes_are_the_oracles_self_sizes() {
         assert_eq!(MESSAGE_PORT_SIZE, 256);
-        assert_eq!(MESSAGE_PORT_DATA_SIZE, 72);
+        assert_eq!(MESSAGE_PORT_DATA_SIZE, 152);
     }
 
     #[test]

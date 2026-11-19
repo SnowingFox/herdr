@@ -34,6 +34,18 @@
 // * `BuildEmbedderGraphCallback` is `void (*)(Isolate*, EmbedderGraph*, void*)`
 //   (`v8-profiler.h:1025`), and `AddBuildEmbedderGraphCallback` takes it plus a
 //   `void*` (`:1274`).
+// * `EmbedderGraph::V8Node(Local<Value>)` is declared pure virtual and
+//   `V8Node(Local<Data>)` is not, in that order, both at `v8-profiler.h:869`
+//   onwards. `rn_v8_sys__embedder_graph_v8_node` calls the `Value` overload,
+//   which `v8::internal::EmbedderGraphImpl` implements by forwarding to the
+//   `Data` one (`heap-snapshot-generator.cc:3524`). Both are scope-free: the
+//   implementation only reads the handle (`Utils::OpenDirectHandle`) and
+//   appends an owned `V8NodeImpl`.
+// * `v8::Local<T>` is one pointer to a handle *slot* under this build (no
+//   `V8_ENABLE_DIRECT_HANDLE`), so `*local` -- `operator*`, i.e. `value()` --
+//   is the slot address, which is what `AddEdge` needs as an opaque handle.
+//   The shim's whole `void*` handle convention rests on that; see the Rust
+//   side's `EmbedderNode`.
 //
 // The registration pair must stay exact: `RemoveBuildEmbedderGraphCallback`
 // matches on the function pointer *and* its data, so both are held in one
@@ -86,6 +98,14 @@ class Local {
  public:
   Local() : value_(nullptr) {}
   explicit Local(T* value) : value_(value) {}
+  /// The handle slot, which is what `*local` means under this build: no
+  /// `V8_ENABLE_DIRECT_HANDLE`, so a `Local<T>` is a pointer to a slot and
+  /// `operator*` yields that slot rather than the object. Named here so the
+  /// null test below reads as "this handle is empty" rather than as "the object
+  /// is null".
+  T* Slot() const { return value_; }
+  T* operator*() const { return value_; }
+  T* operator->() const { return value_; }
 
  private:
   T* value_;
@@ -223,6 +243,34 @@ extern "C" void rn_v8_sys__embedder_graph_add_edge(void* graph, void* from,
   static_cast<v8::EmbedderGraph*>(graph)->AddEdge(
       static_cast<v8::EmbedderGraph::Node*>(from),
       static_cast<v8::EmbedderGraph::Node*>(to), name);
+}
+
+/// Returns the graph node for one V8 value, creating it if needed.
+///
+/// Node's `MemoryTracker::AddNode` calls this for a retainer's wrapper object and
+/// then adds the `native_to_javascript` / `javascript_to_native` pair around it,
+/// which is what makes `Node / ZlibStream --native_to_javascript--> Zlib` exist
+/// in a snapshot. Without it a walk cannot name the JavaScript side of a retainer
+/// at all, so every test that asserts that edge would be unreachable.
+///
+/// `value` is a `v8::Local<v8::Value>` in Rust's layout: one pointer to a handle
+/// slot. Passing null, or a slot holding null, returns null and the caller skips
+/// the nodes rather than adding an edge to nothing.
+///
+/// Scope-free by construction: `EmbedderGraphImpl::V8Node` only reads the handle
+/// and allocates a node, so this is callable from the build callback, which V8
+/// runs with no scope of its own. See the header comment.
+extern "C" void* rn_v8_sys__embedder_graph_v8_node(void* graph,
+                                                  const void* value) {
+  if (graph == nullptr || value == nullptr) {
+    return nullptr;
+  }
+  v8::Local<v8::Value> local =
+      *reinterpret_cast<const v8::Local<v8::Value>*>(&value);
+  if (local.Slot() == nullptr) {
+    return nullptr;
+  }
+  return static_cast<v8::EmbedderGraph*>(graph)->V8Node(local);
 }
 
 /// Registers `callback` to add embedder nodes to every snapshot of `isolate`.

@@ -535,6 +535,25 @@ impl ZstdCompressStream {
         }
     }
 
+    /// Bytes this context's allocation currently holds.
+    ///
+    /// `ZSTD_sizeof_CCtx` reports the context plus every workspace it has
+    /// allocated, which is the same quantity `node_zlib.cc` accumulates through
+    /// its custom `zalloc` for a zstd context
+    /// (`src/node_zlib.cc:1803`,`:1871`). Node's total and this one differ in
+    /// bytes because the counters are attached at different points, but both are
+    /// the live allocation of the live context, which is what the snapshot
+    /// reports and what `test/pummel/test-heapdump-zstd.js` requires to exist at
+    /// all.
+    pub fn allocated_bytes(&self) -> usize {
+        if self.context.is_null() {
+            return 0;
+        }
+        // SAFETY: `context` is a live `ZSTD_CCtx` this stream owns, and
+        // `ZSTD_sizeof_CCtx` only reads it.
+        unsafe { z::ZSTD_sizeof_CCtx(self.context) }
+    }
+
     pub fn error_info(&self) -> Option<&ZstdError> {
         self.error.as_ref()
     }
@@ -813,6 +832,17 @@ impl ZstdDecompressStream {
             unsafe { z::ZSTD_freeDCtx(self.context) };
             self.context = std::ptr::null_mut();
         }
+    }
+
+    /// Bytes this context's allocation currently holds; see
+    /// [`ZstdCompressStream::allocated_bytes`].
+    pub fn allocated_bytes(&self) -> usize {
+        if self.context.is_null() {
+            return 0;
+        }
+        // SAFETY: `context` is a live `ZSTD_DCtx` this stream owns, and
+        // `ZSTD_sizeof_DCtx` only reads it.
+        unsafe { z::ZSTD_sizeof_DCtx(self.context) }
     }
 
     pub fn error_info(&self) -> Option<&ZstdError> {

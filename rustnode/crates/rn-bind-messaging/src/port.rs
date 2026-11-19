@@ -344,15 +344,29 @@ pub fn live_port_count() -> usize {
 /// what the `data` edge points at.
 #[must_use]
 pub fn live_ports() -> Vec<(u64, Arc<MessagePortData>)> {
+    live_port_objects()
+        .into_iter()
+        .map(|port| (port.id, Arc::clone(&port.data)))
+        .collect()
+}
+
+/// The live ports themselves, for a walk that needs their JavaScript objects.
+///
+/// [`live_ports`] gives up the `Rc` to keep callers from holding a port past the
+/// snapshot. The heap walk needs the port because the wrapper edge pair
+/// (`native_to_javascript` / `javascript_to_native`) names the object the weak
+/// handle in `PortInner` points at, which only the port can resolve.
+///
+/// The `Rc` is dropped as soon as this returns, so nothing here keeps a port
+/// alive.
+#[must_use]
+pub fn live_port_objects() -> Vec<Rc<PortInner>> {
     LOCAL_PORTS.with(|ports| {
         let mut ports = ports.borrow_mut();
         ports.retain(|(_, port)| port.strong_count() > 0);
         ports
             .iter()
-            .filter_map(|(id, port)| {
-                let port = port.upgrade()?;
-                Some((*id, Arc::clone(&port.data)))
-            })
+            .filter_map(|(_, port)| port.upgrade())
             .collect()
     })
 }
@@ -991,6 +1005,21 @@ impl PortInner {
 
     /// The owning object, while it is still alive.
     pub fn object<'s>(&self, scope: &v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+        self.object.borrow().as_ref()?.to_local(scope)
+    }
+
+    /// The owning object, for a walk with no entered context.
+    ///
+    /// `Weak::to_local` is typed for a scope with no context type parameter, which
+    /// is what a `HandleScope` opened directly on an isolate produces. The heap
+    /// walk runs inside V8's build callback, where no context is entered and none
+    /// may be; resolving the handle only allocates a handle cell, which needs no
+    /// context. Delivery keeps using [`Self::object`], which has a context scope
+    /// because it calls into JavaScript.
+    pub fn object_without_context<'s>(
+        &self,
+        scope: &v8::PinScope<'s, '_, ()>,
+    ) -> Option<v8::Local<'s, v8::Object>> {
         self.object.borrow().as_ref()?.to_local(scope)
     }
 

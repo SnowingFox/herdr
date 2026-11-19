@@ -62,8 +62,42 @@ mod tests;
 
 pub use context::{Context, ContextError};
 
-/// The internal field holding the `*mut RefCell<Context>`.
+/// The internal field holding the `*mut RefCell<State>`.
 const CONTEXT_STATE_FIELD: i32 = 0;
+
+/// A live `SecureContext`'s state, plus the handles that must live exactly as
+/// long as it does.
+struct State {
+    context: Context,
+    /// The object, weakly, for the heap snapshot's `native_to_javascript` edge.
+    ///
+    /// A strong handle would keep the object alive and its finalizer from ever
+    /// running, so this is weak and resolved inside the snapshot's walk.
+    object: Option<v8::Weak<v8::Object>>,
+    /// The finalizer handle, parked here so it lives exactly as long as the state
+    /// it finalizes.
+    ///
+    /// `Weak::drop` cancels the finalizer, so the previous `let _ = ...` form
+    /// dropped it immediately — which removed the finalizer from the isolate's
+    /// map and left the `SSL_CTX` for the process lifetime. Keeping it in the
+    /// state makes the two lifetimes coincide: the finalizer frees the state,
+    /// which drops this, by which point the callback has already run and
+    /// cancelling is a no-op. `rn_bind_heap_utils::stream` uses the same
+    /// arrangement.
+    finalizer: Option<v8::Weak<v8::Object>>,
+    /// This context's registration in the embedder graph.
+    retainer: rn_core::heap_retainers::RetainerId,
+}
+
+/// `sizeof(node::SecureContext)`, the `SelfSize()` the oracle reports.
+const SECURE_CONTEXT_SIZE: usize = 176;
+
+/// `kSizeOf_SSL_CTX` (`src/crypto/crypto_util.h:58`), what `TrackFieldWithSize`
+/// reports for `ctx_`.
+const SSL_CTX_SIZE: usize = 240;
+
+/// `kSizeOf_X509` (`src/crypto/crypto_util.h:59`), for `cert_` and `issuer_`.
+const X509_SIZE: usize = 128;
 
 /// `SecureContext::kInternalFieldCount` is 1 in Node: the `BaseObject` pointer.
 const INTERNAL_FIELD_COUNT: usize = 1;
@@ -189,24 +223,89 @@ fn constructor(
         return;
     }
     let this = args.this();
-    let pointer = Box::into_raw(Box::new(RefCell::new(Context::default())));
+    let state = Box::into_raw(Box::new(RefCell::new(State {
+        context: Context::default(),
+        object: Some(v8::Weak::new(scope, this)),
+        finalizer: None,
+        retainer: rn_core::heap_retainers::RetainerId::none(),
+    })));
     this.set_aligned_pointer_in_internal_field(
         CONTEXT_STATE_FIELD,
-        pointer.cast::<std::os::raw::c_void>().cast_const(),
+        state.cast::<std::os::raw::c_void>().cast_const(),
         0,
     );
-    let address = pointer as usize;
-    let _ = v8::Weak::with_guaranteed_finalizer(
+    let address = state as usize;
+
+    // `SecureContext::MemoryInfo` (`src/crypto/crypto_context.cc:2684`) tracks
+    // three fields, and each `TrackFieldWithSize` adds nothing when its size is
+    // zero — so a context that has not had `init` called reports none of them.
+    // The sizes are `kSizeOf_SSL_CTX` and `kSizeOf_X509` from
+    // `src/crypto/crypto_util.h:58-59`, pinned by a unit test because
+    // `validateByRetainingPath` never reads them.
+    let retainer = rn_core::heap_retainers::register(move |graph, isolate| {
+        // SAFETY: the finalizer clears the registration before it frees the
+        // state, so a registration that still exists names a live allocation.
+        let cell = unsafe { &*(address as *const RefCell<State>) };
+        let Ok(state) = cell.try_borrow() else {
+            return;
+        };
+        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+        let scope = &mut scope.init();
+        let Some(object) = state
+            .object
+            .as_ref()
+            .and_then(|object| object.to_local(scope))
+        else {
+            return;
+        };
+        let context = &state.context;
+        let mut node = rn_core::heap_retainers::HeapNode::new("SecureContext", SECURE_CONTEXT_SIZE)
+            .with_wrapper(object.into());
+        if context.as_ptr().is_some() {
+            node = node.with_child(
+                "ctx",
+                rn_core::heap_retainers::HeapNode::new("ctx", SSL_CTX_SIZE),
+            );
+        }
+        if context.certificate_der().is_some() {
+            node = node.with_child(
+                "cert",
+                rn_core::heap_retainers::HeapNode::new("cert", X509_SIZE),
+            );
+        }
+        if context.issuer_der().is_some() {
+            node = node.with_child(
+                "issuer",
+                rn_core::heap_retainers::HeapNode::new("issuer", X509_SIZE),
+            );
+        }
+        rn_core::heap_retainers::add_node(graph, &node);
+    });
+    if let Ok(mut state) = unsafe { &*state }.try_borrow_mut() {
+        state.retainer = retainer;
+    }
+
+    let weak = v8::Weak::with_guaranteed_finalizer(
         scope,
         this,
         Box::new(move || {
-            let pointer = address as *mut RefCell<Context>;
+            // SAFETY: the registration names `address`, and it is dropped here
+            // before the allocation it describes, so no snapshot can read freed
+            // memory.
+            let cell = unsafe { &*(address as *const RefCell<State>) };
+            if let Ok(state) = cell.try_borrow() {
+                rn_core::heap_retainers::unregister(state.retainer);
+            }
+            let state = address as *mut RefCell<State>;
             // SAFETY: allocated by `constructor` for this object alone, and this
-            // finalizer is the only thing that frees it. `Context::drop` releases
-            // the `SSL_CTX` if `close()` did not.
-            drop(unsafe { Box::from_raw(pointer) });
+            // finalizer is the only thing that frees it. Dropping the `State`
+            // releases the `SSL_CTX` if `close()` did not.
+            drop(unsafe { Box::from_raw(state) });
         }),
     );
+    if let Ok(mut state) = unsafe { &*state }.try_borrow_mut() {
+        state.finalizer = Some(weak);
+    }
     rv.set(this.into());
 }
 
@@ -240,10 +339,10 @@ fn with_state<R>(this: v8::Local<v8::Object>, body: impl FnOnce(&mut Context) ->
         return None;
     }
     // SAFETY: the object has at least one internal field, and the only writer of
-    // field 0 is `constructor`, which stores a `*mut RefCell<Context>` there.
+    // field 0 is `constructor`, which stores a `*mut RefCell<State>` there.
     // Nothing but the object's finalizer clears or replaces it.
     let pointer = unsafe { this.get_aligned_pointer_from_internal_field(CONTEXT_STATE_FIELD, 0) }
-        as *mut RefCell<Context>;
+        as *mut RefCell<State>;
     if pointer.is_null() {
         return None;
     }
@@ -251,7 +350,7 @@ fn with_state<R>(this: v8::Local<v8::Object>, body: impl FnOnce(&mut Context) ->
     // unreachable, which cannot happen while `this` is a live local.
     let cell = unsafe { &*pointer };
     let mut state = cell.try_borrow_mut().ok()?;
-    Some(body(&mut state))
+    Some(body(&mut state.context))
 }
 
 /// The `SSL_CTX` behind a `SecureContext` object, for the `tls_wrap` namespace.
@@ -1267,4 +1366,22 @@ fn throw(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     };
     let exception = v8::Exception::error(scope, text);
     scope.throw_exception(exception);
+}
+
+#[cfg(test)]
+mod heap_retainer_tests {
+    use super::*;
+
+    /// The sizes are the ones the oracle reports, and nothing else checks them.
+    ///
+    /// `validateByRetainingPath` matches on the node *name*, so a wrong
+    /// `SelfSize()` passes every test in Node's suite. `SecureContext` is 176 on
+    /// the pinned build, and the two children are the `kSizeOf_*` constants Node
+    /// itself reports rather than a `sizeof`.
+    #[test]
+    fn the_sizes_are_the_oracles_self_sizes() {
+        assert_eq!(SECURE_CONTEXT_SIZE, 176);
+        assert_eq!(SSL_CTX_SIZE, 240);
+        assert_eq!(X509_SIZE, 128);
+    }
 }

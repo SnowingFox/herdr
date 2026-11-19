@@ -153,6 +153,11 @@ pub struct WrapState {
     pub secure_context: Option<v8::Global<v8::Object>>,
     /// The `SSL`, which owns both BIOs.
     pub ssl: Option<Ssl>,
+    /// This wrap's registration in the embedder graph, released with its state.
+    ///
+    /// Assigned by `crate::wrap`'s constructor after `RetainerId::none`, so a
+    /// state that never became a snapshot entry is not mistaken for one.
+    pub retainer: rn_core::heap_retainers::RetainerId,
     /// `TLSWrap::kind_`.
     pub kind: Kind,
     /// `TLSWrap::flags_`.
@@ -310,6 +315,7 @@ impl WrapState {
             object: None,
             secure_context: None,
             ssl: None,
+            retainer: rn_core::heap_retainers::RetainerId::none(),
             kind,
             flags: Flags::default(),
             library_call_depth: 0,
