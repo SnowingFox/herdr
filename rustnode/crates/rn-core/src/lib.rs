@@ -18,6 +18,7 @@ pub mod exit_state;
 pub mod finalizer;
 pub mod function;
 pub mod handle;
+pub mod heap_retainers;
 pub mod hook_slot;
 pub mod host_object;
 pub mod isolate_params;

@@ -30,6 +30,15 @@ pub enum BrotliStream {
 }
 
 impl BrotliStream {
+    /// `true` for the encoder direction.
+    ///
+    /// Node instantiates one `BrotliCompressionStream` template per direction, so
+    /// the two are distinct classes with distinct `SelfSize()` values; the
+    /// snapshot needs to know which one a handle is.
+    pub fn is_encoder(&self) -> bool {
+        matches!(self, Self::Encode(_))
+    }
+
     /// The encoder for `BROTLI_ENCODE`.
     pub fn encoder(dictionary: &[u8]) -> Self {
         Self::Encode(Box::new(BrotliEncoder::new(dictionary)))

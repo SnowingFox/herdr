@@ -66,6 +66,7 @@ use rn_v8_sys::v8;
 
 use crate::brotli::{BrotliError, BrotliStream};
 use crate::constants::*;
+use crate::memory::MemoryOwner;
 use crate::zlib::{ZlibError, ZlibStream};
 use crate::zstd::{ZstdCompressStream, ZstdDecompressStream, ZstdError, CONTENTSIZE_UNKNOWN};
 use crate::AfterWrite;
@@ -142,6 +143,26 @@ pub(crate) struct HandleState {
     /// The trigger id the `init` carried, so the completion pushes the same pair
     /// Node's `AsyncWrap::MakeCallback` would.
     trigger_async_id: Option<f64>,
+    /// The compression library's allocations for this handle.
+    ///
+    /// `CompressionStreamMemoryOwner`'s `zlib_memory_`
+    /// (`src/node_zlib.cc:487-488`): `Node / zlib_memory` reports it, and the
+    /// node only exists once something has been allocated, which is why
+    /// `test/pummel/test-heapdump-zlib.js` can assert its absence on a fresh
+    /// stream.
+    memory: Box<MemoryOwner>,
+    /// This handle's registration in the embedder graph, released with its
+    /// state.
+    retainer: rn_core::heap_retainers::RetainerId,
+    /// The wrapper, weakly.
+    ///
+    /// The snapshot's `native_to_javascript` edge names the JavaScript object,
+    /// and a strong reference would keep it alive so `close()` plus a `GC()`
+    /// never reclaimed it. `weak` above is this object's own finalizer handle and
+    /// cannot be used for this: it is dropped by the finalizer that frees this
+    /// state, so describing a wrapper from it would be describing the object
+    /// whose death cancelled it.
+    wrapper: v8::Weak<v8::Object>,
 }
 
 /// A compression step that `write()` accepted but has not run yet.
@@ -160,7 +181,7 @@ struct DeferredStep {
 }
 
 impl HandleState {
-    fn new(backend: Backend) -> Self {
+    fn new(backend: Backend, wrapper: v8::Weak<v8::Object>) -> Self {
         Self {
             backend,
             weak: None,
@@ -174,6 +195,9 @@ impl HandleState {
             closed: false,
             async_id: None,
             trigger_async_id: None,
+            memory: MemoryOwner::new(),
+            retainer: rn_core::heap_retainers::RetainerId::none(),
+            wrapper,
         }
     }
 
@@ -254,6 +278,28 @@ impl HandleState {
             Backend::ZstdCompress(stream) => stream.reset().map(StreamError::Zstd),
             Backend::ZstdDecompress(stream) => stream.reset().map(StreamError::Zstd),
         }
+    }
+
+    /// The backend this handle runs, for the heap snapshot's class names.
+    pub(crate) fn backend(&self) -> &Backend {
+        &self.backend
+    }
+
+    /// The compression library's live allocation total.
+    ///
+    /// zlib and Brotli report through [`MemoryOwner`], whose `zalloc`/`zfree`
+    /// they actually call. zstd allocates its workspace from its own C library
+    /// with no hook this build installs, so its total comes from the context
+    /// itself (`ZSTD_sizeof_CCtx`/`DCtx`), which is the same live allocation
+    /// question answered by the library that made it.
+    pub(crate) fn memory_bytes(&self) -> usize {
+        if let Backend::ZstdCompress(stream) = &self.backend {
+            return stream.allocated_bytes();
+        }
+        if let Backend::ZstdDecompress(stream) = &self.backend {
+            return stream.allocated_bytes();
+        }
+        self.memory.bytes()
     }
 
     /// `CompressionStream::Close()`: ends the compressor state, leaves the
@@ -349,7 +395,18 @@ fn install_state<'s>(
     object: v8::Local<'s, v8::Object>,
     backend: Backend,
 ) {
-    let pointer = Box::into_raw(Box::new(RefCell::new(HandleState::new(backend))));
+    // The wrapper, weakly: the snapshot's `native_to_javascript` edge names it,
+    // and a strong reference would keep the handle alive past `close()`.
+    let wrapper = v8::Weak::new(scope, object);
+    let mut state = HandleState::new(backend, wrapper);
+    // The allocator the compressor will call is this state's counter, so it has
+    // to be installed before the first `deflateInit2_` and after the state is in
+    // its final location. `MemoryOwner` is a `Box`, so `memory::install` can
+    // store a pointer to it that stays valid for the handle's life.
+    if let Backend::Zlib(stream) = &mut state.backend {
+        crate::memory::install(stream.stream_mut(), &state.memory);
+    }
+    let pointer = Box::into_raw(Box::new(RefCell::new(state)));
     object.set_aligned_pointer_in_internal_field(
         STATE_FIELD,
         pointer.cast::<c_void>().cast_const(),
@@ -377,13 +434,51 @@ fn install_state<'s>(
         }
     }
 
+    // The heap-snapshot walk reaches this handle through the registration rather
+    // than a `BaseObject` tree. It resolves the weak wrapper inside the walk's
+    // own scope and reports nothing once the object is gone, so a finalizer that
+    // has not run yet cannot make the snapshot claim a dead handle.
+    //
+    // SAFETY: `pointer` came from `Box::into_raw` just above and is not freed
+    // until the finalizer below runs, which cannot happen while the isolate is
+    // running this callback.
+    let address = pointer as usize;
+    let retainer = rn_core::heap_retainers::register(move |graph, scope| {
+        // SAFETY: the finalizer clears the registration before it frees the
+        // state, so a registration that still exists names a live allocation.
+        let cell = unsafe { &*(address as *const RefCell<HandleState>) };
+        let Ok(state) = cell.try_borrow() else {
+            // A snapshot taken from inside this handle's own callback would find
+            // the state borrowed. Reporting nothing is the honest answer.
+            return;
+        };
+        let wrapper = state
+            .wrapper
+            .to_local(scope)
+            .map(v8::Local::<v8::Value>::from);
+        if let Some(node) = crate::retainers::describe(&state, wrapper) {
+            rn_core::heap_retainers::add_node(graph, &node);
+        }
+    });
+    // SAFETY: `pointer` was just created above and is not otherwise borrowed.
+    let cell = unsafe { &*pointer };
+    if let Ok(mut state) = cell.try_borrow_mut() {
+        state.retainer = retainer;
+    }
+
     // The finalizer owns the allocation from here on, so it is released even if
     // `close()` never runs.
-    let address = pointer as usize;
     let weak = v8::Weak::with_guaranteed_finalizer(
         scope,
         object,
         Box::new(move || {
+            // The registration outlives the state it describes unless it is
+            // dropped first, and a stale one would report freed memory.
+            // SAFETY: the finalizer runs exactly once for this allocation.
+            let cell = unsafe { &*(address as *const RefCell<HandleState>) };
+            if let Ok(state) = cell.try_borrow() {
+                rn_core::heap_retainers::unregister(state.retainer);
+            }
             let pointer = address as *mut RefCell<HandleState>;
             // SAFETY: `install_state` allocated this Box and nothing else frees
             // it; the finalizer runs exactly once.

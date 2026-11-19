@@ -1158,13 +1158,24 @@ fn main() {
 /// lives there rather than in `rn-bind-heap-utils` because that crate is what
 /// owns the ports, and a registration point here avoids making either crate
 /// depend on the other.
+///
+/// [`rn_core::heap_retainers::add_embedder_nodes`] runs the registry the other
+/// binding crates record their own native objects in. Both walks are part of one
+/// callback, because V8 takes one: a second registration would replace the first
+/// rather than add to it.
 fn install_embedder_graph(isolate: &mut v8::Isolate) {
     let registered = unsafe {
         rn_v8_sys::register_embedder_graph(
-            isolate,
-            rn_v8_sys::EmbedderGraphCallback {
-                build: Box::new(|graph| rn_bind_messaging::add_embedder_nodes(&graph)),
-            },
+            &isolate,
+            rn_v8_sys::EmbedderGraphCallback::new(
+                // SAFETY: `isolate` is the caller's live isolate, and the
+                // registration lives no longer than it does.
+                unsafe { rn_v8_sys::v8::Isolate::as_raw_isolate_ptr(&isolate) },
+                |graph| {
+                    rn_bind_messaging::add_embedder_nodes(&graph);
+                    rn_core::heap_retainers::add_embedder_nodes(&graph);
+                },
+            ),
         )
     };
     if !registered {

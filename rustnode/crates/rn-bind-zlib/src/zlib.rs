@@ -154,6 +154,17 @@ impl ZlibStream {
         self.mode
     }
 
+    /// The `z_stream`, so the handle can install its allocator before the first
+    /// `deflateInit2_`.
+    ///
+    /// `CompressionStream`'s constructor sets `strm_.zalloc`, `strm_.zfree` and
+    /// `strm_.opaque` (`src/node_zlib.cc:1349-1352`) before any init call, and
+    /// the compressor keeps them for its own lifetime. Exposed as `&mut` for
+    /// that one assignment; everything else about the stream stays private.
+    pub fn stream_mut(&mut self) -> &mut z::z_stream {
+        self.stream.as_mut()
+    }
+
     /// `ZlibStream::Init()`: stores the options and applies Node's windowBits
     /// fixups. No allocation happens here; zlib is initialized on first write.
     pub fn init(

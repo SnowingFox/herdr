@@ -67,6 +67,13 @@ unsafe extern "C" {
         to: *mut std::ffi::c_void,
         name: *const std::os::raw::c_char,
     );
+    /// The graph node for one V8 value, creating it if needed. `value` is a
+    /// `v8::Local<v8::Value>` in Rust's layout: one pointer to a handle slot.
+    /// See [`EmbedderGraph::v8_node`].
+    fn rn_v8_sys__embedder_graph_v8_node(
+        graph: *mut std::ffi::c_void,
+        value: *const std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
 }
 
 /// One node in the embedder graph V8 is building.
@@ -88,6 +95,10 @@ pub struct EmbedderNode(*mut std::ffi::c_void);
 #[derive(Clone, Copy, Debug)]
 pub struct EmbedderGraph {
     raw: *mut std::ffi::c_void,
+    /// The isolate the snapshot is being taken from, so a rooted value can be
+    /// re-read as the handle slot `V8Node` takes. Recorded by
+    /// [`register_embedder_graph`]; see [`EmbedderGraph::v8_node`].
+    isolate: v8::UnsafeRawIsolatePtr,
 }
 
 impl EmbedderGraph {
@@ -96,10 +107,11 @@ impl EmbedderGraph {
     /// # Safety
     ///
     /// `raw` must be the `v8::EmbedderGraph*` of the callback currently running,
-    /// used only inside it.
+    /// used only inside it, and `isolate` must be the isolate that snapshot is
+    /// of.
     #[must_use]
-    pub unsafe fn from_raw(raw: *mut std::ffi::c_void) -> Self {
-        Self { raw }
+    pub unsafe fn from_raw(raw: *mut std::ffi::c_void, isolate: v8::UnsafeRawIsolatePtr) -> Self {
+        Self { raw, isolate }
     }
 
     /// Adds a node named `name` with `size` bytes and returns its handle.
@@ -137,6 +149,104 @@ impl EmbedderGraph {
             rn_v8_sys__embedder_graph_add_edge(self.raw, from.0, to.0, name);
         }
     }
+
+    /// The node V8 itself has for `value`, creating it if this graph has none.
+    ///
+    /// This is `v8::EmbedderGraph::V8Node`, and it is what makes a retainer's
+    /// `native_to_javascript` and `javascript_to_native` edges possible: Node's
+    /// `MemoryTracker::AddNode` looks the wrapper up here and adds the pair
+    /// around it (`src/memory_tracker-inl.h:401-406`). Without it a walk can
+    /// describe the native side of a retainer but not the JavaScript object it
+    /// belongs to, so every test asserting `Node / X --native_to_javascript-->
+    /// X` is unreachable.
+    ///
+    /// `value` is a `v8::Local<v8::Value>` from the snapshot's isolate. That
+    /// handle has to be live when the snapshot runs, which is why retainers root
+    /// their wrapper: an unrooted one may already have been collected.
+    ///
+    /// Returns `None` for an empty handle, which is Node's "no wrapper" case.
+    #[must_use]
+    pub fn v8_node(&self, value: v8::Local<'_, v8::Value>) -> Option<EmbedderNode> {
+        // `v8::Local<T>` is one pointer to a handle slot, so the address of the
+        // local read back as `*const c_void` is exactly the slot the shim wants.
+        // That layout is pinned by the `v8` crate's own `ptr_to_local`, which
+        // does the same reinterpretation in the other direction.
+        let slot = local_slot(value)?;
+        // SAFETY: `self.raw` is the graph of the running callback and `slot` is
+        // a live handle slot from the same isolate.
+        let node = unsafe { rn_v8_sys__embedder_graph_v8_node(self.raw, slot) };
+        if node.is_null() {
+            None
+        } else {
+            Some(EmbedderNode(node))
+        }
+    }
+
+    /// The node V8 has for a value this process rooted in a [`v8::Global`].
+    ///
+    /// A retained wrapper object has to survive until the snapshot, so a retainer
+    /// can hold it as a `Global`. `V8Node` needs a *scoped* handle instead, so
+    /// callers should resolve the `Global` inside the scope
+    /// [`EmbedderGraph::with_isolate_scope`] opens — and prefer
+    /// [`EmbedderGraph::v8_node`] from there. This variant stays for call sites
+    /// that have no scope and a wrapper that is not going to be collected
+    /// (`rn_core::heap_retainers` opens the scope for the whole walk, so it does
+    /// not use this).
+    #[must_use]
+    pub fn has_isolate(&self) -> bool {
+        !self.isolate.is_null()
+    }
+
+    /// Opens a `HandleScope` on the snapshot's isolate and runs `body` in it.
+    ///
+    /// The scope exists so a retainer can turn a `v8::Weak` or a `v8::Global` into
+    /// the `Local` [`EmbedderGraph::v8_node`] takes. V8 runs the build callback
+    /// with no scope of its own, and `HandleScope::new` needs `&mut Isolate`,
+    /// which a callback cannot obtain soundly — so the isolate is re-entered here,
+    /// exactly as `rn_bind_heap_utils::with_snapshot_isolate` does for
+    /// `TakeHeapSnapshot` and for the same reason.
+    ///
+    /// Every handle the body creates dies when this returns. V8 merges a wrapper
+    /// node into the object's own node *after* the build callback, so a handle
+    /// that outlived the scope would be merged from freed storage — this scope
+    /// spans the whole walk and not one node, which is why
+    /// `rn_core::heap_retainers` calls it once around every retainer.
+    ///
+    /// Returns `None` when no isolate was recorded.
+    ///
+    /// # Safety
+    ///
+    /// Must be called from inside the build callback of the graph it was given:
+    /// the isolate is live only for that call.
+    pub unsafe fn with_isolate_scope<R>(
+        &self,
+        body: impl FnOnce(&mut v8::PinScope<'_, '_, ()>) -> R,
+    ) -> Option<R> {
+        if self.isolate.is_null() {
+            return None;
+        }
+        // SAFETY: the caller guarantees the isolate is live for this call, which
+        // is the build callback's own duration.
+        let mut isolate = unsafe { v8::Isolate::from_raw_isolate_ptr(self.isolate) };
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        Some(body(scope))
+    }
+}
+
+/// The handle slot `v8::Local<T>` holds, as the opaque pointer the shim takes.
+///
+/// `v8::Local<T>` is a `NonNull<T>` of the slot address in this build (no
+/// `V8_ENABLE_DIRECT_HANDLE`), so the raw pointer behind it *is* the slot.
+/// Reading it through `as_non_null` rather than transmuting the handle keeps the
+/// crate's own checking in the path.
+fn local_slot<T>(local: v8::Local<'_, T>) -> Option<*const std::ffi::c_void> {
+    let pointer: *const T = unsafe { std::mem::transmute_copy(&local) };
+    if pointer.is_null() {
+        None
+    } else {
+        Some(pointer.cast())
+    }
 }
 
 /// The `char*` for an edge name V8 will hold for a snapshot's lifetime.
@@ -167,6 +277,23 @@ pub struct EmbedderGraphCallback {
     /// on the thread that registered it, so a walk that touches per-thread state
     /// is the point rather than a hazard.
     pub build: Box<dyn Fn(EmbedderGraph)>,
+    /// The isolate the callback was registered for. [`register_embedder_graph`]
+    /// fills this in; a walk reads it through
+    /// [`EmbedderGraph::v8_node_for_global`].
+    pub isolate: v8::UnsafeRawIsolatePtr,
+}
+
+impl EmbedderGraphCallback {
+    /// A registration for `isolate`. The isolate is recorded here rather than
+    /// passed per call because V8's build callback receives it but the Rust
+    /// trampoline has no other way to reach it.
+    #[must_use]
+    pub fn new(isolate: v8::UnsafeRawIsolatePtr, build: impl Fn(EmbedderGraph) + 'static) -> Self {
+        Self {
+            build: Box::new(build),
+            isolate,
+        }
+    }
 }
 
 /// Registers `callback` to add embedder nodes to every snapshot of `isolate`.
@@ -208,8 +335,9 @@ pub unsafe fn register_embedder_graph(
             // SAFETY: the pointer was boxed and leaked by the registration
             // below, and V8 calls this on the thread that registered it.
             let callback = unsafe { &*callback };
-            // SAFETY: the graph is live for the duration of this call.
-            (callback.build)(unsafe { EmbedderGraph::from_raw(graph) });
+            // SAFETY: the graph is live for the duration of this call, and the
+            // isolate is the one the registration was made for.
+            (callback.build)(unsafe { EmbedderGraph::from_raw(graph, callback.isolate) });
         });
     }
 

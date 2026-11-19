@@ -27,6 +27,8 @@ pub mod brotli;
 pub mod constants;
 pub mod crc;
 pub mod handle;
+pub mod memory;
+pub mod retainers;
 pub mod zlib;
 pub mod zstd;
 
