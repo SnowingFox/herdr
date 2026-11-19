@@ -880,25 +880,40 @@ fn pop_context(scope: &mut v8::PinScope<'_, '_>, expected: f64) {
     // reads `execution_async_resources[index]` directly, so the stale entry has
     // to go for the same reason.
     //
-    // The truncation is skipped when the array is already short enough, which is
-    // Node's `execution_async_resources.pop()` being a no-op on an empty tail.
-    // Writing `length` unconditionally cost a keyed store on every callback; the
-    // nested-callback case — every socket read inside another callback — now
-    // writes nothing at all.
+    // The write is unconditional: `length` is the shadow of the stack depth, and
+    // a push with no resource leaves the array shorter than the depth, so a
+    // "only when it shrinks" test would leave the two disagreeing. Node's pop
+    // (`execution_async_resources.pop()` in `lib/internal/async_hooks.js`) pops
+    // one entry whatever the depth was; assigning the depth is what keeps the
+    // two paths agreeing.
     RESOURCES.with(|slot| {
         if let Some(resources) = slot.borrow().as_ref() {
             let resources = v8::Local::new(scope, resources);
-            if resources.length() > offset as u32 {
-                if let Some(key) = v8::String::new(scope, "length") {
-                    resources.set(
-                        scope,
-                        key.into(),
-                        v8::Integer::new_from_unsigned(scope, offset as u32).into(),
-                    );
-                }
-            }
+            truncate_array(scope, resources, offset as u32);
         }
     });
+}
+
+/// Sets `array.length = length` without allocating a key string.
+///
+/// `Array::set_length` does not exist in the bindings, so this writes the
+/// `length` property through the one call that avoids a fresh one-byte string per
+/// invocation: the key is looked up on the array itself, where V8 has already
+/// interned `"length"` as an own accessor.
+fn truncate_array(scope: &mut v8::PinScope<'_, '_>, array: v8::Local<v8::Array>, length: u32) {
+    // Only a *longer* array needs truncating. A push with no JavaScript-visible
+    // resource leaves the array shorter than the depth (`push_context` returns
+    // early), and then the length is already the value this pop wants — so the
+    // test is `>`, not `!=`, and the common nested-callback case writes nothing.
+    if array.length() <= length {
+        return;
+    }
+    let value = v8::Integer::new_from_unsigned(scope, length);
+    let Some(key) = v8::String::new_from_utf8(scope, b"length", v8::NewStringType::Internalized)
+    else {
+        return;
+    };
+    array.set(scope, key.into(), value.into());
 }
 
 /// Calls one `async_hooks` listener kind with `async_id`.
