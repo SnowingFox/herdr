@@ -185,6 +185,18 @@ fn callback_trampoline(
     let delivery = unsafe { Box::from_raw(external.value().cast::<CallbackDelivery>()) };
 
     let request: Local<v8::Object> = Local::new(scope, &delivery.request);
+    // `bindSignalToReq` marks the request cancelled and reports the abort
+    // itself, so the queued completion must not run the handler again — that
+    // would deliver a second, contradictory result for a call the caller already
+    // settled.
+    if let Some(cancelled) = v8::String::new(scope, "cancelled") {
+        if request
+            .get(scope, cancelled.into())
+            .is_some_and(|value| value.is_true())
+        {
+            return;
+        }
+    }
     let Some(key) = v8::String::new(scope, "oncomplete") else {
         return;
     };
