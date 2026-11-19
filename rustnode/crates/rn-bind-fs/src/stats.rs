@@ -556,7 +556,13 @@ mod tests {
 
     #[test]
     fn statx_matches_std_metadata_for_shared_fields() {
-        let path = std::env::temp_dir();
+        // A directory this test owns, not `temp_dir()` itself. The shared
+        // temporary directory's `size` changes whenever any other test writes a
+        // file into it, and the two stats below are separate calls — so under a
+        // loaded parallel run the sizes disagreed by a byte and the gate went
+        // red for a reason unrelated to the code under test.
+        let path = std::env::temp_dir().join(format!("rn-stat-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("mkdir");
         let bytes = path.as_os_str().as_encoded_bytes();
         let stats = StatFields::for_path(bytes, Follow::Yes).expect("stat");
         let metadata = std::fs::metadata(&path).expect("metadata");
@@ -575,6 +581,7 @@ mod tests {
             assert_eq!(stats.mtime_nsec, metadata.mtime_nsec());
         }
         assert!(is_directory(stats.mode));
+        std::fs::remove_dir_all(&path).expect("cleanup");
     }
 
     #[test]
