@@ -71,12 +71,24 @@ pub enum TransferList {
 }
 
 /// The transfer list of one `postMessage`, resolved into concrete objects.
+///
+/// Nothing has moved yet at this point. The transfer hooks — `[kTransfer]`,
+/// `TransferForMessaging` — run later, in the `Finish` loop, because Node runs
+/// them there too: a message that fails to serialize must not leave the caller's
+/// socket closed or its `FileHandle` descriptor detached.
 struct Transfers<'s> {
     /// `ArrayBuffer`s in list order. The index is the transfer id the serializer
     /// writes, and the order the receiver re-attaches them in.
     array_buffers: Vec<v8::Local<'s, v8::ArrayBuffer>>,
-    /// Ports being handed over rather than copied.
-    ports: Vec<v8::Local<'s, v8::Object>>,
+    /// Entries handed over rather than copied: ports, native handles that can
+    /// only move, and `JSTransferable`s with `[kTransfer]`.
+    ///
+    /// Node keeps these in the same `host_objects_` vector it seeds before
+    /// serializing, because the ids the payload writes are indices into it. Order
+    /// is preserved as listed, and the nested entries each one registers are
+    /// appended after all of them, which is what Node's `AddNestedHostObjects`
+    /// does.
+    transferables: Vec<v8::Local<'s, v8::Object>>,
 }
 
 /// Why a serialization could not produce a message.
@@ -194,6 +206,7 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
             crate::port_state_of(scope, object).is_some()
                 || host_object::is_registered(scope, object)
                 || crate::js_marked(scope, object)
+                || crate::js_transferable(scope, object)
                 || rn_core::env_proxy::is_proxy(scope, object),
         )
     }
@@ -240,6 +253,33 @@ impl v8::ValueSerializerImpl for Delegate<'_> {
                     None
                 }
             };
+        }
+
+        // Node searches `host_objects_` before it decides to clone, and that
+        // order is load-bearing: a `FileHandle` is both a registered host handle
+        // *and* a JS transferable whose `[kTransfer]` ran while the list was
+        // read, so a transfer that took the clone path would report "needs
+        // transfer" for an object it had already accepted. Searching first is
+        // what makes `postMessage(fh, [fh])` find the seeded slot.
+        if let Some(index) = self.transfer_index(scope, object) {
+            serializer.write_uint32(index as u32);
+            return Some(true);
+        }
+
+        // A host handle that can only move, or a JS transferable, that is not in
+        // the transfer list. Node's `WriteHostObject` reaches the same refusal
+        // from `GetTransferMode() & kTransferable` and finds nothing in
+        // `host_objects_`.
+        if rn_core::host_object::transfer_mode(scope, object)
+            .map(|mode| mode.is_transferable())
+            .unwrap_or(false)
+            || crate::js_transferable(scope, object)
+        {
+            crate::throw_data_clone_exception_str(
+                scope,
+                "Object that needs transfer was found in message but not listed in transferList",
+            );
+            return None;
         }
 
         // A handle registered in `rn_core::host_object`, or an object that
@@ -332,6 +372,34 @@ impl Delegate<'_> {
     }
 }
 
+/// The payload for one transfer-list entry, Node's `TransferForMessaging`.
+///
+/// Three kinds reach here, and the order matters: a `MessagePort` has to be
+/// recognised first because it is neither a registered handle nor a
+/// `JSTransferable`; a native handle registered as transferable moves its own
+/// state; and everything else runs `[kTransfer]`.
+fn transfer_payload<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Result<Arc<dyn TransferData>, SerializeError> {
+    if let Some(state) = crate::port_state_of(scope, object) {
+        // `MessagePort::TransferForMessaging` is `Close(); return Detach();`.
+        // The detach happens here rather than while the list was read because
+        // this is the point of no return: everything that could reject the
+        // message has already run.
+        let payload = PortTransferData::for_port(Arc::clone(&state.data));
+        state.detach_for_transfer();
+        return Ok(payload);
+    }
+    if let Some(payload) = rn_core::host_object::transfer_for_messaging(scope, object) {
+        return Ok(payload);
+    }
+    // A throwing hook propagates: Node's `TransferOrClone` returns an empty
+    // pointer and lets the exception out of `postMessage`, so the caller sees the
+    // hook's own error. `Thrown` is how the caller learns not to replace it.
+    crate::js_transfer_for_messaging(scope, object).ok_or(SerializeError::Thrown)
+}
+
 /// Serializes `value`, detaching everything in `transfer_list`.
 ///
 /// `source_port` is Node's `Message::Serialize(..., Local<Object> source_port)`:
@@ -355,7 +423,7 @@ pub fn serialize<'s>(
 
     let host_objects = RefCell::new(Vec::new());
     let shared_array_buffers = RefCell::new(Vec::new());
-    let transferred = transfers.ports.len();
+    let transferred = transfers.transferables.len();
     let serializer = v8::ValueSerializer::new(
         scope,
         Box::new(Delegate {
@@ -369,24 +437,17 @@ pub fn serialize<'s>(
     // value, so `WriteHostObject` finds them by index. Same order here, and in the
     // same place: the ids the payload references are these indices.
     //
-    // Each transfer-list port goes in as a `PortTransferData` carrying the queue,
-    // not as a bare handle. A `MessagePort` is never cloned, so that payload is the
-    // only thing the receiver can rebuild one from — and keeping it in the same
-    // slot as the id is what stops the sender's vector and the receiver's vector
-    // from disagreeing about which object an id names.
+    // Their payloads are empty on purpose. Node runs `TransferForMessaging` in
+    // `Finish`, after `WriteValue`, and the position is observable: a transfer
+    // hook that throws, or a value V8 refuses to serialize, must not have closed
+    // the caller's socket or given up its `FileHandle`. `Finish` below fills these
+    // slots in.
     {
         let mut slots = host_objects.borrow_mut();
-        for port in &transfers.ports {
-            let Some(state) = crate::port_state_of(scope, *port) else {
-                // `collect_transfers` accepted it as a port, so this cannot fail
-                // unless the object changed mid-serialize.
-                crate::throw_data_clone_exception_str(scope, "The port could not be transferred");
-                return Err(SerializeError::Thrown);
-            };
-            let payload = PortTransferData::for_port(Arc::clone(&state.data));
+        for object in &transfers.transferables {
             slots.push(Slot {
-                handle: v8::Global::new(scope, *port),
-                payload: Some(payload),
+                handle: v8::Global::new(scope, *object),
+                payload: None,
             });
         }
     }
@@ -425,43 +486,24 @@ pub fn serialize<'s>(
         }
     }
 
-    // `TransferForMessaging` for each port, at the same point in the sequence as
-    // Node: after the value is written, never before. The sender gives up its end
-    // here, so a port that was handed over refuses to post or receive, and the
-    // queue belongs to the receiver alone once the message is dispatched.
-    // A detached port cannot be reached from the receiving side, so this must not
-    // run when serialization failed — which the early returns above already
-    // guarantee.
-    // The queues this message hands over, so `dispatch` can tell a destination it
-    // is about to deliver to that the transfer list just moved it. Node compares
-    // `MessagePortData*` pointers for this; the addresses are the same identity.
-    // Read before the detach below, so the lookup cannot race the owner change.
-    let transferred_ports: Vec<usize> = transfers
-        .ports
-        .iter()
-        .filter_map(|port| crate::port_state_of(scope, *port))
-        .map(|state| PortTransferData::address(&state.data))
-        .collect();
-
-    for port in &transfers.ports {
-        if let Some(state) = crate::port_state_of(scope, *port) {
-            state.detach_for_transfer();
-        }
-    }
-
-    // `SerializerDelegate::Finish`, which interleaves `CloneForMessaging` and
-    // `FinalizeTransferWrite` in one loop. Both halves have to be here rather than
-    // in two passes because writing a clone's data can itself reach *more* host
-    // objects: a `BlockList` wrapper's `[kClone]` returns `{ handle }`, and that
-    // handle is a cloneable native object too. Node's loop re-reads
-    // `host_objects_.size()` each iteration for exactly this reason, so a nested
-    // object discovered while writing clone `i` is built at `i+1` and its own data
-    // follows.
+    // `SerializerDelegate::Finish`, Node's one loop over `host_objects_` that
+    // runs `TransferForMessaging` below `first_cloned_object_index_` and
+    // `CloneForMessaging` at or above it, writing each payload in turn.
     //
-    // Writing the clone data into the same serializer is also required: it has to
-    // land after the main payload in one buffer, because the receiver reads it back
-    // from the same stream in the same order.
-    let mut index = transferred;
+    // One loop rather than two passes because writing a payload can itself reach
+    // *more* host objects: a `BlockList` wrapper's `[kClone]` returns `{ handle }`,
+    // and that handle is a cloneable native object too. Node re-reads
+    // `host_objects_.size()` each iteration for exactly this reason, so a nested
+    // object discovered while writing entry `i` is built at `i+1`.
+    //
+    // Writing into the same serializer is also required: the payload has to land
+    // after the main value in one buffer, because the receiver reads it back from
+    // the same stream in the same order.
+    //
+    // It runs after `WriteValue` and after the buffers are detached, which is the
+    // position that makes a failed post safe: the sender has not yet given up a
+    // socket, a descriptor or a port queue.
+    let mut index = 0;
     loop {
         let count = host_objects.borrow().len();
         if index >= count {
@@ -474,25 +516,42 @@ pub fn serialize<'s>(
                 None => continue,
             }
         };
-        let clone = rn_core::host_object::clone_for_messaging(scope, object)
-            .or_else(|| crate::js_clone_for_messaging(scope, object));
-        // A hook returning nothing is a failed clone, not a silent skip: Node
-        // returns `Nothing<bool>()` from `Finish` and the serialization fails.
-        let Some(clone) = clone else {
-            return Err(SerializeError::Thrown);
+        let payload = if index < transferred {
+            // A transfer-list entry. A port gives up its queue; a native handle
+            // and a JS transferable run their own move hook, which is where the
+            // sender's handle is actually released.
+            transfer_payload(scope, object)?
+        } else {
+            // A clone. A hook returning nothing is a failed clone, not a silent
+            // skip: Node returns `Nothing<bool>()` from `Finish`.
+            rn_core::host_object::clone_for_messaging(scope, object)
+                .or_else(|| crate::js_clone_for_messaging(scope, object))
+                .ok_or(SerializeError::Thrown)?
         };
-        if !clone.write_data(scope, &serializer) {
+        if !payload.write_data(scope, &serializer) {
             return Err(SerializeError::Thrown);
         }
-        // The clone's payload lands in the slot its id already names, so the
-        // receiver's vector needs no second walk to line up.
+        // The payload lands in the slot its id already names, so the receiver's
+        // vector needs no second walk to line up.
         let mut slots = host_objects.borrow_mut();
         match slots.get_mut(index) {
-            Some(slot) => slot.payload = Some(clone),
+            Some(slot) => slot.payload = Some(payload),
             None => return Err(SerializeError::Thrown),
         }
         index += 1;
     }
+
+    // The queues this message hands over, so `dispatch` can tell a destination it
+    // is about to deliver to that the transfer list just moved it. Node compares
+    // `MessagePortData*` pointers for this; the addresses are the same identity.
+    // Read after the detach above, which is when `data` stops being reachable
+    // from the sending side.
+    let transferred_ports: Vec<usize> = transfers
+        .transferables
+        .iter()
+        .filter_map(|object| crate::port_state_of(scope, *object))
+        .map(|state| PortTransferData::address(&state.data))
+        .collect();
 
     let data = serializer.release();
     drop(serializer);
@@ -547,7 +606,7 @@ fn collect_transfers<'s>(
 ) -> Result<Transfers<'s>, SerializeError> {
     let mut transfers = Transfers {
         array_buffers: Vec::new(),
-        ports: Vec::new(),
+        transferables: Vec::new(),
     };
     if transfer_list.is_undefined() || transfer_list.is_null() {
         return Ok(transfers);
@@ -590,10 +649,7 @@ fn collect_transfers<'s>(
         };
         // `markAsUntransferable()` stamps `node:transfer_mode` and Node consults
         // that stamp before any type-specific transfer path.
-        let marked_untransferable = is_untransferable_mark(scope, object)
-            || crate::js_transfer_mode(scope, object)
-                .map(|mode| !mode.is_transferable())
-                .unwrap_or(false);
+        let marked_untransferable = is_untransferable_mark(scope, object);
 
         if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(entry) {
             if marked_untransferable {
@@ -632,21 +688,11 @@ fn collect_transfers<'s>(
             ));
         }
 
-        let Some(state) = crate::port_state_of(scope, object) else {
-            return Err(SerializeError::DataClone(
-                "Found invalid value in transferList.".to_string(),
-            ));
-        };
-        if marked_untransferable {
-            return Err(SerializeError::DataClone(
-                "Cannot transfer object of unsupported type.".to_string(),
-            ));
-        }
-        // Node tests this *before* the duplicate check, and the source port
-        // before both: `Transfer list contains source port` is what a script sees
-        // when it names the port it is posting on, whether or not that port is
-        // also detached. Passing `None` for the source port (`structuredClone`)
-        // skips the branch entirely, which is Node's `!source_port.IsEmpty()`.
+        // Node tests the source port before anything else, because a script that
+        // names the port it is posting on gets that message whether or not the
+        // port is also detached. Passing `None` for the source port
+        // (`structuredClone`) skips the branch entirely, which is Node's
+        // `!source_port.IsEmpty()`.
         if let Some(source) = source {
             if source.strict_equals(object.into()) {
                 return Err(SerializeError::DataClone(
@@ -654,31 +700,145 @@ fn collect_transfers<'s>(
                 ));
             }
         }
-        // `MessagePort in transfer list is already detached`. Node's
-        // `IsDetached()` is `data_ == nullptr || IsHandleClosing()`: a port is
-        // detached once `close()` ran *or* once it was handed over. Without this
-        // a port could be transferred twice, and the receiver would get two
-        // messages where the sender posted one.
-        if state.closing.get() {
-            return Err(SerializeError::DataClone(
-                "MessagePort in transfer list is already detached".to_string(),
-            ));
-        }
-        // Node refuses a second entry for the same object: the receiver would
-        // resolve two ids to one object and move the port twice.
+
+        // A duplicate is refused before the mode is consulted, and the message
+        // names the constructor: Node's
+        // `String::Concat("Transfer list contains duplicate ", entry->GetConstructorName())`.
+        // Checking it here rather than per branch is what keeps a duplicate
+        // `MessagePort` reporting the port message and a duplicate
+        // `FileHandle` reporting *its* name, instead of one message for both.
         if transfers
-            .ports
+            .transferables
             .iter()
             .any(|existing| existing.strict_equals(object.into()))
         {
-            return Err(SerializeError::DataClone(
-                "Transfer list contains duplicate MessagePort".to_string(),
-            ));
+            let name = object.get_constructor_name().to_rust_string_lossy(scope);
+            return Err(SerializeError::DataClone(format!(
+                "Transfer list contains duplicate {name}"
+            )));
         }
-        transfers.ports.push(object);
+
+        // Ports move by giving up the queue; they are never cloned, which is why
+        // this branch is before the general `is_transferable` test.
+        if let Some(state) = crate::port_state_of(scope, object) {
+            if marked_untransferable {
+                return Err(SerializeError::DataClone(
+                    "Cannot transfer object of unsupported type.".to_string(),
+                ));
+            }
+            // `MessagePort in transfer list is already detached`. Node's
+            // `IsDetached()` is `data_ == nullptr || IsHandleClosing()`: a port
+            // is detached once `close()` ran *or* once it was handed over.
+            if state.closing.get() {
+                return Err(SerializeError::DataClone(
+                    "MessagePort in transfer list is already detached".to_string(),
+                ));
+            }
+            transfers.transferables.push(object);
+            continue;
+        }
+
+        // A host handle that can only move: a `net.Socket`'s `TCP`, a
+        // `FileHandle`'s native handle. Node's `GetTransferMode() ==
+        // kTransferable` test, which is exact rather than "has the bit": a
+        // native handle that is `kTransferableAndCloneable` still may not be
+        // listed, because a transfer list name means "move this".
+        if rn_core::host_object::transfer_mode(scope, object)
+            == Some(rn_core::host_object::TransferMode::Transferable)
+        {
+            if marked_untransferable {
+                return Err(SerializeError::DataClone(
+                    "Cannot transfer object of unsupported type.".to_string(),
+                ));
+            }
+            transfers.transferables.push(object);
+            continue;
+        }
+
+        // A JS transferable: `[kTransfer]` is a function, which is Node's whole
+        // test. The mode is deliberately *not* consulted — a `FileHandle` is
+        // `markTransferMode(this, false, true)`, so mode 1, but so is a web
+        // stream, and requiring `kTransferable` on a value rustnode had marked
+        // itself refused all of them with "Found invalid value in transferList.".
+        if crate::js_transferable(scope, object) && !marked_untransferable {
+            transfers.transferables.push(object);
+            continue;
+        }
+
+        // A handle rustnode registered as cloneable, or a `JSTransferable` whose
+        // mode has no `kTransferable` bit. Both are host objects a transfer list
+        // cannot move, which Node reports as an invalid value rather than as
+        // unsupported: the value is fine, the list is what is wrong.
+        return Err(SerializeError::DataClone(
+            "Found invalid value in transferList.".to_string(),
+        ));
     }
 
+    // Some objects in the transfer list register sub-objects that can be
+    // transferred. This could e.g. be a public JS wrapper object, such as a
+    // FileHandle, that is registering its C++ handle for transfer.
+    add_nested_transferables(scope, &mut transfers)?;
+
     Ok(transfers)
+}
+
+/// Node's `SerializerDelegate::AddNestedHostObjects`.
+///
+/// A wrapper's `[kTransfer]` returns `{ data: { handle }, ... }`, and that
+/// `handle` is itself a moved native object the payload will reference by id. It
+/// is not in the user's transfer list, so the only way the receiver can resolve
+/// it is for the sender to seed the id space with it — which is what this does,
+/// before the value is written, exactly where Node does it.
+///
+/// The loop re-reads the collection's length each iteration because a nested
+/// entry can itself have nested transferables: a `TransformStream`'s list holds
+/// the two streams it is made of, and each of those registers a `MessagePort`.
+/// Node's `host_objects_` grows inside its loop for the same reason.
+fn add_nested_transferables<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    transfers: &mut Transfers<'s>,
+) -> Result<(), SerializeError> {
+    // Only the entries that can register nested ones are asked. A port has no
+    // `[kTransferList]`, and a native handle's nested entries come from its own
+    // kind, not from JavaScript.
+    let mut index = 0;
+    while index < transfers.transferables.len() {
+        let host = transfers.transferables[index];
+        let nested = crate::js_nested_transferables(scope, host).map_err(|()| {
+            // The hook threw; the exception is pending and the caller rethrows it.
+            SerializeError::Thrown
+        })?;
+        for entry in nested {
+            // The *same* object twice would make the receiver resolve two ids to
+            // one object, and moving a port twice loses the first message. Node
+            // says "The transfer list is invalid." for this.
+            if transfers
+                .transferables
+                .iter()
+                .any(|existing| existing.strict_equals(entry.into()))
+            {
+                return Err(SerializeError::DataClone(
+                    "The transfer list is invalid.".to_string(),
+                ));
+            }
+
+            // A port is the common case — every web stream registers one — and
+            // it has no `[kTransfer]`; it moves by giving up its queue.
+            if crate::port_state_of(scope, entry).is_some()
+                || rn_core::host_object::transfer_mode(scope, entry)
+                    == Some(rn_core::host_object::TransferMode::Transferable)
+                || crate::js_transferable(scope, entry)
+            {
+                transfers.transferables.push(entry);
+                continue;
+            }
+            // `if (BaseObject::IsBaseObject) ... else if (!IsJSTransferable) continue;`
+            // — a value that is neither is skipped, not an error, because the
+            // hook is not user-facing.
+        }
+        index += 1;
+    }
+    Ok(())
 }
 
 /// `ReadIterable`: the entries of `object`, or `None` when it is not iterable.
@@ -784,6 +944,7 @@ mod tests {
         fn rebuild<'s>(
             &self,
             scope: &mut v8::PinScope<'s, '_>,
+            _target: v8::Local<'s, v8::Context>,
         ) -> Option<v8::Local<'s, v8::Object>> {
             Some(v8::Object::new(scope))
         }

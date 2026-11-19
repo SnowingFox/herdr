@@ -1117,7 +1117,11 @@ struct CertificateClone {
 }
 
 impl rn_core::host_object::TransferData for CertificateClone {
-    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    fn rebuild<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        _target: v8::Local<'s, v8::Context>,
+    ) -> Option<v8::Local<'s, v8::Object>> {
         // `Deserialize` rebuilds through `X509Certificate::New(env, snapshot_,
         // snapshot_index_)` and then wraps the result in the JavaScript class with
         // `new InternalX509Certificate(handle)`, so the clone is a real

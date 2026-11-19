@@ -1075,6 +1075,7 @@ dependencies = [
  "libc",
  "libuv-sys2",
  "rn-bind-async-wrap",
+ "rn-bind-messaging",
  "rn-bind-url",
  "rn-core",
  "rn-errors",

@@ -766,11 +766,19 @@ impl PortTransferData {
 }
 
 impl TransferData for PortTransferData {
-    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    fn rebuild<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        _target: v8::Local<'s, v8::Context>,
+    ) -> Option<v8::Local<'s, v8::Object>> {
         // Node's `NewPortObject`: a fresh object around the transferred queue. It
         // runs `oninit`, which is the hook that wires up the event target — and
         // the reason this cannot happen from inside `read_host_object`, where
         // JavaScript is disallowed.
+        //
+        // A port has no context restriction: `MessagePortData::Deserialize` builds
+        // it in whatever context the message is being delivered to, which is the
+        // mechanism the whole `moveMessagePortToContext` path relies on.
         crate::new_port_object(scope, Arc::clone(&self.data)).ok()
     }
 }
@@ -822,6 +830,16 @@ pub struct PortInner {
     /// Delivery needs the object to pass as `this` to `emitMessage`. A strong
     /// root here would keep every port alive for the process' life.
     object: RefCell<Option<v8::Weak<v8::Object>>>,
+    /// A strong handle to that object while it must not be collected.
+    ///
+    /// Node's `BaseObject` holds its wrapper strongly and only calls `MakeWeak()`
+    /// once nothing needs it; the port half of that rule is `receiving_messages_`.
+    /// A receiving port is a live handle, so its wrapper has to survive the
+    /// script dropping its last reference — otherwise a queued message is
+    /// delivered to an object that no longer exists and the event never fires.
+    /// Cleared as soon as the port stops receiving or closes, which is what keeps
+    /// it from pinning the process open.
+    pinned: RefCell<Option<v8::Global<v8::Object>>>,
 }
 
 thread_local! {
@@ -907,6 +925,7 @@ impl PortInner {
             data_detached: Cell::new(false),
             identity: Rc::new(()),
             object: RefCell::new(None),
+            pinned: RefCell::new(None),
         });
         inner.data.attach(&inner);
         register_local(inner.id, &inner);
@@ -936,6 +955,7 @@ impl PortInner {
     pub fn attach_object(&self, weak: v8::Weak<v8::Object>) {
         *self.object.borrow_mut() = Some(weak);
     }
+
 
     /// The owning object, while it is still alive.
     pub fn object<'s>(&self, scope: &v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
@@ -988,6 +1008,21 @@ impl PortInner {
         wake_loop();
     }
 
+    /// Holds the port's object strongly because it has a message to deliver.
+    ///
+    /// `start()` is not the only thing that makes a port deliverable: a port whose
+    /// `onmessage` was assigned is put into the receiving state by
+    /// `setupPortReferencing` in `io.js`, and a web stream's internal pair is
+    /// written to before either end calls `start()`. In every one of those cases a
+    /// queued message has to reach the wrapper, so the wrapper is pinned as soon as
+    /// the queue is scheduled and released when the port stops.
+    pub fn pin_for_delivery(self: &Rc<Self>, scope: &mut v8::PinScope<'_, '_>) {
+        if self.closing.get() || self.closed.get() {
+            return;
+        }
+        self.pin_object(scope);
+    }
+
     /// Marks this port as receiving and wakes it if messages are already queued.
     pub fn start(self: &Rc<Self>) {
         self.receiving.set(true);
@@ -996,11 +1031,43 @@ impl PortInner {
         }
     }
 
+    /// Holds the port's object strongly, Node's `ClearWeak()`.
+    ///
+    /// A receiving port is a live handle: the queue is delivered *to* its wrapper,
+    /// so the wrapper must survive the script dropping its last reference. Without
+    /// this, a port the script only reaches through its own event target is
+    /// collected with messages still queued and every one of them is lost with no
+    /// event — which is a hang, not a failure.
+    ///
+    /// Idempotent, and a no-op when the object has already gone.
+    pub fn pin_object(&self, scope: &mut v8::PinScope<'_, '_>) {
+        if self.pinned.borrow().is_some() {
+            return;
+        }
+        let Some(object) = self.object(scope) else {
+            return;
+        };
+        *self.pinned.borrow_mut() = Some(v8::Global::new(scope, object));
+    }
+
+    /// Releases the strong handle, Node's `MakeWeak()`.
+    ///
+    /// Called once the port stops receiving or closes. Keeping the root would pin
+    /// the process open for a port nothing can deliver to, which is the same
+    /// failure the weak reference was there to avoid.
+    pub fn unpin_object(&self) {
+        *self.pinned.borrow_mut() = None;
+    }
+
     /// Stops draining this port, `stopMessagePort`.
     pub fn stop(&self) {
         // `stopMessagePort` clears `receiving_messages_` and nothing else: the
         // handle stays in the registry and is judged by `keeps_loop_alive`.
         self.receiving.set(false);
+        // A port that is no longer receiving has nothing to deliver to, so its
+        // wrapper stops needing to exist — `BaseObject::decrease_refcount`'s
+        // `MakeWeak()`.
+        self.unpin_object();
     }
 
     /// Detaches a port whose queue is being re-homed into another realm.
@@ -1162,6 +1229,11 @@ impl PortInner {
         }
         self.closing.set(true);
         self.receiving.set(false);
+        // A closed port is no longer a handle anything can deliver to, so its
+        // wrapper must not stay rooted. `close_event` still needs the object, and
+        // it reads it through the `Weak` while the frame that called `close()`
+        // keeps it alive.
+        self.unpin_object();
         // The port's handle is going away, so it gives up its claim on the
         // thread's wake handle. Node drops the port's own `uv_async_t` here.
         self.drop_wake();

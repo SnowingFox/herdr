@@ -21,6 +21,11 @@
 //! `fullObjectGraph` walk.
 
 use std::cell::RefCell;
+
+/// The name [`mark_key`] interns the kind under.
+///
+/// Qualified because `Private::for_api` shares one name space per isolate.
+const MARK_NAME: &str = "node:rustnode:host_object_kind";
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -88,7 +93,19 @@ impl TransferMode {
 /// `SocketAddressBlockListWrap::TransferData` both derive from the same base.
 pub trait TransferData: Send + Sync {
     /// Builds the receiving object, Node's `TransferData::Deserialize`.
-    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>>;
+    ///
+    /// `target` is the context the message is being delivered *into*, which Node
+    /// passes so a payload can refuse a context it cannot build in. A
+    /// `JSTransferable` does exactly that: `JSTransferable::Data::Deserialize`
+    /// answers `ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE` when `context` is not the
+    /// environment's own, which is what makes a `FileHandle` posted to a
+    /// `moveMessagePortToContext` port a `messageerror` rather than a handle in
+    /// the wrong realm.
+    fn rebuild<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        target: v8::Local<'s, v8::Context>,
+    ) -> Option<v8::Local<'s, v8::Object>>;
 
     /// Appends this clone's own state, Node's `FinalizeTransferWrite`.
     ///
@@ -128,8 +145,16 @@ thread_local! {
     /// Registered kinds, keyed by the name a handle is marked with.
     static KINDS: RefCell<BTreeMap<&'static str, CloneFn>> = const { RefCell::new(BTreeMap::new()) };
 
-    /// The private key a marked handle carries its kind under.
-    static MARK: RefCell<Option<v8::Global<v8::Private>>> = const { RefCell::new(None) };
+    /// Kinds whose handles move rather than copy, keyed the same way.
+    ///
+    /// Node splits this into `GetTransferMode()` returning `kTransferable` and
+    /// `TransferForMessaging()` returning the state to rebuild from, and the two
+    /// registrations are here for the same reason: a handle that can move cannot
+    /// be copied, and the messaging layer has to be able to tell which it is
+    /// before it decides to search the transfer list.
+    static TRANSFER_KINDS: RefCell<BTreeMap<&'static str, CloneFn>> =
+        const { RefCell::new(BTreeMap::new()) };
+
 }
 
 /// Registers `kind`, whose handles [`mark`] makes cloneable.
@@ -139,6 +164,19 @@ thread_local! {
 pub fn register_kind(kind: &'static str, clone: CloneFn) {
     KINDS.with(|kinds| {
         kinds.borrow_mut().insert(kind, clone);
+    });
+}
+
+/// Registers `kind` as transferable rather than cloneable.
+///
+/// `transfer` is Node's `TransferForMessaging()`: it gives up the sender's
+/// handle and returns the state the receiver rebuilds from. A type registered
+/// here is *only* transferable, which is the distinction
+/// `Message::Serialize` makes when it refuses a `kCloneable` entry in a transfer
+/// list — a socket cannot be copied, so listing it must move it or fail.
+pub fn register_transfer_kind(kind: &'static str, transfer: CloneFn) {
+    TRANSFER_KINDS.with(|kinds| {
+        kinds.borrow_mut().insert(kind, transfer);
     });
 }
 
@@ -165,9 +203,10 @@ pub fn mark(
 
 /// The transfer mode of a registered handle, or `None` when `object` is not one.
 ///
-/// A registered kind is `Cloneable`, because a kind exists to say "this type knows
-/// how to be copied"; a future native type that could only move would carry its
-/// mode in the marking instead.
+/// A kind registered with [`register_kind`] is `Cloneable`, because it exists to
+/// say "this type knows how to be copied"; one registered with
+/// [`register_transfer_kind`] is `Transferable`, because it exists to say "this
+/// type can only move".
 ///
 /// # Why the JavaScript stamp is consulted first
 ///
@@ -186,10 +225,17 @@ pub fn transfer_mode(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
 ) -> Option<TransferMode> {
-    kind_of(scope, object)?;
+    let kind = kind_of(scope, object)?;
     match stamped_mode(scope, object) {
         Some(mode) => Some(mode),
-        None => Some(TransferMode::Cloneable),
+        None => {
+            let transferable = TRANSFER_KINDS.with(|kinds| kinds.borrow().contains_key(kind));
+            Some(if transferable {
+                TransferMode::Transferable
+            } else {
+                TransferMode::Cloneable
+            })
+        }
     }
 }
 
@@ -233,16 +279,38 @@ pub fn clone_for_messaging<'s>(
     clone(scope, object)
 }
 
+/// The transfer payload for `object`, when it is a handle of a transferable kind.
+///
+/// Node's `TransferForMessaging()`. The sender gives up the handle here, which is
+/// why this runs while the transfer list is being read rather than later with the
+/// clones: a rejected message must not have moved anything, and Node's
+/// `Finish` loop is only reached once every entry has been accepted.
+pub fn transfer_for_messaging<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<Arc<dyn TransferData>> {
+    let kind = kind_of(scope, object)?;
+    let transfer = TRANSFER_KINDS.with(|kinds| kinds.borrow().get(kind).copied())?;
+    transfer(scope, object)
+}
+
 /// Whether `object` is a handle of a registered kind.
 pub fn is_registered(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<'_, v8::Object>) -> bool {
     kind_of(scope, object).is_some()
 }
+
 
 /// The kind `object` was marked with, if it was marked at all.
 ///
 /// The returned `&'static str` is the registry's own key, so a lookup does not leak
 /// a fresh string per cloned object. This runs for every object a serializer walks,
 /// so the common case — no mark at all — costs one private lookup and nothing else.
+///
+/// Both tables are searched, not just [`KINDS`]: a kind registered as
+/// transfer-only is still a kind, and a lookup that missed it would make every
+/// socket answer "not a host object" and be reported as
+/// `Found invalid value in transferList.` — the exact failure this split was
+/// meant to fix.
 fn kind_of(
     scope: &mut v8::PinScope<'_, '_>,
     object: v8::Local<'_, v8::Object>,
@@ -251,25 +319,36 @@ fn kind_of(
     let value = object.get_private(scope, key)?;
     let text = v8::Local::<v8::String>::try_from(value).ok()?;
     let name = text.to_rust_string_lossy(scope);
-    KINDS.with(|kinds| {
-        kinds
-            .borrow()
-            .keys()
-            .find(|kind| **kind == name.as_str())
-            .copied()
-    })
+    KINDS
+        .with(|kinds| {
+            kinds
+                .borrow()
+                .keys()
+                .find(|kind| **kind == name.as_str())
+                .copied()
+        })
+        .or_else(|| {
+            TRANSFER_KINDS.with(|kinds| {
+                kinds
+                    .borrow()
+                    .keys()
+                    .find(|kind| **kind == name.as_str())
+                    .copied()
+            })
+        })
 }
 
-/// The cached private key a handle's kind is stored under.
+/// The private key a handle's kind is stored under.
+///
+/// `Private::for_api` interns the name in the *running isolate*, so every call
+/// returns the same private for that isolate and nothing is cached across them.
+/// That is deliberate: a `v8::Global` cache would outlive the isolate that owns
+/// its handle, and a test binary that creates and disposes one isolate per case
+/// then reads through a dead handle and aborts. `rn_core::symbol` documents the
+/// same hazard for the registered-symbol table.
 fn mark_key<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Private>> {
-    let existing = MARK.with(|slot| slot.borrow().as_ref().map(|key| v8::Local::new(scope, key)));
-    if let Some(key) = existing {
-        return Some(key);
-    }
-    let name = v8::String::new(scope, "node:host_object_kind")?;
-    let key = v8::Private::new(scope, Some(name));
-    MARK.with(|slot| *slot.borrow_mut() = Some(v8::Global::new(scope, key)));
-    Some(key)
+    let name = v8::String::new(scope, MARK_NAME)?;
+    Some(v8::Private::for_api(scope, Some(name)))
 }
 
 #[cfg(test)]
