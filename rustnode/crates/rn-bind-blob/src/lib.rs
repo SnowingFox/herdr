@@ -689,6 +689,10 @@ fn new_handle<'s>(
     )? {
         return None;
     }
+    // Marked so `structuredClone` rebuilds it through [`BlobHandleClone`] rather
+    // than treating it as a plain object, which would drop the prototype's
+    // `slice` and `getReader` and leave a clone that cannot be read.
+    rn_core::host_object::mark(scope, object, BLOB_HANDLE_KIND);
     Some(object)
 }
 
@@ -878,6 +882,46 @@ fn throw_type_error(scope: &mut v8::PinScope, message: &str) {
 /// Registers the `blob` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Blob);
+    // A blob *handle* is a host object, so `structuredClone` can rebuild it.
+    // Without this the serialiser treats it as a plain object and the clone comes
+    // back with the private byte range but none of the prototype's methods, so
+    // `structuredClone(blob).text()` threw `getReader is not a function`.
+    //
+    // The reader is not marked: it is short-lived state a `Blob` creates on
+    // demand, never something a user holds across a message.
+    rn_core::host_object::register_kind(BLOB_HANDLE_KIND, blob_handle_clone);
+}
+
+/// The `host_object` kind name for a blob handle.
+const BLOB_HANDLE_KIND: &str = "BlobHandle";
+
+/// `Blob::CloneForMessaging`, which copies the handle's byte range.
+///
+/// Node's returns a `TransferData` that owns a `shared_ptr` to the same source
+/// blob, so the clone reads the same bytes without copying them. [`BlobHandleClone`]
+/// carries the range instead, which is what a rustnode handle is: no part list to
+/// share, and the bytes already live in one `ArrayBuffer` the clone can point at.
+fn blob_handle_clone<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<std::sync::Arc<dyn rn_core::host_object::TransferData>> {
+    let (bytes, start, end) = read_range(scope, object.into())?;
+    Some(std::sync::Arc::new(BlobHandleClone { bytes, start, end }))
+}
+
+/// The receiving half of a blob handle clone.
+struct BlobHandleClone {
+    bytes: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+impl rn_core::host_object::TransferData for BlobHandleClone {
+    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+        let object = new_handle(scope, &self.bytes, self.start, self.end)?;
+        rn_core::host_object::mark(scope, object, BLOB_HANDLE_KIND);
+        Some(object)
+    }
 }
 
 #[cfg(test)]
