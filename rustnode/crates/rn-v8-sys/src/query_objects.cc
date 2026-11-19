@@ -51,26 +51,35 @@
 // # The invariants this file depends on
 //
 // Re-declaring V8 classes is an ODR-sensitive stopgap. It is safe only while these
-// stay compatible with V8 152.2.0 (the pinned crate). Re-check on every `v8` crate
-// bump:
+// stay compatible with the linked V8 build. Re-check on every `v8` crate bump —
+// and note that the last bump (15.2 -> 15.6) changed *one of these and not the
+// others*, which is exactly why the vector layout below carries its own long
+// explanation:
 //
 // * `v8::Local<T>` holds one tagged `T*` (`v8-handle-base.h:89`,
 //   `ValueHelper::SlotAsValue`), so it is pointer-sized and trivially copyable.
 //   `isolate_measure_memory.cc` already relies on this and pins it the same way.
 // * `v8::Global<T>` is one `internal::Address*` slot, and the cell it points at
 //   holds that same tagged pointer (`v8-handle-base.h:83`, `:80`).
-// * `v8::api_internal::DisposeGlobal(unsigned long*)` stays exported.
+// * `v8::api_internal::DisposeGlobal(uintptr_t*)` stays exported, and it *releases*
+//   the cell (`GlobalHandles::Destroy` -> `NodeSpace::Release`). Nothing may be
+//   written through the slot afterwards; see `VectorOwner`.
 // * `QueryObjectPredicate` keeps `~QueryObjectPredicate` then
 //   `virtual bool Filter(Local<Object>)`, in that order, with no other virtuals.
+//   Unchanged in 15.6 (`v8-profiler.h:1001`).
 // * `HeapProfiler::QueryObjects(Local<Context>, QueryObjectPredicate*,
 //   std::__Cr::vector<Global<Object>>*)` keeps this signature and the `__Cr`
-//   namespace. The archive's mangled symbol is the evidence:
+//   namespace. Unchanged in 15.6 (`v8-profiler.h:1013`). The archive's mangled
+//   symbol is the evidence:
 //
 //     _ZN2v812HeapProfiler12QueryObjectsENS_5LocalINS_7ContextEEEPNS_20QueryObjectPredicateEPNSt4__Cr6vectorINS_6GlobalINS_6ObjectEEENS6_9allocatorISA_EEEE
 //
-// * `std::__Cr::vector<T>` keeps libc++'s three-pointer layout (`begin`, `end`,
-//   `capacity_end`). The storage below is exactly that and is only ever handed to
-//   V8 to fill.
+// * `std::__Cr::vector<T>` layout. **This changed between 15.2 and 15.6.** It is
+//   `{begin, size, capacity}` (plus an empty, storage-free allocator) because V8
+//   15.6's libc++ defines `_LIBCPP_ABI_VECTOR_LAYOUT_SIZE_BASED`; 15.2's did not
+//   and used `{begin, end, capacity_end}`. The mangled name is identical either
+//   way, so a mismatch links cleanly and misbehaves at run time. See the `vector`
+//   declaration below for the full reasoning.
 // * `v8::Array::New(Isolate*, Local<Value>*, size_t)` keeps this signature; the
 //   archive exports this overload and it is the one Node's
 //   `Array::New(isolate, result.data(), result.size())` resolves to.
@@ -83,14 +92,37 @@
 
 namespace std {
 namespace __Cr {
-// Storage layout only. The destructor is deliberately *not* declared: this file
-// never calls it, and declaring it would emit a call to a symbol the archive does
-// not define.
+// Storage layout of libc++ 21's `std::__Cr::vector`, which is what V8 15.6 is
+// built against.
+//
+// This is NOT the three-pointer layout older libc++ used, and the difference is
+// load-bearing rather than cosmetic. V8 15.6's `buildtools/third_party/libc++`
+// sets `_LIBCPP_ABI_VERSION 2` and defines
+// `_LIBCPP_ABI_VECTOR_LAYOUT_SIZE_BASED`
+// (`third_party/libc++/src/include/__configuration/abi.h:74`), which selects:
+//
+//     pointer __begin_;
+//     size_type __size_;
+//     size_type __capacity_;
+//     _LIBCPP_NO_UNIQUE_ADDRESS allocator_type __alloc_;   // empty, no storage
+//
+// V8 15.2's libc++ was also ABI version 2 but predates that flag and laid the
+// vector out as `{begin, end, capacity_end}`. Both spell the type
+// `NSt4__Cr6vectorIN2v86GlobalINS2_6ObjectEEENS0_9allocatorIS4_EEEE`, so the
+// mangled name V8 exports matches either way and the linker cannot tell them
+// apart — only the field meanings differ.
+//
+// Reading `end`/`capacity` as pointers under the size-based layout yields the
+// *counts* reinterpreted as addresses (`end == 0x1` for one element), and the
+// resulting walk over `[begin, 0x1)` is what produced a silent SIGABRT in
+// `test-v8-query-objects.js`. Do not "simplify" these back to three pointers.
 template <class T, class A>
 struct vector {
   T* begin_;
-  T* end_;
-  T* capacity_end_;
+  std::size_t size_;
+  std::size_t capacity_;
+  // An empty allocator is `_LIBCPP_NO_UNIQUE_ADDRESS`, so it occupies no storage
+  // and is deliberately not represented here.
 };
 
 template <class T>
@@ -107,14 +139,17 @@ void DisposeGlobal(std::uintptr_t* global);
 namespace {
 
 /// Owns the vector `QueryObjects` filled and applies libc++'s inline destructor
-/// semantics by hand: dispose each element's global reference, clear its slot, then
-/// release the storage.
+/// semantics by hand: dispose each element's global reference, then release the
+/// storage.
 ///
 /// This exists because libc++'s `vector<Global<Object>>::~vector` is emitted inline
 /// in headers this translation unit cannot include, and the archive defines no such
 /// symbol. Doing it in a destructor keeps the release correct on every exit path,
 /// which the earlier "dispose in the fill loop" version was not: it unrooted the
 /// objects before `Array::New` allocated, and that was measured as a segfault.
+///
+/// The elements are addressed as `begin_ + i` rather than by walking `end_`,
+/// because the layout is size-based — see the `vector` comment above.
 template <class T, class A>
 class VectorOwner {
  public:
@@ -124,18 +159,21 @@ class VectorOwner {
     if (vector_ == nullptr) {
       return;
     }
-    for (T* element = vector_->begin_; element != vector_->end_; ++element) {
-      // `PersistentBase<T>::Reset()`: skip an empty slot, dispose the cell, clear it.
-      std::uintptr_t* slot = element->slot();
+    for (std::size_t i = 0; i < vector_->size_; ++i) {
+      // `PersistentBase<T>::Reset()`: skip an empty slot and dispose the cell.
+      // Nothing is written back afterwards: `DisposeGlobal` hands the cell to
+      // V8's global-handle free list (`GlobalHandles::Destroy` ->
+      // `NodeSpace::Release`), so writing through the slot once it is released
+      // would corrupt that list.
+      std::uintptr_t* slot = vector_->begin_[i].slot();
       if (slot != nullptr) {
         v8::api_internal::DisposeGlobal(slot);
-        *slot = 0;
       }
     }
     ::operator delete(vector_->begin_);
     vector_->begin_ = nullptr;
-    vector_->end_ = nullptr;
-    vector_->capacity_end_ = nullptr;
+    vector_->size_ = 0;
+    vector_->capacity_ = 0;
   }
 
  private:
@@ -278,18 +316,19 @@ extern "C" bool rn_v8_sys__query_objects(v8::Isolate* isolate,
     return false;
   }
 
-  // A default-constructed libc++ vector is all-null; the brace-init states that
-  // rather than relying on a constructor this file does not link. V8's own
-  // `emplace_back` growth path does the allocating.
+  // A default-constructed libc++ vector is `{nullptr, 0, 0}` under the
+  // size-based layout; the brace-init states that rather than relying on a
+  // constructor this file does not link. V8's own `emplace_back` growth path does
+  // the allocating.
   std::__Cr::vector<v8::Global<v8::Object>,
                     std::__Cr::allocator<v8::Global<v8::Object>>>
-      found{nullptr, nullptr, nullptr};
+      found{nullptr, 0, 0};
 
   CallbackPredicate predicate(filter, user);
   isolate->GetHeapProfiler()->QueryObjects(local_from_ptr(context), &predicate,
                                            &found);
 
-  const size_t count = static_cast<size_t>(found.end_ - found.begin_);
+  const size_t count = found.size_;
 
   // The vector's references stay rooted until this frame exits. They have to: the
   // element pointers below are read out of the globals, and `Array::New` allocates,
