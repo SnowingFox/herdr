@@ -370,6 +370,14 @@ struct ShutdownCompletion {
     handle: v8::Global<v8::Object>,
     /// The stream the shutdown was queued on; see [`WriteCompletion::state`].
     state: *mut StreamState,
+    /// The `ShutdownWrap`'s `AsyncWrap` identity.
+    ///
+    /// `StreamBase::Shutdown` creates the wrap inside an
+    /// `AsyncHooks::DefaultTriggerAsyncIdScope(GetAsyncWrap())`
+    /// (`src/stream_base.cc`), so it is its own async resource with the stream as
+    /// its trigger, and `oncomplete` runs through `ReqWrap::Done`'s
+    /// `MakeCallback`.
+    async_wrap: rn_core::AsyncWrapState,
 }
 
 /// Issues `uv_shutdown`, reporting to `request.oncomplete`.
@@ -383,11 +391,18 @@ pub unsafe fn queue_shutdown(
     request: v8::Local<v8::Object>,
     handle_object: v8::Local<v8::Object>,
 ) -> i32 {
+    // The trigger is the stream itself, so the request's `triggerAsyncId` is
+    // the socket that is shutting down rather than whatever is executing.
+    let owner_id = unsafe { handle::owner(stream) }
+        .map(|state| unsafe { (*state).async_wrap.async_id })
+        .unwrap_or(rn_core::INVALID_ASYNC_ID);
+    let async_wrap = new_shutdown_wrap(scope, request, owner_id);
     let completion = Box::new(ShutdownCompletion {
         request: v8::Global::new(scope.as_ref(), request),
         handle: v8::Global::new(scope.as_ref(), handle_object),
         // SAFETY: as in `queue_write`.
         state: unsafe { handle::owner(stream) }.unwrap_or(ptr::null_mut()),
+        async_wrap,
     });
     let completion = Box::into_raw(completion);
 
@@ -405,6 +420,9 @@ pub unsafe fn queue_shutdown(
     let status = unsafe { uv::uv_shutdown(request_ref, stream, Some(after_shutdown)) };
 
     if status != 0 {
+        // `if (err != 0 && req_wrap != nullptr) req_wrap->Dispose();` — the
+        // constructor emitted an `init`, so the dispose owes it a `destroy`.
+        rn_core::callback_scope::emit_destroy(async_wrap.async_id);
         // SAFETY: libuv did not take ownership when `uv_shutdown` failed.
         unsafe {
             drop(Box::from_raw(storage));
@@ -412,6 +430,31 @@ pub unsafe fn queue_shutdown(
         }
     }
     status
+}
+
+/// `new ShutdownWrap(req_wrap_obj)` as `CreateShutdownWrap` builds it.
+///
+/// `StreamBase::Shutdown` names it `PROVIDER_SHUTDOWNWRAP`
+/// (`src/stream_base-inl.h:107`); the request object `lib/net.js` constructed is
+/// the resource, which is why the ids are recorded here rather than on the
+/// socket.
+fn new_shutdown_wrap(
+    scope: &mut v8::PinScope<'_, '_>,
+    request: v8::Local<v8::Object>,
+    trigger_async_id: f64,
+) -> rn_core::AsyncWrapState {
+    let mut state =
+        rn_core::AsyncWrapState::uninitialised(rn_core::async_wrap::PROVIDER_SHUTDOWNWRAP);
+    if let Some((async_id, trigger_async_id)) = rn_core::callback_scope::emit_init(
+        scope,
+        request,
+        rn_core::async_wrap::PROVIDER_SHUTDOWNWRAP,
+        Some(trigger_async_id),
+    ) {
+        state.async_id = async_id;
+        state.trigger_async_id = trigger_async_id;
+    }
+    state
 }
 
 /// libuv's shutdown completion.
@@ -435,11 +478,40 @@ unsafe extern "C" fn after_shutdown(request: *mut uv::uv_shutdown_t, status: i32
     callback::with_context(|scope| {
         let request: v8::Local<v8::Object> = v8::Local::new(scope, &completion.request);
         let handle: v8::Local<v8::Object> = v8::Local::new(scope, &completion.handle);
-        // SAFETY: as in `after_write`; `emit_after_shutdown` holds no reference
-        // to the state across the listener call.
-        unsafe {
-            listener::emit_after_shutdown(completion.state, scope, request, Some(handle), status)
-        };
+        // `ReqWrap<uv_shutdown_t>::Done` runs `oncomplete` through
+        // `MakeCallback`, which pushes the request's context and emits
+        // `before`/`after`; `destroy` follows as the wrap is released.
+        let context = rn_core::callback_scope::AsyncContext::from(completion.async_wrap);
+        if context.is_resource() {
+            // The listener call needs locals of the scope it runs in, so the two
+            // objects are rooted and re-materialised inside it.
+            let request = v8::Global::new(scope.as_ref(), request);
+            let handle_global = v8::Global::new(scope.as_ref(), handle);
+            let state = completion.state;
+            let _ = rn_core::callback_scope::with_scope(
+                scope,
+                rn_core::callback_scope::ScopeArgs {
+                    context,
+                    resource: Some(v8::Global::new(scope.as_ref(), v8::Local::<v8::Object>::new(scope, &request))),
+                    frame: None,
+                },
+                |scoped| {
+                    let request = v8::Local::<v8::Object>::new(scoped, &request);
+                    let handle = v8::Local::<v8::Object>::new(scoped, &handle_global);
+                    // SAFETY: as in `after_write`; `emit_after_shutdown` holds no
+                    // reference to the state across the listener call.
+                    unsafe {
+                        listener::emit_after_shutdown(state, scoped, request, Some(handle), status)
+                    };
+                },
+            );
+        } else {
+            // SAFETY: as in `after_write`.
+            unsafe {
+                listener::emit_after_shutdown(completion.state, scope, request, Some(handle), status)
+            };
+        }
+        rn_core::callback_scope::emit_destroy(completion.async_wrap.async_id);
     });
 }
 

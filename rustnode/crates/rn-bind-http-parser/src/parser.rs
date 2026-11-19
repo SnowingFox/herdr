@@ -248,6 +248,33 @@ pub struct Parser {
     /// (`handle.onread`), so attaching records the handle rather than installing
     /// a second listener; see [`Parser::consume`].
     stream: Option<ConsumedStream>,
+    /// `AsyncWrap`'s ids for the parser, set by `initialize`.
+    ///
+    /// `Parser` derives from `AsyncWrap` and `initialize` is its `AsyncReset`
+    /// (`src/node_http_parser.cc:762-767`), so the provider depends on the parser
+    /// kind: a request parser produces `HTTPINCOMINGMESSAGE`, a response parser
+    /// `HTTPCLIENTREQUEST`. Every one of the four callbacks is a `MakeCallback`,
+    /// so the ids are what make `onHeaders`, `onHeadersComplete`, `onBody` and
+    /// `onMessageComplete` report as that resource.
+    pub async_wrap: rn_core::AsyncWrapState,
+    /// The object `initialize` passed as `args[1]`, rooted.
+    ///
+    /// `parser->AsyncReset(args[1].As<Object>())` records it as the parser's
+    /// *public* resource (`resource_symbol`), so `init` receives it and
+    /// `executionAsyncResource()` must answer the same object — `test/async-hooks/
+    /// test-async-exec-resource-http.js` asserts exactly that with
+    /// `strictEqual`. Node's `lookupPublicResource` performs that mapping on the
+    /// JavaScript side; here the object is kept and pushed directly.
+    pub resource_object: Option<v8::Global<v8::Object>>,
+    /// The frame `AsyncReset` captured, `async_context_frame::current()`.
+    ///
+    /// Node's `AsyncReset` ends with `set_context_frame(...)`
+    /// (`src/async_wrap.cc:635`), and `InternalCallbackScope` exchanges it back
+    /// in around each `MakeCallback`. That is what carries an
+    /// `AsyncLocalStorage` store into the parser's callbacks: without it a
+    /// parser callback runs with `undefined` as the frame and the store reads as
+    /// absent.
+    pub context_frame: Option<v8::Global<v8::Value>>,
 }
 
 /// The handle a consuming parser is attached to.
@@ -403,6 +430,11 @@ impl Parser {
             headers_completed: false,
             connections: None,
             stream: None,
+            async_wrap: rn_core::AsyncWrapState::uninitialised(
+                rn_core::async_wrap::PROVIDER_NONE,
+            ),
+            resource_object: None,
+            context_frame: None,
         }));
         let callbacks = ffi::Callbacks {
             user: raw.cast::<c_void>(),
@@ -483,10 +515,10 @@ impl Parser {
     /// `initialize(type, asyncResource, maxHeaderSize, lenientFlags,
     /// connectionsList, maxHeaderPairs)`.
     ///
-    /// `async_resource` is Node's `AsyncResource` and carries no parser state;
-    /// it is accepted by the binding but not stored, because `async_hooks`
-    /// tracing of the incoming message is not implemented here. Every other
-    /// argument is used.
+    /// `async_wrap` is the identity the binding emitted for the resource object
+    /// `args[1]` — `parser->AsyncReset(args[1].As<Object>())`
+    /// (`src/node_http_parser.cc:767`). Every callback the parser makes is a
+    /// `MakeCallback` on it.
     pub fn initialize(
         &mut self,
         kind: Kind,
@@ -494,7 +526,13 @@ impl Parser {
         lenient_flags: u32,
         max_header_pairs: usize,
         has_connections: bool,
+        async_wrap: rn_core::AsyncWrapState,
+        resource_object: Option<v8::Global<v8::Object>>,
+        context_frame: Option<v8::Global<v8::Value>>,
     ) {
+        self.async_wrap = async_wrap;
+        self.resource_object = resource_object;
+        self.context_frame = context_frame;
         // SAFETY: `llhttp` is the live instance this parser owns.
         unsafe { ffi::rn_llhttp_init(self.llhttp.get(), kind.llhttp()) };
         if lenient_flags != 0 {
@@ -662,6 +700,15 @@ impl Parser {
         self.clear_cached_callbacks();
         self.body.clear();
         self.accumulator.reset_for_message();
+        // `~Parser` releases the `AsyncWrap`, which queues its `destroy`. The
+        // id is only emitted once, hence the reset.
+        let async_id = self.async_wrap.async_id;
+        self.async_wrap = rn_core::AsyncWrapState::uninitialised(rn_core::async_wrap::PROVIDER_NONE);
+        self.resource_object = None;
+        self.context_frame = None;
+        if async_id > 0.0 {
+            rn_core::callback_scope::emit_destroy(async_id);
+        }
     }
 
     /// `remove()`: stops further callbacks, Node's `is_being_freed_`.

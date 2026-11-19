@@ -103,7 +103,7 @@ pub unsafe fn c_str<'a>(pointer: *const c_char) -> Option<&'a str> {
 /// happens after teardown.
 fn with_scope<R>(
     parser: &mut Parser,
-    body: impl FnOnce(&mut Parser, &v8::PinScope<'_, '_>) -> R,
+    body: impl FnOnce(&mut Parser, &mut v8::PinScope<'_, '_>) -> R,
 ) -> Option<R> {
     // The wrapper is a `Copy` address, so a local holds it; the reference taken
     // from it lives exactly as long as this call, which is what makes it sound
@@ -135,8 +135,53 @@ fn with_scope<R>(
     // `ContextScope` derefs to `PinScope<'_, '_>`, which is the shape every V8
     // helper below takes. The storage outlives the body, so the deref is valid
     // throughout.
-    let scope: &v8::PinScope<'_, '_> = &context_storage;
+    //
+    // The scope is handed over mutably because a parser callback runs through
+    // `rn_core::callback_scope::with_scope`, which needs `&mut` to open the
+    // parser's async context around the call.
+    let mut storage = context_storage;
+    let scope: &mut v8::PinScope<'_, '_> = &mut storage;
     Some(body(parser, scope))
+}
+
+/// Runs a parser callback inside the parser's `AsyncWrap` context.
+///
+/// `Parser` derives from `AsyncWrap` and every callback it makes is a
+/// `MakeCallback` (`src/node_http_parser.cc:894`, `:1015`), so
+/// `executionAsyncId()` inside `kOnHeaders`/`kOnBody` answers the parser's id and
+/// the `init` the resource object emitted gets its matching `before`/`after`.
+///
+/// A parser that was never given a resource runs the call bare, which is what it
+/// did before this existed.
+fn in_parser_call<R>(
+    scope: &mut v8::PinScope<'_, '_>,
+    parser: &Parser,
+    receiver: v8::Local<v8::Object>,
+    body: impl FnOnce(&mut v8::PinScope<'_, '_>) -> R,
+) -> Option<R> {
+    let context = rn_core::callback_scope::AsyncContext::from(parser.async_wrap);
+    if !context.is_resource() {
+        return Some(body(scope));
+    }
+    // The resource is the object `initialize` received, not the parser: `init`
+    // was emitted for that object, and `executionAsyncResource()` has to answer
+    // the same one. A parser without one falls back to itself, which is the
+    // pre-existing behaviour.
+    let resource = match parser.resource_object.as_ref() {
+        Some(resource) => v8::Global::new(scope.as_ref(), v8::Local::<v8::Object>::new(scope, resource)),
+        None => v8::Global::new(scope.as_ref(), receiver),
+    };
+    rn_core::callback_scope::with_scope(
+        scope,
+        rn_core::callback_scope::ScopeArgs {
+            context,
+            resource: Some(resource),
+            // The frame `AsyncReset` captured, so an `AsyncLocalStorage` store
+            // survives into the parser's callbacks.
+            frame: parser.context_frame.as_ref().map(|frame| v8::Global::new(scope.as_ref(), v8::Local::<v8::Value>::new(scope, frame))),
+        },
+        body,
+    )
 }
 
 /// Reads the callback for `slot`, caching it the way Node's internal fields do.
@@ -175,7 +220,12 @@ pub fn call_no_args(parser: &mut Parser, slot: Slot) {
         let Some(receiver) = receiver(scope, parser) else {
             return true;
         };
-        callback.call(scope, receiver.into(), &[]).is_some()
+        // `MakeCallback` on the parser's own `AsyncWrap`, so the resource
+        // object's `init` gets its `before`/`after` pair.
+        in_parser_call(scope, parser, receiver, |scoped| {
+            callback.call(scoped, receiver.into(), &[]).is_some()
+        })
+        .unwrap_or(true)
     });
     if outcome == Some(false) {
         parser.note_exception();
@@ -206,7 +256,10 @@ pub fn call_headers<'a>(
             .and_then(|bytes| one_byte_string(scope, bytes))
             .unwrap_or_else(|| v8::String::empty(scope));
         let args = [array.into(), url.into()];
-        callback.call(scope, receiver.into(), &args).is_some()
+        in_parser_call(scope, parser, receiver, |scoped| {
+            callback.call(scoped, receiver.into(), &args).is_some()
+        })
+        .unwrap_or(false)
     });
     match outcome {
         // No callback installed, or no object: `lib/**` cleared it.
@@ -231,7 +284,10 @@ pub fn call_body(parser: &mut Parser, bytes: &[u8]) -> bool {
             return true;
         };
         let args = [buffer];
-        callback.call(scope, receiver.into(), &args).is_some()
+        in_parser_call(scope, parser, receiver, |scoped| {
+            callback.call(scoped, receiver.into(), &args).is_some()
+        })
+        .unwrap_or(false)
     });
     match outcome {
         None | Some(true) => true,
@@ -313,19 +369,22 @@ pub fn call_headers_complete(
             v8::Boolean::new(scope, args.keep_alive).into(),
         ];
 
-        let Some(result) = callback.call(scope, receiver.into(), &call_args) else {
-            return HeadersComplete::Failed;
-        };
-        // Node reads the result with `IntegerValue`, which maps `undefined` and
-        // `null` to 0 and truncates a number; only an integer is a valid
-        // instruction, and anything else stops the parse.
-        match result.integer_value(scope) {
-            Some(value) => match c_int::try_from(value) {
-                Ok(instruction) => HeadersComplete::Instruction(instruction),
-                Err(_) => HeadersComplete::Failed,
-            },
-            None => HeadersComplete::Failed,
-        }
+        in_parser_call(scope, parser, receiver, |scoped| {
+            let Some(result) = callback.call(scoped, receiver.into(), &call_args) else {
+                return HeadersComplete::Failed;
+            };
+            // Node reads the result with `IntegerValue`, which maps `undefined`
+            // and `null` to 0 and truncates a number; only an integer is a valid
+            // instruction, and anything else stops the parse.
+            match result.integer_value(scoped) {
+                Some(value) => match c_int::try_from(value) {
+                    Ok(instruction) => HeadersComplete::Instruction(instruction),
+                    Err(_) => HeadersComplete::Failed,
+                },
+                None => HeadersComplete::Failed,
+            }
+        })
+        .unwrap_or(HeadersComplete::Failed)
     });
 
     match outcome {

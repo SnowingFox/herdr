@@ -774,6 +774,24 @@ impl rn_core::callback_scope::CallbackScopeHooks for ScopeHooks {
         // be free to drift.
         rn_errors::report_uncaught_exception(scope, error);
     }
+
+    /// `AsyncWrap`'s constructor half, for `rn-uv`'s request wraps.
+    fn emit_init(
+        &self,
+        scope: &mut v8::PinScope<'_, '_>,
+        object: v8::Local<v8::Object>,
+        provider: u32,
+        trigger_async_id: Option<f64>,
+    ) -> Option<(f64, f64)> {
+        let async_id = next_async_id();
+        let trigger_async_id = trigger_async_id.unwrap_or_else(default_trigger_async_id);
+        emit_async_init(scope, object, provider, async_id, trigger_async_id);
+        Some((async_id, trigger_async_id))
+    }
+
+    fn emit_destroy(&self, async_id: f64) {
+        emit_destroy(async_id);
+    }
 }
 
 /// Pushes an async context onto the shared stack.

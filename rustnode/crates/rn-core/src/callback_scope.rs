@@ -168,6 +168,33 @@ pub trait CallbackScopeHooks {
     /// implementation anywhere — two paths that disagree about ordering is the
     /// same class of defect as two finalizer registries.
     fn report_uncaught(&self, scope: &mut v8::PinScope<'_, '_>, error: v8::Local<v8::Value>);
+
+    /// Emits `init` for a resource that is created once and destroyed once.
+    ///
+    /// This is `AsyncWrap`'s constructor half: a fresh id, a trigger id, and
+    /// `EmitAsyncInit`. `rn-uv` needs it for the request wraps it owns
+    /// (`ShutdownWrap`, `WriteWrap`) but must not depend on a binding crate, so
+    /// it asks here the same way it asks for a callback scope.
+    ///
+    /// `trigger_async_id` is `AsyncHooks::DefaultTriggerAsyncIdScope`'s value:
+    /// `Some(id)` for a request that belongs to a specific handle, `None` for the
+    /// currently executing one.
+    ///
+    /// Returns `(async_id, trigger_async_id)`, or `None` when the shared arrays
+    /// do not exist yet. The default is "nothing emitted", which is the honest
+    /// answer for a caller running before `async_wrap` installed.
+    fn emit_init(
+        &self,
+        _scope: &mut v8::PinScope<'_, '_>,
+        _object: v8::Local<v8::Object>,
+        _provider: u32,
+        _trigger_async_id: Option<f64>,
+    ) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// `AsyncWrap::EmitDestroy` for an id [`Self::emit_init`] returned.
+    fn emit_destroy(&self, _async_id: f64) {}
 }
 
 thread_local! {
@@ -196,6 +223,30 @@ pub fn set_hooks(hooks: Rc<dyn CallbackScopeHooks>) {
 pub fn is_installed() -> bool {
     HOOKS.with(|slot| slot.borrow().is_some())
 }
+
+/// `AsyncWrap`'s constructor half, through whichever binding answers.
+///
+/// `rn-uv` owns request wraps (`ShutdownWrap`, `WriteWrap`) that are `AsyncWrap`
+/// subclasses in Node, and it must not depend on `rn-bind-async-wrap`. This is
+/// the seam it uses instead, the same one [`with_scope`] exists for.
+pub fn emit_init(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<v8::Object>,
+    provider: u32,
+    trigger_async_id: Option<f64>,
+) -> Option<(f64, f64)> {
+    let hooks = HOOKS.with(|slot| slot.borrow().clone())?;
+    hooks.emit_init(scope, object, provider, trigger_async_id)
+}
+
+/// `AsyncWrap::EmitDestroy` through the registered implementation.
+pub fn emit_destroy(async_id: f64) {
+    if let Some(hooks) = HOOKS.with(|slot| slot.borrow().clone()) {
+        hooks.emit_destroy(async_id);
+    }
+}
+
+
 
 /// Runs `body` with the scope for `args` open around it.
 ///

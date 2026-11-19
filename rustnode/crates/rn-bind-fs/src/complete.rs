@@ -371,6 +371,25 @@ pub fn deliver_to_promise<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     completion: Completion<'s>,
 ) -> Option<Local<'s, v8::Promise>> {
+    deliver_to_promise_typed(
+        scope,
+        completion,
+        rn_core::async_wrap::PROVIDER_FSREQPROMISE,
+    )
+}
+
+/// [`deliver_to_promise`] with the resource kind named by the caller.
+///
+/// `FSReqPromise` reports `FSREQPROMISE`, but a `FileHandle.close()` builds a
+/// `FileHandle::CloseReq`, which is `PROVIDER_FILEHANDLECLOSEREQ`
+/// (`src/node_file.cc:446`). Both are promise-shaped and both have to be one
+/// async resource, so the provider is a parameter rather than a second copy of
+/// this function.
+pub fn deliver_to_promise_typed<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    completion: Completion<'s>,
+    provider: u32,
+) -> Option<Local<'s, v8::Promise>> {
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
 
@@ -378,11 +397,7 @@ pub fn deliver_to_promise<'s>(
     // different lifetime and needs to reach the promise it belongs to.
     let resolver = v8::Global::new(scope.as_ref(), resolver);
     let resource = v8::Object::new(scope);
-    let async_id = rn_bind_async_wrap::emit_init_for_new_resource(
-        scope,
-        resource,
-        rn_core::async_wrap::PROVIDER_FSREQPROMISE,
-    );
+    let async_id = rn_bind_async_wrap::emit_init_for_new_resource(scope, resource, provider);
     let resource = v8::Global::new(scope.as_ref(), resource);
     let context = async_id.map(|(async_id, trigger_async_id)| {
         rn_core::callback_scope::AsyncContext {

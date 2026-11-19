@@ -1138,6 +1138,7 @@ name = "rn-bind-http-parser"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-node-oracle",
  "rn-uv",
