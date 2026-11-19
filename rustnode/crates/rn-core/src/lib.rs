@@ -35,7 +35,10 @@ pub mod watchdog;
 
 pub use abi::{BindingModule, InstallCtx};
 pub use aliased_buffer::{AliasedUint8Array, Element};
-pub use array_buffer_allocator::{live_array_buffer_bytes, with_counted_array_buffer_allocator};
+pub use array_buffer_allocator::{
+    live_array_buffer_bytes, with_counted_array_buffer_allocator,
+    with_debugging_array_buffer_allocator,
+};
 pub use async_wrap::{AsyncIds, AsyncWrapState, INVALID_ASYNC_ID};
 pub use binding::{BindingRegistry, Installer, Namespace};
 pub use codec::Encoding;

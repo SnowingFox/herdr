@@ -459,6 +459,16 @@ struct HookState {
     trace_uncaught: bool,
     stack_trace_limit: i64,
     zero_fill_buffers: bool,
+    /// `--trace-sync-io`: warn on a synchronous `fs`/`zlib`/`crypto` call once the
+    /// loop has started.
+    ///
+    /// Two halves, both from Node. `EnvironmentOptions::trace_sync_io` is what
+    /// [`set_trace_sync_io`] records, and `Environment::set_trace_sync_io` is the
+    /// narrower one `SpinEventLoopInternal` flips on at loop start and off at loop
+    /// exit (`src/api/embed_helpers.cc:35`, `:69`) — which is why a sync call
+    /// during the first tick is silent and the same call from a timer is not.
+    trace_sync_io: bool,
+    trace_sync_io_active: bool,
     extra_info_on_fatal_exception: bool,
     node_version: String,
     force_node_api_uncaught_exceptions_policy: bool,
@@ -511,6 +521,8 @@ impl Default for HookState {
             trace_uncaught: false,
             stack_trace_limit: DEFAULT_STACK_TRACE_LIMIT,
             zero_fill_buffers: false,
+            trace_sync_io: false,
+            trace_sync_io_active: false,
             // `extra_info_on_fatal_exception` defaults to *true*
             // (`src/node_options.cc:1419`), unlike every other boolean here.
             extra_info_on_fatal_exception: true,
@@ -733,6 +745,43 @@ pub fn set_zero_fill_buffers(value: bool) {
 #[must_use]
 pub fn zero_fill_buffers() -> bool {
     STATE.with(|state| state.borrow().zero_fill_buffers)
+}
+
+/// Records whether `--trace-sync-io` was given.
+///
+/// `EnvironmentOptions::trace_sync_io` (`src/node_options.h:283`). The flag
+/// itself does nothing until [`set_trace_sync_io_active`] turns the reporting on,
+/// which is `SpinEventLoopInternal`'s `env->set_trace_sync_io(...)`.
+pub fn set_trace_sync_io(value: bool) {
+    STATE.with(|state| {
+        state.borrow_mut().trace_sync_io = value;
+    });
+}
+
+/// Whether `--trace-sync-io` was given, without regard to the loop's phase.
+#[must_use]
+pub fn trace_sync_io() -> bool {
+    STATE.with(|state| state.borrow().trace_sync_io)
+}
+
+/// Turns the sync-IO warning on when the loop starts and off when it stops.
+///
+/// `Environment::set_trace_sync_io` (`src/env-inl.h:337`), called from
+/// `SpinEventLoopInternal` around `uv_run` (`src/api/embed_helpers.cc:35` and
+/// `:69`). Keeping it separate from [`trace_sync_io`], which records the flag, is
+/// what makes a `readFileSync` in the first tick silent while the same call from
+/// a `setImmediate` warns — measured on the oracle, and the reason the flag's
+/// help text says "after the first tick".
+pub fn set_trace_sync_io_active(value: bool) {
+    STATE.with(|state| {
+        state.borrow_mut().trace_sync_io_active = value;
+    });
+}
+
+/// Whether a synchronous call should report right now.
+#[must_use]
+pub fn trace_sync_io_active() -> bool {
+    STATE.with(|state| state.borrow().trace_sync_io_active)
 }
 
 /// Records whether `--no-extra-info-on-fatal-exception` was given.

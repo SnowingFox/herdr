@@ -39,10 +39,29 @@
 //! because the interceptor now answers for it. So the instance must be a plain
 //! object whose interceptor *shadows* anything reachable through the prototype.
 //!
-//! # What is not implemented
+//! # `--trace-env`
 //!
-//! `--trace-env` and the permission model's read-time reporting are stated as
-//! gaps in [`GAPS`] rather than approximated.
+//! The five messages `src/node_env_var.cc` emits are produced here, from the
+//! same callbacks the interceptors already implement, so every access the
+//! JavaScript layer makes is reported: `get`, `set`, `query`, `delete` and
+//! `enumerate environment variables`, each after the `[--trace-env] ` prefix and
+//! with the variable name double-quoted.
+//!
+//! Two parts of Node's implementation are deliberately not reproduced.
+//! `--trace-env-js-stack` and `--trace-env-native-stack` imply `--trace-env` and
+//! additionally dump a stack after each message; those two flags stay reported
+//! as unimplemented because a JavaScript-stack dump needs the realm's
+//! `prepareStackTrace` and a native dump needs `DumpNativeBacktrace`, neither of
+//! which exists here. `--trace-env` alone is the message stream, which is what
+//! this covers.
+//!
+//! The bootstrap reads Node makes through `credentials::SafeGetenv`
+//! (`NODE_ICU_DATA`, `OPENSSL_CONF`, `NODE_EXTRA_CA_CERTS`, `HOME`, `NODE_PATH`
+//! and the rest of the eleven the oracle reports before any user code runs) do
+//! not appear here: they are native reads in this build too, and they do not go
+//! through `process.env`. What the flag reports is the JavaScript-level access
+//! stream, which is what makes a script's own reads and writes visible — the
+//! case the flag exists for.
 
 use rn_v8_sys::v8;
 
@@ -51,30 +70,51 @@ use rn_v8_sys::v8;
 /// Each entry is a gap rather than a silent omission: a caller can report it,
 /// and `DEVIATIONS` in `rn-compat` is the place a test would look. The list is
 /// data so it can be asserted on instead of remembered.
-pub const GAPS: &[(&str, &str)] = &[
-    (
-        "--trace-env",
-        "src/node_env_var.cc's TraceEnvVar writes a line to stderr for every get, set, \
-         query, delete and enumerate. The flag is parsed and stored, but nothing in this \
-         module emits the lines.",
-    ),
-    (
-        "DEP0104 under a worker's own realm",
-        "The DEP0104 warning is emitted from the setter (--pending-deprecation and a value \
-         that is not string, number or boolean), once per process. It reaches \
-         process.emitWarning through the module loader, so an assignment that happens \
-         before internal/process/warning is requireable is a silent skip; the store still \
-         happens.",
-    ),
-    (
-        "permission env scrub reporting",
-        "Node's EnvGetter and EnvQuery publish a denial to node:permission-model:env and \
+pub const GAPS: &[(&str, &str)] = &[(
+    "DEP0104 under a worker's own realm",
+    "Node's EnvGetter and EnvQuery publish a denial to node:permission-model:env and \
          warn once when a variable was removed by the startup scrub. This build scrubs the \
          block (rn-permission) but does not report a read of a removed variable, so \
          test-permission-env-warning.js fails. The scrub also does not wipe the initial \
          environment entries, so `/proc/<pid>/environ` still shows them.",
-    ),
-];
+)];
+
+/// Writes one `[--trace-env] …` line, when the flag is on.
+///
+/// The three format strings are `src/node_env_var.cc`'s: the two-argument form
+/// for the eleven `SafeGetenv` call sites (`"[--trace-env] %s\n"`, message only),
+/// the `const char*` key form and the `Local<String>` key form, which both
+/// produce `"[--trace-env] %s \"%s\"\n"`. Every caller here has a key, so the
+/// keyed form is the one used; `key` is `None` for the one message that has no
+/// variable name (`enumerate environment variables`).
+///
+/// Written to the process's standard error through the same slot the rest of
+/// the crash and diagnostic text uses, so a redirected `2>` captures it in the
+/// order the accesses happened, which is what the oracle's output shows.
+fn trace_env(action: &str, key: Option<&str>) {
+    if !trace_env_enabled() {
+        return;
+    }
+    match key {
+        Some(key) => {
+            rn_core::hook_slot::write_stderr(&format!("[--trace-env] {action} \"{key}\"\n"))
+        }
+        None => rn_core::hook_slot::write_stderr(&format!("[--trace-env] {action}\n")),
+    }
+}
+
+/// Whether `--trace-env` was given.
+///
+/// Read from the option store on every access rather than cached, because a
+/// worker gets its own copy of the store and a cache would have to be
+/// invalidated per realm. The lookup is a small vector scan, which is what
+/// `getOptionValue` costs on the JavaScript side too.
+fn trace_env_enabled() -> bool {
+    matches!(
+        rn_bind_options::parsed::value_of("--trace-env"),
+        Some(rn_bind_options::parsed::ParsedValue::Bool(true))
+    )
+}
 
 /// Builds the `process.env` object.
 ///
@@ -176,6 +216,10 @@ fn named_get<'s>(
     if rn_permission::runtime::env_read_is_denied(&name) {
         return v8::Intercepted::kNo;
     }
+    // `TraceEnvVar(env, "get", property)` sits between the store read and the
+    // answer, so it fires for a variable that is absent as well as one that is
+    // present, and once per access.
+    trace_env("get", Some(&name));
     match env_store::get(&name) {
         Some(value) => {
             if let Some(text) = v8::String::new(scope, &value) {
@@ -291,6 +335,10 @@ fn store<'s>(
     };
     warn_pending_deprecation(scope, value);
     let stored = store_named(scope, &name, value);
+    // `EnvSetter` traces after the store, not before it: a `ToString` that
+    // threw returns `kNo` above and no `set` line is printed, which the oracle
+    // confirms with `process.env.X = Symbol()`.
+    trace_env("set", Some(&name));
     // `DateTimeConfigurationChangeNotification`: writing a name that starts with
     // `TZ` means the process's time zone may have changed, and V8 caches the
     // detected zone. Node calls `tzset()` and then tells the isolate to
@@ -432,6 +480,9 @@ fn named_query<'s>(
         // find the real one.
         return v8::Intercepted::kNo;
     };
+    // `EnvQuery` traces after the store query and before the `has_env` branch,
+    // so an absent variable is reported too: `'X' in process.env` is a query.
+    trace_env("query", Some(&name));
     if !env_store::contains(&name) {
         // A removed variable reports here too, because `'X' in process.env` is
         // a read of it: `test-permission-env-warning.js` counts the two value
@@ -473,6 +524,11 @@ fn named_delete<'s>(
     if let Some(name) = name_of(scope, key) {
         if !name.is_empty() {
             let _ = env_store::unset(&name);
+            // `EnvDeleter` traces after the delete, inside the `IsString` check,
+            // so a symbol delete prints nothing. The empty-name case matches
+            // Node too: `process.env[''] = ''` never stores, and a delete of it
+            // still reaches `env_vars()->Delete`, so the line is printed.
+            trace_env("delete", Some(&name));
         }
     }
     rv.set_bool(true);
@@ -489,6 +545,9 @@ fn enumerate<'s>(
     _args: v8::PropertyCallbackArguments<'s>,
     mut rv: v8::ReturnValue<v8::Array>,
 ) {
+    // `EnvEnumerator` traces *before* it enumerates, which is why the line
+    // precedes every key the caller then reads.
+    trace_env("enumerate environment variables", None);
     let entries = env_store::vars();
     let array = v8::Array::new(scope, entries.len() as i32);
     for (index, entry) in entries.iter().enumerate() {

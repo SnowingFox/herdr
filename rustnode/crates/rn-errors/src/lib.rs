@@ -751,6 +751,54 @@ pub fn trace_exit_warning(scope: &mut v8::PinScope, code: i32) {
     ));
 }
 
+/// Prints the `--trace-sync-io` warning for a synchronous call.
+///
+/// This is `Environment::PrintSyncTrace` (`src/env.cc:1525`) verbatim:
+///
+/// ```text
+/// (node:%d) WARNING: Detected use of sync API
+///     at …
+/// ```
+///
+/// plus one `\n` after the frames, because `PrintStackTrace` ends with
+/// `PrintToStderrAndFlush`'s own newline. The pid is the process id on the main
+/// thread and `(node:PID, thread:ID)` inside a worker, which is
+/// `PrintSyncTrace`'s `is_main_thread` split — the same one
+/// [`trace_exit_warning`] makes.
+///
+/// Node calls this from nine places, all of them native: `uv_fs_*`'s synchronous
+/// paths in `src/node_file.cc` and `node_file-inl.h`, `node_zlib.cc`'s
+/// `SyncProcess`, `spawn_sync.cc`, and the two crypto helpers. Called from
+/// `rn-bind-fs`'s synchronous delivery, which is the one choke point every
+/// `fs.*Sync` member passes through.
+///
+/// The guard is [`rn_core::hook_slot::trace_sync_io_active`] rather than the flag
+/// itself: `SpinEventLoopInternal` only turns the reporting on once the loop is
+/// running, so a synchronous call during the first tick is silent.
+pub fn print_sync_trace(scope: &mut v8::PinScope) {
+    if !rn_core::hook_slot::trace_sync_io_active() {
+        return;
+    }
+    let pid = std::process::id();
+    let facts = rn_core::exit_state::environment_identity();
+    let identity = if facts.is_main_thread {
+        format!("(node:{pid}) ")
+    } else {
+        format!("(node:{pid}, thread:{}) ", facts.thread_id)
+    };
+    let limit = rn_core::hook_slot::stack_trace_limit();
+    let frames = if limit > 0 {
+        v8::StackTrace::current_stack_trace(scope, limit as usize)
+            .map(|trace| format_stack_trace(scope, &trace))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    rn_core::hook_slot::write_stderr(&format!(
+        "{identity}WARNING: Detected use of sync API\n{frames}\n"
+    ));
+}
+
 /// Writes an already-formatted uncaught exception to standard error and asks
 /// the process to exit non-zero.
 ///
