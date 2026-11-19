@@ -956,7 +956,6 @@ impl PortInner {
         *self.object.borrow_mut() = Some(weak);
     }
 
-
     /// The owning object, while it is still alive.
     pub fn object<'s>(&self, scope: &v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
         self.object.borrow().as_ref()?.to_local(scope)

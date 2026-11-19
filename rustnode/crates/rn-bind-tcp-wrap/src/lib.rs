@@ -132,7 +132,10 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
     // kind here, with the namespace, is what makes the messaging layer find the
     // hook; without it the `[kTransfer]` in `lib/net.js` returned a handle the
     // serializer could not resolve and every socket transfer failed.
-    rn_core::host_object::register_transfer_kind(transfer::TCP_KIND, transfer::transfer_for_messaging);
+    rn_core::host_object::register_transfer_kind(
+        transfer::TCP_KIND,
+        transfer::transfer_for_messaging,
+    );
 }
 
 fn define_constant(
