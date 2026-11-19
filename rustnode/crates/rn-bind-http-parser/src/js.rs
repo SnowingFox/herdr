@@ -168,7 +168,10 @@ fn in_parser_call<R>(
     // the same one. A parser without one falls back to itself, which is the
     // pre-existing behaviour.
     let resource = match parser.resource_object.as_ref() {
-        Some(resource) => v8::Global::new(scope.as_ref(), v8::Local::<v8::Object>::new(scope, resource)),
+        Some(resource) => v8::Global::new(
+            scope.as_ref(),
+            v8::Local::<v8::Object>::new(scope, resource),
+        ),
         None => v8::Global::new(scope.as_ref(), receiver),
     };
     rn_core::callback_scope::with_scope(
@@ -178,7 +181,9 @@ fn in_parser_call<R>(
             resource: Some(resource),
             // The frame `AsyncReset` captured, so an `AsyncLocalStorage` store
             // survives into the parser's callbacks.
-            frame: parser.context_frame.as_ref().map(|frame| v8::Global::new(scope.as_ref(), v8::Local::<v8::Value>::new(scope, frame))),
+            frame: parser.context_frame.as_ref().map(|frame| {
+                v8::Global::new(scope.as_ref(), v8::Local::<v8::Value>::new(scope, frame))
+            }),
         },
         body,
     )

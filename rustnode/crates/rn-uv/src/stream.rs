@@ -492,7 +492,10 @@ unsafe extern "C" fn after_shutdown(request: *mut uv::uv_shutdown_t, status: i32
                 scope,
                 rn_core::callback_scope::ScopeArgs {
                     context,
-                    resource: Some(v8::Global::new(scope.as_ref(), v8::Local::<v8::Object>::new(scope, &request))),
+                    resource: Some(v8::Global::new(
+                        scope.as_ref(),
+                        v8::Local::<v8::Object>::new(scope, &request),
+                    )),
                     frame: None,
                 },
                 |scoped| {
@@ -508,7 +511,13 @@ unsafe extern "C" fn after_shutdown(request: *mut uv::uv_shutdown_t, status: i32
         } else {
             // SAFETY: as in `after_write`.
             unsafe {
-                listener::emit_after_shutdown(completion.state, scope, request, Some(handle), status)
+                listener::emit_after_shutdown(
+                    completion.state,
+                    scope,
+                    request,
+                    Some(handle),
+                    status,
+                )
             };
         }
         rn_core::callback_scope::emit_destroy(completion.async_wrap.async_id);

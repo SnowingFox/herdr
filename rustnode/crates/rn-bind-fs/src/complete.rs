@@ -399,12 +399,13 @@ pub fn deliver_to_promise_typed<'s>(
     let resource = v8::Object::new(scope);
     let async_id = rn_bind_async_wrap::emit_init_for_new_resource(scope, resource, provider);
     let resource = v8::Global::new(scope.as_ref(), resource);
-    let context = async_id.map(|(async_id, trigger_async_id)| {
-        rn_core::callback_scope::AsyncContext {
-            async_id,
-            trigger_async_id,
-        }
-    });
+    let context =
+        async_id.map(
+            |(async_id, trigger_async_id)| rn_core::callback_scope::AsyncContext {
+                async_id,
+                trigger_async_id,
+            },
+        );
 
     // `InternalCallbackScope callback_scope(this)` around the settle, which is
     // what makes the `FSREQPROMISE` id the one executing while `then` handlers

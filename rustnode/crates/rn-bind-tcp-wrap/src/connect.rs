@@ -159,15 +159,12 @@ struct ConnectCompletion {
     async_wrap: rn_core::AsyncWrapState,
 }
 
-/// Emits `init` for the connect request object, `TCPWrap::Connect`'s
-/// `new ConnectWrap(env, req_wrap_obj, PROVIDER_TCPCONNECTWRAP)`.
+/// libuv's connect completion, which drives `afterConnect` in `lib/net.js`.
 ///
 /// The request object is the resource, not the socket: `lib/net.js`'s
 /// `afterConnect` receives the same `req` and Node's `AsyncWrap` maps it through
-/// `resource_symbol` back to itself, so handing it over directly is the same
-/// answer `lookupPublicResource` would give.
-
-/// libuv's connect completion, which drives `afterConnect` in `lib/net.js`.
+/// `resource_symbol` back to itself, so `new_connect_wrap` hands it over
+/// directly, which is the same answer `lookupPublicResource` would give.
 ///
 /// # Safety
 ///

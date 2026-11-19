@@ -42,10 +42,7 @@ pub fn begin(
 }
 
 /// Reads back the state [`begin`] stored, if the object carries one.
-pub fn state_of(
-    object: v8::Local<v8::Object>,
-    provider: u32,
-) -> Option<rn_core::AsyncWrapState> {
+pub fn state_of(object: v8::Local<v8::Object>, provider: u32) -> Option<rn_core::AsyncWrapState> {
     read(object, field_for(provider)?)
 }
 

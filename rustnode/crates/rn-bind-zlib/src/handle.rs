@@ -1122,10 +1122,12 @@ fn complete_write<'s>(
     let context = state
         .async_id
         .zip(state.trigger_async_id)
-        .map(|(async_id, trigger_async_id)| rn_core::callback_scope::AsyncContext {
-            async_id,
-            trigger_async_id,
-        });
+        .map(
+            |(async_id, trigger_async_id)| rn_core::callback_scope::AsyncContext {
+                async_id,
+                trigger_async_id,
+            },
+        );
     // The completion is the last thing that needed the wrapper pinned; release
     // it after taking the locals so this object can be collected next GC.
     state.receiver = None;

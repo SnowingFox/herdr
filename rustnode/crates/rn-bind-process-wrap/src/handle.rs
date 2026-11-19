@@ -193,13 +193,7 @@ fn new(
     // The ids are kept on the handle so `OnExit` can run `onexit` as this
     // resource's `MakeCallback`.
     crate::handle::with_handle(object, |handle| {
-        rn_bind_async_wrap::async_reset(
-            scope,
-            &mut handle.async_wrap,
-            object,
-            object,
-            None,
-        );
+        rn_bind_async_wrap::async_reset(scope, &mut handle.async_wrap, object, object, None);
         handle.context_frame = rn_bind_async_wrap::current_context_frame(scope);
     });
     rv.set(object.into());

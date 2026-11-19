@@ -246,8 +246,6 @@ pub fn emit_destroy(async_id: f64) {
     }
 }
 
-
-
 /// Runs `body` with the scope for `args` open around it.
 ///
 /// Returns `Some(body's value)` when the callback returned, `None` when it

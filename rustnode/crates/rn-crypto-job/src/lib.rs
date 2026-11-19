@@ -498,9 +498,12 @@ unsafe extern "C" fn after_work_trampoline<J: Runnable + 'static>(
         };
         match async_wrap {
             Some(async_wrap) if async_wrap.async_id > 0.0 => {
-                let resource = receiver
-                    .as_ref()
-                    .map(|receiver| v8::Global::new(scope.as_ref(), v8::Local::<v8::Object>::new(scope, receiver)));
+                let resource = receiver.as_ref().map(|receiver| {
+                    v8::Global::new(
+                        scope.as_ref(),
+                        v8::Local::<v8::Object>::new(scope, receiver),
+                    )
+                });
                 let _ = rn_core::callback_scope::with_scope(
                     scope,
                     rn_core::callback_scope::ScopeArgs {

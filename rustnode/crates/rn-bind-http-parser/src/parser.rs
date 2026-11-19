@@ -171,6 +171,28 @@ pub struct ParseError {
 /// Why a callback stopped the parse, in the shape llhttp takes.
 type Stop = c_int;
 
+/// Everything `initialize` needs beyond the parser kind.
+///
+/// A struct rather than eight positional parameters: five of them are the
+/// caller's request and three are the `AsyncWrap` identity this crate records,
+/// and a bare list would let a swapped pair of `u64`/`u32` compile.
+pub struct InitializeConfig {
+    /// `maxHeaderSize`; 0 means unbounded.
+    pub max_header_size: u64,
+    /// `lenientFlags`, from `calculateLenientFlags`.
+    pub lenient_flags: u32,
+    /// `maxHeaderPairs`; 0 means unbounded.
+    pub max_header_pairs: usize,
+    /// Whether a `ConnectionsList` was supplied.
+    pub has_connections: bool,
+    /// The `AsyncWrap` identity the binding emitted.
+    pub async_wrap: rn_core::AsyncWrapState,
+    /// The resource object `init` received, for `executionAsyncResource()`.
+    pub resource_object: Option<v8::Global<v8::Object>>,
+    /// The frame `AsyncReset` captured, for `AsyncLocalStorage`.
+    pub context_frame: Option<v8::Global<v8::Value>>,
+}
+
 /// One parser's native state.
 pub struct Parser {
     /// The llhttp instance, allocated by the shim.
@@ -430,9 +452,7 @@ impl Parser {
             headers_completed: false,
             connections: None,
             stream: None,
-            async_wrap: rn_core::AsyncWrapState::uninitialised(
-                rn_core::async_wrap::PROVIDER_NONE,
-            ),
+            async_wrap: rn_core::AsyncWrapState::uninitialised(rn_core::async_wrap::PROVIDER_NONE),
             resource_object: None,
             context_frame: None,
         }));
@@ -519,17 +539,16 @@ impl Parser {
     /// `args[1]` — `parser->AsyncReset(args[1].As<Object>())`
     /// (`src/node_http_parser.cc:767`). Every callback the parser makes is a
     /// `MakeCallback` on it.
-    pub fn initialize(
-        &mut self,
-        kind: Kind,
-        max_header_size: u64,
-        lenient_flags: u32,
-        max_header_pairs: usize,
-        has_connections: bool,
-        async_wrap: rn_core::AsyncWrapState,
-        resource_object: Option<v8::Global<v8::Object>>,
-        context_frame: Option<v8::Global<v8::Value>>,
-    ) {
+    pub fn initialize(&mut self, kind: Kind, config: InitializeConfig) {
+        let InitializeConfig {
+            max_header_size,
+            lenient_flags,
+            max_header_pairs,
+            has_connections,
+            async_wrap,
+            resource_object,
+            context_frame,
+        } = config;
         self.async_wrap = async_wrap;
         self.resource_object = resource_object;
         self.context_frame = context_frame;
@@ -703,7 +722,8 @@ impl Parser {
         // `~Parser` releases the `AsyncWrap`, which queues its `destroy`. The
         // id is only emitted once, hence the reset.
         let async_id = self.async_wrap.async_id;
-        self.async_wrap = rn_core::AsyncWrapState::uninitialised(rn_core::async_wrap::PROVIDER_NONE);
+        self.async_wrap =
+            rn_core::AsyncWrapState::uninitialised(rn_core::async_wrap::PROVIDER_NONE);
         self.resource_object = None;
         self.context_frame = None;
         if async_id > 0.0 {

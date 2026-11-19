@@ -115,9 +115,26 @@ impl BindingModule for CaresWrap {
         }
 
         for (name, constructor) in [
-            ("GetAddrInfoReqWrap", request_wrap(scope, "GetAddrInfoReqWrap", getaddrinfo_req_wrap_constructor)?),
-            ("GetNameInfoReqWrap", request_wrap(scope, "GetNameInfoReqWrap", getnameinfo_req_wrap_constructor)?),
-            ("QueryReqWrap", request_wrap(scope, "QueryReqWrap", query_req_wrap_constructor)?),
+            (
+                "GetAddrInfoReqWrap",
+                request_wrap(
+                    scope,
+                    "GetAddrInfoReqWrap",
+                    getaddrinfo_req_wrap_constructor,
+                )?,
+            ),
+            (
+                "GetNameInfoReqWrap",
+                request_wrap(
+                    scope,
+                    "GetNameInfoReqWrap",
+                    getnameinfo_req_wrap_constructor,
+                )?,
+            ),
+            (
+                "QueryReqWrap",
+                request_wrap(scope, "QueryReqWrap", query_req_wrap_constructor)?,
+            ),
         ] {
             set(scope, object, name, constructor)?;
         }
@@ -1072,7 +1089,12 @@ fn getaddrinfo_req_wrap_constructor(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    request_wrap_construct(scope, &args, &mut rv, rn_core::async_wrap::PROVIDER_GETADDRINFOREQWRAP);
+    request_wrap_construct(
+        scope,
+        &args,
+        &mut rv,
+        rn_core::async_wrap::PROVIDER_GETADDRINFOREQWRAP,
+    );
 }
 
 /// `new GetNameInfoReqWrap()`.
@@ -1081,7 +1103,12 @@ fn getnameinfo_req_wrap_constructor(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    request_wrap_construct(scope, &args, &mut rv, rn_core::async_wrap::PROVIDER_GETNAMEINFOREQWRAP);
+    request_wrap_construct(
+        scope,
+        &args,
+        &mut rv,
+        rn_core::async_wrap::PROVIDER_GETNAMEINFOREQWRAP,
+    );
 }
 
 /// `new QueryReqWrap()`.
@@ -1090,7 +1117,12 @@ fn query_req_wrap_constructor(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    request_wrap_construct(scope, &args, &mut rv, rn_core::async_wrap::PROVIDER_QUERYWRAP);
+    request_wrap_construct(
+        scope,
+        &args,
+        &mut rv,
+        rn_core::async_wrap::PROVIDER_QUERYWRAP,
+    );
 }
 
 /// The shared constructor body: reject a plain call, then emit `init`.

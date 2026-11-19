@@ -663,10 +663,7 @@ pub fn emit_init_for_new_resource(
 /// `kInvalidAsyncId` skips the write, exactly as Node's constructor does with
 /// its `if (default_trigger_async_id == -1) return;` — a resource with no id yet
 /// must not become everyone's trigger.
-pub fn with_default_trigger_async_id<R>(
-    async_id: f64,
-    body: impl FnOnce() -> R,
-) -> R {
+pub fn with_default_trigger_async_id<R>(async_id: f64, body: impl FnOnce() -> R) -> R {
     if async_id == INVALID_ASYNC_ID {
         return body();
     }

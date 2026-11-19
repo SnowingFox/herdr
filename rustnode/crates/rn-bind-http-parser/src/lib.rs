@@ -526,15 +526,15 @@ fn parser_initialize<'s>(
     };
     let (async_wrap, resource_object) = match v8::Local::<v8::Object>::try_from(args.get(1)) {
         Ok(resource) => {
-            let state = match rn_bind_async_wrap::emit_init_for_new_resource(scope, resource, provider)
-            {
-                Some((async_id, trigger_async_id)) => rn_core::AsyncWrapState {
-                    async_id,
-                    trigger_async_id,
-                    provider,
-                },
-                None => rn_core::AsyncWrapState::uninitialised(provider),
-            };
+            let state =
+                match rn_bind_async_wrap::emit_init_for_new_resource(scope, resource, provider) {
+                    Some((async_id, trigger_async_id)) => rn_core::AsyncWrapState {
+                        async_id,
+                        trigger_async_id,
+                        provider,
+                    },
+                    None => rn_core::AsyncWrapState::uninitialised(provider),
+                };
             (state, Some(v8::Global::new(scope.as_ref(), resource)))
         }
         Err(_) => (rn_core::AsyncWrapState::uninitialised(provider), None),
@@ -549,13 +549,15 @@ fn parser_initialize<'s>(
     let result = with_parser(object, |parser| {
         parser.initialize(
             kind,
-            max_header_size,
-            lenient_flags,
-            max_header_pairs,
-            list.is_some(),
-            async_wrap,
-            resource_object,
-            context_frame,
+            crate::parser::InitializeConfig {
+                max_header_size,
+                lenient_flags,
+                max_header_pairs,
+                has_connections: list.is_some(),
+                async_wrap,
+                resource_object,
+                context_frame,
+            },
         );
         match list {
             Some(list) => parser.register_connections(scope, list),

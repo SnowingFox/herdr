@@ -118,7 +118,11 @@ fn random_bytes_constructor<'s>(
         return;
     };
     install_state(scope, this, mode, JobKind::Bytes(job));
-    crate::job_async::begin(scope, this, rn_core::async_wrap::PROVIDER_RANDOMBYTESREQUEST);
+    crate::job_async::begin(
+        scope,
+        this,
+        rn_core::async_wrap::PROVIDER_RANDOMBYTESREQUEST,
+    );
     rv.set(this.into());
 }
 
@@ -150,7 +154,11 @@ fn random_prime_constructor<'s>(
     install_state(scope, this, mode, JobKind::Prime(job));
     // `RandomPrimeJob`'s `CryptoJob` traits name `RANDOMPRIMEREQUEST`; the class
     // shares this file but not the provider.
-    crate::job_async::begin(scope, this, rn_core::async_wrap::PROVIDER_RANDOMPRIMEREQUEST);
+    crate::job_async::begin(
+        scope,
+        this,
+        rn_core::async_wrap::PROVIDER_RANDOMPRIMEREQUEST,
+    );
     rv.set(this.into());
 }
 

@@ -1098,12 +1098,11 @@ pub fn read_file_constructor<'s>(
 /// every job class needs the same two-step: emit `init` once at construction,
 /// then read the ids back when the completion fires.
 fn begin_job(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<v8::Object>, provider: u32) {
-    let (async_id, trigger_async_id) = match rn_bind_async_wrap::emit_init_for_new_resource(
-        scope, object, provider,
-    ) {
-        Some(ids) => ids,
-        None => return,
-    };
+    let (async_id, trigger_async_id) =
+        match rn_bind_async_wrap::emit_init_for_new_resource(scope, object, provider) {
+            Some(ids) => ids,
+            None => return,
+        };
     let _ = write_async_wrap(scope, object, provider, async_id, trigger_async_id);
 }
 

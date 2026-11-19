@@ -61,7 +61,8 @@ pub fn begin(
         0,
     );
     // SAFETY: the pointer was just written to this object's own field.
-    let address = unsafe { object.get_aligned_pointer_from_internal_field(ASYNC_FIELD, 0) } as usize;
+    let address =
+        unsafe { object.get_aligned_pointer_from_internal_field(ASYNC_FIELD, 0) } as usize;
     let _ = v8::Weak::with_guaranteed_finalizer(
         scope,
         object,
@@ -108,9 +109,7 @@ pub fn in_job_scope<R>(
     object: v8::Local<v8::Object>,
     body: impl FnOnce(&mut v8::PinScope<'_, '_>) -> R,
 ) -> Option<R> {
-    let Some(async_wrap) = state_of(object) else {
-        return None;
-    };
+    let async_wrap = state_of(object)?;
     if async_wrap.async_id <= 0.0 {
         return None;
     }
@@ -131,4 +130,3 @@ pub fn in_job_scope<R>(
     rn_bind_async_wrap::emit_destroy(async_wrap.async_id);
     result
 }
-
