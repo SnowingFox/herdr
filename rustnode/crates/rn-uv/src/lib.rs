@@ -36,6 +36,7 @@
 //! `crates/rn-bind-timers` because their callbacks need a V8 scope.
 pub mod addr;
 pub mod callback;
+pub mod deadline;
 pub mod handle;
 pub mod handle_transfer;
 pub mod ledger;

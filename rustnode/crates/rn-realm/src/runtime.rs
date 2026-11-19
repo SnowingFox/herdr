@@ -155,7 +155,15 @@ impl Runtime {
     /// Node does this right after the script body, before the loop starts, which
     /// is why `process.nextTick` and `queueMicrotask` callbacks from the script
     /// run before a 0ms timer.
+    ///
+    /// V8's platform queue is flushed first, for the same reason and in the same
+    /// order as `V8Scheduler`'s checkpoint: a task posted there is not a tick, so
+    /// running it after the ticks would make it observe queues a later phase left
+    /// behind. A worker's loop reaches this method and not that one, so without
+    /// this the worker never flushed the queue at all — its `Atomics.waitAsync`
+    /// timeout resolved through a task that only the main thread ever ran.
     pub fn drain(&self, scope: &mut v8::PinScope) {
+        rn_core::platform_tasks::pump_foreground_tasks(scope);
         let run_next_ticks = self.run_next_ticks(scope);
         let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
         let scope = &mut try_catch.init();

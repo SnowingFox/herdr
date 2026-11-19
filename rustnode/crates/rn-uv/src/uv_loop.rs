@@ -255,8 +255,13 @@ pub fn update_time() {
 /// that duration for us — zero when a callback is already runnable, the next
 /// timer deadline otherwise, and "ignore the timer" when every timer is unref'd.
 ///
-/// Returns `true` when the loop still has referenced work pending.
+/// A V8 delayed task's deadline — `Atomics.waitAsync`'s timeout — is not a libuv
+/// timer, so [`deadline::sync`] gives libuv one to account for before the wait.
+/// That keeps `uv__backend_timeout` the only thing sizing the sleep; see
+/// [`deadline`] for why reporting a timeout from here instead would be a second
+/// loop.
 pub fn run_once_blocking() -> bool {
+    crate::deadline::sync();
     run_inner(uv::uv_run_mode_UV_RUN_ONCE)
 }
 
@@ -371,6 +376,12 @@ pub fn close_loop() -> bool {
     let Some(pointer) = loop_ptr() else {
         return true;
     };
+
+    // The V8 deadline handle is this thread's, not one a binding owns, so it is
+    // closed here rather than by the walk below: its close callback is what frees
+    // the storage the handle was allocated in, and a walk-driven close would only
+    // count it.
+    crate::deadline::shutdown();
 
     // `uv_run` below executes close callbacks, and a close callback can run
     // JavaScript that ends up here again. A nested sweep would call `uv_close`
