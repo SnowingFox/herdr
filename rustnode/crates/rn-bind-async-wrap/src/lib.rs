@@ -299,6 +299,14 @@ thread_local! {
     /// immediate, so the hook fires in the check phase after the resource went
     /// away rather than inline.
     static DESTROY_IDS: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    /// The weak handles `registerDestroyHook` installed, kept alive because a
+    /// `v8::Weak`'s finalizer dies with the `Weak` itself.
+    ///
+    /// Node's equivalent is a `DestroyParam` per registration, freed by
+    /// `DestroyParamCleanupHook` when the environment goes away. A registration
+    /// outliving its environment is not a leak here: the vector is thread-local and
+    /// is cleared by `reset_hooks`, which the harness calls between isolates.
+    static DESTROY_HOOKS: RefCell<Vec<v8::Weak<v8::Object>>> = const { RefCell::new(Vec::new()) };
 }
 
 struct State {
@@ -1409,20 +1417,42 @@ fn queue_destroy_async_id(
 
 fn register_destroy_hook(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue,
 ) {
-    // `AsyncWrap::RegisterDestroyHook` ties a `destroy` hook to a *JavaScript
-    // object's* collection, which needs a weak handle plus the optional
-    // `destroyed` property bag. `v8::Weak`'s guaranteed finalizer runs with no
-    // scope, and the bag has to be read on the isolate thread before deciding,
-    // so a correct implementation needs a V8 callback context this layer does
-    // not have yet. Queuing the id unconditionally would emit a `destroy` for
-    // every promoted promise, which is worse than not emitting one.
+    // `AsyncWrap::RegisterDestroyHook(object, asyncId)`: the id's `destroy` hook
+    // must fire when `object` is collected.
     //
-    // Nothing on the TCP reset path needs it: a handle's destroy is driven by
-    // `AsyncReset` and `close`, not by collection. Declared in `DEFERRED`.
-    let _ = scope;
+    // This used to be a declared deferral, on the reasoning that a finalizer runs
+    // with no scope and so cannot queue the id. That reasoning was wrong for this
+    // queue: `emit_destroy` touches only thread-locals, so a finalizer can call it
+    // directly. `v8::Weak::with_finalizer` supplies the collection callback.
+    //
+    // The `destroyed` property bag argument Node also accepts is not consulted:
+    // Node uses it to answer `hasAsyncId` after collection, and nothing in the
+    // builtin JS passes one here.
+    let Some(id) = args.get(1).number_value(scope) else {
+        throw_type_error(scope, "registerDestroyHook expects a number id");
+        return;
+    };
+    // The object is what must be watched. A non-object first argument would mean
+    // watching a temporary, whose collection says nothing about the resource.
+    let Ok(object) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        return;
+    };
+
+    // SAFETY: the pointer came from the scope we were handed, so the isolate is
+    // alive and is the one this callback is running on.
+    let mut isolate = unsafe { v8::Isolate::from_raw_isolate_ptr(scope.as_raw_isolate_ptr()) };
+    // The `Weak` must outlive the registration: dropping it drops the finalizer
+    // association too, so it is kept for the life of the isolate alongside the id
+    // it will report. This is Node's `DestroyParam`, which `AddCleanupHook` frees.
+    let weak = v8::Weak::with_finalizer(
+        &mut isolate,
+        object,
+        Box::new(move |_isolate: &mut v8::Isolate| emit_destroy(id)),
+    );
+    DESTROY_HOOKS.with(|hooks| hooks.borrow_mut().push(weak));
 }
 
 fn set_callback_trampoline(

@@ -424,3 +424,99 @@ fn queue_destroy_async_id_requires_a_number() {
     ));
     assert_eq!(output, "TypeError");
 }
+
+/// A userland `AsyncResource` that becomes garbage reports its `destroy` hook.
+///
+/// This is `AsyncWrap::RegisterDestroyHook` (`src/async_wrap.cc:252`), which
+/// `lib/async_hooks.js`'s `AsyncResource` constructor calls with the resource
+/// object and its id. Node installs a weak handle with
+/// `WeakCallbackType::kParameter` so collection queues the id through
+/// `destroy_async_id_list`; without it `test-async-hooks-destroy-on-gc.js` and
+/// eight other files fail, and a resource that holds a native handle is never
+/// told to release it.
+///
+/// The `destroy` for a collected resource can only be observed after a real GC,
+/// so this runs `--expose-gc` and lets V8 collect. `v8::Weak`'s finalizer is
+/// best-effort, which is why the script re-checks across turns rather than
+/// asserting after a single `gc()`.
+#[test]
+fn a_collected_async_resource_reports_destroy() {
+    let script = "\
+const { createHook, AsyncResource } = require('async_hooks');
+const destroyed = new Set();
+createHook({ destroy(id) { destroyed.add(id); } }).enable();
+let id = null;
+{
+  const resource = new AsyncResource('rustnode:gc-destroy');
+  id = resource.asyncId();
+}
+let attempts = 0;
+function check() {
+  if (destroyed.has(id) || ++attempts > 20) {
+    console.log(destroyed.has(id) ? 'destroyed' : 'missing');
+    return;
+  }
+  globalThis.gc();
+  setImmediate(check);
+}
+setImmediate(check);";
+    // `run` adds `--expose-internals`; `gc` needs its own flag, so this drives
+    // the binary directly instead.
+    let output = Command::new(rustnode())
+        .arg("--expose-gc")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("the rustnode binary must be built first");
+    assert!(
+        output.status.success(),
+        "script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "destroyed",
+        "a garbage-collected AsyncResource must emit destroy"
+    );
+}
+
+/// A resource that is still referenced must not report `destroy`.
+///
+/// The weak handle is what decides this: a strong one would keep the object
+/// alive forever, and a finalizer queued regardless of collection would report a
+/// false destroy. Both are worse than the original gap.
+#[test]
+fn a_live_async_resource_does_not_report_destroy() {
+    let script = "\
+const { createHook, AsyncResource } = require('async_hooks');
+const destroyed = new Set();
+createHook({ destroy(id) { destroyed.add(id); } }).enable();
+const live = new AsyncResource('rustnode:still-alive');
+const id = live.asyncId();
+let attempts = 0;
+function check() {
+  if (++attempts > 5) {
+    console.log(destroyed.has(id) ? 'wrongly-destroyed' : 'alive');
+    return;
+  }
+  globalThis.gc();
+  setImmediate(check);
+}
+setImmediate(check);";
+    let output = Command::new(rustnode())
+        .arg("--expose-gc")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .expect("the rustnode binary must be built first");
+    assert!(
+        output.status.success(),
+        "script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "alive",
+        "a referenced AsyncResource must not emit destroy"
+    );
+}
