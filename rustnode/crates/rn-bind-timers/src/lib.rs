@@ -225,6 +225,25 @@ impl BindingModule for Timers {
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Timers);
+    rn_core::snapshot_drain::register("rn-bind-timers", forget_realm_handles);
+}
+
+/// Drops the timer counters and the callbacks `setupTimers` installed.
+///
+/// Registered with `rn_core::snapshot_drain`: `immediateInfo` and `timeoutInfo`
+/// are typed arrays V8 cannot reach from a serialised context (the abort names one
+/// as `Uint32Array`), and the two callbacks are `Global` handles. Both buffers and
+/// the callbacks are rebuilt by `install` and `setupTimers` for a loaded realm.
+///
+/// The libuv [`HANDLES`] are left alone: they are not V8 handles, and tearing them
+/// down would close handles a serialising process is still using.
+fn forget_realm_handles() {
+    INFO.with(|slot| *slot.borrow_mut() = None);
+    CALLBACKS.with(|callbacks| {
+        let mut callbacks = callbacks.borrow_mut();
+        callbacks.immediate = None;
+        callbacks.timer = None;
+    });
 }
 
 fn get_libuv_now(

@@ -254,6 +254,11 @@ fn main() {
     let mut env = Env::new();
     let mut registry = rn_core::BindingRegistry::new();
     install_all(&mut registry);
+    // The drains a snapshot build runs before serialising, registered once for
+    // the process. Each one names a crate whose thread-local `v8::Global` caches
+    // belong to the realm on that thread; see `rn_core::snapshot_drain` for why
+    // the registry exists rather than one list here.
+    install_snapshot_drains();
     for namespace in registry.namespaces() {
         env.insert(namespace.clone());
     }
@@ -1211,6 +1216,28 @@ fn install_embedder_graph(isolate: &mut v8::Isolate) {
     }
 }
 
+/// Registers the drains a snapshot build runs before it serialises.
+///
+/// Each entry names a crate that keeps thread-local `v8::Global` caches for the
+/// realm on this thread. `CreateBlob` aborts on every such handle it cannot reach
+/// from a serialised context, so a build has to drop them first; see
+/// `rn_core::snapshot_drain` for the mechanism and `hook_slot::drop_realm_handles`
+/// for what a drain may and may not drop.
+///
+/// Registered from the CLI rather than from each crate's `register` because the
+/// drain has to exist whether or not the crate installed a namespace: `rn-uv`'s
+/// callback context is recorded by *every* binding install and belongs to no
+/// namespace of its own.
+fn install_snapshot_drains() {
+    rn_core::snapshot_drain::register("rn-uv", rn_uv::callback::forget_context);
+    rn_core::snapshot_drain::register("rn-uv-stream", rn_uv::stream::forget_state);
+    rn_core::snapshot_drain::register("rn-realm", rn_realm::trace_promises::forget_state);
+    rn_core::snapshot_drain::register(
+        "rn-bind-inspector",
+        rn_bind_inspector::agent::forget_context,
+    );
+}
+
 /// `--build-snapshot`: bootstrap a realm in a snapshot-creator isolate and write
 /// the blob, then exit.
 ///
@@ -1224,16 +1251,11 @@ fn install_embedder_graph(isolate: &mut v8::Isolate) {
 /// V8 fatals (the three walls in `snapshot_contract.rs`) end the process without
 /// reaching either branch, and their message is the report.
 fn run_snapshot_build(options: &args::Options) -> ! {
-    let params = rn_core::set_isolate_create_params_for_node(
-        v8::CreateParams::default(),
-        rn_uv::memory::constrained_memory(),
-        rn_uv::memory::total_memory(),
-    );
-    let params = if options.debug_arraybuffer_allocations {
-        rn_core::with_debugging_array_buffer_allocator(params)
-    } else {
-        rn_core::with_counted_array_buffer_allocator(params)
-    };
+    // The registry accumulates across bootstrap passes, so it starts empty: an
+    // earlier realm on this thread — `main` bootstraps one before this branch can
+    // be reached only if a caller re-entered, but a worker's realm would — would
+    // otherwise contribute addresses no blob contains.
+    snapshot::forget_recorded_references();
     let path = snapshot::blob_path(options.snapshot_blob.as_deref());
     rn_core::profile::mark("snapshot build starting");
 
@@ -1242,7 +1264,18 @@ fn run_snapshot_build(options: &args::Options) -> ! {
     // `main` makes for a normal run, which is what makes the snapshot a snapshot
     // of a real realm rather than of a bare context.
     let outcome = snapshot::build(
-        params,
+        || {
+            let params = rn_core::set_isolate_create_params_for_node(
+                v8::CreateParams::default(),
+                rn_uv::memory::constrained_memory(),
+                rn_uv::memory::total_memory(),
+            );
+            if options.debug_arraybuffer_allocations {
+                rn_core::with_debugging_array_buffer_allocator(params)
+            } else {
+                rn_core::with_counted_array_buffer_allocator(params)
+            }
+        },
         |scope| {
             // Isolate-level handlers first: they need `&mut Isolate`, and a
             // binding callback cannot obtain one soundly while its callback scope

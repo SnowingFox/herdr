@@ -114,11 +114,23 @@ impl BindingModule for BlockListBinding {
 /// Registers the `block_list` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(BlockListBinding);
+    rn_core::snapshot_drain::register("rn-bind-block-list", forget_realm_handles);
     // The `internalBinding('block_list')` namespace and its clone hooks are one
     // unit: a `BlockList` handle is only ever built here, so the hook and the
     // marking are registered together with the module.
     rn_core::host_object::register_kind(BLOCK_LIST_KIND, block_list_clone);
     rn_core::host_object::register_kind(SOCKET_ADDRESS_KIND, socket_address_clone);
+}
+
+/// Drops the cached `BlockList` and `SocketAddress` instance templates.
+///
+/// Registered with `rn_core::snapshot_drain`: they are `Global<ObjectTemplate>`
+/// handles, which the abort names as `OBJECT_TEMPLATE_INFO_TYPE`, and `install`
+/// builds fresh ones for a loaded realm. A handle already constructed from a
+/// template is untouched — it is a serialised object, not this cache.
+fn forget_realm_handles() {
+    BLOCK_LIST_TEMPLATE.with(|slot| *slot.borrow_mut() = None);
+    SOCKET_ADDRESS_TEMPLATE.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// `SocketAddressBlockListWrap::CloneForMessaging`.

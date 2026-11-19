@@ -180,6 +180,21 @@ impl BindingRegistry {
         self.installers.contains_key(name)
     }
 
+    /// Drops every cached namespace object, keeping the installers.
+    ///
+    /// The cache holds `v8::Global<Object>` handles that belong to one isolate.
+    /// They are pure cache — `install` rebuilds any namespace on demand — so a
+    /// snapshot build drops them before serialising, and the discovery pass drops
+    /// them so the realm it is about to build does not see handles into the
+    /// isolate that has just been disposed.
+    ///
+    /// Not part of the ordinary realm lifecycle: a normal run keeps these for its
+    /// whole life, because `lib/**` relies on `internalBinding('util')` returning
+    /// the identical object twice.
+    pub fn clear_installed(&self) {
+        self.installed.borrow_mut().clear();
+    }
+
     /// Builds one namespace, reusing the object from an earlier call in this realm.
     ///
     /// Node caches bindings per realm, and so must rustnode: `lib/**` relies on

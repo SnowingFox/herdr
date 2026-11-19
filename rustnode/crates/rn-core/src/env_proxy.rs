@@ -40,6 +40,16 @@ pub fn set<'s>(scope: &mut v8::PinScope<'s, '_>, object: v8::Local<'s, v8::Objec
     });
 }
 
+/// Drops the recorded `process.env` object.
+///
+/// Called by `rn_core::snapshot_drain`. The object is a `Global` V8 cannot reach
+/// from a serialised context — the abort names it as a plain `JSObject` — and the
+/// realm bootstrap calls [`set`] again for a loaded realm, so the identity
+/// [`is_proxy`] tests survives.
+pub fn forget_realm_proxy() {
+    PROXY.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// Whether `object` is this realm's `process.env`.
 ///
 /// Two `Local`s of one V8 object compare equal with `strict_equals`, so this is

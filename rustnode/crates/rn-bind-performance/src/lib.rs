@@ -388,6 +388,22 @@ impl BindingModule for Performance {
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Performance);
+    rn_core::snapshot_drain::register("rn-bind-performance", forget_realm_handles);
+}
+
+/// Drops the per-realm performance buffers and the observer callback.
+///
+/// Registered with `rn_core::snapshot_drain`: `observers` is a `Uint32Array` view
+/// over a V8-owned buffer, which the abort names as `Uint32Array`, the milestone
+/// and uv-metrics arrays are the same shape, and `OBSERVER_CALLBACK` is a `Global`.
+/// `install` rebuilds all of them for a loaded realm; the only thing kept is
+/// `TIME_ORIGIN`, which is a process-wide `OnceLock` of scalars rather than a
+/// handle, and rebuilding it would move `performance.timeOrigin`.
+fn forget_realm_handles() {
+    STATE.with(|slot| *slot.borrow_mut() = None);
+    OBSERVER_CALLBACK.with(|slot| *slot.borrow_mut() = None);
+    GC_IN_PROGRESS.with(|slot| *slot.borrow_mut() = None);
+    GC_PENDING.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// Builds the `constants` object with Node's two attribute classes.

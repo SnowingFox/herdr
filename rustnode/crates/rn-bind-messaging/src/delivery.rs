@@ -36,6 +36,16 @@ thread_local! {
     static EMIT_MESSAGE: RefCell<Option<v8::Global<v8::Function>>> = const { RefCell::new(None) };
 }
 
+/// Drops the rooted `emitMessage` callback.
+///
+/// Registered through this module's parent with `rn_core::snapshot_drain`. The
+/// handle is a `Global` V8 cannot reach from a serialised context;
+/// `install_emit_message` roots it again from the per-context exports a loaded
+/// realm already contains.
+pub fn forget_realm_handles() {
+    EMIT_MESSAGE.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// Compiles `internal/per_context/messageport` and roots its `emitMessage`.
 ///
 /// `load` is what compiles a per-context builtin by id; the CLI owns it because

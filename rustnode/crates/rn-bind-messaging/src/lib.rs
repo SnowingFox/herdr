@@ -296,6 +296,20 @@ impl BindingModule for Messaging {
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Messaging);
+    rn_core::snapshot_drain::register("rn-bind-messaging", forget_realm_handles);
+}
+
+/// Drops the per-realm templates and message callbacks this crate keeps.
+///
+/// Registered with `rn_core::snapshot_drain`: the `MessagePort` instance template
+/// and `createObject` are handles V8 cannot reach from a serialised context, and
+/// the abort names a template's info as `OBJECT_TEMPLATE_INFO_TYPE`. Both are
+/// rebuilt by `install` for a loaded realm, which is what makes this safe where
+/// dropping the object they built would not be.
+fn forget_realm_handles() {
+    CREATE_OBJECT.with(|slot| *slot.borrow_mut() = None);
+    INSTANCE_TEMPLATE.with(|slot| slot.borrow_mut().clear());
+    delivery::forget_realm_handles();
 }
 
 // ---------------------------------------------------------------------------

@@ -102,9 +102,28 @@ use rn_v8_sys::v8;
 pub fn method<'s>(
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::FunctionBuilder<'s, v8::FunctionTemplate> {
-    v8::FunctionTemplate::builder(callback)
+    v8::FunctionTemplate::builder_raw(recorded(callback))
         .constructor_behavior(v8::ConstructorBehavior::Throw)
         .length(0)
+}
+
+/// Resolves `callback` to its thunk address and records it for the snapshot build.
+///
+/// This is the funnel every builder in this module goes through, and the reason
+/// is the snapshot build: V8 cannot serialise a template whose callback address
+/// it was not told about, and the address is only obtainable from the callback
+/// *item*, never from a built template. Recording here means the template is
+/// always built from the address that was recorded, so the table and the
+/// templates cannot disagree.
+///
+/// Each builder below therefore calls `builder_raw(recorded(callback))` rather
+/// than `builder(callback)`. That makes the recording load-bearing rather than
+/// advisory: there is no path through this module that builds a template from an
+/// address it did not record.
+fn recorded(callback: impl v8::MapFnTo<v8::FunctionCallback>) -> v8::FunctionCallback {
+    let raw: v8::FunctionCallback = callback.map_fn_to();
+    crate::external_references::record(raw as *mut std::ffi::c_void);
+    raw
 }
 
 /// Builder for a **class**, matching Node's `SetConstructorFunction`: length **0**.
@@ -119,7 +138,7 @@ pub fn method<'s>(
 pub fn class<'s>(
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::FunctionBuilder<'s, v8::FunctionTemplate> {
-    v8::FunctionTemplate::builder(callback).length(0)
+    v8::FunctionTemplate::builder_raw(recorded(callback)).length(0)
 }
 
 /// [`class`] with a length Node sets explicitly, for `FunctionTemplate::SetLength`.
@@ -133,7 +152,7 @@ pub fn class_with_length<'s>(
     length: i32,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::FunctionBuilder<'s, v8::FunctionTemplate> {
-    v8::FunctionTemplate::builder(callback).length(length)
+    v8::FunctionTemplate::builder_raw(recorded(callback)).length(length)
 }
 
 /// [`method`] for the `v8::Function` builder, for call sites that want a
@@ -145,7 +164,7 @@ pub fn class_with_length<'s>(
 pub fn method_function<'s>(
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> v8::FunctionBuilder<'s, v8::Function> {
-    v8::Function::builder(callback)
+    v8::Function::builder_raw(recorded(callback))
         .constructor_behavior(v8::ConstructorBehavior::Throw)
         .length(0)
 }
@@ -189,7 +208,7 @@ pub fn named_method_with_length<'s>(
     length: i32,
     callback: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Function>, String> {
-    let function = v8::FunctionTemplate::builder(callback)
+    let function = v8::FunctionTemplate::builder_raw(recorded(callback))
         .constructor_behavior(v8::ConstructorBehavior::Throw)
         .length(length)
         .build(scope)

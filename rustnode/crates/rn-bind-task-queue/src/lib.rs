@@ -144,6 +144,19 @@ fn has_tick_or_rejection() -> bool {
 /// Registers the `task_queue` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(TaskQueue);
+    rn_core::snapshot_drain::register("rn-bind-task-queue", forget_realm_handles);
+}
+
+/// Drops the tick buffer and callbacks this crate keeps for the realm.
+///
+/// Registered with `rn_core::snapshot_drain`: the `tickInfo` typed array and the
+/// two `Global` callbacks are handles V8 cannot reach from a serialised context,
+/// and the abort names the array as `Uint8Array`. `install` rebuilds the buffer
+/// the next time a realm asks for this namespace, so nothing is lost — the array
+/// is a view over a buffer V8 owns, not state this crate holds across a reload.
+fn forget_realm_handles() {
+    CALLBACKS.with(|callbacks| *callbacks.borrow_mut() = Callbacks::default());
+    TICK_INFO.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// Whether a tick is queued, as `task_queues.js` last left the flag.

@@ -1320,3 +1320,48 @@ pub fn run_teardown_hooks() {
 pub fn has_teardown_hooks() -> bool {
     TEARDOWN_HOOKS.with(|hooks| !hooks.borrow().is_empty())
 }
+
+/// Drops every thread-local `v8::Global` this module keeps for a realm.
+///
+/// Registered with [`crate::snapshot_drain`], which explains why a snapshot build
+/// needs it. The distinction that matters here is between *state* and *identity*:
+///
+/// * Loaders, primordials, the hook callbacks, the dynamic-import referrer, the
+///   warning sink and the environment message port are all handles into the realm
+///   that is being serialised or disposed. They are dropped, and the load path
+///   reinstalls the loaders from the serialised realm.
+///
+/// * The scalar state — `stack_trace_limit`, `source_maps_enabled`,
+///   `zero_fill_buffers`, the trace flags, the recorded Node version — is not a
+///   handle and is deliberately kept. Those are *options*, decided by the command
+///   line before any realm exists, and a build that dropped them would serialise a
+///   realm configured differently from the one the flag asked for.
+///
+/// The `AliasedUint8Array` handles inside [`HookState`] (`abort_toggle`) are
+/// dropped with it: V8 owns their backing store, so a rebuilt one reads the same
+/// memory only if the load path rebuilds it, which is what the per-isolate
+/// reinstall hooks do for every other aliased buffer.
+pub fn drop_realm_handles() {
+    LOADERS.with(|slot| *slot.borrow_mut() = (None, None));
+    REALM_LOADERS.with(|slot| slot.borrow_mut().clear());
+    WARNING_SINK.with(|slot| *slot.borrow_mut() = None);
+    PRIMORDIALS.with(|slot| *slot.borrow_mut() = None);
+    REALM_PRIMORDIALS.with(|slot| slot.borrow_mut().clear());
+    DYNAMIC_IMPORT_REFERRER.with(|slot| *slot.borrow_mut() = None);
+    REALM_DYNAMIC_IMPORT_REFERRER.with(|slot| slot.borrow_mut().clear());
+    ENV_MESSAGE_PORT.with(|slot| *slot.borrow_mut() = None);
+    PRINCIPAL_HOOKS.with(|hooks| {
+        let mut hooks = hooks.borrow_mut();
+        hooks.dynamic_import = None;
+        hooks.import_meta = None;
+        hooks.import_meta_resolve = None;
+    });
+    REALM_HOOKS.with(|hooks| hooks.borrow_mut().clear());
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.prepare_stack_trace = None;
+        state.enhance_stack_before = None;
+        state.enhance_stack_after = None;
+        state.abort_toggle = None;
+    });
+}

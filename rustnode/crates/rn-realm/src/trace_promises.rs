@@ -136,6 +136,24 @@ pub fn record_context(
     });
 }
 
+/// Drops the realm's trace state and the recorded isolate pointer.
+///
+/// Registered with `rn_core::snapshot_drain`. The context is a `Global` V8 cannot
+/// reach from a serialised context (it appears in the abort list as
+/// `NativeContext`), and the isolate pointer would outlive the isolate a snapshot
+/// build serialises. `record_context` runs again as the loaded realm boots, so
+/// nothing is lost by dropping them; with `--trace-promises` off the whole state is
+/// already absent and this is a no-op.
+pub fn forget_state() {
+    STATE.with(|slot| *slot.borrow_mut() = None);
+    ISOLATE.with(|slot| slot.set(None));
+    // `runNextTicks`, which is the anonymous `JSFunction` in the abort list: the
+    // checkpoint reaches it from a libuv completion, so it is rooted here as well
+    // as on the runtime. `clear_runtime` already drops it alongside the rest of
+    // the realm's runtime hooks.
+    crate::runtime::clear_runtime();
+}
+
 /// The id `TracePromises` stored on `promise`, if it has one.
 ///
 /// `GetPromiseId`: a promise without the private property, or whose value is not

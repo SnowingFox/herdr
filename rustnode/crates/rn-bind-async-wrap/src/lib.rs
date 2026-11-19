@@ -500,6 +500,30 @@ impl BindingModule for AsyncWrap {
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(AsyncWrap);
+    rn_core::snapshot_drain::register("rn-bind-async-wrap", forget_realm_handles);
+}
+
+/// Drops the typed arrays and resource list this crate keeps for the realm.
+///
+/// Registered with `rn_core::snapshot_drain`: the three aliased buffers
+/// (`hook_fields`, `id_fields`, `ids_stack`) and the `resources` array are
+/// handles V8 cannot reach from a serialised context, and the abort names one as
+/// `Uint32Array`. `install` allocates them again for a loaded realm, which is what
+/// Node's per-environment `AsyncHooks` construction does too.
+fn forget_realm_handles() {
+    STATE.with(|slot| *slot.borrow_mut() = None);
+    HOOKS.with(|hooks| {
+        let mut hooks = hooks.borrow_mut();
+        hooks.init = None;
+        hooks.before = None;
+        hooks.after = None;
+        hooks.destroy = None;
+        hooks.promise_resolve = None;
+        hooks.trampoline = None;
+    });
+    RESOURCES.with(|slot| *slot.borrow_mut() = None);
+    NATIVE_RESOURCES.with(|slot| slot.borrow_mut().clear());
+    DESTROY_HOOKS.with(|slot| slot.borrow_mut().clear());
 }
 
 fn providers_object<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
