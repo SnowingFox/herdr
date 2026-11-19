@@ -447,10 +447,15 @@ fn take_heap_snapshot(
     let Some(isolate) = handle.isolate_handle() else {
         return;
     };
+    // `lib/internal/worker.js:544` passes `getHeapSnapshotOptions(options)`, the
+    // same `Uint8Array([exposeInternals, exposeNumericValues])` the main thread's
+    // `getHeapSnapshot` uses, so it is read with the same parser.
+    let options = rn_bind_heap_utils::snapshot_options(scope, args.get(0));
     let taker = v8::Object::new(scope);
     let Some((pending, interrupt_data)) = crate::heap_snapshot::request(
         &isolate,
         v8::Global::new(scope, taker),
+        options,
         handle.parent_wake(),
     ) else {
         return;

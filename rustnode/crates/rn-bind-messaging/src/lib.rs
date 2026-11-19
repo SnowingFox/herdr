@@ -72,8 +72,8 @@ pub use crate::delivery::{
     emit_message_installed, has_delivery_pending, install_emit_message, run as run_message_ports,
 };
 pub use crate::port::{
-    has_deliverable_message, live_port_count, refresh_owner_tokens, schedule_ports_with_mail,
-    set_check_phase_armed,
+    has_deliverable_message, live_port_count, live_ports, refresh_owner_tokens,
+    schedule_ports_with_mail, set_check_phase_armed,
 };
 
 /// Whether a `MessagePort` is still keeping the loop alive.
@@ -1706,9 +1706,69 @@ fn set(
     Ok(())
 }
 
+/// Adds this thread's message ports to a heap snapshot's embedder graph.
+///
+/// Node reaches every live `MessagePort` through `Environment`'s
+/// `MemoryRetainer` tree and reports it as `Node / MessagePort` with a `data`
+/// edge to its `Node / MessagePortData`. That is the node
+/// `test/pummel/test-worker-take-heapsnapshot.js` requires:
+///
+/// ```text
+/// Node / MessagePort --data--> Node / MessagePortData
+/// ```
+///
+/// so this walks [`live_ports`] and adds exactly that pair per port.
+///
+/// # What is reproduced and what is not
+///
+/// * `MessagePort::MemoryInfo` also tracks `emit_message_fn`, a `v8::Global`
+///   holding the JavaScript function a message is delivered through. It is an
+///   edge to a V8 node, which needs `EmbedderGraph::V8Node`, so it is left out;
+///   the `data` edge is what the test asserts.
+/// * `MessagePortData::MemoryInfo` tracks `incoming_messages`, the queue. Here
+///   the queue is a field of `MessagePortData` rather than a `MemoryRetainer` of
+///   its own, so the node has a size and no children.
+///
+/// The sizes are the `SelfSize()` Node reports for the C++ classes (256 for
+/// `MessagePort`, 72 for `MessagePortData`), not `size_of` of these Rust types:
+/// the number is what a snapshot of Node would say, and a number that silently
+/// meant something else would be worse than one that matches the oracle.
+pub fn add_embedder_nodes(graph: &rn_v8_sys::EmbedderGraph) {
+    for (_, data) in live_ports() {
+        let Some(port) = graph.add_node("MessagePort", MESSAGE_PORT_SIZE) else {
+            continue;
+        };
+        let Some(queue) = graph.add_node("MessagePortData", MESSAGE_PORT_DATA_SIZE) else {
+            continue;
+        };
+        graph.add_edge(port, queue, "data");
+        // The queue is held only for this iteration; nothing here keeps a port
+        // alive past the snapshot.
+        drop(data);
+    }
+}
+
+/// `sizeof(node::MessagePort)`, the `SelfSize()` the oracle reports.
+const MESSAGE_PORT_SIZE: usize = 256;
+
+/// `sizeof(node::MessagePortData)`, the `SelfSize()` the oracle reports.
+const MESSAGE_PORT_DATA_SIZE: usize = 72;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The walk reports the sizes the oracle reports.
+    ///
+    /// They are the only numbers here that come from the oracle rather than from
+    /// this crate, so they are the ones worth pinning: a `sizeof` change on
+    /// Node's side would be a real difference, and a typo would be invisible in
+    /// a `loose` snapshot validation.
+    #[test]
+    fn the_reported_sizes_are_the_oracles_self_sizes() {
+        assert_eq!(MESSAGE_PORT_SIZE, 256);
+        assert_eq!(MESSAGE_PORT_DATA_SIZE, 72);
+    }
 
     #[test]
     fn the_member_and_deferral_lists_do_not_overlap() {

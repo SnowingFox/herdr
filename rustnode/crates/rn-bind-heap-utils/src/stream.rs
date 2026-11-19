@@ -22,6 +22,11 @@
 //! graph is the one Node captures at that same point — what differs is that the
 //! JSON exists in memory slightly sooner, not that it describes another heap.
 //!
+//! The snapshot itself is taken through `rn_v8_sys::take_heap_snapshot` rather
+//! than the crate's `Isolate::take_heap_snapshot`, because the caller's
+//! `HeapSnapshotOptions` have to reach V8: the crate's binding calls the
+//! no-argument `TakeHeapSnapshot()` and would silently drop them.
+//!
 //! Collecting into a buffer rather than calling into JavaScript from inside the
 //! V8 callback is also what makes this sound. `take_heap_snapshot` needs
 //! `&mut Isolate`, which a callback only obtains through the raw pointer

@@ -32,6 +32,324 @@ unsafe extern "C" {
         user: *mut std::ffi::c_void,
         out: *mut *mut v8::Array,
     ) -> bool;
+    /// `v8::HeapProfiler::TakeHeapSnapshot(options)` + `HeapSnapshot::Serialize`,
+    /// via the shim in this crate.
+    ///
+    /// The crate's own `Isolate::take_heap_snapshot` calls the no-argument
+    /// `TakeHeapSnapshot()`, so V8 always applies its default
+    /// `HeapSnapshotOptions`. This passes Node's two flags through instead.
+    fn rn_v8_sys__take_heap_snapshot(
+        isolate: v8::UnsafeRawIsolatePtr,
+        expose_internals: bool,
+        expose_numeric_values: bool,
+        write: extern "C" fn(*mut std::ffi::c_void, *const std::os::raw::c_char, usize) -> bool,
+        user: *mut std::ffi::c_void,
+    ) -> bool;
+    /// `v8::HeapProfiler::AddBuildEmbedderGraphCallback`, via the shim in this
+    /// crate. See [`register_embedder_graph`].
+    fn rn_v8_sys__add_build_embedder_graph_callback(
+        isolate: v8::UnsafeRawIsolatePtr,
+        callback: extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void),
+        user: *mut std::ffi::c_void,
+    ) -> bool;
+    /// The matching removal.
+    fn rn_v8_sys__remove_build_embedder_graph_callback(isolate: v8::UnsafeRawIsolatePtr);
+    /// Adds one node to a graph and returns it as an opaque handle.
+    fn rn_v8_sys__embedder_graph_add_node(
+        graph: *mut std::ffi::c_void,
+        name: *const std::os::raw::c_char,
+        size: usize,
+    ) -> *mut std::ffi::c_void;
+    /// Adds a named edge between two nodes the same graph returned.
+    fn rn_v8_sys__embedder_graph_add_edge(
+        graph: *mut std::ffi::c_void,
+        from: *mut std::ffi::c_void,
+        to: *mut std::ffi::c_void,
+        name: *const std::os::raw::c_char,
+    );
+}
+
+/// One node in the embedder graph V8 is building.
+///
+/// Opaque on purpose: the shim owns the storage and V8 owns it from the moment
+/// it is added, so all Rust keeps is this handle. It is valid only for the
+/// duration of one [`EmbedderGraph::add_node`] call's graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmbedderNode(*mut std::ffi::c_void);
+
+/// The embedder graph V8 hands a build callback, for adding nodes and edges.
+///
+/// A snapshot taken without an embedder callback contains no native nodes at
+/// all: no `Node / MessagePort`, no `Node / Worker`. Node always has one — it
+/// registers `Environment::BuildEmbedderGraph` at isolate creation — so a test
+/// that looks for those nodes asserts on a walk that rustnode has to reproduce
+/// itself. This is the write side of that walk; see [`register_embedder_graph`]
+/// for the read side.
+#[derive(Clone, Copy, Debug)]
+pub struct EmbedderGraph {
+    raw: *mut std::ffi::c_void,
+}
+
+impl EmbedderGraph {
+    /// Wraps the pointer a build callback is given.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must be the `v8::EmbedderGraph*` of the callback currently running,
+    /// used only inside it.
+    #[must_use]
+    pub unsafe fn from_raw(raw: *mut std::ffi::c_void) -> Self {
+        Self { raw }
+    }
+
+    /// Adds a node named `name` with `size` bytes and returns its handle.
+    ///
+    /// `name` is joined with `"Node / "` by the graph, matching Node's
+    /// `MemoryRetainerNode::NamePrefix`, so `"MessagePort"` becomes the snapshot
+    /// node `Node / MessagePort`. Returns `None` for an allocation failure, which
+    /// V8 does not distinguish from a rejected argument.
+    #[must_use]
+    pub fn add_node(&self, name: &str, size: usize) -> Option<EmbedderNode> {
+        let name = std::ffi::CString::new(name).ok()?;
+        // SAFETY: `self.raw` is the graph of the running callback, and `name`
+        // outlives the call.
+        let node = unsafe { rn_v8_sys__embedder_graph_add_node(self.raw, name.as_ptr(), size) };
+        if node.is_null() {
+            None
+        } else {
+            Some(EmbedderNode(node))
+        }
+    }
+
+    /// Adds a named edge `from --name--> to`.
+    ///
+    /// Both nodes must have come from this graph. V8 stores the `char*` rather
+    /// than copying it, so the name has to outlive the snapshot; `'static` names
+    /// are interned once by [`static_edge_name`] instead of leaked per snapshot.
+    pub fn add_edge(&self, from: EmbedderNode, to: EmbedderNode, name: &'static str) {
+        let Some(name) = static_edge_name(name) else {
+            return;
+        };
+        // SAFETY: both handles came from this graph and are still owned by it,
+        // the snapshot has not been serialized yet, and `name` lives for the
+        // process.
+        unsafe {
+            rn_v8_sys__embedder_graph_add_edge(self.raw, from.0, to.0, name);
+        }
+    }
+}
+
+/// The `char*` for an edge name V8 will hold for a snapshot's lifetime.
+///
+/// Interned by literal address, so a snapshot costs no allocation per edge and
+/// the pointer V8 keeps is valid for the process rather than for one snapshot.
+fn static_edge_name(name: &'static str) -> Option<*const std::os::raw::c_char> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NAMES: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+    let names = NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = name.as_ptr() as usize;
+    let mut names = names.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(pointer) = names.get(&key) {
+        return Some(*pointer as *const std::os::raw::c_char);
+    }
+    let pointer = std::ffi::CString::new(name).ok()?.into_raw();
+    names.insert(key, pointer as usize);
+    Some(pointer)
+}
+
+/// The state a registered build callback carries.
+pub struct EmbedderGraphCallback {
+    /// Adds the nodes and edges for one snapshot. Called on the thread taking
+    /// it, with the graph to fill.
+    ///
+    /// No `Send`/`Sync` bound: the registration is thread-local and V8 calls it
+    /// on the thread that registered it, so a walk that touches per-thread state
+    /// is the point rather than a hazard.
+    pub build: Box<dyn Fn(EmbedderGraph)>,
+}
+
+/// Registers `callback` to add embedder nodes to every snapshot of `isolate`.
+///
+/// Returns false when the isolate has no heap profiler. The registration lives
+/// for the isolate's lifetime; [`unregister_embedder_graph`] removes it.
+///
+/// # Safety
+///
+/// `isolate` must be the live isolate this thread owns, and it must outlive the
+/// registration. `callback` runs on the snapshotting thread while V8 holds no
+/// JavaScript scope of its own, so it may only write to the graph — it must not
+/// call into V8.
+pub unsafe fn register_embedder_graph(
+    isolate: &v8::Isolate,
+    callback: EmbedderGraphCallback,
+) -> bool {
+    // The one registration this thread forwards to.
+    //
+    // Thread-local for the same reason `Isolate` is: a worker's snapshot must run
+    // the worker's walk, not the main thread's. Boxed and then leaked into the
+    // slot so the pointer V8 keeps is stable for the isolate's life.
+    thread_local! {
+        static SLOT: std::cell::Cell<*mut EmbedderGraphCallback> =
+            const { std::cell::Cell::new(std::ptr::null_mut()) };
+    }
+
+    /// The `extern "C"` body V8 calls: forwards to the thread's registration.
+    ///
+    /// # Safety
+    ///
+    /// `graph` is the live `v8::EmbedderGraph*` of the snapshot being taken.
+    extern "C" fn trampoline(_user: *mut std::ffi::c_void, graph: *mut std::ffi::c_void) {
+        SLOT.with(|slot| {
+            let callback = slot.get();
+            if callback.is_null() || graph.is_null() {
+                return;
+            }
+            // SAFETY: the pointer was boxed and leaked by the registration
+            // below, and V8 calls this on the thread that registered it.
+            let callback = unsafe { &*callback };
+            // SAFETY: the graph is live for the duration of this call.
+            (callback.build)(unsafe { EmbedderGraph::from_raw(graph) });
+        });
+    }
+
+    let boxed = Box::into_raw(Box::new(callback));
+    SLOT.with(|slot| {
+        // Replacing a previous registration would leak it; there is one per
+        // isolate and one isolate per thread here, so a second call is a bug the
+        // caller would see as a doubled node count. Freeing the old one is the
+        // honest answer.
+        let previous = slot.replace(boxed);
+        if !previous.is_null() {
+            // SAFETY: it came from `Box::into_raw` above.
+            drop(unsafe { Box::from_raw(previous) });
+        }
+    });
+    // SAFETY: the isolate is the caller's live one; the trampoline reads only
+    // thread-local state and the graph V8 hands it.
+    unsafe {
+        rn_v8_sys__add_build_embedder_graph_callback(
+            isolate.as_raw_isolate_ptr(),
+            trampoline,
+            std::ptr::null_mut(),
+        )
+    }
+}
+
+/// Removes the build callback registered for `isolate`.
+///
+/// # Safety
+///
+/// `isolate` must be the isolate [`register_embedder_graph`] was called with,
+/// and no snapshot may be in progress on this thread.
+pub unsafe fn unregister_embedder_graph(isolate: &v8::Isolate) {
+    // SAFETY: the caller guarantees the isolate and that no snapshot runs now.
+    unsafe { rn_v8_sys__remove_build_embedder_graph_callback(isolate.as_raw_isolate_ptr()) };
+}
+
+/// Which `HeapSnapshotOptions` a snapshot is taken with.
+///
+/// `lib/internal/heap_utils.js`'s `getHeapSnapshotOptions` builds
+/// `Uint8Array([+exposeInternals, +exposeNumericValues])`, and Node's
+/// `src/heap_utils.cc:GetHeapSnapshotOptions` maps those bytes onto
+/// `HeapSnapshotMode` and `NumericsMode`. The names here are the JS option names
+/// rather than the V8 enum names, so the two mappings cannot be confused.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeapSnapshotOptions {
+    pub expose_internals: bool,
+    pub expose_numeric_values: bool,
+}
+
+impl HeapSnapshotOptions {
+    /// A regular snapshot with numeric values hidden, which is V8's default.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            expose_internals: false,
+            expose_numeric_values: false,
+        }
+    }
+}
+
+/// Takes a heap snapshot with `options` and serializes it as JSON.
+///
+/// `write` is called once or more with consecutive chunks of one JSON document
+/// and returns whether to continue; returning `false` aborts the snapshot.
+/// Returns `Err` when V8 produced no snapshot, which happens on allocation
+/// failure, or when `write` aborted.
+///
+/// This is the options-taking sibling of `Isolate::take_heap_snapshot`, whose
+/// binding in the `v8` crate calls the no-argument `TakeHeapSnapshot()` and so
+/// always gets V8's default `HeapSnapshotOptions`.
+///
+/// # Safety
+///
+/// `isolate` must be a live isolate on the calling thread, entered by no other
+/// scope for the duration. V8 calls `write` synchronously on this thread before
+/// this returns, so no handle may be collected during the call.
+pub unsafe fn take_heap_snapshot(
+    isolate: &v8::Isolate,
+    options: HeapSnapshotOptions,
+    write: impl FnMut(&[u8]) -> bool,
+) -> Result<(), &'static str> {
+    /// What the `extern "C"` trampoline receives: the caller's closure and
+    /// whether it asked to stop.
+    struct Sink<'a> {
+        write: &'a mut dyn FnMut(&[u8]) -> bool,
+        aborted: &'a mut bool,
+    }
+
+    /// Forwards one chunk to the closure and records an abort.
+    ///
+    /// # Safety
+    ///
+    /// `user` is the `*mut Sink` `take_heap_snapshot` passes, alive for the
+    /// duration of the one synchronous call V8 makes it from.
+    extern "C" fn trampoline(
+        user: *mut std::ffi::c_void,
+        data: *const std::os::raw::c_char,
+        size: usize,
+    ) -> bool {
+        // SAFETY: see the function docs.
+        let sink = unsafe { &mut *user.cast::<Sink<'_>>() };
+        if data.is_null() {
+            // `EndOfStream` is reported as an empty chunk by the shim's own
+            // `OutputStream`, and there is nothing left to hand on.
+            return true;
+        }
+        // SAFETY: V8 owns `size` bytes at `data` for the duration of the call.
+        let chunk = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size) };
+        let keep_going = (sink.write)(chunk);
+        if !keep_going {
+            *sink.aborted = true;
+        }
+        keep_going
+    }
+
+    let mut write = write;
+    let mut aborted = false;
+    let mut sink = Sink {
+        write: &mut write,
+        aborted: &mut aborted,
+    };
+    // SAFETY: `sink` outlives the call below, which is synchronous and the only
+    // reader; the isolate is the caller's live one.
+    let taken = unsafe {
+        rn_v8_sys__take_heap_snapshot(
+            isolate.as_raw_isolate_ptr(),
+            options.expose_internals,
+            options.expose_numeric_values,
+            trampoline,
+            (&mut sink as *mut Sink<'_>).cast(),
+        )
+    };
+    if !taken {
+        return Err("V8 could not take a heap snapshot");
+    }
+    if aborted {
+        return Err("the heap snapshot was aborted");
+    }
+    Ok(())
 }
 
 /// Sets `v8::Isolate::SetStackLimit` on the current isolate.

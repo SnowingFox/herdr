@@ -1,7 +1,8 @@
-//! The `heap_utils` snapshot stream, driven through a real V8 isolate.
+//! The `heap_utils` namespace, driven through a real V8 isolate.
 //!
-//! Two members are under test and the difference between them matters:
+//! Three members are under test:
 //!
+//! * `buildEmbedderGraph(...values)` returns one node per distinct argument.
 //! * `triggerHeapSnapshot` writes V8's JSON straight to a file.
 //! * `createHeapSnapshotStream` hands the same JSON to a `StreamBase` handle,
 //!   which `lib/internal/stream_base_commons.js`'s `onStreamRead` reads through
@@ -207,7 +208,11 @@ fn every_contract_member_is_installed_or_deferred() {
     });
     assert_eq!(
         installed,
-        ["createHeapSnapshotStream", "triggerHeapSnapshot"]
+        [
+            "buildEmbedderGraph",
+            "createHeapSnapshotStream",
+            "triggerHeapSnapshot"
+        ]
     );
     for name in &installed {
         assert!(
@@ -215,31 +220,86 @@ fn every_contract_member_is_installed_or_deferred() {
             "{name} is installed and also declared deferred"
         );
     }
-    assert_eq!(deferred, ["buildEmbedderGraph"]);
+    assert!(
+        deferred.is_empty(),
+        "{deferred:?} is still deferred but every contract member is installed"
+    );
 }
 
 #[test]
-fn the_deferred_reason_names_the_missing_api() {
-    // The point of a declared deferral is that the reason is actionable: it has to
-    // say which V8 entry point is absent, not that the feature "is not supported".
-    //
-    // The claim was re-measured rather than carried over from the previous reason.
-    // The `v8` crate binds exactly one `HeapProfiler` method — `TakeHeapSnapshot`
-    // (`v8-152.2.0/src/binding.cc:4068`) — so both the callback registration and
-    // the graph walk are absent, and `Environment::BuildEmbedderGraph` does not
-    // exist to call.
-    let (_, reason) = rn_bind_heap_utils::DEFERRED[0];
+fn build_embedder_graph_returns_one_node_per_distinct_value() {
+    // `test/parallel/test-heap-embedder-graph.js` is the caller, and this is its
+    // assertion: `first` is passed twice and must produce one node, and each
+    // distinct value must produce exactly one whose `value` is `Object.is`-equal.
+    with_context(|scope| {
+        install(scope);
+        let script = r#"
+            const first = {};
+            const second = {};
+            const bigint = BigInt('123456789012345678901234567890');
+            const same = BigInt('123456789012345678901234567890');
+            const graph = globalThis.__heap.buildEmbedderGraph(
+              first, first, second, bigint, same);
+            const finds = (value) => graph.filter((node) =>
+              Object.hasOwn(node, 'value') && Object.is(node.value, value));
+            [
+              Array.isArray(graph),
+              graph.length,
+              finds(first).length,
+              finds(second).length,
+              finds(bigint).length,
+              finds({}).length,
+              graph.every((node) =>
+                node.name === '<JS Node>' && node.isRoot === false &&
+                node.size === 0 && Array.isArray(node.edges) &&
+                node.edges.length === 0),
+            ].join(',')
+        "#;
+        assert_eq!(run(scope, script), "true,3,1,1,1,0,true");
+    });
+}
+
+#[test]
+fn build_embedder_graph_uses_same_value_not_same_value_zero() {
+    // `JSGraphJSNode::IsSame` compares with `Value::SameValue`, so `0` and `-0`
+    // are two nodes while `NaN` collapses onto itself. `Object.is` is the same
+    // comparison, which is why the test above can use it.
+    with_context(|scope| {
+        install(scope);
+        let script = r#"
+            const graph = globalThis.__heap.buildEmbedderGraph(0, -0, NaN, NaN);
+            [
+              graph.length,
+              Object.is(graph[0].value, 0),
+              Object.is(graph[1].value, -0),
+              Number.isNaN(graph[2].value),
+            ].join(',')
+        "#;
+        assert_eq!(run(scope, script), "3,true,true,true");
+    });
+}
+
+#[test]
+fn build_embedder_graph_handles_no_arguments() {
+    with_context(|scope| {
+        install(scope);
+        let script = "globalThis.__heap.buildEmbedderGraph().length";
+        assert_eq!(run(scope, script), "0");
+    });
+}
+
+#[test]
+fn no_contract_member_is_left_deferred() {
+    // Every member `contracts/heap_utils.json` records is installed, so the
+    // deferral list has to be empty rather than carrying a stale reason. The
+    // previous entries here (`buildEmbedderGraph` and, before it,
+    // `internal_only_v8.queryObjects`) both described a missing
+    // `HeapProfiler` binding; both are now implemented, so a non-empty list here
+    // means the install regressed.
     assert!(
-        reason.contains("HeapProfiler"),
-        "the reason must name the missing V8 API family: {reason}"
-    );
-    assert!(
-        reason.contains("TakeHeapSnapshot"),
-        "the reason must say what the crate does bind instead: {reason}"
-    );
-    assert!(
-        reason.contains("BuildEmbedderGraph"),
-        "the reason must name the walk it needs: {reason}"
+        rn_bind_heap_utils::DEFERRED.is_empty(),
+        "{:?} is still deferred",
+        rn_bind_heap_utils::DEFERRED
     );
 }
 

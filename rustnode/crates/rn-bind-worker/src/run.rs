@@ -343,6 +343,21 @@ impl WorkerThread {
         // `process.on('unhandledRejection')` listeners.
         rn_bind_task_queue::install_isolate_callbacks(&mut isolate);
         rn_bind_heap_utils::set_snapshot_isolate(&mut isolate);
+        // A worker's snapshot must report the worker's own ports, so the walk is
+        // registered against this isolate exactly as the CLI does for the main
+        // thread's. Node reaches the same set through the worker's own
+        // `Environment`. See `rn_bind_messaging::add_embedder_nodes`.
+        let registered = unsafe {
+            rn_v8_sys::register_embedder_graph(
+                &isolate,
+                rn_v8_sys::EmbedderGraphCallback {
+                    build: Box::new(|graph| rn_bind_messaging::add_embedder_nodes(&graph)),
+                },
+            )
+        };
+        if !registered {
+            tracing::debug!("worker isolate has no heap profiler; snapshots have no ports");
+        }
         // Node's inspector is one `V8Inspector` per isolate, and
         // `inspector.Session()` connects to *this* isolate's inspector. The CLI
         // records the main thread's isolate for the same reason
