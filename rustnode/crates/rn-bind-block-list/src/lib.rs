@@ -151,7 +151,11 @@ struct BlockListClone {
 }
 
 impl TransferData for BlockListClone {
-    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    fn rebuild<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        _target: v8::Local<'s, v8::Context>,
+    ) -> Option<v8::Local<'s, v8::Object>> {
         // `SocketAddressBlockListWrap::TransferData::Deserialize` calls `New(env,
         // std::move(blocklist_))`, which builds a fresh wrapper over the shared
         // rules. `new_block_list_object` is the same thing: an instance of the
@@ -170,7 +174,11 @@ struct SocketAddressClone {
 }
 
 impl TransferData for SocketAddressClone {
-    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    fn rebuild<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        _target: v8::Local<'s, v8::Context>,
+    ) -> Option<v8::Local<'s, v8::Object>> {
         // `SocketAddressBase::TransferData::Deserialize` calls
         // `SocketAddressBase::Create(env, std::move(address_))`, a new wrapper
         // around a copy of the address. The constructor is not run, so the object

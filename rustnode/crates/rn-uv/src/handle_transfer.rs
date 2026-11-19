@@ -364,6 +364,53 @@ pub fn handle_from_ptr(pointer: *mut c_void) -> *mut uv::uv_handle_t {
     pointer.cast()
 }
 
+/// The descriptor behind a live handle, `uv_fileno`.
+///
+/// Node's `TCPWrap::TransferForMessaging` asks for this before it duplicates the
+/// socket. `None` means libuv has no descriptor to report, which is the ordinary
+/// answer for a handle that has not been opened yet.
+pub fn fileno(handle: *mut uv::uv_handle_t) -> Option<uv::uv_os_fd_t> {
+    if handle.is_null() {
+        return None;
+    }
+    let mut descriptor: uv::uv_os_fd_t = -1;
+    // SAFETY: the caller passed a live handle, and `uv_fileno` only reads it.
+    let status = unsafe { uv::uv_fileno(handle, &mut descriptor) };
+    (status == 0 && descriptor >= 0).then_some(descriptor)
+}
+
+/// Duplicates a descriptor so two event loops can each own a reference.
+///
+/// Node's `TCPWrap::TransferForMessaging` calls `dup()` for exactly this: the
+/// sending loop closes its handle, and the duplicate keeps the underlying socket
+/// alive until the receiving loop adopts it — or until the transfer payload is
+/// dropped, which closes it.
+///
+/// Returns `None` when `dup` fails, which is the caller's signal that the handle
+/// cannot be moved.
+pub fn duplicate_descriptor(descriptor: uv::uv_os_fd_t) -> Option<uv::uv_os_fd_t> {
+    // SAFETY: `dup` takes an open descriptor and only borrows it for the call.
+    let duplicate = unsafe { libc::dup(descriptor) };
+    (duplicate >= 0).then_some(duplicate)
+}
+
+/// Closes a descriptor this process owns and nothing else will close.
+///
+/// Used for the two ends of a transfer that never reaches an event loop: a
+/// payload dropped before it is rebuilt, and a duplicate `uv_tcp_open` rejected.
+/// Both are the same obligation — the descriptor was taken out of the transfer
+/// state and has no owner left.
+pub fn close_descriptor(descriptor: uv::uv_os_fd_t) {
+    if descriptor < 0 {
+        return;
+    }
+    // SAFETY: the caller guarantees the descriptor is owned here and no other
+    // handle refers to it. `close` only reads the number.
+    unsafe {
+        libc::close(descriptor);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

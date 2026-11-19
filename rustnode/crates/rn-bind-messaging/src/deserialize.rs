@@ -122,9 +122,18 @@ impl v8::ValueDeserializerImpl for Lookup<'_> {
 }
 
 /// Reads one message's payload, re-attaching everything it transferred.
+///
+/// `target` is the context the message is being delivered into: Node's
+/// `MessagePort::OnMessage` computes
+/// `object(env()->isolate())->GetCreationContextChecked()` — the *port object's*
+/// creation context, not the environment's — and passes it to
+/// `Message::Deserialize`. A payload rebuilds inside that context, which is what
+/// lets `moveMessagePortToContext` deliver into a `vm` realm at all, and what
+/// makes a `JSTransferable` refuse a context it cannot belong to.
 pub fn deserialize<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     message: &crate::port::Message,
+    target: v8::Local<'s, v8::Context>,
 ) -> Result<Deserialized<'s>, ()> {
     // Phase 1: every transferred object, before V8 is involved. Both kinds reach
     // JavaScript — a `PortTransferData::rebuild` builds a port object and runs its
@@ -134,7 +143,7 @@ pub fn deserialize<'s>(
     for payload in message.host_objects.iter() {
         // `rebuild` is where a transfer is inverted: `TransferForMessaging` ran on
         // the sender, and this builds the receiving object from the moved state.
-        let rebuilt = payload.rebuild(scope).ok_or(())?;
+        let rebuilt = payload.rebuild(scope, target).ok_or(())?;
         objects.push(v8::Global::new(scope, rebuilt));
     }
     let rebuilt = Rebuilt { objects };

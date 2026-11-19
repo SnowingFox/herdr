@@ -167,6 +167,12 @@ pub fn deliver<'s>(scope: &mut v8::PinScope<'s, '_>, port: &Rc<PortInner>) -> bo
     };
 
     let mut delivered = false;
+    // A port with work to do is a live handle, so its wrapper is rooted before any
+    // delivery is attempted: the queue is delivered to that wrapper, and one that
+    // was collected while a message waited would drop the message with no event.
+    // This is Node's `ClearWeak()` in `BaseObject::increase_refcount`, applied to
+    // the port half of the rule (`receiving_messages_`).
+    port.pin_for_delivery(scope);
     for _ in 0..PROCESSING_LIMIT {
         // The close marker is read before anything else, which is Node's order:
         // `ReceiveMessage` peeks the front and returns to `OnMessage`, which only
@@ -209,25 +215,51 @@ pub fn deliver<'s>(scope: &mut v8::PinScope<'s, '_>, port: &Rc<PortInner>) -> bo
         // A parse failure is reported as a `messageerror` event, not as an
         // uncaught exception, so the read runs inside its own `TryCatch` and a
         // caught exception never escapes to the loop.
+        //
+        // The exception is kept, not discarded. `test-worker-message-port-transfer-
+        // fake-js-transferable.js` reads `exception.message` off the event and
+        // expects `Missing internal module '<path>'`, which is the error the
+        // receiving create-object hook threw while rebuilding the transferred
+        // object — the only place that message exists. Emitting `undefined` made
+        // every `messageerror` payload empty, so a listener could not tell a
+        // context mismatch from a bad `deserializeInfo` at all.
         let payload = {
             let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
             let scope = &mut try_catch.init();
-            deserialize::deserialize(scope, &message)
-                .ok()
-                .map(|payload| (v8::Global::new(scope, payload.value), payload.ports))
+            // The port object's own creation context, which is Node's
+            // `GetCreationContextChecked()` and the reason a port moved with
+            // `moveMessagePortToContext` receives into the realm it was moved to.
+            let target = object.get_creation_context(scope).unwrap_or_else(|| {
+                scope.get_current_context()
+            });
+            match deserialize::deserialize(scope, &message, target) {
+                Ok(deserialized) => Ok((
+                    v8::Global::new(scope, deserialized.value),
+                    deserialized.ports,
+                )),
+                Err(()) => Err(scope
+                    .exception()
+                    .map(|exception| v8::Global::new(scope, exception))),
+            }
         };
 
         match payload {
-            Some((value, ports)) => {
+            Ok((value, ports)) => {
                 let value: v8::Local<v8::Value> = v8::Local::new(scope, &value);
-                emit_message(scope, emit, object, value, &ports);
+                emit_message(scope, emit, object, value, &ports, "message");
                 delivered = true;
             }
-            None => {
+            Err(exception) => {
                 // Node's `OnMessage` catches the parse failure and emits
-                // `messageerror` with the exception as its payload.
-                let error: v8::Local<v8::Value> = v8::undefined(scope).into();
-                emit_message(scope, emit, object, error, &[]);
+                // `messageerror` with the caught exception as its payload. When
+                // the failure was reported by returning `Err` without throwing —
+                // a payload V8 refused to read, say — there is nothing to pass,
+                // and `undefined` is Node's own answer for a throw of no value.
+                let error: v8::Local<v8::Value> = match &exception {
+                    Some(exception) => v8::Local::new(scope, exception),
+                    None => v8::undefined(scope).into(),
+                };
+                emit_message(scope, emit, object, error, &[], "messageerror");
                 delivered = true;
             }
         }
@@ -238,15 +270,23 @@ pub fn deliver<'s>(scope: &mut v8::PinScope<'s, '_>, port: &Rc<PortInner>) -> bo
 }
 
 /// Calls `emitMessage(data, ports, type)` with `this` as the port.
+///
+/// `kind` is `'message'` or `'messageerror'`, and it is a parameter rather than a
+/// constant because `emitMessage` dispatches on it: `messageport.js` calls
+/// `kHybridDispatch(event, kind)` and falls back to `onmessage`/`onmessageerror`
+/// by comparing the string. Hard-coding `'message'` made every deserialize
+/// failure arrive as a `message` event whose data happened to be the exception,
+/// so `port2.on('messageerror')` never ran and the test hung waiting for it.
 fn emit_message<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     emit: v8::Local<'s, v8::Function>,
     object: v8::Local<'s, v8::Object>,
     data: v8::Local<'s, v8::Value>,
     ports: &[v8::Global<v8::Object>],
+    kind: &str,
 ) {
     let ports = ports_array(scope, ports);
-    let Some(kind) = v8::String::new(scope, "message") else {
+    let Some(kind) = v8::String::new(scope, kind) else {
         return;
     };
     let arguments = [data, ports, kind.into()];

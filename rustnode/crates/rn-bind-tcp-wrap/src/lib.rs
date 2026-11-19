@@ -41,6 +41,7 @@ use rn_v8_sys::v8;
 pub mod connect;
 pub mod handle;
 pub mod methods;
+pub mod transfer;
 pub mod wrap;
 
 /// Members exposed on the namespace object, matching `contracts/tcp_wrap.json`.
@@ -126,6 +127,12 @@ impl BindingModule for TcpWrap {
 /// Registers the `tcp_wrap` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(TcpWrap);
+    // A `TCP` is a host object that can only move, so `postMessage(socket, [socket])`
+    // gives this handle up and the receiver adopts the duplicate. Registering the
+    // kind here, with the namespace, is what makes the messaging layer find the
+    // hook; without it the `[kTransfer]` in `lib/net.js` returned a handle the
+    // serializer could not resolve and every socket transfer failed.
+    rn_core::host_object::register_transfer_kind(transfer::TCP_KIND, transfer::transfer_for_messaging);
 }
 
 fn define_constant(

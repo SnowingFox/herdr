@@ -469,6 +469,14 @@ pub fn new_port_object<'s>(
     // Delivery needs the object to use as `this`, so the port holds a weak
     // reference to it rather than a root that would pin every port forever. The
     // clone's finalizer is empty: its only job is to be a non-owning handle.
+    //
+    // It is only weak *while the port is idle*. A port that is receiving is a
+    // live handle in Node, and `BaseObject::increase_refcount` calls
+    // `ClearWeak()` so its JS wrapper cannot be collected out from under a queued
+    // message. A `Weak` alone loses exactly that case: the message is queued,
+    // nothing else in the script holds the object, GC runs, and the message is
+    // dropped with no event — the silent hang `test-whatwg-webstreams-transfer.js`
+    // and a transferred port's first delivery both hit.
     let peer = weak.clone_with_guaranteed_finalizer(Box::new(|| {}));
     // SAFETY: `slot` is live and exclusively reachable through this local.
     let inner = unsafe { &*slot }.inner.clone();
@@ -757,9 +765,22 @@ fn move_message_port_to_context<'s>(
 /// Throws `new Error(message)` carrying `code`, Node's `THROW_ERR_*` for the codes
 /// whose class is `Error` rather than `TypeError`.
 fn throw_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: &str) {
-    let Some(text) = v8::String::new(scope, message) else {
-        return;
-    };
+    if let Some(exception) = error_with_code(scope, code, message) {
+        scope.throw_exception(exception);
+    }
+}
+
+/// Builds `new Error(message)` carrying `code` without throwing it.
+///
+/// Split out from [`throw_error_with_code`] because one caller cannot throw: a
+/// `messageerror` payload is delivered, not raised, so
+/// `ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE` has to be constructed and handed on.
+pub(crate) fn error_with_code<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    code: &str,
+    message: &str,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let text = v8::String::new(scope, message)?;
     let exception = v8::Exception::error(scope, text);
     if let (Ok(object), Some(key), Some(value)) = (
         v8::Local::<v8::Object>::try_from(exception),
@@ -768,7 +789,7 @@ fn throw_error_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: 
     ) {
         let _ = object.set(scope, key.into(), value.into());
     }
-    scope.throw_exception(exception);
+    Some(exception)
 }
 
 fn handle_wrap_constructor(
@@ -922,6 +943,10 @@ fn start(
         return;
     }
     state.start();
+    // `start()` makes this port deliverable, so its wrapper has to survive the
+    // script dropping its last reference: the queue is delivered to that wrapper,
+    // and a collected one loses every message with no event at all.
+    state.pin_object(scope);
 }
 
 fn handle_wrap_ref(
@@ -1007,7 +1032,12 @@ fn receive_message_on_port(
         set_no_message(scope, &mut rv);
         return;
     };
-    match deserialize::deserialize(scope, &message) {
+    // The port object's creation context, as in `delivery::deliver`.
+    let target = args
+        .this()
+        .get_creation_context(scope)
+        .unwrap_or_else(|| scope.get_current_context());
+    match deserialize::deserialize(scope, &message, target) {
         Ok(deserialized) => rv.set(deserialized.value),
         Err(()) => set_no_message(scope, &mut rv),
     }
@@ -1305,9 +1335,73 @@ pub(crate) fn js_clone_for_messaging<'s>(
     if !mode.is_cloneable() {
         return None;
     }
+    js_transfer_or_clone(scope, object, "messaging_clone_symbol")
+}
+
+/// Whether `object` carries a callable `messaging_transfer_symbol`.
+///
+/// This is Node's actual answer to "is this a `JSTransferable` that can move",
+/// and it is *not* the transfer mode. `JSTransferable::TransferOrClone`
+/// (`src/node_messaging.cc:1352`) looks the symbol up and requires a function;
+/// the mode only decides which of the two symbols
+/// `GetTransferMode`/`CloneForMessaging` would use. A `FileHandle` is
+/// `markTransferMode(this, false, true)` — mode 1 — but so is every web stream,
+/// and a `net.Socket`; what makes each of them transferable is the method.
+///
+/// Consulting the mode here instead is what made a `FileHandle` "Found invalid
+/// value in transferList.": the mode test asked "is it `kTransferable`", saw
+/// `kCloneable` on a handle rustnode had marked itself, and refused it even
+/// though `[kTransfer]` was right there.
+pub(crate) fn js_transferable(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<'_, v8::Object>,
+) -> bool {
+    // `IsJSTransferable` is `HasPrivate(transfer_mode_private_symbol)`, and the
+    // method has to be a function on top of that. Both are needed: an object
+    // whose `[kTransfer]` is not a function is *not* transferable in Node, and
+    // one whose stamp is missing is not a host object at all.
+    if !js_marked(scope, object) {
+        return false;
+    }
     let Ok(symbol) =
-        rn_bind_symbols::ensure(scope, "messaging_clone_symbol", "messaging_clone_symbol")
+        rn_bind_symbols::ensure(scope, "messaging_transfer_symbol", "messaging_transfer_symbol")
     else {
+        return false;
+    };
+    let Some(method) = object.get(scope, symbol.into()) else {
+        return false;
+    };
+    method.is_function()
+}
+
+/// Runs `[kTransfer]` on a marked object, Node's `JSTransferable::TransferForMessaging`.
+///
+/// The moving half of [`js_clone_for_messaging`], with the same result shape:
+/// `data` is the state written after the payload, and `deserializeInfo` names the
+/// receiver's class. Both come from the one method, which is why they are read by
+/// one helper rather than two lookups that could disagree.
+pub(crate) fn js_transfer_for_messaging<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Option<std::sync::Arc<dyn rn_core::host_object::TransferData>> {
+    js_transfer_or_clone(scope, object, "messaging_transfer_symbol")
+}
+
+/// Calls one of `[kClone]`/`[kTransfer]` and turns the result into a payload.
+///
+/// `TransferOrClone<mode>` does not distinguish the two beyond which symbol it
+/// looks up, so neither does this: the result must be an object with `data` and a
+/// stringifiable `deserializeInfo`, and anything else is a failed transfer — not
+/// an empty one. A hook that *throws* is different again: Node lets the exception
+/// propagate out of `postMessage`, so the caller sees the user's own error rather
+/// than a generic `DataCloneError`, and this returns `None` with the exception
+/// pending for exactly that reason.
+fn js_transfer_or_clone<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    symbol_name: &'static str,
+) -> Option<std::sync::Arc<dyn rn_core::host_object::TransferData>> {
+    let Ok(symbol) = rn_bind_symbols::ensure(scope, symbol_name, symbol_name) else {
         return None;
     };
     let method = object.get(scope, symbol.into())?;
@@ -1327,6 +1421,84 @@ pub(crate) fn js_clone_for_messaging<'s>(
         deserialize_info: info.to_rust_string_lossy(scope),
         data: v8::Global::new(scope, data),
     }))
+}
+
+/// Whether `context` is the environment's own, Node's `context == env->context()`.
+///
+/// `JSTransferable::Data::Deserialize` refuses any other context. The
+/// environment's context is the one `rn_uv::callback::remember_context` recorded
+/// when the bindings were installed — the principal realm's — so a `vm` context
+/// created by `vm.createContext` is never it, which is the case
+/// `test-worker-message-port-transfer-filehandle.js` describes.
+pub fn context_is_environment(
+    scope: &mut v8::PinScope<'_, '_>,
+    context: v8::Local<'_, v8::Context>,
+) -> bool {
+    let Some((_, environment)) = rn_uv::callback::isolate_and_context() else {
+        // Nothing recorded means no environment to compare against, which is the
+        // state a payload can only reach before the bindings installed. Treating it
+        // as "the environment" keeps a clone working rather than refusing it for a
+        // reason the caller cannot act on.
+        return true;
+    };
+    // `Context` has no `strict_equals` of its own, so the comparison goes through
+    // their global objects: two distinct contexts never share a global, and one
+    // context's global never equals another's.
+    let environment: v8::Local<v8::Context> = v8::Local::new(scope, &environment);
+    environment.global(scope).strict_equals(context.global(scope).into())
+}
+
+/// Runs `[kTransferList]` on a marked object, Node's
+/// `JSTransferable::NestedTransferables`.
+///
+/// A `FileHandle` moves its native handle, a web stream moves a `MessagePort`
+/// pair, and neither of those is in the user's transfer list: the wrapper
+/// registers them here. Node collects them into `host_objects_` *before*
+/// serializing the value (`AddNestedHostObjects`), so the ids the payload writes
+/// are already resolvable when the wrapper's own `[kTransfer]` runs.
+///
+/// `Ok(None)` means "not a list" — a missing hook, a non-function, or a value
+/// that is not an array — which is Node's `Just(BaseObjectPtrList{})`. `Err`
+/// means the hook threw or the array could not be read, which is `Nothing()`.
+pub(crate) fn js_nested_transferables<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+) -> Result<Vec<v8::Local<'s, v8::Object>>, ()> {
+    let Ok(symbol) = rn_bind_symbols::ensure(
+        scope,
+        "messaging_transfer_list_symbol",
+        "messaging_transfer_list_symbol",
+    ) else {
+        return Ok(Vec::new());
+    };
+    let Some(method) = object.get(scope, symbol.into()) else {
+        return Err(());
+    };
+    if !method.is_function() {
+        return Ok(Vec::new());
+    }
+    let Ok(method) = v8::Local::<v8::Function>::try_from(method) else {
+        return Ok(Vec::new());
+    };
+    let Some(list) = method.call(scope, object.into(), &[]) else {
+        return Err(());
+    };
+    let Ok(list) = v8::Local::<v8::Array>::try_from(list) else {
+        return Ok(Vec::new());
+    };
+
+    let mut entries = Vec::with_capacity(list.length() as usize);
+    for index in 0..list.length() {
+        let Some(value) = list.get_index(scope, index) else {
+            return Err(());
+        };
+        // `if (!value->IsObject()) continue;`: a primitive in the nested list is
+        // skipped, not an error, because the hook is not user-facing.
+        if let Ok(object) = v8::Local::<v8::Object>::try_from(value) {
+            entries.push(object);
+        }
+    }
+    Ok(entries)
 }
 
 /// `object.name`, as a value.
@@ -1352,7 +1524,29 @@ struct JsClone {
 }
 
 impl rn_core::host_object::TransferData for JsClone {
-    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    fn rebuild<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        target: v8::Local<'s, v8::Context>,
+    ) -> Option<v8::Local<'s, v8::Object>> {
+        // `JSTransferable::Data::Deserialize`'s first act is
+        // `if (context != env->context()) THROW_ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE`.
+        // A `JSTransferable` wraps state that belongs to the environment's own
+        // context, so rebuilding it into a `vm` realm would hand user code an
+        // object whose fields point somewhere it cannot see. Refusing is what makes
+        // the message a `messageerror` instead of silently producing the wrong
+        // object, and it is why the context passed down here is the *receiving
+        // port's* context rather than the running one.
+        if !context_is_environment(scope, target) {
+            if let Some(exception) = error_with_code(
+                scope,
+                "ERR_MESSAGE_TARGET_CONTEXT_UNAVAILABLE",
+                "A message object could not be deserialized successfully in the target vm.Context",
+            ) {
+                scope.throw_exception(exception);
+            }
+            return None;
+        }
         // `JSTransferable::Data::Deserialize`. This is the call the bug report
         // names: the hook was stored by
         // `setDeserializerCreateObjectFunction` and never invoked, so a cloned
@@ -1448,7 +1642,9 @@ fn structured_clone<'s>(
         // V8 already scheduled the exception.
         Err(serialize::SerializeError::Thrown) => return,
     };
-    match deserialize::deserialize(scope, &message) {
+    // `structuredClone` has no port, so the running context is what Node passes.
+    let target = scope.get_current_context();
+    match deserialize::deserialize(scope, &message, target) {
         Ok(deserialized) => rv.set(deserialized.value),
         Err(()) => {
             throw_type_error(

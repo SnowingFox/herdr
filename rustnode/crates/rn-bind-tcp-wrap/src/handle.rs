@@ -449,9 +449,24 @@ pub fn constructor<'s>(
 /// Equivalent to `ConnectionWrap::Instantiate`: it calls the constructor with the
 /// `SOCKET` type, which then adopts the handle [`park_accept`] put aside.
 pub fn instantiate<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    instantiate_kind(scope, crate::SOCKET)
+}
+
+/// [`instantiate`] with an explicit socket type.
+///
+/// The type is not cosmetic: it is what `TcpHandle::provider` turns into the
+/// async provider, and `net.Server`'s `[kDeserialize]` adopts the result with
+/// `server.listen(handle)`, which needs a `TCPSERVERWRAP`. A transferred
+/// listening socket rebuilt as a plain `SOCKET` reported provider
+/// `PROVIDER_TCPWRAP` and never accepted a connection — the worker side of
+/// `test-net-server-transfer-worker.js` sat idle with a listening server.
+pub fn instantiate_kind<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    kind: i32,
+) -> Option<v8::Local<'s, v8::Object>> {
     let constructor = CONSTRUCTOR.with(|slot| slot.borrow().clone())?;
     let constructor: v8::Local<v8::Function> = v8::Local::new(scope, &constructor);
-    let argument: v8::Local<v8::Value> = v8::Integer::new(scope, crate::SOCKET).into();
+    let argument: v8::Local<v8::Value> = v8::Integer::new(scope, kind).into();
     let receiver: v8::Local<v8::Value> = v8::undefined(&**scope).into();
     let _ = receiver;
     constructor.new_instance(&*scope, &[argument])
@@ -550,6 +565,11 @@ pub fn install(
     // reaching into the other.
     // SAFETY: `state_pointer` is the live state this function just installed.
     unsafe { rn_uv::streams::attach(scope, object, state_pointer) };
+    // The handle is a host object that can only move, so the messaging layer has
+    // to recognise it as one before any transfer list is read. Marking at
+    // construction is Node's `BaseObject` recording its wrapper once, and it is
+    // what makes `postMessage(socket, [socket])` resolve `[kTransfer]`'s `data`.
+    rn_core::host_object::mark(scope, object, crate::transfer::TCP_KIND);
     install_finalizer(scope, object, pointer);
 }
 
@@ -572,7 +592,16 @@ fn install_finalizer(
             // SAFETY: `pointer` came from `Box::into_raw` in `install` and this
             // finalizer runs exactly once.
             let handle = unsafe { &mut *pointer };
-            if handle.state.state == HandleState::Initialized {
+            // `uv_is_closing` and not only the recorded state: a loop teardown
+            // (`rn_uv::uv_loop::close_loop`) walks every live handle and starts
+            // its close while the wrapper is still alive, so the state here can
+            // read `Initialized` for a handle libuv has already begun closing.
+            // Calling `uv_close` on that aborts the process —
+            // `core.c:160: Assertion !uv__is_closing(handle) failed` — which is
+            // what ended `worker.terminate()` on a worker whose socket was
+            // transferred in `test-net-socket-transfer-worker.js`.
+            let libuv_closing = handle.state.is_closing();
+            if handle.state.state == HandleState::Initialized && !libuv_closing {
                 // The wrapper died while the socket was still open. Close it so
                 // libuv releases the descriptor; the close callback frees the
                 // box, because libuv still holds `data` until then.

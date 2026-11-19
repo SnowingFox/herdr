@@ -193,6 +193,59 @@ impl HandleState {
         self.stream.after_close();
         fd
     }
+
+    /// Whether this handle is mid-operation, `FileHandle::GetTransferMode`'s
+    /// `reading_ || closing_ || closed_`.
+    ///
+    /// `promises.js` refuses a transfer in all three states with
+    /// `Cannot transfer FileHandle while in use`, so this is the native half of
+    /// the same rule. A descriptor already taken reads as closed, which is what
+    /// stops a second transfer of the same handle.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.descriptor.get() < 0 || self.stream.is_closed()
+    }
+}
+
+/// The `FileHandle` constructor function, as `openFileHandle` resolves it.
+///
+/// Cached because a rebuild needs to construct a handle from native code, and
+/// `promises.js` does `new FileHandle(nativeHandle)`: the object has to be the
+/// same class `openFileHandle` resolves, with the same prototype, internal field
+/// and finalizer, or the receiving side's `fh.readFile()` finds no state.
+pub(crate) fn constructor_function<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::Function>> {
+    let cached = CONSTRUCTOR_FUNCTION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|function| v8::Local::new(scope, function))
+    });
+    if let Some(function) = cached {
+        return Some(function);
+    }
+    let value = constructor(scope).ok()?;
+    let function = v8::Local::<v8::Function>::try_from(value).ok()?;
+    CONSTRUCTOR_FUNCTION.with(|slot| {
+        *slot.borrow_mut() = Some(v8::Global::new(scope, function));
+    });
+    Some(function)
+}
+
+thread_local! {
+    /// The `FileHandle` constructor, built once and rooted.
+    static CONSTRUCTOR_FUNCTION: std::cell::RefCell<Option<v8::Global<v8::Function>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Builds a native `FileHandle` around `descriptor`, Node's
+/// `FileHandle::TransferData::Deserialize`.
+pub(crate) fn new_native_handle<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    descriptor: i32,
+) -> Option<v8::Local<'s, v8::Object>> {
+    let constructor = constructor_function(scope)?;
+    let argument: v8::Local<'s, v8::Value> = v8::Integer::new(scope, descriptor).into();
+    constructor.new_instance(&*scope, &[argument])
 }
 
 /// Borrows the handle state behind a `FileHandle` object.
@@ -253,6 +306,10 @@ fn new_handle(
     // SAFETY: the box's address is final and it lives as long as the state that
     // points at it.
     unsafe { (*pointer).stream.install_owner() };
+    // The handle is a host object that can only move, so the messaging layer has
+    // to recognise it before a transfer list is read. Marking at construction is
+    // Node's `BaseObject` recording its wrapper once.
+    rn_core::host_object::mark(scope, object, crate::filehandle_transfer::FILE_HANDLE_KIND);
     // `StreamBase::FromObject` is how `StreamPipe` finds a stream, and a
     // `FileHandle` has no `uv_stream_t` to publish, so the *state* is published.
     // SAFETY: `stream` is live for as long as the object is.

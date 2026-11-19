@@ -19,6 +19,10 @@ rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 # `uv_work_t` on the process loop and deliver `ondone` from it, which needs the
 # loop and the re-enter-V8-from-`uv_run` primitive. Both are that crate's.
 rn-uv.workspace = true
+# Rebuilding a transferred `FileHandle` has to refuse a `vm` context, which is
+# Node's `context != env->context()` check. That comparison lives with the
+# messaging binding, where the rest of the transfer machinery is.
+rn-bind-messaging = { path = "../rn-bind-messaging" }
 rn-errors.workspace = true
 # `legacyMainResolve` reports `imported from <path>`, and that path is
 # `node::url::FileURLToPath`'s answer for the base URL. `rn-bind-url` already owns

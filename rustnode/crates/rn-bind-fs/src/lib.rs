@@ -42,9 +42,20 @@ mod install;
 #[cfg(test)]
 mod testsupport;
 
+mod filehandle_transfer;
+
 pub use install::Fs;
 
 /// Registers the `fs` namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Fs);
+    // A native `FileHandle` is a host object that can only move. `promises.js`
+    // lists it in `[kTransferList]`, so the messaging layer has to know how to
+    // take the descriptor out and rebuild a handle around it; without this the
+    // nested entry was skipped and `postMessage(fh, [fh])` failed with
+    // "Found invalid value in transferList.".
+    rn_core::host_object::register_transfer_kind(
+        filehandle_transfer::FILE_HANDLE_KIND,
+        filehandle_transfer::transfer_for_messaging,
+    );
 }

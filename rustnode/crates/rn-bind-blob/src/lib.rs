@@ -1051,7 +1051,11 @@ struct BlobHandleClone {
 }
 
 impl rn_core::host_object::TransferData for BlobHandleClone {
-    fn rebuild<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    fn rebuild<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        _target: v8::Local<'s, v8::Context>,
+    ) -> Option<v8::Local<'s, v8::Object>> {
         let object = new_handle(scope, &self.bytes, self.start, self.end)?;
         rn_core::host_object::mark(scope, object, BLOB_HANDLE_KIND);
         Some(object)
