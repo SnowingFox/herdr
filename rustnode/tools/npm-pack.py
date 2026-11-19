@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -53,6 +54,7 @@ LICENSE_SRC = NPM_DIR / "LICENSE"
 NOTICES_SRC = NPM_DIR / "THIRD-PARTY-NOTICES.md"
 MAIN_README_SRC = NPM_DIR / "README.md"
 BIN_SRC = NPM_DIR / "bin" / "rsnode"
+PLATFORMS_SRC = NPM_DIR / "platforms.json"
 
 
 class PackError(Exception):
@@ -343,7 +345,38 @@ def command_pack(args: argparse.Namespace) -> int:
 
         main_stage = staging_root / "main"
         (main_stage / "bin").mkdir(parents=True)
-        shutil.copy2(BIN_SRC, main_stage / "bin" / table["command"])
+        # The shim resolves the platform package by name, and it cannot read
+        # `package.json` to learn that name: it is fork-free by design, and the
+        # comment at the top of the file explains what each fork costs on the
+        # startup path. So the names are substituted here, at staging time, from
+        # the same table the manifests are built from.
+        #
+        # Without this a renamed scope produced a package that installed cleanly
+        # and then failed with "the native binary for this platform is not
+        # installed", because the shim still looked under `@example`. The shim
+        # only lists one platform package, which matches this release's single
+        # `platforms` entry; adding a second target means making that line a
+        # list here.
+        if len(table["platforms"]) != 1:
+            raise PackError(
+                f"{PLATFORMS_SRC}: the shim resolves one platform package but the "
+                f"table lists {len(table['platforms'])}; teach bin/rsnode to try each"
+            )
+        shim = BIN_SRC.read_text()
+        shim = re.sub(
+            r"^scope=.*$", f"scope={table['scope']}", shim, count=1, flags=re.M
+        )
+        shim = re.sub(
+            r"^package=.*$", f"package={table['command']}", shim, count=1, flags=re.M
+        )
+        shim = re.sub(
+            r"^platform=.*$",
+            f"platform={table['command']}-{table['platforms'][0]['target']}",
+            shim,
+            count=1,
+            flags=re.M,
+        )
+        (main_stage / "bin" / table["command"]).write_text(shim)
         (main_stage / "bin" / table["command"]).chmod(0o755)
         shutil.copy2(MAIN_README_SRC, main_stage / "README.md")
         stage_common(main_stage)
