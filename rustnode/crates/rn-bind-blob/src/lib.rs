@@ -113,6 +113,14 @@ const KEY_BYTES: &str = "rn-blob-bytes";
 const KEY_START: &str = "rn-blob-start";
 const KEY_END: &str = "rn-blob-end";
 const KEY_OFFSET: &str = "rn-blob-offset";
+/// Cumulative end offset of each source part, as an array of numbers.
+///
+/// Node's handle is a `DataQueue` of parts and its `Pull` hands back one part
+/// per call, so `new Blob(Array(10).fill('hello')).stream()` yields ten 5-byte
+/// chunks. A handle here holds one contiguous `ArrayBuffer`, so without this the
+/// same blob streamed as a single 50-byte chunk — correct in total size and
+/// wrong in every boundary a consumer can observe.
+const KEY_PARTS: &str = "rn-blob-parts";
 
 thread_local! {
     /// The four private keys, created once per isolate.
@@ -134,6 +142,7 @@ struct Keys {
     start: v8::Global<v8::Private>,
     end: v8::Global<v8::Private>,
     offset: v8::Global<v8::Private>,
+    parts: v8::Global<v8::Private>,
 }
 
 struct Templates {
@@ -220,6 +229,7 @@ fn install_keys(scope: &mut v8::PinScope) -> Result<(), String> {
         start: make(scope, KEY_START)?,
         end: make(scope, KEY_END)?,
         offset: make(scope, KEY_OFFSET)?,
+        parts: make(scope, KEY_PARTS)?,
     };
     KEYS.with(|slot| *slot.borrow_mut() = Some(keys));
     Ok(())
@@ -311,6 +321,11 @@ fn create_blob(
     let declared = args.get(1).number_value(scope).unwrap_or(0.0).max(0.0) as usize;
 
     let mut bytes = Vec::with_capacity(declared);
+    // Each source contributes one part, and the boundaries are what a reader
+    // hands out one at a time. Empty sources are skipped: a part of zero bytes
+    // would otherwise make `pull` answer `STATUS_CONTINUE` with an empty buffer
+    // and never advance, which is an infinite read rather than a shorter blob.
+    let mut parts: Vec<usize> = Vec::new();
     let length = sources.length();
     for index in 0..length {
         let Some(source) = sources.get_index(scope, index) else {
@@ -318,10 +333,16 @@ fn create_blob(
         };
         if let Some(range) = read_handle(scope, source) {
             bytes.extend_from_slice(&range);
+            if !range.is_empty() {
+                parts.push(bytes.len());
+            }
             continue;
         }
         if let Some(chunk) = bytes_of(source) {
             bytes.extend_from_slice(&chunk);
+            if !chunk.is_empty() {
+                parts.push(bytes.len());
+            }
             continue;
         }
         throw_type_error(
@@ -342,7 +363,7 @@ fn create_blob(
         return;
     }
 
-    match new_handle(scope, &bytes, 0, bytes.len()) {
+    match new_handle_with_parts(scope, &bytes, 0, bytes.len(), &parts) {
         Some(object) => rv.set(object.into()),
         None => throw_type_error(scope, "cannot allocate a blob handle"),
     }
@@ -545,7 +566,19 @@ fn handle_get_reader(
         throw_type_error(scope, "getReader must be called on a blob handle");
         return;
     };
-    match new_reader(scope, &bytes, start, end) {
+    // The handle's boundaries are absolute in its own buffer; the reader's are
+    // relative to its `start`, and `reader_pull` adds `start` back before
+    // comparing, so they are rebased here rather than at each read.
+    let parts = read_handle_parts(scope, this.into())
+        .map(|parts| {
+            parts
+                .into_iter()
+                .filter(|boundary| *boundary > start && *boundary <= end)
+                .map(|boundary| boundary - start)
+                .collect::<Vec<usize>>()
+        })
+        .unwrap_or_default();
+    match new_reader(scope, &bytes, start, end, &parts) {
         Some(object) => rv.set(object.into()),
         None => throw_type_error(scope, "cannot allocate a blob reader"),
     }
@@ -576,13 +609,29 @@ fn reader_pull(
         return;
     };
 
-    let (bytes, start, end, offset) = state;
+    let ReaderState {
+        bytes,
+        start,
+        end,
+        offset,
+        parts,
+    } = state;
     let absolute = start.saturating_add(offset);
     let remaining = end.saturating_sub(absolute);
+    // One part per pull, as Node's `DataQueue::Pull` does: the next boundary at
+    // or after the cursor ends the chunk, so a blob built from ten sources
+    // streams as ten reads rather than one. With no boundaries recorded the only
+    // boundary is `end`, which keeps a single-source blob and a slice reading as
+    // one chunk.
+    let limit = parts
+        .iter()
+        .copied()
+        .find(|boundary| *boundary > absolute)
+        .map_or(end, |boundary| boundary.min(end));
     let (status, buffer) = if remaining == 0 {
         (STATUS_EOS, v8::undefined(scope).into())
     } else {
-        let chunk = bytes.get(absolute..end).unwrap_or_default().to_vec();
+        let chunk = bytes.get(absolute..limit).unwrap_or_default().to_vec();
         match array_buffer(scope, &chunk) {
             Some(buffer) => {
                 // Advance the cursor on the reader object itself, so the next
@@ -654,12 +703,29 @@ fn reader_set_wakeup(
     }
 }
 
-/// Builds one handle object over `bytes[start..end]`.
+/// [`new_handle_with_parts`] for a handle with no part boundaries.
+///
+/// A slice of an existing blob is one contiguous part, which is what Node's
+/// `Blob::Slice` produces, so the boundaries it had are no longer meaningful.
 fn new_handle<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     bytes: &[u8],
     start: usize,
     end: usize,
+) -> Option<v8::Local<'s, v8::Object>> {
+    new_handle_with_parts(scope, bytes, start, end, &[])
+}
+
+/// Builds one handle object over `bytes[start..end]`, with part boundaries.
+///
+/// `parts` holds cumulative end offsets within the same range; an empty list
+/// means "one part", which is what a slice or a single-source blob is.
+fn new_handle_with_parts<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    parts: &[usize],
 ) -> Option<v8::Local<'s, v8::Object>> {
     let template = TEMPLATES.with(|slot| {
         slot.borrow()
@@ -689,6 +755,18 @@ fn new_handle<'s>(
     )? {
         return None;
     }
+    // The part boundaries, as a plain array of numbers. A handle with none set
+    // reads back as one part covering the whole range.
+    if !parts.is_empty() {
+        let list: Vec<v8::Local<'_, v8::Value>> = parts
+            .iter()
+            .map(|offset| v8::Number::new(scope, *offset as f64).into())
+            .collect();
+        let array = v8::Array::new_with_elements(scope, &list);
+        if !set_private(scope, object, keys.parts, array.into())? {
+            return None;
+        }
+    }
     // Marked so `structuredClone` rebuilds it through [`BlobHandleClone`] rather
     // than treating it as a plain object, which would drop the prototype's
     // `slice` and `getReader` and leave a clone that cannot be read.
@@ -702,6 +780,7 @@ fn new_reader<'s>(
     bytes: &[u8],
     start: usize,
     end: usize,
+    parts: &[usize],
 ) -> Option<v8::Local<'s, v8::Object>> {
     let template = TEMPLATES.with(|slot| {
         slot.borrow()
@@ -730,6 +809,16 @@ fn new_reader<'s>(
         v8::Number::new(scope, end.min(bytes.len()) as f64).into(),
     )? {
         return None;
+    }
+    if !parts.is_empty() {
+        let list: Vec<v8::Local<'_, v8::Value>> = parts
+            .iter()
+            .map(|boundary| v8::Number::new(scope, *boundary as f64).into())
+            .collect();
+        let array = v8::Array::new_with_elements(scope, &list);
+        if !set_private(scope, object, keys.parts, array.into())? {
+            return None;
+        }
     }
     if !set_private(
         scope,
@@ -762,7 +851,7 @@ fn read_range(
 fn read_reader(
     scope: &mut v8::PinScope<'_, '_>,
     value: v8::Local<v8::Value>,
-) -> Option<(Vec<u8>, usize, usize, usize)> {
+) -> Option<ReaderState> {
     let object = v8::Local::<v8::Object>::try_from(value).ok()?;
     let (bytes, start, end) = read_range(scope, value)?;
     let keys = current_keys(scope)?;
@@ -771,7 +860,50 @@ fn read_reader(
         .and_then(|offset| offset.number_value(scope))
         .unwrap_or(0.0);
     let offset = (offset.max(0.0) as usize).min(end.saturating_sub(start));
-    Some((bytes, start, end, offset))
+    // The boundaries ride on the handle; a reader created from a handle that has
+    // none reports an empty list, which `reader_pull` reads as "one part".
+    let parts = read_handle_parts(scope, value)
+        .map(|parts| {
+            parts
+                .into_iter()
+                .map(|boundary| boundary.saturating_sub(start))
+                .collect::<Vec<usize>>()
+        })
+        .unwrap_or_default();
+    Some(ReaderState {
+        bytes,
+        start,
+        end,
+        offset,
+        parts,
+    })
+}
+
+/// What a reader object carries: the bytes, its range, its cursor and the part
+/// boundaries relative to `start`.
+struct ReaderState {
+    bytes: Vec<u8>,
+    start: usize,
+    end: usize,
+    offset: usize,
+    parts: Vec<usize>,
+}
+
+/// The part boundaries recorded on a handle or reader, or `None` when it has none.
+fn read_handle_parts(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Option<Vec<usize>> {
+    let object = v8::Local::<v8::Object>::try_from(value).ok()?;
+    let keys = current_keys(scope)?;
+    let array = v8::Local::<v8::Array>::try_from(object.get_private(scope, keys.parts)?).ok()?;
+    Some(
+        (0..array.length())
+            .filter_map(|index| array.get_index(scope, index))
+            .filter_map(|item| item.number_value(scope))
+            .map(|number| number.max(0.0) as usize)
+            .collect(),
+    )
 }
 
 /// The bytes a handle object covers, for `createBlob`'s `Blob` part case.
@@ -790,12 +922,14 @@ fn current_keys<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<LocalKeys<'s>> {
             start: v8::Local::new(scope, &keys.start),
             end: v8::Local::new(scope, &keys.end),
             offset: v8::Local::new(scope, &keys.offset),
+            parts: v8::Local::new(scope, &keys.parts),
         })
     })
 }
 
 /// The private keys bound to one scope.
 struct LocalKeys<'s> {
+    parts: v8::Local<'s, v8::Private>,
     bytes: v8::Local<'s, v8::Private>,
     start: v8::Local<'s, v8::Private>,
     end: v8::Local<'s, v8::Private>,
