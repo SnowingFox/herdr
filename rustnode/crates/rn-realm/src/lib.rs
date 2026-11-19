@@ -384,20 +384,37 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
         ),
         ("internal/event_target", &["CustomEvent"][..]),
         ("internal/encoding", &["TextEncoder", "TextDecoder"][..]),
+        // `exposed-wildcard.js:98` publishes these as their own `[Exposed=*]`
+        // pair, right above the compression entry.
+        (
+            "internal/webstreams/encoding",
+            &["TextEncoderStream", "TextDecoderStream"][..],
+        ),
         // `util.inspect`'s own test reads `ReadableStream`, and it is an
         // `[Exposed=*]` interface in Node's `exposed-wildcard` bootstrap. The
         // module loads fine here, so this is wiring rather than implementation.
         (
             "internal/webstreams/readablestream",
-            &["ReadableStream"][..],
+            &[
+                "ReadableStream",
+                "ReadableStreamDefaultReader",
+                "ReadableStreamBYOBReader",
+                "ReadableStreamBYOBRequest",
+                "ReadableByteStreamController",
+                "ReadableStreamDefaultController",
+            ][..],
         ),
         (
             "internal/webstreams/writablestream",
-            &["WritableStream"][..],
+            &[
+                "WritableStream",
+                "WritableStreamDefaultController",
+                "WritableStreamDefaultWriter",
+            ][..],
         ),
         (
             "internal/webstreams/transformstream",
-            &["TransformStream"][..],
+            &["TransformStream", "TransformStreamDefaultController"][..],
         ),
         (
             "internal/webstreams/queuingstrategies",
@@ -618,7 +635,23 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
                 "WebSocket",
             ][..],
         ),
-        ("perf_hooks", &["performance"][..]),
+        // `exposed-window-or-worker.js:61` publishes the whole `perf_hooks`
+        // class family as lazy globals, not just the namespace. Only
+        // `performance` was wired, so `globalThis.PerformanceObserver` was
+        // `undefined` while `require('perf_hooks').PerformanceObserver` worked.
+        (
+            "perf_hooks",
+            &[
+                "performance",
+                "Performance",
+                "PerformanceEntry",
+                "PerformanceMark",
+                "PerformanceMeasure",
+                "PerformanceObserver",
+                "PerformanceObserverEntryList",
+                "PerformanceResourceTiming",
+            ][..],
+        ),
     ] {
         let (Some(id), Some(array)) = (v8::String::new(scope, module), names_array(scope, names))
         else {
