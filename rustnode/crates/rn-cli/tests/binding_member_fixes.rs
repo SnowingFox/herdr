@@ -1202,3 +1202,28 @@ fn compression_streams_are_globals_and_produce_node_identical_bytes() {
         "function function\ntrue 31",
     );
 }
+
+#[test]
+fn the_web_stream_and_perf_hooks_globals_are_complete() {
+    // Every one of these is an `[Exposed=*]` entry in Node's bootstrap whose
+    // module already loaded fine here; the globals were wired one name per
+    // module, so only the first of each group existed. Comparing the full
+    // `globalThis` name set against the oracle found 20 missing; `Storage` and
+    // `localStorage`/`sessionStorage` are the three deliberately left out
+    // (Node gates them behind `--localstorage-file` and warns without it).
+    expect(
+        "const names = [
+          'Performance','PerformanceEntry','PerformanceMark','PerformanceMeasure',
+          'PerformanceObserver','PerformanceObserverEntryList','PerformanceResourceTiming',
+          'ReadableStream','ReadableStreamDefaultReader','ReadableStreamBYOBReader',
+          'ReadableStreamBYOBRequest','ReadableByteStreamController',
+          'ReadableStreamDefaultController','WritableStream',
+          'WritableStreamDefaultController','WritableStreamDefaultWriter',
+          'TransformStream','TransformStreamDefaultController',
+          'TextEncoderStream','TextDecoderStream',
+        ];
+        const missing = names.filter((n) => typeof globalThis[n] !== 'function');
+        console.log(missing.length === 0 ? 'complete' : missing.join(','));",
+        "complete",
+    );
+}
