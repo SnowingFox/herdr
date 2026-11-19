@@ -1169,3 +1169,36 @@ fn websocket_is_a_global_and_eventsource_is_not() {
         "function undefined EventTarget",
     );
 }
+
+#[test]
+fn compression_streams_are_globals_and_produce_node_identical_bytes() {
+    // `exposed-wildcard.js:104` publishes these as the last `[Exposed=*]` pair.
+    // The binding behind them already worked (`rn-bind-zlib` implements both
+    // handles), so only the global was missing and `new CompressionStream('gzip')`
+    // threw `is not a constructor`.
+    //
+    // The byte comparison is the part that matters: a constructible global that
+    // emits a different gzip stream would pass a smoke test and fail every
+    // byte-parity assertion. This compares against `zlib.gzipSync` on the same
+    // input, which is the oracle's own reference implementation.
+    expect(
+        "const zlib = require('zlib');
+        console.log(typeof CompressionStream, typeof DecompressionStream);
+        (async () => {
+          const cs = new CompressionStream('gzip');
+          const w = cs.writable.getWriter();
+          await w.write(Buffer.from('hello world'));
+          await w.close();
+          const chunks = [];
+          const reader = cs.readable.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(Buffer.from(value));
+          }
+          const out = Buffer.concat(chunks);
+          console.log(out.equals(zlib.gzipSync(Buffer.from('hello world'))), out.length);
+        })();",
+        "function function\ntrue 31",
+    );
+}

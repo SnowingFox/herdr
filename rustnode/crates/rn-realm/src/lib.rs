@@ -423,6 +423,16 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
         ),
         ("internal/blob", &["Blob"][..]),
         ("internal/file", &["File"][..]),
+        // The compression streams are the last `[Exposed=*]` entry in
+        // `exposed-wildcard.js` (line 104), and the binding behind them already
+        // works: `rn-bind-zlib` implements the `CompressionStream` and
+        // `DecompressionStream` handles. Only the global was missing, so
+        // `new CompressionStream('gzip')` threw `is not a constructor` while
+        // `zlib.gzipSync` worked.
+        (
+            "internal/webstreams/compression",
+            &["CompressionStream", "DecompressionStream"][..],
+        ),
     ] {
         let (Some(id), Some(array)) = (v8::String::new(scope, module), names_array(scope, names))
         else {
