@@ -51,13 +51,39 @@ pub enum ParseError {
     /// which source produced it; both print the same way, because Node's error
     /// vector does not record a source.
     OptionValue(String),
-    /// One or more `--env-file` failures, already in Node's wording.
+    /// The file sources' failures, in the two shapes `StartInternal` prints.
     ///
-    /// A list because Node collects every bad file into its error vector and
-    /// `StartInternal` prints each one as its own `<program>: <message>` line.
-    /// Folding them into one string would put two files' messages on one line and
-    /// prefix only the first.
-    EnvFile(Vec<String>),
+    /// `--env-file` and `--config-file` are both read after the walk and both
+    /// contribute to one error vector, so they share one variant: separating them
+    /// would print the second source's messages after the first source had
+    /// already exited. What forces the split inside is `--config-file`, whose
+    /// reader prints one of its two lines itself, without the `<program>: `
+    /// prefix every other startup error carries. See [`StartupErrors`].
+    Startup(StartupErrors),
+}
+
+/// What the file sources produced, split by who writes each line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupErrors {
+    /// Lines the reader already wrote itself, complete with their newlines.
+    ///
+    /// `ConfigReader::ParseConfig` (`src/node_config_file.cc`) formats these with
+    /// `FPrintF` while it reads, before `InitializeOncePerProcess` has collected
+    /// anything, so they carry no program name and reach stderr ahead of every
+    /// prefixed line. Written verbatim by `main`.
+    pub diagnostics: Vec<String>,
+    /// `<program>: <message>` lines, in the order Node's error vector holds them.
+    ///
+    /// `--env-file`'s entries come first because their files are read first,
+    /// then `--config-file`'s `<path>: not found` or `<path>: invalid content`.
+    pub messages: Vec<String>,
+}
+
+impl StartupErrors {
+    /// Whether there is nothing to report.
+    fn is_empty(&self) -> bool {
+        self.diagnostics.is_empty() && self.messages.is_empty()
+    }
 }
 
 /// What the command line asked for.
@@ -297,6 +323,26 @@ pub struct Options {
     /// parses the files before V8 is initialised and reports their errors through
     /// the same `<program>: <message>` vector as a bad flag, with the same exit 9.
     pub env_files: Vec<EnvFileRequest>,
+    /// The path the last `--config-file` spelling named, if any.
+    ///
+    /// Node's `ConfigReader::GetDataFromArgs` reduces every spelling to one path
+    /// before anything is read, because only one config file is honoured and the
+    /// last spelling wins. Recorded here for the same reason as
+    /// [`Self::env_files`]: the reading itself is [`crate::config_file::read`]'s job,
+    /// called from [`finish`] where the walk's whole result is available.
+    pub config_file: Option<String>,
+    /// The last `--config-file=` or `--experimental-config-file=` with no value.
+    ///
+    /// Node reports these from the command-line parse rather than from the
+    /// reader, so they are deferred past the config read: a command line carrying
+    /// both `--env-file=missing.env` and `--config-file=` shows the env file's
+    /// error alone on the oracle.
+    pub config_file_missing_argument: Option<String>,
+    /// `--experimental-default-config-file=<value>`, which that spelling refuses.
+    ///
+    /// Only the "default" alias rejects a value — it names the file, so a value
+    /// contradicts it — and the rejection is reported before the config is read.
+    pub invalid_default_config_file: bool,
     /// The variables those files defined, in `Dotenv`'s sorted order.
     ///
     /// Parsed by [`read_env_files`] and installed by [`install_env_files`] from
@@ -367,6 +413,9 @@ impl Options {
             build_snapshot: false,
             build_snapshot_config: None,
             snapshot_blob: None,
+            config_file: None,
+            config_file_missing_argument: None,
+            invalid_default_config_file: false,
         }
     }
 
@@ -392,6 +441,33 @@ pub struct EnvFileRequest {
     /// `--env-file-if-exists`: a missing file is not an error.
     pub optional: bool,
 }
+
+/// The config file `--config-file` names, and the spellings that name it.
+///
+/// All three are aliases of one option in Node's table
+/// (`src/node_options.cc`: `AddAlias("--experimental-config-file",
+/// "--config-file")` and the same for `--experimental-default-config-file`), so
+/// all three are recognised by the walk.
+///
+/// They do not share one representation, which is why the walk records them in
+/// three fields rather than in one enum:
+///
+/// * a bare flag names [`DEFAULT_CONFIG_FILE`];
+/// * `--config-file=<path>` and `--experimental-config-file=<path>` name the path;
+/// * an empty `=` value is a missing argument;
+/// * `--experimental-default-config-file=<anything>` is not a path at all.
+pub const CONFIG_FILE_FLAGS: &[&str] = &[
+    "--config-file",
+    "--experimental-config-file",
+    "--experimental-default-config-file",
+];
+
+/// The file a bare `--config-file` reads.
+///
+/// `kDefaultConfigFileName` in `src/node_config_file.cc`, which is what makes
+/// `node --config-file` a request for `./node.config.json` rather than a missing
+/// argument.
+pub const DEFAULT_CONFIG_FILE: &str = "node.config.json";
 
 /// What `--inspect` and its variants asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2002,6 +2078,68 @@ pub fn parse_with_env(
             Err(message) => return Err(ParseError::Cli(message)),
         }
 
+        // `--config-file` and its two aliases. Handled here for the same reason
+        // as `--env-file` — the file *is* acted on, and the read happens in
+        // [`finish`] — but three details come from Node's reader rather than from
+        // `Parse`:
+        //
+        // * the bare flag is not a missing argument: `GetDataFromArgs` rewrites
+        //   it to `--config-file=node.config.json` before the parse runs, so
+        //   `node --config-file` reads `./node.config.json`;
+        // * a *separate* value is not a config path at all: that rewrite covers
+        //   only the bare flag and the `=` form, so `node --config-file x.json`
+        //   reads the default file and treats `x.json` as the script. Measured on
+        //   the oracle, which loads `x.json` as a CommonJS module;
+        // * `--experimental-default-config-file=<value>` is an error rather than
+        //   a path, because the "default" spelling names the file and a value
+        //   contradicts it.
+        //
+        // The last spelling wins, including over an earlier alias, because
+        // `GetDataFromArgs` overwrites one `result` as it walks.
+        if let Some(name) = CONFIG_FILE_FLAGS
+            .iter()
+            .find(|name| argument == **name || argument.starts_with(&format!("{name}=")))
+        {
+            match argument.strip_prefix(&format!("{name}=")) {
+                Some(_) if *name == "--experimental-default-config-file" => {
+                    options.exec_argv.push(argument.clone());
+                    options.invalid_default_config_file = true;
+                }
+                // An empty `=` value never becomes the path, and `Parse` reports
+                // it as a missing argument for the `kString` option it expands
+                // to. `Parse` also *breaks* there, so no later argument is looked
+                // at as an option: that is why `--config-file= --config-file=x`
+                // reports the missing argument rather than reading `x`, which the
+                // oracle confirms.
+                Some("") => {
+                    options.exec_argv.push(argument.clone());
+                    options.config_file_missing_argument =
+                        Some(format!("{argument} requires an argument"));
+                    index += 1;
+                    break;
+                }
+                Some(value) => {
+                    options.exec_argv.push(argument.clone());
+                    options.config_file = Some(value.to_string());
+                }
+                // The bare flag is rewritten rather than recorded as typed. That
+                // is `GetDataFromArgs`'s own transformation — it replaces the
+                // argument in `argv` so the later parse sees a value — and it is
+                // observable twice: `process.execArgv` reports
+                // `--config-file=node.config.json` for `--config-file` (either
+                // alias), and the store's `apply` would otherwise take the next
+                // argument as the value and swallow `-p`. Measured on the oracle.
+                None => {
+                    options
+                        .exec_argv
+                        .push(format!("--config-file={DEFAULT_CONFIG_FILE}"));
+                    options.config_file = Some(DEFAULT_CONFIG_FILE.to_string());
+                }
+            }
+            index += 1;
+            continue;
+        }
+
         // A permission grant whose value is a separate argument. Node accepts
         // both spellings and its own tests use both, so the value is taken here.
         // This is checked before the generic permission branch below, because
@@ -2636,21 +2774,56 @@ fn expand_implied_v8_options(options: &mut Options) {
 /// the walk.
 fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Result<Options, ParseError> {
     options.unimplemented = unimplemented.into_iter().collect();
-    // `InitializeOncePerProcess` parses the env files before V8 is initialised
-    // and before the command line's own errors are reported, which is why
-    // `node --env-file=missing --not-a-real-flag` names the file rather than the
-    // flag. Applying them here reproduces both facts: the files are read after
-    // the walk (so a later `--env-file` still wins), and a bad file stops the
-    // process with exit 9.
+    // `InitializeOncePerProcess` reads both file sources in one pass
+    // (`src/node.cc:960-1030`): `Dotenv::GetDataFromArgs` and its parse first,
+    // then `ConfigReader::GetDataFromArgs` and `ParseConfig`. Every message they
+    // produce lands in one error vector, printed after `argv[0]` — except the
+    // config reader's own diagnostic, which it writes to stderr as it reads.
     //
-    // They have to be *read* during parsing rather than later, because
+    // The ordering the oracle shows, and the reason this is not three separate
+    // early returns:
+    //
+    // * an env-file failure does *not* stop the config read
+    //   (`--env-file=missing --config-file=also-missing` prints both), but an
+    //   error in the vector *does* stop the command-line parse, so
+    //   `--env-file=missing --config-file=` prints the env file alone;
+    // * `--experimental-default-config-file=<value>` is rejected before the read
+    //   and returns immediately, so its message follows any env-file ones and no
+    //   config file is opened;
+    // * `--config-file=` with no value is only reported by the command-line
+    //   parse, which never runs once the vector is non-empty. That is why it is
+    //   deferred to the end here rather than returned from the walk.
+    //
+    // The env files have to be *read* during parsing rather than later because
     // `--permission`'s environment scrub happens before the realm exists and the
-    // names a file defines have to be known by then to be granted. The values
-    // are installed separately, after the scrub — see `main`.
-    options.env_file_store = match read_env_files(&options.env_files) {
-        Ok(store) => store,
-        Err(messages) => return Err(ParseError::EnvFile(messages)),
-    };
+    // names a file defines have to be known by then to be granted. The values are
+    // installed separately, after the scrub — see `main`.
+    let mut startup = StartupErrors::default();
+    match read_env_files(&options.env_files) {
+        Ok(store) => options.env_file_store = store,
+        Err(messages) => startup.messages.extend(messages),
+    }
+    if options.invalid_default_config_file {
+        startup
+            .messages
+            .push("--experimental-default-config-file does not take an argument".to_string());
+    } else if let Some(path) = &options.config_file {
+        if let Err(error) = crate::config_file::read(path) {
+            // The reader's own line comes first in stderr because it is written
+            // while the file is being read, before the vector is printed at all.
+            startup.diagnostics.push(error.diagnostic);
+            startup.messages.push(error.message);
+        }
+    }
+    if !startup.is_empty() {
+        return Err(ParseError::Startup(startup));
+    }
+    // Reaching here means nothing collected a message, so the command-line parse
+    // still has its say — and its one contribution to this file source is the
+    // empty `=` value the walk stopped at.
+    if let Some(message) = options.config_file_missing_argument.take() {
+        return Err(ParseError::Cli(message));
+    }
     // `EnvironmentOptions::CheckOptions` (`src/node_options.cc:318`) rejects this
     // pair by name. Node's dispatch would otherwise reach `--eval` first
     // (`src/node.cc:380` before `:384`), so without the check the command would
@@ -2969,7 +3142,11 @@ mod tests {
             // Joined, because these tests assert on the text a user sees and
             // `main` prints one line per message; keeping the vector would make
             // every assertion compare a `Vec` to a `&str`.
-            ParseError::EnvFile(messages) => messages.join("\n"),
+            ParseError::Startup(startup) => {
+                let mut lines = startup.diagnostics;
+                lines.extend(startup.messages);
+                lines.join("\n")
+            }
         })
     }
 

@@ -134,3 +134,33 @@ pub fn is_terminal(fd: i32) -> bool {
     // SAFETY: `uv_guess_handle` only inspects the descriptor.
     unsafe { libuv_sys2::uv_guess_handle(fd) == libuv_sys2::uv_handle_type_UV_TTY }
 }
+
+/// libuv's own description of an operating-system error, for a startup message.
+///
+/// This is the text Node prints when a C++ `ReadFileSync` fails, and it is not
+/// the libc `strerror` text: `src/node.cc`'s config reader formats
+/// `uv_strerror(r)` (`src/node_config_file.cc:543`) while `ThrowErrnoException`
+/// uses the libc spelling, and the two differ in case — libuv says
+/// `no such file or directory`, libc says `No such file or directory`. A message
+/// that borrowed the wrong one would be a near miss rather than the byte-identical
+/// line a test compares, so the answer comes from libuv rather than from a table
+/// here.
+///
+/// `errno` is the platform value a `std::io::Error` carries; `uv_translate_sys_error`
+/// is what turns it into the negative libuv code `uv_strerror` expects, which is
+/// the same two-step `uv_fs_open` performs internally.
+pub fn sys_error_message(errno: i32) -> String {
+    // SAFETY: `uv_translate_sys_error` is a pure mapping and `uv_strerror`
+    // returns a pointer to a static, NUL-terminated string that lives for the
+    // process.
+    unsafe {
+        let code = libuv_sys2::uv_translate_sys_error(errno);
+        let pointer = libuv_sys2::uv_strerror(code);
+        if pointer.is_null() {
+            return format!("Unknown system error {code}");
+        }
+        std::ffi::CStr::from_ptr(pointer)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
