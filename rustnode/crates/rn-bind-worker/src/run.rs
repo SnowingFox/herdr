@@ -352,8 +352,10 @@ impl WorkerThread {
                 &isolate,
                 rn_v8_sys::EmbedderGraphCallback::new(
                     // SAFETY: `isolate` is this worker's live isolate, and the
-                    // registration lives no longer than it does.
-                    unsafe { rn_v8_sys::v8::Isolate::as_raw_isolate_ptr(&isolate) },
+                    // registration lives no longer than it does. The enclosing
+                    // `unsafe` block already covers this call, so it is not
+                    // repeated here.
+                    rn_v8_sys::v8::Isolate::as_raw_isolate_ptr(&isolate),
                     |graph| {
                         rn_bind_messaging::add_embedder_nodes(&graph);
                         rn_core::heap_retainers::add_embedder_nodes(&graph);

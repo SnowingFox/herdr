@@ -102,10 +102,11 @@ impl RetainerId {
 
 /// What a retainer's description closure is called with.
 ///
-/// The scope is the walk's own, so a retainer can turn its `v8::Weak` back into a
-/// handle without opening one of its own, and every handle the walk creates dies
-/// with the snapshot rather than accumulating in the caller's scope.
-pub type Describe = dyn Fn(&EmbedderGraph, &mut v8::PinScope<'_, '_, ()>);
+/// The isolate is the snapshot's own, offered so a retainer can turn its
+/// `v8::Weak` or `v8::Global` back into a handle. A retainer opens the
+/// `HandleScope` it needs itself, because only it knows whether one is required
+/// and how long the handles must live.
+pub type Describe = dyn Fn(&EmbedderGraph, &mut v8::Isolate);
 
 thread_local! {
     /// The live retainers on this thread, in registration order.
@@ -126,9 +127,7 @@ thread_local! {
 /// retainer kept after its object is gone makes the snapshot claim memory that
 /// nothing holds.
 #[must_use]
-pub fn register(
-    describe: impl Fn(&EmbedderGraph, &mut v8::PinScope<'_, '_, ()>) + 'static,
-) -> RetainerId {
+pub fn register(describe: impl Fn(&EmbedderGraph, &mut v8::Isolate) + 'static) -> RetainerId {
     let id = NEXT_ID.with(|next| {
         let id = next.get() + 1;
         next.set(id);
@@ -160,16 +159,17 @@ pub fn unregister(id: RetainerId) {
 /// This is the body of the embedder-graph build callback: the CLI and each worker
 /// call it from the walk they already register.
 ///
-/// # Why a scope is opened here
+/// # Why the isolate is passed rather than a scope
 ///
-/// V8 runs the build callback with no scope of its own, and a retainer that wants
-/// to name its wrapper needs a handle to it. The scope is opened once for the
-/// whole walk so that every `Local` a retainer produces lives until the walk
-/// ends; V8 merges the wrapper node into the object's own node after the callback
-/// returns, so a handle that died mid-walk would be merged from freed storage.
-///
-/// Nothing here calls into JavaScript: `HandleScope::new` and `Local::new` only
-/// allocate handle cells, which is what makes this legal without a context.
+/// V8 runs the build callback with no scope of its own and no `&mut Isolate`
+/// reachable, so the walk re-enters the isolate recorded at registration. It
+/// hands the result to each retainer rather than a scope, because the two kinds
+/// of handle a retainer holds need different scopes: a `v8::Weak` resolves
+/// through `Weak::to_local`, which takes a context-bearing scope, while a
+/// `v8::Global` needs only `Local::new`. Every retainer here opens its own scope
+/// and keeps it for exactly as long as the handles it creates are needed — V8
+/// merges a wrapper node into the object's own node after the build callback
+/// returns, so a handle must not outlive the walk.
 pub fn add_embedder_nodes(graph: &EmbedderGraph) {
     if !graph.has_isolate() {
         // The walk needs an isolate to open a scope. A registration without one
@@ -193,12 +193,11 @@ pub fn add_embedder_nodes(graph: &EmbedderGraph) {
         return;
     }
     // SAFETY: the graph is live for this call and its isolate is the one the
-    // snapshot is of, so a scope rooted in it outlives every handle the
-    // closures build.
+    // snapshot is of, so every handle a closure builds is valid here.
     unsafe {
-        graph.with_isolate_scope(|scope| {
+        graph.with_isolate(|isolate| {
             for describe in closures {
-                describe(graph, scope);
+                describe(graph, isolate);
             }
         });
     }

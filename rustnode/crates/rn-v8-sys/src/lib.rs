@@ -197,40 +197,25 @@ impl EmbedderGraph {
         !self.isolate.is_null()
     }
 
-    /// Opens a `HandleScope` on the snapshot's isolate and runs `body` in it.
-    ///
-    /// The scope exists so a retainer can turn a `v8::Weak` or a `v8::Global` into
-    /// the `Local` [`EmbedderGraph::v8_node`] takes. V8 runs the build callback
-    /// with no scope of its own, and `HandleScope::new` needs `&mut Isolate`,
-    /// which a callback cannot obtain soundly — so the isolate is re-entered here,
-    /// exactly as `rn_bind_heap_utils::with_snapshot_isolate` does for
-    /// `TakeHeapSnapshot` and for the same reason.
-    ///
-    /// Every handle the body creates dies when this returns. V8 merges a wrapper
-    /// node into the object's own node *after* the build callback, so a handle
-    /// that outlived the scope would be merged from freed storage — this scope
-    /// spans the whole walk and not one node, which is why
-    /// `rn_core::heap_retainers` calls it once around every retainer.
-    ///
     /// Returns `None` when no isolate was recorded.
+    ///
+    /// `body` runs under a fresh `HandleScope` with no entered context, which is
+    /// what a retainer needs: `Local::new` and `v8::Weak::to_local` only allocate
+    /// handle cells, and the graph work touches no JavaScript. A retainer that
+    /// tries to *call* into JavaScript would find no context here; none should.
     ///
     /// # Safety
     ///
     /// Must be called from inside the build callback of the graph it was given:
     /// the isolate is live only for that call.
-    pub unsafe fn with_isolate_scope<R>(
-        &self,
-        body: impl FnOnce(&mut v8::PinScope<'_, '_, ()>) -> R,
-    ) -> Option<R> {
+    pub unsafe fn with_isolate<R>(&self, body: impl FnOnce(&mut v8::Isolate) -> R) -> Option<R> {
         if self.isolate.is_null() {
             return None;
         }
         // SAFETY: the caller guarantees the isolate is live for this call, which
         // is the build callback's own duration.
         let mut isolate = unsafe { v8::Isolate::from_raw_isolate_ptr(self.isolate) };
-        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
-        let scope = &mut scope.init();
-        Some(body(scope))
+        Some(body(&mut isolate))
     }
 }
 

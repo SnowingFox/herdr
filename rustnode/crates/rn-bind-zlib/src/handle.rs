@@ -443,7 +443,7 @@ fn install_state<'s>(
     // until the finalizer below runs, which cannot happen while the isolate is
     // running this callback.
     let address = pointer as usize;
-    let retainer = rn_core::heap_retainers::register(move |graph, scope| {
+    let retainer = rn_core::heap_retainers::register(move |graph, isolate| {
         // SAFETY: the finalizer clears the registration before it frees the
         // state, so a registration that still exists names a live allocation.
         let cell = unsafe { &*(address as *const RefCell<HandleState>) };
@@ -452,6 +452,11 @@ fn install_state<'s>(
             // the state borrowed. Reporting nothing is the honest answer.
             return;
         };
+        // The wrapper is held weakly, so it has to be resolved under a scope
+        // that outlives the walk: V8 merges the wrapper node into the object's
+        // own node after the build callback returns.
+        let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+        let scope = &mut scope.init();
         let wrapper = state
             .wrapper
             .to_local(scope)
