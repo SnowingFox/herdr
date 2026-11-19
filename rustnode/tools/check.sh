@@ -526,6 +526,27 @@ step "installed namespaces match what they declare"
 # that list fails. Shrinking the list is the proof a fix landed.
 cargo test -p rn-bindings --test namespace_structure
 
+step "the benchmark's optional columns cannot break a machine that lacks them"
+# `tools/bench.py` is not a measurement the gate makes, but two of its
+# properties are load-bearing for anyone who runs it, and both are invisible
+# until they break:
+#
+#   * a machine with no Bun must still get the two-way Node/rustnode table, so
+#     discovery has to answer None instead of raising. `find_bun` reaching for a
+#     `bun` on `PATH` alone is exactly the refactor that turns a missing runtime
+#     into a traceback, or into a timed invocation of some unrelated `bun` alias.
+#   * a case a runtime cannot run must be refused rather than timed. Bun exits 0
+#     for `-e ''` and prints a usage banner, which as an "empty startup" figure
+#     measures `--help`; the refusal is what keeps that out of the most-quoted
+#     row of the table.
+#
+# The self-test needs no Node, no Bun and no built binary: it feeds the tool a
+# banner-writing stub and a non-executable path as data, and the three
+# mutations it was checked against (a missing executability check, an
+# unguarded ratio denominator, and judging stdout on the case that prints on
+# purpose) each fail it. A bare statement, so its status is the gate's.
+python3 tools/bench.py --self-test
+
 step "the deferred-reach detector can still fail"
 # `deferred-reach.py` reported a clean run over six live defects, including the
 # unguarded `getWasmCompileCacheEntry` call inside `translators.js` that made
