@@ -2,8 +2,7 @@
 //!
 //! `lib/v8.js` loads this namespace at module scope, so `require('v8')` — and
 //! therefore a large part of the test suite — fails outright without it. Three
-//! members exist on the namespace: two are implemented here, and the third is
-//! deferred with a reason.
+//! members exist on the namespace, and all three are implemented here.
 //!
 //! This crate also registers `internalBinding('internal_only_v8')`, the one-member
 //! namespace `v8.queryObjects()` is built on. Both live here because
@@ -21,10 +20,21 @@
 //! loads in DevTools.
 //!
 //! `options` is the `Uint8Array([+exposeInternals, +exposeNumericValues])`
-//! `internal/heap_utils.js`'s `getHeapSnapshotOptions` builds. V8's
-//! `TakeHeapSnapshot` in the `v8` crate takes no options argument, so both flags
-//! are read and reported as unsupported rather than silently ignored — see
-//! [`DEFERRED`].
+//! `internal/heap_utils.js`'s `getHeapSnapshotOptions` builds. It is passed
+//! through to V8's `TakeHeapSnapshot(options)` rather than dropped, which the
+//! `v8` crate's own binding cannot do; see `rn_v8_sys::take_heap_snapshot`.
+//!
+//! On this V8 the two flags change nothing, and that is measured rather than
+//! assumed: the pinned build's `HeapProfiler::TakeSnapshot` forwards only
+//! `control`, `context_name_resolver` and `stack_state` into the generator, and
+//! `grep -rn 'snapshot_mode\|numerics_mode' src/` over its tree finds no read of
+//! either field outside the assignments that set them. So a regular snapshot
+//! already contains the `exposeInternals` node and already labels numeric values
+//! with `numeric` edges, which is why both option cases of
+//! `test/common/heap.js`'s `getHeapSnapshotOptionTests` pass here with or
+//! without the flags. The plumbing is what makes that a property of the options
+//! rather than an accident of the crate's binding, and it is what will start
+//! mattering if V8 begins honouring the fields.
 //!
 //! # `createHeapSnapshotStream(options)` — implemented
 //!
@@ -34,11 +44,20 @@
 //! pushes the snapshot through `onread` in 64 KiB chunks and then reports
 //! `UV_EOF`. See [`stream`] for what is reproduced and what is deliberately not.
 //!
-//! # `buildEmbedderGraph` — deferred
+//! # `buildEmbedderGraph(...values)` — implemented
 //!
-//! It exists so the inspector can label embedder objects (`BaseObject` instances)
-//! in a snapshot. rustnode has no `BaseObject` hierarchy to describe, and no
-//! inspector to read the result.
+//! `src/heap_utils.cc:BuildEmbedderGraph` walks Node's `BaseObject` tree into a
+//! `JSGraph` and then, for each argument, asks the graph for that value's node.
+//! rustnode has no `BaseObject` tree to walk and no `Environment`, so what is
+//! reproduced is the part the binding's own comment calls its reason for
+//! existing: "include supplied values so tests can verify that JSGraph returns
+//! one graph node for each distinct V8 value". Each distinct argument gets one
+//! node carrying `value`, and repeat arguments collapse onto the first — the
+//! same `SameValue` deduplication `JSGraphJSNode::IsSame` performs.
+//!
+//! The nodes carry `name`, `isRoot`, `size` and an empty `edges` array like
+//! Node's, and no `wraps` edge, because a value that is its own wrapper has
+//! nothing to point at. See [`build_embedder_graph`].
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
@@ -47,20 +66,18 @@ pub mod stream;
 
 /// Members exposed on the namespace object, matching
 /// `contracts/heap_utils.json`.
-pub const MEMBERS: &[&str] = &["createHeapSnapshotStream", "triggerHeapSnapshot"];
+pub const MEMBERS: &[&str] = &[
+    "buildEmbedderGraph",
+    "createHeapSnapshotStream",
+    "triggerHeapSnapshot",
+];
 
 /// Members this build does not implement, each with the reason.
 ///
 /// `rn-compat` reports a declared deferral as a pass and an undeclared gap as a
-/// failure, so these are visible rather than silent.
-pub const DEFERRED: &[(&str, &str)] = &[(
-    "buildEmbedderGraph",
-    "src/heap_utils.cc:BuildEmbedderGraph walks the embedder graph through \
-     Environment::BuildEmbedderGraph into a JSGraph; the v8 crate this build links \
-     binds no HeapProfiler method except TakeHeapSnapshot, so the callback the walk \
-     needs cannot be registered at all, and the node it would produce has no \
-     rustnode equivalent because the walked hierarchy is Node's BaseObject tree",
-)];
+/// failure, so these are visible rather than silent. Empty: all three contract
+/// members are installed.
+pub const DEFERRED: &[(&str, &str)] = &[];
 
 pub struct HeapUtils;
 
@@ -94,6 +111,7 @@ impl BindingModule for HeapUtils {
             .map_err(|_| "the HeapSnapshotStream constructor is not a function".to_string())?;
         stream::remember_constructor(scope, function);
 
+        install_function(scope, object, "buildEmbedderGraph", build_embedder_graph)?;
         install_function(
             scope,
             object,
@@ -116,13 +134,130 @@ fn install_function<'s>(
     Ok(())
 }
 
+/// `buildEmbedderGraph(...values)`: one graph node per distinct argument.
+///
+/// `src/heap_utils.cc:211` is the shape this follows, minus the `BaseObject`
+/// walk. It builds a `JSGraph`, hands it to
+/// `Environment::BuildEmbedderGraph` — which tracks the `Environment` and every
+/// retainer reachable from it — and then calls `graph.V8Node(args[i])` once per
+/// argument. `JSGraph::CreateObject` turns the result into an `Array` of plain
+/// objects with `name`, `isRoot`, `size`, `edges`, and, for a node that is not
+/// an embedder node, `value`.
+///
+/// The walk is what rustnode cannot do: `Environment` and the `BaseObject`
+/// hierarchy it owns do not exist here, and the graph V8 offers has no embedder
+/// nodes because rustnode registers no build callback. The arguments, though,
+/// are ordinary V8 values, and that is the whole of what the binding's own
+/// comment says it adds them for. So this returns exactly the nodes
+/// `graph.V8Node` would have produced for them: one per distinct value, each
+/// with `value` set and `isRoot` false.
+///
+/// A repeated argument collapses onto the first occurrence because
+/// `JSGraphJSNode::IsSame` compares with `Value::SameValue`, which is what
+/// `Object.is` means: `NaN` matches itself, `0` and `-0` do not, and a BigInt
+/// matches only the same BigInt value. `Value::same_value` is that exact call,
+/// so `sameBigint` above collapses onto `bigint` while two distinct `{}` stay
+/// apart.
+///
+/// # Why `edges` is always empty and `wraps` never appears
+///
+/// `CreateObject` sets `wraps` only for a node whose `WrapperNode()` is not
+/// null, and `AddEdge` is only called by the `MemoryTracker` walk this does not
+/// run. A value that is its own wrapper — every argument here, since none of
+/// them is an embedder node with a JS wrapper — has nothing else to point at.
+///
+/// # Why `name` is `"<JS Node>"`
+///
+/// `JSGraphJSNode::Name()` returns that literal for every value node, and it is
+/// what `CreateObject` writes into `name` when `NamePrefix()` is null. It is not
+/// the value's class name: `node.name` is a snapshot-node name, and a heap
+/// snapshot's own JS object nodes get their name from the map instead.
+fn build_embedder_graph(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_>,
+) {
+    /// `JSGraphJSNode::Name()`, the literal `CreateObject` copies into `name`.
+    const NODE_NAME: &str = "<JS Node>";
+
+    let Some(name) = v8::String::new(scope, NODE_NAME) else {
+        throw_error(scope, "buildEmbedderGraph: cannot allocate the node name");
+        return;
+    };
+    let Some(edges_key) = v8::String::new(scope, "edges") else {
+        throw_error(scope, "buildEmbedderGraph: cannot allocate a property key");
+        return;
+    };
+    let Some(name_key) = v8::String::new(scope, "name") else {
+        throw_error(scope, "buildEmbedderGraph: cannot allocate a property key");
+        return;
+    };
+    let Some(value_key) = v8::String::new(scope, "value") else {
+        throw_error(scope, "buildEmbedderGraph: cannot allocate a property key");
+        return;
+    };
+    let Some(root_key) = v8::String::new(scope, "isRoot") else {
+        throw_error(scope, "buildEmbedderGraph: cannot allocate a property key");
+        return;
+    };
+    let Some(size_key) = v8::String::new(scope, "size") else {
+        throw_error(scope, "buildEmbedderGraph: cannot allocate a property key");
+        return;
+    };
+
+    let array = v8::Array::new(scope, 0);
+    // The values already emitted, in argument order. Linear for the same reason
+    // `JSGraph` is: the list is the arguments of one call, and the test that
+    // exercises it passes five.
+    let mut emitted: Vec<v8::Local<'_, v8::Value>> = Vec::new();
+    // `CreateObject`'s `size_t i`, which is separate from the argument index: a
+    // duplicate argument produces no node, so indexing the array by argument
+    // would leave a hole.
+    let mut next_slot: u32 = 0;
+
+    for index in 0..args.length() {
+        let value = args.get(index);
+        if emitted.iter().any(|seen| seen.same_value(value)) {
+            continue;
+        }
+
+        let node = v8::Object::new(scope);
+        // `CreateObject`: name, isRoot, size, edges, then value for a non-embedder
+        // node. `size` is `SizeInBytes()`, which `JSGraphJSNode` reports as 0.
+        let written = node.set(scope, name_key.into(), name.into()).is_some()
+            && node
+                .set(scope, root_key.into(), v8::Boolean::new(scope, false).into())
+                .is_some()
+            // `Number::New(isolate, 0)`: a plain `0`, not `-0` or a NaN box.
+            && node
+                .set(scope, size_key.into(), v8::Number::new(scope, 0.0).into())
+                .is_some()
+            && node
+                .set(scope, edges_key.into(), v8::Array::new(scope, 0).into())
+                .is_some()
+            && node.set(scope, value_key.into(), value).is_some();
+        if !written {
+            throw_error(scope, "buildEmbedderGraph: cannot build a graph node");
+            return;
+        }
+        // `nodes->Set(context, i++, obj)`; it appends past the initial length,
+        // which `Array::new(scope, 0)` leaves empty.
+        if array.set_index(scope, next_slot, node.into()).is_none() {
+            throw_error(scope, "buildEmbedderGraph: cannot append a graph node");
+            return;
+        }
+        next_slot += 1;
+        emitted.push(value);
+    }
+
+    rv.set(array.into())
+}
+
 /// `createHeapSnapshotStream(options)`.
 ///
 /// `options` is `getHeapSnapshotOptions`' `Uint8Array([exposeInternals,
-/// exposeNumericValues])`. The `v8` crate's `take_heap_snapshot` exposes no
-/// options parameter, so the flags are parsed and reported as unsupported rather
-/// than silently ignored — the same gap [`trigger_heap_snapshot`] has, and for
-/// the same reason.
+/// exposeNumericValues])`, forwarded to V8 through
+/// [`rn_v8_sys::take_heap_snapshot`] rather than V8's no-argument default.
 ///
 /// A failure to allocate the stream throws instead of returning `undefined`:
 /// `lib/v8.js`'s `getHeapSnapshot` asserts the handle is truthy, and an
@@ -132,29 +267,42 @@ fn create_heap_snapshot_stream(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_>,
 ) {
-    let _options = snapshot_options(scope, args.get(0));
+    let options = snapshot_options(scope, args.get(0));
 
-    // One buffer, appended in order. `take_heap_snapshot` invokes the callback
-    // repeatedly with consecutive chunks of a single JSON document, and
-    // `try_reserve` keeps a huge snapshot from aborting the process on
-    // allocation failure: aborting the snapshot (`false`) is the contract's own
-    // way to stop, and the empty result is reported as the failure it is.
+    // One buffer, appended in order. The snapshot is serialized in consecutive
+    // chunks of a single JSON document, and `try_reserve` keeps a huge snapshot
+    // from aborting the process on allocation failure: aborting the snapshot
+    // (`false`) is the contract's own way to stop, and the empty result is
+    // reported as the failure it is.
     let mut bytes: Vec<u8> = Vec::new();
     let snapshot = with_snapshot_isolate(|isolate| {
-        isolate.take_heap_snapshot(|chunk| match bytes.try_reserve(chunk.len()) {
-            Ok(()) => {
-                bytes.extend_from_slice(chunk);
-                true
-            }
-            Err(_) => false,
-        })
+        // SAFETY: see `with_snapshot_isolate`: the handle is this thread's live
+        // isolate and the callback is synchronous.
+        unsafe {
+            rn_v8_sys::take_heap_snapshot(isolate, options, |chunk| {
+                match bytes.try_reserve(chunk.len()) {
+                    Ok(()) => {
+                        bytes.extend_from_slice(chunk);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            })
+        }
     });
-    if snapshot.is_none() {
-        throw_error(
-            scope,
-            "createHeapSnapshotStream ran before the isolate was recorded",
-        );
-        return;
+    match snapshot {
+        None => {
+            throw_error(
+                scope,
+                "createHeapSnapshotStream ran before the isolate was recorded",
+            );
+            return;
+        }
+        Some(Err(reason)) => {
+            throw_error(scope, &format!("createHeapSnapshotStream: {reason}"));
+            return;
+        }
+        Some(Ok(())) => {}
     }
 
     let Some(constructor) = stream::constructor_for(scope) else {
@@ -220,31 +368,42 @@ fn trigger_heap_snapshot(
     };
 
     let mut write_error = None;
-    // `take_heap_snapshot` invokes the callback repeatedly with consecutive
-    // chunks of one JSON document, so they are appended in order. Returning
-    // `false` aborts the snapshot; there is nothing useful to gain from a
-    // partial one, so a write failure is recorded and the rest is dropped.
+    // The snapshot is serialized in consecutive chunks of one JSON document, so
+    // they are written in order. Returning `false` aborts the snapshot; there is
+    // nothing useful to gain from a partial one, so a write failure is recorded
+    // and the rest is dropped.
     let snapshot = with_snapshot_isolate(|isolate| {
-        isolate.take_heap_snapshot(|chunk| {
-            use std::io::Write;
-            if write_error.is_some() {
-                return false;
-            }
-            match file.write_all(chunk) {
-                Ok(()) => true,
-                Err(error) => {
-                    write_error = Some(error);
-                    false
+        // SAFETY: see `with_snapshot_isolate`: the handle is this thread's live
+        // isolate and the callback is synchronous.
+        unsafe {
+            rn_v8_sys::take_heap_snapshot(isolate, options, |chunk| {
+                use std::io::Write;
+                if write_error.is_some() {
+                    return false;
                 }
-            }
-        })
+                match file.write_all(chunk) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        write_error = Some(error);
+                        false
+                    }
+                }
+            })
+        }
     });
-    if snapshot.is_none() {
-        throw_error(
-            scope,
-            "triggerHeapSnapshot ran before the isolate was recorded",
-        );
-        return;
+    match snapshot {
+        None => {
+            throw_error(
+                scope,
+                "triggerHeapSnapshot ran before the isolate was recorded",
+            );
+            return;
+        }
+        Some(Err(reason)) => {
+            throw_error(scope, &format!("triggerHeapSnapshot: {reason}"));
+            return;
+        }
+        Some(Ok(())) => {}
     }
 
     if let Some(error) = write_error {
@@ -257,28 +416,39 @@ fn trigger_heap_snapshot(
         Some(value) => rv.set(value.into()),
         None => rv.set(v8::undefined(scope).into()),
     }
-    let _ = options;
 }
 
 /// Reads `getHeapSnapshotOptions`' `Uint8Array([exposeInternals, numerics])`.
 ///
-/// The `v8` crate's `take_heap_snapshot` exposes no options parameter, so V8
-/// always takes a regular snapshot with numeric values hidden. The values are
-/// still parsed and returned so the deferral is a documented gap rather than an
-/// invisible one, and so a caller passing a malformed array is rejected the way
-/// `validateObject` would reject it.
-fn snapshot_options(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> (bool, bool) {
+/// Node's `src/heap_utils.cc:GetHeapSnapshotOptions` `CHECK`s that the argument
+/// is a `Uint8Array` and reads two bytes out of it; a non-array never reaches
+/// there, because `lib/internal/heap_utils.js`'s `getHeapSnapshotOptions` always
+/// builds one. So a malformed argument is treated as V8's default here rather
+/// than thrown: this is the position of Node's `CHECK` (a crash guard), not an
+/// input-validation point.
+///
+/// Public because `Worker.prototype.getHeapSnapshot(options)` takes the same
+/// array: `lib/internal/worker.js:544` calls `getHeapSnapshotOptions` and passes
+/// the result to `takeHeapSnapshot`, so both bindings have to read it the same
+/// way.
+#[must_use]
+pub fn snapshot_options(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<v8::Value>,
+) -> rn_v8_sys::HeapSnapshotOptions {
     let Ok(array) = v8::Local::<v8::Array>::try_from(value) else {
-        return (false, false);
+        return rn_v8_sys::HeapSnapshotOptions::new();
     };
     let flag = |index: u32| -> bool {
         array
             .get_index(scope, index)
             .and_then(|item| item.uint32_value(scope))
-            .map(|value| value != 0)
-            .unwrap_or(false)
+            .is_some_and(|value| value != 0)
     };
-    (flag(0), flag(1))
+    rn_v8_sys::HeapSnapshotOptions {
+        expose_internals: flag(0),
+        expose_numeric_values: flag(1),
+    }
 }
 
 /// `DiagnosticFilename::MakeFilename`: `Heap.<yyyymmdd>.<hhmmss>.<pid>.<tid>.<seq>.<ext>`.
@@ -527,7 +697,18 @@ mod tests {
 
     #[test]
     fn members_cover_the_recorded_contract_without_the_deferral() {
-        assert_eq!(MEMBERS, ["createHeapSnapshotStream", "triggerHeapSnapshot"]);
+        assert_eq!(
+            MEMBERS,
+            [
+                "buildEmbedderGraph",
+                "createHeapSnapshotStream",
+                "triggerHeapSnapshot"
+            ]
+        );
+        assert!(
+            DEFERRED.is_empty(),
+            "{DEFERRED:?} is deferred but every contract member is installed"
+        );
         for (name, reason) in DEFERRED {
             // `MEMBERS` means "install() sets this". A deferred name in both lists
             // cancels itself out of the contract subtraction, which is the shape

@@ -32,6 +32,124 @@ unsafe extern "C" {
         user: *mut std::ffi::c_void,
         out: *mut *mut v8::Array,
     ) -> bool;
+    /// `v8::HeapProfiler::TakeHeapSnapshot(options)` + `HeapSnapshot::Serialize`,
+    /// via the shim in this crate.
+    ///
+    /// The crate's own `Isolate::take_heap_snapshot` calls the no-argument
+    /// `TakeHeapSnapshot()`, so V8 always applies its default
+    /// `HeapSnapshotOptions`. This passes Node's two flags through instead.
+    fn rn_v8_sys__take_heap_snapshot(
+        isolate: v8::UnsafeRawIsolatePtr,
+        expose_internals: bool,
+        expose_numeric_values: bool,
+        write: extern "C" fn(*mut std::ffi::c_void, *const std::os::raw::c_char, usize) -> bool,
+        user: *mut std::ffi::c_void,
+    ) -> bool;
+}
+
+/// Which `HeapSnapshotOptions` a snapshot is taken with.
+///
+/// `lib/internal/heap_utils.js`'s `getHeapSnapshotOptions` builds
+/// `Uint8Array([+exposeInternals, +exposeNumericValues])`, and Node's
+/// `src/heap_utils.cc:GetHeapSnapshotOptions` maps those bytes onto
+/// `HeapSnapshotMode` and `NumericsMode`. The names here are the JS option names
+/// rather than the V8 enum names, so the two mappings cannot be confused.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HeapSnapshotOptions {
+    pub expose_internals: bool,
+    pub expose_numeric_values: bool,
+}
+
+impl HeapSnapshotOptions {
+    /// A regular snapshot with numeric values hidden, which is V8's default.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            expose_internals: false,
+            expose_numeric_values: false,
+        }
+    }
+}
+
+/// Takes a heap snapshot with `options` and serializes it as JSON.
+///
+/// `write` is called once or more with consecutive chunks of one JSON document
+/// and returns whether to continue; returning `false` aborts the snapshot.
+/// Returns `Err` when V8 produced no snapshot, which happens on allocation
+/// failure, or when `write` aborted.
+///
+/// This is the options-taking sibling of `Isolate::take_heap_snapshot`, whose
+/// binding in the `v8` crate calls the no-argument `TakeHeapSnapshot()` and so
+/// always gets V8's default `HeapSnapshotOptions`.
+///
+/// # Safety
+///
+/// `isolate` must be a live isolate on the calling thread, entered by no other
+/// scope for the duration. V8 calls `write` synchronously on this thread before
+/// this returns, so no handle may be collected during the call.
+pub unsafe fn take_heap_snapshot(
+    isolate: &v8::Isolate,
+    options: HeapSnapshotOptions,
+    write: impl FnMut(&[u8]) -> bool,
+) -> Result<(), &'static str> {
+    /// What the `extern "C"` trampoline receives: the caller's closure and
+    /// whether it asked to stop.
+    struct Sink<'a> {
+        write: &'a mut dyn FnMut(&[u8]) -> bool,
+        aborted: &'a mut bool,
+    }
+
+    /// Forwards one chunk to the closure and records an abort.
+    ///
+    /// # Safety
+    ///
+    /// `user` is the `*mut Sink` `take_heap_snapshot` passes, alive for the
+    /// duration of the one synchronous call V8 makes it from.
+    extern "C" fn trampoline(
+        user: *mut std::ffi::c_void,
+        data: *const std::os::raw::c_char,
+        size: usize,
+    ) -> bool {
+        // SAFETY: see the function docs.
+        let sink = unsafe { &mut *user.cast::<Sink<'_>>() };
+        if data.is_null() {
+            // `EndOfStream` is reported as an empty chunk by the shim's own
+            // `OutputStream`, and there is nothing left to hand on.
+            return true;
+        }
+        // SAFETY: V8 owns `size` bytes at `data` for the duration of the call.
+        let chunk = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), size) };
+        let keep_going = (sink.write)(chunk);
+        if !keep_going {
+            *sink.aborted = true;
+        }
+        keep_going
+    }
+
+    let mut write = write;
+    let mut aborted = false;
+    let mut sink = Sink {
+        write: &mut write,
+        aborted: &mut aborted,
+    };
+    // SAFETY: `sink` outlives the call below, which is synchronous and the only
+    // reader; the isolate is the caller's live one.
+    let taken = unsafe {
+        rn_v8_sys__take_heap_snapshot(
+            isolate.as_raw_isolate_ptr(),
+            options.expose_internals,
+            options.expose_numeric_values,
+            trampoline,
+            (&mut sink as *mut Sink<'_>).cast(),
+        )
+    };
+    if !taken {
+        return Err("V8 could not take a heap snapshot");
+    }
+    if aborted {
+        return Err("the heap snapshot was aborted");
+    }
+    Ok(())
 }
 
 /// Sets `v8::Isolate::SetStackLimit` on the current isolate.

@@ -28,6 +28,9 @@ pub type HeapSnapshot = Arc<Mutex<Option<Vec<u8>>>>;
 /// the callback only reads from it.
 pub struct InterruptData {
     snapshot: HeapSnapshot,
+    /// `HeapSnapshotOptions` the caller asked for, read on the parent thread and
+    /// carried across so the worker's isolate honours them.
+    options: rn_v8_sys::HeapSnapshotOptions,
     /// The parent's loop, woken so the check phase delivers the result.
     parent_wake: Option<rn_uv::wake::ThreadToken>,
 }
@@ -39,11 +42,13 @@ pub struct InterruptData {
 pub fn request(
     isolate: &v8::IsolateHandle,
     taker: v8::Global<v8::Object>,
+    options: rn_v8_sys::HeapSnapshotOptions,
     parent_wake: Option<rn_uv::wake::ThreadToken>,
 ) -> Option<(PendingHeapSnapshot, Box<InterruptData>)> {
     let snapshot: HeapSnapshot = Arc::new(Mutex::new(None));
     let data = Box::new(InterruptData {
         snapshot: Arc::clone(&snapshot),
+        options,
         parent_wake,
     });
     let pointer = (&*data as *const InterruptData).cast_mut().cast();
@@ -68,15 +73,25 @@ unsafe extern "C" fn read_heap_snapshot(
     // SAFETY: the pointer came from `request`'s `Box`, which the parent keeps
     // alive for the life of the interrupt.
     let data = unsafe { &*data.cast::<InterruptData>() };
-    let mut isolate = unsafe { v8::Isolate::from_raw_isolate_ptr(isolate) };
+    let isolate = unsafe { v8::Isolate::from_raw_isolate_ptr(isolate) };
     let mut bytes: Vec<u8> = Vec::new();
-    isolate.take_heap_snapshot(|chunk| match bytes.try_reserve(chunk.len()) {
-        Ok(()) => {
-            bytes.extend_from_slice(chunk);
-            true
-        }
-        Err(_) => false,
-    });
+    let read = unsafe {
+        rn_v8_sys::take_heap_snapshot(&isolate, data.options, |chunk| {
+            match bytes.try_reserve(chunk.len()) {
+                Ok(()) => {
+                    bytes.extend_from_slice(chunk);
+                    true
+                }
+                Err(_) => false,
+            }
+        })
+    };
+    if read.is_err() {
+        // An empty buffer is what `deliver` reports as "the worker produced no
+        // snapshot", and `lib/internal/worker.js` turns that into a rejection
+        // rather than a stream that reads as nothing.
+        bytes.clear();
+    }
     if let Ok(mut slot) = data.snapshot.lock() {
         *slot = Some(bytes);
     }
