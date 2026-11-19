@@ -1363,9 +1363,11 @@ pub(crate) fn js_transferable(
     if !js_marked(scope, object) {
         return false;
     }
-    let Ok(symbol) =
-        rn_bind_symbols::ensure(scope, "messaging_transfer_symbol", "messaging_transfer_symbol")
-    else {
+    let Ok(symbol) = rn_bind_symbols::ensure(
+        scope,
+        "messaging_transfer_symbol",
+        "messaging_transfer_symbol",
+    ) else {
         return false;
     };
     let Some(method) = object.get(scope, symbol.into()) else {
@@ -1445,7 +1447,9 @@ pub fn context_is_environment(
     // their global objects: two distinct contexts never share a global, and one
     // context's global never equals another's.
     let environment: v8::Local<v8::Context> = v8::Local::new(scope, &environment);
-    environment.global(scope).strict_equals(context.global(scope).into())
+    environment
+        .global(scope)
+        .strict_equals(context.global(scope).into())
 }
 
 /// Runs `[kTransferList]` on a marked object, Node's

@@ -229,9 +229,9 @@ pub fn deliver<'s>(scope: &mut v8::PinScope<'s, '_>, port: &Rc<PortInner>) -> bo
             // The port object's own creation context, which is Node's
             // `GetCreationContextChecked()` and the reason a port moved with
             // `moveMessagePortToContext` receives into the realm it was moved to.
-            let target = object.get_creation_context(scope).unwrap_or_else(|| {
-                scope.get_current_context()
-            });
+            let target = object
+                .get_creation_context(scope)
+                .unwrap_or_else(|| scope.get_current_context());
             match deserialize::deserialize(scope, &message, target) {
                 Ok(deserialized) => Ok((
                     v8::Global::new(scope, deserialized.value),

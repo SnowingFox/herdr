@@ -299,7 +299,6 @@ pub fn is_registered(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<'_, v8:
     kind_of(scope, object).is_some()
 }
 
-
 /// The kind `object` was marked with, if it was marked at all.
 ///
 /// The returned `&'static str` is the registry's own key, so a lookup does not leak
