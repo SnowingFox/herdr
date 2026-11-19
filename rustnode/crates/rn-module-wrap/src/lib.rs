@@ -764,7 +764,17 @@ fn module_evaluate<'s>(
     // `lib/internal/vm/module.js` always passes both arguments; a missing one is
     // treated as "no timeout" rather than as an error, because reaching here at
     // all means the JS layer already validated the shape.
-    let timeout = args.get(0).int32_value(scope).unwrap_or(-1);
+    //
+    // The type test comes first because `int32_value` *coerces*: called on
+    // `undefined` it answers `Some(0)`, so `unwrap_or(-1)` never applied and a
+    // 0 ms watchdog was armed for every argument-less `evaluate()`. That is a
+    // real 0 ms deadline, not "no timeout", and it made
+    // `rn-module-wrap`'s own lifecycle test fail under CPU load — `Script
+    // execution timed out after 0ms` — while passing on an idle machine.
+    let timeout = match args.get(0) {
+        value if value.is_int32() || value.is_number() => value.int32_value(scope).unwrap_or(-1),
+        _ => -1,
+    };
     if args.get(1).is_true() {
         throw_error(
             scope,
