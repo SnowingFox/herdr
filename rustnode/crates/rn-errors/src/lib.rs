@@ -271,7 +271,14 @@ fn trigger_uncaught_exception(
     // the two cannot disagree about the `_fatalException` ordering.
     let error = args.get(0);
     let from_promise = args.get(1).is_true();
-    report_uncaught(scope, error, from_promise, None);
+    // Called from JavaScript, so no Rust-side `TryCatch` holds the throw site.
+    // `Exception::CreateMessage` is Node's own fallback on this path
+    // (`src/node_errors.cc:1437`) and is what lets a value with no `stack` of its
+    // own still report where it was thrown from.
+    let message = error
+        .is_object()
+        .then(|| v8::Exception::create_message(scope, error));
+    report_uncaught(scope, error, from_promise, message);
 }
 
 /// Reports an uncaught exception the way Node does, giving `process` the first
@@ -313,6 +320,26 @@ pub fn report_uncaught_exception(
 ///
 /// `None` falls back to `Exception::CreateMessage`, which is Node's own
 /// fallback for the paths that reach here without a `TryCatch` in hand.
+/// [`report_uncaught_exception`] for a caller holding a live `TryCatch`.
+///
+/// Reads the throw site from the message V8 captured at the `throw`. Node does
+/// the same (`src/node_errors.cc:1437` takes the `TryCatch` and reads
+/// `Message()`), because a message built at *report* time describes the reporter,
+/// not the throw. A thrown object with no `stack` of its own — `throw {a: 1}`, or
+/// one whose `toString()` throws — otherwise prints with no source location.
+pub fn report_uncaught_currently(
+    scope: &mut v8::PinScope<'_, '_>,
+    error: v8::Local<v8::Value>,
+) -> bool {
+    // `create_message` rather than a `TryCatch` lookup: this is called from a
+    // plain `PinScope`, and Node uses `Exception::CreateMessage` on the paths
+    // that reach here without a `TryCatch` in hand (`src/node_errors.cc:1437`).
+    let message = error
+        .is_object()
+        .then(|| v8::Exception::create_message(scope, error));
+    report_uncaught_exception_with_message(scope, error, message)
+}
+
 pub fn report_uncaught_exception_with_message(
     scope: &mut v8::PinScope<'_, '_>,
     error: v8::Local<v8::Value>,
@@ -607,7 +634,7 @@ fn report(
     from_promise: bool,
     message: Option<v8::Local<'_, v8::Message>>,
 ) {
-    let text = format_exception(scope, error, from_promise);
+    let text = format_exception_at(scope, error, from_promise, message);
     write_uncaught(scope, &text);
 
     // `src/node_errors.cc:582`: with `--trace-uncaught`, the frames behind the
@@ -857,6 +884,31 @@ pub fn format_exception(
     error: v8::Local<v8::Value>,
     from_promise: bool,
 ) -> String {
+    format_exception_at(scope, error, from_promise, None)
+}
+
+/// [`format_exception`], with the V8 message captured at the `throw`.
+///
+/// The message carries the throw *site* — resource name, line and source text —
+/// which the thrown value need not have. `test/fixtures/throws_error7.js` throws
+/// an object whose `toString()` throws and whose `stack` is absent; Node still
+/// prints
+///
+/// ```text
+/// /path/throws_error7.js:1
+/// throw {
+/// ^
+/// { toString: [Function: toString] }
+/// ```
+///
+/// `src/node_errors.cc`'s `PrintSourceLocation` emits those three lines before
+/// the body. Without a message there is no location and the body appears alone.
+pub fn format_exception_at(
+    scope: &mut v8::PinScope,
+    error: v8::Local<v8::Value>,
+    from_promise: bool,
+    message: Option<v8::Local<'_, v8::Message>>,
+) -> String {
     let enhanced = enhance_stack_text(scope, error);
     let detail = if let Some(enhanced) = enhanced {
         enhanced
@@ -876,11 +928,46 @@ pub fn format_exception(
         format!("Uncaught {name}: {text}")
     };
 
-    if from_promise {
-        format!("\nnode:internal/process/promises:XXXX\n{detail}\n")
+    // `PrintSourceLocation`: only when the rendered text did not already begin at
+    // the throw site. `enhance_stack_text` and `error.stack` both start with the
+    // location, so prefixing there would print it twice.
+    let has_location = detail.contains("\n    at ") || detail.starts_with('/');
+    let location = if has_location {
+        None
     } else {
-        format!("\n{detail}\n")
+        message.and_then(|message| source_location(scope, message))
+    };
+
+    if from_promise {
+        format!(
+            "\nnode:internal/process/promises:XXXX\n{}{detail}\n",
+            location.unwrap_or_default()
+        )
+    } else {
+        format!("\n{}{detail}\n", location.unwrap_or_default())
     }
+}
+
+/// Node's `PrintSourceLocation` prefix: `file:line\nsource\ncaret\n`.
+fn source_location(
+    scope: &mut v8::PinScope,
+    message: v8::Local<'_, v8::Message>,
+) -> Option<String> {
+    let resource = message.get_script_resource_name(scope)?;
+    let resource = resource.to_rust_string_lossy(scope);
+    let line = message.get_line_number(scope).unwrap_or(0);
+    let source = message
+        .get_source_line(scope)
+        .map(|line| line.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+    // `get_start_column` is 1-based and the caret sits at that column.
+    // `get_start_column` is a raw `int` cast to `usize`, so V8's `-1` for "no
+    // column" arrives as `usize::MAX` and `repeat` panics with `capacity
+    // overflow`. Clamp rather than trust it: a synthetic message has no column,
+    // and the caret then sits at the start of the line.
+    let column = message.get_start_column().min(1024);
+    let caret_indent = " ".repeat(column.saturating_sub(1));
+    Some(format!("{resource}:{line}\n{source}\n{caret_indent}^\n"))
 }
 
 fn type_name(value: v8::Local<v8::Value>) -> &'static str {

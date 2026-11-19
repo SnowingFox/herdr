@@ -848,10 +848,16 @@ fn main() {
                     // exception and is not a reportable error, so it is skipped
                     // the way the event loop skips it.
                     let handled = if scope.has_caught() && !scope.has_terminated() {
+                        // The message from *this* `TryCatch` is the one that
+                        // carries the throw site. A message built at report time
+                        // describes the reporter: `Exception::create_message`
+                        // here produced `undefined:0` because the failing script
+                        // is no longer the current one by then.
+                        let message = scope.message();
                         match scope.exception() {
-                            Some(exception) => {
-                                rn_errors::report_uncaught_exception(scope, exception)
-                            }
+                            Some(exception) => rn_errors::report_uncaught_exception_with_message(
+                                scope, exception, message,
+                            ),
                             None => true,
                         }
                     } else {
@@ -940,7 +946,7 @@ fn main() {
             }
             let handled = if scope.has_caught() && !scope.has_terminated() {
                 match scope.exception() {
-                    Some(exception) => rn_errors::report_uncaught_exception(scope, exception),
+                    Some(exception) => rn_errors::report_uncaught_currently(scope, exception),
                     None => true,
                 }
             } else {
@@ -1283,7 +1289,7 @@ fn evaluate_script<'s>(
     // reportable error, so it is skipped the way the event loop skips it.
     let _ = if scope.has_caught() && !scope.has_terminated() {
         match scope.exception() {
-            Some(exception) => rn_errors::report_uncaught_exception(scope, exception),
+            Some(exception) => rn_errors::report_uncaught_currently(scope, exception),
             None => true,
         }
     } else {
