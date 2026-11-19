@@ -106,7 +106,10 @@ DEFERRED = (
     # now installs it, because `subtle.deriveBits`/`deriveKey` for ECDH and X25519
     # reach it and both threw "Unsupported operation" without it. Covered by
     # `crates/rn-cli/tests/webcrypto_subtle.rs`.
-    "sqlite.backup",
+    #
+    # `sqlite.backup` was the last entry and has left: `crates/rn-bind-sqlite/src/backup.rs`
+    # installs it now, with Node's length 2 and an asynchronous threadpool copy.
+    # Covered by `test/parallel/test-sqlite-backup.mjs`.
 )
 
 

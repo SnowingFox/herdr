@@ -921,13 +921,7 @@ fn deserialize<'s>(
         return;
     };
     // SAFETY: `state_or_throw` returned a live pointer for `this`.
-    let (open, callback_depth, statements) = unsafe {
-        (
-            (*pointer).is_open(),
-            (*pointer).callback_depth,
-            (*pointer).statements.len(),
-        )
-    };
+    let (open, callback_depth) = unsafe { ((*pointer).is_open(), (*pointer).callback_depth) };
     if !errors::require(scope, open, "database is not open") {
         return;
     }
@@ -938,16 +932,33 @@ fn deserialize<'s>(
     ) {
         return;
     }
-    if !errors::require(scope, statements == 0, "database has open statements") {
-        return;
-    }
-    // The bytes are captured *after* the options bag is read, not before.
-    // `dbName` is a property getter, and a getter can call `buffer.resize(...)`
-    // or `structuredClone(buffer, { transfer })` on the very view it was handed,
-    // which detaches the backing store. A pointer taken before that point is
-    // then dangling, and copying from it is the use-after-free
+    // `Database::Deserialize` does not reject a connection that still has
+    // statements open: it finalizes them, which is what
+    // `test-sqlite-serialize.js` asserts by reading a statement after the
+    // replacement and expecting "statement has been finalized". Refusing instead
+    // would also make the operation impossible for any database prepared past
+    // its first query.
+    //
+    // The view and its length are read *before* the options bag, exactly as the
+    // C++ does, and the copy afterwards reports how many bytes it really moved.
+    // That pair is the only way to notice a getter that resized or detached the
+    // backing store: a length read after the getter would agree with the copy and
+    // the mismatch would be invisible, which is the use-after-free
     // `test-sqlite-options-getter-reentry.js` calls "throws rather than handing
     // uninitialized memory to SQLite".
+    let Ok(input) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(0)) else {
+        errors::throw_type(scope, "The \"buffer\" argument must be a Uint8Array.");
+        return;
+    };
+    let length = input.byte_length();
+    if length == 0 {
+        errors::throw_coded(
+            scope,
+            "ERR_INVALID_ARG_VALUE",
+            "The \"buffer\" argument must not be empty.",
+        );
+        return;
+    }
     let mut name = "main".to_string();
     let options = args.get(1);
     if !options.is_undefined() {
@@ -955,48 +966,63 @@ fn deserialize<'s>(
             errors::throw_type(scope, "The \"options\" argument must be an object.");
             return;
         };
-        // The view's identity is checked after the read, so a getter that
-        // detached it is caught rather than dereferenced.
         if !crate::db::optional_string(scope, options, "dbName", &mut name) {
             return;
         }
     }
-    let Some((bytes, length)) = crate::value::view_snapshot(scope, args.get(0)) else {
+    // Reading the options bag above can run user JavaScript through a property
+    // getter, which may have closed the database since it was checked.
+    // SAFETY: the pointer is still live; `this` is an argument of this call.
+    let Some(raw) = crate::db::open_handle(scope, unsafe { &*pointer }) else {
         return;
     };
     let Ok(name) = std::ffi::CString::new(name) else {
         errors::throw_type(scope, "The \"dbName\" option must not contain null bytes.");
         return;
     };
-    // The copy happens here, after every getter has run, so `bytes` cannot have
-    // been detached between being read and being copied.
-    // SAFETY: `sqlite3_malloc64` may return null; the empty case needs no
-    // allocation because `sqlite3_deserialize` accepts a zero-length image.
+
+    // SAFETY: `sqlite3_malloc64` may return null, which is reported below.
     let buffer = unsafe { crate::ffi::sqlite3_malloc64(length as u64) } as *mut u8;
-    if length > 0 {
-        if buffer.is_null() {
-            errors::throw_coded(
-                scope,
-                "ERR_MEMORY_ALLOCATION_FAILED",
-                "Failed to allocate memory for database deserialization",
-            );
-            return;
-        }
-        // SAFETY: `buffer` is an allocation of `length` bytes and `bytes` does
-        // not overlap it.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, length) };
-    }
-    // SAFETY: the pointer is still live; `this` is an argument of this call.
-    let Some(raw) = crate::db::open_handle(scope, unsafe { &*pointer }) else {
-        // The options getter closed the database; free the allocation rather
-        // than handing it to a connection that no longer exists.
-        if !buffer.is_null() {
-            unsafe { crate::ffi::sqlite3_free(buffer as *mut std::os::raw::c_void) };
-        }
+    if buffer.is_null() {
+        errors::throw_coded(
+            scope,
+            "ERR_MEMORY_ALLOCATION_FAILED",
+            "Failed to allocate memory for database deserialization",
+        );
         return;
-    };
-    // SAFETY: `raw` is open. SQLite takes ownership of `buffer` on success and
-    // frees it on failure, which is what `FREEONCLOSE` declares.
+    }
+    // SAFETY: `buffer` is an allocation of `length` bytes, so the destination
+    // slice is exactly the region V8 may write to.
+    let destination = unsafe { std::slice::from_raw_parts_mut(buffer, length) };
+    let copied = input.copy_contents(destination);
+    if copied != length {
+        // The getter shrank, grew or detached the store, so `buffer` would be
+        // partly uninitialized. Handing that to SQLite would disclose it through
+        // `serialize()`, so it is freed and reported instead.
+        // SAFETY: `buffer` is the allocation just made above and nothing else
+        // owns it yet.
+        unsafe { crate::ffi::sqlite3_free(buffer as *mut std::os::raw::c_void) };
+        errors::throw_coded(
+            scope,
+            "ERR_INVALID_STATE",
+            "The \"buffer\" argument was resized while reading \"options\"",
+        );
+        return;
+    }
+
+    // `FinalizeStatements()` runs here, after every getter, so a statement the
+    // getter created is cleaned up too and the read above is not stale.
+    // SAFETY: the pointer is live; the registry holds statements that root this
+    // database object, so none has been dropped.
+    unsafe {
+        let state = &mut *pointer;
+        for statement in std::mem::take(&mut state.statements) {
+            crate::stmt::finalize_from_database(statement);
+        }
+    }
+    // SAFETY: `raw` is open. SQLite takes ownership of `buffer` and frees it with
+    // `sqlite3_free` when the connection closes, which is what `FREEONCLOSE`
+    // declares.
     let code = unsafe {
         crate::ffi::sqlite3_deserialize(
             raw,
@@ -1046,16 +1072,144 @@ fn set_authorizer<'s>(
 /// SQLite's own query planner. Shipping a partial module would produce answers
 /// that disagree with Node's for exactly the queries a virtual table exists to
 /// serve, so this throws instead.
-fn create_module(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+///
+/// The checks before the throw are `CreateModule`'s, in its order: a closed
+/// connection and an authorizer context are reported before the arguments are
+/// looked at, so a caller inside an options getter sees `ERR_INVALID_STATE`
+/// rather than a missing-feature error from a call that could never have worked.
+fn create_module<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_>,
 ) {
+    let Some(pointer) = this_state(scope, &args) else {
+        return;
+    };
+    // SAFETY: `state_or_throw` returned a live pointer for `this`.
+    let (open, authorizer) = unsafe { ((*pointer).is_open(), (*pointer).authorizer_depth) };
+    if !errors::require(scope, open, "database is not open") {
+        return;
+    }
+    if !errors::require(
+        scope,
+        authorizer == 0,
+        "database cannot be accessed from an authorizer callback",
+    ) {
+        return;
+    }
+    // `CreateModule` validates before it reads `options.columns`, and the column
+    // loop reads one property per column. Those reads are load-bearing even
+    // though the module is never installed: a getter there is how a caller
+    // closes the database, and the second open check below is what reports it.
+    if !args.get(0).is_string() {
+        errors::throw_type(scope, "The \"name\" argument must be a string.");
+        return;
+    }
+    let Ok(options) = v8::Local::<v8::Object>::try_from(args.get(1)) else {
+        errors::throw_type(scope, "The \"options\" argument must be an object.");
+        return;
+    };
+    if !read_create_module_options(scope, options) {
+        return;
+    }
+    // SAFETY: the pointer is still live; `this` is an argument of this call.
+    let open = unsafe { (*pointer).is_open() };
+    if !errors::require(scope, open, "database is not open") {
+        return;
+    }
     errors::throw_coded(
         scope,
         "ERR_METHOD_NOT_IMPLEMENTED",
         "database.createModule is not implemented in rustnode yet",
     );
+}
+
+/// Reads the `createModule` options bag far enough to run every getter
+/// `CreateModule` runs, and to report the same argument errors.
+///
+/// Returns `false` when a check failed and an exception is pending.
+fn read_create_module_options(
+    scope: &mut v8::PinScope<'_, '_>,
+    options: v8::Local<'_, v8::Object>,
+) -> bool {
+    let get = |name: &str| -> Option<v8::Local<'_, v8::Value>> {
+        let key = v8::String::new(scope, name)?;
+        options.get(scope, key.into())
+    };
+    let Some(columns) = get("columns") else {
+        return false;
+    };
+    let Ok(columns) = v8::Local::<v8::Array>::try_from(columns) else {
+        errors::throw_type(scope, "The \"options.columns\" argument must be an array.");
+        return false;
+    };
+    let count = columns.length();
+    if count == 0 {
+        errors::throw_coded(
+            scope,
+            "ERR_INVALID_ARG_VALUE",
+            "The \"options.columns\" array must not be empty.",
+        );
+        return false;
+    }
+    let Some(rows) = get("rows") else {
+        return false;
+    };
+    if !rows.is_function() {
+        errors::throw_type(scope, "The \"options.rows\" argument must be a function.");
+        return false;
+    }
+    for name in ["directOnly", "useBigIntArguments"] {
+        let mut enabled = false;
+        if !db::optional_bool(scope, options, name, &mut enabled) {
+            return false;
+        }
+    }
+    for index in 0..count {
+        let Some(column) = columns.get_index(scope, index) else {
+            return false;
+        };
+        let Ok(column) = v8::Local::<v8::Object>::try_from(column) else {
+            errors::throw_type(
+                scope,
+                "Each column in \"options.columns\" must be an object.",
+            );
+            return false;
+        };
+        let keyed = |name: &str| -> Option<v8::Local<'_, v8::Value>> {
+            let key = v8::String::new(scope, name)?;
+            column.get(scope, key.into())
+        };
+        let Some(name) = keyed("name") else {
+            return false;
+        };
+        if !name.is_string() {
+            errors::throw_type(scope, "The column \"name\" property must be a string.");
+            return false;
+        }
+        let Some(kind) = keyed("type") else {
+            return false;
+        };
+        if !kind.is_string() {
+            errors::throw_type(scope, "The column \"type\" property must be a string.");
+            return false;
+        }
+        let mut hidden = false;
+        if !db::optional_bool(scope, column, "hidden", &mut hidden) {
+            return false;
+        }
+        let kind = kind.to_rust_string_lossy(scope);
+        if !matches!(kind.as_str(), "INTEGER" | "TEXT" | "REAL" | "BLOB" | "ANY") {
+            errors::throw_coded(
+                scope,
+                "ERR_INVALID_ARG_VALUE",
+                "The column \"type\" property must be one of 'INTEGER', 'TEXT', \
+                 'REAL', 'BLOB', or 'ANY'.",
+            );
+            return false;
+        }
+    }
+    true
 }
 
 /// `database.applyChangeset(changeset[, options])`.
@@ -1064,14 +1218,101 @@ fn create_module(
 /// needs the conflict-resolution callback table and the filter callbacks from
 /// `Database::ApplyChangeset`; without them a conflicting changeset would have to
 /// either abort or silently overwrite, and both answer differently from Node.
-fn apply_changeset(
-    scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+///
+/// As with [`create_module`], the state checks run first so the reason reported
+/// for a doomed call is the state rather than the missing feature.
+fn apply_changeset<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    args: v8::FunctionCallbackArguments<'s>,
     _rv: v8::ReturnValue<'_>,
 ) {
+    let Some(pointer) = this_state(scope, &args) else {
+        return;
+    };
+    // SAFETY: `state_or_throw` returned a live pointer for `this`.
+    let (open, authorizer) = unsafe { ((*pointer).is_open(), (*pointer).authorizer_depth) };
+    if !errors::require(scope, open, "database is not open") {
+        return;
+    }
+    if !errors::require(
+        scope,
+        authorizer == 0,
+        "database cannot be accessed from an authorizer callback",
+    ) {
+        return;
+    }
+    // `ApplyChangeset` reads the changeset and then the options bag's
+    // `onConflict` and `filter` getters. Running them is what lets a getter close
+    // the database, which the second open check reports.
+    if !args.get(0).is_uint8_array() {
+        errors::throw_type(scope, "The \"changeset\" argument must be a Uint8Array.");
+        return;
+    }
+    let options = args.get(1);
+    if args.length() > 1 && !options.is_undefined() {
+        let Ok(options) = v8::Local::<v8::Object>::try_from(options) else {
+            errors::throw_type(scope, "The \"options\" argument must be an object.");
+            return;
+        };
+        let mut on_conflict = None;
+        if !read_optional_callable(scope, options, "onConflict", &mut on_conflict) {
+            return;
+        }
+        // `HasOwnProperty` first, so an inherited `filter` is not read at all.
+        let Some(key) = v8::String::new(scope, "filter") else {
+            return;
+        };
+        let Some(has_filter) = options.has_own_property(scope, key.into()) else {
+            return;
+        };
+        if has_filter {
+            let mut filter = None;
+            if !read_optional_callable(scope, options, "filter", &mut filter) {
+                return;
+            }
+        }
+    }
+    // SAFETY: the pointer is still live; `this` is an argument of this call.
+    let open = unsafe { (*pointer).is_open() };
+    if !errors::require(scope, open, "database is not open") {
+        return;
+    }
     errors::throw_coded(
         scope,
         "ERR_METHOD_NOT_IMPLEMENTED",
         "database.applyChangeset is not implemented in rustnode yet",
     );
+}
+
+/// Reads an optional option that must be a function when it is present.
+///
+/// Returns `false` when an exception is pending.
+fn read_optional_callable<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    options: v8::Local<'s, v8::Object>,
+    name: &str,
+    target: &mut Option<v8::Local<'s, v8::Function>>,
+) -> bool {
+    let Some(key) = v8::String::new(scope, name) else {
+        return false;
+    };
+    let Some(value) = options.get(scope, key.into()) else {
+        return false;
+    };
+    if value.is_undefined() {
+        return true;
+    }
+    match v8::Local::<v8::Function>::try_from(value) {
+        Ok(function) => {
+            *target = Some(function);
+            true
+        }
+        Err(_) => {
+            errors::throw_type(
+                scope,
+                &format!("The \"options.{name}\" argument must be a function."),
+            );
+            false
+        }
+    }
 }

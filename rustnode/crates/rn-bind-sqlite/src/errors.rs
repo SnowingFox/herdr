@@ -148,28 +148,42 @@ pub fn throw_sqlite_message(
     errstr: &str,
     errcode: i32,
 ) {
-    let Some(text) = v8::String::new(scope, message) else {
-        return;
-    };
-    let exception = v8::Exception::error(scope, text);
-    if let Some(object) = exception.to_object(scope) {
-        if let (Some(key), Some(code)) = (
-            v8::String::new(scope, "code"),
-            v8::String::new(scope, ERR_SQLITE_ERROR),
-        ) {
-            let _ = object.set(scope, key.into(), code.into());
-        }
-        if let Some(key) = v8::String::new(scope, "errcode") {
-            let _ = object.set(scope, key.into(), v8::Integer::new(scope, errcode).into());
-        }
-        if let (Some(key), Some(value)) = (
-            v8::String::new(scope, "errstr"),
-            v8::String::new(scope, errstr),
-        ) {
-            let _ = object.set(scope, key.into(), value.into());
-        }
+    if let Some(exception) = sqlite_error(scope, message, errstr, errcode) {
+        scope.throw_exception(exception);
     }
-    scope.throw_exception(exception);
+}
+
+/// Builds the `Error` `CreateSQLiteErrorImpl` builds, without throwing it.
+///
+/// A backup reports its failures by rejecting a promise rather than throwing, and
+/// a rejected value has to be an object the caller can inspect after the call
+/// that produced it returned. Building it here keeps one definition of the error
+/// shape, so a rejection and a throw cannot drift apart.
+pub fn sqlite_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    message: &str,
+    errstr: &str,
+    errcode: i32,
+) -> Option<v8::Local<'s, v8::Value>> {
+    let text = v8::String::new(scope, message)?;
+    let exception = v8::Exception::error(scope, text);
+    let object = exception.to_object(scope)?;
+    if let (Some(key), Some(code)) = (
+        v8::String::new(scope, "code"),
+        v8::String::new(scope, ERR_SQLITE_ERROR),
+    ) {
+        let _ = object.set(scope, key.into(), code.into());
+    }
+    if let Some(key) = v8::String::new(scope, "errcode") {
+        let _ = object.set(scope, key.into(), v8::Integer::new(scope, errcode).into());
+    }
+    if let (Some(key), Some(value)) = (
+        v8::String::new(scope, "errstr"),
+        v8::String::new(scope, errstr),
+    ) {
+        let _ = object.set(scope, key.into(), value.into());
+    }
+    Some(exception)
 }
 
 /// Reads a NUL-terminated C string, mapping null to the empty string.

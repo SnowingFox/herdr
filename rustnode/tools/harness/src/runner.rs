@@ -154,7 +154,7 @@ fn run_group(
 
     if jobs <= 1 {
         for index in indices {
-            let result = execute(config, working_dir, script_prefix, &tests[*index]);
+            let result = execute(config, working_dir, script_prefix, &tests[*index], *index);
             progress(&result);
             finished.push((*index, result));
         }
@@ -170,7 +170,7 @@ fn run_group(
                 let Some(index) = indices.get(slot) else {
                     break;
                 };
-                let result = execute(config, working_dir, script_prefix, &tests[*index]);
+                let result = execute(config, working_dir, script_prefix, &tests[*index], *index);
                 if sender.send((*index, result)).is_err() {
                     break;
                 }
@@ -194,6 +194,9 @@ fn execute(
     working_dir: &Path,
     script_prefix: &str,
     test: &TestFile,
+    // A number unique to this file for the whole run, used for the test tree's
+    // temporary directory.
+    slot: usize,
 ) -> FileResult {
     let script_arg = format!("{script_prefix}/{}", test.relative);
     // Node passes the file's `// Flags:` values before the script path, so a
@@ -209,8 +212,17 @@ fn execute(
         // Node's runner exports these so concurrent tests use distinct temp
         // directories. Runtimes that ignore unknown environment variables are
         // unaffected, and one that implements `process.env` gets a working tmpdir.
-        .env("TEST_SERIAL_ID", "0")
-        .env("TEST_THREAD_ID", "0")
+        //
+        // `TEST_THREAD_ID` has to differ per file, and `TEST_SERIAL_ID` has to be
+        // absent rather than `"0"`. `test/common/tmpdir.js` builds the directory
+        // from `TEST_SERIAL_ID || TEST_THREAD_ID || '0'`, and the string `"0"` is
+        // truthy, so setting it made every file share `test/.tmp.0` regardless of
+        // the thread id. Their `tmpdir.refresh()` calls then deleted each other's
+        // databases: `test-sqlite-database.js` and `test-sqlite-timeout.js` failed
+        // 4/4 together and passed alone, with neither at fault. Node only sets
+        // `TEST_SERIAL_ID` for a serial run, which is the rule followed here.
+        .env_remove("TEST_SERIAL_ID")
+        .env("TEST_THREAD_ID", slot.to_string())
         .env("TEST_PARALLEL", "0")
         .env("NODE_TEST_DIR", &config.tests)
         .env("GITHUB_STEP_SUMMARY", "");
@@ -474,7 +486,7 @@ mod tests {
         let tree = TempTree::new("ok");
         let test = tree.script("test-ok.sh", "exit 0\n");
         let config = shell_config(&tree);
-        let result = execute(&config, &config.working_dir(), "test", &test);
+        let result = execute(&config, &config.working_dir(), "test", &test, 0);
         assert!(result.passed, "{}", result.stderr_head);
         assert_eq!(result.exit_code, Some(0));
         assert!(!result.timed_out);
@@ -486,7 +498,7 @@ mod tests {
         let tree = TempTree::new("fail");
         let test = tree.script("test-fail.sh", "echo boom >&2; exit 3\n");
         let config = shell_config(&tree);
-        let result = execute(&config, &config.working_dir(), "test", &test);
+        let result = execute(&config, &config.working_dir(), "test", &test, 0);
         assert!(!result.passed);
         assert_eq!(result.exit_code, Some(3));
         assert!(
@@ -502,7 +514,7 @@ mod tests {
         let test = tree.script("test-hang.sh", "sleep 30\n");
         let mut config = shell_config(&tree);
         config.timeout = Duration::from_millis(300);
-        let result = execute(&config, &config.working_dir(), "test", &test);
+        let result = execute(&config, &config.working_dir(), "test", &test, 0);
         assert!(!result.passed);
         assert!(result.timed_out, "must record the timeout");
         assert!(
@@ -525,7 +537,7 @@ mod tests {
             "i=0; while [ $i -lt 4000 ]; do echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; i=$((i+1)); done; exit 0\n",
         );
         let config = shell_config(&tree);
-        let result = execute(&config, &config.working_dir(), "test", &test);
+        let result = execute(&config, &config.working_dir(), "test", &test, 0);
         assert!(
             result.passed,
             "exit={:?} timed_out={}",
@@ -543,7 +555,7 @@ mod tests {
         let tree = TempTree::new("missing-node");
         let test = tree.script("test-ok.sh", "exit 0\n");
         let config = RunConfig::new("/nonexistent/rustnode", &tree.tests);
-        let result = execute(&config, &config.working_dir(), "test", &test);
+        let result = execute(&config, &config.working_dir(), "test", &test, 0);
         assert!(!result.passed);
         assert!(
             result.stderr_head.contains("spawn failed"),
@@ -562,7 +574,7 @@ mod tests {
             flags: vec!["-x".into()],
         };
         let config = shell_config(&tree);
-        let result = execute(&config, &config.working_dir(), "test", &test);
+        let result = execute(&config, &config.working_dir(), "test", &test, 0);
         assert!(result.passed, "{}", result.stderr_head);
         assert_eq!(result.flags, vec!["-x"]);
         assert!(
