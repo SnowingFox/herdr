@@ -146,6 +146,60 @@ impl BindingModule for Icu {
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Icu);
+    rn_core::snapshot_data::register("rn-bind-icu", attach_for_snapshot, restore_from_snapshot);
+}
+
+/// Hands the cached converter instance template to the snapshot build.
+///
+/// Registered with `rn_core::snapshot_data`. The abort names this handle as
+/// `OBJECT_TEMPLATE_INFO_TYPE`: `CONVERTER_TEMPLATE` is a `Global<ObjectTemplate>`
+/// kept so `getConverter` can build instances later, and nothing in a serialised
+/// context reaches it. Attaching it is what makes the template itself
+/// serialisable, so a loaded realm builds converters from the same template the
+/// build-time realm used — and keeps its internal-field count.
+fn attach_for_snapshot<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _context: v8::Local<'s, v8::Context>,
+) -> v8::Local<'s, v8::Data> {
+    let template = CONVERTER_TEMPLATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|template| v8::Local::new(scope, template))
+    });
+    match template {
+        Some(template) => template.into(),
+        // Never reached for a realm that installed `icu`: `install_converter_template`
+        // is the first thing `install` does. `undefined` would not be `Data`-
+        // convertible to a template, so the placeholder is the build's own
+        // refusal rather than a silent absence — but an uninstalled namespace has
+        // no provider call at all, so this is unreachable in practice.
+        None => v8::undefined(scope).into(),
+    }
+}
+
+/// Puts the converter instance template back from the blob.
+fn restore_from_snapshot(
+    scope: &mut v8::PinScope<'_, '_>,
+    data: v8::Local<'_, v8::Data>,
+) -> Result<(), String> {
+    // `undefined` is what the provider hands over for a realm that never
+    // installed `icu`, and it converts to a `Value` but not to a template. An
+    // `ObjectTemplate` is `Data` rather than `Value`, so the two checks are in
+    // this order: a `Value` means "nothing to restore", anything else must be the
+    // template.
+    if let Ok(value) = v8::Local::<v8::Value>::try_from(data) {
+        if value.is_undefined() {
+            CONVERTER_TEMPLATE.with(|slot| *slot.borrow_mut() = None);
+            return Ok(());
+        }
+        return Err("the blob's icu entry is a value, not an instance template".to_string());
+    }
+    let Ok(template) = v8::Local::<v8::ObjectTemplate>::try_from(data) else {
+        return Err("the blob's icu entry is not an instance template".to_string());
+    };
+    let rooted = v8::Global::new(scope.as_ref(), template);
+    CONVERTER_TEMPLATE.with(|slot| *slot.borrow_mut() = Some(rooted));
+    Ok(())
 }
 
 fn install_converter_template(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {

@@ -58,4 +58,9 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
         filehandle_transfer::FILE_HANDLE_KIND,
         filehandle_transfer::transfer_for_messaging,
     );
+    rn_core::snapshot_data::register(
+        "rn-bind-fs",
+        request::attach_for_snapshot,
+        request::restore_from_snapshot,
+    );
 }

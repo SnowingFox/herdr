@@ -109,6 +109,103 @@ impl BindingModule for DiagnosticsChannel {
 /// Registers the namespace with the runtime.
 pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(DiagnosticsChannel);
+    // Two providers rather than one, because each attached value needs its own
+    // index: `add_context_data` marks *the object it is given*, and V8's handle
+    // check does not reach through an array to the objects inside it. A single
+    // bundled array left both roots unaccounted for and the blob aborted on them.
+    rn_core::snapshot_data::register(
+        "rn-bind-diagnostics-channel/subscribers",
+        attach_subscribers,
+        restore_subscribers,
+    );
+    rn_core::snapshot_data::register(
+        "rn-bind-diagnostics-channel/callback",
+        attach_callback,
+        restore_callback,
+    );
+}
+
+/// Hands the `subscribers` array to the snapshot build.
+///
+/// The abort names it as a `Uint32Array`: it is a `Global` root in this crate and
+/// nothing in a serialised context points at it. Attaching it is what makes it
+/// serialisable, and the blob's `subscribers` property ends up referencing the same
+/// object this restores.
+fn attach_subscribers<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    _context: v8::Local<'s, v8::Context>,
+) -> v8::Local<'s, v8::Data> {
+    let subscribers = CHANNELS.with(|channels| {
+        channels
+            .borrow()
+            .subscribers
+            .as_ref()
+            .map(|array| v8::Local::new(scope, array))
+    });
+    match subscribers {
+        Some(array) => array.into(),
+        None => v8::undefined(scope).into(),
+    }
+}
+
+/// Puts the `subscribers` array back from the blob.
+fn restore_subscribers(
+    scope: &mut v8::PinScope<'_, '_>,
+    data: v8::Local<'_, v8::Data>,
+) -> Result<(), String> {
+    let Some(value) = v8::Local::<v8::Value>::try_from(data).ok() else {
+        return Err("the blob's diagnostics_channel subscribers entry is not a value".to_string());
+    };
+    if value.is_undefined() {
+        return Ok(());
+    }
+    let Ok(array) = v8::Local::<v8::Uint32Array>::try_from(value) else {
+        return Err(
+            "the blob's diagnostics_channel subscribers entry is not a Uint32Array".to_string(),
+        );
+    };
+    let rooted = v8::Global::new(scope.as_ref(), array);
+    CHANNELS.with(|channels| channels.borrow_mut().subscribers = Some(rooted));
+    Ok(())
+}
+
+/// Hands the `linkNativeChannel` callback to the snapshot build.
+///
+/// The abort names it as a `Function`. `pre_execution.js` calls
+/// `dc_binding.linkNativeChannel(...)` during the realm bootstrap, so this root is
+/// always present by the time a build serialises.
+fn attach_callback<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    _context: v8::Local<'s, v8::Context>,
+) -> v8::Local<'s, v8::Data> {
+    let callback = LINK_CALLBACK.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|callback| v8::Local::new(scope, callback))
+    });
+    match callback {
+        Some(callback) => callback.into(),
+        None => v8::undefined(scope).into(),
+    }
+}
+
+/// Puts the `linkNativeChannel` callback back from the blob.
+fn restore_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    data: v8::Local<'_, v8::Data>,
+) -> Result<(), String> {
+    let Some(value) = v8::Local::<v8::Value>::try_from(data).ok() else {
+        return Err("the blob's diagnostics_channel callback entry is not a value".to_string());
+    };
+    if value.is_undefined() {
+        return Ok(());
+    }
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(value) else {
+        return Err("the blob's diagnostics_channel callback entry is not a function".to_string());
+    };
+    let rooted = v8::Global::new(scope.as_ref(), callback);
+    LINK_CALLBACK.with(|slot| *slot.borrow_mut() = Some(rooted));
+    Ok(())
 }
 
 fn create_subscribers<'s>(
