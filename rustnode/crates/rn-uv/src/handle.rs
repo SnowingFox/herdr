@@ -178,8 +178,15 @@ impl StreamState {
     }
 
     /// Whether the handle can still be used, matching `HandleWrap::IsAlive`.
+    ///
+    /// `kClosing` counts as alive, exactly as `handle_wrap.h:64` has it. A
+    /// handle that is closing has already had its descriptor released by
+    /// `uv_close`, so it is still "alive" by this test and a write against it
+    /// reaches libuv and fails with `UV_EBADF`. Reporting "not alive" instead
+    /// would short-circuit that with `UV_EINVAL` and change the error a caller
+    /// sees after `handle.close()` with an empty write queue.
     pub fn is_alive(&self) -> bool {
-        self.state == HandleState::Initialized
+        self.state != HandleState::Closed
     }
 
     /// Whether libuv considers the handle closed or closing.

@@ -335,20 +335,22 @@ pub fn constructor<'s>(
             "writeUtf8String",
             rn_core::method(crate::methods::write_utf8).build(scope),
         ),
-        // The other three string encodings exist for direct users of the handle;
-        // `stream_base_commons` reaches them only when a caller bypasses
-        // `writeGeneric`, which converts non-UTF-8 strings to a `Buffer` first.
+        // `net.Socket` does not set `kDecodeStrings`, so `writeGeneric` hands
+        // these methods the raw string plus the caller's encoding name. Each
+        // must encode as its own name says: aliasing them to `writeUtf8String`
+        // re-encodes a latin1 or ucs2 chunk as UTF-8 and inflates it on the wire
+        // (256 latin1 bytes became 384).
         (
             "writeAsciiString",
-            rn_core::method(crate::methods::write_utf8).build(scope),
+            rn_core::method(crate::methods::write_ascii).build(scope),
         ),
         (
             "writeLatin1String",
-            rn_core::method(crate::methods::write_utf8).build(scope),
+            rn_core::method(crate::methods::write_latin1).build(scope),
         ),
         (
             "writeUcs2String",
-            rn_core::method(crate::methods::write_utf8).build(scope),
+            rn_core::method(crate::methods::write_ucs2).build(scope),
         ),
     ] {
         prototype.set(key(scope, name)?.into(), template.into());

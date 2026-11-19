@@ -234,3 +234,67 @@ fn the_single_write_string_methods_honour_their_encoding() {
         assert!(!printed.is_empty(), "{encoding} produced no bytes");
     }
 }
+
+/// The same encodings over a socket, which reaches a different handle.
+///
+/// `process.stdout` is a pipe or a tty, and those wraps dispatched each
+/// `write*String` method correctly from the start. `lib/net.js` uses a `TCP`
+/// handle, whose methods were instead aliased to `writeUtf8String` — so a latin1
+/// or ucs2 chunk was re-encoded as UTF-8 on the way out. Nothing above caught it
+/// because every existing encoding test wrote to stdout.
+///
+/// The assertion compares the bytes that arrive at a server socket, not the
+/// return values, so it fails on an inflated payload as well as on a wrong one.
+#[test]
+fn a_socket_write_string_method_honours_its_encoding() {
+    let Some(oracle) = oracle() else {
+        return;
+    };
+    // 0..=255 as latin1 is the case that showed the bug: every byte above 0x7f
+    // becomes two UTF-8 bytes, so 256 characters arrive as 384 bytes.
+    let script = r#"
+        const net = require('net');
+        const cases = [
+          ['latin1', Buffer.from(Array.from({ length: 256 }, (_, i) => i)).toString('latin1')],
+          ['ascii', '\u00e9\u00ffhi'],
+          ['ucs2', 'hi\u4e16'],
+          ['utf8', 'caf\u00e9\u4e16'],
+        ];
+        const seen = [];
+        (async () => {
+          for (const [encoding, text] of cases) {
+            const hex = await new Promise((resolve, reject) => {
+              const chunks = [];
+              const server = net.Server((socket) => {
+                socket.on('data', (chunk) => chunks.push(chunk));
+                socket.on('end', () => {
+                  socket.end();
+                  server.close();
+                  resolve(Buffer.concat(chunks).toString('hex'));
+                });
+              });
+              server.on('error', reject);
+              server.listen(0, '127.0.0.1', () => {
+                const client = net.connect(server.address().port, '127.0.0.1', () => {
+                  client.end(text, encoding);
+                });
+                client.on('error', reject);
+              });
+            });
+            seen.push(hex);
+          }
+          console.log(seen.join('\n'));
+        })();
+    "#;
+    let printed = same_bytes_as_node(oracle, script);
+    let text = String::from_utf8(printed).expect("the probe prints hex");
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), 4, "one line per encoding, got {lines:?}");
+    // latin1 0..=255 is exactly 256 bytes, unchanged by the hop.
+    assert_eq!(
+        lines[0].len(),
+        512,
+        "latin1 should send 256 bytes (512 hex digits), got {}",
+        lines[0].len() / 2
+    );
+}
