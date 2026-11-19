@@ -123,6 +123,21 @@ pub struct Options {
     /// contains only the command line, and passing the environment's flags on
     /// would make a child process inherit them twice.
     pub env_options: Option<rn_bind_options::EnvOptions>,
+    /// `NODE_USE_ENV_PROXY=1`: `--use-env-proxy`'s environment spelling.
+    ///
+    /// `HandleEnvOptions` (`src/node_options.cc:2555`) reads it into
+    /// `EnvironmentOptions::use_env_proxy` from `InitializeOncePerProcess`,
+    /// before either `NODE_OPTIONS` or the command line is parsed. Both of
+    /// those therefore override it, which is measured on the oracle:
+    /// `NODE_USE_ENV_PROXY=1 --no-use-env-proxy` leaves the proxy off and
+    /// `NODE_USE_ENV_PROXY=0 --use-env-proxy` leaves it on.
+    ///
+    /// It has to be a field of its own rather than a value written straight
+    /// into the store, because the store is created by the `NODE_OPTIONS` walk
+    /// and the command line is applied on top of it later. Writing the
+    /// variable's value first and letting those two overwrite it is exactly
+    /// Node's order; a store seeded at the end could not tell which source won.
+    pub node_use_env_proxy: bool,
     /// The flags `NODE_OPTIONS` named, for the parsers that read a list rather
     /// than a single value (the permission model).
     pub env_argv: Vec<String>,
@@ -197,6 +212,37 @@ pub struct Options {
     /// `options()->syntax_check_only`, and because the flag can appear on either
     /// side of the script argument's position.
     pub syntax_check_only: bool,
+    /// `--trace-promises`: print a line for every promise V8 creates or
+    /// resolves.
+    ///
+    /// `EnvironmentOptions::trace_promises` (`src/node_options.h:287`), read by
+    /// `Environment::InitializeDiagnostics` (`src/node.cc:247`) to install
+    /// `SetPromiseHook(TracePromises)`. It is a field here rather than a pure
+    /// store value because the hook is installed before the store exists — see
+    /// `rn_realm::trace_promises::arm` — and because the `--no-` form has to
+    /// clear it.
+    pub trace_promises: bool,
+    /// `--debug-arraybuffer-allocations`: track every live `ArrayBuffer` backing
+    /// store and abort on a double registration, a bad free or a leak at exit.
+    ///
+    /// `PerProcessOptions::debug_arraybuffer_allocations`
+    /// (`src/node_options.h:431`), undocumented, read by
+    /// `ArrayBufferAllocator::Create` (`src/api/environment.cc:196`) to pick
+    /// `DebuggingArrayBufferAllocator` over the counting one.
+    ///
+    /// The CLI's own record rather than a store lookup, because the allocator is
+    /// chosen when the isolate is created and the isolate exists before
+    /// `internalBinding('options')` does.
+    pub debug_arraybuffer_allocations: bool,
+    /// `--trace-sync-io`: warn when a synchronous `fs` call happens after the
+    /// loop has started.
+    ///
+    /// `EnvironmentOptions::trace_sync_io` (`src/node_options.h:283`). Recorded in
+    /// the shared hook slot rather than read from here, because the warning comes
+    /// from `rn-bind-fs`: that crate cannot see this struct, and the warning has
+    /// to stay silent during the first tick even when the flag is set, which is
+    /// the second switch `main` sets around the loop.
+    pub trace_sync_io: bool,
     /// `--trace-exit`: print a stack when this environment ends.
     ///
     /// Node's `EnvironmentOptions::trace_exit` (`src/node_options.h:282`), read
@@ -279,6 +325,7 @@ impl Options {
             permission_config: rn_permission::PermissionConfig::default(),
             abort_on_uncaught_exception: false,
             env_options: None,
+            node_use_env_proxy: false,
             env_argv: Vec::new(),
             inspect_enabled: false,
             inspect_wait: false,
@@ -290,6 +337,9 @@ impl Options {
             force_repl: false,
             syntax_check_only: false,
             trace_exit: false,
+            trace_promises: false,
+            trace_sync_io: false,
+            debug_arraybuffer_allocations: false,
             trace_uncaught: false,
             print_v8_options: false,
             zero_fill_buffers: false,
@@ -671,6 +721,10 @@ const IGNORED_WITHOUT_VALUE: &[&str] = &[
     "--preserve-symlinks-main",
     "--throw-deprecation",
     "--trace-deprecation",
+    // `--trace-sync-io` is in [`STORE_BOOLEAN_FLAGS`] instead, because its
+    // `=value` form has to be accepted and this list matches names exactly. Its
+    // consumer is `rn-bind-fs`'s synchronous delivery plus the loop-active flag
+    // `main` sets around `run_loop`.
     "--trace-warnings",
     "--strip-types",
     "--no-strip-types",
@@ -848,6 +902,44 @@ const ABORT_ON_UNCAUGHT: &[&str] = &[
 const ABORT_ON_UNCAUGHT_NEGATED: &[&str] = &[
     "--no-abort-on-uncaught-exception",
     "--no-abort_on_uncaught_exception",
+];
+
+/// Boolean flags this build acts on whose value `lib/**` reads from the store.
+///
+/// Every one is a `BOOL_FIELD` in `src/node_options.cc` whose *only* job is to
+/// reach `getOptionValue`: accepting it here is what puts the value into
+/// `options.parsed`, and the vendored `lib/**` then decides what it means. They
+/// are not in [`IGNORED_WITHOUT_VALUE`] because they are not ignored, and not
+/// reported through [`UNIMPLEMENTED`] because nothing about them is missing.
+///
+/// The `--no-` spellings accept too, because the negation is the whole point of
+/// a boolean and the walk matches names literally.
+///
+/// * `--use-env-proxy` — `lib/internal/process/pre_execution.js:274`
+///   (`setupHttpProxy`) installs undici's `EnvHttpProxyAgent` as the global
+///   dispatcher, and `lib/internal/http/agent.js:714` plus `lib/https.js`
+///   build the global agent with `proxyEnv`. Both are already vendored and
+///   already reachable, so the store is the whole mechanism: measured on this
+///   build, `NODE_OPTIONS=--use-env-proxy` with `HTTP_PROXY` set sends a
+///   request to the proxy and gets `ECONNREFUSED` where the same run without
+///   the flag gets `ENOTFOUND` — the same pair the oracle produces. Node also
+///   reads `NODE_USE_ENV_PROXY` into the same field before either source is
+///   parsed; [`Options::node_use_env_proxy`] is where that lands.
+/// * `--entry-url` — `lib/internal/main/run_main_module.js:14` gates
+///   `prepareMainThreadExecution(!isEntryURL)` on it and
+///   `lib/internal/modules/run_main.js:162` forces the ESM loader. That reader
+///   is live here too: `NODE_OPTIONS=--entry-url` on this build runs a `.js`
+///   entry point through the ESM loader where the same file without the flag
+///   goes through CommonJS.
+const STORE_BOOLEAN_FLAGS: &[&str] = &[
+    "--use-env-proxy",
+    "--no-use-env-proxy",
+    "--entry-url",
+    "--no-entry-url",
+    "--trace-env",
+    "--no-trace-env",
+    "--debug-arraybuffer-allocations",
+    "--no-debug-arraybuffer-allocations",
 ];
 
 /// Flags that are `--flag=value` and may also appear bare.
@@ -1288,6 +1380,10 @@ pub fn parse_with_env(
     stdin: StdinKind,
 ) -> Result<Options, ParseError> {
     let mut options = Options::new();
+    // `HandleEnvOptions` runs from `InitializeOncePerProcess`, so the variable
+    // is read even when `NODE_OPTIONS` is unset. Recorded before the two option
+    // sources so they can override it — see `Options::node_use_env_proxy`.
+    options.node_use_env_proxy = rn_bind_options::EnvOptions::from_process_env().node_use_env_proxy;
 
     if let Some((env, env_store)) = env {
         // The inspector and the abort decision are the two pieces of CLI state
@@ -1355,6 +1451,22 @@ pub fn parse_with_env(
             env_store.value_of("--zero-fill-buffers")
         {
             options.zero_fill_buffers = value;
+        }
+        // `--trace-promises` is `kAllowedInEnvvar` too, and the hook is armed
+        // from this field before the store exists, so the variable's value has to
+        // be taken here for the same two-pass reason the two above are.
+        if let Some(rn_bind_options::ParsedValue::Bool(value)) =
+            env_store.value_of("--trace-promises")
+        {
+            options.trace_promises = value;
+        }
+        // `--trace-sync-io` is `kAllowedInEnvvar` as well, and for the same
+        // reason: its warning comes from the hook slot rather than from `lib/**`,
+        // so the variable's value would otherwise never reach it.
+        if let Some(rn_bind_options::ParsedValue::Bool(value)) =
+            env_store.value_of("--trace-sync-io")
+        {
+            options.trace_sync_io = value;
         }
         // The environment's values become the base the command line is applied
         // to, which is Node's two-pass order rather than a merge of two lists.
@@ -1527,6 +1639,35 @@ pub fn parse_with_env(
             continue;
         }
 
+        // `--flag=value` for a boolean: `Parse` splits the `=` for a `--long`
+        // option and discards the value for a `kBoolean`, so the argument is
+        // recorded as typed and the store sees the name. `--entry-url=0` is
+        // `true` in Node for that reason, and the oracle agrees.
+        if let Some(name) = argument.split_once('=').map(|(name, _)| name) {
+            if STORE_BOOLEAN_FLAGS.contains(&name) {
+                if name == "--debug-arraybuffer-allocations" {
+                    // The `=value` form sets the field too: `Parse` discards the
+                    // value for a `kBoolean`, so `--debug-arraybuffer-allocations=0`
+                    // is `true`, which the oracle confirms.
+                    options.debug_arraybuffer_allocations = true;
+                }
+                options.exec_argv.push(argument.clone());
+                index += 1;
+                continue;
+            }
+        }
+
+        if STORE_BOOLEAN_FLAGS.contains(&argument.as_str()) {
+            if argument == "--debug-arraybuffer-allocations" {
+                options.debug_arraybuffer_allocations = true;
+            } else if argument == "--no-debug-arraybuffer-allocations" {
+                options.debug_arraybuffer_allocations = false;
+            }
+            options.exec_argv.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
         if TEST_FLAGS_WITHOUT_VALUE.contains(&argument.as_str()) {
             options.exec_argv.push(argument.clone());
             index += 1;
@@ -1589,6 +1730,24 @@ pub fn parse_with_env(
                 }
                 "--trace-uncaught" => {
                     options.trace_uncaught = sets;
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
+                // `--trace-promises` installs an isolate promise hook, which only
+                // a `&mut Isolate` can do, so the CLI records the decision and
+                // `main` applies it where the isolate exists.
+                "--trace-promises" => {
+                    options.trace_promises = sets;
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
+                // `--trace-sync-io`'s warning is printed from `rn-bind-fs`, which
+                // cannot see this struct, so the decision goes into the shared
+                // hook slot; the loop-phase half is `main`'s.
+                "--trace-sync-io" => {
+                    options.trace_sync_io = sets;
                     options.exec_argv.push(argument.clone());
                     index += 1;
                     continue;
@@ -2080,6 +2239,8 @@ fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
         "--check" | "-c" => Some(("--check", false)),
         "--trace-exit" => Some(("--trace-exit", false)),
         "--trace-uncaught" => Some(("--trace-uncaught", false)),
+        "--trace-promises" => Some(("--trace-promises", false)),
+        "--trace-sync-io" => Some(("--trace-sync-io", false)),
         "--bench" => Some(("--bench", false)),
         "--v8-options" => Some(("--v8-options", false)),
         "--zero-fill-buffers" => Some(("--zero-fill-buffers", false)),
@@ -2090,6 +2251,8 @@ fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
         "--no-check" => Some(("--check", true)),
         "--no-trace-exit" => Some(("--trace-exit", true)),
         "--no-trace-uncaught" => Some(("--trace-uncaught", true)),
+        "--no-trace-promises" => Some(("--trace-promises", true)),
+        "--no-trace-sync-io" => Some(("--trace-sync-io", true)),
         "--no-bench" => Some(("--bench", true)),
         "--no-v8-options" => Some(("--v8-options", true)),
         "--no-zero-fill-buffers" => Some(("--zero-fill-buffers", true)),
@@ -2109,6 +2272,16 @@ fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
 fn record_v8_flag(options: &mut Options, argument: &str) {
     options.exec_argv.push(argument.to_string());
     options.v8_args.push(argument.to_string());
+}
+
+/// Whether `flag` is `--use-env-proxy` in any spelling `Parse` accepts.
+///
+/// The `--no-` form and the `=value` form both name the same `BOOL_FIELD`, so
+/// all three count as "the sources named this option". Used by [`finish`] to
+/// decide whether `NODE_USE_ENV_PROXY` still has anything to contribute.
+fn is_use_env_proxy_flag(flag: &str) -> bool {
+    let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+    matches!(name, "--use-env-proxy" | "--no-use-env-proxy")
 }
 
 /// One option's value from a raw argument list, in either spelling.
@@ -2511,6 +2684,45 @@ fn finish(mut options: Options, unimplemented: BTreeSet<String>) -> Result<Optio
     // places take the command line's value while `--require` keeps both, and it
     // is why the environment's parse has to have happened first.
     options.parsed.apply(&options.exec_argv);
+    // `--node-memory-debug` is a `NoOp{}` in Node's table with two `Implies`
+    // entries, and the one that matters here is
+    // `--debug-arraybuffer-allocations` (`src/node_options.cc:1830`): the CLI
+    // reads that field to choose the allocator, so the implication has to be
+    // applied to the field and not only to the store. Node applies `Implies` in
+    // `Parse` as it walks, so the variable and the command line both count.
+    if options
+        .env_argv
+        .iter()
+        .chain(options.exec_argv.iter())
+        .any(|flag| {
+            flag.split_once('=').map_or(flag.as_str(), |(name, _)| name) == "--node-memory-debug"
+        })
+    {
+        options.debug_arraybuffer_allocations = true;
+        options.parsed.force(
+            "--debug-arraybuffer-allocations",
+            rn_bind_options::parsed::ParsedValue::Bool(true),
+        );
+    }
+    // `HandleEnvOptions` is the *base* `use_env_proxy` comes from, and both
+    // later sources override it. Applying it after the command line is what
+    // reproduces that order: anything the environment variable or command line
+    // said has already landed, so the variable only fills a value neither of
+    // them set. `NODE_USE_ENV_PROXY=1 --no-use-env-proxy` therefore stays off
+    // and `NODE_USE_ENV_PROXY=0 --use-env-proxy` stays on, which is what the
+    // oracle does.
+    if options.node_use_env_proxy
+        && !options
+            .env_argv
+            .iter()
+            .chain(options.exec_argv.iter())
+            .any(|flag| is_use_env_proxy_flag(flag))
+    {
+        options.parsed.force(
+            "--use-env-proxy",
+            rn_bind_options::parsed::ParsedValue::Bool(true),
+        );
+    }
     // Node pushes an implied `kV8Option` onto `v8_args` as its own argument
     // (`src/node_options-inl.h:449`), which for the shadow-realm pair is what
     // turns `--experimental-shadow-realm` into a V8 flag at all: V8 only knows
@@ -2729,6 +2941,199 @@ mod tests {
                 options.unimplemented.is_empty(),
                 "{flag} is NoOp in Node's table but was reported unimplemented"
             );
+        }
+    }
+
+    /// Every flag this change stopped rejecting is accepted in the spellings
+    /// `Parse` accepts, and none of them is reported as missing.
+    ///
+    /// These were all measured as `unsupported option` before the change. Each
+    /// has a real consumer, so listing them as [`UNIMPLEMENTED`] would now be the
+    /// false alarm `warns_about` exists to prevent — and listing them as ignored
+    /// without a consumer is the "accepted and silently ignored" shape the flag
+    /// taxonomy forbids.
+    ///
+    /// The `=value` and `--no-` forms are asserted because they are the shapes
+    /// that used to be rejected *even when the bare form was accepted*: the
+    /// store-boolean branch matches on the whole argument, so a flag without an
+    /// explicit `=` arm passes the bare spelling and fails the other two.
+    #[test]
+    fn the_newly_accepted_flags_take_every_spelling() {
+        for flag in [
+            "--use-env-proxy",
+            "--entry-url",
+            "--trace-env",
+            "--trace-promises",
+            "--trace-sync-io",
+            "--debug-arraybuffer-allocations",
+        ] {
+            for spelling in [
+                flag.to_string(),
+                format!("{flag}=1"),
+                format!("{flag}=0"),
+                format!("--no-{}", &flag[2..]),
+            ] {
+                let options = parse_of(&[spelling.as_str(), "-e", "1"])
+                    .unwrap_or_else(|error| panic!("{spelling} should parse: {error}"));
+                assert!(
+                    options.unimplemented.is_empty(),
+                    "{spelling} was reported unimplemented"
+                );
+                assert!(
+                    options
+                        .exec_argv
+                        .iter()
+                        .any(|recorded| recorded == &spelling),
+                    "{spelling} must reach process.execArgv as typed"
+                );
+            }
+        }
+    }
+
+    /// `--entry-url` and `--use-env-proxy` reach the store, which is where
+    /// `lib/**` reads them.
+    ///
+    /// The value matters as much as the acceptance: `getOptionValue('--entry-url')`
+    /// is what forces the ESM loader, and `--use-env-proxy` is what builds the
+    /// global agents with `proxyEnv`. A parse that accepted the flag and left the
+    /// store at its default would be accepted-and-ignored.
+    #[test]
+    fn store_backed_flags_are_true_and_their_negations_are_false() {
+        for flag in ["--entry-url", "--use-env-proxy", "--trace-env"] {
+            let set = parse_of(&[flag, "-e", "1"]).expect("parses");
+            assert_eq!(
+                set.parsed.value_of(flag),
+                Some(rn_bind_options::parsed::ParsedValue::Bool(true)),
+                "{flag} should be true in the store"
+            );
+            // The `=0` form is still `true`: `Parse` discards a value given to a
+            // `kBoolean`. This is measured, not assumed — the oracle reports
+            // `getOptionValue('--entry-url') === true` for `--entry-url=0`.
+            let value_zero = parse_of(&[&format!("{flag}=0"), "-e", "1"]).expect("parses");
+            assert_eq!(
+                value_zero.parsed.value_of(flag),
+                Some(rn_bind_options::parsed::ParsedValue::Bool(true)),
+                "{flag}=0 is still true for a kBoolean"
+            );
+            let negated = parse_of(&[&format!("--no-{}", &flag[2..]), "-e", "1"]).expect("parses");
+            assert_eq!(
+                negated.parsed.value_of(flag),
+                Some(rn_bind_options::parsed::ParsedValue::Bool(false)),
+                "--no-{flag} should be false in the store"
+            );
+        }
+    }
+
+    /// `--debug-arraybuffer-allocations` and its `--node-memory-debug`
+    /// implication reach the CLI field the allocator is chosen from.
+    ///
+    /// This is not a store assertion: the allocator is selected before
+    /// `internalBinding('options')` exists, so `main` reads
+    /// [`Options::debug_arraybuffer_allocations`]. A test that only checked the
+    /// store would pass while the flag did nothing.
+    #[test]
+    fn the_debug_arraybuffer_flag_sets_the_field_the_allocator_reads() {
+        let direct = parse_of(&["--debug-arraybuffer-allocations", "-e", "1"]).expect("parses");
+        assert!(direct.debug_arraybuffer_allocations);
+
+        // The `=value` form sets it too, for the same `kBoolean` reason.
+        let value_form =
+            parse_of(&["--debug-arraybuffer-allocations=0", "-e", "1"]).expect("parses");
+        assert!(value_form.debug_arraybuffer_allocations);
+
+        let negated = parse_of(&["--no-debug-arraybuffer-allocations", "-e", "1"]).expect("parses");
+        assert!(!negated.debug_arraybuffer_allocations);
+
+        // `Implies("--node-memory-debug", "--debug-arraybuffer-allocations")`,
+        // `src/node_options.cc:1830`. `--node-memory-debug` is a `NoOp` in Node's
+        // table, so the implication is the only thing it does.
+        let implied = parse_of(&["--node-memory-debug", "-e", "1"]).expect("parses");
+        assert!(
+            implied.debug_arraybuffer_allocations,
+            "--node-memory-debug must imply --debug-arraybuffer-allocations"
+        );
+        assert!(implied.unimplemented.is_empty());
+    }
+
+    /// `--trace-promises` and `--trace-sync-io` are read from the CLI field by the
+    /// isolate-time installers, so the `NODE_OPTIONS` spelling has to reach it.
+    ///
+    /// Both are `kAllowedInEnvvar` in Node's table, and the two consumers run
+    /// before `getOptionValue` is available: the promise hook is installed on the
+    /// isolate, and the sync-IO decision goes into a hook slot. Reading them only
+    /// from the store would make `NODE_OPTIONS=--trace-promises` silently do
+    /// nothing.
+    #[test]
+    fn the_trace_flags_reach_their_fields_from_node_options() {
+        let (env, store) = rn_bind_options::parse_env("--trace-promises --trace-sync-io")
+            .expect("accepted in NODE_OPTIONS");
+        let options = parse_with_env(
+            &["-e".to_string(), "1".to_string()],
+            Some((env, store)),
+            StdinKind::Redirected,
+        )
+        .expect("parses");
+        assert!(options.trace_promises);
+        assert!(options.trace_sync_io);
+
+        // And the command line's negation clears what the variable set, which is
+        // Node's two-pass order.
+        let (env, store) =
+            rn_bind_options::parse_env("--trace-promises").expect("accepted in NODE_OPTIONS");
+        let options = parse_with_env(
+            &[
+                "--no-trace-promises".to_string(),
+                "-e".to_string(),
+                "1".to_string(),
+            ],
+            Some((env, store)),
+            StdinKind::Redirected,
+        )
+        .expect("parses");
+        assert!(!options.trace_promises);
+    }
+
+    /// `NODE_USE_ENV_PROXY=1` is `--use-env-proxy`'s environment spelling, and
+    /// either option source overrides it.
+    ///
+    /// `HandleEnvOptions` (`src/node_options.cc:2565`) runs from
+    /// `InitializeOncePerProcess` before both parses, so its value is only the
+    /// base. Measured on the oracle: `NODE_USE_ENV_PROXY=1 --no-use-env-proxy`
+    /// leaves the proxy off, and `NODE_USE_ENV_PROXY=0 --use-env-proxy` turns it
+    /// on.
+    #[test]
+    fn node_use_env_proxy_is_overridden_by_the_option_sources() {
+        // `NODE_USE_ENV_PROXY` itself is process state, so this test sets it and
+        // restores it. The store assertions below do not depend on the rest of the
+        // environment.
+        let previous = std::env::var_os("NODE_USE_ENV_PROXY");
+
+        std::env::set_var("NODE_USE_ENV_PROXY", "1");
+        let variable_only = parse_of(&["-e", "1"]).expect("parses");
+        assert_eq!(
+            variable_only.parsed.value_of("--use-env-proxy"),
+            Some(rn_bind_options::parsed::ParsedValue::Bool(true)),
+            "NODE_USE_ENV_PROXY=1 should set the flag"
+        );
+
+        let negated = parse_of(&["--no-use-env-proxy", "-e", "1"]).expect("parses");
+        assert_eq!(
+            negated.parsed.value_of("--use-env-proxy"),
+            Some(rn_bind_options::parsed::ParsedValue::Bool(false)),
+            "the command line's --no- form must clear the variable"
+        );
+
+        std::env::set_var("NODE_USE_ENV_PROXY", "0");
+        let command_line = parse_of(&["--use-env-proxy", "-e", "1"]).expect("parses");
+        assert_eq!(
+            command_line.parsed.value_of("--use-env-proxy"),
+            Some(rn_bind_options::parsed::ParsedValue::Bool(true)),
+            "NODE_USE_ENV_PROXY=0 must not override --use-env-proxy"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("NODE_USE_ENV_PROXY", value),
+            None => std::env::remove_var("NODE_USE_ENV_PROXY"),
         }
     }
 

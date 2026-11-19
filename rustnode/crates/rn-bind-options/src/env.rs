@@ -70,6 +70,37 @@ pub struct EnvOptions {
     /// V8 has to see these before `V8::initialize`, so the CLI cannot wait for
     /// the option store to be installed; it forwards this list separately.
     pub v8_args: Vec<String>,
+    /// `NODE_USE_ENV_PROXY`: `use_env_proxy`'s environment spelling.
+    ///
+    /// This is `HandleEnvOptions` (`src/node_options.cc:2555`), the second
+    /// source a `BOOL_FIELD` can come from besides the option table. It runs
+    /// from `InitializeOncePerProcess` *before* either `NODE_OPTIONS` or the
+    /// command line is parsed, so both of them override it: measured on the
+    /// oracle, `NODE_USE_ENV_PROXY=1 ... --no-use-env-proxy` leaves the proxy
+    /// off and `NODE_USE_ENV_PROXY=0 ... --use-env-proxy` turns it on.
+    ///
+    /// Only `use_env_proxy` is here. Node's `HandleEnvOptions` also reads
+    /// `NODE_PENDING_DEPRECATION`, `NODE_PRESERVE_SYMLINKS`,
+    /// `NODE_PRESERVE_SYMLINKS_MAIN` and `NODE_USE_SYSTEM_CA` into the same
+    /// struct; those keep their existing `getOptionValue`-only paths here
+    /// because their consumers already read the store and this change is
+    /// scoped to the flags it names.
+    pub node_use_env_proxy: bool,
+}
+
+impl EnvOptions {
+    /// Reads the environment-only option sources, the way
+    /// `HandleEnvOptions` does.
+    ///
+    /// Anything other than `"1"` is `false`, including `"0"`, an empty value
+    /// and an unset variable: Node compares the whole string to `"1"`.
+    #[must_use]
+    pub fn from_process_env() -> Self {
+        Self {
+            node_use_env_proxy: std::env::var("NODE_USE_ENV_PROXY").as_deref() == Ok("1"),
+            ..Self::default()
+        }
+    }
 }
 
 /// A rejected `NODE_OPTIONS` value.
@@ -266,7 +297,16 @@ pub fn parse(text: &str) -> Result<(EnvOptions, Store), EnvError> {
         store.assign(option, negated, value.as_deref());
     }
 
-    Ok((EnvOptions { argv, v8_args }, store))
+    // `NODE_OPTIONS` is not one of `HandleEnvOptions`'s sources, so the
+    // variable-only field stays at its default here; see [`EnvOptions::from_process_env`].
+    Ok((
+        EnvOptions {
+            argv,
+            v8_args,
+            node_use_env_proxy: false,
+        },
+        store,
+    ))
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@
 pub mod process_env;
 pub mod runtime;
 pub mod shadow_realm;
+pub mod trace_promises;
 pub mod versions;
 
 use rn_js2c::builtin_by_id;
@@ -1650,6 +1651,55 @@ pub fn prepare_execution<'s>(
             .map(|exception| exception.to_rust_string_lossy(scope))
             .unwrap_or_default();
         eprintln!("rustnode: pre-execution failed: {message}");
+        return;
+    }
+    emit_entry_url_warning(scope, require);
+}
+
+/// `emitExperimentalWarning('--entry-url')` for a process that was given it.
+///
+/// `lib/internal/main/run_main_module.js:22` is the caller, and it is the only
+/// one: the warning belongs to the *file* entry point's main script, so a run
+/// with no entry file (`-e`, a pipe, the REPL) says nothing. Measured on the
+/// oracle: `node --entry-url <file>` warns,
+/// `node --entry-url -e 0` does not.
+///
+/// Running it here rather than from the main script matches the ordering the
+/// vendored file establishes — pre-execution completes first, then the warning
+/// — and avoids loading `internal/main/run_main_module` for a file entry point,
+/// which this build drives through `run_main` instead.
+///
+/// A failure is silent. The warning is diagnostic, and a realm that cannot
+/// reach `internal/util` already reports its own bootstrap failures; refusing
+/// to run the user's script over a missing warning would be worse.
+fn emit_entry_url_warning<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    require: v8::Local<'s, v8::Function>,
+) {
+    let enabled = matches!(
+        rn_bind_options::parsed::value_of("--entry-url"),
+        Some(rn_bind_options::parsed::ParsedValue::Bool(true))
+    );
+    if !enabled {
+        return;
+    }
+    let Some(util) = call_require(scope, require, "internal/util") else {
+        return;
+    };
+    let Some(emit) = get_property(scope, util, "emitExperimentalWarning") else {
+        return;
+    };
+    let Ok(emit) = v8::Local::<v8::Function>::try_from(emit) else {
+        return;
+    };
+    let Some(feature) = v8::String::new(scope, "--entry-url") else {
+        return;
+    };
+    let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+    let scope = &mut try_catch.init();
+    let _ = emit.call(scope, util, &[feature.into()]);
+    if scope.has_caught() {
+        let _ = scope.exception();
     }
 }
 

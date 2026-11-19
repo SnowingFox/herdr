@@ -123,6 +123,16 @@ fn main() {
     // script does later can turn them on.
     rn_core::hook_slot::set_trace_exit(options.trace_exit);
     rn_core::hook_slot::set_trace_uncaught(options.trace_uncaught);
+    // `--trace-sync-io` is two switches in Node: this one, and the loop-phase one
+    // `main` flips around `run_loop` (`SpinEventLoopInternal`'s
+    // `env->set_trace_sync_io`). Setting only the second would lose the flag;
+    // setting only this one would warn during the first tick, which the oracle
+    // does not.
+    rn_core::hook_slot::set_trace_sync_io(options.trace_sync_io);
+    // `--trace-promises` is deliberately *not* a hook-slot value: the isolate
+    // promise hook is installed before any of this runs (see `trace_promises`),
+    // because V8 must see it before the first promise is created by the loaders.
+    //
     // `--zero-fill-buffers` decides how `createUnsafeArrayBuffer` allocates, and
     // that call happens in `rn-bind-buffer` on whichever thread asks, so the
     // decision travels in the shared slot rather than in this struct.
@@ -344,7 +354,15 @@ fn main() {
         rn_uv::memory::constrained_memory(),
         rn_uv::memory::total_memory(),
     );
-    let mut isolate = v8::Isolate::new(rn_core::with_counted_array_buffer_allocator(params));
+    let mut isolate = v8::Isolate::new(if options.debug_arraybuffer_allocations {
+        // `ArrayBufferAllocator::Create`'s debugging subtype
+        // (`src/api/environment.cc:196`), selected when
+        // `debug_arraybuffer_allocations` is set. The flag's whole behaviour is
+        // in this allocator, so this is the one place it matters.
+        rn_core::with_debugging_array_buffer_allocator(params)
+    } else {
+        rn_core::with_counted_array_buffer_allocator(params)
+    });
     rn_core::profile::mark("Isolate::new");
     // `import.meta` and `import()` are dispatched by V8 through isolate-level
     // handlers rather than `internalBinding()`, so they are installed here,
@@ -371,6 +389,13 @@ fn main() {
     // and a binding callback cannot obtain a `&mut Isolate` soundly. Recording
     // the isolate here is the same arrangement the ESM handlers use.
     rn_bind_heap_utils::set_snapshot_isolate(&mut isolate);
+    // `--trace-promises` is `Environment::InitializeDiagnostics`'s
+    // `isolate_->SetPromiseHook(TracePromises)`, and the only API that installs
+    // one takes `&mut Isolate`. This is *before* the option store is installed
+    // below, so the flag is read from the parser's own record rather than from
+    // `getOptionValue`, which is the same source `InitializeDiagnostics` uses
+    // (`EnvironmentOptions`).
+    rn_realm::trace_promises::arm(options.trace_promises, &mut isolate);
     // `V8Inspector::create` and V8's client callbacks need `&mut Isolate`, which a
     // binding cannot obtain soundly, so the inspector records the isolate here the
     // same way `heap_utils` does for heap snapshots.
@@ -398,6 +423,10 @@ fn main() {
     let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
     let scope = &mut scope.init();
     let context = v8::Context::new(scope, Default::default());
+    // `--trace-promises`'s hook needs the principal realm's context; see
+    // `trace_promises::record_context`. Recorded here, where the context is a
+    // handle this frame owns.
+    rn_realm::trace_promises::record_context(options.trace_promises, scope, context);
     let scope = &mut v8::ContextScope::new(scope, context);
     rn_core::profile::mark("Context::new");
 
@@ -544,7 +573,48 @@ fn main() {
     // while `argv` matches what Node reports for the same command line.
     let mut argv_rest: Vec<String> = Vec::new();
     let mut script_path = None;
+    // What `install_cjs_loader` anchors `require` at, when it differs from
+    // `process.argv[1]`. Only `--entry-url` splits them: the published slot has
+    // to stay what the user typed, while `Module.createRequire` needs something
+    // it can resolve.
+    let mut require_anchor: Option<String> = None;
+    // `--entry-url` changes both halves of this slot. Node keeps the entry point
+    // as the user wrote it — `process.argv[1]` is the raw `a1.js` or
+    // `file:///…` string, not an absolute path — because
+    // `lib/internal/modules/run_main.js:176` builds the `URL` from it, and
+    // `run_main_module.js:17` passes `false` for `expandArgv1` so nothing
+    // rewrites the slot afterwards. Measured on the oracle: `node a1.js` reports
+    // `/tmp/eu/a1.js`, `node --entry-url a1.js` reports `a1.js`, and
+    // `node --entry-url file:///tmp/eu/a1.js` reports the URL.
+    let entry_is_url = matches!(
+        options.parsed.value_of("--entry-url"),
+        Some(rn_bind_options::parsed::ParsedValue::Bool(true))
+    );
     match &options.source {
+        args::Source::File(path) if entry_is_url => {
+            // `process.argv[1]` keeps what the user typed, exactly as Node
+            // leaves it: `run_main_module.js:17` passes `false` for
+            // `expandArgv1`, so nothing rewrites the slot, and
+            // `lib/internal/modules/run_main.js:176` resolves it with
+            // `new URL(mainPath, getCWDURL())` when it needs a URL.
+            //
+            // The CJS loader's `require` anchor is a different value, because
+            // `Module.createRequire` rejects a bare relative string. Node never
+            // builds one on this path — `--entry-url` forces the ESM loader, so
+            // `executeUserEntryPoint` resolves `mainPath` itself — but this
+            // build's entry point still reaches `executeUserEntryPoint`'s CJS
+            // branch, so the anchor is kept resolvable rather than left to
+            // throw. A `file:` URL is already resolvable as typed.
+            argv_rest.push(path.clone());
+            script_path = Some(path.clone());
+            require_anchor = Some(if path.contains("://") {
+                path.clone()
+            } else {
+                std::path::absolute(path)
+                    .map(|resolved| resolved.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| path.clone())
+            });
+        }
         args::Source::File(path) => {
             let resolved = std::path::absolute(path)
                 .map(|resolved| resolved.to_string_lossy().into_owned())
@@ -634,7 +704,8 @@ fn main() {
             // correct there.
             if let Some(require) = loaders.require.as_ref() {
                 let require = v8::Local::new(scope, require);
-                if let Err(message) = bootstrap::install_cjs_loader(scope, require, &script_path) {
+                let anchor = require_anchor.clone().or_else(|| script_path.clone());
+                if let Err(message) = bootstrap::install_cjs_loader(scope, require, &anchor) {
                     // A failure is reported rather than fatal, for the same
                     // reason the bootstrap itself is: a script using only
                     // builtins still runs, and saying why file requires do not
@@ -995,6 +1066,12 @@ fn main() {
                 }
             }
         }
+        // `SpinEventLoopInternal` brackets `uv_run` with
+        // `env->set_trace_sync_io(...)` (`src/api/embed_helpers.cc:35` and `:69`),
+        // which is what makes the flag's "after the first tick" wording true: the
+        // script's own top-level synchronous calls run before this line and are
+        // silent, while a timer or immediate callback runs inside it and warns.
+        rn_core::hook_slot::set_trace_sync_io_active(rn_core::hook_slot::trace_sync_io());
         match rn_realm::run_loop(scope, hooks) {
             Ok(rn_io::StopReason::ExitRequested | rn_io::StopReason::TurnLimit) => {
                 exit_requested = true;
@@ -1002,6 +1079,7 @@ fn main() {
             Ok(rn_io::StopReason::Idle) => {}
             Err(message) => eprintln!("rustnode: the event loop could not start: {message}"),
         }
+        rn_core::hook_slot::set_trace_sync_io_active(false);
         // A microtask queued by the last callback in the last turn still has to
         // run, and Node drains once more before exiting.
         hooks.drain(scope);

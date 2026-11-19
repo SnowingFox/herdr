@@ -95,18 +95,27 @@ macro_rules! conclude_with {
         let mode = $mode;
         let request = $request;
         match mode {
-            Delivery::Sync => match completion.payload {
-                Ok(Payload::Unit) => $rv.set_undefined(),
-                Ok(Payload::Value(value)) => $rv.set(value),
-                Ok(Payload::Pair(first, second)) => {
-                    let array = v8::Array::new_with_elements($scope, &[first, second]);
-                    $rv.set(array.into());
+            Delivery::Sync => {
+                // `--trace-sync-io`: Node calls `env->PrintSyncTrace()` from every
+                // synchronous `uv_fs_*` path (`src/node_file.cc:2164`, `:2799`,
+                // `node_file-inl.h:376`, `:402` and the rest), and this is the one
+                // place every `fs.*Sync` member passes through. Reported *before*
+                // the result is delivered, which is where Node puts it: the
+                // warning names the stack that is still live.
+                rn_errors::print_sync_trace($scope);
+                match completion.payload {
+                    Ok(Payload::Unit) => $rv.set_undefined(),
+                    Ok(Payload::Value(value)) => $rv.set(value),
+                    Ok(Payload::Pair(first, second)) => {
+                        let array = v8::Array::new_with_elements($scope, &[first, second]);
+                        $rv.set(array.into());
+                    }
+                    Err(Failure::Syscall(error)) => throw_error($scope, &error),
+                    Err(Failure::Denied(error)) => {
+                        error.throw($scope);
+                    }
                 }
-                Err(Failure::Syscall(error)) => throw_error($scope, &error),
-                Err(Failure::Denied(error)) => {
-                    error.throw($scope);
-                }
-            },
+            }
             Delivery::Callback => {
                 if let Some(request) = request {
                     deliver_to_callback($scope, request, completion);
