@@ -10,4 +10,3 @@ description = "internalBinding('icu') for rustnode"
 [dependencies]
 rn-core.workspace = true
 rn-v8-sys.workspace = true
-unicode-width.workspace = true

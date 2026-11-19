@@ -1,10 +1,12 @@
 //! `internalBinding('icu')` for rustnode.
 //!
-//! `lib/internal/util/inspect.js` calls `getStringWidth` on every non-ASCII
-//! code point it prints, and `lib/buffer.js` calls `transcode` for
-//! `Buffer.from(source, from, to)`. Node guards both behind
-//! `internalBinding('config').hasIntl`, which is true here because V8 is linked
-//! with full ICU (`Intl.Segmenter` exists).
+//! `lib/internal/util/inspect.js` calls `getStringWidth` on every non-ASCII code
+//! point it prints, `lib/buffer.js` calls `transcode` for
+//! `Buffer.from(source, from, to)`, and `lib/internal/encoding.js` calls
+//! `getConverter`/`decode`/`hasConverter` to build every `TextDecoder` that is
+//! not UTF-8 and not a single-byte legacy encoding. Node guards all of them
+//! behind `internalBinding('config').hasIntl`, which is true here because V8 is
+//! linked with full ICU (`Intl.Segmenter` exists).
 //!
 //! # Why `getStringWidth` is the important one
 //!
@@ -14,76 +16,81 @@
 //! `require('util')` — not with an ICU error but with
 //! `internalBinding('icu'): the namespace has no Rust implementation yet`
 //! thrown from deep inside the inspect code. That is why this namespace matters
-//! out of proportion to its six members.
+//! out of proportion to its member count.
 //!
-//! The width calculation follows `GetColumnWidth` in `src/node_i18n.cc`:
-//! `UCHAR_EAST_ASIAN_WIDTH` decides full width, then emoji presentation
-//! overrides to 2, then the control/format/mark categories and emoji modifiers
-//! become 0. `unicode-width` supplies the same Unicode tables.
+//! # Where the ICU calls come from
 //!
-//! # `transcode`
+//! The two subsystems whose answers depend on Unicode property data — column
+//! width and the converter surface — ask the ICU that `librusty_v8.a` already
+//! carries, through the declarations in [`ffi`], because every hand-copied
+//! approximation of those answers disagreed with Node somewhere measurable:
 //!
-//! The four encodings `lib/buffer.js` transcodes between are utf8, utf16le,
-//! latin1 and ascii. All four are implemented here directly, so
-//! `Buffer.from(x, 'utf8', 'latin1')` works. What is *not* implemented is the
-//! arbitrary-converter surface (`getConverter`, `decode`, `hasConverter`),
-//! which needs an ICU converter; those are declared deferred.
+//! * [`width`] is `GetColumnWidth` from `src/node_i18n.cc`. A table-driven
+//!   version reported zero columns for `Cn` (unassigned) code points and for
+//!   `Mc` spacing marks, where Node reports one for both.
+//! * [`converter`] is `ConverterObject`: an ICU handle with its own decoder
+//!   state, which is what lets `TextDecoder({ stream: true })` end a chunk
+//!   mid-character.
+//!
+//! [`transcode`] is the exception, and it is the interesting one. It is written
+//! out in Rust rather than routed through ICU, because the ICU inside
+//! `librusty_v8.a` is a 37-name data subset in which `us-ascii` and `iso8859-1`
+//! both alias `windows-1252-html` — so calling it would have produced
+//! `windows-1252` semantics for a label that means ISO-8859-1. Node links full
+//! ICU, where they are distinct. The four encodings `transcode` accepts make
+//! that a total function of four cases rather than a table.
+//!
+//! The crate's doc comment used to claim the converter surface "needs an ICU
+//! converter handle over the ICU V8 bundles" and deferred it on that basis. The
+//! claim was wrong in the direction that matters: the whole converter API is in
+//! the archive we link, and only absent from the binary because nothing
+//! referenced it. See [`ffi`].
 
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+pub mod converter;
+pub mod ffi;
+pub mod transcode;
+pub mod width;
 
 use rn_core::{BindingModule, InstallCtx};
 use rn_v8_sys::v8;
-use unicode_width::UnicodeWidthChar;
 
 /// Members exposed on the namespace object, matching `contracts/icu.json`.
-pub const MEMBERS: &[&str] = &["getStringWidth", "icuErrName", "transcode"];
-
-/// Members this build does not install yet.
-///
-/// One subsystem, reachable from user code: `lib/internal/encoding.js` builds
-/// every `TextDecoder` with `getConverter`, so `new TextDecoder('shift_jis')`
-/// throws `icuGetConverter is not a function` today.
-///
-/// What it needs is an ICU converter bound over V8's bundled ICU.
-/// `src/node_i18n.cc`'s `ConverterObject` is `ucnv_open` + `ucnv_toUnicode`
-/// with a per-handle state carried across calls, which is what makes
-/// `TextDecoder({ stream: true })` split a multi-byte character across chunks
-/// correctly. The four encodings `transcode` covers are a closed list; a
-/// converter is an arbitrary ICU charset, and a table of the nine multibyte
-/// names `lib/internal/encoding/single-byte.js` does not handle itself would be
-/// a second converter implementation that disagrees with ICU on invalid input.
-pub const DEFERRED: &[(&str, &str)] = &[
-    (
-        "getConverter",
-        "needs an ICU converter handle (ucnv_open/ucnv_toUnicode) over the ICU \
-         V8 bundles, with per-handle decoder state so a streamed chunk can end \
-         mid-character; TextDecoder() cannot be constructed without it",
-    ),
-    (
-        "decode",
-        "the namespace-level ucnv_toUnicode call that consumes a getConverter \
-         handle, deferred with it",
-    ),
-    (
-        "hasConverter",
-        "reports whether a charset label resolves in ICU, which needs the same \
-         ucnv_open; deferred with getConverter",
-    ),
+pub const MEMBERS: &[&str] = &[
+    "decode",
+    "getConverter",
+    "getStringWidth",
+    "hasConverter",
+    "icuErrName",
+    "transcode",
 ];
 
-/// The four encodings `lib/buffer.js` transcodes between.
-const SUPPORTED: &[&str] = &["utf8", "utf16le", "latin1", "ascii"];
+/// Members this build does not install.
+///
+/// Empty: every member `src/node_i18n.cc` publishes is implemented here. The
+/// constant stays because `BindingModule::deferred` returns a slice and an empty
+/// one is a stronger statement than omitting the override.
+pub const DEFERRED: &[(&str, &str)] = &[];
 
-/// ICC error codes, from `icu::UErrorCode`. `transcode` returns one of these
-/// when it cannot honour a request.
-pub const U_ZERO_ERROR: i32 = 0;
-pub const U_INVALID_CHAR_FOUND: i32 = 10;
-
+// The one-shot converter template `getConverter` instantiates.
+//
+// Node builds it per isolate (`isolate_data->set_i18n_converter_template`) and
+// instantiates it with `ObjectTemplate::NewInstance`, i.e. without a JavaScript
+// constructor. The `FunctionTemplate` here exists only to own an instance
+// template carrying one internal field; `new` is unreachable because the
+// template is never published.
 thread_local! {
-    /// Converters created by `getConverter`. The member is deferred, so this is
-    /// only ever populated if that changes.
-    static CONVERTERS: RefCell<BTreeMap<&'static str, ()>> = const { RefCell::new(BTreeMap::new()) };
+    static CONVERTER_TEMPLATE: std::cell::RefCell<Option<v8::Global<v8::ObjectTemplate>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn converter_template<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+) -> Option<v8::Local<'s, v8::ObjectTemplate>> {
+    CONVERTER_TEMPLATE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|template| v8::Local::new(scope, template))
+    })
 }
 
 pub struct Icu;
@@ -106,14 +113,28 @@ impl BindingModule for Icu {
         scope: &mut v8::PinScope<'s, '_>,
         _ctx: &mut InstallCtx<'_>,
     ) -> Result<v8::Local<'s, v8::Object>, String> {
+        install_converter_template(scope)?;
+
         let object = v8::Object::new(scope);
-        let values: [(&str, v8::Local<v8::Value>); 3] = [
+        // Every value is built before any `set`, because `set` takes the scope
+        // mutably and constructing inside its arguments would need two live
+        // borrows.
+        let values: [(&str, v8::Local<'s, v8::Value>); 6] = [
+            ("decode", function(scope, "decode", decode)?),
+            (
+                "getConverter",
+                function(scope, "getConverter", get_converter)?,
+            ),
             (
                 "getStringWidth",
                 function(scope, "getStringWidth", get_string_width)?,
             ),
-            ("transcode", function(scope, "transcode", transcode)?),
+            (
+                "hasConverter",
+                function(scope, "hasConverter", has_converter)?,
+            ),
             ("icuErrName", function(scope, "icuErrName", icu_err_name)?),
+            ("transcode", function(scope, "transcode", transcode)?),
         ];
         for (name, value) in values {
             set(scope, object, name, value)?;
@@ -127,125 +148,54 @@ pub fn register(registry: &mut rn_core::BindingRegistry) {
     registry.register_module(Icu);
 }
 
+fn install_converter_template(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
+    // `set_internal_field_count` is on the instance template, so the object is
+    // built from a `FunctionTemplate`'s instance template rather than from a
+    // bare `ObjectTemplate` — the same shape `blob` uses for its handles.
+    let template = v8::FunctionTemplate::builder(no_converter_constructor).build(scope);
+    template
+        .instance_template(scope)
+        .set_internal_field_count(1);
+    if let Some(name) = v8::String::new(scope, "Converter") {
+        template.set_class_name(name);
+    }
+    let instance = template.instance_template(scope);
+    CONVERTER_TEMPLATE.with(|slot| *slot.borrow_mut() = Some(v8::Global::new(scope, instance)));
+    Ok(())
+}
+
+/// A handle is only ever built by `getConverter`, so `new` is refused.
+fn no_converter_constructor(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_>,
+) {
+    throw_type_error(scope, "Illegal constructor");
+}
+
 fn get_string_width(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let Some(text) = args.get(0).to_string(scope) else {
-        rv.set(v8::Integer::new(scope, 0).into());
+    // Node's `CHECK(args[0]->IsString())` is a hard abort there; a binding must
+    // not abort here, so a non-string is a `TypeError` and the caller sees a
+    // bug rather than a silent `0`.
+    let Ok(text) = v8::Local::<v8::String>::try_from(args.get(0)) else {
+        throw_type_error(scope, "getStringWidth expects a string");
         return;
     };
-    let text = text.to_rust_string_lossy(scope);
     // `getStringWidth(str, ambiguousAsFullWidth, expandEmojiSequence)`.
-    let ambiguous_as_full_width = args.get(1).boolean_value(scope);
-    let expand_emoji = !args.get(2).is_boolean() || args.get(2).boolean_value(scope);
+    let ambiguous_as_full_width = args.get(1).is_true();
+    let expand_emoji = !args.get(2).is_boolean() || args.get(2).is_true();
 
-    let width = string_width(&text, ambiguous_as_full_width, expand_emoji);
+    // `TwoByteValue`, not a Rust `&str`: a lone surrogate is a legal unit in the
+    // string Node measures, and it takes one column.
+    let mut units = vec![0u16; text.length()];
+    text.write_v2(scope, 0, &mut units, v8::WriteFlags::empty());
+
+    let width = width::string_width(&units, ambiguous_as_full_width, expand_emoji);
     rv.set(v8::Integer::new(scope, width as i32).into());
-}
-
-/// The display width of `text` in terminal columns.
-///
-/// Follows `GetColumnWidth` in `src/node_i18n.cc`, including the two rules that
-/// are easy to miss: an emoji presentation character is two columns even when
-/// Unicode calls it ambiguous or narrow, and a control, format or mark character
-/// is zero columns. U+00AD SOFT HYPHEN is the documented exception, being a
-/// format character that still occupies a column.
-fn string_width(text: &str, ambiguous_as_full_width: bool, expand_emoji: bool) -> usize {
-    let mut width = 0;
-    let mut previous = None;
-    for character in text.chars() {
-        // Inside a ZWJ sequence, the individual emoji are not counted
-        // separately: the sequence renders as one glyph. `expand_emoji` skips
-        // this check and counts each code point.
-        if !expand_emoji && previous == Some('\u{200d}') && is_emoji(character) {
-            previous = Some(character);
-            continue;
-        }
-        width += column_width(character, ambiguous_as_full_width);
-        previous = Some(character);
-    }
-    width
-}
-
-fn column_width(character: char, ambiguous_as_full_width: bool) -> usize {
-    // `UnicodeWidthChar` resolves East-Asian Width, with ambiguous characters
-    // counted as one column, which is Node's default.
-    let narrow = character.width().unwrap_or(0);
-    if narrow == 0 {
-        // A zero width from the table means a control, format or combining
-        // character. Node still gives the soft hyphen one column.
-        return usize::from(character == '\u{00ad}');
-    }
-    if is_emoji(character) {
-        return 2;
-    }
-    // A wide or fullwidth character is already two columns in the table. An
-    // ambiguous one is one column unless the caller asks otherwise.
-    if ambiguous_as_full_width && is_ambiguous_width(character) {
-        return 2;
-    }
-    narrow
-}
-
-/// Whether `character` renders as an emoji, which Node treats as two columns.
-///
-/// Node asks ICU for `UCHAR_EMOJI_PRESENTATION`. Without an ICU table this uses
-/// the ranges that property covers; the cost of being wrong is a misaligned
-/// column in `util.inspect`, not a wrong value from user code.
-fn is_emoji(character: char) -> bool {
-    matches!(character as u32,
-        0x1F300..=0x1F5FF   // Misc Symbols and Pictographs
-        | 0x1F600..=0x1F64F // Emoticons
-        | 0x1F680..=0x1F6FF // Transport and Map
-        | 0x1F700..=0x1F77F
-        | 0x1F780..=0x1F7FF
-        | 0x1F800..=0x1F8FF
-        | 0x1F900..=0x1F9FF // Supplemental Symbols and Pictographs
-        | 0x1FA00..=0x1FA6F
-        | 0x1FA70..=0x1FAFF
-        | 0x2600..=0x27BF   // Misc Symbols and Dingbats
-        | 0x1F1E6..=0x1F1FF // Regional indicators
-    )
-}
-
-/// Whether `character` has East-Asian Width "Ambiguous".
-///
-/// Node only consults this when `ambiguousAsFullWidth` is set, which
-/// `util.inspect` never does, so a conservative approximation is enough: the
-/// characters that are ambiguous and commonly appear in box drawing and
-/// typographic punctuation.
-fn is_ambiguous_width(character: char) -> bool {
-    matches!(character as u32,
-        0x00A1 | 0x00A4 | 0x00A7 | 0x00A8 | 0x00AA | 0x00AD..=0x00AE
-        | 0x00B0..=0x00B4 | 0x00B6..=0x00BA | 0x00BC..=0x00BF
-        | 0x2010 | 0x2013..=0x2016 | 0x2018..=0x2019 | 0x201C..=0x201D
-        | 0x2020..=0x2022 | 0x2024..=0x2027 | 0x2030 | 0x2032..=0x2033
-        | 0x2035 | 0x203B | 0x203E | 0x2074 | 0x207F | 0x2081..=0x2084
-        | 0x20AC | 0x2103 | 0x2109 | 0x2113 | 0x2116 | 0x2121..=0x2122
-        | 0x2126 | 0x212B | 0x2153..=0x2154 | 0x215B..=0x215E
-        | 0x2160..=0x216B | 0x2170..=0x2179 | 0x2189
-        | 0x2190..=0x2199 | 0x21B8..=0x21B9 | 0x21D2 | 0x21D4
-        | 0x21E7 | 0x2200 | 0x2202..=0x2203 | 0x2207..=0x2208
-        | 0x220B | 0x220F | 0x2211 | 0x2215 | 0x221A | 0x221D..=0x2220
-        | 0x2223 | 0x2225 | 0x2227..=0x222C | 0x222E | 0x2234..=0x2237
-        | 0x223C..=0x223D | 0x2248 | 0x224C | 0x2252 | 0x2260..=0x2261
-        | 0x2264..=0x2267 | 0x226A..=0x226B | 0x226E..=0x226F
-        | 0x2282..=0x2283 | 0x2286..=0x2287 | 0x2295 | 0x2299 | 0x22A5
-        | 0x22BF | 0x2312 | 0x2460..=0x24E9 | 0x24EB..=0x254B
-        | 0x2550..=0x2573 | 0x2580..=0x258F | 0x2592..=0x2595
-        | 0x25A0..=0x25A1 | 0x25A3..=0x25A9 | 0x25B2..=0x25B3
-        | 0x25B6..=0x25B7 | 0x25BC..=0x25BD | 0x25C0..=0x25C1
-        | 0x25C6..=0x25C8 | 0x25CB | 0x25CE..=0x25D1 | 0x25E2..=0x25E5
-        | 0x25EF | 0x2605..=0x2606 | 0x2609 | 0x260E..=0x260F
-        | 0x261C | 0x261E | 0x2640 | 0x2642 | 0x2660..=0x2661
-        | 0x2663..=0x2665 | 0x2667..=0x266A | 0x266C..=0x266D | 0x266F
-        | 0x269E..=0x269F | 0x26BE..=0x26BF | 0x26C4..=0x26CD
-        | 0x26CF..=0x26E1 | 0x26E3 | 0x26E8..=0x26FF | 0x273D
-        | 0x2757 | 0x2776..=0x277F | 0x2B55..=0x2B59
-        | 0xFFFD
-    )
 }
 
 fn transcode(
@@ -253,132 +203,123 @@ fn transcode(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    // `transcode(source, fromEncoding, toEncoding)` returns either a Buffer or
-    // a numeric `UErrorCode`. `lib/buffer.js` checks `typeof result !== 'number'`
+    // `transcode(source, fromEncoding, toEncoding)` returns either a Buffer or a
+    // numeric `UErrorCode`. `lib/buffer.js` checks `typeof result !== 'number'`
     // and builds the error from `icuErrName` when it got one.
-    let Ok(source) = v8::Local::<v8::ArrayBufferView>::try_from(args.get(0)) else {
-        rv.set(v8::Integer::new(scope, U_INVALID_CHAR_FOUND).into());
+    let Some(source) = view_bytes(args.get(0)) else {
+        rv.set(v8::Integer::new(scope, ffi::U_ILLEGAL_ARGUMENT_ERROR).into());
         return;
     };
+    // `ParseEncoding` returns its default for a non-string, and the default is
+    // `BUFFER`, which `SupportedEncoding` rejects — so a missing label is the
+    // same `U_ILLEGAL_ARGUMENT_ERROR` as an unknown one.
     let from = args
         .get(1)
         .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope).to_ascii_lowercase())
+        .map(|text| text.to_rust_string_lossy(scope))
         .unwrap_or_default();
     let to = args
         .get(2)
         .to_string(scope)
-        .map(|text| text.to_rust_string_lossy(scope).to_ascii_lowercase())
+        .map(|text| text.to_rust_string_lossy(scope))
         .unwrap_or_default();
 
-    if !SUPPORTED.contains(&from.as_str()) || !SUPPORTED.contains(&to.as_str()) {
-        rv.set(v8::Integer::new(scope, U_INVALID_CHAR_FOUND).into());
-        return;
-    }
-
-    let length = source.byte_length();
-    let mut input = vec![0u8; length];
-    if source.copy_contents(&mut input) != length {
-        rv.set(v8::Integer::new(scope, U_INVALID_CHAR_FOUND).into());
-        return;
-    }
-
-    let decoded = match decode(&input, &from) {
-        Some(text) => text,
-        None => {
-            rv.set(v8::Integer::new(scope, U_INVALID_CHAR_FOUND).into());
-            return;
-        }
-    };
-    let output = encode(&decoded, &to);
-
-    // The result is a Buffer, which `lib/buffer.js` receives through
-    // `internalBinding('buffer')`'s own constructor. Returning a Uint8Array
-    // here is what the JS side accepts, because it only reads `.length` and
-    // `.buffer` off the value before wrapping it.
-    let Ok(array) = v8::Local::<v8::Uint8Array>::try_from(make_uint8_array(scope, &output)) else {
-        rv.set(v8::Integer::new(scope, U_INVALID_CHAR_FOUND).into());
-        return;
-    };
-    rv.set(array.into());
-}
-
-fn make_uint8_array<'s>(
-    scope: &mut v8::PinScope<'s, '_>,
-    bytes: &[u8],
-) -> v8::Local<'s, v8::Value> {
-    let store =
-        v8::ArrayBuffer::new_backing_store_from_boxed_slice(bytes.to_vec().into_boxed_slice());
-    let store: v8::SharedRef<v8::BackingStore> = store.into();
-    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
-    match v8::Uint8Array::new(scope, buffer, 0, bytes.len()) {
-        Some(array) => array.into(),
-        None => v8::undefined(scope).into(),
+    match transcode::transcode(&source, &from, &to) {
+        Ok(bytes) => rv.set(make_buffer(scope, &bytes)),
+        Err(code) => rv.set(v8::Integer::new(scope, code).into()),
     }
 }
 
-fn decode(bytes: &[u8], encoding: &str) -> Option<String> {
-    match encoding {
-        "utf8" => String::from_utf8(bytes.to_vec()).ok(),
-        "utf16le" => {
-            // An odd trailing byte cannot be part of a code unit; ICU reports
-            // the error rather than silently dropping it.
-            if !bytes.len().is_multiple_of(2) {
-                return None;
+fn get_converter(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    // `getConverter(label, flags)`. `lib/internal/encoding.js` passes exactly
+    // two arguments and treats `undefined` as "not supported", so a missing or
+    // unresolvable label leaves the return value unset.
+    let Some(label) = args
+        .get(0)
+        .to_string(scope)
+        .map(|text| text.to_rust_string_lossy(scope))
+    else {
+        return;
+    };
+    let flags = args.get(1).uint32_value(scope).unwrap_or(0);
+    let Some(template) = converter_template(scope) else {
+        return;
+    };
+    if let Some(object) = converter::create(scope, template, &label, flags) {
+        rv.set(object.into());
+    }
+}
+
+fn decode(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    // `decode(handle, input, flags, encoding)`.
+    let Ok(handle) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        throw_with_code(
+            scope,
+            "ERR_INVALID_ARG_TYPE",
+            "The \"handle\" argument must be an instance of Converter",
+        );
+        return;
+    };
+    let Some(input) = view_bytes(args.get(1)) else {
+        throw_with_code(
+            scope,
+            "ERR_INVALID_ARG_TYPE",
+            "The \"input\" argument must be an instance of SharedArrayBuffer, \
+             ArrayBuffer or ArrayBufferView.",
+        );
+        return;
+    };
+    let flags = args.get(2).uint32_value(scope).unwrap_or(0);
+    // The fourth argument is only used to name the encoding in the error, and
+    // Node words it from the JavaScript side's own label. Keeping it out of the
+    // Rust path means the message is produced where the label lives.
+    let encoding = args
+        .get(3)
+        .to_string(scope)
+        .map(|text| text.to_rust_string_lossy(scope))
+        .unwrap_or_default();
+
+    match converter::decode(handle, &input, flags) {
+        Ok(units) => {
+            if let Some(text) = converter::units_to_string(scope, &units) {
+                rv.set(text.into());
             }
-            let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .collect();
-            String::from_utf16(&units).ok()
         }
-        "latin1" => Some(bytes.iter().map(|byte| *byte as char).collect()),
-        "ascii" => Some(
-            bytes
-                .iter()
-                .map(|byte| {
-                    if *byte < 0x80 {
-                        *byte as char
-                    } else {
-                        '\u{fffd}'
-                    }
-                })
-                .collect(),
+        Err(converter::DecodeError::NotAHandle) => throw_with_code(
+            scope,
+            "ERR_INVALID_ARG_TYPE",
+            "The \"handle\" argument must be an instance of Converter",
         ),
-        _ => None,
+        Err(converter::DecodeError::InvalidData) => throw_with_code(
+            scope,
+            "ERR_ENCODING_INVALID_ENCODED_DATA",
+            &format!("The encoded data was not valid for encoding {encoding}"),
+        ),
     }
 }
 
-fn encode(text: &str, encoding: &str) -> Vec<u8> {
-    match encoding {
-        "utf8" => text.as_bytes().to_vec(),
-        "utf16le" => text
-            .encode_utf16()
-            .flat_map(|unit| unit.to_le_bytes())
-            .collect(),
-        "latin1" => text
-            .chars()
-            .map(|character| {
-                if (character as u32) <= 0xff {
-                    character as u32 as u8
-                } else {
-                    // Latin-1 cannot represent this; ICU substitutes.
-                    0x1a
-                }
-            })
-            .collect(),
-        "ascii" => text
-            .chars()
-            .map(|character| {
-                if (character as u32) < 0x80 {
-                    character as u32 as u8
-                } else {
-                    0x1a
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+fn has_converter(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    let Some(label) = args
+        .get(0)
+        .to_string(scope)
+        .map(|text| text.to_rust_string_lossy(scope))
+    else {
+        rv.set(v8::Boolean::new(scope, false).into());
+        return;
+    };
+    rv.set(v8::Boolean::new(scope, converter::has_converter(&label)).into());
 }
 
 fn icu_err_name(
@@ -386,17 +327,108 @@ fn icu_err_name(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    let code = args.get(0).int32_value(scope).unwrap_or(U_ZERO_ERROR);
-    let name = match code {
-        U_ZERO_ERROR => "U_ZERO_ERROR",
-        U_INVALID_CHAR_FOUND => "U_INVALID_CHAR_FOUND",
-        _ => "U_UNKNOWN_ERROR",
-    };
-    if let Some(text) = v8::String::new(scope, name) {
+    // Node's `CHECK(args[0]->IsInt32())` becomes a coercion here: the only
+    // caller is `lib/buffer.js`, which passes the `UErrorCode` number it got
+    // back from `transcode`.
+    let code = args.get(0).int32_value(scope).unwrap_or(ffi::U_ZERO_ERROR);
+    if let Some(text) = v8::String::new(scope, &transcode::error_name(code)) {
         rv.set(text.into());
     }
 }
 
+/// The bytes of an `ArrayBuffer`, `SharedArrayBuffer` or `ArrayBufferView`
+/// argument, or `None` when it is none of those.
+///
+/// `ArrayBufferViewContents` reads a whole buffer for the first two and the
+/// view's own `byteOffset`/`byteLength` for the third. Copying is what Node does
+/// for a shared buffer to avoid tearing, and it is harmless for the others: a
+/// borrowed slice into memory JavaScript can still mutate cannot be held across
+/// a call that might run JavaScript.
+fn view_bytes(value: v8::Local<v8::Value>) -> Option<Vec<u8>> {
+    // A detached buffer reports a zero byte length, so it reads as empty input
+    // rather than as an error.
+    if let Ok(buffer) = v8::Local::<v8::ArrayBuffer>::try_from(value) {
+        return Some(copy_backing_store(
+            &buffer.get_backing_store(),
+            buffer.byte_length(),
+        ));
+    }
+    if let Ok(buffer) = v8::Local::<v8::SharedArrayBuffer>::try_from(value) {
+        return Some(copy_backing_store(
+            &buffer.get_backing_store(),
+            buffer.byte_length(),
+        ));
+    }
+    if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
+        let mut bytes = vec![0u8; view.byte_length()];
+        let copied = view.copy_contents(&mut bytes);
+        bytes.truncate(copied);
+        return Some(bytes);
+    }
+    None
+}
+
+fn copy_backing_store(store: &v8::BackingStore, length: usize) -> Vec<u8> {
+    match store.get(..length) {
+        Some(cells) => cells.iter().map(|cell| cell.get()).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// A `Buffer` over `bytes`.
+///
+/// `Buffer` *is* a `Uint8Array` carrying `Buffer.prototype`, so setting the
+/// prototype is what makes `Buffer.isBuffer` true on the result. Reading the
+/// prototype off the global rather than through `rn-bind-buffer` keeps one
+/// binding out of another's state, which is the choice `udp_wrap` and
+/// `http_parser` also made.
+fn make_buffer<'s>(scope: &mut v8::PinScope<'s, '_>, bytes: &[u8]) -> v8::Local<'s, v8::Value> {
+    let store =
+        v8::ArrayBuffer::new_backing_store_from_boxed_slice(bytes.to_vec().into_boxed_slice());
+    let store: v8::SharedRef<v8::BackingStore> = store.into();
+    let buffer = v8::ArrayBuffer::with_backing_store(scope, &store);
+    let Some(view) = v8::Uint8Array::new(scope, buffer, 0, bytes.len()) else {
+        return v8::undefined(scope).into();
+    };
+    if let Some(prototype) = buffer_prototype(scope) {
+        view.set_prototype(scope, prototype.into());
+    }
+    view.into()
+}
+
+fn buffer_prototype<'s>(scope: &v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+    let global = scope.get_current_context().global(scope);
+    let key = v8::String::new(scope, "Buffer")?;
+    let buffer = global.get(scope, key.into())?;
+    let object = v8::Local::<v8::Object>::try_from(buffer).ok()?;
+    let prototype = v8::String::new(scope, "prototype")?;
+    let value = object.get(scope, prototype.into())?;
+    v8::Local::<v8::Object>::try_from(value).ok()
+}
+
+fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    let text = v8::String::new(scope, message).unwrap_or_else(|| v8::String::empty(scope));
+    let exception = v8::Exception::type_error(scope, text);
+    scope.throw_exception(exception);
+}
+
+/// Throws a `TypeError` carrying `code`, which is the shape
+/// `ERR_ENCODING_INVALID_ENCODED_DATA` and `ERR_INVALID_ARG_TYPE` have once
+/// Node's error machinery has built them.
+fn throw_with_code(scope: &mut v8::PinScope<'_, '_>, code: &str, message: &str) {
+    let text = v8::String::new(scope, message).unwrap_or_else(|| v8::String::empty(scope));
+    let exception = v8::Exception::type_error(scope, text);
+    if let (Ok(object), Some(code_key), Some(code_value)) = (
+        v8::Local::<v8::Object>::try_from(exception),
+        v8::String::new(scope, "code"),
+        v8::String::new(scope, code),
+    ) {
+        object.set(scope, code_key.into(), code_value.into());
+    }
+    scope.throw_exception(exception);
+}
+
+/// `rn_core::named_method`, which is `SetMethod` complete: name and length 0.
 fn function<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
@@ -421,75 +453,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ascii_text_is_one_column_per_character() {
-        assert_eq!(string_width("hello", false, true), 5);
-        assert_eq!(string_width("", false, true), 0);
-    }
-
-    #[test]
-    fn cjk_characters_are_two_columns() {
-        // East Asian Wide: the table must say two, not one.
-        assert_eq!(string_width("中", false, true), 2);
-        assert_eq!(string_width("日本", false, true), 4);
-    }
-
-    #[test]
-    fn combining_marks_add_no_width() {
-        // "e" + COMBINING ACUTE ACCENT renders as one column.
-        assert_eq!(string_width("e\u{301}", false, true), 1);
-    }
-
-    #[test]
-    fn control_characters_are_zero_columns() {
-        assert_eq!(string_width("\u{0}", false, true), 0);
-        assert_eq!(string_width("\u{7f}", false, true), 0);
-    }
-
-    #[test]
-    fn the_soft_hyphen_is_the_documented_exception() {
-        // It is a format character but still occupies a column.
-        assert_eq!(string_width("\u{ad}", false, true), 1);
-    }
-
-    #[test]
-    fn an_emoji_sequence_counts_as_one_glyph_unless_expanded() {
-        // A family emoji joined by ZWJ: collapsed by default, counted per code
-        // point when the caller asks for expansion.
-        let family = "\u{1F468}\u{200d}\u{1F469}\u{200d}\u{1F467}";
-        let collapsed = string_width(family, false, false);
-        let expanded = string_width(family, false, true);
-        assert!(
-            collapsed < expanded,
-            "collapsing a ZWJ sequence must count fewer columns: {collapsed} vs {expanded}"
-        );
-        assert_eq!(expanded, 6, "three emoji, two columns each");
-    }
-
-    #[test]
-    fn transcoding_round_trips_between_the_supported_encodings() {
-        let text = "héllo";
-        for encoding in SUPPORTED {
-            let bytes = encode(text, encoding);
-            let decoded = decode(&bytes, encoding).expect("decodes");
-            if *encoding == "ascii" {
-                // ASCII cannot carry é; the substitution is documented.
-                assert!(decoded.starts_with("h"));
-                continue;
-            }
-            assert_eq!(decoded, text, "round trip through {encoding}");
+    fn every_contract_member_is_installed_and_none_is_deferred() {
+        // `contracts/icu.json` records six members. Node publishes all six from
+        // `CreatePerIsolateProperties`, and this build now does too.
+        assert_eq!(MEMBERS.len(), 6);
+        for member in [
+            "decode",
+            "getConverter",
+            "getStringWidth",
+            "hasConverter",
+            "icuErrName",
+            "transcode",
+        ] {
+            assert!(MEMBERS.contains(&member), "{member} must be installed");
         }
+        assert!(DEFERRED.is_empty(), "nothing is deferred");
     }
 
     #[test]
-    fn invalid_utf8_is_an_error_rather_than_a_substitution() {
-        // ICU reports U_INVALID_CHAR_FOUND; silently replacing the bytes would
-        // hide the caller's bug.
-        assert!(decode(&[0xff, 0xfe], "utf8").is_none());
-    }
-
-    #[test]
-    fn an_odd_length_utf16_input_is_an_error() {
-        assert!(decode(&[0x68], "utf16le").is_none());
-        assert!(decode(&[0x68, 0x00], "utf16le").is_some());
+    fn error_names_come_from_icu() {
+        // The old table knew two codes and called everything else
+        // U_UNKNOWN_ERROR; `lib/buffer.js` puts this name in the thrown error's
+        // message, so an unknown code was a misleading message rather than a
+        // missing one.
+        assert_eq!(transcode::error_name(0), "U_ZERO_ERROR");
+        assert_eq!(
+            transcode::error_name(ffi::U_ILLEGAL_ARGUMENT_ERROR),
+            "U_ILLEGAL_ARGUMENT_ERROR"
+        );
+        // `u_errorName`'s answer for an unassigned code is ICU's own
+        // "[BOGUS UErrorCode]", which is what the C++ passes straight through.
+        assert_eq!(transcode::error_name(0x1010), "[BOGUS UErrorCode]");
     }
 }
