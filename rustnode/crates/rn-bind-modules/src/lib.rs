@@ -59,15 +59,16 @@ pub use install::{Modules, DEFERRED, MEMBERS};
 
 /// V8 version this runtime is **linked against**, as the engine itself reports it.
 ///
-/// This is not a constant because a constant was wrong: it said `"15.6.75"`,
-/// which is the version Node's pin names, while the linked engine reports
-/// `15.2.124.1-rusty`. Its only consumer is the compile cache's version tag, and
-/// that tag exists to stop two runtimes with different engines sharing a cache
-/// directory — so a value transcribed from a different engine defeats the
+/// Read from V8 rather than restated, so the value cannot drift from the engine
+/// it describes. Its consumer is the compile cache's version tag, and that tag
+/// exists to stop two runtimes with different engines sharing a cache directory
+/// — a value transcribed from a different engine would defeat exactly the
 /// property it is there to provide.
 ///
-/// Read from V8 rather than restated, the way `HEAP_SPACES` now comes from the
-/// isolate instead of a table.
+/// Until this runtime moved to a V8 15.6.75 build the constant here said
+/// `"15.6.75"` while the linked engine was 15.2.124.1, which is why it is now a
+/// call into V8. The linked engine and the pin now agree; deriving the value is
+/// still what keeps that true the next time they do not.
 pub fn v8_version() -> &'static str {
     rn_v8_sys::v8::V8::get_version()
 }

@@ -1582,9 +1582,9 @@ mod cache_tag_tests {
     /// The tag must come from V8, not from a transcribed version string.
     ///
     /// The constant it replaced said `"15.6.75"` — the version Node's pin names —
-    /// while the linked engine reports `15.2.124.1-rusty`. A tag is supposed to
-    /// keep two engines' caches apart, so a value naming neither engine defeats
-    /// the property it exists for.
+    /// while the linked engine then reported `15.2.124.1-rusty`. A tag is
+    /// supposed to keep two engines' caches apart, so a value naming neither
+    /// engine defeats the property it exists for.
     #[test]
     fn the_cache_tag_is_v8s_own_and_not_the_transcribed_hash() {
         let tag = v8_cache_tag();
@@ -1602,18 +1602,21 @@ mod cache_tag_tests {
         );
     }
 
-    /// The linked engine is not the pin's engine, which is why the constant was
-    /// wrong. This fails if that ever stops being true, so the reasoning above
-    /// does not quietly go stale.
+    /// The linked engine is the pinned one, which is what the engine move was
+    /// for. Before it, this test asserted the opposite: the engine was 15.2.x
+    /// while `tools/node-pin.toml` named 15.6.75, and that mismatch was the
+    /// reason the cache tag could not be a transcribed string.
+    ///
+    /// Kept as an assertion rather than deleted so a future dependency change
+    /// that regresses the engine is caught here instead of silently
+    /// reintroducing the skew.
     #[test]
-    fn the_linked_engine_is_not_the_pinned_one() {
+    fn the_linked_engine_is_the_pinned_one() {
         let linked = crate::v8_version();
         assert!(!linked.is_empty(), "V8 reports a version string");
-        assert_ne!(
-            linked, "15.6.75",
-            "if the linked engine ever matches the pin, revisit whether deriving \
-             the tag from a string is acceptable again; when this constant was \
-             written the engine was 15.2.x against a 15.6 pin"
+        assert!(
+            linked.starts_with("15.6."),
+            "the linked engine must be the pinned 15.6.x, got {linked}"
         );
     }
 }

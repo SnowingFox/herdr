@@ -344,6 +344,12 @@ fn the_stream_is_a_real_snapshot_document() {
         assert!(report["chunks"].as_u64().unwrap_or(0) > 1);
 
         // The sections a `.heapsnapshot` must have for DevTools to load it.
+        //
+        // V8 15.6 added the three scope sections (`scopes`, `scope_uses`,
+        // `scope_context_vars`) alongside `samples`; 15.2 wrote only the eight
+        // below without them. The list stays exact rather than a subset check so
+        // an unexpected section still fails here — it is the document's whole
+        // top-level shape, which is what DevTools reads.
         let mut keys: Vec<&str> = document
             .as_object()
             .expect("the document is an object")
@@ -358,6 +364,9 @@ fn the_stream_is_a_real_snapshot_document() {
                 "locations",
                 "nodes",
                 "samples",
+                "scope_context_vars",
+                "scope_uses",
+                "scopes",
                 "snapshot",
                 "strings",
                 "trace_function_infos",
