@@ -56,10 +56,17 @@ self_test=0
 # profile, and one per fingerprint change — so the newest `libssl.a` is the one
 # this build actually linked. Picking the first match would compare against a
 # stale library and still report a verdict.
+#
+# The target directory is `CARGO_TARGET_DIR` when set, `target` otherwise, the way
+# Cargo resolves it. Reading only `target/` made this step depend on that variable
+# being unset: with it pointing elsewhere the loop found nothing and reported "no
+# vendored OpenSSL build under target/" while looking in a directory the build
+# never used. `tools/audit-ffi-types.py` had the same defect.
+target_dir="${CARGO_TARGET_DIR:-target}"
 libdir=""
 newest=0
-for candidate in target/debug/build/openssl-sys-*/out/openssl-build/install/lib \
-                 target/release/build/openssl-sys-*/out/openssl-build/install/lib; do
+for candidate in "$target_dir"/debug/build/openssl-sys-*/out/openssl-build/install/lib \
+                 "$target_dir"/release/build/openssl-sys-*/out/openssl-build/install/lib; do
   [ -f "$candidate/libssl.a" ] || continue
   stamp="$(stat -c %Y "$candidate/libssl.a" 2>/dev/null || echo 0)"
   if [ "$stamp" -gt "$newest" ]; then
@@ -68,7 +75,7 @@ for candidate in target/debug/build/openssl-sys-*/out/openssl-build/install/lib 
   fi
 done
 if [ -z "$libdir" ]; then
-  echo "link-control: no vendored OpenSSL build under target/; run cargo build first" >&2
+  echo "link-control: no vendored OpenSSL build under $target_dir/; run cargo build first" >&2
   exit 1
 fi
 includedir="$(cd "$libdir/../include" && pwd)"
