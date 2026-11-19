@@ -1166,12 +1166,12 @@ fn main() {
 fn install_embedder_graph(isolate: &mut v8::Isolate) {
     let registered = unsafe {
         rn_v8_sys::register_embedder_graph(
-            &isolate,
+            isolate,
             rn_v8_sys::EmbedderGraphCallback::new(
                 // SAFETY: `isolate` is the caller's live isolate, and the
                 // registration lives no longer than it does. The enclosing
                 // `unsafe` block already covers this call.
-                rn_v8_sys::v8::Isolate::as_raw_isolate_ptr(&isolate),
+                rn_v8_sys::v8::Isolate::as_raw_isolate_ptr(isolate),
                 |graph| {
                     rn_bind_messaging::add_embedder_nodes(&graph);
                     rn_core::heap_retainers::add_embedder_nodes(&graph);
