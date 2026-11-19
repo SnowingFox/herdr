@@ -174,6 +174,7 @@ pub mod encoding;
 pub mod engine;
 pub mod enumerate;
 pub mod install;
+pub mod job_async;
 pub mod jobs;
 pub mod kdf;
 pub mod random_jobs;

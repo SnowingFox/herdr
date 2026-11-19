@@ -16,6 +16,10 @@ rn-errors.workspace = true
 # delivered to `oncomplete` as the error object, which is what
 # `SET_INSUFFICIENT_PERMISSION_ERROR_CALLBACK` does.
 rn-permission = { path = "../rn-permission" }
+# `ChannelWrap` and the three request wraps are `AsyncWrap` subclasses, so their
+# constructors have to emit `init` through the same id counter and hook table
+# every other resource uses.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 libc.workspace = true
 
 [dev-dependencies]

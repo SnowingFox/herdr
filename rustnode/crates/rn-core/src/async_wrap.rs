@@ -95,8 +95,22 @@ pub const PROVIDER_SHUTDOWNWRAP: u32 = 36;
 pub const PROVIDER_SIGNALWRAP: u32 = 37;
 /// `PROVIDER_RANDOMBYTESREQUEST`: one `crypto.randomBytes` job.
 pub const PROVIDER_RANDOMBYTESREQUEST: u32 = 64;
+/// `PROVIDER_RANDOMPRIMEREQUEST`: one `crypto.generatePrime` job.
+pub const PROVIDER_RANDOMPRIMEREQUEST: u32 = 65;
+/// `PROVIDER_CHECKPRIMEREQUEST`: one `crypto.checkPrime` job.
+pub const PROVIDER_CHECKPRIMEREQUEST: u32 = 55;
+/// `PROVIDER_ARGON2REQUEST`: one `crypto.argon2` job.
+pub const PROVIDER_ARGON2REQUEST: u32 = 60;
 /// `PROVIDER_PBKDF2REQUEST`: one `crypto.pbkdf2` job.
 pub const PROVIDER_PBKDF2REQUEST: u32 = 56;
+/// `PROVIDER_SCRYPTREQUEST`: one `crypto.scrypt` job.
+pub const PROVIDER_SCRYPTREQUEST: u32 = 66;
+/// `PROVIDER_HKDFREQUEST`: one `crypto.hkdf` job.
+///
+/// Node has no `HKDFREQUEST` provider: `HKDFJob` reports `DERIVEBITSREQUEST`,
+/// because `node_hkdf` derives through `DeriveBitsJob`. The constant is named
+/// for the JavaScript class so a reader is not misled about which job it is.
+pub const PROVIDER_HKDFREQUEST: u32 = 62;
 /// `PROVIDER_HTTPCLIENTREQUEST`: the parser behind a client request.
 pub const PROVIDER_HTTPCLIENTREQUEST: u32 = 19;
 /// `PROVIDER_HTTPINCOMINGMESSAGE`: the connection a server parses.

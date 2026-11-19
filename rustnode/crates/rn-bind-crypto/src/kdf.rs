@@ -270,6 +270,7 @@ pub(crate) fn pbkdf2_constructor<'s>(
             digest,
         },
     );
+    crate::job_async::begin(scope, this, rn_core::async_wrap::PROVIDER_PBKDF2REQUEST);
     rv.set(this.into());
 }
 
@@ -313,6 +314,7 @@ pub(crate) fn scrypt_constructor<'s>(
             keylen,
         },
     );
+    crate::job_async::begin(scope, this, rn_core::async_wrap::PROVIDER_SCRYPTREQUEST);
     rv.set(this.into());
 }
 
@@ -383,6 +385,7 @@ pub(crate) fn hkdf_constructor<'s>(
             length,
         },
     );
+    crate::job_async::begin(scope, this, rn_core::async_wrap::PROVIDER_HKDFREQUEST);
     rv.set(this.into());
 }
 
@@ -471,8 +474,36 @@ pub(crate) fn run(
             v8::undefined(scope).into(),
         ),
     };
+    // `CryptoJob::AfterThreadPoolWork` delivers through `ptr->MakeCallback`,
+    // which pushes the job's own context and emits `before`/`after` around the
+    // call. `ondone` is where `crypto.pbkdf2`'s user callback runs, so without
+    // this the job's `init` has no matching `before`.
+    let callback = v8::Global::new(scope.as_ref(), callback);
     let receiver: v8::Local<v8::Value> = this.into();
-    callback.call(scope, receiver, &[first, second]);
+    let receiver = v8::Global::new(scope.as_ref(), receiver);
+    let first = v8::Global::new(scope.as_ref(), first);
+    let second = v8::Global::new(scope.as_ref(), second);
+    let call = |scoped: &mut v8::PinScope<'_, '_>| {
+        let callback: v8::Local<v8::Function> = v8::Local::new(scoped, &callback);
+        let receiver = v8::Local::new(scoped, &receiver);
+        let first = v8::Local::new(scoped, &first);
+        let second = v8::Local::new(scoped, &second);
+        let _ = callback.call(scoped, receiver, &[first, second]);
+    };
+    if crate::job_async::in_job_scope(scope, this, call).is_none() {
+        let caught = {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+            let inner = &mut try_catch.init();
+            call(inner);
+            inner
+                .exception()
+                .map(|exception| v8::Global::new(inner, exception))
+        };
+        if let Some(caught) = caught {
+            let exception = v8::Local::new(&*scope, &caught);
+            rn_errors::report_uncaught_exception(scope, exception);
+        }
+    }
 }
 
 /// Builds the JavaScript error object a [`CryptoError`] corresponds to, without
@@ -549,7 +580,8 @@ pub(crate) fn install_job_class<'s>(
     let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
-        .set_internal_field_count(1);
+        // Field 0 is the job state; field 1 is the `AsyncWrap` identity.
+        .set_internal_field_count(crate::job_async::JOB_FIELDS as usize);
     let prototype = template.prototype_template(scope);
     let Some(key) = v8::String::new(scope, "run") else {
         return Err(format!("cannot allocate {name}.run"));

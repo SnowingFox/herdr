@@ -78,6 +78,10 @@ enum RootedQuery {
 struct Delivery {
     request: v8::Global<v8::Object>,
     payload: Rooted,
+    /// The request wrap's `AsyncWrap` identity, when its constructor recorded
+    /// one. `oncomplete` runs through `MakeCallback`, so the ids are what make
+    /// the request's `init` carry a matching `before`/`after`.
+    context: Option<rn_core::callback_scope::AsyncContext>,
 }
 
 /// Roots a payload while the producing scope is still alive.
@@ -114,8 +118,18 @@ pub(crate) fn deliver<'s>(
 ) {
     let request = v8::Global::new(scope.as_ref(), request);
     let payload = root(scope, payload);
+    // `MakeCallback(env->oncomplete_string(), ...)` on a `ReqWrap`: the request's
+    // own async context is pushed for the duration of the handler, and
+    // `EmitDestroy` follows it. The state is read from the object the
+    // constructor tagged; a request built outside the binding has none, and then
+    // the handler runs unscoped exactly as before.
+    let context = request_wrap_context(scope, &request);
 
-    let boxed = Box::new(Delivery { request, payload });
+    let boxed = Box::new(Delivery {
+        request,
+        payload,
+        context,
+    });
     let pointer = Box::into_raw(boxed);
     let external = v8::External::new(scope, pointer.cast());
     let template = rn_core::class(trampoline)
@@ -213,18 +227,76 @@ fn trampoline(
     // `try` is gone. Node's `MakeCallback` catches it and routes it through
     // `TriggerUncaughtException`; letting V8 report it alone leaves the process
     // exiting 0 after a fatal error.
-    let caught = {
-        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
-        let inner = &mut try_catch.init();
-        let _ = handler.call(inner, receiver, &arguments);
-        inner
-            .exception()
-            .map(|exception| v8::Global::new(inner, exception))
+    let handler = v8::Global::new(scope.as_ref(), handler);
+    let receiver = v8::Global::new(scope.as_ref(), receiver);
+    let rooted: Vec<v8::Global<v8::Value>> = arguments
+        .iter()
+        .map(|argument| v8::Global::new(scope.as_ref(), *argument))
+        .collect();
+
+    // The `AsyncWrap::MakeCallback` shape: push the request's context, emit
+    // `before`, call, emit `after`, pop. `with_scope` does exactly that and
+    // reports an uncaught throw through `process._fatalException`, so there is
+    // no second copy of that ordering here.
+    let call = |scoped: &mut v8::PinScope<'_, '_>| {
+        let handler: v8::Local<v8::Function> = v8::Local::new(scoped, &handler);
+        let receiver = v8::Local::new(scoped, &receiver);
+        let arguments: Vec<v8::Local<v8::Value>> = rooted
+            .iter()
+            .map(|argument| v8::Local::new(scoped, argument))
+            .collect();
+        let _ = handler.call(scoped, receiver, &arguments);
     };
-    if let Some(caught) = caught {
-        let exception = v8::Local::new(scope, &caught);
-        rn_errors::report_uncaught_exception(scope, exception);
+    match delivery.context {
+        Some(context) => {
+            let _ = rn_core::callback_scope::with_scope(
+                scope,
+                rn_core::callback_scope::ScopeArgs {
+                    context,
+                    resource: Some(v8::Global::new(scope.as_ref(), request)),
+                    frame: None,
+                },
+                call,
+            );
+            // `ReqWrap::~ReqWrap` queues the destroy as the request is released.
+            rn_bind_async_wrap::emit_destroy(context.async_id);
+        }
+        None => {
+            let caught = {
+                let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+                let inner = &mut try_catch.init();
+                call(inner);
+                inner
+                    .exception()
+                    .map(|exception| v8::Global::new(inner, exception))
+            };
+            if let Some(caught) = caught {
+                let exception = v8::Local::new(&*scope, &caught);
+                rn_errors::report_uncaught_exception(scope, exception);
+            }
+        }
     }
+}
+
+/// Reads the async identity a request wrap's constructor recorded.
+///
+/// All three request wraps store it in the same internal field, so the provider
+/// is resolved from whichever of the three names the field carries.
+fn request_wrap_context(
+    scope: &mut v8::PinScope<'_, '_>,
+    request: &v8::Global<v8::Object>,
+) -> Option<rn_core::callback_scope::AsyncContext> {
+    let object = v8::Local::new(scope, request);
+    for provider in [
+        rn_core::async_wrap::PROVIDER_GETADDRINFOREQWRAP,
+        rn_core::async_wrap::PROVIDER_GETNAMEINFOREQWRAP,
+        rn_core::async_wrap::PROVIDER_QUERYWRAP,
+    ] {
+        if let Some(state) = crate::async_ids::state_of(object, provider) {
+            return Some(rn_core::callback_scope::AsyncContext::from(state));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
