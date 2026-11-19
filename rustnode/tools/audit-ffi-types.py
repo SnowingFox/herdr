@@ -464,8 +464,28 @@ def rust_extern_decls():
                            fm.group(2), fm.group(3), (fm.group(4) or "()").strip())
 
 
+def cargo_target_dir():
+    """The directory Cargo actually built into.
+
+    `CARGO_TARGET_DIR` wins over a workspace-local `target/`, and honouring only
+    the latter made the gate depend on that variable being *unset*: with the
+    variable pointing anywhere else, the audit found no tree, exited non-zero, and
+    failed the gate for a reason unrelated to the declarations it checks. It also
+    made the honest workaround — a `target` symlink — something each person had to
+    rediscover.
+
+    Resolution follows Cargo: `CARGO_TARGET_DIR` if set (relative paths resolve
+    against the current directory, as Cargo does), otherwise `target/` beside the
+    workspace manifest.
+    """
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    if configured:
+        return configured
+    return "target"
+
+
 def find_include_dir():
-    """The newest `openssl-src` install tree under `target/`.
+    """The newest `openssl-src` install tree under the Cargo target directory.
 
     Several `openssl-sys-<hash>` build directories can exist at once, one per
     profile and one per fingerprint change. The newest `libssl.a` is the one this
@@ -474,15 +494,17 @@ def find_include_dir():
     and still report a verdict.
     """
     newest, found = 0, None
-    for pattern in ("target/*/build/openssl-sys-*/out/openssl-build/install",):
-        for candidate in glob.glob(pattern):
-            lib = os.path.join(candidate, "lib", "libssl.a")
-            header = os.path.join(candidate, "include", "openssl", "ssl.h")
-            if not (os.path.isfile(lib) and os.path.isfile(header)):
-                continue
-            stamp = os.stat(lib).st_mtime
-            if stamp > newest:
-                newest, found = stamp, os.path.join(candidate, "include")
+    target = cargo_target_dir()
+    pattern = os.path.join(target, "*", "build", "openssl-sys-*", "out",
+                           "openssl-build", "install")
+    for candidate in glob.glob(pattern):
+        lib = os.path.join(candidate, "lib", "libssl.a")
+        header = os.path.join(candidate, "include", "openssl", "ssl.h")
+        if not (os.path.isfile(lib) and os.path.isfile(header)):
+            continue
+        stamp = os.stat(lib).st_mtime
+        if stamp > newest:
+            newest, found = stamp, os.path.join(candidate, "include")
     return found
 
 
@@ -601,8 +623,11 @@ def main():
     if "--self-test" in sys.argv:
         include_dir = find_include_dir()
         if not include_dir:
-            sys.exit("audit: no vendored OpenSSL install tree under target/; "
-                     "run cargo build before the self-test")
+            # Name the directory actually searched, not a fixed `target/`: with
+            # `CARGO_TARGET_DIR` set those differ, and saying "under target/" told
+            # the reader to check a directory the audit never looked at.
+            sys.exit(f"audit: no vendored OpenSSL install tree under "
+                     f"{cargo_target_dir()}/; run cargo build before the self-test")
         return self_test(include_dir)
 
     include_dir = sys.argv[1] if len(sys.argv) > 1 else find_include_dir()
