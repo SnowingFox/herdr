@@ -103,7 +103,12 @@ pub struct ContextifyContext {
     pub allow_code_gen_wasm: bool,
     /// The explicit microtask queue when `microtaskMode: 'afterEvaluate'` asked
     /// for one, kept alive for the context's lifetime.
-    pub microtask_queue: Option<v8::MicrotaskQueueHandle>,
+    ///
+    /// Behind an `Rc` so [`microtask_queue_for`] can hand a clone out before
+    /// releasing the `CONTEXTS` borrow. The checkpoint runs user microtasks,
+    /// and one of those can call `vm.createContext`, which needs `&mut` on the
+    /// same map — holding the borrow across the drain would abort.
+    pub microtask_queue: Option<std::rc::Rc<v8::MicrotaskQueueHandle>>,
 }
 
 impl std::fmt::Debug for ContextifyContext {
@@ -217,10 +222,10 @@ pub fn make_context<'s>(
     // An explicit microtask queue is what `microtaskMode: 'afterEvaluate'` asks
     // for: microtasks run only when `vm` says so, not at the end of every turn.
     let microtask_queue = if own_microtask_queue {
-        Some(v8::MicrotaskQueue::new(
+        Some(std::rc::Rc::new(v8::MicrotaskQueue::new(
             scope,
             v8::MicrotasksPolicy::Explicit,
-        ))
+        )))
     } else {
         None
     };
@@ -852,6 +857,24 @@ fn run_in_context<'s>(
     run_script(scope, script, context, timeout, display_errors, &mut rv);
 }
 
+/// The explicit microtask queue attached to a realm, if it has one.
+///
+/// Returns a clone of the handle rather than a borrow: the checkpoint it is
+/// used for runs user microtasks, which can re-enter the `CONTEXTS` map through
+/// `vm.createContext`, so the map must not stay borrowed across the drain.
+fn microtask_queue_for<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    context: v8::Local<'s, v8::Context>,
+) -> Option<std::rc::Rc<v8::MicrotaskQueueHandle>> {
+    let id = i32::from(context.global(scope).get_identity_hash()) as u64;
+    CONTEXTS.with(|contexts| {
+        contexts
+            .borrow()
+            .get(&id)
+            .and_then(|entry| entry.microtask_queue.clone())
+    })
+}
+
 /// Runs `script` in `context`, or the current realm when `context` is `None`.
 ///
 /// A positive `timeout` needs V8's watchdog: `TerminateExecution` has to be
@@ -894,6 +917,17 @@ fn run_script<'s>(
                 script.bind_to_current_context(scope).run(scope)
             }
         };
+        // Node's `EvalMachine` (`src/node_contextify.cc:1291`) runs the
+        // checkpoint only when the body produced a value, so a body that threw
+        // or was terminated never runs the microtasks it queued. The checkpoint
+        // runs with the watchdog still armed, so a microtask that outlives the
+        // deadline terminates the isolate and is reported as this call's
+        // timeout — `timed_out` is sampled after it, not before.
+        if result.is_some() {
+            if let Some(queue) = context.and_then(|context| microtask_queue_for(scope, context)) {
+                queue.perform_checkpoint(scope.as_mut());
+            }
+        }
         let timed_out = watchdog
             .as_ref()
             .is_some_and(rn_core::watchdog::Watchdog::fired);

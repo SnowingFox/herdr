@@ -527,6 +527,66 @@ fn contextifying_the_same_sandbox_twice_is_refused() {
 }
 
 #[test]
+fn an_after_evaluate_microtask_runs_after_the_script_body() {
+    // `microtaskMode: 'afterEvaluate'` gives the realm an explicit microtask
+    // queue, so the body's `.then` is queued rather than drained inline, and
+    // `runInContext` drains it after the body returns. Without the checkpoint
+    // the microtask never ran at all and `out` stayed at its seed value.
+    let result = run(r#"
+        const sandbox = { out: '?' };
+        contextify.makeContext(
+          sandbox, 'ctx', undefined, true, true, true, Symbol('host'));
+        const script = new contextify.ContextifyScript(
+          'Promise.resolve().then(() => { globalThis.out = "ran"; }); 42',
+          'after.js', 0, 0, undefined, false, sandbox, Symbol('host'));
+        const ran = script.runInContext(sandbox, -1, false, false, false);
+        __out = JSON.stringify({ ran, out: sandbox.out });
+        "#);
+    assert_eq!(result, r#"{"ran":42,"out":"ran"}"#);
+}
+
+#[test]
+fn a_thrown_body_does_not_drain_the_after_evaluate_queue() {
+    // Node's `EvalMachine` runs the checkpoint only when the body produced a
+    // value (`src/node_contextify.cc`). A body that threw must leave its queued
+    // microtask pending, so the sandbox stays untouched.
+    let result = run(r#"
+        const sandbox = { out: 'not-run' };
+        contextify.makeContext(
+          sandbox, 'ctx', undefined, true, true, true, Symbol('host'));
+        const script = new contextify.ContextifyScript(
+          'Promise.resolve().then(() => { globalThis.out = "ran"; }); throw new Error("body");',
+          'threw.js', 0, 0, undefined, false, sandbox, Symbol('host'));
+        let caught;
+        try { script.runInContext(sandbox, -1, false, false, false); }
+        catch (error) { caught = error.message; }
+        __out = JSON.stringify({ caught, out: sandbox.out });
+        "#);
+    assert_eq!(result, r#"{"caught":"body","out":"not-run"}"#);
+}
+
+#[test]
+fn the_drain_survives_a_microtask_that_contextifies_a_new_sandbox() {
+    // The checkpoint runs user code, and that code can reach `makeContext`,
+    // which needs a mutable borrow of the same registry the queue was read
+    // from. Holding that borrow across the drain would abort the process.
+    let result = run(r#"
+        const sandbox = { makeContext: contextify.makeContext, out: '?' };
+        contextify.makeContext(
+          sandbox, 'ctx', undefined, true, true, true, Symbol('host'));
+        const script = new contextify.ContextifyScript(
+          'Promise.resolve().then(() => {' +
+          '  makeContext({}, "nested", undefined, true, true, false, Symbol("h"));' +
+          '  globalThis.out = "ok";' +
+          '});',
+          'reentrant.js', 0, 0, undefined, false, sandbox, Symbol('host'));
+        script.runInContext(sandbox, -1, false, false, false);
+        __out = sandbox.out;
+        "#);
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn run_interruptible_returns_false_for_a_normal_call() {
     // `lib/internal/repl/inspector.js` treats `true` as "the user pressed Ctrl+C",
     // so an ordinary call must report `false`.
