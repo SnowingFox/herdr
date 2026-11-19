@@ -1,4 +1,5 @@
 mod args;
+mod config_file;
 mod diagnostics;
 mod snapshot;
 
@@ -86,12 +87,18 @@ fn main() {
                 eprintln!("{}: {message}", args::program_name());
                 terminate(9);
             }
-            // A bad `--env-file` is one line per file, each with the same
-            // `<program>: <message>` shape, because Node pushes each into its
-            // error vector and `StartInternal` prints them in a loop.
-            args::ParseError::EnvFile(messages) => {
+            // The two file sources, whose messages Node collects into one vector
+            // and `StartInternal` prints in a loop — but only the config reader
+            // also writes a line of its own, with no program name. That line has
+            // to reach stderr first and verbatim, so it is written here with
+            // `eprint!` (it already carries its newlines) before the prefixed
+            // messages.
+            args::ParseError::Startup(startup) => {
+                for diagnostic in &startup.diagnostics {
+                    eprint!("{diagnostic}");
+                }
                 let program = args::program_name();
-                for message in messages {
+                for message in &startup.messages {
                     eprintln!("{program}: {message}");
                 }
                 terminate(9);

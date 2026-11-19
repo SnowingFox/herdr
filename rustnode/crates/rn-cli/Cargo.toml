@@ -71,6 +71,12 @@ rn-napi = { path = "../rn-napi" }
 # version string in two places.
 rn-bind-zlib = { path = "../rn-bind-zlib" }
 rn-v8-sys = { path = "../rn-v8-sys" }
+# `--config-file` is parsed and validated for JSON-object shape before it is
+# accepted, which is the same crate `lib/internal/**` already uses for its own
+# JSON work in this workspace. A hand-written JSON reader would be a second
+# interpretation of the format, and the one Node ships (`simdjson`) is not
+# vendored here.
+serde_json.workspace = true
 # `NODE_COMPILE_CACHE` is flushed from an `atexit` handler, which is the one hook
 # `process.reallyExit`'s direct `std::process::exit` also reaches.
 libc.workspace = true
