@@ -356,13 +356,28 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
     /// is the `oncomplete` property.
     fn fs_req_callback(&mut self) -> Result<(), String> {
         let template = rn_core::class(fs_req_callback_ctor).build(self.scope);
+        // `lib/fs.js`'s `bindSignalToReq` calls `req.cancel()` when an
+        // `AbortSignal` fires, then invokes the callback itself with an
+        // `AbortError`. Node's `CancelFSReq` cancels the in-flight libuv request;
+        // here the syscall has already run and only the queued completion is
+        // outstanding, so `cancel` marks the request abandoned and the delivery
+        // skips it. Without the method the abort path threw
+        // `req.cancel is not a function` and the callback variant of every
+        // signal-abort test failed while the promise variant passed.
+        let prototype = template.prototype_template(self.scope);
+        if let Some(key) = v8::String::new(self.scope, "cancel") {
+            prototype.set(
+                key.into(),
+                rn_core::method(fs_req_cancel).build(self.scope).into(),
+            );
+        }
         // `SetConstructorFunction` sets the class name from the property name,
         // so `fs.FSReqCallback.name` is `"FSReqCallback"`.
         rn_core::set_class(self.scope, self.object, "FSReqCallback", template)?;
         Ok(())
     }
 
-    /// Defines the two one-shot file job constructors.
+    /// Defines the two one-shot job constructors.
     ///
     /// `lib/fs.js` and `lib/internal/fs/promises.js` construct these
     /// unconditionally for `options.buffer === undefined`, which is every
@@ -415,6 +430,24 @@ impl<'a, 's, 'i> Installer<'a, 's, 'i> {
 }
 
 /// `new FSReqCallback(useBigint)`.
+/// `FSReqCallback.prototype.cancel`.
+///
+/// `lib/fs.js`'s `bindSignalToReq` calls `req.cancel()` when the signal fires and
+/// then invokes the callback itself with an `AbortError`. Node's `CancelFSReq`
+/// cancels the in-flight libuv request; here the syscall has already run and only
+/// the queued completion is outstanding, so this marks the request abandoned and
+/// the delivery returns without calling `oncomplete`.
+fn fs_req_cancel(
+    _scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let request = args.this();
+    if let Some(key) = v8::String::new(_scope, "cancelled") {
+        let _ = request.set(_scope, key.into(), v8::Boolean::new(_scope, true).into());
+    }
+}
+
 fn fs_req_callback_ctor(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments,
