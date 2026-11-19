@@ -18,6 +18,9 @@ rn-permission = { path = "../rn-permission" }
 rn-uv.workspace = true
 tracing.workspace = true
 rn-v8-sys.workspace = true
+# `ProcessWrap` is a `HandleWrap` over `AsyncWrap(..., PROVIDER_PROCESSWRAP)`,
+# so the handle emits `init` and `OnExit` is its `MakeCallback`.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 rn-errors.workspace = true
 
 [target.'cfg(unix)'.dependencies]

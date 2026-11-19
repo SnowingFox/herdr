@@ -1209,6 +1209,7 @@ dependencies = [
 name = "rn-bind-messaging"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-async-wrap",
  "rn-bind-symbols",
  "rn-core",
  "rn-env",
@@ -1307,6 +1308,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libuv-sys2",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-env",
  "rn-errors",
