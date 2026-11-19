@@ -20,6 +20,9 @@ rn-env = { path = "../rn-env" }
 rn-uv.workspace = true
 rn-v8-sys.workspace = true
 rn-errors.workspace = true
+# `MessagePort` is an `AsyncWrap` (`src/node_messaging.cc:667`), so its
+# constructor emits `init` and each delivered message is a `MakeCallback`.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 v8.workspace = true
 
 [dev-dependencies]

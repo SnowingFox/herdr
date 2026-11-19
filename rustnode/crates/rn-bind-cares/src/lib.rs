@@ -28,6 +28,7 @@
 //! the ordering `lib/dns.js` depends on without an event loop. The cost is that a
 //! slow resolver blocks instead of running in the background.
 
+mod async_ids;
 mod channel;
 mod deliver;
 mod errors;

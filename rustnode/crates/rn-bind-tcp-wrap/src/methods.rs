@@ -80,6 +80,15 @@ pub unsafe extern "C" fn after_close(handle_pointer: *mut uv::uv_handle_t) {
             state.context_frame.clone(),
             object,
         );
+        // `HandleWrap::Close` finishes with `AsyncWrap::EmitDestroy`, queued
+        // through the environment's destroy list. Emitting it here is what gives
+        // a socket's `init` its `destroy`; without it `init-hooks.js`'s
+        // `sanityCheck` reports the activity as never destroyed and a test that
+        // waits for one never sees it.
+        let async_id = state.async_wrap.async_id();
+        if async_id > 0.0 {
+            rn_bind_async_wrap::emit_destroy(async_id);
+        }
     });
 }
 

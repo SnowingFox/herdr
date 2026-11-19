@@ -179,6 +179,12 @@ struct Queued<J: Runnable> {
     /// Which shape a completion takes is encoded by which of these two is
     /// `Some`, so there is no separate mode field to disagree with them.
     resolver: Mutex<Option<v8::Global<v8::PromiseResolver>>>,
+    /// The job's `AsyncWrap` identity, so `ondone` runs inside it.
+    ///
+    /// `CryptoJob::AfterThreadPoolWork` delivers through `ptr->MakeCallback`,
+    /// which pushes the job's own context before calling and emits `after` on
+    /// the way out; `None` for a class that never emitted an `init`.
+    async_wrap: Option<JobAsyncWrap>,
 }
 
 impl<J: Runnable> Queued<J> {
@@ -204,12 +210,50 @@ impl<J: Runnable> Queued<J> {
 /// `completion` is the shape the class wants. `Sync` ignores it and always
 /// returns the tuple, because that is the only thing the sync callers
 /// destructure — `lib/**` reads `const { 0: err, 1: value } = job.run()`.
-pub fn dispatch<'s, J: Runnable + 'static>(
+/// `CryptoJob`'s `AsyncWrap` identity, as the dispatch needs it.
+///
+/// `CryptoJob(env, object, type, mode, ...) : AsyncWrap(env, object, type)`
+/// (`src/crypto/crypto_util.h:339-345`), so every job class is an async resource
+/// whose provider comes from the trait — `RANDOMBYTESREQUEST`,
+/// `PBKDF2REQUEST`, `KEYPAIRGENREQUEST` and so on. `AfterThreadPoolWork` then
+/// runs `ptr->MakeCallback(ondone, ...)`, which pushes that resource's context
+/// and emits `before`/`after` around the delivery.
+///
+/// The ids are handed to [`dispatch`] rather than read back from the object
+/// because the job class's internal field is already the job itself, and because
+/// the sync and WebCrypto modes have different completion paths that both need
+/// the same pair.
+#[derive(Clone, Copy)]
+pub struct JobAsyncWrap {
+    /// The `init` id the job's constructor emitted.
+    pub async_id: f64,
+    /// The trigger id that `init` carried.
+    pub trigger_async_id: f64,
+}
+
+impl JobAsyncWrap {
+    /// The `AsyncWrap` context `MakeCallback` pushes.
+    pub fn context(self) -> rn_core::callback_scope::AsyncContext {
+        rn_core::callback_scope::AsyncContext {
+            async_id: self.async_id,
+            trigger_async_id: self.trigger_async_id,
+        }
+    }
+}
+
+/// `dispatch` with the job's async identity, so its completion runs in scope.
+///
+/// The plain [`dispatch`] is for a class that has not emitted an `init`; this is
+/// the one every `AsyncWrap`-derived job uses, and it is what makes
+/// `crypto.randomBytes(n, cb)` report `RANDOMBYTESREQUEST` activity with a
+/// matching `before`/`after`.
+pub fn dispatch_with_async_wrap<'s, J: Runnable + 'static>(
     scope: &mut v8::PinScope<'s, '_>,
     mode: JobMode,
     mut job: J,
     receiver: v8::Local<'s, v8::Object>,
     completion: Completion,
+    async_wrap: Option<JobAsyncWrap>,
 ) -> Option<v8::Local<'s, v8::Value>> {
     if mode == JobMode::Sync {
         let result = job.run();
@@ -237,9 +281,21 @@ pub fn dispatch<'s, J: Runnable + 'static>(
         receiver,
         completion,
         resolver.map(|resolver| v8::Global::new(scope.as_ref(), resolver)),
+        async_wrap,
     );
 
     promise.map(v8::Local::into)
+}
+
+/// `dispatch` for a job with no async identity to report.
+pub fn dispatch<'s, J: Runnable + 'static>(
+    scope: &mut v8::PinScope<'s, '_>,
+    mode: JobMode,
+    job: J,
+    receiver: v8::Local<'s, v8::Object>,
+    completion: Completion,
+) -> Option<v8::Local<'s, v8::Value>> {
+    dispatch_with_async_wrap(scope, mode, job, receiver, completion, None)
 }
 
 /// Queues `job` on libuv's threadpool.
@@ -249,6 +305,7 @@ fn queue<'s, J: Runnable + 'static>(
     receiver: v8::Local<'s, v8::Object>,
     completion: Completion,
     resolver: Option<v8::Global<v8::PromiseResolver>>,
+    async_wrap: Option<JobAsyncWrap>,
 ) {
     // `ondone` and the receiver are rooted now: they belong to this job object
     // and must survive the queue even if JavaScript drops its last reference.
@@ -273,6 +330,7 @@ fn queue<'s, J: Runnable + 'static>(
         ondone: Mutex::new(ondone),
         receiver: Mutex::new(Some(receiver)),
         resolver: Mutex::new(resolver),
+        async_wrap,
     });
     let state = Box::into_raw(state);
 
@@ -419,18 +477,48 @@ unsafe extern "C" fn after_work_trampoline<J: Runnable + 'static>(
     // The completion runs inside `uv_run`, which has no V8 scope and no entered
     // context, so the call has to go through the same primitive the socket
     // bindings use.
+    let async_wrap = state.async_wrap;
     rn_uv::callback::with_context(|scope| {
-        if let Some(resolver) = resolver {
-            match output {
-                Ok(output) => resolve(scope, &resolver, &job, output),
-                Err(error) => reject(scope, &resolver, &error),
+        // `CryptoJob::AfterThreadPoolWork` delivers through `ptr->MakeCallback`,
+        // so the job's own async context is what executes during `ondone` and
+        // its `before`/`after` pair is what a hook observes. `destroy` follows
+        // as the job object is released.
+        let call = |scoped: &mut v8::PinScope<'_, '_>| {
+            if let Some(resolver) = &resolver {
+                match output {
+                    Ok(output) => resolve(scoped, resolver, &job, output),
+                    Err(error) => reject(scoped, resolver, &error),
+                }
+                return;
             }
-            return;
-        }
-        let (Some(ondone), Some(receiver)) = (ondone, receiver) else {
-            return;
+            let (Some(ondone), Some(receiver)) = (ondone.as_ref(), receiver.as_ref()) else {
+                return;
+            };
+            call_ondone(scoped, ondone, receiver, &job, output);
         };
-        call_ondone(scope, &ondone, &receiver, &job, output);
+        match async_wrap {
+            Some(async_wrap) if async_wrap.async_id > 0.0 => {
+                let resource = receiver.as_ref().map(|receiver| {
+                    v8::Global::new(
+                        scope.as_ref(),
+                        v8::Local::<v8::Object>::new(scope, receiver),
+                    )
+                });
+                let _ = rn_core::callback_scope::with_scope(
+                    scope,
+                    rn_core::callback_scope::ScopeArgs {
+                        context: async_wrap.context(),
+                        resource: resource.as_ref(),
+                        frame: None,
+                    },
+                    call,
+                );
+                // `CryptoJob` is released by `unique_ptr` in
+                // `AfterThreadPoolWork`, which queues the destroy.
+                rn_bind_async_wrap::emit_destroy(async_wrap.async_id);
+            }
+            _ => call(scope),
+        }
     });
 }
 

@@ -302,9 +302,34 @@ fn emit_message<'s>(
             .exception()
             .map(|exception| v8::Global::new(inner, exception))
     };
-    if let Some(caught) = caught {
-        let exception = v8::Local::new(&*scope, &caught);
-        rn_errors::report_uncaught_exception(scope, exception);
+    // Both sides of this hunk are load-bearing. `HEAD` reports the caught
+    // exception through `report_uncaught_exception`; the branch puts the call
+    // inside an async scope when the port carries an id, so `executionAsyncId`
+    // inside a `messageerror` listener names the port. Keep the scope and keep
+    // the reporting, inside it.
+    match async_wrap {
+        Some(ids) if ids.async_id > 0.0 => {
+            let _ = rn_core::callback_scope::with_scope(
+                scope,
+                rn_core::callback_scope::ScopeArgs {
+                    context: ids.context(),
+                    resource: Some(&object_resource),
+                    frame: None,
+                },
+                |scoped| {
+                    if let Some(caught) = call(scoped) {
+                        let exception = v8::Local::new(&*scoped, &caught);
+                        rn_errors::report_uncaught_exception(scoped, exception);
+                    }
+                },
+            );
+        }
+        _ => {
+            if let Some(caught) = call(scope) {
+                let exception = v8::Local::new(&*scope, &caught);
+                rn_errors::report_uncaught_exception(scope, exception);
+            }
+        }
     }
 }
 

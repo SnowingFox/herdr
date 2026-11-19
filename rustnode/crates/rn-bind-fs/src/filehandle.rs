@@ -60,6 +60,9 @@ pub struct HandleState {
     descriptor: Cell<i32>,
     /// `AsyncWrap`'s id for this resource, stable across calls.
     async_id: f64,
+    /// `AsyncWrap`'s trigger id, so a read completion can push the handle's
+    /// context.
+    trigger_async_id: f64,
     /// The `StreamBase` half, boxed so its address is stable.
     ///
     /// `StreamBase::AddMethods` makes `FileHandle` a stream, which is what lets
@@ -287,8 +290,12 @@ fn new_handle(
     let state = Box::new(HandleState {
         descriptor: Cell::new(fd),
         // A fresh id per handle: an async id identifies the resource, so two
-        // FileHandles must not share one.
+        // FileHandles must not share one. `FileHandle::New` reaches the counter
+        // through `AsyncWrap(env, obj, PROVIDER_FILEHANDLE)`, which emits `init`
+        // in the same breath, so the emit is here rather than a bare counter
+        // bump.
         async_id: rn_bind_async_wrap::next_async_id(),
+        trigger_async_id: rn_core::INVALID_ASYNC_ID,
         stream: Box::new(crate::filehandle_stream::FileHandleStream::new(
             fd, offset, length,
         )),
@@ -296,6 +303,22 @@ fn new_handle(
     let pointer = Box::into_raw(state);
     let object = args.this();
     object.set_aligned_pointer_in_internal_field(HANDLE_FIELD, pointer.cast(), 0);
+    // `FileHandle(env, obj, fd) : AsyncWrap(env, obj, PROVIDER_FILEHANDLE)`
+    // (`src/node_file.cc:240`). The handle is installed first so a hook that
+    // reads `handle.getAsyncId()` from inside `init` finds its method, and the
+    // id the `init` carries is the one `getAsyncId()` will answer with.
+    let async_id = unsafe { (*pointer).async_id };
+    let trigger_async_id = rn_bind_async_wrap::default_trigger_async_id();
+    unsafe {
+        (*pointer).trigger_async_id = trigger_async_id;
+    }
+    rn_bind_async_wrap::emit_async_init(
+        scope,
+        object,
+        rn_core::async_wrap::PROVIDER_FILEHANDLE,
+        async_id,
+        trigger_async_id,
+    );
 
     // SAFETY: `pointer` names the live allocation, and `stream` inside it is the
     // box whose address the ops record — a `Box` does not move with its owner.
@@ -373,6 +396,11 @@ fn get_async_id(
 ///
 /// `FileHandle.close()` does `SafePromisePrototypeFinally(this[kHandle].close(), ...)`,
 /// so the return value has to be a promise whatever happens.
+///
+/// `FileHandle::ClosePromise` builds a `FileHandle::CloseReq`, which is
+/// `ReqWrap(env, obj, PROVIDER_FILEHANDLECLOSEREQ)` (`src/node_file.cc:446`), and
+/// resolves through it inside an `InternalCallbackScope`. Settling the promise
+/// directly left that resource unemitted, so a hook saw an open and no close.
 fn close(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -386,10 +414,14 @@ fn close(
         Some(Ok(())) => Ok(crate::complete::Payload::Unit),
         Some(Err(error)) => Err(crate::complete::Failure::Syscall(error)),
         // A receiver that is not a FileHandle closes nothing and resolves, which
-        // is what `ASSIGN_OR_RETURN_UNWRAP`'s early return amounts to.
+        // is what `ASSIGN_RETURN_UNWRAP`'s early return amounts to.
         None => Ok(crate::complete::Payload::Unit),
     };
-    match crate::complete::deliver_to_promise(scope, crate::complete::Completion { payload }) {
+    match crate::complete::deliver_to_promise_typed(
+        scope,
+        crate::complete::Completion { payload },
+        rn_core::async_wrap::PROVIDER_FILEHANDLECLOSEREQ,
+    ) {
         Some(promise) => rv.set(promise.into()),
         None => rv.set_undefined(),
     }

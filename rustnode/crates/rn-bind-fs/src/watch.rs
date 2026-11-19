@@ -443,8 +443,8 @@ unsafe extern "C" fn on_change(
         };
         let args = rn_core::callback_scope::ScopeArgs {
             context,
-            resource: Some(owner.clone()),
-            frame,
+            resource: Some(&owner),
+            frame: frame.as_ref(),
         };
         // `wrap->MakeCallback(env->onchange_string(), argv)`: the receiver is
         // the handle object, and the call runs inside an `InternalCallbackScope`

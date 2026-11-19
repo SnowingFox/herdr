@@ -819,12 +819,14 @@ fn in_stream_scope<R>(
             state.context_frame.clone(),
         )
     })?;
+    // The resource is the handle object, rooted for the scope's lifetime.
+    let resource = v8::Global::new(scope.as_ref(), object);
     rn_core::callback_scope::with_scope(
         scope,
         rn_core::callback_scope::ScopeArgs {
             context,
-            resource: Some(v8::Global::new(scope.as_ref(), object)),
-            frame,
+            resource: Some(&resource),
+            frame: frame.as_ref(),
         },
         body,
     )

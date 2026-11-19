@@ -114,8 +114,28 @@ impl BindingModule for CaresWrap {
             define_constant(scope, object, name, v8::Integer::new(scope, value).into())?;
         }
 
-        for name in ["GetAddrInfoReqWrap", "GetNameInfoReqWrap", "QueryReqWrap"] {
-            let constructor = request_wrap(scope, name)?;
+        for (name, constructor) in [
+            (
+                "GetAddrInfoReqWrap",
+                request_wrap(
+                    scope,
+                    "GetAddrInfoReqWrap",
+                    getaddrinfo_req_wrap_constructor,
+                )?,
+            ),
+            (
+                "GetNameInfoReqWrap",
+                request_wrap(
+                    scope,
+                    "GetNameInfoReqWrap",
+                    getnameinfo_req_wrap_constructor,
+                )?,
+            ),
+            (
+                "QueryReqWrap",
+                request_wrap(scope, "QueryReqWrap", query_req_wrap_constructor)?,
+            ),
+        ] {
             set(scope, object, name, constructor)?;
         }
         let channel = channel_wrap(scope)?;
@@ -384,7 +404,7 @@ fn channel_wrap<'s>(scope: &mut v8::PinScope<'s, '_>) -> Result<v8::Local<'s, v8
     let template = rn_core::class(channel_constructor).build(scope);
     template
         .instance_template(scope)
-        .set_internal_field_count(1);
+        .set_internal_field_count(2);
 
     {
         let prototype = template.prototype_template(scope);
@@ -489,6 +509,12 @@ fn channel_constructor(
     let key = channel::open_channel(timeout, tries, max_timeout);
     let this = args.this();
     install_channel_key(scope, this, key);
+    // `ChannelWrap(env, object) : AsyncWrap(env, object, PROVIDER_DNSCHANNEL)`
+    // (`src/cares_wrap.cc:958-963`). Every DNS request is created with the
+    // channel as its `DefaultTriggerAsyncIdScope`, so without a channel init the
+    // requests have nothing to hang off and `dns.lookup` reports no
+    // `DNSCHANNEL` activity at all. `async_ids.rs` owns the id storage.
+    crate::async_ids::begin(scope, this, rn_core::async_wrap::PROVIDER_DNSCHANNEL);
     rv.set(this.into());
 }
 
@@ -1040,11 +1066,12 @@ fn set_number<'s>(
 fn request_wrap<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     name: &str,
+    constructor: impl v8::MapFnTo<v8::FunctionCallback>,
 ) -> Result<v8::Local<'s, v8::Value>, String> {
-    let template = rn_core::class(request_wrap_constructor).build(scope);
+    let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
-        .set_internal_field_count(0);
+        .set_internal_field_count(crate::async_ids::REQUEST_ASYNC_FIELD as usize + 1);
     let Some(class_name) = v8::String::new(scope, name) else {
         return Err(format!("cannot allocate the {name} class name"));
     };
@@ -1056,16 +1083,54 @@ fn request_wrap<'s>(
     Ok(function.into())
 }
 
-/// The body shared by all three request wraps.
-///
-/// Each `new ReqWrap()` allocates one async id, which is what `async_hooks`
-/// reports and what `perf_hooks` uses as an entry key. Node's `AsyncWrap`
-/// assigns the id in its constructor, and `lib/dns.js` starts a perf entry on the
-/// request object, so the id has to exist.
-fn request_wrap_constructor(
+/// `new GetAddrInfoReqWrap()`.
+fn getaddrinfo_req_wrap_constructor(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
+) {
+    request_wrap_construct(
+        scope,
+        &args,
+        &mut rv,
+        rn_core::async_wrap::PROVIDER_GETADDRINFOREQWRAP,
+    );
+}
+
+/// `new GetNameInfoReqWrap()`.
+fn getnameinfo_req_wrap_constructor(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    request_wrap_construct(
+        scope,
+        &args,
+        &mut rv,
+        rn_core::async_wrap::PROVIDER_GETNAMEINFOREQWRAP,
+    );
+}
+
+/// `new QueryReqWrap()`.
+fn query_req_wrap_constructor(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    request_wrap_construct(
+        scope,
+        &args,
+        &mut rv,
+        rn_core::async_wrap::PROVIDER_QUERYWRAP,
+    );
+}
+
+/// The shared constructor body: reject a plain call, then emit `init`.
+fn request_wrap_construct(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    rv: &mut v8::ReturnValue,
+    provider: u32,
 ) {
     if !args.is_construct_call() {
         if let Some(message) =
@@ -1076,7 +1141,9 @@ fn request_wrap_constructor(
         }
         return;
     }
-    rv.set(args.this().into());
+    let this = args.this();
+    crate::async_ids::begin(scope, this, provider);
+    rv.set(this.into());
 }
 
 // ---------------------------------------------------------------------------

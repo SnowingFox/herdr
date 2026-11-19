@@ -687,8 +687,8 @@ pub fn call_onclose(
     if let Ok(function) = v8::Local::<v8::Function>::try_from(value) {
         let args = rn_core::callback_scope::ScopeArgs {
             context,
-            resource: Some(v8::Global::new(scope.as_ref(), object)),
-            frame,
+            resource: Some(&v8::Global::new(scope.as_ref(), object)),
+            frame: frame.as_ref(),
         };
         let _ = rn_core::callback_scope::with_scope(scope, args, |scope| {
             let receiver: v8::Local<v8::Value> = object.into();

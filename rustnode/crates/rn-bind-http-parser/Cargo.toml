@@ -13,6 +13,10 @@ rn-v8-sys.workspace = true
 # `consume(handle)` has to resolve a JavaScript stream handle to its
 # `uv_stream_t`, which is the pairing `rn-uv` owns for every binding.
 rn-uv.workspace = true
+# `initialize` is the parser`s `AsyncWrap` reset: Node names the resource
+# HTTPINCOMINGMESSAGE or HTTPCLIENTREQUEST from the parser kind, and emits
+# `init` for the resource object `lib/internal/http` constructs.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 
 [build-dependencies]
 # Compiles the vendored llhttp. Node parses HTTP with this generated C state

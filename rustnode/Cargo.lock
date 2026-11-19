@@ -917,6 +917,7 @@ name = "rn-bind-cares"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rn-bind-async-wrap",
  "rn-bind-uv",
  "rn-core",
  "rn-errors",
@@ -965,6 +966,7 @@ dependencies = [
  "openssl",
  "openssl-src",
  "openssl-sys",
+ "rn-bind-async-wrap",
  "rn-bind-crypto-cipher",
  "rn-bind-crypto-dh",
  "rn-bind-crypto-keys",
@@ -974,6 +976,7 @@ dependencies = [
  "rn-core",
  "rn-crypto-job",
  "rn-crypto-openssl",
+ "rn-errors",
  "rn-node-oracle",
  "rn-v8-sys",
  "serde_json",
@@ -1135,6 +1138,7 @@ name = "rn-bind-http-parser"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-node-oracle",
  "rn-uv",
@@ -1206,6 +1210,7 @@ dependencies = [
 name = "rn-bind-messaging"
 version = "0.1.0"
 dependencies = [
+ "rn-bind-async-wrap",
  "rn-bind-symbols",
  "rn-core",
  "rn-env",
@@ -1304,6 +1309,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libuv-sys2",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-env",
  "rn-errors",
@@ -1608,6 +1614,7 @@ dependencies = [
  "brotli",
  "brotli-decompressor",
  "libz-rs-sys",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-errors",
  "rn-node-oracle",
@@ -1916,6 +1923,7 @@ name = "rn-crypto-job"
 version = "0.1.0"
 dependencies = [
  "libuv-sys2",
+ "rn-bind-async-wrap",
  "rn-core",
  "rn-errors",
  "rn-uv",

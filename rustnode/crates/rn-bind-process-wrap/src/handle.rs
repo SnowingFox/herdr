@@ -59,6 +59,17 @@ pub struct ProcessHandle {
     /// The finalizer registration, parked here so it lives as long as the
     /// handle.
     pub weak: Option<v8::Weak<v8::Object>>,
+    /// `AsyncWrap`'s ids for this handle, `PROVIDER_PROCESSWRAP`.
+    ///
+    /// `ProcessWrap(env, object) : HandleWrap(...)` over
+    /// `AsyncWrap(env, object, PROVIDER_PROCESSWRAP)`, so a spawned child is an
+    /// async resource from construction and `OnExit` is its `MakeCallback`.
+    pub async_wrap: rn_core::AsyncWrapState,
+    /// The continuation-preserved embedder data at construction.
+    ///
+    /// `AsyncWrap` captures it in `set_context_frame` so `AsyncLocalStorage`
+    /// reaches the child's `'exit'` handler with the scope that spawned it.
+    pub context_frame: Option<v8::Global<v8::Value>>,
 }
 
 impl ProcessHandle {
@@ -71,6 +82,10 @@ impl ProcessHandle {
             closed: false,
             owner_object: None,
             weak: None,
+            async_wrap: rn_core::AsyncWrapState::uninitialised(
+                rn_core::async_wrap::PROVIDER_PROCESSWRAP,
+            ),
+            context_frame: None,
         })
     }
 
@@ -173,6 +188,14 @@ fn new(
 
     let object = args.this();
     install(scope, object, ProcessHandle::new());
+    // `ProcessWrap(env, object) : HandleWrap(object, PROVIDER_PROCESSWRAP)`,
+    // whose `AsyncWrap` base calls `AsyncReset` (`src/process_wrap.cc:75-80`).
+    // The ids are kept on the handle so `OnExit` can run `onexit` as this
+    // resource's `MakeCallback`.
+    crate::handle::with_handle(object, |handle| {
+        rn_bind_async_wrap::async_reset(scope, &mut handle.async_wrap, object, object, None);
+        handle.context_frame = rn_bind_async_wrap::current_context_frame(scope);
+    });
     rv.set(object.into());
 }
 
@@ -281,6 +304,11 @@ pub unsafe extern "C" fn after_exit(
     }
 
     let signal = term_signal_name(term_signal);
+    // Both are read here rather than inside the closure: the closure holds the
+    // `&mut` borrow of `handle` only through what it captures, and these are
+    // plain owned values.
+    let async_wrap = handle.async_wrap;
+    let context_frame = handle.context_frame.clone();
     rn_uv::callback::with_context(|scope| {
         let Some(object) = handle
             .owner_object
@@ -305,19 +333,48 @@ pub unsafe extern "C" fn after_exit(
             .map(Into::into)
             .unwrap_or_else(|| v8::undefined(scope).into());
         let receiver: v8::Local<v8::Value> = object.into();
-        // A throw from `'exit'` is uncaught: the process handle completed inside
-        // `uv_run`, where nothing above it can handle one. `MakeCallback` catches
-        // it and routes it through `TriggerUncaughtException`; ignoring the
-        // result prints the error and still exits 0.
-        let caught = {
-            let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
+        // `ProcessWrap::OnExit` calls `MakeCallback(env->onexit_string(), ...)`,
+        // so the handle's own async context is what executes during `onexit` and
+        // its `init` gets the matching `before`/`after` pair.
+        let callback = v8::Global::new(scope.as_ref(), callback);
+        let receiver = v8::Global::new(scope.as_ref(), receiver);
+        let status_value = v8::Global::new(scope.as_ref(), status_value);
+        let signal_value = v8::Global::new(scope.as_ref(), signal_value);
+        let resource = v8::Global::new(scope.as_ref(), object);
+        let frame = context_frame.clone();
+        let call = |scoped: &mut v8::PinScope<'_, '_>| {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scoped));
             let inner = &mut try_catch.init();
+            let callback: v8::Local<v8::Function> = v8::Local::new(inner, &callback);
+            let receiver = v8::Local::new(inner, &receiver);
+            let status_value = v8::Local::new(inner, &status_value);
+            let signal_value = v8::Local::new(inner, &signal_value);
             let _ = callback.call(inner, receiver, &[status_value, signal_value]);
             inner
                 .exception()
                 .map(|exception| v8::Global::new(inner, exception))
         };
-        if let Some(caught) = caught {
+        // A throw from `'exit'` is uncaught: the process handle completed inside
+        // `uv_run`, where nothing above it can handle one. `MakeCallback` catches
+        // it and routes it through `TriggerUncaughtException`; ignoring the
+        // result prints the error and still exits 0.
+        let context = rn_core::callback_scope::AsyncContext::from(async_wrap);
+        if context.is_resource() {
+            let _ = rn_core::callback_scope::with_scope(
+                scope,
+                rn_core::callback_scope::ScopeArgs {
+                    context,
+                    resource: Some(&resource),
+                    frame: frame.as_ref(),
+                },
+                |scoped| {
+                    if let Some(caught) = call(scoped) {
+                        let exception = v8::Local::new(&*scoped, &caught);
+                        rn_errors::report_uncaught_exception(scoped, exception);
+                    }
+                },
+            );
+        } else if let Some(caught) = call(scope) {
             let exception = v8::Local::new(&*scope, &caught);
             rn_errors::report_uncaught_exception(scope, exception);
         }

@@ -15,4 +15,7 @@ rn-core.workspace = true
 rn-uv.workspace = true
 rn-errors.workspace = true
 rn-v8-sys.workspace = true
+# `CryptoJob` is an `AsyncWrap` (`src/crypto/crypto_util.h:339`), so its
+# completion runs inside the job's own async context.
+rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
 libuv-sys2.workspace = true

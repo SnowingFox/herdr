@@ -68,6 +68,19 @@ use crate::stats::{is_regular_file, StatFields};
 /// never touches an internal field, so one field is all either class needs.
 const JOB_FIELD: i32 = 0;
 
+/// The internal field a job's `AsyncWrapState` lives in.
+///
+/// Node's job classes derive from `AsyncWrap`, which keeps its ids in C++ state.
+/// Here the ids have to outlive the constructor and be readable from the libuv
+/// completion, so they are an allocation behind a second internal field. Both
+/// values are read exactly twice — once at construction, once at completion — so
+/// a pointer rather than an inline representation keeps the field count down and
+/// keeps `AsyncWrapState` private to `rn-core`.
+const ASYNC_FIELD: i32 = 1;
+
+/// How many internal fields every job class reserves.
+const JOB_FIELDS: i32 = ASYNC_FIELD + 1;
+
 /// `kUnknownSizeChunk`: the first allocation for a file that reports size 0.
 ///
 /// A size-0 regular file is either genuinely empty or a procfs-style file that
@@ -587,6 +600,9 @@ pub fn cp_dir_constructor<'s>(
 
     let this: v8::Local<v8::Object> = args.this();
     install_job(scope, this, CpDirJob::new(src, dest, display, options));
+    // `CpDirJob(env, object, ...) : AsyncWrap(env, object,
+    // PROVIDER_FSREQCALLBACK)` (`src/node_file.cc:5382`).
+    begin_job(scope, this, rn_core::async_wrap::PROVIDER_FSREQCALLBACK);
     rv.set(this.into());
 }
 
@@ -830,6 +846,15 @@ unsafe extern "C" fn after_work_trampoline<J: FsJob>(
     // The completion runs inside `uv_run`, which has no V8 scope and no entered
     // context, so this goes through the primitive the socket bindings use.
     rn_uv::callback::with_context(|scope| {
+        let target: v8::Local<v8::Object> = v8::Local::new(scope, &receiver);
+        // `AsyncWrap::MakeCallback` for the job: the id its constructor emitted
+        // is pushed so `before`/`after` fire for it, and `destroy` is queued
+        // when the callback returns. Without this the job's `init` had no
+        // matching `before`, which `init-hooks.js`'s `sanityCheck` reports.
+        let async_wrap = job_async_wrap(target);
+        let job_context = async_wrap.map(rn_core::callback_scope::AsyncContext::from);
+        let job_resource = async_wrap.map(|_| v8::Global::new(scope.as_ref(), target));
+
         // Node's `AsyncWrap`/`MakeCallback` restore the creator's async context
         // around `ondone`, so `process.domain` and `AsyncLocalStorage` read the
         // scope that called `run()`. A threadpool completion restores nothing by
@@ -840,15 +865,36 @@ unsafe extern "C" fn after_work_trampoline<J: FsJob>(
 
         let arguments = job.deliver(scope, outcome);
         let callback: v8::Local<v8::Function> = v8::Local::new(scope, &ondone);
-        let target: v8::Local<v8::Object> = v8::Local::new(scope, &receiver);
         // A throw here is uncaught in the same sense a timer's is: nothing above
         // a threadpool completion can handle it. `MakeCallback` wraps the call in
         // a `TryCatch` and routes a throw through `TriggerUncaughtException`, so
         // dropping the result would let V8 print the error and still exit 0.
+        //
+        // `with_scope` when the job has an identity, so the ids and the frame are
+        // entered and left together; the frame is passed as the scope's frame for
+        // that reason, and the manual exchange below is only the fallback for a
+        // job constructed without one.
         let caught = {
-            let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+            let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
             let inner = &mut try_catch.init();
-            let _ = callback.call(inner, target.into(), &arguments);
+            match (job_context, job_resource) {
+                (Some(context), Some(resource)) => {
+                    let _ = rn_core::callback_scope::with_scope(
+                        inner,
+                        rn_core::callback_scope::ScopeArgs {
+                            context,
+                            resource: Some(&resource),
+                            frame: Some(&frame),
+                        },
+                        |scoped| {
+                            let _ = callback.call(scoped, target.into(), &arguments);
+                        },
+                    );
+                }
+                _ => {
+                    let _ = callback.call(inner, target.into(), &arguments);
+                }
+            }
             inner
                 .exception()
                 .map(|exception| v8::Global::new(inner, exception))
@@ -864,6 +910,11 @@ unsafe extern "C" fn after_work_trampoline<J: FsJob>(
         if let Some(caught) = caught {
             let exception = v8::Local::new(scope, &caught);
             rn_errors::report_uncaught_exception(scope, exception);
+        }
+
+        // `AsyncWrap::~AsyncWrap` for the job, after its `ondone` returned.
+        if let Some(async_wrap) = async_wrap {
+            rn_bind_async_wrap::emit_destroy(async_wrap.async_id);
         }
     });
 }
@@ -930,7 +981,7 @@ pub fn install_job_class<'s>(
     let template = rn_core::class(constructor).build(scope);
     template
         .instance_template(scope)
-        .set_internal_field_count(JOB_FIELD as usize + 1);
+        .set_internal_field_count(JOB_FIELDS as usize);
     let prototype = template.prototype_template(scope);
     let Some(key) = v8::String::new(scope, "run") else {
         return Err(format!("cannot allocate {name}.run"));
@@ -1029,7 +1080,82 @@ pub fn read_file_constructor<'s>(
     let track_fd = args.length() > 3 && args.get(3).is_true();
     let this: v8::Local<v8::Object> = args.this();
     install_job(scope, this, ReadFileJob::new(path, flags, limit, track_fd));
+    // `ReadFileJob(env, object, ...) : AsyncWrap(env, object,
+    // PROVIDER_FSREQCALLBACK)` (`src/node_file.cc:3785-3793`). The job *is* the
+    // request wrap on this path — there is no `FSReqCallback` object involved —
+    // so `fs.readFile`'s async-hook activity is the job's, and `ondone` is its
+    // `MakeCallback`. `async_wrap.rs` records the ids on the instance so the
+    // completion can push the same context and emit `destroy` after it.
+    begin_job(scope, this, rn_core::async_wrap::PROVIDER_FSREQCALLBACK);
     rv.set(this.into());
+}
+
+/// Gives a job instance its `AsyncWrap` identity, storing the ids in the second
+/// internal field.
+///
+/// `ReadFileJob` and `WriteFileJob` are both `AsyncWrap(env, object,
+/// PROVIDER_FSREQCALLBACK)`, and `CpDirJob` is an `AsyncWrap` of its own kind, so
+/// every job class needs the same two-step: emit `init` once at construction,
+/// then read the ids back when the completion fires.
+fn begin_job(scope: &mut v8::PinScope<'_, '_>, object: v8::Local<v8::Object>, provider: u32) {
+    let (async_id, trigger_async_id) =
+        match rn_bind_async_wrap::emit_init_for_new_resource(scope, object, provider) {
+            Some(ids) => ids,
+            None => return,
+        };
+    let _ = write_async_wrap(scope, object, provider, async_id, trigger_async_id);
+}
+
+/// Stores a job's async identity in its `ASYNC_FIELD` internal field.
+fn write_async_wrap(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<v8::Object>,
+    provider: u32,
+    async_id: f64,
+    trigger_async_id: f64,
+) -> Option<()> {
+    let state = Box::new(rn_core::AsyncWrapState {
+        async_id,
+        trigger_async_id,
+        provider,
+    });
+    object.set_aligned_pointer_in_internal_field(
+        ASYNC_FIELD,
+        Box::into_raw(state).cast_const().cast(),
+        0,
+    );
+    // The state is a plain three-scalar allocation with no V8 handles in it, so
+    // the finalizer only has to free it. It is attached to the object whose
+    // field points at it, and the job's own finalizer frees the parameters; both
+    // run once, because V8 guarantees one finalizer per object.
+    let address =
+        unsafe { object.get_aligned_pointer_from_internal_field(ASYNC_FIELD, 0) } as usize;
+    v8::Weak::with_guaranteed_finalizer(
+        scope,
+        object,
+        Box::new(move || {
+            let pointer = address as *mut rn_core::AsyncWrapState;
+            // SAFETY: allocated just above for this object alone, freed once by
+            // the finalizer V8 guarantees to run.
+            drop(unsafe { Box::from_raw(pointer) });
+        }),
+    );
+    Some(())
+}
+
+/// Reads a job's async identity back, if the constructor stored one.
+fn job_async_wrap(object: v8::Local<v8::Object>) -> Option<rn_core::AsyncWrapState> {
+    if object.internal_field_count() <= ASYNC_FIELD as usize {
+        return None;
+    }
+    let pointer = unsafe { object.get_aligned_pointer_from_internal_field(ASYNC_FIELD, 0) }
+        as *const rn_core::AsyncWrapState;
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: the field only ever holds a pointer produced by `write_async_wrap`,
+    // and the object is a live local so the allocation has not been freed.
+    Some(unsafe { *pointer })
 }
 
 /// `new WriteFileJob(path, flags, mode, buffer)`.
@@ -1064,6 +1190,10 @@ pub fn write_file_constructor<'s>(
 
     let this: v8::Local<v8::Object> = args.this();
     install_job(scope, this, WriteFileJob::new(path, flags, mode, data));
+    // `WriteFileJob(env, object, ...) : AsyncWrap(env, object,
+    // PROVIDER_FSREQCALLBACK)` (`src/node_file.cc:3979`): the job is the request
+    // wrap, so its `init` has to exist for `ondone` to run `before`/`after`.
+    begin_job(scope, this, rn_core::async_wrap::PROVIDER_FSREQCALLBACK);
     rv.set(this.into());
 }
 

@@ -132,6 +132,16 @@ pub(crate) struct HandleState {
     pending_close: bool,
     write_in_progress: bool,
     closed: bool,
+    /// `AsyncWrap`'s id for this handle, `PROVIDER_ZLIB`.
+    ///
+    /// `CompressionStream(env, wrap) : AsyncWrap(env, wrap, PROVIDER_ZLIB)`
+    /// (`src/node_zlib.cc:502-503`), so every zlib handle is an async resource
+    /// from construction and its write completion emits `before`/`after` for it.
+    /// `None` when `async_wrap` never installed, which is the bootstrap state.
+    async_id: Option<f64>,
+    /// The trigger id the `init` carried, so the completion pushes the same pair
+    /// Node's `AsyncWrap::MakeCallback` would.
+    trigger_async_id: Option<f64>,
 }
 
 /// A compression step that `write()` accepted but has not run yet.
@@ -162,6 +172,8 @@ impl HandleState {
             pending_close: false,
             write_in_progress: false,
             closed: false,
+            async_id: None,
+            trigger_async_id: None,
         }
     }
 
@@ -344,6 +356,26 @@ fn install_state<'s>(
         0,
     );
     crate::note_handle_allocated();
+
+    // `AsyncWrap(env, wrap, PROVIDER_ZLIB)`: the handle is an async resource
+    // from construction, so `init` fires here and the ids are kept for the
+    // `MakeCallback` its write completion performs. Emitting before the ids are
+    // stored is deliberate — a hook that inspects the handle must find it
+    // installed, which `install_state` has already done.
+    let ids = rn_bind_async_wrap::emit_init_for_new_resource(
+        scope,
+        object,
+        rn_core::async_wrap::PROVIDER_ZLIB,
+    );
+    if let Some((async_id, trigger_async_id)) = ids {
+        // SAFETY: `pointer` was just created above and is not otherwise
+        // borrowed yet.
+        let cell = unsafe { &*pointer };
+        if let Ok(mut state) = cell.try_borrow_mut() {
+            state.async_id = Some(async_id);
+            state.trigger_async_id = Some(trigger_async_id);
+        }
+    }
 
     // The finalizer owns the allocation from here on, so it is released even if
     // `close()` never runs.
@@ -1083,6 +1115,19 @@ fn complete_write<'s>(
         .receiver
         .as_ref()
         .map(|handle| v8::Local::new(scope, handle));
+    // `CompressionStream::AfterThreadPoolWork` ends with
+    // `MakeCallback(writeCallback, 0, nullptr)`, so the handle's own id is the
+    // one executing during the callback. Without it the handle's `init` has no
+    // `before`, which `test/async-hooks/init-hooks.js` reports.
+    let context = state
+        .async_id
+        .zip(state.trigger_async_id)
+        .map(
+            |(async_id, trigger_async_id)| rn_core::callback_scope::AsyncContext {
+                async_id,
+                trigger_async_id,
+            },
+        );
     // The completion is the last thing that needed the wrapper pinned; release
     // it after taking the locals so this object can be collected next GC.
     state.receiver = None;
@@ -1093,13 +1138,35 @@ fn complete_write<'s>(
         // nothing above it can handle one. Node's `MakeCallback` catches it and
         // routes it through `TriggerUncaughtException`; ignoring the result
         // leaves V8 to print the error with the process still exiting 0.
-        let caught = {
-            let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let call = |scoped: &mut v8::PinScope<'_, '_>| {
+            let try_catch = std::pin::pin!(v8::TryCatch::new(scoped));
             let inner = &mut try_catch.init();
             let _ = callback.call(inner, object.into(), &[]);
             inner
                 .exception()
                 .map(|exception| v8::Global::new(inner, exception))
+        };
+        let caught = match context {
+            Some(context) => {
+                let resource = v8::Global::new(scope.as_ref(), object);
+                // `with_scope` reports a throw itself, so the `TryCatch` above
+                // exists only for the unscoped fallback.
+                let _ = rn_core::callback_scope::with_scope(
+                    scope,
+                    rn_core::callback_scope::ScopeArgs {
+                        context,
+                        resource: Some(&resource),
+                        frame: None,
+                    },
+                    |scoped| {
+                        let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scoped));
+                        let inner = &mut try_catch.init();
+                        let _ = callback.call(inner, object.into(), &[]);
+                    },
+                );
+                None
+            }
+            None => call(scope),
         };
         if let Some(caught) = caught {
             let exception = v8::Local::new(scope, &caught);

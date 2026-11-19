@@ -15,6 +15,11 @@ libc.workspace = true
 # `FileHandle.getAsyncId()` answers from the same async-id counter every other
 # wrapped resource uses, and that counter lives with the `async_wrap` binding.
 rn-bind-async-wrap = { path = "../rn-bind-async-wrap" }
+# A request's `init` records its ids on the object under the shared
+# `async_id_symbol`/`trigger_async_id_symbol` keys, the same table
+# `internalBinding('symbols')` publishes. Minting private symbols would make
+# every JS-side lookup miss silently.
+rn-bind-symbols = { path = "../rn-bind-symbols" }
 # `ReadFileJob` and `WriteFileJob` are real threadpool jobs: they queue a
 # `uv_work_t` on the process loop and deliver `ondone` from it, which needs the
 # loop and the re-enter-V8-from-`uv_run` primitive. Both are that crate's.

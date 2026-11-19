@@ -54,6 +54,7 @@
 //! first `message` listener arrives. A port that never runs `oninit` never
 //! delivers anything.
 
+mod async_ids;
 mod delivery;
 mod deserialize;
 pub mod port;
@@ -446,6 +447,14 @@ pub fn new_port_object<'s>(
         .ok_or("cannot allocate a MessagePort")?;
 
     let inner = PortInner::new(data);
+    // `MessagePort(env, context, wrap) : HandleWrap(..., PROVIDER_MESSAGEPORT)`
+    // (`src/node_messaging.cc:667-673`): the port is an async resource from
+    // construction, and every delivered message runs `emitMessage` as its
+    // `MakeCallback`. `async_ids.rs` owns the ids, which live on the
+    // `PortInner` so the delivery path can push the same context.
+    inner
+        .async_wrap
+        .set(crate::async_ids::begin(scope, object, &inner));
     let slot = Box::into_raw(Box::new(PortSlot {
         inner,
         _weak: RefCell::new(None),

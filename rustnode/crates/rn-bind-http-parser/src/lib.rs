@@ -512,14 +512,52 @@ fn parser_initialize<'s>(
         }
     };
 
+    // `parser->set_provider_type(provider); parser->AsyncReset(args[1].As<Object>())`
+    // (`src/node_http_parser.cc:762-767`). The provider depends on the *parser
+    // kind*, not on the `type` string the JavaScript resource object carries: a
+    // parser for a request produces `HTTPINCOMINGMESSAGE` (the server side), and
+    // one for a response produces `HTTPCLIENTREQUEST` (the client side). The
+    // resource the hook receives is `args[1]`, the object the JavaScript layer
+    // constructed, so that is what is emitted for.
+    let provider = if kind == Kind::Request {
+        rn_core::async_wrap::PROVIDER_HTTPINCOMINGMESSAGE
+    } else {
+        rn_core::async_wrap::PROVIDER_HTTPCLIENTREQUEST
+    };
+    let (async_wrap, resource_object) = match v8::Local::<v8::Object>::try_from(args.get(1)) {
+        Ok(resource) => {
+            let state =
+                match rn_bind_async_wrap::emit_init_for_new_resource(scope, resource, provider) {
+                    Some((async_id, trigger_async_id)) => rn_core::AsyncWrapState {
+                        async_id,
+                        trigger_async_id,
+                        provider,
+                    },
+                    None => rn_core::AsyncWrapState::uninitialised(provider),
+                };
+            (state, Some(v8::Global::new(scope.as_ref(), resource)))
+        }
+        Err(_) => (rn_core::AsyncWrapState::uninitialised(provider), None),
+    };
+
+    // `AsyncReset`'s `set_context_frame(async_context_frame::current(isolate))`:
+    // the frame current at `initialize` is the one every parser callback must
+    // run under, which is how an `AsyncLocalStorage` store reaches them.
+    let context_frame = rn_bind_async_wrap::current_context_frame(scope);
+
     let object = args.this();
     let result = with_parser(object, |parser| {
         parser.initialize(
             kind,
-            max_header_size,
-            lenient_flags,
-            max_header_pairs,
-            list.is_some(),
+            crate::parser::InitializeConfig {
+                max_header_size,
+                lenient_flags,
+                max_header_pairs,
+                has_connections: list.is_some(),
+                async_wrap,
+                resource_object,
+                context_frame,
+            },
         );
         match list {
             Some(list) => parser.register_connections(scope, list),

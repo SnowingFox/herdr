@@ -20,7 +20,7 @@
 //! state at construction, which is what `CryptoJob`'s `mode_` member is: a value
 //! read once, not a property of the JavaScript object (which `lib/**` could set).
 
-use rn_crypto_job::{dispatch, Completion, CryptoJobError, JobMode, Runnable};
+use rn_crypto_job::{Completion, CryptoJobError, JobMode, Runnable};
 use rn_v8_sys::v8;
 
 use crate::argon2_job::Argon2Job;
@@ -51,11 +51,11 @@ fn install_class<'s>(
     // writes `new` against, so they keep `[[Construct]]` — Node publishes them
     // through `SetConstructorFunction`.
     let template = rn_core::class(constructor).build(scope);
-    // One internal field, holding the mode and the job, exactly as
-    // `CryptoJob::kInternalFieldCount` is 1.
+    // Field 0 holds the mode and the job, matching `CryptoJob`'s one internal
+    // field; field 1 is the `AsyncWrap` identity `begin_job` stores.
     template
         .instance_template(scope)
-        .set_internal_field_count(1);
+        .set_internal_field_count(crate::job_async::JOB_FIELDS as usize);
     let prototype = template.prototype_template(scope);
     let Some(key) = v8::String::new(scope, "run") else {
         return Err(format!("cannot allocate {name}.run"));
@@ -118,6 +118,11 @@ fn random_bytes_constructor<'s>(
         return;
     };
     install_state(scope, this, mode, JobKind::Bytes(job));
+    crate::job_async::begin(
+        scope,
+        this,
+        rn_core::async_wrap::PROVIDER_RANDOMBYTESREQUEST,
+    );
     rv.set(this.into());
 }
 
@@ -147,6 +152,13 @@ fn random_prime_constructor<'s>(
         return;
     };
     install_state(scope, this, mode, JobKind::Prime(job));
+    // `RandomPrimeJob`'s `CryptoJob` traits name `RANDOMPRIMEREQUEST`; the class
+    // shares this file but not the provider.
+    crate::job_async::begin(
+        scope,
+        this,
+        rn_core::async_wrap::PROVIDER_RANDOMPRIMEREQUEST,
+    );
     rv.set(this.into());
 }
 
@@ -176,6 +188,7 @@ fn check_prime_constructor<'s>(
         return;
     };
     install_state(scope, this, mode, JobKind::Check(job));
+    crate::job_async::begin(scope, this, rn_core::async_wrap::PROVIDER_CHECKPRIMEREQUEST);
     rv.set(this.into());
 }
 
@@ -202,7 +215,14 @@ fn run<'s>(
     };
     // `Completion::Callback` is the shape every `random.js` caller uses: it
     // assigns `job.ondone` before calling `run()`. The sync mode ignores it.
-    match dispatch(scope, mode, job, this, Completion::Callback) {
+    match rn_crypto_job::dispatch_with_async_wrap(
+        scope,
+        mode,
+        job,
+        this,
+        Completion::Callback,
+        crate::job_async::state_of(this),
+    ) {
         Some(value) => rv.set(value),
         // A queued `Async` job returns `undefined` and delivers through
         // `ondone`; `random.js` ignores `run()`'s return value on that path.
@@ -237,6 +257,7 @@ fn argon2_constructor<'s>(
         return;
     };
     install_state(scope, this, mode, JobKind::Argon2(job));
+    crate::job_async::begin(scope, this, rn_core::async_wrap::PROVIDER_ARGON2REQUEST);
     rv.set(this.into());
 }
 
