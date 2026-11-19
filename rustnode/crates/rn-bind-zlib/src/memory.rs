@@ -44,8 +44,12 @@ impl MemoryOwner {
     }
 
     /// The `opaque` pointer the compressor hands back to `zalloc`/`zfree`.
-    pub(crate) fn opaque(self: &Box<Self>) -> *mut c_void {
-        (&**self as *const Self as *mut Self).cast()
+    ///
+    /// Taken from `&self` rather than the `Box`, so nothing here depends on how
+    /// the owner is held; the caller keeps the `Box` alive for the stream's
+    /// lifetime, which is what makes the address stable.
+    pub(crate) fn opaque(&self) -> *mut c_void {
+        (self as *const Self as *mut Self).cast()
     }
 
     /// Bytes currently held by the compressor.
@@ -143,7 +147,7 @@ extern "C" fn zfree(opaque: *mut c_void, pointer: *mut c_void) {
 /// `src/node_zlib.cc:1349` does the same three assignments to the `z_stream` the
 /// context owns, once, before any `deflateInit2_`/`inflateInit2_` call. The
 /// compressor keeps them for its own lifetime, so they only have to be set once.
-pub(crate) fn install(stream: &mut libz_rs_sys::z_stream, owner: &Box<MemoryOwner>) {
+pub(crate) fn install(stream: &mut libz_rs_sys::z_stream, owner: &MemoryOwner) {
     stream.zalloc = Some(zalloc);
     stream.zfree = Some(zfree);
     stream.opaque = owner.opaque();

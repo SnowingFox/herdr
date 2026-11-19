@@ -139,9 +139,7 @@ pub(crate) fn describe<'s>(
     state: &HandleState,
     wrapper: Option<v8::Local<'s, v8::Value>>,
 ) -> Option<HeapNode<'s>> {
-    let Some(wrapper) = wrapper else {
-        return None;
-    };
+    let wrapper = wrapper?;
     let names = names(state.backend());
     let mut node = HeapNode::new(names.stream, names.stream_size).with_wrapper(wrapper);
     node = node.with_child(
