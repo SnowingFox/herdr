@@ -1674,6 +1674,26 @@ pub fn parse_with_env(
             continue;
         }
 
+        // Node gives every boolean option both spellings for free: `Parse`'s
+        // `kBoolean` arm strips a leading `--no-` and stores the inverted value,
+        // so `--no-test-forbid-only` is accepted wherever `--test-forbid-only`
+        // is. A list that names only the positive form therefore rejects an
+        // option Node accepts, which is what four files hit.
+        //
+        // Handling it here rather than per-flag keeps the two spellings from
+        // drifting apart as more test flags land.
+        if let Some(positive) = argument.strip_prefix("--no-") {
+            let positive = format!("--{positive}");
+            if TEST_FLAGS_WITHOUT_VALUE.contains(&positive.as_str()) {
+                // Forwarded as typed: `lib/internal/test_runner/**` reads the
+                // option through `getOptionValue`, which already understands the
+                // negation, so the CLI only has to stop rejecting it.
+                options.exec_argv.push(argument.clone());
+                index += 1;
+                continue;
+            }
+        }
+
         // `--abort-on-uncaught-exception` is a real option, not an ignored one:
         // it changes how the process dies. It is parsed here rather than left in
         // the ignore list because a flag that is accepted and then not acted on
@@ -4283,5 +4303,36 @@ mod tests {
             options.parsed.value_of("--use-bundled-ca"),
             Some(rn_bind_options::ParsedValue::Bool(true))
         );
+    }
+    /// Every test flag that takes no value must also accept its `--no-` form.
+    ///
+    /// Node's `Parse` strips a leading `--no-` and inverts the value for any
+    /// boolean option, so the negated spelling is accepted wherever the positive
+    /// one is. A list naming only the positive form therefore rejects an option
+    /// Node accepts, which is what `--no-test-forbid-only` did in four test files.
+    #[test]
+    fn a_test_flag_without_value_accepts_its_negated_form() {
+        for flag in TEST_FLAGS_WITHOUT_VALUE {
+            let name = flag
+                .strip_prefix("--")
+                .unwrap_or_else(|| panic!("{flag} is not a long option"));
+            let negated = format!("--no-{name}");
+            let options = parse_of(&[negated.as_str(), "-e", "0"])
+                .unwrap_or_else(|error| panic!("{negated} was rejected: {error}"));
+            assert!(
+                options.exec_argv.iter().any(|arg| arg == &negated),
+                "{negated} was accepted but not forwarded, so the test runner \
+                 never sees it and `getOptionValue` reports the wrong value"
+            );
+        }
+    }
+
+    /// A negated form must not be invented for a flag that has no boolean form.
+    ///
+    /// `--no-test-shard` takes a value and has no negation; accepting it would be
+    /// the "flag accepted and then ignored" failure this module exists to prevent.
+    #[test]
+    fn a_negated_value_flag_is_still_rejected() {
+        assert!(parse_of(&["--no-test-shard"]).is_err());
     }
 }
