@@ -293,9 +293,18 @@ fn shutdown<'s>(
         if state.in_library_call() {
             // `crypto_tls.cc:1333`: `SSL_shutdown` must not run on the library's
             // own stack. Park it; the next cycle completes it.
+            //
+            // This is a third outcome, not `Ok(0)`: the success arm below puts the
+            // FIN on the wire, and doing that here — mid-handshake, before the
+            // close-notify has even been written — closed the socket underneath the
+            // flush that came later, which is what made `end()` from a
+            // `'secureConnection'` handler lose its body to `EPIPE`.
             state.pending_shutdown = Some(v8::Global::new(scope.as_ref(), request));
             state.flags.shutdown = true;
-            return Ok(0);
+            // `crypto_tls.cc:1338`: same reason as the parked write above — the
+            // replay in `FlushPendingShutdown` only happens if a cycle runs.
+            crate::callback::schedule_deferred_cycle(state_cell_of(object));
+            return Ok(ShutdownPlan::Parked);
         }
         // `crypto_tls.cc:1344`: the first `SSL_shutdown` sends the close-notify
         // and returns 0; the second waits for the peer's and returns 1. Node calls
@@ -316,11 +325,12 @@ fn shutdown<'s>(
         //
         // SAFETY: `ssl` is live, checked above, and `state` is this borrow.
         unsafe { crate::cycle::enc_out(state, ssl) };
-        Ok(0)
+        Ok(ShutdownPlan::Run)
     });
 
     match plan {
-        Some(Ok(0)) => {
+        Some(Ok(ShutdownPlan::Parked)) => rv.set(v8::Integer::new(scope, 0).into()),
+        Some(Ok(ShutdownPlan::Run)) => {
             // `crypto_tls.cc:1351`: `EncOut()` produced the close-notify, then the
             // **underlying stream's own** `DoShutdown` puts a FIN on the wire and
             // completes the request.
@@ -334,37 +344,137 @@ fn shutdown<'s>(
             //   from `afterShutdown`, and if that never runs the socket never
             //   closes and `server.close()`'s callback never fires.
             let underlying = with_state(object, |state| state.underlying).flatten();
-            let Some(stream) = underlying else {
-                rn_bind_stream_wrap::wrap::report_completion(scope, request, 0, None, None);
-                rv.set(v8::Integer::new(scope, 0).into());
-                return;
-            };
-            // The notify is flushed *without* the caller's request: it is
-            // ciphertext, not the caller's write, and passing the request here
-            // would complete it before the FIN was even issued. The caller's
-            // completion follows from `queue_shutdown` below.
-            //
             // SAFETY: `stream` is the wrap's own `underlying`, live while it holds
             // it.
-            let _ = unsafe { flush(scope, object, stream, None) };
-            // SAFETY: the stream is live and `request` is the caller's
-            // `ShutdownWrap`, kept alive by `lib/net.js`.
-            let status = unsafe {
-                let state = &mut *stream;
-                if state.stream.is_null() {
+            let status = match underlying {
+                Some(stream) => unsafe { finish_shutdown(scope, object, stream, request, true) },
+                None => {
+                    rn_bind_stream_wrap::wrap::report_completion(scope, request, 0, None, None);
                     0
-                } else {
-                    rn_uv::stream::queue_shutdown(scope, state.stream, request, object)
                 }
             };
             rv.set(v8::Integer::new(scope, status).into());
         }
-        Some(Ok(_)) => rv.set(v8::Integer::new(scope, 0).into()),
         Some(Err(status)) => rv.set(v8::Integer::new(scope, status).into()),
         None => {
             throw_type_error(scope, "Invalid TLSWrap receiver");
         }
     }
+}
+
+/// Puts the close-notify and then the FIN on the wire, completing `request`.
+///
+/// The tail of `TLSWrap::DoShutdown` (`crypto_tls.cc:1349`): `EncOut()` has
+/// already parked the close-notify in `pending_output`, so it is flushed first,
+/// and only then is the underlying stream asked to shut down. `lib/net.js` marks
+/// the writable side finished from that stream's `afterShutdown`, which is why the
+/// completion has to come from there rather than locally.
+///
+/// # Safety
+///
+/// `stream` must be a live `StreamState` — the wrap's own `underlying`, retrieved
+/// while the wrap still holds it.
+pub unsafe fn finish_shutdown<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    stream: *mut rn_uv::handle::StreamState,
+    request: v8::Local<'s, v8::Object>,
+    flush_first: bool,
+) -> i32 {
+    // The notify is flushed *without* the caller's request: it is ciphertext, not
+    // the caller's write, and passing the request here would complete it before
+    // the FIN was even issued. The caller's completion follows from
+    // `queue_shutdown` below.
+    //
+    // SAFETY: `stream` is the wrap's own `underlying`, live while it holds it.
+    if flush_first {
+        // SAFETY: the caller guarantees `stream` is live.
+        let _ = unsafe { flush(scope, object, stream, None) };
+    }
+    // SAFETY: the caller guarantees `stream` is live, and `request` is the
+    // caller's `ShutdownWrap`, kept alive by `lib/net.js`.
+    unsafe {
+        let state = &mut *stream;
+        if state.stream.is_null() {
+            0
+        } else {
+            rn_uv::stream::queue_shutdown(scope, state.stream, request, object)
+        }
+    }
+}
+
+/// `TLSWrap::FlushPendingShutdown` (`crypto_tls.cc:1370`): replay a parked
+/// `shutdown()`.
+///
+/// `shutdown()` parks its request when it is called from inside the SSL library's
+/// stack — which is exactly what a handshake handler does, because Node runs
+/// `onhandshakedone` from inside `SSL_read`. Without this replay the request is
+/// never completed: `lib/net.js`'s `pending` never drops, `'finish'` never fires,
+/// and a server that calls `end()` from its `'secureConnection'` handler leaves the
+/// peer waiting for a close-notify that is still sitting in `enc_out_`.
+/// `Cycle` calls this between `ClearIn` and `EncOut` (`crypto_tls.cc:2345`).
+///
+/// Returns the request to complete once the caller has released the state borrow,
+/// which is why this does not call [`finish_shutdown`] itself: that path flushes,
+/// and `flush` re-borrows the same state.
+pub fn take_pending_shutdown(
+    state: &mut crate::state::WrapState,
+) -> Option<v8::Global<v8::Object>> {
+    // `crypto_tls.cc:1371`: no request, or no SSL to send it on, is nothing to do.
+    state.pending_shutdown.as_ref()?;
+    let ssl = state.ssl_ptr();
+    if ssl.is_null() {
+        return None;
+    }
+    // `can_send_close_notify`: the handshake is finished and no `newSession`
+    // callback is still owed. A close-notify before either would be an alert on a
+    // handshake that has not completed.
+    let awaiting = state
+        .callback
+        .as_ref()
+        .map(|handles| handles.awaiting_new_session.get())
+        .unwrap_or(state.flags.awaiting_new_session);
+    if !state.flags.established || awaiting {
+        return None;
+    }
+    let request = state.pending_shutdown.take();
+    // The parked request is re-run through the same body `shutdown()` uses, now
+    // that it is no longer on the library's stack. `SSL_shutdown` is called twice
+    // because the first call only writes the close-notify.
+    state.library_call_depth = state.library_call_depth.saturating_add(1);
+    // SAFETY: `ssl` is live, checked above.
+    unsafe {
+        if openssl_sys::SSL_shutdown(ssl) == 0 {
+            openssl_sys::SSL_shutdown(ssl);
+        }
+    }
+    state.flags.shutdown = true;
+    // SAFETY: `ssl` is live and `state` is the borrow this call owns.
+    unsafe { crate::cycle::enc_out(state, ssl) };
+    state.library_call_depth = state.library_call_depth.saturating_sub(1);
+    request
+}
+
+/// Which of `DoShutdown`'s two outcomes the borrow took.
+///
+/// The parked case returns `0` to JavaScript exactly like the running one, which
+/// is why the two cannot share a variant: the success arm is the one that puts the
+/// FIN on the wire, and running it for a parked request closes the stream before
+/// the close-notify it is still waiting for.
+enum ShutdownPlan {
+    /// The request is parked in `pending_shutdown` for `FlushPendingShutdown`.
+    Parked,
+    /// `SSL_shutdown` ran and `enc_out_` holds the close-notify.
+    Run,
+}
+
+/// The state cell of `object`, for the callback table's key.
+fn state_cell_of(
+    object: v8::Local<'_, v8::Object>,
+) -> *const std::cell::RefCell<crate::state::WrapState> {
+    crate::state::state_cell(object)
+        .map(|cell| cell as *const std::cell::RefCell<crate::state::WrapState>)
+        .unwrap_or(std::ptr::null())
 }
 
 /// Reads a request object out of a method argument.
@@ -771,6 +881,11 @@ fn dispatch_chunks<'s>(
             state.pending_cleartext.extend_from_slice(&cleartext);
             state.current_write = Some(v8::Global::new(scope.as_ref(), request));
             state.flags.write_callback_scheduled = true;
+            // `crypto_tls.cc:1162`: the parked bytes are encrypted by a cycle that
+            // the immediate schedules. Without it nothing ever runs `ClearIn` for
+            // them, and a server writing from its `'secureConnection'` handler
+            // delivers nothing.
+            crate::callback::schedule_deferred_cycle(state_cell_of(object));
             return Ok(None);
         }
         state.flags.write_callback_scheduled = true;

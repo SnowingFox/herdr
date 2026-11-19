@@ -124,6 +124,13 @@ impl WrapListener {
         };
     }
 
+    /// Emits the EOF read a cycle recorded, if it left one for this drain.
+    fn emit_pending_eof(&self) {
+        if self.with(|state| state.take_eof_read()).unwrap_or(false) {
+            self.emit_event(UV_EOF);
+        }
+    }
+
     /// Hands decrypted cleartext to JavaScript through the wrap's own
     /// `StreamBase`.
     ///
@@ -262,7 +269,11 @@ impl StreamListener for WrapListener {
         //
         // SAFETY: `cell` is this listener's wrap state, guaranteed live for the
         // listener's whole life by `attach`'s contract.
+        // Told to `run` so it leaves the cleartext to the drain below rather
+        // than emitting it as well.
+        self.with(|state| state.flags.emitting_by_reader = true);
         let outcome = unsafe { crate::cycle::run(self.cell) };
+        self.with(|state| state.flags.emitting_by_reader = false);
         if outcome == crate::cycle::CycleOutcome::Reentrant {
             // A callback inside the state machine re-entered the listener. The
             // outer invocation continues the machine when it returns, so the
@@ -282,6 +293,10 @@ impl StreamListener for WrapListener {
         if let Some(bytes) = cleartext {
             self.emit_cleartext(bytes);
         }
+        // The EOF read `run` recorded must follow the cleartext it decrypted in
+        // the same cycle, so the reader sees the last bytes and only then
+        // `'end'`. `run` leaves it for this drain for exactly that reason.
+        self.emit_pending_eof();
         let Some(Some(stream)) = self.with(|state| state.underlying) else {
             return;
         };
@@ -294,7 +309,7 @@ impl StreamListener for WrapListener {
             let object = self.object(scope);
             // SAFETY: `stream` came from the wrap's own `underlying` field
             // while the wrap holds it, per `attach`'s contract.
-            unsafe { crate::stream::flush(scope, object, stream, None) }
+            unsafe { crate::stream::flush(scope, object, stream, None) };
         });
     }
 
@@ -344,6 +359,21 @@ impl StreamListener for WrapListener {
         // SAFETY: `cell` is this listener's wrap state, live by `attach`'s
         // contract.
         unsafe { crate::cycle::run(self.cell) };
+        // This cycle was not started by a read, so nothing else drains the
+        // cleartext it decrypted — the read callback's own drain is not on this
+        // stack.
+        let cleartext = self
+            .with(|state| {
+                if state.pending_cleartext_output.is_empty() {
+                    return None;
+                }
+                Some(std::mem::take(&mut state.pending_cleartext_output))
+            })
+            .flatten();
+        if let Some(bytes) = cleartext {
+            self.emit_cleartext(bytes);
+        }
+        self.emit_pending_eof();
     }
 
     /// `TLSWrap::OnStreamAfterShutdown`.
@@ -493,6 +523,43 @@ pub fn deliver_cleartext(object: v8::Local<v8::Object>) {
         )
     };
 }
+
+/// Emits the EOF read a phase recorded, through the wrap's own `StreamBase`.
+///
+/// `crypto_tls.cc:932` is `EmitRead(UV_EOF)`, and `lib/net.js` is what turns a
+/// negative read count into `'end'`. It is called after the cycle's cleartext
+/// emit so the final bytes reach the reader before the end of the stream, and it
+/// does nothing when the phase did not record one.
+pub fn deliver_eof(object: Option<&v8::Global<v8::Object>>) {
+    let Some(object) = object else {
+        return;
+    };
+    let _ = rn_uv::callback::with_context(|scope| {
+        let object = v8::Local::new(scope, object);
+        if !with_state(object, |state| state.take_eof_read()).unwrap_or(false) {
+            return;
+        }
+        let reader = with_state(object, |state| &mut state.reader as *mut _);
+        let Some(reader) = reader else {
+            return;
+        };
+        // SAFETY: `reader` is the wrap's own `StreamState`, live for the wrap's
+        // whole life. A negative count carries no buffer.
+        unsafe {
+            rn_uv::listener::emit_read(
+                reader,
+                UV_EOF,
+                rn_uv::listener::ReadBuffer::Listener(rn_uv::sys::uv_buf_t {
+                    base: std::ptr::null_mut(),
+                    len: 0,
+                }),
+            )
+        };
+    });
+}
+
+/// `UV_EOF` from `uv.h`, the count a stream reports for a clean end.
+const UV_EOF: isize = -4095;
 
 /// Pushes a listener for `object`'s state onto `stream`.
 ///
