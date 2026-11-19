@@ -1,0 +1,48 @@
+module
+
+public import EulerMaclaurin.Induction
+public import EulerMaclaurin.Remainder
+public import EulerMaclaurin.GeneralRemainder
+public import EulerMaclaurin.SumIntegral
+public import EulerMaclaurin.ZetaMain
+public import EulerMaclaurin.GlobalDeriv
+public import EulerMaclaurin.SumBound
+public import EulerMaclaurin.NumericCheck
+
+#print axioms EulerMaclaurin.eulerMaclaurin_identity
+#print axioms EulerMaclaurin.abs_integral_sub_eulerMaclaurin_le
+#print axioms EulerMaclaurin.abs_integral_sub_sum_sub_half_le
+#print axioms EulerMaclaurin.abs_sum_Ico_sub_integral_le
+#print axioms EulerMaclaurin.integral_eq_sum_Ico_add_half_sub
+#print axioms EulerMaclaurin.integral_periodicBernoulli_rec
+#print axioms EulerMaclaurin.integral_unit_eq_half_add
+#print axioms EulerMaclaurin.abs_periodicBernoulli_one_le
+#print axioms EulerMaclaurin.integral_bernoulliFun_smul_iteratedDerivWithin
+#print axioms EulerMaclaurin.emRemCoeff_mul_bernoulli
+#print axioms EulerMaclaurin.abs_emRemCoeff
+#print axioms EulerMaclaurin.exists_bernoulliFun_bound
+#print axioms EulerMaclaurin.integral_periodicBernoulli_mul_eq_sum_Ico'
+#print axioms EulerMaclaurin.abs_integral_unit_periodicBernoulli_mul_le
+#print axioms EulerMaclaurin.periodicBernoulli_add_one
+#print axioms EulerMaclaurin.periodicBernoulli_eq_on_Ioo
+#print axioms EulerMaclaurin.integral_ofReal_cpow_neg
+#print axioms EulerMaclaurin.integral_rpow_neg_sub_one
+#print axioms EulerMaclaurin.norm_ofReal_cpow_neg
+#print axioms EulerMaclaurin.abs_eulerMaclaurin_rpow_le
+#print axioms EulerMaclaurin.abs_eulerMaclaurin_rpow_le_uniform
+-- ordinary-derivative restatements (GlobalDeriv.lean)
+#print axioms EulerMaclaurin.iteratedDerivWithin_univ_eq
+#print axioms EulerMaclaurin.eulerMaclaurin_identity_univ
+#print axioms EulerMaclaurin.abs_integral_sub_eulerMaclaurin_le_univ
+#print axioms EulerMaclaurin.abs_integral_sub_sum_sub_half_le_univ
+#print axioms EulerMaclaurin.abs_sum_Ico_sub_integral_le_univ
+-- consumer bounds (SumBound.lean)
+#print axioms EulerMaclaurin.norm_cpow_neg_nat
+#print axioms EulerMaclaurin.integral_rpow_neg_eq
+#print axioms EulerMaclaurin.sum_Ico_rpow_le_const_of_one_lt
+#print axioms EulerMaclaurin.sum_Ico_rpow_le_of_lt_one
+#print axioms EulerMaclaurin.norm_sum_Ico_cpow_le_const
+#print axioms EulerMaclaurin.norm_sum_Ico_cpow_le_of_lt_one
+-- genuine instantiation (NumericCheck.lean)
+#print axioms EulerMaclaurin.eulerMaclaurin_x_sq_p0
+#print axioms EulerMaclaurin.integral_periodicBernoulli_one_mul_sq
