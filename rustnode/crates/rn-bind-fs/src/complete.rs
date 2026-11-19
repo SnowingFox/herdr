@@ -117,6 +117,15 @@ struct CallbackDelivery {
     /// A [`Failure`] holds no V8 handles, so it survives the scope that
     /// produced it as-is; only the success payload has to be rooted.
     payload: Result<Rooted, Failure>,
+    /// The request's `AsyncWrap` identity.
+    ///
+    /// `FSReqCallback` is an `AsyncWrap` (`src/node_file.cc:583`), so its
+    /// `oncomplete` runs through `AsyncWrap::MakeCallback`: the completion
+    /// pushes the request's async context, emits `before`, and emits `after` on
+    /// the way out. Without the ids the `init` this request emitted has no
+    /// matching `before`, which is what `test/async-hooks/init-hooks.js`'s
+    /// `sanityCheck` reports as "expects 1 before".
+    context: rn_core::callback_scope::AsyncContext,
 }
 
 /// Converts a completion into rooted handles.
@@ -142,6 +151,21 @@ fn root<'s>(
 }
 
 /// Queues `completion` for a callback-style request object.
+///
+/// `request` is the `FSReqCallback` the JavaScript layer constructed, and this
+/// is where that request becomes async-hook visible. Node creates the resource in
+/// the C++ constructor:
+///
+/// ```text
+/// FSReqBase(binding_data, req, AsyncWrap::PROVIDER_FSREQCALLBACK, use_bigint)
+///   : ReqWrap(binding_data->env(), req, type)   // AsyncWrap ctor -> AsyncReset
+/// ```
+///
+/// (`src/node_file-inl.h:53-60`, `:91-94`), and the reset emits `init` with
+/// `FSREQCALLBACK` before `lib/fs.js` has even assigned `oncomplete`. Emitting it
+/// here rather than in the constructor is the same resource with the same
+/// trigger, because `lib/fs.js` calls the binding synchronously right after
+/// `new FSReqCallback()` — the execution id has not changed in between.
 pub fn deliver_to_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     request: Local<'s, v8::Object>,
@@ -150,8 +174,13 @@ pub fn deliver_to_callback<'s>(
     // Root the payload and the request before the scope goes away.
     let request = v8::Global::new(scope.as_ref(), request);
     let payload = root(scope, completion);
+    let context = begin_request(scope, &request);
 
-    let boxed = Box::new(CallbackDelivery { request, payload });
+    let boxed = Box::new(CallbackDelivery {
+        request,
+        payload,
+        context,
+    });
     let pointer = Box::into_raw(boxed);
     let external = v8::External::new(scope, pointer.cast());
     let template = rn_core::class(callback_trampoline)
@@ -168,6 +197,57 @@ pub fn deliver_to_callback<'s>(
     };
 
     scope.as_mut().enqueue_microtask(function);
+}
+
+/// Creates and emits the `FSREQCALLBACK` resource for a request object.
+///
+/// The ids are written onto the object under `async_id_symbol` and
+/// `trigger_async_id_symbol` as well as returned, because both readers exist:
+/// `lib/fs.js`'s `bindSignalToReq` and the `destroy` bookkeeping read them, and
+/// `node --expose-internals`'s `getAsyncId()` path does too.
+///
+/// A request whose ids are already present is *not* reset: `lib/fs.js` reuses
+/// the `FSReqCallback` it constructed for the whole `open`/`fstat`/`read`
+/// sequence of a chunked `readFile`, and each of those is a separate Node
+/// request. `classify` hands the same object back for each, so the reset has to
+/// happen per call — which is what Node's `ReqWrap::Dispatch` does not do either:
+/// it constructs a *new* `FSReqCallback` per step. Here the object is reused, so
+/// the reset is what makes each step its own `init`.
+fn begin_request(
+    scope: &mut v8::PinScope<'_, '_>,
+    request: &v8::Global<v8::Object>,
+) -> rn_core::callback_scope::AsyncContext {
+    let object = v8::Local::new(scope, request);
+    let (async_id, trigger_async_id) = rn_bind_async_wrap::emit_init_for_new_resource(
+        scope,
+        object,
+        rn_core::async_wrap::PROVIDER_FSREQCALLBACK,
+    )
+    .unwrap_or((rn_core::INVALID_ASYNC_ID, rn_core::INVALID_ASYNC_ID));
+
+    // `AsyncWrap::object()->Set(async_id_symbol, ...)` is what
+    // `getAsyncId()`-style readers on the JS side expect; the symbols come from
+    // the shared table so an id read back is the one the hook saw.
+    if let (Ok(id_key), Ok(trigger_key)) = (
+        rn_bind_symbols::ensure(scope, "async_id_symbol", "async_id_symbol"),
+        rn_bind_symbols::ensure(scope, "trigger_async_id_symbol", "trigger_async_id_symbol"),
+    ) {
+        object.set(
+            scope,
+            id_key.into(),
+            v8::Number::new(scope, async_id).into(),
+        );
+        object.set(
+            scope,
+            trigger_key.into(),
+            v8::Number::new(scope, trigger_async_id).into(),
+        );
+    }
+
+    rn_core::callback_scope::AsyncContext {
+        async_id,
+        trigger_async_id,
+    }
 }
 
 fn callback_trampoline(
@@ -229,24 +309,44 @@ fn callback_trampoline(
         }
     };
 
+    // `req_wrap->MakeCallback(oncomplete_string, argc, argv)` is what Node calls
+    // (`src/node_file.cc:738`), and `MakeCallback` is what pushes the request's
+    // async context and emits `before`/`after`. A bare `Function::Call` runs the
+    // handler at whatever id happened to be current, so the `init` this request
+    // emitted would never be followed by a `before` and `init-hooks.js`'s
+    // `sanityCheck` reports the activity as unbalanced.
+    let callback = v8::Global::new(scope.as_ref(), handler);
+    let resource = v8::Global::new(scope.as_ref(), request);
     let receiver: Local<v8::Value> = request.into();
-    // A throw here is uncaught: the completion runs inside `uv_run`, where
-    // nothing above it can handle one. Node's `MakeCallback` wraps the call in a
-    // `TryCatch` and routes a throw through `TriggerUncaughtException`, which is
-    // what tells `process` first and sets a non-zero exit code when it declines.
-    // Ignoring the result instead lets V8 print the error and exit 0.
-    let caught = {
-        let try_catch = std::pin::pin!(v8::TryCatch::new(&mut *scope));
-        let inner = &mut try_catch.init();
-        let _ = handler.call(inner, receiver, &arguments);
-        inner
-            .exception()
-            .map(|exception| v8::Global::new(inner, exception))
-    };
-    if let Some(caught) = caught {
-        let exception = Local::new(&*scope, &caught);
-        rn_errors::report_uncaught_exception(scope, exception);
-    }
+    let receiver = v8::Global::new(scope.as_ref(), receiver);
+    let rooted: Vec<v8::Global<v8::Value>> = arguments
+        .iter()
+        .map(|argument| v8::Global::new(scope.as_ref(), *argument))
+        .collect();
+
+    let result = rn_core::callback_scope::with_scope(
+        scope,
+        rn_core::callback_scope::ScopeArgs {
+            context: delivery.context,
+            resource: Some(resource),
+            frame: None,
+        },
+        |scoped| {
+            let callback: Local<v8::Function> = Local::new(scoped, &callback);
+            let receiver = Local::new(scoped, &receiver);
+            let arguments: Vec<Local<v8::Value>> = rooted
+                .iter()
+                .map(|argument| Local::new(scoped, argument))
+                .collect();
+            let _ = callback.call(scoped, receiver, &arguments);
+        },
+    );
+
+    // `FSReqBase::~FSReqBase` calls `EmitDestroy`, and it runs as the request
+    // wrap is released after the callback. `with_scope` reports a throw itself
+    // and still returns, so the destroy is emitted either way.
+    let _ = result;
+    rn_bind_async_wrap::emit_destroy(delivery.context.async_id);
 }
 
 /// Delivers `completion` by settling a promise created now.
@@ -254,6 +354,19 @@ fn callback_trampoline(
 /// Promise mode settles immediately: the promise is returned to JavaScript
 /// before the script continues, and V8 queues the `then` callbacks itself, so the
 /// ordering guarantee holds without a microtask of our own.
+///
+/// The promise is not the async resource Node reports for this call. A
+/// `kUsePromises` binding call constructs an `FSReqPromise`, which is
+/// `AsyncWrap(env, obj, PROVIDER_FSREQPROMISE)` (`src/node_file-inl.h:219-223`),
+/// and only *that* object is resolved — so `fs.promises.stat` reports
+/// `FSREQPROMISE` and not merely the `PROMISE` V8 emits for the promise itself.
+/// `Resolve`/`Reject` settle it inside an `InternalCallbackScope`, so the wrap
+/// gets a matching `before`/`after` pair, and the wrap is destroyed as the
+/// completion returns.
+///
+/// The resource object is a plain object, which is also what Node hands over:
+/// `FSReqPromise::New` allocates one and attaches the resolver to it as the
+/// `promise` property.
 pub fn deliver_to_promise<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     completion: Completion<'s>,
@@ -261,7 +374,57 @@ pub fn deliver_to_promise<'s>(
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
 
-    match completion.payload {
+    // The resolver is rooted because the settle runs inside a scope of a
+    // different lifetime and needs to reach the promise it belongs to.
+    let resolver = v8::Global::new(scope.as_ref(), resolver);
+    let resource = v8::Object::new(scope);
+    let async_id = rn_bind_async_wrap::emit_init_for_new_resource(
+        scope,
+        resource,
+        rn_core::async_wrap::PROVIDER_FSREQPROMISE,
+    );
+    let resource = v8::Global::new(scope.as_ref(), resource);
+    let context = async_id.map(|(async_id, trigger_async_id)| {
+        rn_core::callback_scope::AsyncContext {
+            async_id,
+            trigger_async_id,
+        }
+    });
+
+    // `InternalCallbackScope callback_scope(this)` around the settle, which is
+    // what makes the `FSREQPROMISE` id the one executing while `then` handlers
+    // are queued.
+    let payload = root(scope, completion);
+    let settle = |scoped: &mut v8::PinScope<'_, '_>, payload: Result<Rooted, Failure>| {
+        let resolver: v8::Local<v8::PromiseResolver> = v8::Local::new(scoped, &resolver);
+        settle_promise(scoped, resolver, payload);
+    };
+    match context {
+        Some(context) => {
+            let _ = rn_core::callback_scope::with_scope(
+                scope,
+                rn_core::callback_scope::ScopeArgs {
+                    context,
+                    resource: Some(resource),
+                    frame: None,
+                },
+                |scoped| settle(scoped, payload),
+            );
+            rn_bind_async_wrap::emit_destroy(context.async_id);
+        }
+        None => settle(scope, payload),
+    }
+
+    Some(promise)
+}
+
+/// `FSReqPromise::Resolve` / `Reject`: settle the promise with the payload.
+fn settle_promise<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    resolver: Local<'s, v8::PromiseResolver>,
+    payload: Result<Rooted, Failure>,
+) {
+    match payload {
         Err(Failure::Syscall(error)) => {
             if let Some(object) = error_object(scope, &error) {
                 resolver.reject(scope, object);
@@ -271,21 +434,22 @@ pub fn deliver_to_promise<'s>(
             let value = error.to_value(scope);
             resolver.reject(scope, value);
         }
-        Ok(Payload::Unit) => {
+        Ok(Rooted::Unit) => {
             resolver.resolve(scope, v8::undefined(scope).into());
         }
-        Ok(Payload::Value(value)) => {
+        Ok(Rooted::Value(value)) => {
+            let value = Local::<v8::Value>::new(&*scope, &value);
             resolver.resolve(scope, value);
         }
-        Ok(Payload::Pair(first, second)) => {
+        Ok(Rooted::Pair(first, second)) => {
             // `fs.mkstemp` destructures the pair, and promise mode must give it
             // the same shape the callback form delivers.
+            let first = Local::<v8::Value>::new(&*scope, &first);
+            let second = Local::<v8::Value>::new(&*scope, &second);
             let array = v8::Array::new_with_elements(scope, &[first, second]);
             resolver.resolve(scope, array.into());
         }
     }
-
-    Some(promise)
 }
 
 #[cfg(test)]

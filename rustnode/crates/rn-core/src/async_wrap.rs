@@ -24,6 +24,13 @@ pub const PROVIDER_NONE: u32 = 0;
 pub const PROVIDER_TCPSERVERWRAP: u32 = 41;
 /// `PROVIDER_TCPWRAP`: a connected socket.
 pub const PROVIDER_TCPWRAP: u32 = 42;
+/// `PROVIDER_TCPCONNECTWRAP`: one `uv_tcp_connect` request.
+///
+/// `TCPWrap::Connect` constructs a fresh `ConnectWrap` per attempt with this
+/// provider (`src/tcp_wrap.cc:588`), and it is the *request*, not the socket,
+/// that carries the type. A connecting socket's `TCPWRAP` comes from the handle
+/// itself, so `net.connect` reports both.
+pub const PROVIDER_TCPCONNECTWRAP: u32 = 40;
 /// `PROVIDER_TTYWRAP`: a terminal.
 pub const PROVIDER_TTYWRAP: u32 = 43;
 /// `PROVIDER_PIPECONNECTWRAP`: a pipe connect request.
@@ -53,6 +60,47 @@ pub const PROVIDER_TLSWRAP: u32 = 68;
 /// Counted from `NONE` in `NODE_ASYNC_NON_CRYPTO_PROVIDER_TYPES`, which is the
 /// same table the `TCPWRAP`/`TCPSERVERWRAP` pair above is checked against.
 pub const PROVIDER_STATWATCHER: u32 = 38;
+
+/// `PROVIDER_FSREQCALLBACK`: an `FSReqCallback`-based `fs` request.
+///
+/// Emitted by every callback-form `fs` binding call, by `FileHandle` reads, and
+/// by the `ReadFileJob`/`WriteFileJob` classes.
+pub const PROVIDER_FSREQCALLBACK: u32 = 8;
+/// `PROVIDER_FSREQPROMISE`: the `FSReqPromise` a `kUsePromises` call creates.
+pub const PROVIDER_FSREQPROMISE: u32 = 10;
+/// `PROVIDER_FILEHANDLE`: the `FileHandle` behind `fs.promises.open`.
+pub const PROVIDER_FILEHANDLE: u32 = 4;
+/// `PROVIDER_FILEHANDLECLOSEREQ`: the request `FileHandle.prototype.close`
+/// schedules.
+pub const PROVIDER_FILEHANDLECLOSEREQ: u32 = 5;
+/// `PROVIDER_DNSCHANNEL`: the resolver channel `dns.lookup` creates lazily.
+pub const PROVIDER_DNSCHANNEL: u32 = 2;
+/// `PROVIDER_GETADDRINFOREQWRAP`: one `getaddrinfo` request.
+pub const PROVIDER_GETADDRINFOREQWRAP: u32 = 11;
+/// `PROVIDER_GETNAMEINFOREQWRAP`: one `getnameinfo` request.
+pub const PROVIDER_GETNAMEINFOREQWRAP: u32 = 12;
+/// `PROVIDER_QUERYWRAP`: one c-ares DNS query.
+pub const PROVIDER_QUERYWRAP: u32 = 30;
+/// `PROVIDER_WORKER`: the `Worker` handle behind `new Worker(...)`.
+pub const PROVIDER_WORKER: u32 = 47;
+/// `PROVIDER_ZLIB`: a `Zlib` stream handle.
+pub const PROVIDER_ZLIB: u32 = 54;
+/// `PROVIDER_MESSAGEPORT`: a `MessagePort`.
+pub const PROVIDER_MESSAGEPORT: u32 = 24;
+/// `PROVIDER_PROCESSWRAP`: a child process's `uv_process_t`.
+pub const PROVIDER_PROCESSWRAP: u32 = 28;
+/// `PROVIDER_SHUTDOWNWRAP`: the request that closes a child's stdio.
+pub const PROVIDER_SHUTDOWNWRAP: u32 = 36;
+/// `PROVIDER_SIGNALWRAP`: a `uv_signal_t`.
+pub const PROVIDER_SIGNALWRAP: u32 = 37;
+/// `PROVIDER_RANDOMBYTESREQUEST`: one `crypto.randomBytes` job.
+pub const PROVIDER_RANDOMBYTESREQUEST: u32 = 64;
+/// `PROVIDER_PBKDF2REQUEST`: one `crypto.pbkdf2` job.
+pub const PROVIDER_PBKDF2REQUEST: u32 = 56;
+/// `PROVIDER_HTTPCLIENTREQUEST`: the parser behind a client request.
+pub const PROVIDER_HTTPCLIENTREQUEST: u32 = 19;
+/// `PROVIDER_HTTPINCOMINGMESSAGE`: the connection a server parses.
+pub const PROVIDER_HTTPINCOMINGMESSAGE: u32 = 18;
 
 /// The `AsyncWrap` fields of a wrapped handle.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -133,8 +181,34 @@ mod tests {
         // wrap with the wrong kind while still looking like a working id.
         assert_eq!(PROVIDER_TCPSERVERWRAP, 41);
         assert_eq!(PROVIDER_TCPWRAP, 42);
+        assert_eq!(PROVIDER_TCPCONNECTWRAP, 40);
         assert_eq!(PROVIDER_STATWATCHER, 38);
         assert_eq!(PROVIDER_TLSWRAP, 68);
         assert_eq!(PROVIDER_NONE, 0);
+    }
+
+    #[test]
+    fn the_request_and_job_provider_ids_match_the_async_wrap_table() {
+        // The providers the resource wrappers this crate does not own name. Each
+        // one is a position in `NODE_ASYNC_PROVIDER_TYPES`, and a wrong number
+        // makes `async_hooks` label a resource with a *different* valid name,
+        // which no test that only checks "an init fired" would notice.
+        assert_eq!(PROVIDER_FSREQCALLBACK, 8);
+        assert_eq!(PROVIDER_FSREQPROMISE, 10);
+        assert_eq!(PROVIDER_FILEHANDLE, 4);
+        assert_eq!(PROVIDER_FILEHANDLECLOSEREQ, 5);
+        assert_eq!(PROVIDER_DNSCHANNEL, 2);
+        assert_eq!(PROVIDER_GETADDRINFOREQWRAP, 11);
+        assert_eq!(PROVIDER_GETNAMEINFOREQWRAP, 12);
+        assert_eq!(PROVIDER_QUERYWRAP, 30);
+        assert_eq!(PROVIDER_ZLIB, 54);
+        assert_eq!(PROVIDER_MESSAGEPORT, 24);
+        assert_eq!(PROVIDER_PROCESSWRAP, 28);
+        assert_eq!(PROVIDER_SHUTDOWNWRAP, 36);
+        assert_eq!(PROVIDER_SIGNALWRAP, 37);
+        assert_eq!(PROVIDER_RANDOMBYTESREQUEST, 64);
+        assert_eq!(PROVIDER_PBKDF2REQUEST, 56);
+        assert_eq!(PROVIDER_HTTPCLIENTREQUEST, 19);
+        assert_eq!(PROVIDER_HTTPINCOMINGMESSAGE, 18);
     }
 }

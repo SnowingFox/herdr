@@ -609,6 +609,85 @@ pub fn push_top_level_context(scope: &mut v8::PinScope<'_, '_>) {
     });
 }
 
+/// `AsyncWrap::AsyncReset` for a resource that is not a long-lived handle.
+///
+/// `FSReqCallback`, `ReadFileJob`, `ZLIB`, `MESSAGEPORT`, the DNS request wraps
+/// and the crypto job classes are all `AsyncWrap` subclasses, but none of them
+/// owns a libuv stream whose state this crate could reach, so they have no
+/// `AsyncWrapState` field to update across calls. Each of them is created once
+/// and destroyed once, which is the constructor half of `AsyncReset`:
+///
+/// ```text
+/// async_id_ = env()->new_async_id();
+/// trigger_async_id_ = env()->get_default_trigger_async_id();
+/// EmitAsyncInit(env(), object, provider_string(provider_type_),
+///               async_id_, trigger_async_id_);
+/// ```
+///
+/// (`src/async_wrap.cc:607-631`). There is no prior id on a fresh object, so the
+/// `EmitDestroy` at the top of the C++ method has nothing to do, and `resource`
+/// is always the object itself, so no `resource_symbol` write is needed.
+///
+/// The returned pair is what a later `before`/`after`/`destroy` needs, and the
+/// object is *not* given an internal field by this call: the binding that owns
+/// the class keeps its own state and passes the ids back when the completion
+/// fires.
+///
+/// # Cost
+///
+/// Two array reads and a counter bump, then a hook-table lookup. With no `init`
+/// hook enabled the hook call is skipped at `emit_async_init`'s first check, so
+/// an untraced process pays only the counter. That is the same short circuit
+/// Node's `AsyncWrap` constructor takes, and it is why every one of these paths
+/// may be called per operation.
+pub fn emit_init_for_new_resource(
+    scope: &mut v8::PinScope<'_, '_>,
+    object: v8::Local<v8::Object>,
+    provider: u32,
+) -> Option<(f64, f64)> {
+    let async_id = next_async_id();
+    let trigger_async_id = default_trigger_async_id();
+    emit_async_init(scope, object, provider, async_id, trigger_async_id);
+    Some((async_id, trigger_async_id))
+}
+
+/// Runs `body` with `kDefaultTriggerAsyncId` set to `async_id`.
+///
+/// `AsyncHooks::DefaultTriggerAsyncIdScope` (`src/env.h:520-545`). Node uses it
+/// wherever a resource is created on behalf of a *specific* other resource
+/// rather than whatever happens to be executing: a connect request belongs to
+/// its socket, an accepted child pipe belongs to its server, a DNS query belongs
+/// to its channel. Without it the child inherits `executionAsyncId()`, which is
+/// only the same value by accident.
+///
+/// `kInvalidAsyncId` skips the write, exactly as Node's constructor does with
+/// its `if (default_trigger_async_id == -1) return;` — a resource with no id yet
+/// must not become everyone's trigger.
+pub fn with_default_trigger_async_id<R>(
+    async_id: f64,
+    body: impl FnOnce() -> R,
+) -> R {
+    if async_id == INVALID_ASYNC_ID {
+        return body();
+    }
+    let saved = STATE.with(|state| {
+        let state = state.borrow();
+        let state = state.as_ref()?;
+        let previous = state.id_fields.get_float(UID_FIELDS[3].1)?;
+        state.id_fields.set_float(UID_FIELDS[3].1, async_id);
+        Some(previous)
+    });
+    let result = body();
+    if let Some(saved) = saved {
+        STATE.with(|state| {
+            if let Some(state) = state.borrow().as_ref() {
+                state.id_fields.set_float(UID_FIELDS[3].1, saved);
+            }
+        });
+    }
+    result
+}
+
 /// `AsyncHooks::provider_string`: the name `init` receives for a provider id.
 ///
 /// Node keeps one internalized string per provider in `IsolateData` and indexes
