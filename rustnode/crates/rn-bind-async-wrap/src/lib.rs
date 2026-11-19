@@ -290,8 +290,32 @@ thread_local! {
         })
     };
     /// The `execution_async_resources` array, which holds one resource object
-    /// per stack entry that has a JavaScript-visible resource.
+    /// per stack entry that a *JavaScript* push put there.
+    ///
+    /// Node's `js_execution_async_resources_`. Only `lib/internal/async_hooks.js`
+    /// writes it — `pushAsyncContext` when the inline stack is full, and
+    /// `emitBeforeScript` for an `AsyncResource.runInAsyncScope` — so a native
+    /// callback never touches it. The native `push_async_context` fills
+    /// [`NATIVE_RESOURCES`] instead, and `executionAsyncResource()` falls through
+    /// to the native accessor for any index the array does not cover. Writing
+    /// this array from the native path made every scoped callback a V8 keyed
+    /// store, which measured as a real throughput loss on the HTTP path.
     static RESOURCES: RefCell<Option<v8::Global<v8::Array>>> = const { RefCell::new(None) };
+    /// `AsyncHooks::native_execution_async_resources_`: one resource per stack
+    /// entry, in stack order.
+    ///
+    /// This is what `AsyncWrap::ExecutionAsyncResource` answers from, and it is a
+    /// Rust `Vec` rather than a JavaScript array for the reason Node's is a
+    /// `std::deque`: pushing onto the stack happens on every callback in the
+    /// process, so it must not touch V8's heap.
+    ///
+    /// Node's container is `std::deque<std::variant<Local<Object>*,
+    /// Global<Object>*>>` — a *borrowed pointer* in the common case, never a copy
+    /// of the handle. [`NativeResource`] is that variant, and borrowing is what
+    /// makes a push allocation-free for a caller that already roots its resource
+    /// (which every `AsyncWrap` subclass does).
+    static NATIVE_RESOURCES: RefCell<Vec<Option<NativeResource>>> =
+        const { RefCell::new(Vec::new()) };
 
     /// `Environment::destroy_async_id_list()`: ids whose `destroy` hook has not
     /// been called yet.
@@ -314,6 +338,39 @@ struct State {
     hook_fields: AliasedUint8Array,
     id_fields: AliasedUint8Array,
     ids_stack: AliasedUint8Array,
+}
+
+/// One entry of `native_execution_async_resources_`.
+///
+/// Node's is `std::variant<v8::Local<v8::Object>*, v8::Global<v8::Object>*>`: a
+/// *pointer to a handle* the caller already owns. The push path stores the
+/// caller's own `Global` by reference, which is why Node's native push allocates
+/// nothing on the hot path — a `Global::new` per callback was measurable here.
+///
+/// The variant exists for the one caller whose handle does not outlive the push:
+/// a JS-side `pushAsyncContext` with a resource only the current scope holds. That
+/// case owns its handle, which is `Owned`.
+enum NativeResource {
+    /// Borrowed from the caller, which guarantees it outlives the pop.
+    Borrowed(*const v8::Global<v8::Object>),
+    /// Owned because nothing else roots it.
+    Owned(v8::Global<v8::Object>),
+}
+
+impl NativeResource {
+    /// The object this entry answers, materialized in `scope`.
+    fn to_local<'s>(&self, scope: &mut v8::PinScope<'s, '_>) -> Option<v8::Local<'s, v8::Object>> {
+        match self {
+            // SAFETY: a borrowed entry is written by `push_context` with a pointer
+            // to a `Global` its caller keeps alive until the matching pop, and
+            // `pop_context` drops the entry before that. Nothing reads an entry at
+            // or beyond the current depth.
+            Self::Borrowed(pointer) => {
+                unsafe { pointer.as_ref() }.map(|resource| v8::Local::new(&*scope, resource))
+            }
+            Self::Owned(resource) => Some(v8::Local::new(&*scope, resource)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -576,20 +633,23 @@ pub fn default_trigger_async_id() -> f64 {
 /// opened before any hook could be registered.
 pub fn push_top_level_context(scope: &mut v8::PinScope<'_, '_>) {
     // `InternalCallbackScope` is constructed with `Object::New(isolate)` as the
-    // scope's resource and hands it to `push_async_context`, which stores it in
+    // scope's resource and hands it to `push_async_context`, which Node stores in
     // `native_execution_async_resources_[0]`. `executionAsyncResource()` then
     // answers that object for the whole script body — it is what makes the
     // top-level call in `test-async-hooks-execution-async-resource.js` truthy.
     //
-    // The JS `executionAsyncResource()` reads `execution_async_resources[index]`
-    // first and only falls back to the native accessor, so putting the object
-    // in the shared array covers both readers.
+    // It goes in the native vector for the same reason every other native push
+    // does; the JavaScript array is only for what JavaScript pushes.
     let resource = v8::Object::new(scope);
-    RESOURCES.with(|slot| {
-        if let Some(resources) = slot.borrow().as_ref() {
-            let resources = v8::Local::new(scope, resources);
-            resources.set_index(scope, 0, resource.into());
+    NATIVE_RESOURCES.with(|slot| {
+        let mut resources = slot.borrow_mut();
+        if resources.is_empty() {
+            resources.push(None);
         }
+        resources[0] = Some(NativeResource::Owned(v8::Global::new(
+            scope.as_ref(),
+            resource,
+        )));
     });
     STATE.with(|state| {
         let state = state.borrow();
@@ -797,9 +857,40 @@ impl rn_core::callback_scope::CallbackScopeHooks for ScopeHooks {
 /// `AsyncHooks::push_async_context` (`src/env.cc:133`) stores the *outgoing*
 /// pair so the matching pop restores it, then installs the incoming one.
 fn push_context(
-    scope: &mut v8::PinScope<'_, '_>,
+    _scope: &mut v8::PinScope<'_, '_>,
     context: rn_core::callback_scope::AsyncContext,
     resource: Option<&v8::Global<v8::Object>>,
+) {
+    push_context_entry(
+        context,
+        resource.map(|resource| NativeResource::Borrowed(resource as *const _)),
+    );
+}
+
+/// [`push_context`] for a resource only this scope holds.
+///
+/// Every `with_scope` caller roots its resource for the length of the callback, so
+/// [`push_context`] can borrow it. A JS-visible promise pushed from
+/// `PromiseRejectCallback` has no such owner — the handle is made here — so the
+/// entry owns it instead.
+fn push_context_owned(
+    scope: &mut v8::PinScope<'_, '_>,
+    context: rn_core::callback_scope::AsyncContext,
+    resource: Option<v8::Local<'_, v8::Object>>,
+) {
+    let owned =
+        resource.map(|resource| NativeResource::Owned(v8::Global::new(scope.as_ref(), resource)));
+    push_context_entry(context, owned);
+}
+
+/// The shared body: advance the id stack, then record `resource` at that depth.
+///
+/// Deliberately takes no scope. Everything here is the shared id arrays and a
+/// `Vec` slot, which is what lets a callback's push stay off V8's heap: the only
+/// V8 call was rooting the resource, and a borrowed entry does not need it.
+fn push_context_entry(
+    context: rn_core::callback_scope::AsyncContext,
+    resource: Option<NativeResource>,
 ) {
     if !context.is_resource() {
         return;
@@ -835,15 +926,21 @@ fn push_context(
     let Some(offset) = offset else {
         return;
     };
-    if let Some(resource) = resource {
-        let local = v8::Local::new(scope, resource);
-        RESOURCES.with(|slot| {
-            if let Some(resources) = slot.borrow().as_ref() {
-                let resources = v8::Local::new(scope, resources);
-                resources.set_index(scope, offset as u32, local.into());
-            }
-        });
-    }
+    // `native_execution_async_resources_[offset] = resource`. Node's native push
+    // fills its C++ container and never touches the JavaScript array — see the
+    // note on `RESOURCES`.
+    //
+    // The entry borrows the caller's handle rather than rooting it. That is Node's
+    // `std::variant<Local<Object>*, Global<Object>*>`: the caller (`with_scope`)
+    // holds the `Global` for the whole callback, so a pointer is enough, and the
+    // matching `pop_context` clears the entry before that borrow ends.
+    NATIVE_RESOURCES.with(|slot| {
+        let mut resources = slot.borrow_mut();
+        if resources.len() <= offset {
+            resources.resize_with(offset + 1, || None);
+        }
+        resources[offset] = resource;
+    });
 }
 
 /// Pops the innermost async context, restoring the pair it saved.
@@ -875,23 +972,32 @@ fn pop_context(scope: &mut v8::PinScope<'_, '_>, expected: f64) {
     }) else {
         return;
     };
-    // `js_execution_async_resources()->Set(length, offset)` — the JS array's
-    // `length` is the shadow of the stack depth, and `executionAsyncResource()`
-    // reads `execution_async_resources[index]` directly, so the stale entry has
-    // to go for the same reason.
+    // The native vector is deliberately **not** emptied here. Every push writes
+    // the slot for its own depth — including writing "no resource" explicitly —
+    // so a stale entry can never be read for a frame that has already returned,
+    // and leaving the slot alone lets the next push at this depth skip its
+    // `v8::Global` entirely (see `push_context`). Nothing reads a slot at or
+    // beyond the current depth: `execution_async_resource` is only ever handed
+    // `kStackLength - 1`, which is a live frame.
     //
-    // The write is unconditional: `length` is the shadow of the stack depth, and
-    // a push with no resource leaves the array shorter than the depth, so a
-    // "only when it shrinks" test would leave the two disagreeing. Node's pop
-    // (`execution_async_resources.pop()` in `lib/internal/async_hooks.js`) pops
-    // one entry whatever the depth was; assigning the depth is what keeps the
-    // two paths agreeing.
-    RESOURCES.with(|slot| {
-        if let Some(resources) = slot.borrow().as_ref() {
-            let resources = v8::Local::new(scope, resources);
-            truncate_array(scope, resources, offset as u32);
-        }
+    // `if (js_execution_async_resources()->Length() > offset)`, `[unlikely]`:
+    // the JavaScript array is only longer than the depth when JavaScript itself
+    // pushed a resource there, so a native pop normally skips V8 entirely. That
+    // guard is what keeps the pop off the per-callback path.
+    let needs_truncate = RESOURCES.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|resources| v8::Local::new(scope, resources).length() > offset as u32)
+            .unwrap_or(false)
     });
+    if needs_truncate {
+        RESOURCES.with(|slot| {
+            if let Some(resources) = slot.borrow().as_ref() {
+                let resources = v8::Local::new(scope, resources);
+                truncate_array(scope, resources, offset as u32);
+            }
+        });
+    }
 }
 
 /// Sets `array.length = length` without allocating a key string.
@@ -1191,14 +1297,13 @@ pub fn push_promise_context(
     trigger_async_id: f64,
     promise: Option<v8::Local<'_, v8::Object>>,
 ) {
-    let resource = promise.map(|promise| v8::Global::new(scope, promise));
-    push_context(
+    push_context_owned(
         scope,
         rn_core::callback_scope::AsyncContext {
             async_id,
             trigger_async_id,
         },
-        resource.as_ref(),
+        promise,
     );
 }
 
@@ -1214,28 +1319,44 @@ pub fn promise_context_is_pushable(async_id: f64, trigger_async_id: f64) -> bool
 
 fn execution_async_resource(
     scope: &mut v8::PinScope<'_, '_>,
-    _args: v8::FunctionCallbackArguments<'_>,
+    args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    // The top of the stack is the currently executing resource. Node returns
-    // the resource it stored for that entry, or `undefined` when there is none,
-    // which is the state before any async operation starts.
-    let index = STATE.with(|state| {
-        state
-            .borrow()
-            .as_ref()
-            .and_then(|state| state.hook_fields.get(7))
-            .unwrap_or(0) as usize
-    });
-    let resource = RESOURCES.with(|slot| {
-        let resources = slot.borrow();
-        let resources = resources.as_ref()?;
-        let resources = v8::Local::new(scope, resources);
-        if index == 0 {
-            return None;
-        }
-        resources.get_index(scope, index as u32 - 1)
-    });
+    // `AsyncWrap::ExecutionAsyncResource` takes the index from `args[0]`, which
+    // `lib/internal/async_hooks.js` passes as `kStackLength - 1` — an already
+    // 0-based stack index. Computing it from the stack length instead would
+    // double-decrement and answer the wrong frame.
+    let index = match args.get(0).uint32_value(scope) {
+        Some(index) => index as usize,
+        None => return,
+    };
+    // `execution_async_resources[index] || executionAsyncResource_(index)` in
+    // `lib/internal/async_hooks.js`: the JavaScript array first, then the native
+    // vector. The array only holds what JavaScript pushed, so the native vector
+    // is what answers for a callback's own frame.
+    let resource: Option<v8::Local<v8::Value>> = RESOURCES
+        .with(|slot| {
+            let resources = slot.borrow();
+            let resources = resources.as_ref()?;
+            let resources = v8::Local::new(scope, resources);
+            // A hole reads back as `Some(undefined)` rather than `None`, so the
+            // fall-through to the native vector has to be a value test. That is
+            // also Node's `execution_async_resources[index] ||` — an empty slot is
+            // falsy and the native accessor answers instead.
+            resources
+                .get_index(scope, index as u32)
+                .filter(|value| !value.is_undefined())
+        })
+        .or_else(|| {
+            NATIVE_RESOURCES.with(|slot| {
+                let resources = slot.borrow();
+                resources
+                    .get(index)
+                    .and_then(|resource| resource.as_ref())
+                    .and_then(|resource| resource.to_local(scope))
+                    .map(Into::into)
+            })
+        });
     match resource {
         Some(resource) => rv.set(resource),
         None => rv.set(v8::undefined(scope).into()),
@@ -1484,11 +1605,23 @@ fn clear_async_id_stack(
     // (`src/env.cc:232-237`). Only the depth was reset here, so a fatal
     // exception left the execution id pointing at a resource whose callback had
     // already unwound.
+    //
+    // The resource stores are cleared with it, which Node does on the same path
+    // (`native_execution_async_resources_.clear()` and the JS array's `length =
+    // 0`): leaving them would answer `executionAsyncResource()` with a frame
+    // that no longer exists.
     STATE.with(|state| {
         if let Some(state) = state.borrow().as_ref() {
             state.hook_fields.set(HOOK_FIELDS[7].1, 0);
             state.id_fields.set_float(UID_FIELDS[0].1, 0.0);
             state.id_fields.set_float(UID_FIELDS[1].1, 0.0);
+        }
+    });
+    NATIVE_RESOURCES.with(|slot| slot.borrow_mut().clear());
+    RESOURCES.with(|slot| {
+        if let Some(resources) = slot.borrow().as_ref() {
+            let resources = v8::Local::new(scope, resources);
+            truncate_array(scope, resources, 0);
         }
     });
 }
