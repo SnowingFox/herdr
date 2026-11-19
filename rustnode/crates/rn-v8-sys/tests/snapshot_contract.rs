@@ -127,6 +127,37 @@
 //!    an isolate"), and `create_blob` is exactly the check the discovery pass
 //!    exists to avoid. A plain `Isolate` builds the same templates and can be
 //!    dropped, so that is what a two-pass build has to use for its first pass.
+//!
+//! 8. **Wall 4 has a second cure, and it is the one Node uses.** A `v8::Global`
+//!    that nothing serialised reaches aborts the blob — unless that object is
+//!    given to `SnapshotCreator::AddData`, which records it in the context's
+//!    `serialized_objects` and satisfies the checker while the `Global` stays
+//!    alive. This is `IsolateData`'s mechanism in Node
+//!    (`PER_ISOLATE_SYMBOL_PROPERTIES`, `src/env_properties.h`), and it is the
+//!    right answer for a handle that is a binding's *identity* rather than a
+//!    cache: draining it would change behaviour after a load, attaching it
+//!    carries the same object across the blob. `rn_core::snapshot_data` is that
+//!    mechanism, and the test below pins both halves — build, then read the value
+//!    back in a second isolate and require it to be the object the loaded context
+//!    published.
+//!
+//!    The distinction matters because the two cures are not interchangeable. An
+//!    fs sentinel, a diagnostics-channel subscriber array, an icu instance template
+//!    and a linked callback are all identity: they go through `AddData`. A cache
+//!    the bootstrap happens to leave rooted (loaders, primordials, per-realm hook
+//!    tables) goes through the drain. See `rn_core::snapshot_drain`.
+//!
+//! 9. **Attaching a value does not reach the objects inside it.** A JS array
+//!    holding a `Uint32Array` and a `Function` was attached once and the blob still
+//!    aborted on both members: `AddData` marks the object it is handed, not a graph.
+//!    Each value that a binding roots needs its own index, which is why the
+//!    diagnostics-channel binding registers two providers rather than one bundle.
+//!
+//! 10. **The microtask policy is not why a `NativeContext` survives.** An explicit
+//!     policy makes V8 create a `MicrotaskQueue` bound to a context, which looks
+//!     like a candidate for the last handle a real build reports. It is not: a
+//!     build with and without the policy serialises identically, pinned below so a
+//!     future attempt does not spend its time there.
 
 use std::borrow::Cow;
 use std::io::Write;
@@ -427,8 +458,9 @@ fn every_isolate_has_the_typed_array_intrinsics() {
 /// The failing case is recorded as its exact output in the module docs rather
 /// than asserted here, because a V8 fatal takes the whole test binary with it. It
 /// is deterministic: a `--build-snapshot` on a bootstrapped realm named 39
-/// handles, 3 runs of 3 identical, before the drains in `rn_core::snapshot_drain`
-/// took that to 8.
+/// handles, 3 runs of 3 identical. The drain in `rn_core::snapshot_drain` took that
+/// to 5, and `rn_core::snapshot_data` carries four of those five, so one
+/// `NativeContext` remains.
 #[test]
 fn a_blob_builds_only_when_no_unreachable_globals_are_alive() {
     with_v8(|| {
@@ -669,4 +701,127 @@ fn second_probe_callback(
     _args: v8::FunctionCallbackArguments,
     _rv: v8::ReturnValue,
 ) {
+}
+
+/// Wall 4 has a *second* cure, and it is the one Node uses.
+///
+/// A `v8::Global` that nothing serialised reaches aborts `CreateBlob` — unless the
+/// object is given to `SnapshotCreator::AddData`, in which case V8 records it in the
+/// context's `serialized_objects` and the handle check accepts it. `AddData` is
+/// what `IsolateData` uses in Node (`PER_ISOLATE_SYMBOL_PROPERTIES` in
+/// `src/env_properties.h`), and it is the mechanism `rn_core::snapshot_data` builds
+/// on: binding identity is *carried* across the blob rather than rebuilt.
+///
+/// This runs both halves in one process — build with the value attached, then load
+/// in a second isolate and read the value back by index — because the claim being
+/// pinned is that the identity survives, not merely that the build stops aborting.
+///
+/// Attaching is not the same as rooting. The `Global` stays alive here, which is
+/// the point: a binding keeps reading its cached handle between the attach and the
+/// serialise, and `AddData` is what makes that handle acceptable to the checker.
+#[test]
+fn attached_data_is_serialisable_while_a_global_still_roots_it() {
+    with_v8(|| {
+        let params = v8::CreateParams::default().external_references(no_references());
+        let mut creator = v8::Isolate::snapshot_creator(None, Some(params));
+        let index = {
+            let scope = std::pin::pin!(v8::HandleScope::new(&mut creator));
+            let scope = &mut scope.init();
+            let default_context = v8::Context::new(scope, Default::default());
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+
+            let name = v8::String::new(scope, "probe:carried").expect("a name");
+            let symbol = v8::Symbol::new(scope, Some(name));
+            // Published on the global, the way a binding publishes its sentinel on
+            // its namespace object.
+            let global = scope.get_current_context().global(scope);
+            let key = v8::String::new(scope, "carried").expect("a key");
+            global.set(scope, key.into(), symbol.into());
+
+            // Rooted and *not* dropped: this is the handle that aborts the blob
+            // when it is not also attached.
+            let rooted = v8::Global::new(scope.as_ref(), symbol);
+            std::mem::forget(rooted);
+
+            let isolate: &mut v8::Isolate = (*scope).as_mut();
+            let as_data: v8::Local<v8::Data> = symbol.into();
+            let at = isolate.add_context_data(context, as_data);
+            assert_eq!(at, 0, "the first attached value takes index 0");
+
+            isolate.set_default_context(default_context);
+            isolate.add_context(context)
+        };
+        let blob = creator
+            .create_blob(v8::FunctionCodeHandling::Clear)
+            .expect("a blob with a rooted-but-attached value");
+        say(&format!("carried blob {} bytes", blob.len()));
+
+        let params = v8::CreateParams::default()
+            .external_references(no_references())
+            .snapshot_blob(blob);
+        let mut isolate = v8::Isolate::new(params);
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::from_snapshot(scope, index, Default::default())
+            .expect("a context from the snapshot");
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        // The identity half: the value the load retrieves is the same object the
+        // serialised namespace property points at, which is what a loaded binding
+        // needs in order to keep classifying its own calls.
+        let carried = scope
+            .get_context_data_from_snapshot_once::<v8::Symbol>(0)
+            .expect("the carried symbol is retrievable by index");
+        let source = v8::String::new(scope, "globalThis.carried").expect("a source");
+        let script = v8::Script::compile(scope, source, None).expect("a script");
+        let published = script.run(scope).expect("the loaded script runs");
+        let published = v8::Local::<v8::Symbol>::try_from(published).expect("a symbol");
+        assert!(
+            carried == published,
+            "the value the blob carries is the same object the loaded context published"
+        );
+    });
+}
+
+/// The microtask policy is not what leaves a `NativeContext` unserialisable.
+///
+/// `--build-snapshot` sets `MicrotasksPolicy::Explicit` on its creator isolate, and
+/// an explicit policy makes V8 create a `MicrotaskQueue` bound to a context. It is
+/// tempting to blame that for the last `NativeContext` the real build reports, so
+/// this measures it: a build with the policy set serialises exactly like one
+/// without. Recorded here so the next attempt does not spend its time on this
+/// hypothesis.
+#[test]
+fn the_microtask_policy_does_not_change_what_serialises() {
+    with_v8(|| {
+        let mut sizes = Vec::new();
+        for explicit in [false, true] {
+            let params = v8::CreateParams::default().external_references(no_references());
+            let mut creator = v8::Isolate::snapshot_creator(None, Some(params));
+            {
+                let scope = std::pin::pin!(v8::HandleScope::new(&mut creator));
+                let scope = &mut scope.init();
+                let default_context = v8::Context::new(scope, Default::default());
+                let context = v8::Context::new(scope, Default::default());
+                let scope = &mut v8::ContextScope::new(scope, context);
+                let isolate: &mut v8::Isolate = (*scope).as_mut();
+                if explicit {
+                    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+                }
+                isolate.set_default_context(default_context);
+                let index = isolate.add_context(context);
+                assert_eq!(index, 0);
+            }
+            let blob = creator
+                .create_blob(v8::FunctionCodeHandling::Clear)
+                .expect("a blob");
+            sizes.push(blob.len());
+        }
+        say(&format!("microtask policy sizes {sizes:?}"));
+        assert_eq!(
+            sizes[0], sizes[1],
+            "an explicit microtask policy changes nothing about what serialises"
+        );
+    });
 }

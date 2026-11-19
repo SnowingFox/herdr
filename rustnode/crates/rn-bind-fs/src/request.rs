@@ -104,22 +104,38 @@ pub fn classify_slot<'s>(
 /// name is incidental, and a user-created symbol with the same description must
 /// not be mistaken for it.
 fn is_use_promises<'s>(scope: &mut v8::PinScope<'s, '_>, value: Local<'s, v8::Value>) -> bool {
-    let context = scope.get_current_context();
-    let Some(sentinel) = context.get_slot::<Sentinel>() else {
+    let Some(sentinel) = sentinel(scope) else {
         return false;
     };
-    let sentinel: Local<v8::Value> = Local::new(scope, &sentinel.0);
     value.strict_equals(sentinel)
 }
 
-/// Context-slot payload holding the sentinel symbol.
-///
-/// A V8 context slot is used rather than a global property so user JavaScript
-/// cannot overwrite the sentinel and silently change the meaning of a call.
-struct Sentinel(v8::Global<v8::Value>);
+thread_local! {
+    /// The `kUsePromises` sentinel this realm published.
+    ///
+    /// Thread-local rather than a V8 context slot, which is where it used to live.
+    /// A context slot is stored in the context's Rust-side annex, and a snapshot
+    /// build pays for it twice: the annex entry makes `CreateBlob` abort naming a
+    /// `NativeContext`, and the `Global` it held is a second root the serializer
+    /// has to be told about. A thread-local costs neither, and it is the same
+    /// lifetime the annex had — one realm per thread.
+    ///
+    /// Identity still has to survive a snapshot load, which is what
+    /// [`attach_for_snapshot`] and [`restore_from_snapshot`] are for.
+    static SENTINEL: std::cell::RefCell<Option<v8::Global<v8::Value>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
-/// Publishes the `kUsePromises` sentinel on the namespace object and records it
-/// in a context slot for `is_use_promises`.
+/// The sentinel this realm published, as a handle in `scope`.
+fn sentinel<'s>(scope: &mut v8::PinScope<'s, '_>) -> Option<Local<'s, v8::Value>> {
+    SENTINEL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|sentinel| Local::new(scope, sentinel))
+    })
+}
+
+/// Publishes the `kUsePromises` sentinel on the namespace object and remembers it.
 pub fn install_sentinel<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     namespace: Local<'s, Object>,
@@ -129,14 +145,59 @@ pub fn install_sentinel<'s>(
     let key = v8::String::new(scope, "kUsePromises")?;
     namespace.set(scope, key.into(), sentinel.into())?;
 
-    // The symbol belongs to this context, so it is rooted next to it rather than
-    // in a process-wide static.
-    let symbol: Local<v8::Value> = sentinel.into();
-    let rooted = v8::Global::new(scope.as_ref(), symbol);
-    scope
-        .get_current_context()
-        .set_slot(std::rc::Rc::new(Sentinel(rooted)));
+    let value: Local<v8::Value> = sentinel.into();
+    let rooted = v8::Global::new(scope.as_ref(), value);
+    SENTINEL.with(|slot| *slot.borrow_mut() = Some(rooted));
     Some(sentinel)
+}
+
+/// Hands the sentinel to the snapshot build so it is carried across the blob.
+///
+/// Registered with `rn_core::snapshot_data`. Attaching the symbol is what makes it
+/// serialisable at all: the namespace property alone would be reachable from the
+/// context, but the thread-local `Global` rooting it is not, and `add_context_data`
+/// is what tells V8 the object belongs in the blob. The `Global` is left in place —
+/// dropping it would make this realm's `is_use_promises` stop recognising calls
+/// between now and `CreateBlob`.
+pub fn attach_for_snapshot<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _context: Local<'s, v8::Context>,
+) -> Local<'s, v8::Data> {
+    match sentinel(scope) {
+        Some(sentinel) => sentinel.into(),
+        // A realm that never installed `fs` has no sentinel, and an absent one is
+        // not an error. `undefined` still occupies this provider's index, which is
+        // what keeps the load side's numbering aligned.
+        None => v8::undefined(scope).into(),
+    }
+}
+
+/// Puts the sentinel back from the blob, so `is_use_promises` recognises it again.
+///
+/// The symbol the load hands back is the *same object* the serialised namespace
+/// property points at, because V8 serialised one object and both references are to
+/// it. That is exactly the property `install_sentinel` establishes at build time,
+/// so a loaded realm classifies `openFileHandle(…, kUsePromises)` as a promise call
+/// rather than falling through to the callback path.
+pub fn restore_from_snapshot(
+    scope: &mut v8::PinScope<'_, '_>,
+    data: Local<'_, v8::Data>,
+) -> Result<(), String> {
+    let Some(symbol) = Local::<v8::Value>::try_from(data).ok() else {
+        return Err("the blob's fs entry is not a value".to_string());
+    };
+    if symbol.is_undefined() {
+        // This realm installed `fs` without a sentinel, which is the state
+        // `install_sentinel` refuses to produce; treat it as nothing to restore.
+        SENTINEL.with(|slot| *slot.borrow_mut() = None);
+        return Ok(());
+    }
+    if !symbol.is_symbol() {
+        return Err("the blob's fs entry is not the kUsePromises symbol".to_string());
+    }
+    let rooted = v8::Global::new(scope.as_ref(), symbol);
+    SENTINEL.with(|slot| *slot.borrow_mut() = Some(rooted));
+    Ok(())
 }
 
 /// Builds the `Error` object Node's `UVException` would have produced.

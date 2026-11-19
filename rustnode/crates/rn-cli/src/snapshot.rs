@@ -150,6 +150,11 @@ pub fn build(
         let context = v8::Context::new(scope, Default::default());
         let scope = &mut v8::ContextScope::new(scope, context);
         bootstrap(scope);
+        // Attach the state the blob must carry, before anything is drained: a
+        // provider reads the handles its crate kept during bootstrap, and the
+        // drain drops some of them.
+        let carried = rn_core::snapshot_data::attach_all(scope, context);
+        eprintln!("rustnode: attached {carried} value(s) of realm state to the blob");
         // Reached through `AsMut<Isolate>` on the scope, which is the borrow that
         // already exists; `creator` itself is borrowed by `scope`.
         let isolate: &mut v8::Isolate = (*scope).as_mut();
@@ -246,4 +251,11 @@ fn discovery_pass(
         let scope = &mut v8::ContextScope::new(scope, context);
         bootstrap(scope);
     }
+    // Collect this isolate's garbage before disposing it, so anything the
+    // bootstrap left reachable only through it is reclaimed here rather than
+    // counted against the next isolate. `low_memory_notification` is the public
+    // form of a full collection; `request_garbage_collection_for_testing` is the
+    // same thing but V8 fatals unless `--expose-gc` is set, which a build must not
+    // require of its own runtime.
+    isolate.low_memory_notification();
 }

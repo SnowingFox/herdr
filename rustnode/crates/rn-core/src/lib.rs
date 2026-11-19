@@ -29,6 +29,7 @@ pub mod platform_tasks;
 pub mod profile;
 pub mod queue;
 pub mod realm;
+pub mod snapshot_data;
 pub mod snapshot_drain;
 pub mod symbol;
 pub mod task_queue;
