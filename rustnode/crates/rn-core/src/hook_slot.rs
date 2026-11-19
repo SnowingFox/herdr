@@ -454,6 +454,8 @@ struct HookState {
     abort_toggle: Option<crate::AliasedUint8Array>,
     abort_on_uncaught_exception: bool,
     trace_exit: bool,
+    /// `--pending-deprecation`, which `src/uv.cc:74` gates DEP0119 on.
+    pending_deprecation: bool,
     trace_uncaught: bool,
     stack_trace_limit: i64,
     zero_fill_buffers: bool,
@@ -505,6 +507,7 @@ impl Default for HookState {
             abort_toggle: None,
             abort_on_uncaught_exception: false,
             trace_exit: false,
+            pending_deprecation: false,
             trace_uncaught: false,
             stack_trace_limit: DEFAULT_STACK_TRACE_LIMIT,
             zero_fill_buffers: false,
@@ -577,6 +580,21 @@ pub fn abort_on_uncaught_exception() -> bool {
 /// Node reads the option from the environment rather than from the option
 /// layer at exit time, so `v8.setFlagsFromString` cannot change it; the same
 /// holds here.
+/// Records whether `--pending-deprecation` was passed.
+///
+/// Read by `rn-bind-uv`'s `errname`, which cannot reach the option store: that
+/// crate depends only on `rn-core` and `rn-v8-sys`, and this is the same
+/// arrangement `trace_exit` and `zero_fill_buffers` already use.
+pub fn set_pending_deprecation(value: bool) {
+    STATE.with(|state| state.borrow_mut().pending_deprecation = value);
+}
+
+/// Whether `--pending-deprecation` was passed.
+#[must_use]
+pub fn pending_deprecation() -> bool {
+    STATE.with(|state| state.borrow().pending_deprecation)
+}
+
 pub fn set_trace_exit(value: bool) {
     STATE.with(|state| {
         state.borrow_mut().trace_exit = value;

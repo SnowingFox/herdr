@@ -419,6 +419,13 @@ fn main() {
         rn_bind_options::parsed::ParsedValue::Bool(false),
     );
     rn_bind_options::parsed::install(parsed);
+    // Read *after* the store is installed: `parsed::value_of` reads the
+    // thread-local store, and a read before this line saw the table default
+    // rather than the flag, so DEP0119 never fired.
+    rn_core::hook_slot::set_pending_deprecation(matches!(
+        rn_bind_options::parsed::value_of("--pending-deprecation"),
+        Some(rn_bind_options::parsed::ParsedValue::Bool(true))
+    ));
 
     // The inspector is created before the console is installed, because V8 puts its
     // own `console` on the per-context extras object during `contextCreated`, and
