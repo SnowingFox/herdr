@@ -903,8 +903,31 @@ fn static_lib_name(suffix: &str) -> String {
   }
 }
 
+// Herdr publishes its own V8 15.6.75 artifacts rather than downloading
+// denoland's. Upstream has no prebuilt library for this engine: its V8 submodule
+// went 15.2 -> 15.8 and skipped 15.6, and the newest published crate is
+// `152.2.0` (V8 15.2). Pointing at denoland's releases therefore 404s on
+// `v158.0.0`, which is a confusing mid-build failure rather than a statement
+// about what this crate needs.
+//
+// The release is public and needs no credentials. It is produced by
+// `rustnode/tools/build-v8-15.6.sh` and holds both files the build wants: the
+// static library and the matching `src_binding.rs`.
 const DEFAULT_ARTIFACT_BASE: &str =
-  "https://github.com/denoland/rusty_v8/releases/download";
+  "https://github.com/SnowingFox/herdr/releases/download";
+
+/// The release tag the default artifacts live under.
+///
+/// Not `v{version}`: this crate carries `158.0.0` so the 15.8 bindings keep
+/// their upstream identity, while the engine is 15.6.75 and the artifacts are
+/// tagged after the engine, which is the version they actually contain.
+const DEFAULT_ARTIFACT_TAG: &str = "v8-15.6.75";
+
+/// sha256 of `librusty_v8_release_x86_64-unknown-linux-gnu.a.gz` in that
+/// release. Pinned so a corrupted or substituted download fails loudly instead
+/// of producing a binary that reports the right version and misbehaves.
+const DEFAULT_ARCHIVE_SHA256: &str =
+  "f48e0060b3f1526f1b35c2a63cde272aa0fe85b6ff1247982f0824430f23271c";
 
 /// Values substituted into artifact URLs and URL templates.
 struct UrlVars<'a> {
@@ -926,10 +949,10 @@ struct UrlVars<'a> {
 /// `RUSTY_V8_MIRROR_TAG` overrides the default `v{version}` verbatim (no `v`
 /// is prepended), so mirrors can serve artifacts from e.g. the last published
 /// tag while `Cargo.toml` carries an unpublished version.
-fn resolved_tag(tag_override: Option<&str>, version: &str) -> String {
+fn resolved_tag(tag_override: Option<&str>, _version: &str) -> String {
   match tag_override {
     Some(tag) => tag.to_string(),
-    None => format!("v{version}"),
+    None => DEFAULT_ARTIFACT_TAG.to_string(),
   }
 }
 
@@ -1441,11 +1464,16 @@ fn try_download_artifact(
   };
   Err(format!(
     "Failed to fetch the V8 prebuilt artifact {}. Tried:\n{}\n\
-     If no prebuilt artifact is published for your target or version, \
-     compile V8 from source by setting V8_FROM_SOURCE=1. You can also point \
-     the build at an artifact via RUSTY_V8_ARCHIVE (static lib), a binding \
+     This crate links a V8 15.6.75 engine, which upstream `rusty_v8` never \
+     published a prebuilt library for, so the artifact comes from herdr's own \
+     release at {DEFAULT_ARTIFACT_BASE}/{DEFAULT_ARTIFACT_TAG}/. If that is \
+     unreachable, build it once from source:\n\
+     \n    rustnode/tools/build-v8-15.6.sh\n\n\
+     It prints a directory to export as RUSTY_V8_ARCHIVE; ~20 min and ~10 GB on \
+     8 cores. Alternatively set V8_FROM_SOURCE=1 to build inline, point the \
+     build at an artifact via RUSTY_V8_ARCHIVE (static lib), supply a binding \
      via RUSTY_V8_SRC_BINDING_URL or RUSTY_V8_SRC_BINDING_PATH (src binding \
-     only), a mirror via RUSTY_V8_MIRROR, or another release tag via \
+     only), use a mirror via RUSTY_V8_MIRROR, or select another release tag via \
      RUSTY_V8_MIRROR_TAG.{fallback_hint}",
     filename.display(),
     errors.join("\n")
@@ -1662,21 +1690,30 @@ fn download_static_lib_binaries() {
   let features = prebuilt_features_suffix();
   let lib_name = static_lib_name(&format!("{features}_{profile}_{target}"));
   let gz_name = format!("{lib_name}.gz");
-  let expected_sha256 = pinned_archive_sha256();
 
   // RUSTY_V8_ARCHIVE short-circuits the mirror/upstream candidates entirely:
   // it points at exactly one archive, or at a directory to look up the
   // expected artifact filename in. The cargo-home cache is only keyed for
   // candidate URLs, not for explicit overrides.
-  let (urls, cache_key) =
-    if let Ok(custom_archive) = env::var("RUSTY_V8_ARCHIVE") {
-      (archive_urls(&custom_archive, &gz_name, &lib_name), None)
-    } else {
-      (
-        artifact_url_candidates(&gz_name),
-        Some(artifact_cache_key(&gz_name)),
-      )
-    };
+  let custom_archive = env::var("RUSTY_V8_ARCHIVE").ok();
+  let (urls, cache_key) = match &custom_archive {
+    Some(archive) => (archive_urls(archive, &gz_name, &lib_name), None),
+    None => (
+      artifact_url_candidates(&gz_name),
+      Some(artifact_cache_key(&gz_name)),
+    ),
+  };
+
+  // The pinned hash describes the artifact this crate publishes. It must not be
+  // applied to a caller-supplied archive or a third-party mirror, which hold
+  // whatever that operator built. When the caller names a hash explicitly it
+  // wins, so a mirror can be verified against its own value.
+  let expected_sha256 = pinned_archive_sha256().or_else(|| {
+    let default_source = custom_archive.is_none()
+      && env::var("RUSTY_V8_MIRROR").is_err()
+      && env::var("RUSTY_V8_MIRROR_TAG").is_err();
+    default_source.then(|| DEFAULT_ARCHIVE_SHA256.to_string())
+  });
   println!("static lib URLs: {urls:?}");
 
   download_artifact(

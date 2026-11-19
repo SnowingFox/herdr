@@ -58,10 +58,52 @@ build files.
 It syncs V8 15.6.75, roots GN at that tree with this crate's `.gn`, builds
 `//crate:rusty_v8`, and generates the matching `src_binding.rs`.
 
-The resulting `librusty_v8.a` and `src_binding_*.rs` are consumed through
-`RUSTY_V8_ARCHIVE`, which upstream `build.rs` treats as a directory holding both
-files by their published names. That path never runs `gn gen` at all, which is
-what a CI job wants.
+You only need this to change the engine. A normal `cargo build` fetches the
+published artifacts from herdr's `v8-15.6.75` release; see "How a normal build
+gets the engine" below.
+
+## How a normal build gets the engine
+
+A plain `cargo build` needs no setup and no environment variables. `build.rs`
+downloads the static library from herdr's own release:
+
+    https://github.com/SnowingFox/herdr/releases/download/v8-15.6.75/
+
+Two details make that safe and honest:
+
+- The release is **public**, so it needs no credentials and works for anyone
+  who clones the repository or a fork.
+- The download is **hash-pinned** against `DEFAULT_ARCHIVE_SHA256` in
+  `build.rs`, and the pin only applies to that default source — a
+  `RUSTY_V8_ARCHIVE`, `RUSTY_V8_MIRROR` or `RUSTY_V8_MIRROR_TAG` override is
+  verified against whatever the caller names instead, since those hold whatever
+  that operator built. A corrupted or substituted download fails loudly rather
+  than producing a binary that reports the right version and misbehaves.
+
+The Rust binding ships in this crate under `gen/`, so only the library is
+fetched.
+
+`DEFAULT_ARTIFACT_TAG` is `v8-15.6.75`, not `v{version}`. This crate carries
+`158.0.0` so the 15.8 bindings keep their upstream identity, while the artifacts
+are named for the engine they contain, which is the version that actually
+matters.
+
+## Rebuilding the engine from source
+
+If the release is unreachable, or the engine itself needs to change:
+
+```bash
+./tools/build-v8-15.6.sh     # prints the RUSTY_V8_ARCHIVE directory
+```
+
+It syncs V8 15.6.75 (~90 s), roots GN at that tree with this crate's `.gn`,
+builds `//crate:rusty_v8`, and generates the matching binding from the same
+`project.json`. `RUSTY_V8_ARCHIVE` is a directory holding both files by their
+published names; that path never runs `gn gen` at all, which is what a CI job
+wants.
+
+Cost: ~20 min and ~10 GB on 8 cores. The build script's failure message names
+this step, so a missing release produces an instruction rather than a 404.
 
 ## What the archive must satisfy
 
