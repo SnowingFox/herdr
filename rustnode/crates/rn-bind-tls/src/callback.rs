@@ -212,6 +212,9 @@ struct CallbackSlot {
     /// its output until `newSessionDone` runs, so a ticket can never be sent
     /// before the application has decided whether to store the session.
     awaiting_new_session: Rc<Cell<bool>>,
+    /// `flags_.deferred_cycle_scheduled`, mirrored so a caller that only has the
+    /// slot can set it without the state borrow.
+    deferred_cycle_scheduled: Rc<Cell<bool>>,
     /// `TLSWrap::cert_cb_ != nullptr`, i.e. `enableCertCb` ran. Read by
     /// [`cert_cb`] to answer `is_waiting_cert_cb()` without the state borrow.
     cert_cb_enabled: Rc<Cell<bool>>,
@@ -254,6 +257,7 @@ pub fn register(
     let pending_cert_cb = Rc::new(RefCell::new(None));
     let ssl_slot = Rc::new(Cell::new(std::ptr::null_mut()));
     let ocsp_response = Rc::new(RefCell::new(Vec::new()));
+    let deferred_cycle_scheduled = Rc::new(Cell::new(false));
     SLOTS.with(|slots| {
         let mut slots = slots.borrow_mut();
         // A wrap registered twice — which a handle swap can do — replaces its
@@ -272,6 +276,7 @@ pub fn register(
             session,
             alpn_protos: Rc::clone(&alpn_protos),
             awaiting_new_session: Rc::clone(&awaiting_new_session),
+            deferred_cycle_scheduled: Rc::clone(&deferred_cycle_scheduled),
             cert_cb_enabled: Rc::clone(&cert_cb_enabled),
             cert_cb_running: Rc::clone(&cert_cb_running),
             pending_cert_cb: Rc::clone(&pending_cert_cb),
@@ -288,6 +293,7 @@ pub fn register(
         alpn_callback_enabled,
         alpn_protos,
         awaiting_new_session,
+        deferred_cycle_scheduled,
         cert_cb_enabled,
         cert_cb_running,
         pending_cert_cb,
@@ -319,6 +325,8 @@ pub struct CallbackHandles {
     pub alpn_protos: Rc<RefCell<Vec<u8>>>,
     /// `flags_.awaiting_new_session`, shared with the slot.
     pub awaiting_new_session: Rc<Cell<bool>>,
+    /// `flags_.deferred_cycle_scheduled`, shared with the slot.
+    pub deferred_cycle_scheduled: Rc<Cell<bool>>,
     /// `TLSWrap::cert_cb_ != nullptr`, shared with the slot.
     pub cert_cb_enabled: Rc<Cell<bool>>,
     /// `flags_.cert_cb_running`, shared with the slot.
@@ -355,6 +363,7 @@ impl CallbackHandles {
             alpn_callback_enabled: Rc::clone(&self.alpn_callback_enabled),
             alpn_protos: Rc::clone(&self.alpn_protos),
             awaiting_new_session: Rc::clone(&self.awaiting_new_session),
+            deferred_cycle_scheduled: Rc::clone(&self.deferred_cycle_scheduled),
             cert_cb_enabled: Rc::clone(&self.cert_cb_enabled),
             cert_cb_running: Rc::clone(&self.cert_cb_running),
             pending_cert_cb: Rc::clone(&self.pending_cert_cb),
@@ -384,6 +393,34 @@ pub fn unregister(cell: *const RefCell<WrapState>) {
         return;
     }
     SLOTS.with(|slots| slots.borrow_mut().retain(|slot| slot.cell != cell));
+}
+
+/// A set of handles over live cells, with no rooted object and no slot.
+///
+/// [`register`] needs a `v8::Global<Object>` and therefore a V8 scope, which a
+/// unit test of the cycle has no way to make. The cycle's snapshots only read the
+/// mirrors, and a wrap with no object is a real configuration — a direct
+/// `new TLSWrap()` never gets one — so the flags below are enough to exercise the
+/// recording and clearing those snapshots do.
+#[cfg(test)]
+pub fn handles_for_test() -> CallbackHandles {
+    CallbackHandles {
+        established: Rc::new(Cell::new(false)),
+        depth: Rc::new(Cell::new(0)),
+        pending_done: Rc::new(Cell::new(false)),
+        pending_start: Rc::new(Cell::new(false)),
+        session_callbacks: Rc::new(Cell::new(false)),
+        alpn_callback_enabled: Rc::new(Cell::new(false)),
+        alpn_protos: Rc::new(RefCell::new(Vec::new())),
+        awaiting_new_session: Rc::new(Cell::new(false)),
+        deferred_cycle_scheduled: Rc::new(Cell::new(false)),
+        cert_cb_enabled: Rc::new(Cell::new(false)),
+        cert_cb_running: Rc::new(Cell::new(false)),
+        pending_cert_cb: Rc::new(RefCell::new(None)),
+        ssl: Rc::new(Cell::new(std::ptr::null_mut())),
+        ocsp_response: Rc::new(RefCell::new(Vec::new())),
+        cell: None,
+    }
 }
 
 /// Clears `flags_.awaiting_new_session` without borrowing the wrap's state.
@@ -959,6 +996,64 @@ pub unsafe extern "C" fn cert_cb(ssl: *mut ffi::SSL, _arg: *mut c_void) -> c_int
 
     schedule_cert_cb(&slot, servername, ocsp);
     CERT_CB_PARK
+}
+
+/// `TLSWrap::ScheduleDeferredCycle` (`crypto_tls.cc:1354`): run `Cycle` on the
+/// next check phase.
+///
+/// A write or a shutdown issued from inside the SSL library's stack is parked
+/// rather than run, and this is what makes the parked work happen at all: the
+/// immediate re-enters the state machine with no library frame below it. The flag
+/// keeps N calls in one library call to one immediate, which is Node's guard.
+pub fn schedule_deferred_cycle(cell: *const RefCell<WrapState>) {
+    if cell.is_null() {
+        return;
+    }
+    let slot = SLOTS.with(|slots| {
+        slots
+            .borrow()
+            .iter()
+            .find(|slot| slot.cell == cell)
+            .cloned()
+    });
+    let Some(slot) = slot else {
+        return;
+    };
+    if slot.deferred_cycle_scheduled.replace(true) {
+        return;
+    }
+    DEFERRED_CYCLES.with(|cycles| cycles.borrow_mut().push(cell));
+    rn_core::native_immediates::set_immediate(run_deferred_cycle);
+}
+
+/// Runs every wrap a deferred cycle was scheduled for.
+///
+/// The list is drained under its own borrow and the cycles run after it, because
+/// [`crate::cycle::run`] re-enters this module (a handler can schedule another).
+fn run_deferred_cycle(_scope: &mut v8::PinScope<'_, '_>) {
+    let cells = DEFERRED_CYCLES.with(|cycles| std::mem::take(&mut *cycles.borrow_mut()));
+    for cell in cells {
+        if let Some(slot) = SLOTS.with(|slots| {
+            slots
+                .borrow()
+                .iter()
+                .find(|slot| slot.cell == cell)
+                .cloned()
+        }) {
+            slot.deferred_cycle_scheduled.set(false);
+        } else {
+            continue;
+        }
+        // SAFETY: the cell came from a live slot, which `destroy` drops before the
+        // state it points at is freed.
+        unsafe { crate::cycle::run(cell as *mut RefCell<WrapState>) };
+    }
+}
+
+thread_local! {
+    /// The wraps a deferred cycle is owed for, in the order it was requested.
+    static DEFERRED_CYCLES: RefCell<Vec<*const RefCell<WrapState>>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// `TLSWrap::ScheduleCertCb` (`crypto_tls.cc:515`): defer `oncertcb` to a native

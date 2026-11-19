@@ -135,6 +135,36 @@ impl IoOutcome {
 
 /// `TLSWrap::Cycle`: the three phases, in order.
 ///
+/// # Why the handshake events are delivered between `ClearOut` and `ClearIn`
+///
+/// Node's `SSLInfoCallback` calls `onhandshakedone` **synchronously**, from
+/// inside `SSL_read` — that is, in the middle of `ClearOut`, before `Cycle`
+/// reaches its second `ClearIn`. The ordering is load-bearing and not
+/// cosmetic, because a client that rejects the server's certificate destroys
+/// the socket from that handler:
+///
+/// ```text
+/// ClearIn();    // nothing parked yet
+/// ClearOut();   // SSL_read -> SSL_CB_HANDSHAKE_DONE -> onhandshakedone
+///               //   -> 'secure' -> onConnectSecure -> verifyError
+///               //   -> destroy(verifyError) -> destroySSL() -> SSL_free
+/// ClearIn();    // ssl_ == nullptr: the request bytes are never encrypted
+/// ```
+///
+/// rsnode used to run all three phases first and deliver the recorded events
+/// afterwards, so the second `ClearIn` encrypted the request that the client had
+/// already given up on, `EncOut` parked the ciphertext, and `flush` put it on the
+/// wire. The server then parsed it and ran its request handler for a connection
+/// whose certificate the client had refused — measured as an extra
+/// `HANDLER HIT` in the `https` reproduction, and as `Mismatched ... function
+/// calls. Expected exactly 1, actual 2` across the `https`/`http2`/`tls-ticket`
+/// tests.
+///
+/// The events are therefore delivered where Node delivers them: after
+/// `ClearOut`, before `ClearIn`. Because JavaScript runs there and can free the
+/// `SSL`, the phase-two block re-reads `ssl_ptr()` instead of reusing the
+/// pointer taken at entry.
+///
 /// # Safety
 ///
 /// `cell` must be the live state cell of a `TLSWrap` whose object is still
@@ -164,68 +194,99 @@ pub unsafe fn run(cell: *mut RefCell<WrapState>) -> CycleOutcome {
         return CycleOutcome::InLibraryCall;
     }
 
-    // `SSLLibraryCallScope` (`crypto_tls.cc:2336`) raises the depth across the
-    // phases so a callback the library invokes knows not to re-enter. It is
-    // raised once for the whole cycle rather than per phase, which is what Node
-    // does, and it is a plain increment/decrement here because the phases take
-    // `&mut state` and a guard borrowing a field of it could not span them.
-    // Nothing between the increment and the decrement calls into V8, so there is
-    // no early return to guard against.
+    // Phase one raises `SSLLibraryCallScope` (`crypto_tls.cc:2336`). Node's scope
+    // wraps the `SSL_read` call, and `SSLInfoCallback` fires *inside* it — so the
+    // JavaScript a handshake event runs still sees `in_ssl_library_call()` and any
+    // `shutdown()` it issues is parked for the next cycle rather than run
+    // mid-handshake. The depth therefore stays raised across the delivery and is
+    // lowered after it, which is what `SSLLibraryCallScope`'s destructor does when
+    // `SSL_read` returns.
+    //
+    // The borrow itself is scoped: the delivery re-enters this wrap from
+    // JavaScript, and a live `&mut WrapState` there would make every method it
+    // calls report `Invalid TLSWrap receiver` (R2).
     state.library_call_depth = state.library_call_depth.saturating_add(1);
     if let Some(handles) = state.callback.as_ref() {
         handles.depth.set(state.library_call_depth);
     }
     // SAFETY: `ssl` is the live SSL of this state, checked above, and `state` is
-    // the borrow this call owns.
-    unsafe {
-        clear_out(&mut state, ssl);
-        clear_in(&mut state, ssl);
-        enc_out(&mut state, ssl);
-    }
+    // the borrow this scope owns.
+    unsafe { clear_out(&mut state, ssl) };
+    let after_clear_out = snapshot(&mut state);
+    // The `SSLLibraryCallScope` around `SSL_read` ends when it returns. It is
+    // lowered *before* the delivery, so a write or shutdown the handler issues
+    // runs here rather than being parked for a later cycle: the socket is still
+    // live at this point, and a parked write on a socket the handler goes on to
+    // destroy is one that never reaches the peer.
     state.library_call_depth = state.library_call_depth.saturating_sub(1);
-    // Read what the callback recorded, then write it into the state. The two
-    // steps are separate because `callback` is a field of `state`: reading and
-    // writing it in one borrow would need a mutable borrow of the whole.
-    let recorded = state.callback.as_ref().map(|handles| {
+    if let Some(handles) = state.callback.as_ref() {
         handles.depth.set(state.library_call_depth);
-        (
-            handles.established.get(),
-            handles.pending_done.get() || handles.pending_start.get(),
-            handles.clone_handles(),
-        )
-    });
-    // Everything the delivery steps need, taken under the borrow and used after
-    // it: the ciphertext to send, the cleartext to emit, the stream to send on
-    // and the object to complete through.
-    let mut outbound = None;
-    let mut deliver = None;
-    if let Some((established, has_event, handles)) = recorded {
-        if established {
-            state.flags.established = true;
-        }
-        if has_event {
-            deliver = state
-                .object
-                .as_ref()
-                .map(|object| (object.clone(), handles));
-        }
     }
-    // An error `ClearOut` recorded is delivered to `onerror` once the borrow is
-    // released. Node's `ClearOut` does this itself (`crypto_tls.cc:1007`
-    // `MakeCallback(onerror)`), and it is what makes `tls.createServer` emit
-    // `tlsClientError` and destroy the socket. Recording it without delivering
-    // left a failed handshake with nothing happening at all: no JS event, no
-    // close, and the accepted socket ref'd forever.
-    let failure = state
-        .error
-        .take()
-        .and_then(|error| state.object.as_ref().map(|object| (object.clone(), error)));
-    if let (Some(stream), Some(object), false) = (
-        state.underlying,
-        state.object.as_ref(),
-        state.pending_output.is_empty() && state.pending_cleartext_output.is_empty(),
-    ) {
-        outbound = Some((object.clone(), stream));
+    drop(state);
+
+    // `onhandshakedone` / `onhandshakestart` fire here, between `ClearOut` and
+    // `ClearIn`, which is Node's ordering and not a detail: the client's handler
+    // is where `rejectUnauthorized` destroys the socket, and it must run before
+    // the request bytes are encrypted. See this function's doc comment.
+    deliver_events(after_clear_out.events);
+
+    let Ok(mut state) = cell.try_borrow_mut() else {
+        return CycleOutcome::Reentrant;
+    };
+
+    // The handler above can have destroyed the wrap, which frees the `SSL`. Node
+    // reaches the second `ClearIn` in that case too, where it returns immediately
+    // on `ssl_ == nullptr` — so this re-reads the pointer rather than reusing
+    // `ssl`, and skips both remaining phases when it is gone. That skip is what
+    // keeps the abandoned request off the wire: without it `ClearIn` encrypts the
+    // bytes, `EncOut` parks the ciphertext, and the flush below sends it.
+    let ssl = state.ssl_ptr();
+    if !ssl.is_null() {
+        state.library_call_depth = state.library_call_depth.saturating_add(1);
+        if let Some(handles) = state.callback.as_ref() {
+            handles.depth.set(state.library_call_depth);
+        }
+        // SAFETY: `ssl` was re-read above and `state` is the borrow this scope
+        // owns.
+        unsafe { clear_in(&mut state, ssl) };
+        state.library_call_depth = state.library_call_depth.saturating_sub(1);
+    }
+    // `FlushPendingShutdown()` (`crypto_tls.cc:2345`) sits between `ClearIn` and
+    // `EncOut`, and it is what replays a `shutdown()` that a handshake handler
+    // parked. Without it the request is never completed and the peer never
+    // receives the close-notify that `end()` produced.
+    let shutdown_request = crate::stream::take_pending_shutdown(&mut state);
+    let ssl = state.ssl_ptr();
+    if !ssl.is_null() {
+        state.library_call_depth = state.library_call_depth.saturating_add(1);
+        if let Some(handles) = state.callback.as_ref() {
+            handles.depth.set(state.library_call_depth);
+        }
+        // SAFETY: `ssl` is live, checked above, and `state` is this borrow.
+        unsafe { enc_out(&mut state, ssl) };
+        state.library_call_depth = state.library_call_depth.saturating_sub(1);
+    }
+    let after_clear_in = snapshot(&mut state);
+
+    // Everything the delivery steps need, taken under the borrow and used after
+    // it: the object to emit through, the stream to flush ciphertext on, and the
+    // three notifications a phase recorded. The cleartext itself is deliberately
+    // *not* taken here — the listener drains it after this call returns, and
+    // taking it here would strand those bytes.
+    let object = state.object.clone();
+    let stream = state.underlying;
+    // A cycle the underlying read callback started drains the cleartext itself;
+    // every other entry point has to emit it here.
+    let reader_drains = state.flags.emitting_by_reader;
+    let cleartext_pending = !state.pending_cleartext_output.is_empty();
+    let pending = !state.pending_output.is_empty() || cleartext_pending;
+    // The close-notify `take_pending_shutdown` wrote is part of `pending_output`,
+    // so it goes out with the same flush below and its request is completed after
+    // that — the FIN must not race the bytes it follows.
+    let shutdown_stream = state.underlying.filter(|_| shutdown_request.is_some());
+    let eof_pending = state.flags.eof_read_pending;
+    if eof_pending {
+        state.flags.eof_read_pending = false;
     }
     drop(state);
 
@@ -237,31 +298,136 @@ pub unsafe fn run(cell: *mut RefCell<WrapState>) -> CycleOutcome {
     // nested cycle that `on_stream_after_write` runs produced the ciphertext after
     // the caller's flush had already returned — which sent nothing and left the
     // peer waiting forever.
-    if let Some((object, stream)) = outbound {
+    //
+    // The guard is on `pending`, not on `outbound`: a phase that produced output
+    // is exactly the case that needs this, and `flush` itself is the no-op for an
+    // empty queue.
+    if let (Some(object), Some(stream)) = (object.as_ref(), stream) {
+        if pending {
+            let _ = rn_uv::callback::with_context(|scope| {
+                let object = v8::Local::new(scope, object);
+                if !reader_drains {
+                    crate::listener::deliver_cleartext(object);
+                }
+                // SAFETY: `stream` is the wrap's own `underlying`, live while it
+                // holds it.
+                unsafe { crate::stream::flush(scope, object, stream, None) };
+            });
+        }
+    }
+    // The EOF read, if a phase saw a close-notify. Node emits it from inside
+    // `ClearOut`; here it has to wait for a scope, and it must come after the
+    // cleartext of the same cycle so the reader sees the last bytes before
+    // `'end'`.
+    // The reader's own drain emits it after the cleartext it decrypts, so a
+    // cycle that a read started leaves it for that drain.
+    if eof_pending && !reader_drains {
+        crate::listener::deliver_eof(object.as_ref());
+    }
+    // The parked `shutdown()`'s request is completed from the underlying stream's
+    // own shutdown callback, which is what `lib/net.js` waits on to mark the
+    // writable side finished.
+    // `finish_shutdown` runs *after* the flush above: the close-notify it produced
+    // is part of `pending_output`, and closing the stream before writing it made
+    // the flush fail with `EPIPE` (`uv_write` on a shutting-down handle), which
+    // dropped both the notify and the cleartext that shared the queue.
+    if let (Some(object), Some(stream), Some(request)) =
+        (object.as_ref(), shutdown_stream, shutdown_request.as_ref())
+    {
         let _ = rn_uv::callback::with_context(|scope| {
             let object = v8::Local::new(scope, object);
-            // Cleartext goes up through the wrap's own `StreamBase`, ciphertext
-            // down through the wrapped stream.
-            crate::listener::deliver_cleartext(object);
-            // SAFETY: `stream` is the wrap's own `underlying`, live while it holds
-            // it.
-            unsafe { crate::stream::flush(scope, object, stream, None) };
+            let request = v8::Local::new(scope, request);
+            // SAFETY: `stream` is the wrap's own `underlying`, live while it
+            // holds it.
+            unsafe { crate::stream::finish_shutdown(scope, object, stream, request, false) };
         });
     }
-    // The events the info callback recorded are delivered last, so `secureConnect`
-    // sees a stream whose first flight has already been sent.
-    if let Some((object, handles)) = deliver {
-        crate::callback::deliver_events(Some(&object), &handles);
+    // `ClearIn`/`EncOut` can finish a handshake that `ClearOut` could not — a
+    // server's `SSL_write` is what completes its side once the application has
+    // stored the session. Node's callback fires from inside that call, so the
+    // event is delivered here rather than batched with the one above.
+    if let Some(events) = after_clear_in.events.as_ref() {
+        crate::callback::deliver_events(Some(&events.object), &events.handles);
+    }
+    // `ClearIn`'s own hard failure (`SSL_write` returning a real error) is
+    // reported the same way `ClearOut`'s is, once its alert has been flushed.
+    if let Some(failure) = after_clear_in.failure.as_ref() {
+        deliver_failure(failure);
     }
     // A failed handshake reports itself after its alert has been flushed, so the
     // peer sees a TLS alert rather than a truncated stream.
-    if let Some((object, error)) = failure {
-        let _ = rn_uv::callback::with_context(|scope| {
-            let object = v8::Local::new(scope, object);
-            crate::listener::deliver_error(scope, object, &error);
-        });
+    if let Some(failure) = after_clear_out.failure.as_ref() {
+        deliver_failure(failure);
     }
     CycleOutcome::Cycled
+}
+
+/// Reports a phase's captured error through the wrap's `onerror`, as Node's
+/// `ClearOut` does (`crypto_tls.cc:1007`).
+fn deliver_failure(failure: &Failure) {
+    let _ = rn_uv::callback::with_context(|scope| {
+        let object = v8::Local::new(scope, &failure.object);
+        crate::listener::deliver_error(scope, object, &failure.error);
+    });
+}
+
+/// What one phase recorded, copied out of the state so it can be delivered once
+/// the borrow is released (R2).
+struct Snapshot {
+    /// The rooted object and callback mirrors, when a handshake event is owed.
+    events: Option<Events>,
+    /// An error `SSL_read` recorded, delivered to `onerror` after the alert has
+    /// been flushed.
+    failure: Option<Failure>,
+}
+
+/// A handshake event `SSLInfoCallback` recorded while a phase ran.
+struct Events {
+    object: v8::Global<v8::Object>,
+    handles: crate::callback::CallbackHandles,
+}
+
+/// An error `ClearOut` captured, with the object needed to report it.
+struct Failure {
+    object: v8::Global<v8::Object>,
+    error: crate::error::SslError,
+}
+
+/// Takes a [`Snapshot`] of `state`, writing `flags_.established` back first.
+///
+/// The flag is current before any handler runs because `EncOut`'s
+/// `flags_.established && current_write_` branch and `exportKeyingMaterial` both
+/// read it, and the `'secure'` handler does either.
+fn snapshot(state: &mut WrapState) -> Snapshot {
+    let mut events = None;
+    if let Some(handles) = state.callback.as_ref() {
+        handles.depth.set(state.library_call_depth);
+        if handles.established.get() {
+            state.flags.established = true;
+        }
+        if handles.pending_done.get() || handles.pending_start.get() {
+            if let Some(object) = state.object.as_ref() {
+                events = Some(Events {
+                    object: object.clone(),
+                    handles: handles.clone_handles(),
+                });
+            }
+        }
+    }
+    let failure = state.error.take().and_then(|error| {
+        state.object.as_ref().map(|object| Failure {
+            object: object.clone(),
+            error,
+        })
+    });
+    Snapshot { events, failure }
+}
+
+/// Runs the handshake handlers a phase recorded, with no borrow held.
+fn deliver_events(events: Option<Events>) {
+    if let Some(events) = events {
+        crate::callback::deliver_events(Some(&events.object), &events.handles);
+    }
 }
 
 /// `TLSWrap::ClearOut` (`crypto_tls.cc:840`): `SSL_read`, cleartext **out**.
@@ -324,6 +490,7 @@ pub unsafe fn clear_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
     let mut buffer = vec![0u8; CHUNK];
     let mut length = 0usize;
     let mut total = 0usize;
+    let mut eof = false;
     loop {
         // SAFETY: `ssl` is live and `buffer[length..]` is `CHUNK - length` bytes.
         let read = unsafe {
@@ -339,13 +506,22 @@ pub unsafe fn clear_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
             // SAFETY: `read` is this call's own return value.
             let outcome = unsafe { IoOutcome::of(ssl, read, 0) };
             match outcome {
-                IoOutcome::ZeroReturn => {
-                    state.flags.eof = true;
-                }
-                IoOutcome::SyscallEof => {
-                    // A peer that closed without a close-notify. Node emits an
-                    // EOF read rather than an error, so `'end'` fires.
-                    state.flags.eof = true;
+                IoOutcome::ZeroReturn | IoOutcome::SyscallEof => {
+                    // `crypto_tls.cc:928`: a clean close-notify (and a peer that
+                    // closed without one) is an EOF *read*, not silence — Node
+                    // sets `flags_.eof` and calls `EmitRead(UV_EOF)`. Setting the
+                    // flag alone leaves `'end'` unemitted, so a consumer that
+                    // reads until EOF waits forever; measured as
+                    // `test-tls-client-destroy-soon` hanging after all 2 MiB had
+                    // arrived and been decrypted.
+                    //
+                    // Only the first one emits: a second EOF read would complete
+                    // the stream twice. `flags_.eof` is the guard, exactly as
+                    // Node's `if (!flags_.eof)` is.
+                    if !state.flags.eof {
+                        state.flags.eof = true;
+                        eof = true;
+                    }
                 }
                 // `CertCbParked` is a handshake waiting for JavaScript, not a
                 // failure: the resume re-enters `SSL_read` and this call simply
@@ -406,6 +582,13 @@ pub unsafe fn clear_out(state: &mut WrapState, ssl: *mut ffi::SSL) -> usize {
         state
             .pending_cleartext_output
             .extend_from_slice(&buffer[..length]);
+    }
+    if eof {
+        // `EmitRead(UV_EOF)` (`crypto_tls.cc:932`) comes after the batch Node's
+        // `emit()` produced, so the last bytes reach the reader before `'end'`.
+        // Recorded on the state because the emit needs a scope and this function
+        // holds the borrow; [`crate::listener::deliver_cleartext`] sends it.
+        state.flags.eof_read_pending = true;
     }
     total
 }
@@ -606,5 +789,89 @@ mod tests {
     fn the_kind_is_readable() {
         assert!(is_client(&WrapState::new(Kind::Client)));
         assert!(!is_client(&WrapState::new(Kind::Server)));
+    }
+
+    /// `snapshot` takes the captured error out of the state and writes
+    /// `flags_.established` back, which is what lets the delivery run with the
+    /// borrow released.
+    #[test]
+    fn a_snapshot_takes_the_failure_and_writes_the_flag_back() {
+        let mut state = WrapState::new(Kind::Client);
+        let handles = crate::callback::handles_for_test();
+        handles.established.set(true);
+        state.callback = Some(handles.clone_handles());
+        state.error = Some(crate::error::SslError {
+            message: "boom".to_string(),
+            ..Default::default()
+        });
+
+        let snapshot = snapshot(&mut state);
+
+        assert!(state.flags.established, "the flag must be written back");
+        assert!(
+            state.error.is_none(),
+            "the error is taken rather than left to be reported twice"
+        );
+        // A wrap with no rooted object has nowhere to report it, which is the
+        // state a direct `new TLSWrap()` leaves behind — the error is dropped
+        // rather than delivered to nothing.
+        assert!(snapshot.failure.is_none());
+    }
+
+    /// An error on a wrap that does have an object is carried to the delivery,
+    /// which is what makes `tlsClientError` fire.
+    #[test]
+    fn a_failure_is_carried_when_there_is_an_object() {
+        // `V8::initialize` may run only once per process, so the platform is
+        // installed through a `Once` this module owns — the same shape
+        // `rn_core`'s test support uses, which is private to that crate.
+        static INIT: std::sync::Once = std::sync::Once::new();
+        static PLATFORM: std::sync::OnceLock<v8::SharedRef<v8::Platform>> =
+            std::sync::OnceLock::new();
+        INIT.call_once(|| {
+            let platform = v8::new_default_platform(0, false).make_shared();
+            // V8 keeps a raw pointer to the platform, so it must outlive this
+            // call — dropping the last reference would leave V8 dereferencing
+            // freed memory.
+            let _ = PLATFORM.set(platform.clone());
+            v8::V8::initialize_platform(platform);
+            v8::V8::initialize();
+        });
+
+        let mut state = WrapState::new(Kind::Client);
+        state.callback = Some(crate::callback::handles_for_test());
+        let mut isolate = v8::Isolate::new(Default::default());
+        let storage = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut storage.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        state.object = Some(v8::Global::new(&*scope, v8::Object::new(scope)));
+        state.error = Some(crate::error::SslError {
+            message: "boom".to_string(),
+            ..Default::default()
+        });
+
+        let snapshot = snapshot(&mut state);
+
+        assert_eq!(
+            snapshot
+                .failure
+                .as_ref()
+                .map(|failure| failure.error.message.as_str()),
+            Some("boom")
+        );
+    }
+
+    /// A clean phase records nothing, so `run` does not run a handler that has
+    /// no event behind it.
+    #[test]
+    fn a_clean_snapshot_records_nothing() {
+        let mut state = WrapState::new(Kind::Client);
+        state.callback = Some(crate::callback::handles_for_test());
+
+        let snapshot = snapshot(&mut state);
+
+        assert!(snapshot.events.is_none());
+        assert!(snapshot.failure.is_none());
     }
 }

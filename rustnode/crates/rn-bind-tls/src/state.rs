@@ -89,6 +89,35 @@ pub struct Flags {
     /// `ClearIn` does nothing once set, and `ReadStart` does not re-arm, which is
     /// `crypto_tls.cc:1094`'s `!flags_.eof` guard.
     pub eof: bool,
+    /// An EOF read is owed to the wrap's own `StreamBase`.
+    ///
+    /// Node's `ClearOut` calls `EmitRead(UV_EOF)` itself when `SSL_read` reports
+    /// `ZERO_RETURN` (`crypto_tls.cc:932`), and that call is what `lib/net.js`
+    /// turns into `'end'`. Here the emit needs a V8 scope, which a phase cannot
+    /// take, so the phase records the obligation and the cycle delivers it after
+    /// the borrow is released. Separate from [`Flags::eof`] because the flag
+    /// suppresses further reads while this one is a single owed notification.
+    pub eof_read_pending: bool,
+    /// The EOF read has been handed to the reader, so a later cycle does not
+    /// repeat it.
+    pub eof_emitted: bool,
+    /// The wrap is inside a cycle driven by the underlying stream's read
+    /// callback, which drains the cleartext itself when the cycle returns.
+    ///
+    /// `Cycle` emits cleartext for every other entry point — a write completion,
+    /// a cert-callback resume — because nothing else drains it. Emitting in both
+    /// places delivered one TLS record more than the reader had room for, which
+    /// is what `test-https-no-reader` measures as a buffer above its watermark.
+    pub emitting_by_reader: bool,
+    /// `flags_.deferred_cycle_scheduled` — a native immediate is going to run
+    /// `Cycle` for this wrap.
+    ///
+    /// Node sets this in `ScheduleDeferredCycle` so that N calls from inside one
+    /// library call cost one immediate rather than N. It matters because a write
+    /// that is parked for being on the library's stack (`crypto_tls.cc:1162`)
+    /// schedules one: without it the parked cleartext is never encrypted, and a
+    /// server that writes from its `'secureConnection'` handler loses the body.
+    pub deferred_cycle_scheduled: bool,
     /// `flags_.in_destroy` — re-entrant `Destroy` is a no-op.
     ///
     /// Node has no such flag because `if (!ssl_) return;` covers it; it is here
@@ -252,6 +281,22 @@ pub struct WrapState {
 }
 
 impl WrapState {
+    /// Takes the pending EOF read, reporting whether one is owed.
+    ///
+    /// `crypto_tls.cc:932` is `EmitRead(UV_EOF)`, and it happens once per stream:
+    /// `eof` is set by the phase that saw the close-notify, `eof_emitted` records
+    /// that the count has been handed to the reader. Both emit paths — the
+    /// listener's drain and [`crate::listener::deliver_eof`] — go through this so
+    /// they cannot disagree about when the read is owed.
+    pub fn take_eof_read(&mut self) -> bool {
+        let owed = (self.flags.eof || self.flags.eof_read_pending) && !self.flags.eof_emitted;
+        self.flags.eof_read_pending = false;
+        if owed {
+            self.flags.eof_emitted = true;
+        }
+        owed
+    }
+
     /// The state for a freshly constructed `TLSWrap`.
     ///
     /// `ssl` is created by [`crate::wrap`] after the JavaScript object exists,
@@ -405,6 +450,7 @@ impl WrapState {
         self.flags.eof = false;
         self.secure_context = None;
         self.flags.established = false;
+        self.flags.deferred_cycle_scheduled = false;
         self.flags.started = false;
         self.flags.reading = false;
         self.cert_cb_pending = false;
