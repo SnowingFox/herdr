@@ -122,7 +122,7 @@ pub fn in_job_scope<R>(
         scope,
         rn_core::callback_scope::ScopeArgs {
             context: async_wrap.context(),
-            resource: Some(resource),
+            resource: Some(&resource),
             frame: None,
         },
         body,

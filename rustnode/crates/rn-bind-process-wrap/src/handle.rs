@@ -364,8 +364,8 @@ pub unsafe extern "C" fn after_exit(
                 scope,
                 rn_core::callback_scope::ScopeArgs {
                     context,
-                    resource: Some(resource),
-                    frame,
+                    resource: Some(&resource),
+                    frame: frame.as_ref(),
                 },
                 |scoped| {
                     if let Some(caught) = call(scoped) {

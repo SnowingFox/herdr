@@ -156,34 +156,23 @@ fn with_scope<R>(
 fn in_parser_call<R>(
     scope: &mut v8::PinScope<'_, '_>,
     parser: &Parser,
-    receiver: v8::Local<v8::Object>,
     body: impl FnOnce(&mut v8::PinScope<'_, '_>) -> R,
 ) -> Option<R> {
     let context = rn_core::callback_scope::AsyncContext::from(parser.async_wrap);
     if !context.is_resource() {
         return Some(body(scope));
     }
-    // The resource is the object `initialize` received, not the parser: `init`
-    // was emitted for that object, and `executionAsyncResource()` has to answer
-    // the same one. A parser without one falls back to itself, which is the
-    // pre-existing behaviour.
-    let resource = match parser.resource_object.as_ref() {
-        Some(resource) => v8::Global::new(
-            scope.as_ref(),
-            v8::Local::<v8::Object>::new(scope, resource),
-        ),
-        None => v8::Global::new(scope.as_ref(), receiver),
-    };
     rn_core::callback_scope::with_scope(
         scope,
         rn_core::callback_scope::ScopeArgs {
             context,
-            resource: Some(resource),
+            // The resource is the object `initialize` received, not the parser:
+            // `init` was emitted for that object, and `executionAsyncResource()`
+            // has to answer the same one.
+            resource: parser.resource_object.as_ref(),
             // The frame `AsyncReset` captured, so an `AsyncLocalStorage` store
             // survives into the parser's callbacks.
-            frame: parser.context_frame.as_ref().map(|frame| {
-                v8::Global::new(scope.as_ref(), v8::Local::<v8::Value>::new(scope, frame))
-            }),
+            frame: parser.context_frame.as_ref(),
         },
         body,
     )
@@ -227,7 +216,7 @@ pub fn call_no_args(parser: &mut Parser, slot: Slot) {
         };
         // `MakeCallback` on the parser's own `AsyncWrap`, so the resource
         // object's `init` gets its `before`/`after` pair.
-        in_parser_call(scope, parser, receiver, |scoped| {
+        in_parser_call(scope, parser, |scoped| {
             callback.call(scoped, receiver.into(), &[]).is_some()
         })
         .unwrap_or(true)
@@ -261,7 +250,7 @@ pub fn call_headers<'a>(
             .and_then(|bytes| one_byte_string(scope, bytes))
             .unwrap_or_else(|| v8::String::empty(scope));
         let args = [array.into(), url.into()];
-        in_parser_call(scope, parser, receiver, |scoped| {
+        in_parser_call(scope, parser, |scoped| {
             callback.call(scoped, receiver.into(), &args).is_some()
         })
         .unwrap_or(false)
@@ -289,7 +278,7 @@ pub fn call_body(parser: &mut Parser, bytes: &[u8]) -> bool {
             return true;
         };
         let args = [buffer];
-        in_parser_call(scope, parser, receiver, |scoped| {
+        in_parser_call(scope, parser, |scoped| {
             callback.call(scoped, receiver.into(), &args).is_some()
         })
         .unwrap_or(false)
@@ -374,7 +363,7 @@ pub fn call_headers_complete(
             v8::Boolean::new(scope, args.keep_alive).into(),
         ];
 
-        in_parser_call(scope, parser, receiver, |scoped| {
+        in_parser_call(scope, parser, |scoped| {
             let Some(result) = callback.call(scoped, receiver.into(), &call_args) else {
                 return HeadersComplete::Failed;
             };

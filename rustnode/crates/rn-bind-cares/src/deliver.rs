@@ -253,7 +253,7 @@ fn trampoline(
                 scope,
                 rn_core::callback_scope::ScopeArgs {
                     context,
-                    resource: Some(v8::Global::new(scope.as_ref(), request)),
+                    resource: Some(&v8::Global::new(scope.as_ref(), request)),
                     frame: None,
                 },
                 call,

@@ -5963,7 +5963,7 @@ pub unsafe extern "C" fn napi_make_callback(
                 async_id: 0.0,
                 trigger_async_id: 0.0,
             }),
-            resource,
+            resource: resource.as_ref(),
             frame: None,
         };
 
@@ -6033,7 +6033,7 @@ pub unsafe extern "C" fn napi_open_callback_scope(
                 async_id: boxed.async_id,
                 trigger_async_id: boxed.trigger_async_id,
             },
-            resource,
+            resource: resource.as_ref(),
             frame: None,
         };
         rn_core::callback_scope::open_scope(scope, args)

@@ -292,6 +292,7 @@ thread_local! {
     /// The `execution_async_resources` array, which holds one resource object
     /// per stack entry that has a JavaScript-visible resource.
     static RESOURCES: RefCell<Option<v8::Global<v8::Array>>> = const { RefCell::new(None) };
+
     /// `Environment::destroy_async_id_list()`: ids whose `destroy` hook has not
     /// been called yet.
     ///
@@ -718,14 +719,14 @@ impl rn_core::callback_scope::CallbackScopeHooks for ScopeHooks {
         // because a `before` hook that reads `getStore()` sees the callback's own
         // frame — hooking it up after the push but before the exchange would have
         // the hook observe the caller's.
-        let prior = exchange_frame(scope, args.frame.as_ref());
+        let prior = exchange_frame(scope, args.frame);
 
         // `async_hooks()->push_async_context(async_id, trigger_async_id, object)`
         // (`src/api/callback.cc:124`). This is what makes `executionAsyncId()`
         // inside the callback answer the resource's id, and it happens whether
         // or not any hook is enabled: the id stack is state JavaScript reads
         // directly.
-        push_context(scope, args.context, args.resource.as_ref());
+        push_context(scope, args.context, args.resource);
 
         // `AsyncWrap::EmitBefore` (`src/api/callback.cc:127`), guarded by the
         // same `async_id != 0 && !skip_hooks_`.
@@ -807,13 +808,33 @@ fn push_context(
     // resource goes in this array; `executionAsyncResource()` reads it by index,
     // so an entry that is missing reads as `undefined` rather than as the wrong
     // resource.
+    //
+    // The offset is read and the stack advanced in one borrow: this runs on every
+    // callback in the process, and two `RefCell` borrows per push is one more
+    // than the work needs.
     let offset = STATE.with(|state| {
+        let state = state.borrow();
+        let state = state.as_ref()?;
+        let offset = state.hook_fields.get(HOOK_FIELDS[7].1)? as usize;
+        if offset * 2 >= ASYNC_IDS_STACK_LENGTH {
+            return None;
+        }
+        // `async_id_fields_[kExecutionAsyncId]` / `[kTriggerAsyncId]` are saved
+        // so the matching pop restores this context rather than the incoming one.
+        let previous_execution = state.id_fields.get_float(UID_FIELDS[0].1)?;
+        let previous_trigger = state.id_fields.get_float(UID_FIELDS[1].1)?;
+        state.ids_stack.set_float(offset * 2, previous_execution);
+        state.ids_stack.set_float(offset * 2 + 1, previous_trigger);
+        state.hook_fields.set(HOOK_FIELDS[7].1, (offset + 1) as u32);
+        state.id_fields.set_float(UID_FIELDS[0].1, context.async_id);
         state
-            .borrow()
-            .as_ref()
-            .and_then(|state| state.hook_fields.get(HOOK_FIELDS[7].1))
-            .unwrap_or(0) as usize
+            .id_fields
+            .set_float(UID_FIELDS[1].1, context.trigger_async_id);
+        Some(offset)
     });
+    let Some(offset) = offset else {
+        return;
+    };
     if let Some(resource) = resource {
         let local = v8::Local::new(scope, resource);
         RESOURCES.with(|slot| {
@@ -823,31 +844,6 @@ fn push_context(
             }
         });
     }
-    STATE.with(|state| {
-        let state = state.borrow();
-        let Some(state) = state.as_ref() else {
-            return;
-        };
-        let offset = state.hook_fields.get(HOOK_FIELDS[7].1).unwrap_or(0) as usize;
-        if offset * 2 >= ASYNC_IDS_STACK_LENGTH {
-            return;
-        }
-        let previous_execution = state
-            .id_fields
-            .get_float(UID_FIELDS[0].1)
-            .unwrap_or(INVALID_ASYNC_ID);
-        let previous_trigger = state
-            .id_fields
-            .get_float(UID_FIELDS[1].1)
-            .unwrap_or(INVALID_ASYNC_ID);
-        state.ids_stack.set_float(offset * 2, previous_execution);
-        state.ids_stack.set_float(offset * 2 + 1, previous_trigger);
-        state.hook_fields.set(HOOK_FIELDS[7].1, (offset + 1) as u32);
-        state.id_fields.set_float(UID_FIELDS[0].1, context.async_id);
-        state
-            .id_fields
-            .set_float(UID_FIELDS[1].1, context.trigger_async_id);
-    });
 }
 
 /// Pops the innermost async context, restoring the pair it saved.
@@ -859,51 +855,47 @@ fn pop_context(scope: &mut v8::PinScope<'_, '_>, expected: f64) {
     if expected <= 0.0 {
         return;
     }
-    STATE.with(|state| {
+    let Some(offset) = STATE.with(|state| {
         let state = state.borrow();
-        let Some(state) = state.as_ref() else {
-            return;
-        };
-        let depth = state.hook_fields.get(HOOK_FIELDS[7].1).unwrap_or(0) as usize;
+        let state = state.as_ref()?;
+        let depth = state.hook_fields.get(HOOK_FIELDS[7].1)? as usize;
         if depth == 0 {
-            return;
+            return None;
         }
         let offset = depth - 1;
         // `async_id_fields_[kExecutionAsyncId] = async_ids_stack_[2 * offset]`.
         // The restore is the point of the pop: without it the next callback to
         // run would inherit this one's id.
-        let saved_execution = state
-            .ids_stack
-            .get_float(offset * 2)
-            .unwrap_or(INVALID_ASYNC_ID);
-        let saved_trigger = state
-            .ids_stack
-            .get_float(offset * 2 + 1)
-            .unwrap_or(INVALID_ASYNC_ID);
+        let saved_execution = state.ids_stack.get_float(offset * 2)?;
+        let saved_trigger = state.ids_stack.get_float(offset * 2 + 1)?;
         state.id_fields.set_float(UID_FIELDS[0].1, saved_execution);
         state.id_fields.set_float(UID_FIELDS[1].1, saved_trigger);
         state.hook_fields.set(HOOK_FIELDS[7].1, offset as u32);
-    });
+        Some(offset)
+    }) else {
+        return;
+    };
     // `js_execution_async_resources()->Set(length, offset)` — the JS array's
     // `length` is the shadow of the stack depth, and `executionAsyncResource()`
     // reads `execution_async_resources[index]` directly, so the stale entry has
     // to go for the same reason.
+    //
+    // The truncation is skipped when the array is already short enough, which is
+    // Node's `execution_async_resources.pop()` being a no-op on an empty tail.
+    // Writing `length` unconditionally cost a keyed store on every callback; the
+    // nested-callback case — every socket read inside another callback — now
+    // writes nothing at all.
     RESOURCES.with(|slot| {
         if let Some(resources) = slot.borrow().as_ref() {
             let resources = v8::Local::new(scope, resources);
-            let length = STATE.with(|state| {
-                state
-                    .borrow()
-                    .as_ref()
-                    .and_then(|state| state.hook_fields.get(HOOK_FIELDS[7].1))
-                    .unwrap_or(0)
-            });
-            if let Some(key) = v8::String::new(scope, "length") {
-                resources.set(
-                    scope,
-                    key.into(),
-                    v8::Integer::new_from_unsigned(scope, length).into(),
-                );
+            if resources.length() > offset as u32 {
+                if let Some(key) = v8::String::new(scope, "length") {
+                    resources.set(
+                        scope,
+                        key.into(),
+                        v8::Integer::new_from_unsigned(scope, offset as u32).into(),
+                    );
+                }
             }
         }
     });

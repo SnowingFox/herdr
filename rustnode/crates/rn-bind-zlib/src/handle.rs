@@ -1155,7 +1155,7 @@ fn complete_write<'s>(
                     scope,
                     rn_core::callback_scope::ScopeArgs {
                         context,
-                        resource: Some(resource),
+                        resource: Some(&resource),
                         frame: None,
                     },
                     |scoped| {

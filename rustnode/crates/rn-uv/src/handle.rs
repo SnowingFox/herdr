@@ -413,8 +413,8 @@ pub unsafe fn deliver_read(state: *mut StreamState, status: isize, allocation: O
     };
     let context_args = || rn_core::callback_scope::ScopeArgs {
         context,
-        resource: Some(owner.clone()),
-        frame: frame.clone(),
+        resource: Some(&owner),
+        frame: frame.as_ref(),
     };
 
     if status > 0 {
@@ -614,8 +614,8 @@ pub unsafe fn deliver_connection(
     };
     let args = rn_core::callback_scope::ScopeArgs {
         context,
-        resource: Some(owner.clone()),
-        frame,
+        resource: Some(&owner),
+        frame: frame.as_ref(),
     };
     let object: v8::Local<'_, v8::Object> = v8::Local::new(scope, &owner);
     let Some(key) = v8::String::new(scope, "onconnection") else {

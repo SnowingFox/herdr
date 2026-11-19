@@ -508,7 +508,7 @@ unsafe extern "C" fn after_work_trampoline<J: Runnable + 'static>(
                     scope,
                     rn_core::callback_scope::ScopeArgs {
                         context: async_wrap.context(),
-                        resource,
+                        resource: resource.as_ref(),
                         frame: None,
                     },
                     call,

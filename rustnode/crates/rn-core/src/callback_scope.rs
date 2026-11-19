@@ -111,17 +111,23 @@ impl From<crate::AsyncWrapState> for AsyncContext {
 }
 
 /// Everything a scope needs to know about the callback it wraps.
-pub struct ScopeArgs {
+///
+/// Both values are **borrowed**. They are read once, at the top of the scope, so
+/// taking them by reference is what keeps a per-callback path free of two
+/// `Global` allocations and their drops — a socket read or an HTTP parse runs
+/// this millions of times, and the clone was measurable as a throughput loss.
+/// A caller that has an owned `Global` passes `as_ref()`.
+pub struct ScopeArgs<'a> {
     /// The resource's async identity.
     pub context: AsyncContext,
     /// The JS object the resource is visible as, for `executionAsyncResource`.
-    pub resource: Option<v8::Global<v8::Object>>,
+    pub resource: Option<&'a v8::Global<v8::Object>>,
     /// The frame the resource captured when it was created.
     ///
     /// `None` is Node's empty internal field, which `async_context_frame`
     /// represents with `empty_context_frame_sentinel_symbol`. A missing frame and
     /// an explicit `undefined` are the same thing to `AsyncLocalStorage`.
-    pub frame: Option<v8::Global<v8::Value>>,
+    pub frame: Option<&'a v8::Global<v8::Value>>,
 }
 
 /// What a registered implementation has to do.
@@ -138,7 +144,7 @@ pub trait CallbackScopeHooks {
     fn open(
         &self,
         scope: &mut v8::PinScope<'_, '_>,
-        args: &ScopeArgs,
+        args: &ScopeArgs<'_>,
     ) -> Option<v8::Global<v8::Value>>;
 
     /// Closes the scope, after the call.
@@ -154,7 +160,7 @@ pub trait CallbackScopeHooks {
     fn close(
         &self,
         scope: &mut v8::PinScope<'_, '_>,
-        args: &ScopeArgs,
+        args: &ScopeArgs<'_>,
         prior_frame: Option<v8::Global<v8::Value>>,
         threw: bool,
     );
@@ -257,7 +263,7 @@ pub fn emit_destroy(async_id: f64) {
 /// would reach V8's default reporter instead of Node's.
 pub fn with_scope<R>(
     scope: &mut v8::PinScope<'_, '_>,
-    args: ScopeArgs,
+    args: ScopeArgs<'_>,
     body: impl FnOnce(&mut v8::PinScope<'_, '_>) -> R,
 ) -> Option<R> {
     // No implementation means no `async_wrap`, i.e. something is calling back
@@ -305,8 +311,28 @@ pub fn with_scope<R>(
 /// the body.
 pub struct OpenScope {
     hooks: Option<Rc<dyn CallbackScopeHooks>>,
-    args: ScopeArgs,
+    /// Owned because this scope outlives the call that opened it: the addon's
+    /// code runs between `napi_open_callback_scope` and its close, so nothing
+    /// the opener borrowed is still guaranteed alive.
+    args: OwnedScopeArgs,
     prior_frame: Option<v8::Global<v8::Value>>,
+}
+
+/// [`ScopeArgs`] with its values rooted, for a scope that spans two calls.
+struct OwnedScopeArgs {
+    context: AsyncContext,
+    resource: Option<v8::Global<v8::Object>>,
+    frame: Option<v8::Global<v8::Value>>,
+}
+
+impl OwnedScopeArgs {
+    fn borrowed(&self) -> ScopeArgs<'_> {
+        ScopeArgs {
+            context: self.context,
+            resource: self.resource.as_ref(),
+            frame: self.frame.as_ref(),
+        }
+    }
 }
 
 /// Opens a scope and returns the state needed to close it.
@@ -314,9 +340,21 @@ pub struct OpenScope {
 /// Returns a value even with no implementation registered, so a close is never
 /// unbalanced: the bootstrap case runs the addon's code unscoped, which is what
 /// [`with_scope`] does and what every call site did before hooks existed.
-pub fn open_scope(scope: &mut v8::PinScope<'_, '_>, args: ScopeArgs) -> OpenScope {
+pub fn open_scope(scope: &mut v8::PinScope<'_, '_>, args: ScopeArgs<'_>) -> OpenScope {
     let hooks = HOOKS.with(|slot| slot.borrow().clone());
-    let prior_frame = hooks.as_ref().and_then(|hooks| hooks.open(scope, &args));
+    let args = OwnedScopeArgs {
+        context: args.context,
+        resource: args
+            .resource
+            .map(|resource| v8::Global::new(scope.as_ref(), v8::Local::new(scope, resource))),
+        frame: args
+            .frame
+            .map(|frame| v8::Global::new(scope.as_ref(), v8::Local::new(scope, frame))),
+    };
+    let borrowed = args.borrowed();
+    let prior_frame = hooks
+        .as_ref()
+        .and_then(|hooks| hooks.open(scope, &borrowed));
     OpenScope {
         hooks,
         args,
@@ -331,7 +369,8 @@ pub fn open_scope(scope: &mut v8::PinScope<'_, '_>, args: ScopeArgs) -> OpenScop
 /// passes whatever evidence it has; the only effect is whether `after` fires.
 pub fn close_scope(scope: &mut v8::PinScope<'_, '_>, open: OpenScope, threw: bool) {
     if let Some(hooks) = open.hooks {
-        hooks.close(scope, &open.args, open.prior_frame, threw);
+        let args = open.args.borrowed();
+        hooks.close(scope, &args, open.prior_frame, threw);
     }
 }
 

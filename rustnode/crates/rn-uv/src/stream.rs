@@ -492,10 +492,7 @@ unsafe extern "C" fn after_shutdown(request: *mut uv::uv_shutdown_t, status: i32
                 scope,
                 rn_core::callback_scope::ScopeArgs {
                     context,
-                    resource: Some(v8::Global::new(
-                        scope.as_ref(),
-                        v8::Local::<v8::Object>::new(scope, &request),
-                    )),
+                    resource: Some(&request),
                     frame: None,
                 },
                 |scoped| {

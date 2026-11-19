@@ -328,7 +328,7 @@ fn callback_trampoline(
         scope,
         rn_core::callback_scope::ScopeArgs {
             context: delivery.context,
-            resource: Some(resource),
+            resource: Some(&resource),
             frame: None,
         },
         |scoped| {
@@ -421,7 +421,7 @@ pub fn deliver_to_promise_typed<'s>(
                 scope,
                 rn_core::callback_scope::ScopeArgs {
                     context,
-                    resource: Some(resource),
+                    resource: Some(&resource),
                     frame: None,
                 },
                 |scoped| settle(scoped, payload),

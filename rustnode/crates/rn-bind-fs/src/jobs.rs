@@ -883,8 +883,8 @@ unsafe extern "C" fn after_work_trampoline<J: FsJob>(
                         inner,
                         rn_core::callback_scope::ScopeArgs {
                             context,
-                            resource: Some(resource),
-                            frame: Some(frame.clone()),
+                            resource: Some(&resource),
+                            frame: Some(&frame),
                         },
                         |scoped| {
                             let _ = callback.call(scoped, target.into(), &arguments);

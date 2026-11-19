@@ -247,7 +247,7 @@ unsafe extern "C" fn after_connect(request: *mut uv::uv_connect_t, status: i32) 
             scope,
             rn_core::callback_scope::ScopeArgs {
                 context,
-                resource: Some(resource),
+                resource: Some(&resource),
                 frame: None,
             },
             |scoped| {
