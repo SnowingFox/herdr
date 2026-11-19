@@ -599,6 +599,13 @@ fn install_web_globals<'s>(scope: &mut v8::PinScope<'s, '_>) {
                 "MessageEvent",
                 "CloseEvent",
                 "ErrorEvent",
+                // Node publishes these in a *second* `exposeLazyInterfaces`
+                // call on the same module (`exposed-window-or-worker.js:99`).
+                // Leaving them out made `typeof WebSocket` `"undefined"` where
+                // the oracle says `"function"`, which breaks every test that
+                // upgrades an http connection to a WebSocket.
+                "EventSource",
+                "WebSocket",
             ][..],
         ),
         ("perf_hooks", &["performance"][..]),

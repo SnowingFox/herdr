@@ -1149,3 +1149,23 @@ fn a_listener_less_port_keeps_its_queue_for_receive_message_on_port() {
         ),
     );
 }
+
+#[test]
+fn websocket_is_a_global_and_eventsource_is_not() {
+    // `exposed-window-or-worker.js` publishes these in a *second*
+    // `exposeLazyInterfaces` call on the undici module (line 99). rustnode's
+    // `install_web_globals` transcribed the first call's list and dropped this
+    // one, so `WebSocket` was `undefined` where Node 28 has a function, and
+    // every test that upgrades an http connection to a WebSocket failed.
+    //
+    // `EventSource` is listed on the same line and must stay absent: Node gates
+    // it behind `--experimental-eventsource`, so the oracle reports
+    // `undefined` without the flag. Asserting both is what keeps a future
+    // "add the missing names" change from publishing something Node does not.
+    expect(
+        "console.log(typeof globalThis.WebSocket,
+                    typeof globalThis.EventSource,
+                    Object.getPrototypeOf(globalThis.WebSocket).name);",
+        "function undefined EventTarget",
+    );
+}
