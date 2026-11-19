@@ -1,5 +1,6 @@
 mod args;
 mod diagnostics;
+mod snapshot;
 
 use rn_bindings::install_all;
 use rn_core::Env;
@@ -336,6 +337,16 @@ fn main() {
     rn_v8_sys::use_custom_platform();
     v8::V8::initialize();
     rn_core::profile::mark("V8::initialize");
+
+    // `--build-snapshot` runs on its own isolate and never reaches the path
+    // below. Two reasons: `create_blob` consumes its isolate and must not run
+    // inside a handle scope, and `main`'s scope is pinned for the whole function,
+    // so the isolate it borrows could never be moved into `create_blob`. A build
+    // therefore happens in [`snapshot::build`], which owns both the isolate and
+    // the scope in one body and so can end the scope before consuming the isolate.
+    if options.build_snapshot {
+        run_snapshot_build(&options);
+    }
 
     // The allocator is what makes `process.memoryUsage().arrayBuffers` a real
     // number: V8's default allocator does not count anything, so an isolate
@@ -1172,6 +1183,88 @@ fn install_embedder_graph(isolate: &mut v8::Isolate) {
         // every consumer of these nodes fails for a reason it can report itself.
         // Logging keeps that from looking like "the walk found nothing".
         tracing::debug!("no heap profiler; heap snapshots will have no embedder nodes");
+    }
+}
+
+/// `--build-snapshot`: bootstrap a realm in a snapshot-creator isolate and write
+/// the blob, then exit.
+///
+/// Self-contained rather than a branch inside `main`, because `create_blob`
+/// consumes its isolate and must not run inside a handle scope. `main`'s scope is
+/// pinned for the whole function, so an isolate borrowed by it could never be
+/// moved into `create_blob`; here the isolate and the scope are both locals of
+/// one function, and [`snapshot::build`] ends the scope before consuming it.
+///
+/// Never returns: a build either writes the blob or explains why it could not.
+/// V8 fatals (the three walls in `snapshot_contract.rs`) end the process without
+/// reaching either branch, and their message is the report.
+fn run_snapshot_build(options: &args::Options) -> ! {
+    let params = rn_core::set_isolate_create_params_for_node(
+        v8::CreateParams::default(),
+        rn_uv::memory::constrained_memory(),
+        rn_uv::memory::total_memory(),
+    );
+    let params = if options.debug_arraybuffer_allocations {
+        rn_core::with_debugging_array_buffer_allocator(params)
+    } else {
+        rn_core::with_counted_array_buffer_allocator(params)
+    };
+    let path = snapshot::blob_path(options.snapshot_blob.as_deref());
+    rn_core::profile::mark("snapshot build starting");
+
+    // The bootstrap runs inside the added context, so `snapshot::build` owns the
+    // scope and this closure only fills it in. `bootstrap_realm` is the same call
+    // `main` makes for a normal run, which is what makes the snapshot a snapshot
+    // of a real realm rather than of a bare context.
+    let outcome = snapshot::build(
+        params,
+        |scope| {
+            // Isolate-level handlers first: they need `&mut Isolate`, and a
+            // binding callback cannot obtain one soundly while its callback scope
+            // is open. `main` installs the same set for the same reasons.
+            {
+                let isolate: &mut v8::Isolate = (*scope).as_mut();
+                rn_module_wrap::install_isolate_callbacks(isolate);
+                rn_realm::shadow_realm::install_callback(isolate);
+                rn_bind_task_queue::install_isolate_callbacks(isolate);
+                rn_bind_heap_utils::set_snapshot_isolate(isolate);
+                rn_bind_inspector::set_isolate(isolate);
+                install_embedder_graph(isolate);
+                isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+            }
+            // Wall 4 lives here: the bootstrap populates thread-local
+            // `v8::Global` caches, and `CreateBlob` aborts on any it cannot reach
+            // from a serialised context. If it aborts, that is the report.
+            let context = scope.get_current_context();
+            let _ = context;
+            match rn_realm::bootstrap_realm(
+                scope,
+                &[args::program_name()],
+                &options.exec_argv,
+                rn_realm::ProcessState::main_thread(options.debug_port.port),
+            ) {
+                Ok(_loaders) => {}
+                Err(message) => {
+                    eprintln!("rustnode: the realm bootstrap failed: {message}");
+                }
+            }
+        },
+        &path,
+    );
+
+    match outcome {
+        Ok(bytes) => {
+            // Node prints nothing on success; the blob's existence is the result.
+            // Reporting the size on stderr keeps it out of a captured stdout.
+            eprintln!("rustnode: wrote {bytes} bytes to {path}");
+            terminate(0);
+        }
+        Err(message) => {
+            // Loudly, not silently: a `--build-snapshot` that exits 0 without a
+            // blob is the "flag that lies" failure this change removes.
+            eprintln!("rustnode: cannot build a snapshot: {message}");
+            terminate(1);
+        }
     }
 }
 

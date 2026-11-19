@@ -305,6 +305,24 @@ pub struct Options {
     /// *after* `--permission`'s environment scrub. Installing here would let an
     /// inherited value the scrub removed survive under the file's name.
     pub env_file_store: std::collections::BTreeMap<String, String>,
+    /// `--build-snapshot`: the process bootstraps a realm and writes a snapshot
+    /// blob instead of running a script.
+    ///
+    /// Node's `SnapshotConfig::builder_script_path` is the entry point to run
+    /// first; `--build-snapshot -e <src>` and `--build-snapshot <file>` both land
+    /// here, with `None` meaning "bootstrap only, run no builder script".
+    pub build_snapshot: bool,
+    /// `--build-snapshot-config`: a JSON file naming the builder script and its
+    /// arguments, instead of taking them from the command line.
+    ///
+    /// Recorded and reported as unsupported rather than silently ignored: the
+    /// config's `builder` field replaces `argv[1]`, and reproducing that without
+    /// the rest of `ReadSnapshotConfig` would accept a config it does not honour.
+    pub build_snapshot_config: Option<String>,
+    /// `--snapshot-blob`: the path a built blob is written to, and the path a
+    /// load reads from. Empty means Node's default of `snapshot.blob` in the
+    /// working directory.
+    pub snapshot_blob: Option<String>,
 }
 
 impl Options {
@@ -346,6 +364,9 @@ impl Options {
             bench_runner: false,
             env_files: Vec::new(),
             env_file_store: std::collections::BTreeMap::new(),
+            build_snapshot: false,
+            build_snapshot_config: None,
+            snapshot_blob: None,
         }
     }
 
@@ -1010,6 +1031,11 @@ const VALUE_INLINE_PREFIXES: &[&str] = &[
     "--use-largepages=",
     "--trace-event-file-pattern=",
     "--unhandled-rejections=",
+    // Snapshot paths. Both take a value, so they have to be listed or the
+    // separate-value branch never sees them: `--snapshot-blob out.blob` would
+    // otherwise treat `out.blob` as the script to run.
+    "--snapshot-blob=",
+    "--build-snapshot-config=",
 ];
 
 /// Permission flags that take a value, in either the `=` or the separate form.
@@ -1765,6 +1791,59 @@ pub fn parse_with_env(
                     index += 1;
                     continue;
                 }
+                // `--build-snapshot` asks the process to bootstrap and serialise
+                // instead of running a script. It used to fall through to the
+                // `is_v8_flag` branch and reach V8's own parser, which rejected it
+                // with `unsupported option '--build-snapshot'` — the flag looked
+                // absent rather than unimplemented.
+                //
+                // Recorded here and acted on in `main` after the isolate exists,
+                // because building a snapshot needs the whole bootstrap that a
+                // normal run does.
+                "--build-snapshot" => {
+                    options.build_snapshot = sets;
+                    options.exec_argv.push(argument.clone());
+                    index += 1;
+                    continue;
+                }
+                // The two snapshot paths. `--snapshot-blob` is where a built blob
+                // is written and where a load reads from; `--build-snapshot-config`
+                // is a JSON file naming the builder script. Both take a value, so
+                // they consume the next argument in the separate form.
+                //
+                // The config is recorded but refused with a message rather than
+                // ignored: honouring it means reproducing `ReadSnapshotConfig`,
+                // which replaces `argv[1]` with the config's `builder` field.
+                // Accepting one and not reading it would be the flag-that-lies
+                // this change exists to remove.
+                "--snapshot-blob" | "--build-snapshot-config" => {
+                    let value = match argument.split_once('=') {
+                        Some((_, value)) => value.to_string(),
+                        None => match args.get(index + 1) {
+                            Some(value) if !value.starts_with('-') => value.clone(),
+                            _ => {
+                                return Err(ParseError::Cli(format!(
+                                    "{argument} requires an argument"
+                                )));
+                            }
+                        },
+                    };
+                    if argument.starts_with("--build-snapshot-config") {
+                        options.build_snapshot_config = Some(value);
+                    } else {
+                        options.snapshot_blob = Some(value);
+                    }
+                    options.exec_argv.push(argument.clone());
+                    if !argument.contains('=') {
+                        options
+                            .exec_argv
+                            .push(args.get(index + 1).cloned().unwrap_or_default());
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                    continue;
+                }
                 // `--v8-options` prints V8's list and exits 0. It is recorded
                 // here rather than answered in this walk because V8 is not
                 // initialised yet: `main` answers it where `src/node.cc:1297`
@@ -2242,6 +2321,14 @@ fn flag_name(argument: &str) -> Option<(&'static str, bool)> {
         "--trace-promises" => Some(("--trace-promises", false)),
         "--trace-sync-io" => Some(("--trace-sync-io", false)),
         "--bench" => Some(("--bench", false)),
+        // Snapshot plumbing. `--build-snapshot` is the boolean; the two value
+        // flags are listed so `flag_name` does not return `None` for them and
+        // send the walk into the "declared but unhandled" branch. Their values
+        // are read in the arm below, not from `flag_name`'s name half.
+        "--build-snapshot" => Some(("--build-snapshot", false)),
+        "--no-build-snapshot" => Some(("--build-snapshot", true)),
+        "--snapshot-blob" => Some(("--snapshot-blob", false)),
+        "--build-snapshot-config" => Some(("--build-snapshot-config", false)),
         "--v8-options" => Some(("--v8-options", false)),
         "--zero-fill-buffers" => Some(("--zero-fill-buffers", false)),
         "--debug" | "--debug-brk" => Some(("--debug-brk", false)),
