@@ -224,7 +224,7 @@ fn a_captured_callback_address_rebuilds_a_working_function_after_a_snapshot() {
         let captured: v8::FunctionCallback = v8::MapFnTo::map_fn_to(probe_callback);
         say(&format!("captured thunk {:#x}", captured as usize));
         assert!(
-            !(captured as usize == 0),
+            (captured as usize) != 0,
             "a callback's thunk address is never null"
         );
         // The same function item yields the same address on every call, which is
