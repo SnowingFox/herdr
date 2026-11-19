@@ -848,6 +848,13 @@ pub struct PortInner {
     /// would change what `postMessage` returns and skip the serialization Node
     /// performs, so it is a separate fact.
     data_detached: Cell<bool>,
+    /// This port's async ids, when `async_wrap` was installed.
+    ///
+    /// Node's `MessagePort` is an `AsyncWrap` with `PROVIDER_MESSAGEPORT`, so its
+    /// id exists from construction and every delivered message runs
+    /// `emitMessage` under that scope. `None` during bootstrap, where no
+    /// `async_wrap` binding has installed and Node has no id to emit either.
+    pub async_wrap: Cell<Option<crate::async_ids::AsyncIds>>,
     /// Identity of this port, so two ports never compare equal.
     identity: Rc<()>,
     /// The JavaScript object, weakly.
@@ -948,6 +955,7 @@ impl PortInner {
             closed: Cell::new(false),
             wake_refed: Cell::new(false),
             data_detached: Cell::new(false),
+            async_wrap: Cell::new(None),
             identity: Rc::new(()),
             object: RefCell::new(None),
             pinned: RefCell::new(None),
