@@ -227,6 +227,8 @@ pub const MEMBERS: &[&str] = &[
     // Comparison and feature queries.
     "timingSafeEqual",
     "getFipsCrypto",
+    "setFipsCrypto",
+    "testFipsCrypto",
     "getFipsCryptoGeneration",
     "getOpenSSLSecLevelCrypto",
     // Constants the JavaScript layer passes straight back in.
@@ -341,17 +343,8 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "ML-KEM encapsulation mode flag; the KEM jobs it selects are deferred.",
     ),
     (
-        "setFipsCrypto",
-        "FIPS mode needs a validated provider; `getFipsCrypto` reports false truthfully and \
-         turning it on cannot succeed.",
-    ),
-    (
         "setupFipsIndicatorChannel",
         "FIPS indicator events, deferred with setFipsCrypto.",
-    ),
-    (
-        "testFipsCrypto",
-        "FIPS indicator testing, deferred with FIPS.",
     ),
 ];
 
@@ -585,6 +578,8 @@ impl BindingModule for Crypto {
         )?;
         rn_core::set_method(scope, object, "secureHeapUsed", secure_heap_used)?;
         rn_core::set_method(scope, object, "getFipsCrypto", get_fips_crypto)?;
+        rn_core::set_method(scope, object, "setFipsCrypto", set_fips_crypto)?;
+        rn_core::set_method(scope, object, "testFipsCrypto", test_fips_crypto)?;
         rn_core::set_method(
             scope,
             object,
@@ -1425,7 +1420,31 @@ fn get_fips_crypto(
     _args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue,
 ) {
-    rv.set(v8::Integer::new(scope, i32::from(engine::FIPS_ENABLED)).into());
+    rv.set(v8::Integer::new(scope, i32::from(engine::fips_enabled())).into());
+}
+
+/// `setFipsCrypto(enable)`: `crypto.setFips()`.
+///
+/// Records OpenSSL's FIPS property-query state. See [`engine::set_fips_enabled`]
+/// for what that does and does not guarantee.
+fn set_fips_crypto(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue,
+) {
+    let _ = scope;
+    engine::set_fips_enabled(args.get(0).is_true());
+}
+
+/// `testFipsCrypto()`: the same state as `getFipsCrypto`, as a number.
+///
+/// `crypto.fips` and the indicator paths read this rather than the string form.
+fn test_fips_crypto(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue,
+) {
+    rv.set(v8::Integer::new(scope, i32::from(engine::fips_enabled())).into());
 }
 
 /// `getFipsCryptoGeneration()`: the counter `getHashCache()` watches.

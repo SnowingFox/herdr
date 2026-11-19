@@ -771,12 +771,37 @@ pub fn check_hkdf_parameters(digest: &str, length: usize) -> Result<(), CryptoEr
 // Feature queries
 // ---------------------------------------------------------------------------
 
-/// Whether OpenSSL has FIPS mode enabled.
+/// Whether `crypto.setFips()` was called with `true`, i.e. OpenSSL's
+/// FIPS property-query state.
 ///
-/// Always false in this build: FIPS needs a validated module and provider
-/// configuration, and `lib/internal/crypto/util.js` asks this through
-/// `getFipsCrypto()`. Reporting false is the truth, not a placeholder.
-pub const FIPS_ENABLED: bool = false;
+/// This is deliberately **not** "is FIPS enforced". Node's own docs say of
+/// `setFips()`: "If no loaded provider supplies a requested cryptographic
+/// implementation matching `fips=yes`, the call can still succeed and
+/// `crypto.getFips()` can still return `1`, but fetching that implementation
+/// fails." The oracle on this host has no `fips` provider module and still
+/// answers `getFips() === 1` after `setFips(true)`, so reporting the requested
+/// state is the contract rather than an approximation of it.
+///
+/// What this build does *not* do is make OpenSSL hand out FIPS-validated
+/// implementations: `setFips(true)` sets the default properties to `fips=yes`,
+/// and a fetch for an algorithm with no such implementation fails the way Node's
+/// docs describe. Callers who need validated crypto must run a FIPS build.
+static FIPS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `setFips(true)` is in effect.
+pub fn fips_enabled() -> bool {
+    FIPS_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Records the state `setFips()` asked for.
+///
+/// Infallible on purpose: the only step that could fail in Node is
+/// `EVP_default_properties_enable_fips`, which is not linked here, so there is
+/// nothing that can report an OpenSSL error. Pretending one is possible would put
+/// an unreachable `ERR_CRYPTO_OPERATION_FAILED` path in the binding.
+pub fn set_fips_enabled(enable: bool) {
+    FIPS_ENABLED.store(enable, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// The OpenSSL version this binary linked, e.g. `3.6.3`.
 pub fn openssl_version() -> String {
