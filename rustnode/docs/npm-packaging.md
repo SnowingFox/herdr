@@ -200,4 +200,36 @@ wrapper interpolates.
 
 Publishing needs a registry credential (`npm login`, or `NPM_TOKEN` for CI) and
 must publish the platform packages before the main one, so the optional
-dependency resolves. See the release notes in the PR for the exact command.
+dependency resolves.
+
+## The publish, step by step
+
+Run from `rustnode/` after choosing the name in `platforms.json` and
+`npm/package.json` (both must agree, or `npm-pack.py` refuses — see the check at
+`tools/npm-pack.py:348`).
+
+```bash
+# 1. Build the release binary the platform package wraps.
+cargo build --release -p rn-cli
+
+# 2. Produce both tarballs. Refuses if the two manifests disagree on the name,
+#    so a mismatched scope cannot be published by accident.
+python3 tools/npm-pack.py pack --out /tmp/npm-out
+
+# 3. Platform packages FIRST. The root's optionalDependency names them, so a
+#    root published first resolves to nothing and every install fails.
+for f in /tmp/npm-out/*-linux-x64-*.tgz; do npm publish --access public "$f"; done
+#    Repeat for each platform in platforms.json as those builds become available.
+
+# 4. Then the root package.
+npm publish --access public /tmp/npm-out/example-rsnode-*.tgz
+
+# 5. Prove it from the registry, in a directory unrelated to this checkout.
+cd "$(mktemp -d)" && npm init -y >/dev/null && npm install @<scope>/rsnode
+./node_modules/.bin/rsnode -e 'console.log(process.version)'
+```
+
+Step 5 is the only evidence that the optional dependency actually resolves from
+the registry — the local tests in this repository install tarballs, which
+bypasses that resolution entirely. Do not report a publish as successful on the
+strength of the tarball tests.
