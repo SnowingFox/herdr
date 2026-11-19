@@ -729,6 +729,86 @@ fn module_instantiate<'s>(
     let _ = module.instantiate_module(scope, resolve_module_callback);
 }
 
+/// Arms `isolate->TerminateExecution()` after `timeout_ms`, from another thread.
+///
+/// This is Node's `Watchdog` (`src/node_watchdog.{h,cc}`) reduced to what
+/// `ModuleWrap::Evaluate` uses: a thread that sleeps for the deadline and then
+/// terminates the isolate. Node runs a libuv loop on that thread so the timer can
+/// be cancelled early; here the deadline is only ever waited out or cancelled, so
+/// a parked thread with a `Condvar` does the same job without a second loop, and
+/// [`Drop`] is what stops it when evaluation finishes first.
+///
+/// The isolate handle is the thread-safe one (`IsolateHandle` is `Send + Sync` by
+/// its own documentation), because `TerminateExecution` is explicitly allowed from
+/// a thread that does not hold the V8 lock while the running thread does.
+///
+/// `fired` is how the caller learns whether the termination it is about to
+/// observe came from *this* watchdog rather than from an outer one: Node checks
+/// the same flag before converting the termination into
+/// `ERR_SCRIPT_EXECUTION_TIMEOUT` (`src/module_wrap.cc:855`), because a nested
+/// timeout must not be re-reported as this one's.
+struct EvaluateWatchdog {
+    /// Set by the thread when the deadline passes before the guard is dropped.
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set once evaluation is finished, so the thread can stop waiting.
+    finished: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl EvaluateWatchdog {
+    /// Arms the watchdog for `timeout_ms` milliseconds.
+    fn arm(isolate: &v8::Isolate, timeout_ms: u64) -> Self {
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished =
+            std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let handle = isolate.thread_safe_handle();
+        let thread_fired = std::sync::Arc::clone(&fired);
+        let thread_finished = std::sync::Arc::clone(&finished);
+
+        // A thread that cannot be spawned leaves the guard armed but never firing,
+        // so evaluation runs without a deadline rather than failing to start. That
+        // is the same outcome as Node's `uv_thread_create` failure path, which also
+        // proceeds.
+        std::thread::Builder::new()
+            .name("rn-evaluate-watchdog".to_string())
+            .spawn(move || {
+                let (lock, ready) = &*thread_finished;
+                let Ok(guard) = lock.lock() else {
+                    return;
+                };
+                let Ok((guard, _)) =
+                    ready.wait_timeout(guard, std::time::Duration::from_millis(timeout_ms))
+                else {
+                    return;
+                };
+                // Signalled by `Drop` before the deadline: evaluation finished.
+                if *guard {
+                    return;
+                }
+                drop(guard);
+                thread_fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                handle.terminate_execution();
+            })
+            .ok();
+
+        Self { fired, finished }
+    }
+
+    /// Whether this watchdog is what terminated the isolate.
+    fn fired(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for EvaluateWatchdog {
+    fn drop(&mut self) {
+        let (lock, ready) = &*self.finished;
+        if let Ok(mut finished) = lock.lock() {
+            *finished = true;
+            ready.notify_all();
+        }
+    }
+}
+
 /// `evaluate(timeout, breakOnSigint)`: the asynchronous evaluation entry point.
 ///
 /// Returns V8's evaluation promise, which settles once the module graph — and
@@ -737,6 +817,19 @@ fn module_instantiate<'s>(
 ///
 /// A `None` return means evaluation threw and the exception is already pending,
 /// so it propagates without any rethrow here.
+///
+/// # The timeout
+///
+/// `lib/internal/vm/module.js`'s `evaluate(options)` validates `options.timeout`
+/// and passes `-1` when it is absent, which is `ModuleWrap::Evaluate`'s
+/// no-watchdog case (`src/module_wrap.cc:796`). A non-negative value arms
+/// [`EvaluateWatchdog`], and a termination that watchdog caused is converted into
+/// `ERR_SCRIPT_EXECUTION_TIMEOUT` after `CancelTerminateExecution`, exactly as
+/// `src/module_wrap.cc:855-862` does.
+///
+/// Without this the argument was ignored, so `evaluate({ timeout: 500 })` on
+/// `while (true) {}` ran forever. `test-vm-module-basic.js` exercises precisely
+/// that, and a hung process is the one outcome a caller cannot diagnose.
 fn module_evaluate<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     args: v8::FunctionCallbackArguments<'s>,
@@ -747,9 +840,92 @@ fn module_evaluate<'s>(
         throw_type_error(scope, "ModuleWrap instance is not initialized");
         return;
     };
-    if let Some(value) = module.evaluate(scope) {
+
+    // `lib/internal/vm/module.js` always passes both arguments; a missing one is
+    // treated as "no timeout" rather than as an error, because reaching here at
+    // all means the JS layer already validated the shape.
+    let timeout = args.get(0).int32_value(scope).unwrap_or(-1);
+    if args.get(1).is_true() {
+        throw_error(
+            scope,
+            "evaluate: breakOnSigint needs a V8 watchdog thread, which rustnode does not run",
+        );
+        return;
+    }
+
+    if timeout < 0 {
+        if let Some(value) = module.evaluate(scope) {
+            rv.set(value);
+        }
+        return;
+    }
+
+    // The termination has to be observed by a `TryCatch` this function owns: V8
+    // reports it as an uncatchable exception that unwinds to the nearest one, and
+    // the module's own promise never settles.
+    let watchdog_fired;
+    let mut pending: Option<v8::Local<'_, v8::Value>> = None;
+    let evaluated = {
+        let watchdog = EvaluateWatchdog::arm(scope.as_ref(), timeout as u64);
+        let try_catch = std::pin::pin!(v8::TryCatch::new(scope));
+        let scope = &mut try_catch.init();
+        let evaluated = module.evaluate(scope);
+        watchdog_fired = watchdog.fired();
+        if watchdog_fired {
+            // `CancelTerminateExecution` first, so the isolate can run again: the
+            // termination is converted into a regular exception rather than left in
+            // effect, which is what lets the caller's `catch` work.
+            scope.as_ref().cancel_terminate_execution();
+        } else if scope.has_caught() {
+            if scope.has_terminated() {
+                // An outer watchdog, not this one. Leave the termination in effect
+                // and report nothing, so the outer caller's
+                // `ERR_SCRIPT_EXECUTION_TIMEOUT` is the one the user sees.
+                return;
+            }
+            pending = scope.exception();
+        }
+        evaluated
+    };
+    // The `TryCatch` is gone from here on, so an exception has to be re-thrown on
+    // the outer scope — and the timeout is thrown *outside* it too, because one
+    // raised inside is caught by it and the caller would see `undefined` instead of
+    // a throw. `lib/internal/vm/module.js`'s `evaluate` builds its rejected promise
+    // from that `catch`, so losing the throw loses the rejection.
+    if watchdog_fired {
+        throw_script_timeout(scope, timeout);
+        return;
+    }
+    if let Some(exception) = pending {
+        scope.throw_exception(exception);
+        return;
+    }
+    if let Some(value) = evaluated {
         rv.set(value);
     }
+}
+
+/// Throws Node's `ERR_SCRIPT_EXECUTION_TIMEOUT`.
+///
+/// Node defines this one in `src/node_errors.h:129` with the message
+/// `Script execution timed out after %dms` (`:271`), so it is constructed here
+/// rather than looked up in `lib/internal/errors.js` — it is not in that file,
+/// which is why `errors.js` has no `E('ERR_SCRIPT_EXECUTION_TIMEOUT', ...)` entry
+/// to reach.
+fn throw_script_timeout(scope: &mut v8::PinScope<'_, '_>, timeout_ms: i32) {
+    let message = format!("Script execution timed out after {timeout_ms}ms");
+    let Some(text) = v8::String::new(scope, &message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, text);
+    if let Ok(object) = v8::Local::<v8::Object>::try_from(exception) {
+        if let Some(key) = v8::String::new(scope, "code") {
+            if let Some(value) = v8::String::new(scope, "ERR_SCRIPT_EXECUTION_TIMEOUT") {
+                object.set(scope, key.into(), value.into());
+            }
+        }
+    }
+    scope.throw_exception(exception);
 }
 
 /// `evaluateSync()`: evaluate a graph that is known to have no top-level await.
