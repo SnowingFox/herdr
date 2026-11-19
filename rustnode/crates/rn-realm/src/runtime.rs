@@ -194,7 +194,15 @@ impl Runtime {
 /// own order (`process._fatalException` first) rather than printing directly.
 /// When nothing handles it, the print-and-exit path still runs unchanged.
 fn report_uncaught(scope: &mut v8::PinScope, exception: v8::Local<v8::Value>) {
-    rn_errors::report_uncaught_exception(scope, exception);
+    // `Exception::create_message` is Node's fallback when no `TryCatch` is in
+    // hand (`src/node_errors.cc:1437`). Without it a thrown object that carries
+    // no `stack` of its own — `throw {a: 1}`, or one whose `toString()` throws —
+    // prints with no source location, where Node still prints
+    // `file:line`, the source line and a caret before the value.
+    let message = exception
+        .is_object()
+        .then(|| v8::Exception::create_message(scope, exception));
+    rn_errors::report_uncaught_exception_with_message(scope, exception, message);
 }
 
 /// Runs `internal/util/debuglog`'s `initializeDebugEnv`, which Node's
