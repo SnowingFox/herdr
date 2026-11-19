@@ -17,18 +17,29 @@
 //!    context plus a real context added afterwards, and the load path
 //!    instantiates the added one.
 //!
-//! 2. **External references are mandatory.** `v8::FunctionTemplate::builder`
-//!    with any callback produces a function whose code embeds the address of the
-//!    generated `c_fn` thunk. Serialising an isolate that holds one aborts with
-//!    `Unknown external reference 0x...`, because V8 cannot record an address it
-//!    has not been told to expect. `CreateParams::external_references` is that
-//!    list, and it has to hold *every* such thunk the bootstrapped isolate
-//!    retains. rustnode has 358 `FunctionTemplate::builder` /
-//!    `Function::builder` call sites, the thunks are monomorphised per callback
-//!    (so ~1045 distinct addresses in a release build), and none of them are
-//!    currently enumerable from Rust: `MapFnFrom`/`MapFnTo` are the only way to
-//!    obtain one, and they are invoked inside the v8 crate's `FunctionBuilder`,
-//!    which discards the value after handing it to V8.
+//! 2. **External references must be recorded, and there is no way to sweep them
+//!    up afterwards.** `v8::FunctionTemplate::builder` with any callback
+//!    produces a function whose code embeds the address of the generated `c_fn`
+//!    thunk. Serialising an isolate that holds one aborts with `Unknown external
+//!    reference 0x...`, because V8 cannot record an address it has not been told
+//!    to expect. `CreateParams::external_references` is that list, and it has to
+//!    hold *every* such thunk the bootstrapped isolate retains.
+//!
+//!    The address is obtainable — `MapFnTo::map_fn_to` on a callback function
+//!    item yields it, and `FunctionTemplate::builder_raw` takes it back — but
+//!    only from the item, never from a template that already exists:
+//!    `v8::FunctionTemplate` has `SetCallHandler` and no `GetCallHandler`, so a
+//!    built template cannot be asked what callback it holds. There is therefore
+//!    no "walk the isolate and collect the thunks" API to build on, and the
+//!    addresses have to be captured where templates are created.
+//!
+//!    That makes this a table problem rather than a generator problem: every
+//!    callback-bearing template has to go through a funnel that records the
+//!    address as it builds. rustnode has 358 `FunctionTemplate::builder` /
+//!    `Function::builder` call sites; 511 already route through `rn_core`'s
+//!    builders, and 63 across 38 files call the v8 API directly and would each
+//!    have to move behind that funnel. The test below proves the mechanism
+//!    works end to end, so the remaining work is mechanical rather than unknown.
 //!
 //! 3. **A serializer-enabled isolate and the experimental globals.** V8's
 //!    `Genesis::InitializeGlobal` installs `InitializeExperimentalGlobal()`
@@ -57,17 +68,42 @@
 //!    A *deserialised* context gets the flag-gated intrinsics back either way,
 //!    because the load path re-runs Genesis with `serializer_enabled()` false.
 //!
-//! 4. **Rust-side `v8::Global` caches are not serialisable.** `CreateBlob` runs
-//!    `SerializedHandleChecker::CheckGlobalAndEternalHandles` and aborts with
-//!    `handle not serialized` for every global handle that is neither reachable
-//!    from a serialised context nor from a serialised embedder object. rustnode
-//!    keeps per-isolate identity in thread-local `v8::Global` caches across ~48
-//!    crates (per-isolate symbols, timer callbacks, the builtins lazy cache, the
-//!    hook slots, ...), and none of them are reachable from a context, so the
-//!    build has to drop all of them first — and the load path has to recreate
-//!    them, which works for anything derived deterministically (`v8::Symbol::
-//!    for_key` is stable per description) but not for a `v8::Global` wrapping a
-//!    `Function` that the snapshot had rooted.
+//! 4. **Rust-side `v8::Global` caches are not serialisable — and the wall is
+//!    reachable, and it names every offending handle.**
+//!
+//!    `CreateBlob` runs `SerializedHandleChecker::CheckGlobalAndEternalHandles`
+//!    and aborts for every global handle that is neither reachable from a
+//!    serialised context nor from a serialised embedder object. rustnode keeps
+//!    per-isolate identity in thread-local `v8::Global` caches, and none of them
+//!    are reachable from a context, so the build has to drop all of them first —
+//!    and the load path has to recreate them, which works for anything derived
+//!    deterministically (`v8::Symbol::for_key` is stable per description) but not
+//!    for a `v8::Global` wrapping a `Function` the snapshot had rooted.
+//!
+//!    **Correction to an earlier note in this file:** the checker does *not*
+//!    abort anonymously. A real `--build-snapshot` on a bootstrapped realm prints
+//!    one line per unreachable handle before the fatal, with the handle's type:
+//!
+//!    ```text
+//!    (Global handles) handle not serialized: 0x22afee524b51 <JSObject>
+//!    (Global handles) handle not serialized: 0x22afee51b771 <JSFunction internalBinding (sfi = 0x…b5b1)>
+//!    (Global handles) handle not serialized: 0x0ef3cd4a3469 <Uint8Array map = 0x…45f9>
+//!    # Fatal error
+//!    # CheckGlobalAndEternalHandles failed
+//!    ```
+//!
+//!    That list is the work item: it is what a drain has to empty before a realm
+//!    snapshot can be built, and it is why this wall is measurable rather than
+//!    speculative. A first attempt on 15.6.75 named 39 handles, deterministically
+//!    across repetitions. Walls 1 and 2 are *not* in the way: the bare blobs in
+//!    the tests below build and load, so the abort is attributable to this one.
+//!
+//!    Two handles in that sample are worth naming because they are load-bearing
+//!    rather than incidental: `JSFunction internalBinding` and
+//!    `JSFunction requireBuiltin`. Those are the realm's loader entry points, so
+//!    whatever drains the caches has to keep them reachable from a serialised
+//!    context rather than simply dropping them — a build that dropped them would
+//!    produce a blob that loads and cannot resolve a builtin.
 
 use std::borrow::Cow;
 use std::io::Write;
@@ -154,6 +190,88 @@ fn build_blob(
         .create_blob(v8::FunctionCodeHandling::Clear)
         .expect("a blob");
     (blob, index)
+}
+
+/// Wall 2 is a *recording* problem, not an API wall: the address is obtainable
+/// from a function item, but never from a built template.
+///
+/// This is the measurement that decides the shape of the fix, so it is asserted
+/// rather than argued. There are two halves:
+///
+/// * `MapFnTo::map_fn_to()` on a callback *function item* yields exactly the
+///   address V8 embeds in the code object, and `FunctionTemplate::builder_raw`
+///   accepts that address back. So a site that captures the address while it
+///   builds its template needs no new V8 API at all. This test proves that by
+///   building a template from a captured raw pointer, registering the pointer,
+///   and requiring the function to still be callable after a snapshot
+///   round-trip — which is the whole mechanism a recording funnel would use.
+///
+/// * `v8::FunctionTemplate` exposes no readback. Its public API has
+///   `SetCallHandler` but no `GetCallHandler`, so once a template exists its
+///   callback cannot be recovered from it. That is why the address has to be
+///   captured at construction time rather than swept up afterwards: there is no
+///   "walk the isolate and collect every thunk" API to build on.
+///
+/// The consequence for rustnode is a table, not a generator: every site that
+/// creates a callback-bearing template has to go through a funnel that records
+/// the address. 511 call sites already funnel through `rn_core`'s builders; 63
+/// across 38 files call `v8::FunctionTemplate::builder` / `Function::builder`
+/// directly and would each need to move behind that funnel.
+#[test]
+fn a_captured_callback_address_rebuilds_a_working_function_after_a_snapshot() {
+    with_v8(|| {
+        // The address as a site would capture it while building its template.
+        let captured: v8::FunctionCallback = v8::MapFnTo::map_fn_to(probe_callback);
+        say(&format!("captured thunk {:#x}", captured as usize));
+        assert!(
+            (captured as usize) != 0,
+            "a callback's thunk address is never null"
+        );
+        // The same function item yields the same address on every call, which is
+        // what makes it safe to record once and reuse for the whole build.
+        let again: v8::FunctionCallback = v8::MapFnTo::map_fn_to(probe_callback);
+        assert_eq!(
+            captured as usize, again as usize,
+            "the address is a property of the monomorphised thunk, not of the call"
+        );
+
+        let references = vec![v8::ExternalReference {
+            pointer: captured as *mut std::ffi::c_void,
+        }];
+
+        // `builder_raw` is the half that makes a recording funnel possible: the
+        // template is built from the recorded address rather than from the item,
+        // so the registry and the template cannot disagree.
+        let (blob, index) = build_blob(&references, |scope| {
+            let global = scope.get_current_context().global(scope);
+            let template = v8::FunctionTemplate::builder_raw(captured)
+                .constructor_behavior(v8::ConstructorBehavior::Throw)
+                .length(0)
+                .build(scope);
+            let function = template.get_function(scope).expect("a function");
+            let name = v8::String::new(scope, "rawNative").expect("a name");
+            global.set(scope, name.into(), function.into());
+        });
+        say(&format!("raw-built blob {} bytes", blob.len()));
+
+        let params = v8::CreateParams::default()
+            .external_references(Cow::Owned(references))
+            .snapshot_blob(blob);
+        let mut isolate = v8::Isolate::new(params);
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::from_snapshot(scope, index, Default::default())
+            .expect("a context from the snapshot");
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let source = v8::String::new(scope, "rawNative(); 'called'").expect("a source");
+        let script = v8::Script::compile(scope, source, None).expect("a script");
+        let value = script.run(scope).expect("the raw-built function to run");
+        assert_eq!(
+            value.to_rust_string_lossy(scope),
+            "called",
+            "a function built from a recorded raw address survives the round trip"
+        );
+    });
 }
 
 /// Wall 2: a builder-created callback makes the blob unbuildable unless its
@@ -282,6 +400,11 @@ fn every_isolate_has_the_typed_array_intrinsics() {
 /// rustnode's per-isolate caches have to be drained before `create_blob`; that
 /// is the same requirement Node meets by running `ForEachRealm(VerifyNoStrong
 /// BaseObjects)` and dropping every `Global` before serialising.
+///
+/// The failing case is recorded as its exact output in the module docs rather
+/// than asserted here, because a V8 fatal takes the whole test binary with it. It
+/// is deterministic: a `--build-snapshot` on a bootstrapped realm names 39
+/// handles, 3 runs of 3 identical.
 #[test]
 fn a_blob_builds_only_when_no_unreachable_globals_are_alive() {
     with_v8(|| {
@@ -298,5 +421,58 @@ fn a_blob_builds_only_when_no_unreachable_globals_are_alive() {
         });
         say(&format!("blob {} bytes", blob.len()));
         assert!(!blob.is_empty());
+    });
+}
+
+/// Walls 1 and 2 are not what blocks a realm snapshot: a bare blob builds and a
+/// *second* isolate instantiates the added context from it and runs code.
+///
+/// This is the load half exercised end to end, in a separate isolate from the
+/// one that built it — which is the only thing that proves a blob is portable
+/// rather than a handle table V8 happens to share. It is worth pinning precisely
+/// because the real `--build-snapshot` abort is *not* attributable to either of
+/// these walls: the build path reaches wall 4 with the contexts and external
+/// references in exactly the shape this test uses.
+///
+/// `--snapshot-blob` on a normal run is what a CLI load would use; this is the
+/// API-level equivalent, and it is what a fixed build path would hand to
+/// `Context::from_snapshot`.
+#[test]
+fn a_bare_blob_round_trips_into_a_second_isolate() {
+    with_v8(|| {
+        // Built in one isolate: a global the load has to see.
+        let (blob, index) = build_blob(&[], |scope| {
+            let global = scope.get_current_context().global(scope);
+            let source = v8::String::new(scope, "globalThis.ported = 'yes'").expect("a source");
+            let script = v8::Script::compile(scope, source, None).expect("a script");
+            let _ = script.run(scope).expect("the build-time script runs");
+            let _ = global;
+        });
+        say(&format!(
+            "ported blob {} bytes at index {index}",
+            blob.len()
+        ));
+        assert!(!blob.is_empty(), "the build produced a blob");
+
+        // Loaded in a fresh isolate. `from_snapshot` on the added index is the
+        // half wall 1 is about: index 0 is the default context's, whose global
+        // proxy V8 does not serialise.
+        let params = v8::CreateParams::default()
+            .external_references(no_references())
+            .snapshot_blob(blob);
+        let mut isolate = v8::Isolate::new(params);
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut isolate));
+        let scope = &mut scope.init();
+        let context = v8::Context::from_snapshot(scope, index, Default::default())
+            .expect("the added context deserialises");
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let source = v8::String::new(scope, "globalThis.ported").expect("a source");
+        let script = v8::Script::compile(scope, source, None).expect("a script");
+        let value = script.run(scope).expect("the loaded script runs");
+        assert_eq!(
+            value.to_rust_string_lossy(scope),
+            "yes",
+            "a global set while building is present after loading"
+        );
     });
 }
