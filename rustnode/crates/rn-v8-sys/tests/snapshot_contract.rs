@@ -30,8 +30,7 @@
 //!    obtain one, and they are invoked inside the v8 crate's `FunctionBuilder`,
 //!    which discards the value after handing it to V8.
 //!
-//! 3. **A serializer-enabled isolate has no experimental globals, and whether
-//!    that matters depends on the V8 version.** V8's
+//! 3. **A serializer-enabled isolate and the experimental globals.** V8's
 //!    `Genesis::InitializeGlobal` installs `InitializeExperimentalGlobal()`
 //!    only `if (!isolate->serializer_enabled())`, with the comment "Do not
 //!    include them into the snapshot as we should be able to turn them off at
@@ -39,26 +38,21 @@
 //!    isolate is initialised, so a creator isolate lacks every *flag-gated*
 //!    intrinsic.
 //!
-//!    On the V8 this crate links (15.2, `v8` crate 152.2.0) `Float16Array` is
-//!    one of them: 15.2 keeps it in a separate `TYPED_ARRAYS_FLOAT16` macro and
-//!    installs it from `InitializeGlobal_js_float16array`, which only
-//!    `InitializeExperimentalGlobal` calls. `internal/per_context/primordials.js`
-//!    reads `Float16Array` unconditionally, so on 15.2 the realm bootstrap
-//!    throws `TypeError: Reflect.ownKeys called on non-object` and no snapshot
-//!    of a rustnode realm can be built at all. On V8 15.6 (what Node 28 ships)
-//!    `Float16Array` moved into `TYPED_ARRAYS_BASE` and is installed
-//!    unconditionally in `InitializeGlobal`, so `Float16Array` is present during
-//!    a build — verified against the Oracle binary, whose `--build-snapshot`
-//!    isolate reports `typeof Float16Array === 'function'`. **This wall is
-//!    version skew, not a rustnode defect.** Closing it needs a V8 15.6 build of
-//!    the `v8` crate, and no such crate exists: the newest published `v8` is
-//!    `152.2.0`, which is V8 15.2, while `tools/node-pin.toml` records
-//!    `v8_version = "15.6.75"`. So the smallest next step is either a
-//!    locally-built `v8` crate from a 15.6 tag, or teaching the build path to
-//!    install `Float16Array` (and every other intrinsic 15.2 gates) before
-//!    `primordials.js` runs. The second is not a one-line patch: the global has
-//!    to be a real `JSTypedArray` constructor, which a binding cannot synthesize
-//!    from Rust because `v8::Float16Array::new` needs the intrinsic to exist.
+//!    Which intrinsics that covers is engine-specific, and this is the wall
+//!    that a 15.2 build hit and a 15.6 build does not. On V8 15.2
+//!    `Float16Array` was flag-gated: it lived in `TYPED_ARRAYS_FLOAT16` and was
+//!    installed from `InitializeGlobal_js_float16array`, which only
+//!    `InitializeExperimentalGlobal` called. A creator isolate therefore
+//!    reported `typeof Float16Array === 'undefined'`, and
+//!    `internal/per_context/primordials.js`, which reads `Float16Array`
+//!    unconditionally, threw `TypeError: Reflect.ownKeys called on non-object`.
+//!    No snapshot of a rustnode realm could be built on 15.2 at all.
+//!
+//!    On V8 15.6 (what Node 28 ships) `Float16Array` moved into
+//!    `TYPED_ARRAYS_BASE` and is installed unconditionally in
+//!    `InitializeGlobal`, so a creator isolate has it. This crate now links a
+//!    15.6.75 engine, and the test below records that the wall is gone rather
+//!    than that it was worked around.
 //!
 //!    A *deserialised* context gets the flag-gated intrinsics back either way,
 //!    because the load path re-runs Genesis with `serializer_enabled()` false.
@@ -208,14 +202,21 @@ fn an_api_function_needs_its_thunk_as_an_external_reference() {
     });
 }
 
-/// Wall 3: a from-scratch creator isolate lacks the flag-gated intrinsics that
-/// the same V8 installs in an ordinary isolate, and a loaded context has them
-/// again.
+/// Wall 3: a serializer-enabled creator isolate no longer lacks `Float16Array`,
+/// because V8 15.6 installs it outside the experimental set.
 ///
-/// The middle arm is the one that matters: it is why `primordials.js` throws
-/// during a build unless the build installs the missing globals itself.
+/// On V8 15.2 this test asserted the opposite. 15.2 kept `Float16Array` in a
+/// separate `TYPED_ARRAYS_FLOAT16` macro reachable only from
+/// `InitializeExperimentalGlobal`, so a creator isolate reported
+/// `typeof Float16Array === 'undefined'` and `primordials.js` threw while
+/// building a realm snapshot. 15.6 moved it into `TYPED_ARRAYS_BASE` and
+/// installed it unconditionally in `InitializeGlobal`, so all three isolates
+/// below — ordinary, build-time, and loaded — now report `function`.
+///
+/// That removes the wall, and the assertion records which engine it holds on
+/// rather than assuming the 15.2 behaviour still applies.
 #[test]
-fn a_creator_isolate_omits_experimental_globals_a_loaded_one_has() {
+fn every_isolate_has_the_typed_array_intrinsics() {
     with_v8(|| {
         const REPORT: &str = "'Float16Array=' + typeof globalThis.Float16Array";
         fn report(scope: &mut v8::PinScope<'_, '_>) -> String {
@@ -259,15 +260,17 @@ fn a_creator_isolate_omits_experimental_globals_a_loaded_one_has() {
         ));
         assert_eq!(
             ordinary, "Float16Array=function",
-            "an ordinary isolate installs the flag-gated intrinsics"
+            "an ordinary isolate installs the intrinsics"
         );
         assert_eq!(
-            building, "Float16Array=undefined",
-            "a serializer-enabled isolate omits them, which is what breaks primordials"
+            building, "Float16Array=function",
+            "V8 15.6 installs Float16Array outside the experimental set, so a \
+             serializer-enabled isolate has it too — this is what makes a realm \
+             snapshot buildable at all"
         );
         assert_eq!(
             loaded, "Float16Array=function",
-            "deserialisation re-runs Genesis without the serializer, so they come back"
+            "deserialisation re-runs Genesis, so they are present here as well"
         );
     });
 }

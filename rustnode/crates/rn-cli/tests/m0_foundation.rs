@@ -60,7 +60,7 @@ fn script_file_runs() {
 fn linked_v8_matches_pin() {
     let out = rustnode(&["-p", "process.versions.v8"]);
     let version = String::from_utf8_lossy(&out.stdout);
-    assert!(version.trim().starts_with("15.2."), "got {version}");
+    assert!(version.trim().starts_with("15.6."), "got {version}");
 }
 
 #[test]

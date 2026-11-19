@@ -298,7 +298,7 @@ pub fn pump_platform_tasks(scope: &v8::PinScope<'_, '_>) -> bool {
 /// V8 version rustnode requires. Keep aligned with `deps/v8/include/v8-version.h`
 /// of the Node source pinned in `tools/node-pin.toml`.
 pub const REQUIRED_V8_MAJOR: u32 = 15;
-pub const REQUIRED_V8_MINOR: u32 = 2;
+pub const REQUIRED_V8_MINOR: u32 = 6;
 
 /// Returns an error when the linked V8 is not the pinned major/minor.
 pub fn check_linked_v8() -> Result<(), String> {

@@ -269,7 +269,7 @@ pub fn call_tick_callback(scope: &mut v8::PinScope) {
 ///
 /// Kept as a named predicate rather than an inline match so the rule is testable
 /// without depending on V8 emitting one of the filtered events for some script;
-/// no ordinary JavaScript shape makes it do so on V8 15.2.
+/// no ordinary JavaScript shape makes it do so on V8 15.6.
 pub fn forwards_reject_event(event: v8::PromiseRejectEvent) -> bool {
     matches!(
         event,
