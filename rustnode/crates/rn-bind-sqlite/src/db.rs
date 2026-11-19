@@ -286,9 +286,22 @@ impl DatabaseState {
 /// The pointer is valid only while `object` is alive. Callers copy out the
 /// scalars they need instead of holding a borrow across a re-entry into
 /// JavaScript, because such a re-entry could run the object's finalizer.
+///
+/// # Why the field count is checked first
+///
+/// `get_aligned_pointer_from_internal_field` does not bounds-check. On an object
+/// with no internal fields — `Object.create(Database.prototype)`, or a `Proxy`
+/// around a real instance — it reads a slot that does not exist, which V8 makes
+/// a fatal check in debug builds and an out-of-bounds read in release builds. A
+/// `Statement` or `Session` has an internal field, but only one, and its pointer
+/// is a different type. [`INTERNAL_FIELDS`] is unique to this class, so counting
+/// first is both the safe test and the accurate one.
 pub fn pointer_of(object: v8::Local<'_, v8::Object>) -> Option<*mut DatabaseState> {
-    // SAFETY: the field is either absent, in which case V8 reports a null
-    // pointer, or installed by `install_state` for this object's own template.
+    if object.internal_field_count() != INTERNAL_FIELDS {
+        return None;
+    }
+    // SAFETY: the object has this class's internal field count, and field zero is
+    // either null or the pointer `install_state` stored for it.
     let pointer = unsafe { object.get_aligned_pointer_from_internal_field(STATE_FIELD, 0) }
         as *mut DatabaseState;
     if pointer.is_null() {
@@ -296,6 +309,23 @@ pub fn pointer_of(object: v8::Local<'_, v8::Object>) -> Option<*mut DatabaseStat
     } else {
         Some(pointer)
     }
+}
+
+/// Whether `value` is a `Database` instance, answering what Node's
+/// `HasInstance` answers.
+///
+/// `sqlite_database_constructor_template()->HasInstance(value)` is a *template*
+/// test, not a prototype-chain test, and the difference is observable:
+/// `Object.create(Database.prototype)` satisfies `instanceof Database` but is
+/// rejected by Node, and so is a `Proxy` around a real instance. Being created
+/// by the class's own template is what makes an instance real, which here means
+/// having this class's internal fields.
+pub fn is_database(value: v8::Local<'_, v8::Value>) -> Option<*mut DatabaseState> {
+    if !value.is_object() {
+        return None;
+    }
+    let object = v8::Local::<v8::Object>::try_from(value).ok()?;
+    pointer_of(object)
 }
 
 /// The connection handle, re-checked after a possible re-entry into JavaScript.
@@ -627,10 +657,13 @@ fn url_path_argument(
             Some(path)
         }
         Err(crate::url::UrlError::NotFile) => {
+            // `ERR_INVALID_URL_SCHEME`'s message ends with the colon, which looks
+            // like a typo in `node_errors.h` and is Node's literal text:
+            // `test-sqlite-backup.mjs` compares it with `strictEqual`.
             errors::throw_coded(
                 scope,
                 "ERR_INVALID_URL_SCHEME",
-                "The URL must be of scheme file",
+                "The URL must be of scheme file:",
             );
             None
         }

@@ -48,6 +48,7 @@
 //! the deferrals are honestly just gaps.
 
 pub mod accessor;
+pub mod backup;
 pub mod constants;
 pub mod database;
 pub mod db;
@@ -73,37 +74,24 @@ use rn_v8_sys::v8;
 
 /// Members this crate actually installs, matching `contracts/sqlite.json`.
 ///
-/// `install()` puts exactly these keys on the namespace object. `backup` is
-/// deliberately absent: it is declared in [`DEFERRED`] instead. Listing it here
-/// as well is what made the contract check report `sqlite` complete while
-/// `node:sqlite.backup` was `undefined` — `rn-compat` subtracts a member that
-/// appears in `members()` from the gap before it ever consults `deferred()`, so
-/// a member that is claimed *and* deferred is only ever checked once, as a
-/// claim. `install()` never set it, and nothing compared the built object
-/// against this list.
-pub const MEMBERS: &[&str] = &["Database", "Session", "Statement", "constants"];
+/// `install()` puts exactly these keys on the namespace object. `backup` used to
+/// be absent, declared in [`DEFERRED`] instead, and that is where the contract
+/// check's blind spot lived: `rn-compat` subtracts a member that appears in
+/// `members()` from the gap before it ever consults `deferred()`, so a member
+/// that is claimed *and* deferred is only ever checked once, as a claim.
+/// `install()` never set it and nothing compared the built object against this
+/// list. It is installed now, so it is listed here and nowhere else.
+pub const MEMBERS: &[&str] = &["Database", "Session", "Statement", "backup", "constants"];
 
 /// Members this namespace needs but does not install, each with the reason.
 ///
-/// `backup` is the only one. It is a separate subsystem — an asynchronous
-/// page-by-page copy driven through libuv's threadpool with a progress callback
-/// and a promise — and `test-sqlite-backup.mjs` is 448 lines that only that
-/// subsystem can satisfy. Shipping a synchronous approximation would answer
-/// differently from Node's for every observable: the return type, the progress
-/// callback's timing, and the retry behaviour on `SQLITE_BUSY`.
-///
-/// It is declared here rather than stubbed so the contract check reports it as a
-/// known gap instead of a member that exists and lies. `lib/sqlite.js`
-/// destructures it at module scope and re-exports it, so
-/// `require('node:sqlite').backup` is `undefined` until this is implemented —
-/// which is the honest state, and is why the deferral has to be visible to the
-/// contract check rather than hidden behind a `MEMBERS` entry.
-pub const DEFERRED: &[(&str, &str)] = &[
-    (
-        "backup",
-        "page-wise asynchronous backup with a progress callback and a promise; needs threadpool integration (uv_queue_work plus a promise settled on the loop), and a synchronous stand-in would differ from Node in return type, progress-callback timing and SQLITE_BUSY retries",
-    ),
-];
+/// Empty. `backup` was the only entry: it is an asynchronous page-by-page copy
+/// driven through libuv's threadpool with a progress callback and a promise, and
+/// it is now implemented in [`backup`]. A synchronous approximation was never an
+/// option, because it would answer differently from Node's for every observable:
+/// the return type, the progress callback's timing, and the retry behaviour on
+/// `SQLITE_BUSY`.
+pub const DEFERRED: &[(&str, &str)] = &[];
 
 /// `internalBinding('sqlite')`.
 pub struct Sqlite;
@@ -151,6 +139,20 @@ impl BindingModule for Sqlite {
 
         let constants = db::constants_object(scope)?;
         set(scope, object, "constants", constants.into())?;
+
+        // `Function::New(context, Backup, Local<Value>(), 2)` plus
+        // `SetName(backup_string)`: a plain function object with length 2, not a
+        // template, which is why it is the one member here whose length is not
+        // zero. `backup.length` is asserted by `test-sqlite-backup.mjs`.
+        let backup = v8::FunctionTemplate::builder(backup::backup)
+            .length(2)
+            .build(scope)
+            .get_function(scope)
+            .ok_or("cannot allocate the backup function")?;
+        if let Some(name) = v8::String::new(scope, "backup") {
+            backup.set_name(name);
+        }
+        set(scope, object, "backup", backup.into())?;
 
         Ok(object)
     }

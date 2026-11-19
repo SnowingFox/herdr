@@ -196,29 +196,42 @@ fn installed_keys() -> Vec<String> {
 }
 
 #[test]
-fn backup_is_declared_deferred_and_not_claimed_installed() {
-    // The contract check treats a declared deferral as satisfied, which is honest
-    // only if the declaration is real. `backup` is the one gap, it carries a
-    // reason rather than an empty string, and it must not also appear in
-    // `MEMBERS` — that double claim is what hid its absence.
-    assert_eq!(crate::DEFERRED.len(), 1);
-    let (member, reason) = crate::DEFERRED[0];
-    assert_eq!(member, "backup");
+fn backup_is_installed_with_node_s_name_and_length() {
+    // `Initialize` builds it with `Function::New(context, Backup, Local<Value>(),
+    // 2)` and then `SetName(backup_string)`, so `backup.length` is 2 while every
+    // other member of this namespace is 0 through `NewFunctionTemplate`.
+    // `test-sqlite-backup.mjs` asserts both fields, and the length is the only
+    // reason this member cannot go through `rn_core::set_method`.
+    assert!(crate::MEMBERS.contains(&"backup"));
     assert!(
-        reason.len() > 40,
-        "a deferral needs a real reason, not a placeholder"
+        crate::DEFERRED.is_empty(),
+        "backup is implemented, so the namespace has no declared gaps left"
     );
-    assert!(
-        !crate::MEMBERS.contains(&"backup"),
-        "a member that is both claimed installed and deferred is only ever checked as a claim"
-    );
-    // Every installed member must be genuinely installed, never deferred.
-    for member in crate::MEMBERS {
-        assert!(
-            !crate::DEFERRED
-                .iter()
-                .any(|(deferred, _)| deferred == member),
-            "{member} is both installed and deferred"
-        );
-    }
+    crate::testsupport::with_context(|scope| {
+        let mut async_ids = rn_core::AsyncIds::new();
+        let mut ctx = rn_core::InstallCtx {
+            async_ids: &mut async_ids,
+        };
+        let object =
+            <crate::Sqlite as rn_core::BindingModule>::install(&crate::Sqlite, scope, &mut ctx)
+                .expect("install the sqlite namespace");
+        let key = v8::String::new(scope, "backup").expect("allocate the member name");
+        let value = object.get(scope, key.into()).expect("read backup");
+        let function = v8::Local::<v8::Function>::try_from(value).expect("backup is a function");
+        // `Function::length()`/`name` on the JavaScript object, not the Rust
+        // `FunctionCallbackArguments` accessors: the observable fields are the
+        // JS ones `test-sqlite-backup.mjs` reads.
+        let length_key = v8::String::new(scope, "length").expect("allocate length");
+        let length = function
+            .get(scope, length_key.into())
+            .and_then(|value| value.number_value(scope))
+            .expect("read backup.length");
+        assert_eq!(length, 2.0, "backup.length must be Node's");
+        let name_key = v8::String::new(scope, "name").expect("allocate name");
+        let name = function
+            .get(scope, name_key.into())
+            .map(|value| value.to_rust_string_lossy(scope))
+            .unwrap_or_default();
+        assert_eq!(name, "backup", "backup.name must be Node's");
+    });
 }
